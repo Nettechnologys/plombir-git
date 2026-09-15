@@ -647,36 +647,46 @@ async fn run_sync_pass(
     // public earlier, an old mirror predating this guard, or a DNS-rebind to an
     // internal address is caught right before the network call. A failure is
     // recorded as a normal sync error below (status=error), not propagated.
-    let result = match &credentials {
+    let (credentials, result) = match credentials {
         Ok(credentials) => match transport_policy.destination(&mirror.url).await {
             Ok(remote) => {
-                if repo_path.join("HEAD").exists() {
-                    // Existing mirror: git remote update
-                    run_git_remote_update(
-                        transport_policy,
-                        &repo_path,
-                        &remote,
-                        credentials.as_ref(),
-                    )
-                } else {
-                    // First time: git clone --mirror
-                    run_git_clone_mirror(
-                        transport_policy,
-                        &remote,
-                        &repo_path,
-                        credentials.as_ref(),
-                    )
-                }
+                crate::blocking::run_blocking_git("mirror repository sync", move || {
+                    let result = if repo_path.join("HEAD").exists() {
+                        // Existing mirror: git remote update
+                        run_git_remote_update(
+                            transport_policy,
+                            &repo_path,
+                            &remote,
+                            credentials.as_ref(),
+                        )
+                    } else {
+                        // First time: git clone --mirror
+                        run_git_clone_mirror(
+                            transport_policy,
+                            &remote,
+                            &repo_path,
+                            credentials.as_ref(),
+                        )
+                    };
+                    Ok((credentials, result))
+                })
+                .await?
             }
-            Err(e) => Err(e.context("mirror remote URL failed transport/SSRF validation")),
+            Err(e) => (
+                credentials,
+                Err(e.context("mirror remote URL failed transport/SSRF validation")),
+            ),
         },
         // `anyhow::Error` is not `Clone`, and the borrow above needs the
         // credentials to stay put, so re-word the failure instead of moving it.
-        Err(_) => Err(anyhow::anyhow!(
-            "the stored credential for this mirror could not be decrypted \
-             (it predates encryption at rest, or the server's secret changed) — \
-             re-enter it in the mirror settings"
-        )),
+        Err(_) => (
+            None,
+            Err(anyhow::anyhow!(
+                "the stored credential for this mirror could not be decrypted \
+                 (it predates encryption at rest, or the server's secret changed) — \
+                 re-enter it in the mirror settings"
+            )),
+        ),
     };
 
     let now = Utc::now();
@@ -703,7 +713,7 @@ async fn run_sync_pass(
             // string is persisted and rendered in the settings UI, which is
             // the last place a secret should surface if that ever stops
             // holding.
-            let reason = mask_credential(&format!("{e:#}"), credentials.as_ref().ok());
+            let reason = mask_credential(&format!("{e:#}"), Some(&credentials));
             model.last_sync_error = Set(Some(reason.clone()));
             model.status = Set(STATUS_ERROR.to_string());
             tracing::error!(repo_id = mirror.repo_id, error = %reason, "mirror sync failed");

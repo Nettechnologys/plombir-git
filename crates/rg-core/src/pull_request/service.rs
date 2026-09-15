@@ -760,37 +760,35 @@ pub async fn compute_diff(
         let head_namespace = repository_namespace(db, &head_repo).await?;
         let head_repo_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
 
-        // Do not let a failed fetch silently reuse an old `refs/forks/...` ref:
-        // a deleted head branch is a stale PR state (409), whereas an unreadable
-        // fork repository or a failed fetch is our retryable failure (5xx).
-        require_pull_request_branch(&head_repo_path, "head", &pr.head_branch)?;
         let fetch_ref = format!("refs/heads/{}", pr.head_branch);
         let local_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
-
-        let git = rg_git::cli_gateway::global_gateway()
-            .as_ref()
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-        let fetch_output = git.run(
-            &[
-                "fetch",
-                &head_repo_path.to_string_lossy(),
-                &format!("{}:{}", fetch_ref, local_ref),
-            ],
-            Some(&base_repo_path),
-        )?;
-        fetch_output
-            .ensure_success()
-            .context("failed to fetch pull request head branch")?;
-
-        // Compute diff inside spawn_blocking (CPU-intensive gix tree-diff)
-        let base_path = base_repo_path.clone();
+        let base_path = base_repo_path;
         let pr_clone = pr.clone();
-        let local_ref = local_ref.clone();
-        return tokio::task::spawn_blocking(move || {
-            compute_cross_repo_diff(&base_path, &pr_clone.base_branch, &local_ref, &pr_clone)
-        })
-        .await?;
+        return crate::blocking::run_blocking_git(
+            "fetching and diffing a fork pull request",
+            move || {
+                // Do not let a failed fetch silently reuse an old `refs/forks/...`
+                // ref: a deleted head branch is stale PR state (409), whereas an
+                // unreadable fork repository or failed fetch is retryable (5xx).
+                require_pull_request_branch(&head_repo_path, "head", &pr_clone.head_branch)?;
+                let git = rg_git::cli_gateway::global_gateway()
+                    .as_ref()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let fetch_output = git.run(
+                    &[
+                        "fetch",
+                        &head_repo_path.to_string_lossy(),
+                        &format!("{}:{}", fetch_ref, local_ref),
+                    ],
+                    Some(&base_path),
+                )?;
+                fetch_output
+                    .ensure_success()
+                    .context("failed to fetch pull request head branch")?;
+                compute_cross_repo_diff(&base_path, &pr_clone.base_branch, &local_ref, &pr_clone)
+            },
+        )
+        .await;
     }
 
     require_pull_request_branch(&base_repo_path, "head", &pr.head_branch)?;
@@ -4031,55 +4029,49 @@ async fn merge_claimed_pr(
         let head_namespace = repository_namespace(db, &head_repo).await?;
         let head_repo_path = repo_root.join(format!("{}/{}.git", head_namespace, head_repo.name));
 
-        // A deleted head is stale PR state, while an unreadable fork repository
-        // is a server failure. Checking before fetch also prevents an old local
-        // `refs/forks/...` ref from being reused after the source branch vanished.
-        require_pull_request_branch(&head_repo_path, "head", &pr.head_branch)?;
         let fetch_ref = format!("refs/heads/{}", pr.head_branch);
         let local_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
-
-        let git = rg_git::cli_gateway::global_gateway()
-            .as_ref()
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-        let fetch_output = git.run(
-            &[
-                "fetch",
-                &head_repo_path.to_string_lossy(),
-                &format!("{}:{}", fetch_ref, local_ref),
-            ],
-            Some(&repo_path),
-        )?;
-
-        if !fetch_output.success() {
-            bail!(
-                "failed to fetch fork branch: {}",
-                String::from_utf8_lossy(&fetch_output.stderr)
-            );
-        }
-
-        // Merge and cleanup in spawn_blocking (CPU-intensive gix merge)
         let merge_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
-        // The fetch above brought whatever the fork's branch points at *now*.
-        // That is the tip this merge is about, so it — not the PR row, not the
-        // sha some earlier pass read — is what the caller's pin is checked
-        // against, and what the merge is then performed on by object id.
-        let head_sha = resolve_ref_sha(&repo_path, &merge_ref)?;
-        require_pinned_head(&pr, expected_head_sha, &head_sha)?;
-        let merge_commit_sha = {
-            let repo_path = repo_path.clone();
-            let pr = pr.clone();
-            let merge_ref = merge_ref.clone();
-            tokio::task::spawn_blocking(move || -> Result<String> {
-                let sha = merge_head_rev(&repo_path, &pr, &head_sha, strategy)?;
-                // Clean up fetched ref
-                if let Err(e) = gix_delete_ref(&repo_path, &merge_ref) {
+        let expected_head_sha = expected_head_sha.map(str::to_owned);
+        let repo_path_for_git = repo_path.clone();
+        let pr_for_git = pr.clone();
+        let merge_commit_sha = crate::blocking::run_blocking_git(
+            "fetching and merging a fork pull request",
+            move || -> Result<String> {
+                // A deleted head is stale PR state, while an unreadable fork
+                // repository is a server failure. Checking before fetch also
+                // prevents reuse of an old local fork ref.
+                require_pull_request_branch(&head_repo_path, "head", &pr_for_git.head_branch)?;
+                let git = rg_git::cli_gateway::global_gateway()
+                    .as_ref()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let fetch_output = git.run(
+                    &[
+                        "fetch",
+                        &head_repo_path.to_string_lossy(),
+                        &format!("{}:{}", fetch_ref, local_ref),
+                    ],
+                    Some(&repo_path_for_git),
+                )?;
+                if !fetch_output.success() {
+                    bail!(
+                        "failed to fetch fork branch: {}",
+                        String::from_utf8_lossy(&fetch_output.stderr)
+                    );
+                }
+
+                // The fetch brought whatever the fork branch points at now.
+                // Pin and merge that same object inside this blocking phase.
+                let head_sha = resolve_ref_sha(&repo_path_for_git, &merge_ref)?;
+                require_pinned_head(&pr_for_git, expected_head_sha.as_deref(), &head_sha)?;
+                let sha = merge_head_rev(&repo_path_for_git, &pr_for_git, &head_sha, strategy)?;
+                if let Err(e) = gix_delete_ref(&repo_path_for_git, &merge_ref) {
                     tracing::warn!("failed to clean up fork ref '{}': {}", merge_ref, e);
                 }
                 Ok(sha)
-            })
-            .await??
-        };
+            },
+        )
+        .await?;
 
         return update_pr_merged(
             db,

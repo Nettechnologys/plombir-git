@@ -355,11 +355,11 @@ async fn clone_into_target_with_destination(
     // network-capable step. Metadata/API work cannot age this DNS decision.
     let destination = destination.await?;
     let outcome = clone_repo(
-        &destination,
+        destination,
         repo_root,
         &task.target_owner,
         &task.target_name,
-        source_credentials(&task.platform, &task.source_url, token).as_ref(),
+        source_credentials(&task.platform, &task.source_url, token),
     )
     .await?;
     // The fact, not the intention. Set unconditionally, this reported the one
@@ -1200,6 +1200,34 @@ fn discard_partial_clone(staging: &Path) {
     }
 }
 
+/// Keep cleanup attached to a detached blocking clone. Dropping the async join
+/// future does not cancel `spawn_blocking`; if the subprocess then succeeds,
+/// its return value is dropped and this guard retires the otherwise orphaned
+/// staging repository.
+#[derive(Debug)]
+struct StagedImportClone {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl StagedImportClone {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedImportClone {
+    fn drop(&mut self) {
+        if self.armed {
+            discard_partial_clone(&self.path);
+        }
+    }
+}
+
 /// Remove the skeleton a finished install replaced.
 ///
 /// Only ever called once the clone holds the target path, which is what makes
@@ -1318,15 +1346,15 @@ fn install_clone(
 /// plaintext PAT on disk long after the import finished, and would show up in
 /// `ps`, in the gateway's error text, and in its trace span.
 async fn clone_repo(
-    remote: &crate::net::GuardedGitRemote,
+    remote: crate::net::GuardedGitRemote,
     repo_root: &Path,
     owner: &str,
     name: &str,
-    credentials: Option<&GitCredentials>,
+    credentials: Option<GitCredentials>,
 ) -> Result<CloneOutcome> {
-    // Final sink guard. `run_import` owns the worker boundary, but keeping the
-    // invariant here prevents a future direct caller or derived clone URL from
-    // reintroducing native plaintext Git.
+    // Admission guard before any filesystem touch. The blocking closure repeats
+    // it at the final sink so a future direct caller or derived clone URL cannot
+    // reintroduce native plaintext Git.
     crate::import::trust::ImportTransportPolicy::require_confidential_transport(remote.url())?;
 
     let target_dir = repo_root.join(format!("{}/{}.git", owner, name));
@@ -1362,18 +1390,26 @@ async fn clone_repo(
     let staging = parent.join(crate::staging::import_clone_staging_name(name, pass));
     let retired = parent.join(format!(".{name}.git.replaced-{token}"));
 
-    let git = global_gateway()
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let invocation = remote.bind_invocation(credential_invocation(credentials))?;
-    let destination = staging.to_string_lossy();
-    let cloned = invocation
-        .run(git, &["clone", "--bare", remote.url(), &destination], None)
-        .and_then(|output| output.ensure_success().context("git clone --bare"));
-    if let Err(error) = cloned {
-        discard_partial_clone(&staging);
-        return Err(error);
-    }
+    let staged_clone = StagedImportClone::new(staging.clone());
+    let mut staged_clone =
+        crate::blocking::run_blocking_git("import repository clone", move || {
+            // Repeat the policy at the actual sink. The check above preserves the
+            // existing fail-before-filesystem contract; this one keeps the owned
+            // guarded remote coupled to the subprocess that consumes it.
+            crate::import::trust::ImportTransportPolicy::require_confidential_transport(
+                remote.url(),
+            )?;
+            let git = global_gateway()
+                .as_ref()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let invocation = remote.bind_invocation(credential_invocation(credentials.as_ref()))?;
+            let destination = staged_clone.path.to_string_lossy();
+            invocation
+                .run(git, &["clone", "--bare", remote.url(), &destination], None)
+                .and_then(|output| output.ensure_success().context("git clone --bare"))?;
+            Ok(staged_clone)
+        })
+        .await?;
 
     // The skeleton is about to leave its live name by rename, and a rename is
     // only reversible by the process that made it. Declared one statement
@@ -1417,6 +1453,7 @@ async fn clone_repo(
         }
         return Err(failed.error);
     }
+    staged_clone.disarm();
 
     if occupied {
         // The clone holds the target path now, so the skeleton beside it is a
@@ -4937,6 +4974,51 @@ mod clone_effect_tests {
 mod clone_path_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn cancelling_a_clone_keeps_staging_cleanup_attached_to_the_work() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let staging = directory.path().join("cancelled-import-clone.git");
+        std::fs::create_dir(&staging).expect("staging clone");
+        let staged_clone = StagedImportClone::new(staging.clone());
+
+        let release = Arc::new(Barrier::new(2));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let operation_release = Arc::clone(&release);
+        let operation = tokio::spawn(async move {
+            crate::blocking::run_blocking_git("test import clone", move || {
+                entered_tx.send(()).expect("test still awaits clone start");
+                operation_release.wait();
+                Ok(staged_clone)
+            })
+            .await
+        });
+
+        entered_rx.await.expect("clone starts");
+        operation.abort();
+        assert!(
+            operation
+                .await
+                .expect_err("the import task was aborted")
+                .is_cancelled(),
+            "the request must be cancelled while blocking work owns the staging clone"
+        );
+        release.wait();
+
+        for _ in 0..100 {
+            if !staging.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "cancelled import clone leaked staging at {}",
+            staging.display()
+        );
+    }
+
     /// An import into an unusable `repo_root` is the failure an operator meets
     /// first, and until this test it reported the errno alone — the directory
     /// the clone tried to create was computed here and never left the function.
@@ -4951,7 +5033,7 @@ mod clone_path_tests {
             "https://example.invalid/alice/site.git",
         );
 
-        let error = clone_repo(&remote, &repo_root, "alice", "site", None)
+        let error = clone_repo(remote, &repo_root, "alice", "site", None)
             .await
             .expect_err("repo_root is a file");
         let rendered = format!("{error:#}");
@@ -5048,7 +5130,7 @@ mod clone_path_tests {
             .expect("block the journal prefix");
 
         let remote = crate::net::GuardedGitRemote::unbound_for_test(&source.to_string_lossy());
-        let error = clone_repo(&remote, &repo_root, "alice", "site", None)
+        let error = clone_repo(remote, &repo_root, "alice", "site", None)
             .await
             .expect_err("an import that cannot record its move must not make it");
 
@@ -5095,7 +5177,7 @@ mod clone_path_tests {
             .expect("block the commit-marker prefix");
 
         let remote = crate::net::GuardedGitRemote::unbound_for_test(&source.to_string_lossy());
-        let outcome = clone_repo(&remote, &repo_root, "alice", "site", None)
+        let outcome = clone_repo(remote, &repo_root, "alice", "site", None)
             .await
             .expect("a marker that cannot be written is reported, not fatal");
         assert_eq!(outcome, CloneOutcome::Cloned);
@@ -5126,7 +5208,7 @@ mod clone_path_tests {
             "git://does-not-resolve.invalid/alice/site.git",
         );
 
-        let error = clone_repo(&remote, &repo_root, "alice", "site", None)
+        let error = clone_repo(remote, &repo_root, "alice", "site", None)
             .await
             .expect_err("the final clone sink must refuse native Git");
 
@@ -5189,7 +5271,7 @@ mod clone_credential_tests {
         let credentials =
             source_credentials("github", "https://github.com/o/r.git", TOKEN).expect("a token");
         let remote = crate::net::GuardedGitRemote::unbound_for_test(&source.to_string_lossy());
-        clone_repo(&remote, &repo_root, "alice", "site", Some(&credentials))
+        clone_repo(remote, &repo_root, "alice", "site", Some(credentials))
             .await
             .expect("clone of a local source");
 
@@ -5220,14 +5302,8 @@ mod clone_credential_tests {
             "http://{address}/upstream.git"
         ));
 
-        let outcome = clone_repo(
-            &remote,
-            directory.path(),
-            "alice",
-            "site",
-            Some(&credentials),
-        )
-        .await;
+        let outcome =
+            clone_repo(remote, directory.path(), "alice", "site", Some(credentials)).await;
         assert!(
             outcome.is_err(),
             "the stub remote refuses everyone — the clone cannot succeed"
@@ -5261,7 +5337,7 @@ mod clone_credential_tests {
         ));
 
         let started = std::time::Instant::now();
-        let outcome = clone_repo(&remote, directory.path(), "alice", "site", None).await;
+        let outcome = clone_repo(remote, directory.path(), "alice", "site", None).await;
         let elapsed = started.elapsed();
 
         assert!(outcome.is_err(), "the stub remote demands authentication");
@@ -5283,7 +5359,7 @@ mod clone_credential_tests {
             .expect("the public-answer stand-in is allowed");
         let directory = tempfile::tempdir().expect("tempdir");
 
-        let outcome = clone_repo(&remote, directory.path(), "alice", "site", None).await;
+        let outcome = clone_repo(remote, directory.path(), "alice", "site", None).await;
         assert!(
             outcome.is_err(),
             "the checked sink deliberately returns 403"
