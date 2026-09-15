@@ -1025,22 +1025,38 @@ pub async fn store_object_from_file(
     // Hence one cleanup tail over the whole body instead of a discard on the
     // one failure that happened to be noticed: a compression error in the
     // middle used to leave both files behind for good.
-    let compressed_path = uncompressed_path.with_extension(format!("{}.zst", uuid::Uuid::new_v4()));
-    let stored = stream_compress_and_store(
+    let staged = StagedLfsPublication {
+        uncompressed: uncompressed_path.to_path_buf(),
+        compressed: uncompressed_path.with_extension(format!("{}.zst", uuid::Uuid::new_v4())),
+    };
+    stream_compress_and_store(
         db,
         repo_id,
         storage,
         owner,
         repo,
         oid,
-        uncompressed_path,
-        &compressed_path,
+        staged,
         original_size,
     )
-    .await;
-    discard_file("uncompressed LFS upload", uncompressed_path);
-    discard_file("compressed LFS object", &compressed_path);
-    stored
+    .await
+}
+
+/// Own both request-private files across the blocking and async halves of an
+/// LFS publication. A dropped `spawn_blocking` join future does not stop its
+/// closure; moving this guard into that closure keeps cleanup attached to the
+/// work even when the request is cancelled while compression is still running.
+#[derive(Debug)]
+struct StagedLfsPublication {
+    uncompressed: PathBuf,
+    compressed: PathBuf,
+}
+
+impl Drop for StagedLfsPublication {
+    fn drop(&mut self) {
+        discard_file("uncompressed LFS upload", &self.uncompressed);
+        discard_file("compressed LFS object", &self.compressed);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1051,26 +1067,39 @@ async fn stream_compress_and_store(
     owner: &str,
     repo: &str,
     oid: &str,
-    uncompressed_path: &std::path::Path,
-    compressed_path: &std::path::Path,
+    staged: StagedLfsPublication,
     original_size: i64,
 ) -> Result<()> {
     // Find or create the DB record first
     let object = find_or_register_object(db, repo_id, oid, original_size).await?;
 
-    // Stream-compress from file (uses chunked I/O, not full file read)
-    let src_file = std::fs::File::open(uncompressed_path)
-        .with_context(|| format!("open uncompressed file {:?}", uncompressed_path))?;
-    let dst_file = std::fs::File::create(compressed_path)
-        .with_context(|| format!("create compressed file {:?}", compressed_path))?;
+    // The client controls the object size, so this entire file traversal and
+    // zstd phase belongs on the blocking pool. The staging guard moves with the
+    // work and comes back for publication, keeping cleanup alive across a
+    // cancelled join future.
+    let (staged, measured) = run_blocking_lfs_compression(move || {
+        let src_file = std::fs::File::open(&staged.uncompressed)
+            .with_context(|| format!("open uncompressed file {:?}", staged.uncompressed))?;
+        let dst_file = std::fs::File::create(&staged.compressed)
+            .with_context(|| format!("create compressed file {:?}", staged.compressed))?;
 
-    let mut encoder = zstd::stream::Encoder::new(dst_file, ZSTD_LEVEL)
-        .context("failed to create zstd stream encoder")?;
-    std::io::copy(&mut std::io::BufReader::new(src_file), &mut encoder)
-        .context("failed to stream-compress LFS object")?;
-    let finished = encoder
-        .finish()
-        .context("failed to finish zstd stream encoding")?;
+        let mut encoder = zstd::stream::Encoder::new(dst_file, ZSTD_LEVEL)
+            .with_context(|| format!("create zstd stream encoder for {:?}", staged.compressed))?;
+        std::io::copy(&mut std::io::BufReader::new(src_file), &mut encoder).with_context(|| {
+            format!(
+                "stream-compress LFS object from {:?} to {:?}",
+                staged.uncompressed, staged.compressed
+            )
+        })?;
+        let finished = encoder
+            .finish()
+            .with_context(|| format!("finish zstd stream encoding at {:?}", staged.compressed))?;
+        let measured = finished.metadata().map(|metadata| metadata.len());
+        drop(finished);
+
+        Ok((staged, measured))
+    })
+    .await?;
 
     let key = lfs_object_key(owner, repo, oid, true)?;
 
@@ -1082,13 +1111,28 @@ async fn stream_compress_and_store(
             repo_id,
             oid,
             key: &key,
-            source: PublicationSource::File(compressed_path),
+            source: PublicationSource::File(&staged.compressed),
         },
-        compressed_path,
+        &staged.compressed,
         original_size,
-        finished.metadata().map(|metadata| metadata.len()),
+        measured,
     )
     .await
+}
+
+/// Run one complete LFS compression phase without occupying a Tokio worker.
+///
+/// The operation owns the paths it traverses. Its inner IO error is preserved,
+/// while a panic or cancellation receives enough context to identify the
+/// publication phase that failed.
+async fn run_blocking_lfs_compression<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .context("LFS compression blocking task failed")?
 }
 
 /// Commit a staged, already-compressed LFS object under the size it actually
@@ -1259,8 +1303,8 @@ fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>> {
 mod blob_publication_tests {
     use super::{
         compress_data, decompress_data, find_or_register_object, lfs_object_key,
-        publish_compressed_object, store_object, store_object_from_file, PublicationRequest,
-        PublicationSource,
+        publish_compressed_object, run_blocking_lfs_compression, store_object,
+        store_object_from_file, PublicationRequest, PublicationSource, StagedLfsPublication,
     };
     use crate::blob_storage::{
         BlobKey, BlobMetadata, BlobStorage, LocalBlobStorage, Result as BlobResult,
@@ -1270,6 +1314,188 @@ mod blob_publication_tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, NotSet, Set};
     use std::sync::Arc;
     use tokio::sync::Semaphore;
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    /// Saturating every async worker with an LFS compression phase must still
+    /// leave a worker available for a cheap request. Running `operation`
+    /// directly makes the timing tooth fail when both workers reach the
+    /// barrier and remain there until the release thread wakes them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lfs_compression_does_not_occupy_async_workers() {
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        const PARALLEL_COMPRESSIONS: usize = 2;
+        let release = Arc::new(Barrier::new(PARALLEL_COMPRESSIONS + 1));
+        let release_thread = {
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                release.wait();
+            })
+        };
+
+        let started_at = Instant::now();
+        let (operations, entered): (Vec<_>, Vec<_>) = (0..PARALLEL_COMPRESSIONS)
+            .map(|marker| {
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let release = Arc::clone(&release);
+                let operation = tokio::spawn(async move {
+                    run_blocking_lfs_compression(move || {
+                        entered_tx
+                            .send(())
+                            .expect("test still awaits the compression start signal");
+                        release.wait();
+                        Ok(marker)
+                    })
+                    .await
+                });
+                (operation, entered_rx)
+            })
+            .unzip();
+
+        for entered in entered {
+            entered.await.expect("LFS compression starts");
+        }
+        let cheap_task = tokio::spawn(async { tokio::task::yield_now().await });
+        tokio::time::timeout(Duration::from_millis(100), cheap_task)
+            .await
+            .expect("a cheap async task was delayed by LFS compression")
+            .expect("cheap async task joins");
+        assert!(
+            started_at.elapsed() < Duration::from_millis(200),
+            "LFS compression occupied every async worker"
+        );
+
+        for (expected, operation) in operations.into_iter().enumerate() {
+            assert_eq!(
+                operation
+                    .await
+                    .expect("LFS compression task joins")
+                    .expect("LFS compression succeeds"),
+                expected
+            );
+        }
+        release_thread.join().expect("release thread joins");
+    }
+
+    #[tokio::test]
+    async fn a_panicked_lfs_compression_keeps_its_operation_context() {
+        let error = run_blocking_lfs_compression(|| -> anyhow::Result<()> {
+            panic!("injected LFS compression panic")
+        })
+        .await
+        .expect_err("a panicked compression task must fail the caller");
+
+        assert!(
+            error
+                .to_string()
+                .contains("LFS compression blocking task failed"),
+            "JoinError lost the LFS compression context: {error:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_lfs_compression_keeps_staging_cleanup_attached_to_the_work() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let staged = StagedLfsPublication {
+            uncompressed: dir.path().join("cancelled.upload"),
+            compressed: dir.path().join("cancelled.zst"),
+        };
+        std::fs::write(&staged.uncompressed, b"source").unwrap();
+        std::fs::write(&staged.compressed, b"compressed").unwrap();
+        let uncompressed = staged.uncompressed.clone();
+        let compressed = staged.compressed.clone();
+
+        let release = Arc::new(Barrier::new(2));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let operation_release = Arc::clone(&release);
+        let operation = tokio::spawn(async move {
+            run_blocking_lfs_compression(move || {
+                entered_tx
+                    .send(())
+                    .expect("test still awaits the compression start signal");
+                operation_release.wait();
+                Ok(staged)
+            })
+            .await
+        });
+
+        entered_rx.await.expect("LFS compression starts");
+        operation.abort();
+        assert!(
+            operation
+                .await
+                .expect_err("the request task was aborted")
+                .is_cancelled(),
+            "the request must be cancelled while blocking work still owns its staging files"
+        );
+        release.wait();
+
+        for _ in 0..100 {
+            if !uncompressed.exists() && !compressed.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "cancelled LFS compression leaked staging files: source={}, compressed={}",
+            uncompressed.exists(),
+            compressed.exists()
+        );
+    }
+
+    /// The helper probe proves its scheduling contract; this guard proves that
+    /// the production upload actually nests every synchronous traversal inside
+    /// that boundary rather than merely calling the helper elsewhere.
+    #[test]
+    fn lfs_file_publication_uses_the_blocking_boundary() {
+        let source = include_str!("service.rs");
+        let boundary = rust_source::production_function_call_sites(
+            source,
+            "stream_compress_and_store",
+            &["run_blocking_lfs_compression"],
+        );
+        assert_eq!(
+            boundary.len(),
+            1,
+            "LFS publication must have one compression boundary, found {boundary:?}"
+        );
+
+        for blocking_call in [
+            "std::fs::File::open",
+            "std::fs::File::create",
+            "zstd::stream::Encoder::new",
+            "std::io::copy",
+            "finish",
+            "metadata",
+        ] {
+            let calls = rust_source::production_function_call_sites(
+                source,
+                "stream_compress_and_store",
+                &[blocking_call],
+            );
+            assert_eq!(
+                calls.len(),
+                1,
+                "LFS publication must make one `{blocking_call}` call, found {calls:?}"
+            );
+            assert!(
+                rust_source::call_site_contains(source, boundary[0], calls[0]),
+                "LFS publication's `{blocking_call}` call is outside its blocking boundary"
+            );
+        }
+    }
 
     /// A rendezvous point a request can be held at, and the test can observe.
     ///
