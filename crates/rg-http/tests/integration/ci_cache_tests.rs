@@ -744,6 +744,54 @@ async fn a_failed_cache_row_takes_the_uploaded_archive_with_it() {
     );
 }
 
+/// The HTTP writer must refuse before the final archive rename when it cannot
+/// make recovery intent durable. If the route bypasses the shared publication
+/// boundary, this request succeeds and the assertions expose both the row and
+/// the unjournalled final file.
+#[tokio::test]
+async fn http_cache_publication_refuses_an_unwritable_journal() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let cache_key = "deps-journal";
+    let (repo_id, runner_id, job_id, runner_token) = cache_upload_fixture(
+        &app.base,
+        &app.db,
+        "cache_journal_outage",
+        "journal-outage",
+        cache_key,
+    )
+    .await;
+    std::fs::remove_dir(app.repo_root.join("_deleted/journal")).unwrap();
+    std::fs::write(app.repo_root.join("_deleted/journal"), b"not a directory").unwrap();
+
+    let upload = client
+        .put(format!(
+            "{}/api/v1/runners/{runner_id}/jobs/{job_id}/cache",
+            app.base
+        ))
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .body(b"cache archive bytes".to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        upload.status(),
+        500,
+        "an unjournalled final cache publication must be refused"
+    );
+    assert!(
+        cache_entry(&app.db, repo_id, cache_key).await.is_none(),
+        "the HTTP writer recorded a cache row without durable recovery intent"
+    );
+    assert_eq!(
+        leftover_cache_files(&cache_dir(&app.repo_root, repo_id)),
+        Vec::<String>::new(),
+        "the HTTP writer published final cache bytes without durable recovery intent"
+    );
+}
+
 /// Publish one cache archive through the real upload route.
 ///
 /// Hands back the owner's token (the retention route is repo-admin only), the

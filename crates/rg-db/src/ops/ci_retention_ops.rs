@@ -259,6 +259,29 @@ pub async fn find_cache_entry(
         .await
         .context("db: find CI cache entry")
 }
+
+/// Check whether one repository's metadata still owns an exact cache archive.
+///
+/// Startup publication recovery is the only caller. The archive name is
+/// request-private, but it is still scoped by `repo_id` here so this primitive
+/// cannot accidentally turn a path copied from one repository into ownership
+/// proof supplied by another.
+pub async fn exists_by_file_path(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    file_path: &str,
+) -> Result<bool> {
+    Ok(ci_cache_entry::Entity::find()
+        .select_only()
+        .column(ci_cache_entry::Column::Id)
+        .filter(ci_cache_entry::Column::RepoId.eq(repo_id))
+        .filter(ci_cache_entry::Column::FilePath.eq(file_path))
+        .into_tuple::<i64>()
+        .one(db)
+        .await
+        .context("db: find CI cache entry by file path")?
+        .is_some())
+}
 /// Delete only the expired publication the caller actually observed.
 ///
 /// Retention lists rows before it stages their archives. A download, restore or

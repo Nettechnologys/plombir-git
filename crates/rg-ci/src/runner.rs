@@ -1515,42 +1515,28 @@ impl PipelineRunner {
     async fn save_cache(&self, key: &str, paths: &[String]) -> Result<()> {
         let key_hash = cache_key_hash(key);
         let directory = self.cache_archive_dir();
-        // What the live entry names before this save rewrites it, read while the
-        // row still points at the previous run's archive.
-        let replaced =
-            rg_db::ops::ci_retention_ops::find_cache_entry(&self.db, self.repo_id, &key_hash)
-                .await?
-                .map(|entry| entry.file_path);
-        // Each save publishes under a name of its own. Packing over a stable
-        // `<key_hash>.tar` destroyed the previous run's archive before anything
-        // had confirmed this one — and then every failure below compensated by
-        // deleting that same path, leaving the live row pointing at bytes that
-        // no longer exist. Here the only file this save can roll back is the one
-        // it created.
-        let archive = directory.join(format!("{key_hash}.{}.tar", uuid::Uuid::new_v4()));
-
-        // Nothing names this archive until `record_cache_entry` succeeds, and
-        // retention walks rows — so every exit below has to take it along.
-        if let Err(error) = self.pack_cache_archive(paths, &archive) {
-            remove_cache_archive(&archive, "packing the cache archive failed");
-            return Err(error);
-        }
-        if let Err(error) = self.record_cache_entry(key, &archive).await {
-            remove_cache_archive(&archive, "the cache entry could not be recorded");
-            return Err(error);
-        }
-
-        // The row names this save's archive now, which is what makes the one it
-        // named before ours to retire — and only now. A failure above left the
-        // previous run's cache exactly where it was, still restorable.
-        if let Some(previous) = replaced
-            .as_deref()
-            .and_then(|recorded| recorded_cache_archive(&directory, recorded))
-        {
-            if previous != archive {
-                remove_cache_archive(&previous, "a newer archive took over the cache entry");
-            }
-        }
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| cache_path_error("CI cache directory", &directory, &error))?;
+        let spool = rg_core::ci_cache::spool_in(&directory)
+            .map_err(|error| cache_path_error("CI cache staging file", &directory, &error))?;
+        self.pack_cache_archive(paths, spool.path())?;
+        let size = spool
+            .as_file()
+            .metadata()
+            .map_err(|error| cache_path_error("CI cache staging file", spool.path(), &error))?
+            .len() as i64;
+        let digest = hash_archive(spool.path())
+            .map_err(|error| cache_path_error("CI cache staging file", spool.path(), &error))?;
+        rg_core::ci_cache::publish_from_spool(
+            &self.db,
+            self.storage_root(),
+            self.repo_id,
+            &key_hash,
+            spool.into_temp_path(),
+            size,
+            &digest,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1662,27 +1648,6 @@ impl PipelineRunner {
             size,
             Some(sha256),
             expires_at,
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Record the published archive so something points at it.
-    async fn record_cache_entry(&self, key: &str, archive: &std::path::Path) -> Result<()> {
-        let size = std::fs::metadata(archive)
-            .map_err(|error| cache_path_error("CI cache archive", archive, &error))?
-            .len() as i64;
-        let digest = hash_archive(archive)
-            .map_err(|error| cache_path_error("CI cache archive", archive, &error))?;
-        let policy = rg_db::ops::ci_retention_ops::get_policy(&self.db, self.repo_id).await?;
-        rg_db::ops::ci_retention_ops::upsert_cache_entry(
-            &self.db,
-            self.repo_id,
-            &cache_key_hash(key),
-            archive.to_string_lossy().as_ref(),
-            size,
-            Some(&digest),
-            policy.cache_retention_days,
         )
         .await?;
         Ok(())
@@ -2417,6 +2382,47 @@ mod tests {
             cache_dir_leftovers(&runner.cache_archive_dir()),
             Vec::<String>::new(),
             "the failed save kept an archive no row points at"
+        );
+    }
+
+    /// The embedded writer must refuse before the final archive rename when it
+    /// cannot make the recovery intent durable. Removing its call to the shared
+    /// publication boundary makes this save succeed and leaves an unjournalled
+    /// final archive, so the assertion is mutation-sensitive to this producer.
+    #[tokio::test]
+    async fn embedded_cache_publication_refuses_an_unwritable_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = cache_runner(temp.path()).await;
+        std::fs::create_dir_all(runner.storage_root().join("_deleted")).unwrap();
+        std::fs::write(
+            runner.storage_root().join("_deleted/journal"),
+            b"not a directory",
+        )
+        .unwrap();
+
+        let error = save_workspace_cache(&runner, "build-main", "cached")
+            .await
+            .expect_err("save must refuse an unjournalled final publication");
+
+        assert!(
+            format!("{error:#}").contains("deletion journal entry"),
+            "the save failed outside the durable publication boundary: {error:#}"
+        );
+        assert!(
+            rg_db::ops::ci_retention_ops::find_cache_entry(
+                &runner.db,
+                runner.repo_id,
+                &cache_key_hash("build-main")
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the embedded runner recorded a cache row without durable recovery intent"
+        );
+        assert_eq!(
+            cache_dir_leftovers(&runner.cache_archive_dir()),
+            Vec::<String>::new(),
+            "the embedded runner published final cache bytes without durable recovery intent"
         );
     }
 

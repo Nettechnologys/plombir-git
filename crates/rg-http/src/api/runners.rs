@@ -1214,10 +1214,7 @@ async fn stage_cache_archive(
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncWriteExt;
 
-    let staged = tempfile::Builder::new()
-        .prefix(rg_core::staging::CI_CACHE_SPOOL_PREFIX)
-        .suffix(rg_core::staging::CI_CACHE_SPOOL_SUFFIX)
-        .tempfile_in(directory)
+    let staged = rg_core::ci_cache::spool_in(directory)
         .map_err(|error| cache_path_error("CI cache staging file", directory, &error))?;
     let (file, path) = staged.into_parts();
     let mut file = tokio::fs::File::from_std(file);
@@ -1309,14 +1306,6 @@ pub async fn upload_cache(
     if let Err(error) = tokio::fs::create_dir_all(&directory).await {
         return cache_path_error("CI cache directory", &directory, &error).into_response();
     }
-    // What the live entry names *before* this upload rewrites it. Read here
-    // because the upsert below is the point of no return: afterwards the row
-    // names this request's archive and the previous publication's bytes have no
-    // handle left in the database at all.
-    let replaced = match cache_entry_for_download(&state.db, repo_id, &key_hash).await {
-        Ok(entry) => entry.map(|entry| entry.file_path),
-        Err(error) => return error.into_response(),
-    };
     // Spool the archive to disk as it arrives, digesting it on the way. The
     // request may be a gigabyte; the ceiling bounds what a job may store, and
     // this is what keeps that number off the heap — an over-ceiling body is
@@ -1335,111 +1324,20 @@ pub async fn upload_cache(
         return AppError::bad_request("cache archive must contain 1 byte to 1 GiB").into_response();
     }
     let size = len as i64;
-    // Every publication is written under a name of its own. Under the stable
-    // `<key_hash>.tar` a retry wrote over the archive the live row still named,
-    // so any failure below compensated by deleting bytes that belonged to the
-    // *previous*, successful upload: one failed retry turned a working cache
-    // into a row pointing at nothing. A request-private name makes the rollback
-    // provable — the only file this request can ever remove is the one this
-    // request created.
-    let path = directory.join(format!("{key_hash}.{}.tar", uuid::Uuid::new_v4()));
-    // From here until `upsert_cache_entry` succeeds there is a file on disk that
-    // no DB row points at. Retention walks rows, so every early exit below has to
-    // take its file with it — otherwise the failure leaks a cache-sized archive
-    // that nothing will ever come back for. Until this rename the spool is still
-    // a `TempPath`, which takes itself with it; afterwards the rollback below is
-    // what does.
-    if let Err(error) = spool.persist(&path) {
-        return cache_path_error("CI cache archive", &path, &error.error).into_response();
-    }
-    let policy = match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo_id).await {
-        Ok(policy) => policy,
-        Err(error) => {
-            discard_unreferenced_cache_file("CI cache archive", &path, repo_id, job_id, key).await;
-            return AppError::from(error).into_response();
-        }
-    };
-    if let Err(error) = rg_db::ops::ci_retention_ops::upsert_cache_entry(
+    if let Err(error) = rg_core::ci_cache::publish_from_spool(
         &state.db,
+        &state.repo_root,
         repo_id,
         &key_hash,
-        path.to_string_lossy().as_ref(),
+        spool,
         size,
-        Some(&sha256),
-        policy.cache_retention_days,
+        &sha256,
     )
     .await
     {
-        discard_unreferenced_cache_file("CI cache archive", &path, repo_id, job_id, key).await;
         return AppError::from(error).into_response();
     }
-    // The row names this request's archive now, and that — not the write that
-    // returned `Ok` earlier — is what makes the archive it named before ours to
-    // retire. Only a request that got this far may touch it; a failure above
-    // leaves it exactly where the previous upload put it, still restorable.
-    //
-    // Two uploads of one key racing here can leave the loser's archive behind
-    // with no row naming it: waste that retention (which walks rows) will not
-    // reclaim, and the deliberate side of the trade — the ordering that avoids
-    // it is the one that risks deleting a cache somebody is still restoring.
-    if let Some(previous) = replaced
-        .as_deref()
-        .and_then(|recorded| recorded_cache_archive(&directory, recorded))
-    {
-        if previous != path {
-            discard_replaced_cache_file(&previous, repo_id, job_id, key).await;
-        }
-    }
     StatusCode::NO_CONTENT.into_response()
-}
-
-/// Retire the archive a previous publication left behind, once this request's
-/// own archive is the one the row names.
-///
-/// Best-effort for the same reason as the rollback below: the upload succeeded,
-/// so a failure here cannot be reported to the runner without lying about the
-/// cache it just stored. What stays behind is waste, not loss.
-async fn discard_replaced_cache_file(path: &std::path::Path, repo_id: i64, job_id: i64, key: &str) {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => tracing::warn!(
-            repo_id,
-            job_id,
-            cache_key = %key,
-            path = %path.display(),
-            error = %error,
-            "superseded CI cache archive not deleted — the file stays on disk after the entry moved to the newly uploaded archive"
-        ),
-    }
-}
-
-/// Roll back a cache file that is on disk with no DB row pointing at it.
-///
-/// The caller still has to report the original failure to the runner, so a
-/// failed rollback can only be logged: if the file survives, nothing references
-/// it and retention (which walks DB rows) will never come back for it. An
-/// already-absent file is the normal outcome of a write that failed before
-/// creating anything, and is not worth a warning.
-async fn discard_unreferenced_cache_file(
-    what: &str,
-    path: &std::path::Path,
-    repo_id: i64,
-    job_id: i64,
-    key: &str,
-) {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => {}
-        Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(cleanup_error) => tracing::warn!(
-            repo_id,
-            job_id,
-            cache_key = %key,
-            path = %path.display(),
-            error = %cleanup_error,
-            "orphaned {what}: the cache entry was not recorded and the rollback delete failed too — the file stays on disk with no row pointing at it"
-        ),
-    }
 }
 
 /// The job named by `{job_id}`, provided it is the one this runner was given.
@@ -2120,7 +2018,7 @@ mod cache_upload_staging_tests {
             .split_once("pub async fn upload_cache(")
             .expect("cache upload handler")
             .1
-            .split_once("/// Retire the archive a previous publication left behind")
+            .split_once("/// The job named by `{job_id}`")
             .expect("handler end marker")
             .0;
 

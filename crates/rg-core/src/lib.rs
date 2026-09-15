@@ -38,6 +38,7 @@ pub mod wiki;
 // ── Delivery & CI ───────────────────────────────────
 pub mod artifact;
 pub mod ci;
+pub mod ci_cache;
 pub mod import;
 pub mod mirror;
 pub mod package_registry;

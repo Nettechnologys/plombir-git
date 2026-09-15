@@ -155,6 +155,8 @@ pub enum StagedBytes {
     AttachmentCreation { blob_key: String },
     /// A final CI artifact blob published before its metadata row was inserted.
     ArtifactCreation { blob_key: String },
+    /// A final CI cache archive published before its metadata row was upserted.
+    CacheCreation { path: String, repo_id: i64 },
 }
 
 impl StagedBytes {
@@ -220,6 +222,17 @@ impl StagedBytes {
             blob_key: blob_key.to_string(),
         }
     }
+
+    fn cache_creation(path: &Path, repo_id: i64) -> anyhow::Result<Self> {
+        let path = path.to_str().map(str::to_owned).ok_or_else(|| {
+            anyhow::anyhow!(
+                "CI cache archive path {} cannot be recorded in a recovery journal entry because \
+                 it is not valid UTF-8",
+                path.display()
+            )
+        })?;
+        Ok(Self::CacheCreation { path, repo_id })
+    }
 }
 
 /// What the commit marker of one journal entry authorizes.
@@ -246,6 +259,8 @@ pub(crate) enum Disposition {
     AttachmentCreation,
     /// A CI artifact upload: keep the final blob iff its database row exists.
     ArtifactCreation,
+    /// A CI cache upload: keep the final archive iff its database row names it.
+    CacheCreation,
 }
 
 /// What one deletion declared it was about to move, before it moved it.
@@ -369,6 +384,28 @@ pub async fn open_artifact_creation(
         "CI artifact publication",
         vec![StagedBytes::artifact_creation(blob_key)],
         Disposition::ArtifactCreation,
+    )
+    .await
+}
+
+/// Declare a final CI cache archive immediately before publishing it.
+///
+/// Cache rows are mutable: the ownership proof is the exact `(repo_id,
+/// file_path)` pair, not merely the cache key whose row a later publication may
+/// already have replaced. Recovery may remove this request-private path only
+/// after that exact lookup succeeds and says no.
+pub async fn open_cache_creation(
+    storage: &dyn BlobStorage,
+    publication_id: &str,
+    repo_id: i64,
+    path: &Path,
+) -> anyhow::Result<()> {
+    declare(
+        storage,
+        publication_id,
+        "CI cache publication",
+        vec![StagedBytes::cache_creation(path, repo_id)?],
+        Disposition::CacheCreation,
     )
     .await
 }
@@ -605,6 +642,7 @@ async fn recover_interrupted_deletions(
             Disposition::RepositoryCreation
                 | Disposition::AttachmentCreation
                 | Disposition::ArtifactCreation
+                | Disposition::CacheCreation
         ) {
             let Some(db) = db else {
                 tracing::warn!(
@@ -620,6 +658,7 @@ async fn recover_interrupted_deletions(
                 Disposition::RepositoryCreation => repository_creation_exists(db, &entry).await,
                 Disposition::AttachmentCreation => attachment_creation_exists(db, &entry).await,
                 Disposition::ArtifactCreation => artifact_creation_exists(db, &entry).await,
+                Disposition::CacheCreation => cache_creation_exists(db, &entry).await,
                 Disposition::Destroy | Disposition::Keep => unreachable!("matched above"),
             };
             let outcome = match owner_exists {
@@ -630,7 +669,7 @@ async fn recover_interrupted_deletions(
                     )
                 }
                 Ok(false) => Outcome::DiscardedPublication(
-                    discard_uncommitted_blob_creation(storage, &entry).await,
+                    discard_uncommitted_publication(storage, &entry).await,
                 ),
                 Err(error) => {
                     tracing::warn!(
@@ -705,7 +744,8 @@ async fn recover_interrupted_deletions(
                 _,
                 Disposition::RepositoryCreation
                 | Disposition::AttachmentCreation
-                | Disposition::ArtifactCreation,
+                | Disposition::ArtifactCreation
+                | Disposition::CacheCreation,
             ) => {
                 unreachable!("handled above")
             }
@@ -783,6 +823,16 @@ async fn artifact_creation_exists(
     rg_db::ops::artifact_ops::exists_by_file_path(db, blob_key).await
 }
 
+async fn cache_creation_exists(
+    db: &rg_db::DatabaseConnection,
+    entry: &DeletionJournalEntry,
+) -> anyhow::Result<bool> {
+    let [StagedBytes::CacheCreation { path, repo_id }] = entry.staged.as_slice() else {
+        anyhow::bail!("CI cache creation journal entry has an invalid payload");
+    };
+    rg_db::ops::ci_retention_ops::exists_by_file_path(db, *repo_id, path).await
+}
+
 async fn discard_uncommitted_repository_creation(entry: &DeletionJournalEntry) -> bool {
     let [StagedBytes::RepositoryCreation { path, .. }] = entry.staged.as_slice() else {
         return false;
@@ -834,10 +884,36 @@ async fn discard_uncommitted_repository_creation(entry: &DeletionJournalEntry) -
     }
 }
 
-async fn discard_uncommitted_blob_creation(
+async fn discard_uncommitted_publication(
     storage: &dyn BlobStorage,
     entry: &DeletionJournalEntry,
 ) -> bool {
+    if let [StagedBytes::CacheCreation { path, .. }] = entry.staged.as_slice() {
+        return match tokio::fs::remove_file(path).await {
+            Ok(()) => {
+                tracing::info!(
+                    deletion_id = entry.deletion_id,
+                    what = entry.what,
+                    path,
+                    "discarded a cache archive whose interrupted publication never committed"
+                );
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => {
+                tracing::warn!(
+                    deletion_id = entry.deletion_id,
+                    what = entry.what,
+                    path,
+                    %error,
+                    "failed to discard a cache archive whose interrupted publication never \
+                     committed"
+                );
+                false
+            }
+        };
+    }
+
     let blob_key = match entry.staged.as_slice() {
         [StagedBytes::AttachmentCreation { blob_key }]
         | [StagedBytes::ArtifactCreation { blob_key }] => blob_key,
@@ -954,7 +1030,9 @@ async fn restore(storage: &dyn BlobStorage, entry: &DeletionJournalEntry) -> boo
                 );
                 finished = false;
             }
-            StagedBytes::AttachmentCreation { .. } | StagedBytes::ArtifactCreation { .. } => {
+            StagedBytes::AttachmentCreation { .. }
+            | StagedBytes::ArtifactCreation { .. }
+            | StagedBytes::CacheCreation { .. } => {
                 tracing::warn!(
                     deletion_id = entry.deletion_id,
                     what = entry.what,
@@ -1110,7 +1188,9 @@ async fn destroy(storage: &dyn BlobStorage, entry: &DeletionJournalEntry) -> boo
                 );
                 finished = false;
             }
-            StagedBytes::AttachmentCreation { .. } | StagedBytes::ArtifactCreation { .. } => {
+            StagedBytes::AttachmentCreation { .. }
+            | StagedBytes::ArtifactCreation { .. }
+            | StagedBytes::CacheCreation { .. } => {
                 tracing::warn!(
                     deletion_id = entry.deletion_id,
                     what = entry.what,
@@ -1961,6 +2041,121 @@ mod tests {
             assert!(
                 storage.exists(&key).await.unwrap(),
                 "a live artifact row must protect {key} regardless of marker state"
+            );
+        }
+    }
+
+    /// The cache variant of the post-write/pre-upsert crash: the final archive
+    /// is not a spool any more, and row-driven retention cannot discover it.
+    #[tokio::test]
+    async fn an_interrupted_cache_publication_without_a_row_discards_its_archive() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = storage(root.path());
+        let (db, _) = repository_db().await;
+        let archive = root
+            .path()
+            .join("_ci_cache/7/aaaaaaaa.11111111111111111111111111111111.tar");
+        open_aged_with(
+            &storage,
+            "11111111111111111111111111111111",
+            "CI cache publication",
+            vec![StagedBytes::cache_creation(&archive, 7).unwrap()],
+            AN_HOUR_AND_A_HALF,
+            Disposition::CacheCreation,
+        )
+        .await;
+        write_file(&archive, "unowned cache archive");
+
+        let report = recover_interrupted_storage_at(&db, root.path(), Duration::ZERO).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                discarded_publications: 1,
+                ..RecoveryReport::default()
+            }
+        );
+        assert!(
+            !archive.exists(),
+            "a final cache archive with no owning row must not survive forever"
+        );
+    }
+
+    /// The exact `(repo_id, file_path)` lookup is the destructive-action guard,
+    /// not the optional marker. Removing or inverting it deletes both archives.
+    #[tokio::test]
+    async fn live_cache_rows_protect_archives_with_or_without_a_commit_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = storage(root.path());
+        let (db, owner_id) = repository_db().await;
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(owner_id),
+                name: Set("cache-recovery".to_string()),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut archives = Vec::new();
+
+        for (suffix, committed) in [("22222222", false), ("33333333", true)] {
+            let key_hash = suffix.repeat(8);
+            let publication_id = suffix.repeat(4);
+            let archive = root
+                .path()
+                .join("_ci_cache")
+                .join(repo.id.to_string())
+                .join(format!("{key_hash}.{publication_id}.tar"));
+            open_aged_with(
+                &storage,
+                &publication_id,
+                "CI cache publication",
+                vec![StagedBytes::cache_creation(&archive, repo.id).unwrap()],
+                AN_HOUR_AND_A_HALF,
+                Disposition::CacheCreation,
+            )
+            .await;
+            write_file(&archive, "live cache archive");
+            rg_db::ops::ci_retention_ops::upsert_cache_entry(
+                &db,
+                repo.id,
+                &key_hash,
+                archive.to_string_lossy().as_ref(),
+                18,
+                None,
+                7,
+            )
+            .await
+            .unwrap();
+            if committed {
+                mark_committed(&storage, &publication_id).await.unwrap();
+            }
+            archives.push(archive);
+        }
+
+        let report = recover_interrupted_storage_at(&db, root.path(), Duration::ZERO).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                kept: 2,
+                ..RecoveryReport::default()
+            }
+        );
+        for archive in archives {
+            assert!(
+                archive.is_file(),
+                "a live cache row must protect {} regardless of marker state",
+                archive.display()
             );
         }
     }
