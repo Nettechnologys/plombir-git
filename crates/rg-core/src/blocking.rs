@@ -226,6 +226,18 @@ mod tests {
                     "push_branch_with_lease",
                 ],
             ),
+            (
+                repositories,
+                "fork_repo",
+                1,
+                &[
+                    "UncommittedRepositoryStorage::new",
+                    "create_dir_all",
+                    "path_to_git_url",
+                    "path_for_new_entry",
+                    "run",
+                ],
+            ),
             (merge_queue, "cleanup_merge_group_ref", 2, &["run"]),
             (
                 merge_queue,
@@ -269,6 +281,31 @@ mod tests {
                 );
             }
         }
+
+        let fork_journal = rust_source::production_function_call_sites(
+            repositories,
+            "fork_repo",
+            &["open_repository_creation"],
+        );
+        let fork_boundary = rust_source::production_function_call_sites(
+            repositories,
+            "fork_repo",
+            &["run_blocking_git"],
+        );
+        assert_eq!(
+            fork_journal.len(),
+            1,
+            "fork_repo must open exactly one recovery entry before it can clone"
+        );
+        assert_eq!(
+            fork_boundary.len(),
+            1,
+            "fork_repo must own exactly one blocking clone boundary"
+        );
+        assert!(
+            fork_journal[0].open_paren < fork_boundary[0].open_paren,
+            "fork_repo must journal the target before blocking clone work can claim it"
+        );
 
         let contents_api = include_str!("../../rg-http/src/api/repo_content.rs");
         for blocking_read in ["previous_branch_sha", "latest_commit_sha_or_log"] {

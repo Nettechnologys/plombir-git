@@ -718,6 +718,63 @@ impl Drop for UncommittedRepositoryStorage {
     }
 }
 
+#[cfg(test)]
+mod uncommitted_repository_storage_tests {
+    use super::UncommittedRepositoryStorage;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    /// A cancelled fork waiter does not cancel `spawn_blocking`. The directory
+    /// guard therefore has to stay inside the blocking work until its result is
+    /// received; otherwise a successful clone can outlive the request without
+    /// a repository row pointing at it.
+    #[tokio::test]
+    async fn cancelling_a_fork_clone_keeps_storage_cleanup_attached_to_blocking_work() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let target = directory.path().join("fork-owner/repository.git");
+
+        let release = Arc::new(Barrier::new(2));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let operation_release = Arc::clone(&release);
+        let target_for_clone = target.clone();
+        let operation = tokio::spawn(async move {
+            crate::blocking::run_blocking_git("test repository fork", move || {
+                std::fs::create_dir_all(&target_for_clone).expect("fork clone fixture");
+                let pending = UncommittedRepositoryStorage::new(
+                    target_for_clone,
+                    "the cancelled fork would reserve its repository name forever".to_string(),
+                );
+                entered_tx
+                    .send(())
+                    .expect("test still awaits the fork clone start");
+                operation_release.wait();
+                Ok(pending)
+            })
+            .await
+        });
+
+        entered_rx.await.expect("fork clone starts");
+        operation.abort();
+        let join_error = match operation.await {
+            Ok(_) => panic!("the fork waiter completed after it was aborted"),
+            Err(error) => error,
+        };
+        assert!(
+            join_error.is_cancelled(),
+            "the request must be cancelled while blocking work owns the fork directory"
+        );
+        release.wait();
+
+        for _ in 0..100 {
+            if !target.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("cancelled fork leaked storage at {}", target.display());
+    }
+}
+
 /// Create the source row, then expose the historical post-commit FTS window to
 /// a deterministic regression test. Production has no index write in that
 /// window: source-table triggers are the sole owner of `repos_fts`.
@@ -2687,32 +2744,6 @@ pub async fn fork_repo(
 
     let source_path = repo_root.join(format!("{source_owner}/{repo_name}.git"));
     let target_path = repo_root.join(format!("{destination_namespace}/{repo_name}.git"));
-    std::fs::create_dir_all(
-        target_path
-            .parent()
-            .context("target path has no parent directory")?,
-    )
-    .with_context(|| format!("failed to create directory: {:?}", target_path.parent()))?;
-
-    // TODO(gix): Local bare clone - gix doesn't support local bare clone via prepare_clone_bare
-    // For now, use git CLI for local fork operations
-    let git = rg_git::cli_gateway::global_gateway()
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    // The source is a clone *source*, so it goes through the URL form to avoid
-    // Windows path issues. The target is a clone *destination*, which git reads
-    // as a plain filesystem path and never as a URL: handed `file:///…` it
-    // creates a literal `file:` directory under its own working directory
-    // instead of the repository root. Canonicalizing it is impossible in any
-    // case — the clone is what brings it into existence — so resolve the parent
-    // `create_dir_all` just made and re-append the name.
-    let source_url =
-        path_to_git_url(&source_path).context("failed to convert source path to git URL")?;
-    let target_dir =
-        path_for_new_entry(&target_path).context("failed to resolve fork target directory")?;
-    let target_arg = target_dir.to_string_lossy();
-
     let creation_id = uuid::Uuid::new_v4().simple().to_string();
     let creation_journal = crate::deletion_recovery::journal_at(repo_root);
     crate::deletion_recovery::open_repository_creation(
@@ -2726,24 +2757,75 @@ pub async fn fork_repo(
     )
     .await?;
 
-    let out = match git
-        .run(&["clone", "--bare", &source_url, &target_arg], None)
-        .context("git clone --bare failed")
-    {
-        Ok(out) => out,
-        Err(error) => {
-            if discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name)) {
+    let source_path_for_clone = source_path.clone();
+    let target_path_for_clone = target_path.clone();
+    let repo_name_for_clone = repo_name.to_string();
+    let cloned = crate::blocking::run_blocking_git("cloning repository fork", move || {
+        let pending = UncommittedRepositoryStorage::new(
+            target_path_for_clone.clone(),
+            recreate_blocked_by(&repo_name_for_clone),
+        );
+        let clone_result = (|| -> Result<()> {
+            std::fs::create_dir_all(
+                target_path_for_clone
+                    .parent()
+                    .context("target path has no parent directory")?,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to create directory: {:?}",
+                    target_path_for_clone.parent()
+                )
+            })?;
+
+            // TODO(gix): Local bare clone - gix doesn't support local bare clone via
+            // prepare_clone_bare. For now, use git CLI for local fork operations.
+            let git = rg_git::cli_gateway::global_gateway()
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+            // The source is a clone *source*, so it goes through the URL form to
+            // avoid Windows path issues. The target is a clone *destination*, which
+            // git reads as a plain filesystem path and never as a URL: handed
+            // `file:///…` it creates a literal `file:` directory under its own
+            // working directory instead of the repository root. Canonicalizing it
+            // is impossible in any case — the clone is what brings it into
+            // existence — so resolve the parent `create_dir_all` just made and
+            // re-append the name.
+            let source_url = path_to_git_url(&source_path_for_clone)
+                .context("failed to convert source path to git URL")?;
+            let target_dir = path_for_new_entry(&target_path_for_clone)
+                .context("failed to resolve fork target directory")?;
+            let target_arg = target_dir.to_string_lossy();
+
+            git.run(&["clone", "--bare", &source_url, &target_arg], None)
+                .context("git clone --bare failed")?
+                .ensure_success()?;
+            Ok(())
+        })();
+
+        match clone_result {
+            Ok(()) => Ok(Ok(pending)),
+            Err(error) => {
+                let discarded = pending.discard();
+                Ok(Err((error, discarded)))
+            }
+        }
+    })
+    .await?;
+    let mut cloned = match cloned {
+        Ok(cloned) => cloned,
+        Err((error, storage_released)) => {
+            if storage_released {
                 crate::deletion_recovery::close(&creation_journal, &creation_id).await;
             }
             return Err(error);
         }
     };
-    if let Err(error) = out.ensure_success() {
-        if discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name)) {
-            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
-        }
-        return Err(error);
-    }
+    // The journal and the existing DB rollback own the clone from here. Disarm
+    // before the first DB await so cancellation keeps the same recovery
+    // semantics as repository creation.
+    cloned.disarm();
 
     let now = Utc::now();
     let model = RepoActiveModel {
@@ -2776,7 +2858,9 @@ pub async fn fork_repo(
     let forked = match repo_ops::create(db, model).await {
         Ok(forked) => forked,
         Err(error) => {
-            if discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name)) {
+            if discard_unreferenced_repo_dir_blocking(&target_path, &recreate_blocked_by(repo_name))
+                .await
+            {
                 crate::deletion_recovery::close(&creation_journal, &creation_id).await;
             }
             return Err(if rg_db::is_unique_violation_anyhow(&error) {
@@ -2825,7 +2909,9 @@ pub async fn fork_repo(
             );
             return Err(rollback_error);
         }
-        if discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name)) {
+        if discard_unreferenced_repo_dir_blocking(&target_path, &recreate_blocked_by(repo_name))
+            .await
+        {
             crate::deletion_recovery::close(&creation_journal, &creation_id).await;
         }
         return Err(error);
