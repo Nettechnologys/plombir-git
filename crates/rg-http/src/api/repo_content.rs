@@ -1687,9 +1687,6 @@ pub async fn delete_file(
 
     let branch = params.branch.unwrap_or(repo_model.default_branch.clone());
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
-    // Same as `create_or_update_file`: the ref's old value has to be read
-    // before the commit that replaces it.
-    let old_sha = previous_branch_sha(&repo_path, &branch);
 
     // Call business logic
     match rg_core::repo::service::delete_file(
@@ -1708,9 +1705,11 @@ pub async fn delete_file(
     )
     .await
     {
-        Ok(_) => {
-            // Get the new commit SHA
-            let new_sha = latest_commit_sha_or_log(&repo_path, &branch);
+        Ok(outcome) => {
+            let old_sha = outcome
+                .previous_head_sha
+                .unwrap_or_else(|| ZERO_SHA.to_string());
+            let new_sha = outcome.commit_sha;
 
             spawn_post_push_hooks_for_edit(
                 &state, repo_path, &owner, &repo, &branch, &old_sha, &new_sha, user.id,
@@ -1734,28 +1733,6 @@ pub async fn delete_file(
 
 /// The all-zero object id git uses on the wire for "this ref had no value".
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
-
-/// The branch's SHA *before* an edit, in the form a push reports it: the
-/// all-zero id when the branch does not exist yet.
-///
-/// An unresolvable branch is the normal case for an editor that creates one, so
-/// this is not an error path — but it is not silent either, since the same
-/// failure also covers an unreadable repository, and the hooks downstream would
-/// then mistake an existing branch for a newly created one.
-fn previous_branch_sha(repo_path: &std::path::Path, branch: &str) -> String {
-    match get_latest_commit_sha(repo_path, branch) {
-        Ok(sha) => sha,
-        Err(e) => {
-            tracing::debug!(
-                repo = %repo_path.display(),
-                branch = %branch,
-                error = %format!("{e:#}"),
-                "no pre-edit SHA for branch — treating the edit as a branch creation"
-            );
-            ZERO_SHA.to_string()
-        }
-    }
-}
 
 /// Hand a web-editor commit to the same post-push automation a `git push` gets.
 ///
@@ -1805,38 +1782,6 @@ fn spawn_post_push_hooks_for_edit(
             message: String::new(),
         }],
     );
-}
-
-/// Best-effort read-back of the commit SHA for the write endpoints. The commit
-/// has already landed, so a failure here must not fail the request — but it
-/// must not be silent either: `.unwrap_or_default()` used to hand the client an
-/// empty `commit_sha` with nothing in the log (card_6f2a9ab1e623).
-fn latest_commit_sha_or_log(repo_path: &std::path::Path, branch: &str) -> String {
-    match get_latest_commit_sha(repo_path, branch) {
-        Ok(sha) => sha,
-        Err(e) => {
-            tracing::warn!(
-                repo = %repo_path.display(),
-                branch = %branch,
-                error = %format!("{e:#}"),
-                "commit landed but reading back its SHA failed — responding with an empty commit_sha"
-            );
-            String::new()
-        }
-    }
-}
-
-/// Get the latest commit SHA on a branch.
-fn get_latest_commit_sha(repo_path: &std::path::Path, branch: &str) -> anyhow::Result<String> {
-    let repo = rg_git::repository::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
-
-    let reference = format!("refs/heads/{}", branch);
-    let oid = repo
-        .rev_parse_single(reference.as_str())
-        .map_err(|e| anyhow::anyhow!("failed to resolve branch '{}': {}", branch, e))?;
-
-    Ok(oid.to_string())
 }
 
 #[cfg(test)]

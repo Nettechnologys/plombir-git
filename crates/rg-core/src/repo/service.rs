@@ -3953,53 +3953,58 @@ pub async fn delete_file(
     author_name: &str,
     author_email: &str,
     repo_root: &std::path::Path,
-) -> Result<()> {
+) -> Result<FileEditOutcome> {
     validate_repo_file_path(file_path)?;
     validate_edit_branch(branch)?;
     let push_policy = ServerSideCommitPolicy::load(db, repo_id, branch, actor_id).await?;
-
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
+    let repo_name = repo_name.to_string();
+    let file_path = file_path.to_string();
+    let message = message.to_string();
+    let branch = branch.to_string();
+    let expected_sha = sha.to_string();
+    let author_name = author_name.to_string();
+    let author_email = author_email.to_string();
 
-    // See `create_or_update_file`: a missing bare tree is ours, so it stays 5xx.
-    if !repo_path.exists() {
-        bail!("repository path not found: {:?}", repo_path);
-    }
-    let previous_head_sha = try_get_branch_sha(&repo_path, branch)?;
-
-    // Verify the file SHA to prevent accidental deletes
-    match read_path_entry(&repo_path, branch, file_path)? {
-        None => return Err(crate::error::not_found("file")),
-        // Removing a submodule also rewrites `.gitmodules`, and removing a
-        // directory is a recursive delete the caller never asked for: both are
-        // outside what a single-file endpoint may do, so neither is attempted.
-        Some(PathEntry::NotAFile(what)) => return Err(not_a_file(what)),
-        Some(PathEntry::File(current)) if current != sha => {
-            return Err(crate::error::conflict(format!(
-                "file SHA mismatch: expected {sha}, got {current}"
-            )));
+    crate::blocking::run_blocking_git("deleting a repository file", move || {
+        // See `create_or_update_file`: a missing bare tree is ours, so it stays 5xx.
+        if !repo_path.exists() {
+            bail!("repository path not found: {:?}", repo_path);
         }
-        Some(PathEntry::File(_)) => {}
-    }
+        let previous_head_sha = try_get_branch_sha(&repo_path, &branch)?;
 
-    // Create temp working directory
-    let tmp = stage_worktree_beside(
-        "file-delete working tree",
-        &repo_path,
-        crate::staging::WorktreePurpose::FileDelete,
-    )?;
+        // Verify the file SHA to prevent accidental deletes.
+        match read_path_entry(&repo_path, &branch, &file_path)? {
+            None => return Err(crate::error::not_found("file")),
+            // Removing a submodule also rewrites `.gitmodules`, and removing a
+            // directory is a recursive delete the caller never asked for: both are
+            // outside what a single-file endpoint may do, so neither is attempted.
+            Some(PathEntry::NotAFile(what)) => return Err(not_a_file(what)),
+            Some(PathEntry::File(current)) if current != expected_sha => {
+                return Err(crate::error::conflict(format!(
+                    "file SHA mismatch: expected {expected_sha}, got {current}"
+                )));
+            }
+            Some(PathEntry::File(_)) => {}
+        }
 
-    // One cleanup point behind the body — see `auto_init_repo`.
-    let result = (|| -> Result<()> {
+        let tmp = StagedWorktree::new(
+            "file-delete working tree",
+            &repo_path,
+            crate::staging::WorktreePurpose::FileDelete,
+        )?;
+        let tmp_path = tmp.path();
+
         // Clone the repo
         let clone_url =
             path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
-        let tmp_str = tmp.to_string_lossy();
+        let tmp_str = tmp_path.to_string_lossy();
         let gateway = rg_git::cli_gateway::global_gateway()
             .as_ref()
             .map_err(|e| anyhow::anyhow!("git CLI not available: {e}"))?;
 
         let output = gateway
-            .run(&["clone", "-b", branch, &clone_url, &tmp_str], None)
+            .run(&["clone", "-b", &branch, &clone_url, &tmp_str], None)
             .context("git clone failed")?;
         if !output.success() {
             bail!("git clone failed: {}", output.stderr_str());
@@ -4010,33 +4015,30 @@ pub async fn delete_file(
         // a leading `-` through, and without the separator git reads
         // `--cached`/`-r`/… as an option instead of a pathspec.
         let output = gateway
-            .run(&["rm", "--", file_path], Some(&tmp))
+            .run(&["rm", "--", &file_path], Some(tmp_path))
             .context("git rm failed")?;
         if !output.success() {
             bail!("git rm failed: {}", output.stderr_str());
         }
 
         // Git commit
-        let identity = git_identity_env(author_name, author_email);
+        let identity = git_identity_env(&author_name, &author_email);
         let output = gateway
-            .run_with_env(&["commit", "-m", message], Some(&tmp), &identity)
+            .run_with_env(&["commit", "-m", &message], Some(tmp_path), &identity)
             .context("git commit failed")?;
         if !output.success() {
             bail!("git commit failed: {}", output.stderr_str());
         }
-        let commit_sha = gateway.run(&["rev-parse", "HEAD"], Some(&tmp))?;
+        let commit_sha = gateway.run(&["rev-parse", "HEAD"], Some(tmp_path))?;
         commit_sha.ensure_success()?;
-        push_policy.verify_created_commit(
-            &tmp,
-            previous_head_sha.as_deref(),
-            commit_sha.stdout_str().trim(),
-        )?;
+        let commit_sha = commit_sha.stdout_str().trim().to_string();
+        push_policy.verify_created_commit(tmp_path, previous_head_sha.as_deref(), &commit_sha)?;
 
         push_branch_with_lease(
             gateway,
-            &tmp,
+            tmp_path,
             &repo_path,
-            branch,
+            &branch,
             previous_head_sha.as_deref(),
         )?;
 
@@ -4047,10 +4049,12 @@ pub async fn delete_file(
             "file deleted successfully"
         );
 
-        Ok(())
-    })();
-    discard_dir("file-delete working tree", &tmp);
-    result
+        Ok(FileEditOutcome {
+            previous_head_sha,
+            commit_sha,
+        })
+    })
+    .await
 }
 
 /// Reject a repository-relative file path before it is joined onto a working
@@ -4204,53 +4208,64 @@ mod file_edit_ref_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelling_a_file_edit_keeps_worktree_cleanup_attached_to_blocking_work() {
+    async fn cancelling_contents_file_edits_keeps_worktree_cleanup_attached_to_blocking_work() {
         use std::time::Duration;
 
         let directory = tempfile::tempdir().expect("tempdir");
         let bare_repo = directory.path().join("owner/repo.git");
         std::fs::create_dir_all(&bare_repo).expect("bare repository fixture");
 
-        let release = Arc::new(Barrier::new(2));
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let operation_release = Arc::clone(&release);
-        let operation = tokio::spawn(async move {
-            crate::blocking::run_blocking_git("test file edit", move || {
-                let worktree = StagedWorktree::new(
-                    "file-edit working tree",
-                    &bare_repo,
-                    crate::staging::WorktreePurpose::FileEdit,
-                )?;
-                entered_tx
-                    .send(worktree.path().to_path_buf())
-                    .expect("test still awaits the worktree path");
-                operation_release.wait();
-                Ok(())
-            })
-            .await
-        });
-
-        let worktree = entered_rx.await.expect("blocking file edit starts");
-        operation.abort();
-        assert!(
-            operation
+        for (operation_name, worktree_name, purpose) in [
+            (
+                "test file edit",
+                "file-edit working tree",
+                crate::staging::WorktreePurpose::FileEdit,
+            ),
+            (
+                "test file delete",
+                "file-delete working tree",
+                crate::staging::WorktreePurpose::FileDelete,
+            ),
+        ] {
+            let release = Arc::new(Barrier::new(2));
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let operation_release = Arc::clone(&release);
+            let operation_repo = bare_repo.clone();
+            let operation = tokio::spawn(async move {
+                crate::blocking::run_blocking_git(operation_name, move || {
+                    let worktree = StagedWorktree::new(worktree_name, &operation_repo, purpose)?;
+                    entered_tx
+                        .send(worktree.path().to_path_buf())
+                        .expect("test still awaits the worktree path");
+                    operation_release.wait();
+                    Ok(())
+                })
                 .await
-                .expect_err("the file-edit waiter was aborted")
-                .is_cancelled(),
-            "the request must be cancelled while blocking work owns the worktree"
-        );
-        release.wait();
+            });
 
-        for _ in 0..100 {
-            if !worktree.exists() {
-                return;
+            let worktree = entered_rx.await.expect("blocking file edit starts");
+            operation.abort();
+            assert!(
+                operation
+                    .await
+                    .expect_err("the file-edit waiter was aborted")
+                    .is_cancelled(),
+                "the request must be cancelled while blocking work owns the worktree"
+            );
+            release.wait();
+
+            for _ in 0..100 {
+                if !worktree.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(
+                !worktree.exists(),
+                "cancelled {operation_name} leaked its worktree at {}",
+                worktree.display()
+            );
         }
-        panic!(
-            "cancelled file edit leaked its worktree at {}",
-            worktree.display()
-        );
     }
 
     #[test]

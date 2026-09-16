@@ -228,6 +228,21 @@ mod tests {
             ),
             (
                 repositories,
+                "delete_file",
+                1,
+                &[
+                    "exists",
+                    "try_get_branch_sha",
+                    "read_path_entry",
+                    "StagedWorktree::new",
+                    "run",
+                    "run_with_env",
+                    "verify_created_commit",
+                    "push_branch_with_lease",
+                ],
+            ),
+            (
+                repositories,
                 "fork_repo",
                 1,
                 &[
@@ -308,16 +323,18 @@ mod tests {
         );
 
         let contents_api = include_str!("../../rg-http/src/api/repo_content.rs");
-        for blocking_read in ["previous_branch_sha", "latest_commit_sha_or_log"] {
-            let calls = rust_source::production_function_call_sites(
-                contents_api,
-                "create_or_update_file",
-                &[blocking_read],
-            );
-            assert!(
-                calls.is_empty(),
-                "the Contents create/update handler must receive ref SHAs from its blocking service outcome, found `{blocking_read}` at {calls:?}"
-            );
+        for handler in ["create_or_update_file", "delete_file"] {
+            for blocking_read in ["previous_branch_sha", "latest_commit_sha_or_log"] {
+                let calls = rust_source::production_function_call_sites(
+                    contents_api,
+                    handler,
+                    &[blocking_read],
+                );
+                assert!(
+                    calls.is_empty(),
+                    "the Contents {handler} handler must receive ref SHAs from its blocking service outcome, found `{blocking_read}` at {calls:?}"
+                );
+            }
         }
     }
 }
