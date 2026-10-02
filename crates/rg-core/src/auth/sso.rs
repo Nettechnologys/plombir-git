@@ -489,17 +489,41 @@ pub async fn oauth2_fetch_user_info(
     config: &SsoProviderConfig,
     access_token: &str,
 ) -> Result<SsoIdentity> {
-    let info = match config.slug.as_str() {
-        "github" => fetch_github_user(access_token).await,
-        "gitlab" => fetch_gitlab_user(access_token).await,
-        "google" => fetch_google_user(access_token).await,
-        _ => {
-            // For unknown OIDC providers, try the standard userinfo endpoint
-            if config.provider_type == "oidc" {
-                fetch_oidc_userinfo(config, access_token).await
-            } else {
-                Err(anyhow::anyhow!("unsupported SSO provider: {}", config.slug))
+    fetch_user_info_with_builtin_urls(config, access_token, &BUILTIN_PROFILE_URLS).await
+}
+
+struct BuiltinProfileUrls<'a> {
+    github_user: &'a str,
+    github_emails: &'a str,
+    gitlab_user: &'a str,
+    google_user: &'a str,
+}
+
+const BUILTIN_PROFILE_URLS: BuiltinProfileUrls<'static> = BuiltinProfileUrls {
+    github_user: "https://api.github.com/user",
+    github_emails: "https://api.github.com/user/emails",
+    gitlab_user: "https://gitlab.com/api/v4/user",
+    google_user: "https://openidconnect.googleapis.com/v1/userinfo",
+};
+
+async fn fetch_user_info_with_builtin_urls(
+    config: &SsoProviderConfig,
+    access_token: &str,
+    builtins: &BuiltinProfileUrls<'_>,
+) -> Result<SsoIdentity> {
+    let info = if config.provider_type == "oidc" {
+        // The issuer and userinfo endpoint come from discovery, regardless of
+        // the local slug. A built-in slug must not send this issuer's token to
+        // the public OAuth2 provider with the same name.
+        fetch_oidc_userinfo(config, access_token).await
+    } else {
+        match config.slug.as_str() {
+            "github" => {
+                fetch_github_user(access_token, builtins.github_user, builtins.github_emails).await
             }
+            "gitlab" => fetch_gitlab_user(access_token, builtins.gitlab_user).await,
+            "google" => fetch_google_user(access_token, builtins.google_user).await,
+            _ => Err(anyhow::anyhow!("unsupported SSO provider: {}", config.slug)),
         }
     }?;
 
@@ -508,11 +532,15 @@ pub async fn oauth2_fetch_user_info(
 
 // ── GitHub user info ─────────────────────────────────────────────
 
-async fn fetch_github_user(access_token: &str) -> Result<SsoUserInfo> {
+async fn fetch_github_user(
+    access_token: &str,
+    user_endpoint: &str,
+    emails_endpoint: &str,
+) -> Result<SsoUserInfo> {
     let client = crate::net::outbound_client();
 
     let user_resp = client
-        .get("https://api.github.com/user")
+        .get(user_endpoint)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("User-Agent", "ForgeKeep/0.1")
         .header("Accept", "application/vnd.github.v3+json")
@@ -544,10 +572,11 @@ async fn fetch_github_user(access_token: &str) -> Result<SsoUserInfo> {
     // that branch carries the provider's word for it. The profile fallback is a
     // different payload with no `verified` flag on it — claiming one would be
     // inventing a guarantee, so it stays `None`.
-    let (email, email_verified) = match fetch_github_email(client, access_token).await? {
-        Some(email) => (email, Some(true)),
-        None => (user["email"].as_str().unwrap_or("").to_string(), None),
-    };
+    let (email, email_verified) =
+        match fetch_github_email(client, access_token, emails_endpoint).await? {
+            Some(email) => (email, Some(true)),
+            None => (user["email"].as_str().unwrap_or("").to_string(), None),
+        };
 
     Ok(SsoUserInfo {
         provider_user_id,
@@ -580,9 +609,10 @@ async fn fetch_github_user(access_token: &str) -> Result<SsoUserInfo> {
 async fn fetch_github_email(
     client: &reqwest::Client,
     access_token: &str,
+    endpoint: &str,
 ) -> Result<Option<String>> {
     let resp = client
-        .get("https://api.github.com/user/emails")
+        .get(endpoint)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("User-Agent", "ForgeKeep/0.1")
         .header("Accept", "application/vnd.github.v3+json")
@@ -631,10 +661,10 @@ async fn fetch_github_email(
 
 // ── GitLab user info ─────────────────────────────────────────────
 
-async fn fetch_gitlab_user(access_token: &str) -> Result<SsoUserInfo> {
+async fn fetch_gitlab_user(access_token: &str, endpoint: &str) -> Result<SsoUserInfo> {
     let client = crate::net::outbound_client();
     let resp = client
-        .get("https://gitlab.com/api/v4/user")
+        .get(endpoint)
         .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
@@ -666,10 +696,10 @@ async fn fetch_gitlab_user(access_token: &str) -> Result<SsoUserInfo> {
 
 // ── Google OIDC user info ────────────────────────────────────────
 
-async fn fetch_google_user(access_token: &str) -> Result<SsoUserInfo> {
+async fn fetch_google_user(access_token: &str, endpoint: &str) -> Result<SsoUserInfo> {
     let client = crate::net::outbound_client();
     let resp = client
-        .get("https://openidconnect.googleapis.com/v1/userinfo")
+        .get(endpoint)
         .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
@@ -882,7 +912,127 @@ fn default_oidc_token_url(slug: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{oidc_email_verified, OidcTransportPolicy, SsoIdentityDefect, SsoUserInfo};
+    use super::{
+        fetch_user_info_with_builtin_urls, oidc_email_verified, BuiltinProfileUrls,
+        OidcTransportPolicy, SsoIdentityDefect, SsoProviderConfig, SsoUserInfo,
+    };
+
+    #[tokio::test]
+    async fn oidc_builtin_slugs_fetch_profile_from_the_discovered_userinfo_origin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for slug in ["gitlab", "github", "google"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind local IdP");
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let discovery = format!("{origin}/.well-known/openid-configuration");
+            let endpoint = format!("{origin}/userinfo");
+            let allowed_origin = origin.clone();
+            let token = format!("private-{slug}-token");
+            let expected_token = token.clone();
+            let server = tokio::spawn(async move {
+                for (path, body, bearer) in [
+                    (
+                        "/.well-known/openid-configuration",
+                        serde_json::json!({
+                            "authorization_endpoint": format!("{origin}/authorize"),
+                            "token_endpoint": format!("{origin}/token"),
+                            "userinfo_endpoint": endpoint,
+                        })
+                        .to_string(),
+                        false,
+                    ),
+                    (
+                        "/userinfo",
+                        serde_json::json!({
+                            "sub": format!("subject-{slug}"),
+                            "preferred_username": slug,
+                            "email": format!("{slug}@example.test"),
+                            "email_verified": true,
+                        })
+                        .to_string(),
+                        true,
+                    ),
+                ] {
+                    let (mut socket, _) = listener.accept().await.expect("IdP request");
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let n = socket.read(&mut chunk).await.expect("read IdP request");
+                        assert!(n > 0, "request ended before headers");
+                        request.extend_from_slice(&chunk[..n]);
+                    }
+                    let request = String::from_utf8(request).expect("ASCII HTTP request");
+                    assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+                    let header = format!("authorization: Bearer {expected_token}\r\n");
+                    assert_eq!(
+                        request
+                            .to_ascii_lowercase()
+                            .contains(&header.to_ascii_lowercase()),
+                        bearer
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("IdP reply");
+                }
+            });
+
+            // Stand in for every built-in public profile URL. The tested
+            // dispatcher receives these URLs, while OIDC must ignore them.
+            let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind public-provider sink");
+            let public_url = format!("http://{}/user", public_listener.local_addr().unwrap());
+            let (stop_public, stopped_public) = tokio::sync::oneshot::channel();
+            let public_sink = tokio::spawn(async move {
+                tokio::select! {
+                    request = public_listener.accept() => {
+                        request.expect("public-provider request");
+                        1
+                    }
+                    _ = stopped_public => 0,
+                }
+            });
+
+            let config = SsoProviderConfig {
+                slug: slug.to_string(),
+                provider_type: "oidc".to_string(),
+                client_id: "test-client".to_string(),
+                client_secret: "test-secret".to_string(),
+                redirect_url: "http://localhost/callback".to_string(),
+                scopes: vec!["openid".to_string()],
+                discovery_url: Some(discovery),
+                transport_policy: OidcTransportPolicy::parse(&[allowed_origin])
+                    .expect("allow the local IdP origin"),
+            };
+            let identity = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                fetch_user_info_with_builtin_urls(
+                    &config,
+                    &token,
+                    &BuiltinProfileUrls {
+                        github_user: &public_url,
+                        github_emails: &public_url,
+                        gitlab_user: &public_url,
+                        google_user: &public_url,
+                    },
+                ),
+            )
+            .await
+            .expect("profile must come from the local IdP")
+            .expect("valid discovered profile");
+            assert_eq!(identity.provider_user_id, format!("subject-{slug}"));
+            server.await.expect("both IdP requests completed");
+            stop_public.send(()).expect("public sink still listening");
+            assert_eq!(public_sink.await.expect("public sink completed"), 0);
+        }
+    }
 
     #[test]
     fn oidc_plaintext_exceptions_are_exact_http_origins() {
