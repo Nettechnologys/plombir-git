@@ -148,6 +148,12 @@ directory, or take a hot SQLite backup with the commands in the
 | `FORGEKEEP_CSP_CONNECT_SRC` | No | unset |
 | `FORGEKEEP_REGISTRATION` | No (set it before exposing the port) | `open` — `[auth].registration` |
 
+On Linux with glibc, the server limits malloc to two arenas before starting
+worker threads. To override this for a measured high-concurrency deployment,
+set `MALLOC_ARENA_MAX` in the **server process** environment. For Docker, pass
+it through the service's `environment:` block; placing it only in the Compose
+`.env` file does not pass it into the container.
+
 ### Who may create an account
 
 `FORGEKEEP_REGISTRATION=closed` (or `[auth].registration = "closed"`, the env

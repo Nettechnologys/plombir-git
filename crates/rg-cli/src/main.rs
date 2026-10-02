@@ -27,8 +27,21 @@ use clap::Parser;
 
 use cli::{Cli, Commands};
 
+fn main() -> anyhow::Result<()> {
+    // Cap glibc's per-thread arenas before Tokio starts worker threads. The
+    // default can retain large, THP-backed arenas after transient git/API
+    // traffic. An explicit operator setting still takes precedence.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        let applied = unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) };
+        anyhow::ensure!(applied != 0, "failed to cap glibc malloc arenas");
+    }
+
+    run()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     // Parse CLI args first (without initializing logging, to avoid early output)
     let cli = Cli::parse();
     let state_writer = commands::prepare_state_writer(&cli.command)?;

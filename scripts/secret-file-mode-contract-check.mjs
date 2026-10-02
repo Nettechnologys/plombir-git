@@ -394,16 +394,17 @@ if (!oneShotPreparation) {
   }
 }
 
-const cliMain = fnBody(
-  productionRustCode(readFileSync(join(root, CLI_MAIN), 'utf8')),
-  'main',
-);
+const cliMainCode = productionRustCode(readFileSync(join(root, CLI_MAIN), 'utf8'));
+const cliMain = fnBody(cliMainCode, 'main');
+const cliDispatch = fnBody(cliMainCode, 'run');
 if (!cliMain) {
   failures.push(`${CLI_MAIN}: \`main\` is gone — one-shot process ordering cannot be read.`);
+} else if (!cliDispatch || !/\brun\s*\(\s*\)/.test(cliMain)) {
+  failures.push(`${CLI_MAIN}: \`main\` must call the command dispatcher whose state policy is checked.`);
 } else {
-  const preparedMatch = /\bprepare_state_writer\s*\(\s*&cli\.command\s*\)/.exec(cliMain);
+  const preparedMatch = /\bprepare_state_writer\s*\(\s*&cli\.command\s*\)/.exec(cliDispatch);
   const prepared = preparedMatch?.index ?? -1;
-  const dispatched = cliMain.indexOf('match cli.command');
+  const dispatched = cliDispatch.indexOf('match cli.command');
   if (prepared < 0 || dispatched < 0 || prepared > dispatched) {
     failures.push(
       `${CLI_MAIN}: one-shot state policy must be prepared before command dispatch can create state.`,
