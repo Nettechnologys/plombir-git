@@ -13,6 +13,7 @@ setup, crate boundaries, coding conventions, and the common workflows.
 - [Commit conventions](#commit-conventions)
 - [Testing](#testing)
 - [Branching & PRs](#branching--prs)
+- [License and CLA](#license-and-cla)
 
 ---
 
@@ -505,3 +506,16 @@ Before a PR is merged into `main`:
 1. `cargo build --release` passes.
 2. `cargo clippy` reports no errors (and preferably no new warnings).
 3. The relevant `scripts/` regression subset passes.
+
+---
+
+## License and CLA
+
+ForgeKeep is licensed under the
+[GNU Affero General Public License v3.0 or later](LICENSE). The copyright
+holder also offers it under a commercial license (see [NOTICE](NOTICE)).
+
+To keep both options open, every contributor signs the
+[Contributor License Agreement](CLA.md) once, by commenting on their first pull
+request. You keep the copyright in your work. The CLA gives the project the
+right to ship it under both licenses.

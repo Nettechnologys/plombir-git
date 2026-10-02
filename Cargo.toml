@@ -14,12 +14,11 @@ members = [
 resolver = "2"
 
 # Shared package metadata inherited by every crate via `license.workspace = true`.
-# The whole workspace is proprietary (see LICENSE / NOTICE, © Yahook), so the
-# license lives in one place instead of being repeated (or, worse, drifting)
-# per crate. `LicenseRef-Proprietary` is a valid SPDX license-ref for a custom,
-# non-standard license whose full text ships in the LICENSE file.
+# The whole workspace is AGPL-3.0-or-later (see LICENSE / NOTICE, © Yahook), so
+# the license lives in one place instead of being repeated (or, worse,
+# drifting) per crate.
 [workspace.package]
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-or-later"
 # Minimum Supported Rust Version. Floored by the toughest dependencies in the
 # tree — russh 0.60 and rand 0.10 both declare `rust-version = "1.85"`. Bump only
 # deliberately (a bump is a breaking change for downstream builders). Every crate

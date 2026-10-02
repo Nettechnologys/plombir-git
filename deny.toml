@@ -40,8 +40,10 @@ ignore = [
 version = 2
 # Confidence required for the license detector to accept a text match.
 confidence-threshold = 0.8
-# OSI-approved permissive licenses only — no copyleft that would encumber a
-# MIT-licensed forge. Extend deliberately when a new dependency needs it.
+# OSI-approved permissive licenses only. ForgeKeep itself is AGPL-3.0-or-later,
+# and every entry here is AGPL-compatible; keeping dependencies permissive also
+# keeps the commercial-license option (see NOTICE) free of third-party
+# copyleft. Extend deliberately when a new dependency needs it.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -58,6 +60,21 @@ allow = [
     "CC0-1.0",
     "BSL-1.0",
     "0BSD",
+]
+
+# ForgeKeep's own crates carry the project license. AGPL is allowed for them by
+# name only, so a copyleft *dependency* still fails the gate above.
+exceptions = [
+    { name = "rg-ci", allow = ["AGPL-3.0-or-later"] },
+    { name = "rg-cli", allow = ["AGPL-3.0-or-later"] },
+    { name = "rg-core", allow = ["AGPL-3.0-or-later"] },
+    { name = "rg-db", allow = ["AGPL-3.0-or-later"] },
+    { name = "rg-git", allow = ["AGPL-3.0-or-later"] },
+    { name = "rg-http", allow = ["AGPL-3.0-or-later"] },
+    { name = "rg-mcp", allow = ["AGPL-3.0-or-later"] },
+    { name = "rg-process", allow = ["AGPL-3.0-or-later"] },
+    { name = "rg-runner", allow = ["AGPL-3.0-or-later"] },
+    { name = "rg-ssh", allow = ["AGPL-3.0-or-later"] },
 ]
 
 # ────────────────────────────────── Bans ──────────────────────────────────

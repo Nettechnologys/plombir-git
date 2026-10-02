@@ -3,7 +3,7 @@
 > A lightweight, self-hosted Git platform written in Rust.
 
 [![Rust](https://img.shields.io/badge/rust-1.95%2B-orange)](https://www.rust-lang.org/)
-[![License: Proprietary](https://img.shields.io/badge/license-Proprietary-red)](LICENSE)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 
 ForgeKeep is a full-featured Git hosting platform — repositories, issues, pull
 requests, code review, wiki, CI/CD, and a package registry — built as a single
@@ -645,7 +645,12 @@ environment toggles.
 
 ## License
 
-ForgeKeep is proprietary software — see the [LICENSE](LICENSE) file. All rights
-reserved by [Yahook](https://github.com/Yahook); no use, copying, modification,
-or distribution is permitted without prior written permission. Please read
-[NOTICE](NOTICE) for the fork's upstream provenance.
+ForgeKeep is free software under the
+[GNU Affero General Public License v3.0 or later](LICENSE), © [Yahook](https://github.com/Yahook).
+You may use, study, modify and share it. If you run a modified version for
+other people over a network, the AGPL asks you to offer them its source.
+
+A commercial license without the AGPL obligations is available from the
+copyright holder. Contributions are accepted under the
+[Contributor License Agreement](CLA.md). See [NOTICE](NOTICE) for the fork's
+upstream provenance and the MIT terms of the code that came from IronForge.
