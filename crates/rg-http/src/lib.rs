@@ -14,6 +14,7 @@
 //!  - [`pat_auth`] — PAT ⇄ JWT bridging and git actor extraction
 
 pub mod api;
+pub mod build_info;
 pub mod error;
 pub mod git_v2;
 pub mod instance;
@@ -154,6 +155,11 @@ pub struct AppState {
     /// enabled. Default `false`: the sign/verify endpoints return 404 until an
     /// operator turns the feature on.
     pub attestation_enabled: bool,
+    /// The repository holding this instance's source, validated and without a
+    /// trailing slash — `[server].source_url`. `GET /api/v1/instance` joins it
+    /// with [`build_info::source_commit`] into the link the UI offers under
+    /// AGPL §13.
+    pub source_url: Arc<str>,
     /// How often an already-open WebSocket re-checks that it may still be open,
     /// in seconds — see [`ws::DEFAULT_WS_SESSION_RECHECK_SECS`], which is the
     /// value every production instance uses. A field rather than a constant so
@@ -382,6 +388,9 @@ pub struct HttpServerConfig {
     /// Enable opt-in Ed25519 provenance attestation of release assets. Default
     /// `false` (feature off; endpoints 404).
     pub attestation_enabled: bool,
+    /// Repository the UI links as this instance's source, validated by the
+    /// caller and without a trailing slash. See [`AppState::source_url`].
+    pub source_url: String,
     /// WebSocket notification hub to serve clients from. Pass an existing hub
     /// when another transport in the same process must reach the same clients —
     /// the SSH server's post-push hooks push `ci_triggered` / `push` events
@@ -554,6 +563,7 @@ async fn run_with_listener(
         git_idle_timeout_secs: config.git_idle_timeout_secs,
         ci_engine: config.ci_engine,
         attestation_enabled: config.attestation_enabled,
+        source_url: Arc::from(config.source_url),
         ws_session_recheck_secs: ws::DEFAULT_WS_SESSION_RECHECK_SECS,
         instance_settings: config.instance_settings,
     };

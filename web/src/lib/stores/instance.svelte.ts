@@ -19,6 +19,28 @@ export function clearBanner() {
   bannerMessage = '';
 }
 
+// ── Source code link ────────────────────────────────────
+
+/// Where this instance's source is offered (AGPL §13), as `GET /api/v1/instance`
+/// reported it. `null` until that answer arrives — and for good if it never
+/// does: a link the server did not supply would be a guess, and the only guess
+/// available is upstream's repository, which is exactly the wrong one for a
+/// modified fork.
+export interface SourceLink {
+  url: string;
+  commit: string | null;
+}
+
+let sourceLink = $state<SourceLink | null>(null);
+
+export function getSourceLink(): SourceLink | null {
+  return sourceLink;
+}
+
+export function setSourceLink(link: SourceLink | null) {
+  sourceLink = link;
+}
+
 // ── Keyboard Shortcuts ──────────────────────────────────
 
 /// Call this once in root layout to register global keyboard shortcuts.

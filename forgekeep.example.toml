@@ -33,6 +33,12 @@ package_upload_max_mb = 512
 # SIGTERM / ctrl-c before the process is forced down. Raise it if a slow clone
 # or a long CI-log flush is being cut off during a rolling restart.
 # shutdown_grace_secs = 30
+# Repository holding this instance's source code. Every page links
+# `<source_url>/tree/<commit>` for the commit the binary was built from (the
+# Docker build takes it as FORGEKEEP_SOURCE_COMMIT) — the source offer AGPL §13
+# asks of anyone who modifies the code and serves it over a network. Point it at
+# your fork if you run a modified build.
+# source_url = "https://github.com/Yahook/ForgeKeep"
 
 [database]
 url = "sqlite://./forgekeep.db?mode=rwc"

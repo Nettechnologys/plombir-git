@@ -4,12 +4,13 @@
   import InstanceBanner from '$lib/components/InstanceBanner.svelte';
   import SessionStatusBanner from '$lib/components/SessionStatusBanner.svelte';
   import Layout from '$lib/components/Layout.svelte';
+  import SourceFooter from '$lib/components/SourceFooter.svelte';
 import { fetchUser, isAuthReady } from '$lib/stores/auth.svelte';
 import { registerKeyboardShortcuts } from '$lib/stores/instance.svelte';
 import { locale, t } from '$lib/i18n';
 import { onMount } from 'svelte';
 import type { Snippet } from 'svelte';
-import { setBanner } from '$lib/stores/instance.svelte';
+import { setBanner, setSourceLink } from '$lib/stores/instance.svelte';
 import { instance } from '$lib/api/client.svelte';
 import { withBackendBase } from '$lib/api/_base';
 
@@ -59,6 +60,9 @@ import { withBackendBase } from '$lib/api/_base';
   async function loadInstanceBanner() {
     try {
       const info = await instance.get();
+      // The source offer (AGPL §13) rides on the same answer: one request, and
+      // the link exists only once the server has said where its source is.
+      setSourceLink({ url: info.source_url, commit: info.source_commit });
       if (info.banner_message) {
         setBanner(info.banner_message, info.banner_type ?? 'info');
       }
@@ -83,6 +87,7 @@ import { withBackendBase } from '$lib/api/_base';
       {/if}
     </main>
   </Layout>
+  <SourceFooter />
 </div>
 
 <style>

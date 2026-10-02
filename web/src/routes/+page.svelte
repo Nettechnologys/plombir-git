@@ -3,8 +3,10 @@
   import { repos } from '$lib/api/client.svelte';
   import { goto } from '$app/navigation';
   import { createT, formatDate } from '$lib/i18n';
+  import { getSourceLink } from '$lib/stores/instance.svelte';
 
   const t = createT();
+  let sourceLink = $derived(getSourceLink());
 
   let repoList = $state<any[]>([]);
   let loading = $state(true);
@@ -224,9 +226,12 @@
           <span class="footer-logo-text">ForgeKeep</span>
         </div>
         <div class="footer-links">
-          <a href="https://github.com/Yahook/ForgeKeep" target="_blank">{t('home.footer.github')}</a>
+          <!-- The configured source of the running build, not a hard-coded
+               upstream URL: a fork's visitors must be sent to the fork. -->
+          {#if sourceLink}
+            <a href={sourceLink.url} target="_blank" rel="noopener noreferrer">{t('common.source_code')}</a>
+          {/if}
           <a href="/explore">{t('home.footer.explore')}</a>
-          <a href="https://github.com/Yahook/ForgeKeep#readme" target="_blank">{t('home.footer.help')}</a>
         </div>
         <div class="footer-copyright">
           © 2026 ForgeKeep. {t('home.footer.built_with')}

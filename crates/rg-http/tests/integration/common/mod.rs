@@ -340,6 +340,11 @@ pub const TEST_ENCRYPTION_KEY: &str = "test-encryption-key";
 /// reached for the right key from one that reached for `jwt_secret`.
 pub const TEST_INSTANCE_KEY_SECRET: &str = "test-instance-key";
 
+/// `[server].source_url` of every test app. A fork's URL rather than the
+/// shipped default, so a handler that ignored the configured value and served
+/// the default would be caught.
+pub const TEST_SOURCE_URL: &str = "https://source.example.test/fork/plombir";
+
 pub fn build_test_app_state(
     db: rg_db::DatabaseConnection,
     repo_root: std::path::PathBuf,
@@ -427,6 +432,7 @@ pub fn build_test_app_state_with(
         // Enabled in the test harness so attestation endpoints are reachable;
         // production defaults to off (opt-in).
         attestation_enabled: true,
+        source_url: std::sync::Arc::from(TEST_SOURCE_URL),
         ws_session_recheck_secs: overrides
             .ws_session_recheck_secs
             .unwrap_or(rg_http::ws::DEFAULT_WS_SESSION_RECHECK_SECS),

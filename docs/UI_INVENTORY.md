@@ -27,7 +27,7 @@
 | Из них достижимы из браузера | 240 (67%) |
 | Layout-модулей | 2 |
 | Страниц | 61 |
-| Интерактивных элементов | 807 |
+| Интерактивных элементов | 806 |
 | — из них дёргают API | 302 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
@@ -91,8 +91,8 @@
 | `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/settings/branches` | 13 | 2 | 0 |
 | `/admin/users` 🔒 | 13 | 5 | 0 |
-| `/` | 11 | 1 | 0 |
 | `/[owner]/[repo]/settings/webhooks` | 11 | 6 | 0 |
+| `/` | 10 | 1 | 0 |
 | `/admin/runners` 🔒 | 10 | 4 | 0 |
 | `/login` | 10 | 1 | 0 |
 | `/[owner]/[repo]/edit/[...path]` | 8 | 0 | 8 |
@@ -138,7 +138,7 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Retry | :186 | `GET /api/v1/repos/explore` | `PublicFiltered` | rust+web+smoke |
+| Retry | :188 | `GET /api/v1/repos/explore` | `PublicFiltered` | rust+web+smoke |
 
 ### `/[owner]`
 

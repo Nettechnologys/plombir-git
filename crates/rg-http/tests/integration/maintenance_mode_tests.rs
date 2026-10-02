@@ -11,6 +11,7 @@ use std::path::Path;
 
 use crate::common::{
     build_test_app_state, register_full, setup_test_db, spawn_test_app_with_db, wait_for_listener,
+    TEST_SOURCE_URL,
 };
 use crate::security_headers_tests::assert_security_headers;
 use base64::Engine as _;
@@ -528,4 +529,44 @@ async fn the_instance_banner_is_readable_without_logging_in() {
         "the admin settings endpoint must stay closed to anonymous callers, got {}",
         refused.status()
     );
+}
+
+/// card_0960f17d6aeb: every visitor is offered the source of the build they
+/// are using (AGPL §13), and the offer follows the operator's
+/// `[server].source_url`.
+///
+/// The fixture configures a fork's URL rather than the shipped default, so a
+/// handler that hard-coded upstream — the way the landing page's footer used to
+/// — would fail here. Anonymous on purpose: the offer is owed to everyone the
+/// instance serves, not only to signed-in users.
+#[tokio::test]
+async fn the_instance_offers_the_source_of_the_running_build_to_anyone() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let info = reqwest::Client::new()
+        .get(format!("{base}/api/v1/instance"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info.status(), 200, "{}", info.text().await.unwrap());
+    let info = info.json::<serde_json::Value>().await.unwrap();
+
+    let commit = rg_http::build_info::source_commit().known();
+    assert_eq!(
+        info["source_url"],
+        rg_http::build_info::source_link(TEST_SOURCE_URL, commit),
+        "the link must be built from the configured source_url: {info}"
+    );
+    assert!(
+        info["source_url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with(TEST_SOURCE_URL)),
+        "the configured fork, not upstream, must be offered: {info}"
+    );
+    match commit {
+        Some(commit) => assert_eq!(info["source_commit"], commit, "{info}"),
+        None => assert!(
+            info["source_commit"].is_null(),
+            "a build that recorded no commit must say null rather than guess: {info}"
+        ),
+    }
 }

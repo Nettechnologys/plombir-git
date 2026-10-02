@@ -22,6 +22,10 @@ services:
       # Dockerfile and crates/ live.
       context: ..
       dockerfile: Dockerfile
+      args:
+        # The commit being built, so every page links its exact source:
+        #   FORGEKEEP_SOURCE_COMMIT=$(git rev-parse HEAD) docker compose up -d --build
+        FORGEKEEP_SOURCE_COMMIT: ${FORGEKEEP_SOURCE_COMMIT:-}
     container_name: forgekeep
     restart: unless-stopped
     ports:

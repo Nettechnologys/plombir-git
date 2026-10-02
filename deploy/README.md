@@ -68,8 +68,10 @@ install -m 600 forgekeep.docker.toml forgekeep.toml
 #    once, on the directory; the server never narrows it for you.
 install -d -m 700 data
 
-# 4. Build + start (the build bakes FORGEKEEP_UID into the image).
-docker compose -f docker-compose.hostdir.yml up -d --build
+# 4. Build + start. The build bakes FORGEKEEP_UID into the image, and the
+#    commit being built into the binary: every page links that commit's source.
+FORGEKEEP_SOURCE_COMMIT=$(git rev-parse HEAD) \
+  docker compose -f docker-compose.hostdir.yml up -d --build
 
 # 5. Verify both listeners are up.
 docker compose -f docker-compose.hostdir.yml logs -f

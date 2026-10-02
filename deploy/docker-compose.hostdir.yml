@@ -41,6 +41,11 @@ services:
         # Match the host owner of ./data. Defaults to 1000 when unset in .env.
         FORGEKEEP_UID: ${FORGEKEEP_UID:-1000}
         FORGEKEEP_GID: ${FORGEKEEP_GID:-1000}
+        # The commit being built, so every page links its exact source. Set it
+        # from the shell at build time rather than in .env, where it would go
+        # stale with the next pull:
+        #   FORGEKEEP_SOURCE_COMMIT=$(git rev-parse HEAD) docker compose ... up -d --build
+        FORGEKEEP_SOURCE_COMMIT: ${FORGEKEEP_SOURCE_COMMIT:-}
     container_name: forgekeep
     restart: unless-stopped
     ports:

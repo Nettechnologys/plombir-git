@@ -2238,7 +2238,11 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 15] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 16] = [
+        (
+            "DEFAULT_SOURCE_URL",
+            "config-file-only: `[server].source_url` has no CLI flag, so no help text names it",
+        ),
         (
             "DEFAULT_PACKAGE_UPLOAD_MAX_MB",
             "config-file-only: `[server].package_upload_max_mb` has no CLI flag, so no help \

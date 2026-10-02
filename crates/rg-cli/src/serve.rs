@@ -106,6 +106,37 @@ fn publish_listen_addresses(
     publish
 }
 
+/// Say at startup which source link every page will offer, and warn when the
+/// build did not record the commit it came from.
+///
+/// The warning is the only place an operator learns that their image was built
+/// without `FORGEKEEP_SOURCE_COMMIT`: the UI still links the repository, so
+/// nothing looks broken — it just stops naming the code that is running.
+fn announce_source_link(source_url: &str) {
+    use rg_http::build_info::{self, SourceCommit};
+
+    let commit = build_info::source_commit();
+    let link = build_info::source_link(source_url, commit.known());
+    match commit {
+        SourceCommit::Known(commit) => {
+            tracing::info!(%commit, %link, "source code of this build is offered at the link")
+        }
+        SourceCommit::Unrecorded => tracing::warn!(
+            %link,
+            "this binary was built without FORGEKEEP_SOURCE_COMMIT, so the UI links the \
+             repository instead of the commit that is running; pass it at build time \
+             (docker build --build-arg FORGEKEEP_SOURCE_COMMIT=$(git rev-parse HEAD))"
+        ),
+        SourceCommit::Malformed(raw) => tracing::warn!(
+            %link,
+            recorded = raw,
+            "FORGEKEEP_SOURCE_COMMIT was set at build time to something that is not a full \
+             commit id, so it is ignored and the UI links the repository instead; pass the \
+             full `git rev-parse HEAD`"
+        ),
+    }
+}
+
 /// Wait for the first OS shutdown signal: ctrl_c (SIGINT) on all platforms,
 /// plus SIGTERM on Unix (the signal `kill`/systemd/Docker send on stop).
 async fn wait_for_shutdown_signal() {
@@ -662,6 +693,8 @@ pub(crate) async fn run_serve(
             .and_then(|c| c.releases.attestation_enabled)
             .unwrap_or(DEFAULT_ATTESTATION_ENABLED),
     };
+    let resolved_source_url = crate::config::resolve_source_url(cfg.as_ref())?;
+    announce_source_link(&resolved_source_url);
     let resolved_rate_limit_trusted_proxy_values = if !rate_limit_trusted_proxies.is_empty() {
         rate_limit_trusted_proxies
     } else {
@@ -1307,6 +1340,7 @@ pub(crate) async fn run_serve(
         shutdown_rx: shutdown_rx.clone(),
         shutdown_grace_secs: resolved_shutdown_grace,
         attestation_enabled: resolved_attestation_enabled,
+        source_url: resolved_source_url,
         notification_hub: Some(notification_hub.clone()),
         instance_settings: instance_settings.clone(),
     };

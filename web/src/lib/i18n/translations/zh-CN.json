@@ -28,7 +28,10 @@
     "offline": "离线",
     "date": "日期",
     "view": "查看",
-    "never": "从未"
+    "never": "从未",
+    "source_code": "源代码",
+    "source_code_at_commit": "本实例在提交 {commit} 的源代码",
+    "source_code_commit_unknown": "本实例的源代码（构建未记录提交）"
   },
   "nav": {
     "dashboard": "仪表板",
@@ -141,9 +144,7 @@
       "empty": "暂无公开仓库"
     },
     "footer": {
-      "github": "GitHub",
       "explore": "探索",
-      "help": "帮助",
       "built_with": "用 Rust 和 SvelteKit 构建"
     }
   },

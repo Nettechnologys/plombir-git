@@ -89,6 +89,15 @@ RUN cargo build --release
 #     preserves the build context's timestamps, so without it cargo can consider
 #     the artifacts built from the stubs newer than the sources that replaced
 #     them and skip the rebuild entirely.
+#
+#     FORGEKEEP_SOURCE_COMMIT is the commit these sources are, recorded into the
+#     binary so every page can link the exact code it runs (AGPL §13; see
+#     `rg_http::build_info`). It is declared here, after 2c, on purpose: an ARG
+#     is part of the cache key of every later RUN, so declaring it above the
+#     dependency build would rebuild every dependency on every commit. Pass
+#     `--build-arg FORGEKEEP_SOURCE_COMMIT=$(git rev-parse HEAD)`; left empty,
+#     the server links the repository instead and warns about it at startup.
+ARG FORGEKEEP_SOURCE_COMMIT=
 RUN find crates -name '*.rs' -delete
 COPY crates/ crates/
 RUN find crates -name '*.rs' -exec touch {} + \

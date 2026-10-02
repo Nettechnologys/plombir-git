@@ -28,7 +28,10 @@
     "view": "View",
     "never": "Never",
     "all": "All",
-    "search": "Search"
+    "search": "Search",
+    "source_code": "Source code",
+    "source_code_at_commit": "Source code of this instance at commit {commit}",
+    "source_code_commit_unknown": "Source code of this instance (build commit not recorded)"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -141,9 +144,7 @@
     },
     "public_repos": "Public Repositories",
     "footer": {
-      "github": "GitHub",
       "explore": "Explore",
-      "help": "Help",
       "built_with": "Built with Rust and SvelteKit"
     }
   },

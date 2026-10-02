@@ -4446,7 +4446,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 51,
+          "line": 53,
           "via": null,
           "href": null,
           "handler": "() => goto('/dashboard')",
@@ -4456,7 +4456,7 @@
         {
           "tag": "a",
           "label": "/ ⭐ · )}",
-          "line": 70,
+          "line": 72,
           "via": null,
           "href": "`/${repo.owner_name || 'unknown'}/${repo.name}`",
           "handler": null,
@@ -4466,7 +4466,7 @@
         {
           "tag": "a",
           "label": "→",
-          "line": 84,
+          "line": 86,
           "via": null,
           "href": "/explore",
           "handler": null,
@@ -4476,7 +4476,7 @@
         {
           "tag": "button",
           "label": "i18n:home.sign_up",
-          "line": 104,
+          "line": 106,
           "via": null,
           "href": null,
           "handler": "handleRegister",
@@ -4486,7 +4486,7 @@
         {
           "tag": "button",
           "label": "i18n:home.sign_in",
-          "line": 107,
+          "line": 109,
           "via": null,
           "href": null,
           "handler": "handleLogin",
@@ -4496,7 +4496,7 @@
         {
           "tag": "a",
           "label": "→",
-          "line": 180,
+          "line": 182,
           "via": null,
           "href": "/explore",
           "handler": null,
@@ -4506,7 +4506,7 @@
         {
           "tag": "button",
           "label": "Retry",
-          "line": 186,
+          "line": 188,
           "via": null,
           "href": null,
           "handler": "loadRepos",
@@ -4532,7 +4532,7 @@
         {
           "tag": "a",
           "label": "/ ⭐ · )}",
-          "line": 199,
+          "line": 201,
           "via": null,
           "href": "`/${repo.owner_name || 'unknown'}/${repo.name}`",
           "handler": null,
@@ -4541,10 +4541,10 @@
         },
         {
           "tag": "a",
-          "label": "i18n:home.footer.github",
-          "line": 227,
+          "label": "i18n:common.source_code",
+          "line": 232,
           "via": null,
-          "href": "https://github.com/Yahook/ForgeKeep",
+          "href": "sourceLink.url",
           "handler": null,
           "calls": [],
           "unresolved": false
@@ -4552,19 +4552,9 @@
         {
           "tag": "a",
           "label": "i18n:home.footer.explore",
-          "line": 228,
+          "line": 234,
           "via": null,
           "href": "/explore",
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "i18n:home.footer.help",
-          "line": 229,
-          "via": null,
-          "href": "https://github.com/Yahook/ForgeKeep#readme",
           "handler": null,
           "calls": [],
           "unresolved": false

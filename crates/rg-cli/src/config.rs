@@ -81,6 +81,10 @@ pub(crate) struct ServerConfig {
     /// Grace window (seconds) for draining in-flight requests and the CI-log
     /// queue on SIGTERM/ctrl_c before the process is forced down (default: 30).
     pub(crate) shutdown_grace_secs: Option<u64>,
+    /// Repository holding this instance's source code. The UI links
+    /// `<source_url>/tree/<commit the binary was built from>` — the AGPL §13
+    /// offer. A fork that modifies the code points this at itself.
+    pub(crate) source_url: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -542,6 +546,49 @@ pub(crate) const DEFAULT_LOG_MAX_SIZE_MB: u64 = 10;
 pub(crate) const DEFAULT_LOG_MAX_FILES: usize = 5;
 pub(crate) const DEFAULT_PACKAGE_UPLOAD_MAX_MB: u64 =
     (rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES / (1024 * 1024)) as u64;
+
+/// The repository the UI offers as this instance's source when
+/// `[server].source_url` is unset: upstream's. Right for an unmodified build;
+/// a modified one owes its users its own URL, which is what the setting is for.
+pub(crate) const DEFAULT_SOURCE_URL: &str = "https://github.com/Yahook/ForgeKeep";
+
+/// Resolve and validate `[server].source_url`.
+///
+/// The value lands in an `href` on every page, so it is held to what a source
+/// link can be: an absolute `http(s)` URL with a host and no query or fragment,
+/// which `/tree/<commit>` is appended to. Anything else fails the start rather
+/// than shipping a link that goes nowhere — or a `javascript:` one. A trailing
+/// slash is dropped so the joined link has exactly one.
+pub(crate) fn resolve_source_url(cfg: Option<&ConfigFile>) -> anyhow::Result<String> {
+    let raw = cfg
+        .and_then(|c| c.server.source_url.as_deref())
+        .unwrap_or(DEFAULT_SOURCE_URL);
+    let refuse = |why: &str| {
+        anyhow::anyhow!(
+            "[server].source_url = {raw:?} {why}; it must be the absolute http(s) URL of a \
+             repository, e.g. {DEFAULT_SOURCE_URL:?}"
+        )
+    };
+    let parsed = reqwest::Url::parse(raw.trim())
+        .map_err(|error| refuse(&format!("is not a URL ({error})")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(refuse("is not an http(s) URL"));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(refuse("has no host"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(refuse(
+            "carries a query or fragment, which `/tree/<commit>` cannot be appended to",
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(refuse(
+            "carries credentials, which every visitor would be shown",
+        ));
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
 
 /// Built-in defaults for the config-file-only knobs `serve` resolves. They have
 /// no CLI flag, so nothing about them was ever named anywhere: each used to be
@@ -1727,6 +1774,12 @@ mod tests {
                 "package_upload_max_mb",
                 "DEFAULT_PACKAGE_UPLOAD_MAX_MB",
                 super::DEFAULT_PACKAGE_UPLOAD_MAX_MB.to_string(),
+            ),
+            row(
+                "server",
+                "source_url",
+                "DEFAULT_SOURCE_URL",
+                format!("{:?}", super::DEFAULT_SOURCE_URL),
             ),
             row(
                 "server",
@@ -3477,5 +3530,58 @@ max_files = 7
             toml::from_str(include_str!("../../../deploy/forgekeep.docker.toml")).unwrap();
         assert_eq!(docker.backup.enabled, Some(true));
         assert_eq!(docker.backup.dir.as_deref(), Some("/data/backups"));
+    }
+
+    use super::{resolve_source_url, DEFAULT_SOURCE_URL};
+
+    fn source_url_from(value: &str) -> anyhow::Result<String> {
+        let config: ConfigFile =
+            toml::from_str(&format!("[server]\nsource_url = {value:?}\n")).unwrap();
+        resolve_source_url(Some(&config))
+    }
+
+    /// Unset is upstream's repository; a fork's value is taken as written,
+    /// minus the trailing slash that would double up in `<url>/tree/<commit>`.
+    #[test]
+    fn source_url_defaults_to_upstream_and_keeps_a_forks_value() {
+        assert_eq!(resolve_source_url(None).unwrap(), DEFAULT_SOURCE_URL);
+        let without_key: ConfigFile = toml::from_str("[server]\n").unwrap();
+        assert_eq!(
+            resolve_source_url(Some(&without_key)).unwrap(),
+            DEFAULT_SOURCE_URL
+        );
+        assert_eq!(
+            source_url_from("https://codeberg.org/someone/fork/").unwrap(),
+            "https://codeberg.org/someone/fork"
+        );
+        assert_eq!(
+            source_url_from("http://git.internal:3000/team/forge").unwrap(),
+            "http://git.internal:3000/team/forge"
+        );
+    }
+
+    /// The value becomes an `href` on every page. Each of these would ship a
+    /// link that goes nowhere, runs script, or shows every visitor a password —
+    /// so each one fails the start and names the setting.
+    #[test]
+    fn a_source_url_that_cannot_be_a_repository_link_fails_the_start() {
+        for (value, reason) in [
+            ("javascript:alert(1)", "is not an http(s) URL"),
+            ("ftp://example.com/forge", "is not an http(s) URL"),
+            ("github.com/someone/fork", "is not a URL"),
+            ("", "is not a URL"),
+            ("https://example.com/fork?ref=main", "query or fragment"),
+            ("https://example.com/fork#readme", "query or fragment"),
+            (
+                "https://user:secret@example.com/fork",
+                "carries credentials",
+            ),
+        ] {
+            let error = source_url_from(value).expect_err(value).to_string();
+            assert!(
+                error.contains("[server].source_url") && error.contains(reason),
+                "{value:?} must be refused with {reason:?}, got: {error}"
+            );
+        }
     }
 }

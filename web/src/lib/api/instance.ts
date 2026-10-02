@@ -18,6 +18,15 @@ export interface InstanceInfo {
    * versus "this file was never signed" (card_5e52392a0274).
    */
   attestation_enabled: boolean;
+  /**
+   * Where to read the source of the build answering this request:
+   * `<[server].source_url>/tree/<commit>`, or the repository itself when the
+   * build did not record its commit. The AGPL §13 offer — it follows the
+   * operator's setting, so a fork's users are sent to the fork.
+   */
+  source_url: string;
+  /** The commit this binary was built from, or `null` when the build was not told. */
+  source_commit: string | null;
 }
 
 export const instance = {
