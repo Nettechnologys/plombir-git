@@ -340,8 +340,11 @@ If you deploy with a config file, pass `--config /app/forgekeep.toml` instead of
 `index-repo`, `package list`) reads `[database].url` from it, so the admin
 command and the server cannot end up pointed at two different databases.
 Passing **neither** falls back to `sqlite://./forgekeep.db?mode=rwc` relative to
-the container's `WORKDIR /app` — an empty database that nothing else ever opens,
-which is why the flag matters for `backup-db` in particular.
+the current directory — the container's `WORKDIR /app` unless `docker exec -w`
+says otherwise — where no database lives. `backup-db` refuses that address and
+creates nothing, but `migrate` is allowed to create a database, so there it
+would build and migrate a new empty one that the server never opens. Pass the
+flag.
 
 CLI commands that can apply pending migrations against file-backed SQLite use
 the same offline contract as restore. `migrate`, `import`, and `package list`
@@ -396,11 +399,27 @@ online-capable:
    CI job before reopening traffic.
 
 The migration is deliberately forward-only: narrowing a newly accepted id
-above `i32::MAX` is not a safe rollback. The previous binary remains compatible
-with the widened schema, so application rollback means stopping the new binary
-and starting the previous one. If the database migration itself is only partly
-applied on MySQL or post-migration verification fails, keep ForgeKeep stopped
-and restore the verified backup; do not hand-edit columns back to `INT`.
+above `i32::MAX` is not a safe rollback. If the database migration itself is
+only partly applied on MySQL or post-migration verification fails, keep
+ForgeKeep stopped and restore the verified backup; do not hand-edit columns back
+to `INT`.
+
+#### Rolling back across a migration
+
+A binary refuses to start on a database that has a migration it does not know:
+
+```text
+Error: migration failed
+    Custom Error: Migration file of version 'm20260830_000001_align_ci_schema_types' is missing, this migration has been applied but its file is missing
+```
+
+That holds on every backend and for every release that adds a migration, so
+starting the previous image is never a rollback on its own. Rolling back means
+the previous image **plus** the database backup taken before the upgrade
+(`restore-db` on SQLite, the native restore on PostgreSQL/MySQL). Whatever was
+written after the upgrade is lost with it, so take that backup immediately
+before the switch and keep the previous image tagged until the new one has
+proved itself.
 
 ### Ports
 | Port | Protocol |
