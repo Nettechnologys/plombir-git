@@ -4,10 +4,12 @@
 //! MCP (Model Context Protocol) server that exposes ForgeKeep
 //! repository data as Tools and Resources to AI agents.
 //!
-//! Supported transport:
-//! - **stdio**: run as a subprocess of an MCP-capable agent.
-//!
-//! HTTP SSE transport is intentionally not advertised until implemented.
+//! Supported transports:
+//! - **stdio**: run as a subprocess of an MCP-capable agent (`forgekeep-mcp`).
+//! - **HTTP**: the ForgeKeep server embeds this crate and answers
+//!   `POST /api/v1/mcp` itself, calling its own API in-process through an
+//!   [`ApiTransport`] — so an agent needs no local binary, and the server knows
+//!   which tool every API call serves.
 
 pub mod client;
 pub mod error;
@@ -158,14 +160,55 @@ fn parse_allow_insecure_http(raw: &str) -> Result<bool> {
     }
 }
 
-/// ForgeKeep API base URL + PAT cache.
+/// The HTTP method an [`ApiTransport`] is asked to send — re-exported so an
+/// embedding server implements the trait without depending on `reqwest`.
+pub use reqwest::Method;
+
+/// One exchange with the ForgeKeep REST API, before any decoding.
+pub struct ApiResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+/// A future an [`ApiTransport`] answers with.
+pub type ApiFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<ApiResponse>> + Send + 'a>>;
+
+/// How tool calls reach the ForgeKeep REST API when they do not go over the
+/// network — the server hosting this crate's tools behind its own MCP endpoint.
 ///
-/// Constructed once at startup from environment variables.
+/// `path` is the full API path including `/api/v1` and any query string. The
+/// implementation owns authentication: the tools never see a credential.
+pub trait ApiTransport: Send + Sync {
+    fn exchange(
+        &self,
+        method: reqwest::Method,
+        path: String,
+        body: Option<serde_json::Value>,
+    ) -> ApiFuture<'_>;
+}
+
+/// Where tool calls are sent.
+#[derive(Clone)]
+pub(crate) enum Backend {
+    /// A ForgeKeep server over HTTP(S) — the stdio binary's only mode.
+    Http {
+        api_base: String,
+        /// Pre-built, reusable API client (Bearer header + timeouts baked in).
+        client: reqwest::Client,
+    },
+    /// The server this crate is embedded in, without a network hop.
+    InProcess(std::sync::Arc<dyn ApiTransport>),
+}
+
+/// ForgeKeep API base URL + PAT cache, or an in-process transport.
+///
+/// The stdio binary constructs it once at startup from environment variables;
+/// the server's own MCP endpoint constructs one per request around the
+/// caller's credential with [`AppState::in_process`].
 #[derive(Clone)]
 pub struct AppState {
-    api_base: String,
-    /// Pre-built, reusable API client (Bearer header + timeouts baked in).
-    http_client: reqwest::Client,
+    pub(crate) backend: Backend,
 }
 
 impl AppState {
@@ -198,22 +241,140 @@ impl AppState {
         Self::try_new_with_transport_policy(api_base, pat, false)
     }
 
+    /// Serve the tools through `transport` instead of over the network.
+    pub fn in_process(transport: std::sync::Arc<dyn ApiTransport>) -> Self {
+        Self {
+            backend: Backend::InProcess(transport),
+        }
+    }
+
     fn try_new_with_transport_policy(
         api_base: String,
         pat: String,
         allow_insecure_http: bool,
     ) -> Result<Self> {
         require_confidential_bearer_server(&api_base, &pat, allow_insecure_http)?;
-        let http_client = build_http_client(&pat);
+        let client = build_http_client(&pat);
         Ok(Self {
-            api_base,
-            http_client,
+            backend: Backend::Http { api_base, client },
         })
     }
 
-    /// Cheap clone of the shared `reqwest::Client` (Bearer header + timeouts).
-    pub fn http_client(&self) -> reqwest::Client {
-        self.http_client.clone()
+    /// Cheap clone of the shared `reqwest::Client` (Bearer header + timeouts),
+    /// when this state talks HTTP.
+    #[cfg(test)]
+    fn http_client(&self) -> reqwest::Client {
+        match &self.backend {
+            Backend::Http { client, .. } => client.clone(),
+            Backend::InProcess(_) => panic!("an in-process state has no HTTP client"),
+        }
+    }
+}
+
+/// MCP protocol revisions this server speaks, oldest first.
+///
+/// The server's answer to `initialize` is the client's requested revision when
+/// it is one of these, and the newest otherwise — the negotiation the
+/// specification describes. Nothing here differs between the revisions for the
+/// subset implemented (tools, resources, no sampling or elicitation).
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+
+/// Answer one JSON-RPC message, the same way over every transport.
+///
+/// `None` for a notification: JSON-RPC forbids answering one, and the stdio
+/// loop used to reply to `notifications/initialized` with a result carrying a
+/// `null` id, which a strict client reads as a protocol violation.
+pub fn dispatch(
+    state: &AppState,
+    req: &protocol::JsonRpcRequest,
+) -> Option<protocol::JsonRpcResponse> {
+    if req.is_notification() {
+        return None;
+    }
+    Some(match req.method.as_str() {
+        "initialize" => handle_initialize(req),
+        "ping" => protocol::make_success(req.id.clone(), serde_json::json!({})),
+        "tools/list" => tools::list_tools(state, req),
+        "tools/call" => tools::call_tool(state, req),
+        "resources/list" => resources::list_resources(state, req),
+        "resources/read" => resources::read_resource(state, req),
+        _ => protocol::make_error(
+            req.id.clone(),
+            -32601,
+            &format!("method not found: {}", req.method),
+        ),
+    })
+}
+
+fn handle_initialize(req: &protocol::JsonRpcRequest) -> protocol::JsonRpcResponse {
+    let requested = req
+        .params
+        .as_ref()
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(|version| version.as_str());
+    let version = requested
+        .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[SUPPORTED_PROTOCOL_VERSIONS.len() - 1]);
+    let result = serde_json::json!({
+        "protocolVersion": version,
+        "serverInfo": {
+            "name": "forgekeep-mcp",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "capabilities": {
+            "tools": { "listChanged": true },
+            "resources": { "subscribe": false, "listChanged": true }
+        }
+    });
+    protocol::make_success(req.id.clone(), result)
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use protocol::JsonRpcRequest;
+
+    fn request(raw: serde_json::Value) -> JsonRpcRequest {
+        serde_json::from_value(raw).expect("a well-formed JSON-RPC message")
+    }
+
+    fn state() -> AppState {
+        AppState::new("http://localhost:8080".into(), String::new())
+    }
+
+    #[test]
+    fn a_notification_is_never_answered() {
+        let initialized = request(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }));
+        assert!(initialized.is_notification());
+        assert!(dispatch(&state(), &initialized).is_none());
+    }
+
+    #[test]
+    fn initialize_negotiates_the_protocol_revision() {
+        for (asked, answered) in [
+            ("2024-11-05", "2024-11-05"),
+            ("2025-03-26", "2025-03-26"),
+            ("1999-01-01", "2025-06-18"),
+        ] {
+            let response = dispatch(
+                &state(),
+                &request(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": { "protocolVersion": asked }
+                })),
+            )
+            .expect("a request is answered");
+            assert_eq!(
+                response.result.unwrap()["protocolVersion"],
+                answered,
+                "asked for {asked}"
+            );
+        }
     }
 }
 

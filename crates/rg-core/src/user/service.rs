@@ -1077,6 +1077,24 @@ async fn refuse_ownerships_this_deletion_may_not_cascade(
             "failed to inventory the organizations owned by this account — it cannot be deleted \
              without them",
         )?;
+    // A bot answers to its owner and stops working with them; the reference
+    // carries no cascade, because deleting the bot row would take its
+    // repository rows through `repositories.owner_id` while their bytes stayed
+    // in storage. Deleting the bots is the owner's own, storage-safe operation.
+    let bots = rg_db::ops::user_ops::list_bots_by_owner(db, user_id)
+        .await
+        .context("failed to inventory the bots owned by this account")?;
+    if !bots.is_empty() {
+        let names = bots
+            .iter()
+            .map(|bot| bot.username.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(crate::error::conflict(format!(
+            "account still owns the bot(s) {names}; delete them before deleting the account"
+        )));
+    }
+
     if !owned_orgs.is_empty() {
         let names = owned_orgs
             .iter()

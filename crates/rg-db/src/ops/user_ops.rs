@@ -383,8 +383,70 @@ pub async fn create_user(
         created_at: Set(now),
         updated_at: Set(now),
         deleted_at: Set(None),
+        bot_owner_id: Set(None),
     };
     create(db, model).await
+}
+
+/// Create a bot account owned by `owner_id`.
+///
+/// A bot has no password and no external identity: `auth_provider = "bot"`
+/// is a provider no login form reaches, so the only credential it can ever
+/// present is a Personal Access Token its owner minted for it. It is never an
+/// administrator, whatever the owner is.
+pub async fn create_bot(
+    db: &DatabaseConnection,
+    owner_id: i64,
+    username: &str,
+    email: &str,
+    display_name: Option<&str>,
+) -> Result<User> {
+    let now = chrono::Utc::now();
+    create(
+        db,
+        user::ActiveModel {
+            id: NotSet,
+            username: Set(username.to_string()),
+            email: Set(email.to_string()),
+            password_hash: Set(String::new()),
+            display_name: Set(display_name.map(str::to_string)),
+            avatar_url: Set(None),
+            bio: Set(None),
+            is_admin: Set(false),
+            is_active: Set(true),
+            auth_provider: Set(BOT_AUTH_PROVIDER.into()),
+            ldap_uid: Set(None),
+            ldap_provider_id: Set(None),
+            totp_secret: Set(None),
+            pending_totp_secret: Set(None),
+            pending_totp_secret_at: Set(None),
+            mfa_enabled: Set(false),
+            totp_last_step: Set(None),
+            last_login_at: Set(None),
+            login_attempts: Set(0),
+            locked_until: Set(None),
+            session_version: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            bot_owner_id: Set(Some(owner_id)),
+        },
+    )
+    .await
+}
+
+/// `users.auth_provider` of a bot account — a provider no login form reaches.
+pub const BOT_AUTH_PROVIDER: &str = "bot";
+
+/// The bots a person owns, oldest first.
+pub async fn list_bots_by_owner(db: &DatabaseConnection, owner_id: i64) -> Result<Vec<User>> {
+    UserEntity::find()
+        .filter(user::Column::BotOwnerId.eq(owner_id))
+        .order_by_asc(user::Column::CreatedAt)
+        .order_by_asc(user::Column::Id)
+        .all(db)
+        .await
+        .context("db: list bots by owner")
 }
 
 /// Create a directory-backed user after successful LDAP authentication.
@@ -424,6 +486,7 @@ pub async fn create_ldap_user(
             created_at: Set(now),
             updated_at: Set(now),
             deleted_at: Set(None),
+            bot_owner_id: Set(None),
         },
     )
     .await

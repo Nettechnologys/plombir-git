@@ -3,8 +3,9 @@
 //! # Transports
 //! - **stdio** – run as subprocess of an AI agent.
 //!
-//! HTTP SSE transport is not implemented yet. Passing `--sse` exits with an
-//! error instead of silently starting a partial server.
+//! Over HTTP the same tools are served by the ForgeKeep server itself at
+//! `POST /api/v1/mcp`, with no local binary at all. Passing `--sse` exits with
+//! an error instead of silently starting a partial server.
 //!
 //! # Environment
 //! | Variable                        | Default                 | Notes                                      |
@@ -54,8 +55,9 @@ fn run_stdio(state: &AppState) -> io::Result<()> {
             }
         };
 
-        let resp = dispatch(state, &req);
-        write_json(&mut writer, &resp)?;
+        if let Some(resp) = rg_mcp::dispatch(state, &req) {
+            write_json(&mut writer, &resp)?;
+        }
     }
     Ok(())
 }
@@ -66,38 +68,6 @@ fn write_json<W: Write>(w: &mut W, resp: &JsonRpcResponse) -> io::Result<()> {
     writeln!(w, "{}", s)?;
     w.flush()?;
     Ok(())
-}
-
-fn dispatch(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
-    match req.method.as_str() {
-        "initialize" => handle_initialize(state, req),
-        "notifications/initialized" => make_success(req.id.clone(), serde_json::json!({})),
-        "tools/list" => rg_mcp::tools::list_tools(state, req),
-        "tools/call" => rg_mcp::tools::call_tool(state, req),
-        "resources/list" => rg_mcp::resources::list_resources(state, req),
-        "resources/read" => rg_mcp::resources::read_resource(state, req),
-        "notifications/cancelled" => make_success(req.id.clone(), serde_json::json!({})),
-        _ => make_error(
-            req.id.clone(),
-            -32601,
-            &format!("method not found: {}", req.method),
-        ),
-    }
-}
-
-fn handle_initialize(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
-    let result = serde_json::json!({
-        "protocolVersion": "2024-11-05",
-        "serverInfo": {
-            "name": "forgekeep-mcp",
-            "version": "0.1.0"
-        },
-        "capabilities": {
-            "tools": { "listChanged": true },
-            "resources": { "subscribe": false, "listChanged": true }
-        }
-    });
-    make_success(req.id.clone(), result)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -125,7 +95,7 @@ fn main() -> anyhow::Result<()> {
 
     if std::env::args().any(|a| a == "--sse") {
         anyhow::bail!(
-            "SSE transport is not implemented; use stdio by running forgekeep-mcp without --sse"
+            "SSE transport is not implemented; use stdio by running forgekeep-mcp without --sse, or point an HTTP MCP client at <server>/api/v1/mcp"
         );
     }
 

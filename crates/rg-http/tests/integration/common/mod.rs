@@ -317,6 +317,9 @@ pub struct StateOverrides {
     pub webhook_transport_policy: Option<rg_core::webhook::transport::WebhookTransportPolicy>,
     /// Overrides the decoded package artifact ceiling for boundary tests.
     pub package_upload_max_bytes: Option<usize>,
+    /// Replaces the bot-account limiter, which the harness leaves disabled so
+    /// no test trips over a budget it did not ask for.
+    pub agent_rate_limiter: Option<rg_http::rate_limit::RateLimiter>,
     /// Replaces this state's provenance signing identity.
     ///
     /// The default is derived from [`TEST_INSTANCE_KEY_SECRET`] rather than
@@ -439,6 +442,10 @@ pub fn build_test_app_state_with(
         // Empty memo over this state's own database — see
         // `rg_http::instance::InstanceSettingsCache`.
         instance_settings: Default::default(),
+        agent_rate_limiter: overrides
+            .agent_rate_limiter
+            .unwrap_or_else(|| rg_http::rate_limit::RateLimiter::new(0, 60)),
+        mcp_router: Default::default(),
     }
 }
 

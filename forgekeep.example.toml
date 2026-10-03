@@ -154,6 +154,11 @@ max_keys = 0
 # Set auth_max = 0 to disable it.
 auth_max = 10
 auth_window_secs = 60
+# Per-account limit for bot accounts (AI agents): every token of one bot shares
+# this budget, whatever address it calls from, and the MCP endpoint counts one
+# request per tool call. Independent of `max`; on by default. 0 disables it.
+agent_max = 600
+agent_window_secs = 60
 
 [smtp]
 # host = "smtp.example.com"

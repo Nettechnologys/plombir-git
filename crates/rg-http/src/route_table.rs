@@ -435,9 +435,20 @@ impl RouteTable {
         credential: Option<&'static str>,
         handler: &'static str,
     ) -> Self {
+        let full_path = format!("{}{}", self.prefix, path);
+        // Every route answers to a narrowed token's repository confinement,
+        // judged from the level declared right here — so a route cannot be
+        // added without it, and a handler cannot forget it
+        // (card_60a80311d512).
+        let gateway = full_path == crate::agent_scope::MCP_ENDPOINT_PATH;
+        let method_router = method_router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                crate::agent_scope::enforce(access, gateway, req, next)
+            },
+        ));
         self.facts.push(RouteFact {
             method,
-            path: format!("{}{}", self.prefix, path),
+            path: full_path,
             access,
             credential,
             handler,

@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
+  import BotBadge from '$lib/components/BotBadge.svelte';
   import {
     buildIssueLinksPayload,
     collaborators,
@@ -232,7 +233,7 @@
             {t(`issues.state.${issue.state}`, undefined, formatTranslationFallback(issue.state))}
           </span>
           <span class="text-secondary">
-            {t('issues.opened_by', { date: formatDate(issue.created_at), author: issue.author || t('common.unknown') })}
+            {t('issues.opened_by', { date: formatDate(issue.created_at), author: issue.author || t('common.unknown') })}<BotBadge owner={issue.author_bot_owner} />
           </span>
           {#if issue.labels?.length}
             {#each issue.labels as label}
@@ -272,7 +273,7 @@
       {#if issue.body}
         <div class="issue-body">
           <div class="comment-header">
-            {t('issues.commented', { author: issue.author || t('common.unknown'), date: formatDate(issue.created_at) })}
+            {t('issues.commented', { author: issue.author || t('common.unknown'), date: formatDate(issue.created_at) })}<BotBadge owner={issue.author_bot_owner} />
           </div>
           <div class="comment-body markdown-body">{@html renderMarkdown(issue.body)}</div>
         </div>
@@ -284,7 +285,7 @@
       {#each commentList as comment}
         <div class="comment">
           <div class="comment-header">
-            {t('issues.commented', { author: comment.author || t('common.unknown'), date: formatDate(comment.created_at) })}
+            {t('issues.commented', { author: comment.author || t('common.unknown'), date: formatDate(comment.created_at) })}<BotBadge owner={comment.author_bot_owner} />
           </div>
           <div class="comment-body markdown-body">{@html renderMarkdown(comment.body)}</div>
           <AttachmentPanel {owner} {repo} target="issues/comments" targetId={comment.id} />

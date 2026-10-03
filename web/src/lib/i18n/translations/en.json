@@ -58,7 +58,13 @@
     "chinese": "Chinese",
     "security": "Security",
     "ssh_keys": "SSH Keys",
-    "access_tokens": "Access Tokens"
+    "access_tokens": "Access Tokens",
+    "agents": "Agents"
+  },
+  "author": {
+    "bot": "bot",
+    "bot_title": "An AI agent account",
+    "on_behalf_of": "on behalf of"
   },
   "ssh_keys": {
     "title": "SSH Keys",

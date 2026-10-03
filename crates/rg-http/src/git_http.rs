@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use sea_orm::DatabaseConnection;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::pat_auth::extract_actor_id;
+use crate::pat_auth::{extract_git_credential, GitCredential};
 use crate::{git_v2, AppState};
 use rg_core::branch_protection::push_rules::{
     branch_protection_rejected_refs, signed_commit_required_refs, tag_protection_rejected_refs,
@@ -315,6 +315,74 @@ async fn check_git_access(
 /// Both halves read an allow-list out of a stored JSON column and both are
 /// fallible for the same reason, so they are joined here and the call site has
 /// one error to answer rather than two identical arms.
+/// Apply a Personal Access Token's narrowing to a git request.
+///
+/// Git is not behind the REST PAT middleware or the per-route layer, so the two
+/// confinements a token can carry are applied here: a token confined to MCP
+/// tools has no business on the git transport at all, and a token confined to
+/// repositories reaches only those. An unknown repository and one outside the
+/// allow-list answer alike, so the confinement is not an existence oracle.
+async fn git_grant_refusal(
+    state: &AppState,
+    credential: Option<&GitCredential>,
+    owner: &str,
+    repo: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), (StatusCode, [(header::HeaderName, &'static str); 1], String)> {
+    let Some(grant) = credential.and_then(|credential| credential.grant.as_ref()) else {
+        return Ok(());
+    };
+    let refusal = |message: String| {
+        (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/plain")],
+            message,
+        )
+    };
+    if grant.is_mcp_only() {
+        grant
+            .record_denial(
+                headers,
+                serde_json::json!({
+                    "reason": "mcp_only",
+                    "transport": "git",
+                    "repository": format!("{owner}/{repo}"),
+                }),
+            )
+            .await;
+        return Err(refusal(
+            "this token may be used only through the MCP endpoint".to_string(),
+        ));
+    }
+    if !grant.is_repo_restricted() {
+        return Ok(());
+    }
+    let admitted = match find_repo_by_name(&state.db, owner, repo).await {
+        Ok(found) => found.is_some_and(|found| grant.admits_repository(found.id)),
+        Err(e) => {
+            return Err((
+                git_db_status(&e),
+                [(header::CONTENT_TYPE, "text/plain")],
+                git_failure_body("load repository", &e),
+            ));
+        }
+    };
+    if admitted {
+        return Ok(());
+    }
+    grant
+        .record_denial(
+            headers,
+            serde_json::json!({
+                "reason": "repository_not_allowed",
+                "transport": "git",
+                "repository": format!("{owner}/{repo}"),
+            }),
+        )
+        .await;
+    Err(refusal(format!("this token may not access {owner}/{repo}")))
+}
+
 fn receive_pack_rejected_refs(
     protection_rules: Vec<rg_db::ops::protected_branch_ops::Rule>,
     tag_protection_rules: Vec<rg_db::ops::protected_tag_ops::Rule>,
@@ -830,8 +898,8 @@ pub(crate) async fn handle_info_refs(
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
     // Extract actor from auth header
-    let actor_id = match extract_actor_id(&state.db, &headers, &state.jwt_secret).await {
-        Ok(actor_id) => actor_id,
+    let credential = match extract_git_credential(&state.db, &headers, &state.jwt_secret).await {
+        Ok(credential) => credential,
         Err(e) => {
             return (
                 git_db_status(&e),
@@ -841,6 +909,11 @@ pub(crate) async fn handle_info_refs(
         }
     };
     let require_write = service == "git-receive-pack";
+    let actor_id = credential.as_ref().map(|credential| credential.user_id);
+    if let Err(resp) = git_grant_refusal(&state, credential.as_ref(), &owner, &repo, &headers).await
+    {
+        return resp;
+    }
 
     // Check access
     if let Err(resp) = check_git_access(&state.db, &owner, &repo, actor_id, require_write).await {
@@ -1020,8 +1093,8 @@ pub(crate) async fn handle_git_upload_pack(
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
     // Check read access
-    let actor_id = match extract_actor_id(&state.db, &headers, &state.jwt_secret).await {
-        Ok(actor_id) => actor_id,
+    let credential = match extract_git_credential(&state.db, &headers, &state.jwt_secret).await {
+        Ok(credential) => credential,
         Err(e) => {
             return (
                 git_db_status(&e),
@@ -1031,6 +1104,11 @@ pub(crate) async fn handle_git_upload_pack(
                 .into_response();
         }
     };
+    let actor_id = credential.as_ref().map(|credential| credential.user_id);
+    if let Err(resp) = git_grant_refusal(&state, credential.as_ref(), &owner, &repo, &headers).await
+    {
+        return (resp.0, resp.1, Body::from(resp.2)).into_response();
+    }
     if let Err(resp) = check_git_access(&state.db, &owner, &repo, actor_id, false).await {
         return (resp.0, resp.1, Body::from(resp.2)).into_response();
     }
@@ -1114,8 +1192,8 @@ pub(crate) async fn handle_git_receive_pack(
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
     // Check write access
-    let actor_id = match extract_actor_id(&state.db, &headers, &state.jwt_secret).await {
-        Ok(actor_id) => actor_id,
+    let credential = match extract_git_credential(&state.db, &headers, &state.jwt_secret).await {
+        Ok(credential) => credential,
         Err(e) => {
             return (
                 git_db_status(&e),
@@ -1124,6 +1202,11 @@ pub(crate) async fn handle_git_receive_pack(
             );
         }
     };
+    let actor_id = credential.as_ref().map(|credential| credential.user_id);
+    if let Err(resp) = git_grant_refusal(&state, credential.as_ref(), &owner, &repo, &headers).await
+    {
+        return (resp.0, resp.1, Body::from(resp.2));
+    }
     if let Err(resp) = check_git_access(&state.db, &owner, &repo, actor_id, true).await {
         return (resp.0, resp.1, Body::from(resp.2));
     }
@@ -1203,9 +1286,30 @@ pub(crate) async fn handle_git_receive_pack(
     // than "push to protected branch … is not allowed" — which would blame the
     // pusher for a broken row and, for a pusher who *is* on the list, be a lie.
     let require_signed_refs = signed_commit_required_refs(&protection_rules);
+    // A token kept off protected branches is refused every one of them, first,
+    // whatever the rules would let its account do (card_60a80311d512).
+    let token_rejections: Vec<(String, String)> = match credential
+        .as_ref()
+        .and_then(|credential| credential.grant.as_ref())
+        .filter(|grant| grant.denies_protected_writes())
+    {
+        Some(_) => protection_rules
+            .iter()
+            .map(|rule| {
+                (
+                    format!("refs/heads/{}", rule.protection.branch_name),
+                    format!(
+                        "this token may not write to protected branch '{}'",
+                        rule.protection.branch_name
+                    ),
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     let rejected_refs =
         match receive_pack_rejected_refs(protection_rules, tag_protection_rules, actor_id) {
-            Ok(refs) => refs,
+            Ok(refs) => token_rejections.into_iter().chain(refs).collect(),
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,

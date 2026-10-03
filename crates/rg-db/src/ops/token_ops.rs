@@ -7,6 +7,7 @@ use sea_orm::*;
 use crate::entities::access_token::{
     self, ActiveModel, Entity as TokenEntity, Model as AccessToken,
 };
+use crate::entities::access_token_repository;
 
 /// Find a token by id.
 pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<AccessToken>> {
@@ -35,9 +36,71 @@ pub async fn list_by_user(db: &DatabaseConnection, user_id: i64) -> Result<Vec<A
         .context("db: list access tokens by user")
 }
 
-/// Create a new access token.
-pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<AccessToken> {
-    model.insert(db).await.context("db: create access token")
+/// Create a token, together with the repositories it is confined to, in one
+/// transaction.
+///
+/// `repository_ids` is written only when the model sets `repo_restricted`;
+/// the rows and the flag either both land or neither does, so a failure can
+/// never publish a restricted token that silently reaches everything.
+pub async fn create(
+    db: &DatabaseConnection,
+    model: ActiveModel,
+    repository_ids: &[i64],
+) -> Result<AccessToken> {
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin restricted access token create")?;
+    let token = model
+        .insert(&transaction)
+        .await
+        .context("db: create access token")?;
+    if token.repo_restricted && !repository_ids.is_empty() {
+        let mut unique = repository_ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        access_token_repository::Entity::insert_many(unique.into_iter().map(|repository_id| {
+            access_token_repository::ActiveModel {
+                token_id: Set(token.id),
+                repository_id: Set(repository_id),
+            }
+        }))
+        .exec(&transaction)
+        .await
+        .context("db: record access token repositories")?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("db: commit restricted access token create")?;
+    Ok(token)
+}
+
+/// The repositories a restricted token may reach, keyed by token id.
+///
+/// Tokens with no rows are absent from the map; whether that means "nothing"
+/// or "unrestricted" is the token's own `repo_restricted` flag.
+pub async fn repository_ids_by_token(
+    db: &DatabaseConnection,
+    token_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, Vec<i64>>> {
+    let mut by_token: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+    if token_ids.is_empty() {
+        return Ok(by_token);
+    }
+    let rows = access_token_repository::Entity::find()
+        .filter(access_token_repository::Column::TokenId.is_in(token_ids.iter().copied()))
+        .order_by_asc(access_token_repository::Column::RepositoryId)
+        .all(db)
+        .await
+        .context("db: list access token repositories")?;
+    for row in rows {
+        by_token
+            .entry(row.token_id)
+            .or_default()
+            .push(row.repository_id);
+    }
+    Ok(by_token)
 }
 
 /// Record that a Personal Access Token was successfully authenticated.
@@ -105,7 +168,9 @@ mod tests {
                 expires_at: sea_orm::Set(None),
                 last_used_at: sea_orm::Set(None),
                 created_at: sea_orm::Set(Utc::now()),
+                ..Default::default()
             },
+            &[],
         )
         .await
         .expect("create test token");

@@ -148,6 +148,7 @@ pub async fn record(
     details: Option<serde_json::Value>,
 ) {
     let (ip_address, user_agent) = headers.map(extract_ip_and_ua).unwrap_or((None, None));
+    let details = with_credential(details, crate::auth::credential_context::current());
 
     let entry = audit_log::ActiveModel {
         id: NotSet,
@@ -174,6 +175,41 @@ pub async fn record(
             "audit event not written — this action leaves no trace in the audit log"
         );
     }
+}
+
+/// Stamp the credential the request came through onto an audit row's details.
+///
+/// An action an agent took through a Personal Access Token — and, on this
+/// instance's MCP endpoint, through which tool — is otherwise indistinguishable
+/// from the same action taken in the browser: the actor column names the
+/// account and nothing else. The stamp lives under one key, `credential`, so it
+/// can never overwrite a field the caller wrote.
+fn with_credential(
+    details: Option<serde_json::Value>,
+    credential: Option<crate::auth::credential_context::CredentialContext>,
+) -> Option<serde_json::Value> {
+    let Some(credential) = credential.filter(|c| c.token_id.is_some() || c.mcp_tool.is_some())
+    else {
+        return details;
+    };
+    let mut stamp = serde_json::Map::new();
+    if let Some(token_id) = credential.token_id {
+        stamp.insert("token_id".to_string(), token_id.into());
+    }
+    if let Some(tool) = credential.mcp_tool {
+        stamp.insert("mcp_tool".to_string(), tool.into());
+    }
+    let mut object = match details {
+        Some(serde_json::Value::Object(object)) => object,
+        None => serde_json::Map::new(),
+        Some(other) => {
+            let mut object = serde_json::Map::new();
+            object.insert("value".to_string(), other);
+            object
+        }
+    };
+    object.insert("credential".to_string(), serde_json::Value::Object(stamp));
+    Some(serde_json::Value::Object(object))
 }
 
 /// Client IP and User-Agent, as far as either can be trusted.
@@ -301,6 +337,40 @@ mod tests {
             Some("203.0.113.7"),
             "the client-facing hop is the first entry"
         );
+    }
+
+    /// A row written while a token is the request's credential says which one,
+    /// and through which MCP tool — under its own key, never over a caller's.
+    #[test]
+    fn the_credential_is_stamped_under_its_own_key() {
+        use crate::auth::credential_context::CredentialContext;
+        let credential = CredentialContext {
+            user_id: 7,
+            token_id: Some(11),
+            mcp_tool: Some("create_pr".to_string()),
+            deny_protected_writes: false,
+        };
+
+        let stamped = with_credential(
+            Some(serde_json::json!({"number": 3, "credential": "caller's"})),
+            Some(credential.clone()),
+        )
+        .unwrap();
+        assert_eq!(stamped["number"], 3);
+        assert_eq!(stamped["credential"]["token_id"], 11);
+        assert_eq!(stamped["credential"]["mcp_tool"], "create_pr");
+
+        let wrapped = with_credential(Some(serde_json::json!("text")), Some(credential)).unwrap();
+        assert_eq!(wrapped["value"], "text");
+        assert_eq!(wrapped["credential"]["token_id"], 11);
+
+        // A browser session publishes no token: the row stays as written.
+        let session = CredentialContext {
+            user_id: 7,
+            ..Default::default()
+        };
+        assert_eq!(with_credential(None, Some(session)), None);
+        assert_eq!(with_credential(None, None), None);
     }
 
     /// The User-Agent's length is the client's choice, so the column's is ours.

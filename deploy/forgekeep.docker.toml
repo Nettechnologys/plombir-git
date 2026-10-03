@@ -85,6 +85,9 @@ window_secs = 60
 # trusted_proxies = ["172.17.0.1"]
 auth_max = 10
 auth_window_secs = 60
+# Per-account limit shared by every token of one bot account (AI agent).
+agent_max = 600
+agent_window_secs = 60
 
 [logging]
 # Left unset on purpose: with no `file`, the server logs to stdout, which is

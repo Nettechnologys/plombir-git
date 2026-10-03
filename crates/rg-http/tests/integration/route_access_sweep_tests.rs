@@ -392,6 +392,21 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
          outsider is answered 404 by the ownership check behind the gate. The owner's cell is real",
     ),
     (
+        "outsider global DELETE /api/v1/users/bots/{bot}",
+        "the bot is the owner's, and somebody else's bot is answered exactly like no bot: the \
+         outsider is 404 by the ownership check behind the gate. The owner's cell is real",
+    ),
+    (
+        "outsider global GET /api/v1/users/bots/{bot}/tokens",
+        "the bot is the owner's: the outsider is 404 by the ownership check behind the gate. The \
+         owner's cell is real",
+    ),
+    (
+        "outsider global DELETE /api/v1/users/bots/{bot}/tokens/{id}",
+        "the bot and its token are the owner's: the outsider is 404 by the ownership check behind \
+         the gate. The owner's cell is real",
+    ),
+    (
         "GET /api/v1/auth/sso/{slug}",
         "no SSO provider is configured on this instance",
     ),
@@ -951,11 +966,17 @@ async fn create_org_with_teams(
 /// however much this seeds, because the row behind the gate is somebody else's.
 /// That is the route's own ownership check rather than a fixture gap, and it is
 /// signed off cell by cell in [`VACUOUS_ALLOW`].
-async fn seed_owner_rows(
-    fx: &Fixture,
-    db: &rg_db::DatabaseConnection,
-    owner_id: i64,
-) -> (String, String, String) {
+/// The owner's own rows the global routes address.
+struct OwnerRows {
+    ssh_key_id: String,
+    token_id: String,
+    notification_id: String,
+    bot: String,
+    doomed_bot: String,
+    bot_token_id: String,
+}
+
+async fn seed_owner_rows(fx: &Fixture, db: &rg_db::DatabaseConnection, owner_id: i64) -> OwnerRows {
     let id_of = |what: &'static str, body: &str| {
         serde_json::from_str::<serde_json::Value>(body)
             .ok()
@@ -1006,8 +1027,41 @@ async fn seed_owner_rows(
     .await
     .unwrap_or_else(|error| panic!("fixture: seeding the owner's notification failed: {error}"));
 
-    (ssh_key_id, token_id, notification.id.to_string())
+    // Two bots for the reason the `doomed_*` seeds exist: the owner's pass runs
+    // `DELETE /users/bots/{bot}` before the token routes hanging under it.
+    created(
+        "bot",
+        "/api/v1/users/bots",
+        serde_json::json!({"username": SWEEP_BOT}),
+    )
+    .await;
+    created(
+        "doomed bot",
+        "/api/v1/users/bots",
+        serde_json::json!({"username": SWEEP_DOOMED_BOT}),
+    )
+    .await;
+    let bot_token_id = created(
+        "bot token",
+        "/api/v1/users/bots/sweepowner-agent/tokens",
+        serde_json::json!({"name": "sweep-agent"}),
+    )
+    .await;
+
+    OwnerRows {
+        ssh_key_id,
+        token_id,
+        notification_id: notification.id.to_string(),
+        bot: SWEEP_BOT.to_string(),
+        doomed_bot: SWEEP_DOOMED_BOT.to_string(),
+        bot_token_id,
+    }
 }
+
+/// The owner's bot the `/users/bots/{bot}/...` routes are pointed at, and the
+/// one `DELETE /users/bots/{bot}` takes.
+const SWEEP_BOT: &str = "sweepowner-agent";
+const SWEEP_DOOMED_BOT: &str = "sweepowner-doomed-agent";
 
 /// What the fixture actually seeded in one repository, for the placeholders a
 /// constant cannot fill.
@@ -1179,6 +1233,11 @@ struct GlobalSeed {
     /// routes stays a `404` and always will — see the note on
     /// [`VACUOUS_ALLOW`]'s cell-keyed entries.
     notification_id: String,
+    /// The owner's bot, the one `DELETE /users/bots/{bot}` removes, and a token
+    /// of the first.
+    bot: String,
+    doomed_bot: String,
+    bot_token_id: String,
 }
 
 impl GlobalSeed {
@@ -1194,6 +1253,9 @@ impl GlobalSeed {
             ssh_key_id: absent(),
             token_id: absent(),
             notification_id: absent(),
+            bot: "nosuchbot".to_string(),
+            doomed_bot: "nosuchbot".to_string(),
+            bot_token_id: absent(),
         }
     }
 }
@@ -1899,6 +1961,9 @@ fn fill(fact: &RouteFact, repo: &RepoSeed, globals: &GlobalSeed, org: &str) -> S
             "id" if path.contains("/notifications/{id}") => &globals.notification_id,
             "id" if path.contains("/users/ssh-keys/{id}") => &globals.ssh_key_id,
             "id" if path.contains("/users/tokens/{id}") => &globals.token_id,
+            "id" if path.contains("/users/bots/{bot}/tokens/{id}") => &globals.bot_token_id,
+            "bot" if deletes && path.ends_with("/users/bots/{bot}") => &globals.doomed_bot,
+            "bot" => &globals.bot,
             "col_id" if deletes => &repo.doomed_board_column_id,
             "col_id" => &repo.board_column_id,
             "card_id" => &repo.board_card_id,
@@ -2256,15 +2321,18 @@ async fn every_route_answers_its_declared_access_level() {
     let private_repo_id = create_repo(&fx, PRIVATE_REPO, true).await;
     let public_repo_id = create_repo(&fx, PUBLIC_REPO, false).await;
     let (team_id, doomed_team_id) = create_org_with_teams(&fx, &org_member, &team_member).await;
-    let (ssh_key_id, token_id, notification_id) = seed_owner_rows(&fx, &db, owner_id).await;
+    let owner_rows = seed_owner_rows(&fx, &db, owner_id).await;
     let globals = GlobalSeed {
         team_id,
         doomed_team_id,
         org_member_id: org_member.id.to_string(),
         team_member_id: team_member.id.to_string(),
-        ssh_key_id,
-        token_id,
-        notification_id,
+        ssh_key_id: owner_rows.ssh_key_id,
+        token_id: owner_rows.token_id,
+        notification_id: owner_rows.notification_id,
+        bot: owner_rows.bot,
+        doomed_bot: owner_rows.doomed_bot,
+        bot_token_id: owner_rows.bot_token_id,
     };
     // One artifact in the *private* repository, which is what makes the anchored
     // rows judgeable at all: without it every anchored route answers `404` for

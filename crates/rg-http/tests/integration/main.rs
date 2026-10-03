@@ -22,6 +22,7 @@
 //! is the gate, already runs every test in its own process.
 
 mod access_grant_audit_guard;
+mod agent_accounts_tests;
 mod common;
 
 mod account_deletion_serialized_grant_tests;

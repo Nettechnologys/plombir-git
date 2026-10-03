@@ -1128,6 +1128,9 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
             "recipient",
         )
         .await
+        // A bot's address is a placeholder under `.invalid`: no mailbox to
+        // reach, only a failed SMTP round trip per push (card_60a80311d512).
+        .filter(|owner_user| !owner_user.is_bot())
         {
             let subject = format!(
                 "[ForgeKeep] CI pipeline #{} triggered for {}/{}",

@@ -207,6 +207,13 @@ impl RateLimiter {
         true
     }
 
+    /// Spend one request from `key`'s budget — for a limiter keyed by an
+    /// identity rather than by the client address, such as the bot-account
+    /// limiter the PAT middleware drives. `true` when the request may proceed.
+    pub(crate) fn allow_key(&self, key: &str) -> bool {
+        self.allow(key)
+    }
+
     /// Clean up expired entries. Called periodically by the background task.
     fn cleanup(&self) {
         let mut guard = match self.clients.lock() {

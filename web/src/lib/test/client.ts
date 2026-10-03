@@ -17,6 +17,7 @@ export {
 	parseStringList,
 } from '../api/branchProtectionForm';
 export { buildIssueLinksPayload } from '../api/issueForm';
+export { splitList } from '../api/tokens';
 export { buildLabelPayload } from '../api/labelForm';
 export {
 	buildMilestoneCreatePayload,
@@ -52,6 +53,7 @@ export const artifacts = namespace();
 export const attachments = namespace();
 export const auth = namespace();
 export const boards = namespace();
+export const bots = namespace();
 export const branchProtections = namespace();
 export const ciEnvironments = namespace();
 export const ciRetention = namespace();

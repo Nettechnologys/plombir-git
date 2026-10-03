@@ -476,6 +476,71 @@
     },
     {
       "method": "GET",
+      "url": "/api/v1/users/bots",
+      "access": "User",
+      "handler": "api::bots::list_bots",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/users/bots",
+      "access": "User",
+      "handler": "api::bots::create_bot",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/users/bots/{bot}",
+      "access": "User",
+      "handler": "api::bots::delete_bot",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/users/bots/{bot}/tokens",
+      "access": "User",
+      "handler": "api::bots::list_bot_tokens",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/users/bots/{bot}/tokens",
+      "access": "User",
+      "handler": "api::bots::create_bot_token",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/users/bots/{bot}/tokens/{id}",
+      "access": "User",
+      "handler": "api::bots::delete_bot_token",
+      "testedIn": [
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
       "url": "/api/v1/users/ssh-keys",
       "access": "User",
       "handler": "api::ssh_keys::list_ssh_keys",
@@ -4373,6 +4438,16 @@
       "reachedFromUi": false
     },
     {
+      "method": "POST",
+      "url": "/api/v1/mcp",
+      "access": "User",
+      "handler": "api::mcp::mcp_endpoint",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
+    },
+    {
       "method": "GET",
       "url": "/api/v1/ws/notifications",
       "access": "Foreign:ws.rs",
@@ -7063,7 +7138,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.open",
-          "line": 208,
+          "line": 209,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('open')",
@@ -7088,7 +7163,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.closed",
-          "line": 215,
+          "line": 216,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('closed')",
@@ -7113,7 +7188,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.all",
-          "line": 222,
+          "line": 223,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('all')",
@@ -7138,7 +7213,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.new",
-          "line": 230,
+          "line": 231,
           "via": null,
           "href": null,
           "handler": "openCreate",
@@ -7185,7 +7260,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.create_form.cancel",
-          "line": 242,
+          "line": 243,
           "via": null,
           "href": null,
           "handler": "() => showChooser = false",
@@ -7195,7 +7270,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.templates.get_started",
-          "line": 251,
+          "line": 252,
           "via": null,
           "href": null,
           "handler": "() => chooseTemplate(template)",
@@ -7205,7 +7280,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.templates.open_blank",
-          "line": 260,
+          "line": 261,
           "via": null,
           "href": null,
           "handler": "() => chooseTemplate()",
@@ -7215,7 +7290,7 @@
         {
           "tag": "a",
           "label": "i18n:issues.templates.open_link",
-          "line": 269,
+          "line": 270,
           "via": null,
           "href": "link.url",
           "handler": null,
@@ -7225,7 +7300,7 @@
         {
           "tag": "form",
           "label": "toggleLabel(label.name, event.currentTarget.checked)} /> }>",
-          "line": 278,
+          "line": 279,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -7272,7 +7347,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 285,
+          "line": 286,
           "via": null,
           "href": null,
           "handler": null,
@@ -7282,7 +7357,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 303,
+          "line": 304,
           "via": null,
           "href": null,
           "handler": "(event) => toggleLabel(label.name, event.currentTarget.checked)",
@@ -7292,7 +7367,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.create_form.submit",
-          "line": 317,
+          "line": 318,
           "via": null,
           "href": null,
           "handler": null,
@@ -7302,7 +7377,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.create_form.cancel",
-          "line": 318,
+          "line": 319,
           "via": null,
           "href": null,
           "handler": "() => { showCreate = false; if (issueTemplates.length > 0 || templateConfig.cont",
@@ -7312,7 +7387,7 @@
         {
           "tag": "a",
           "label": ")}",
-          "line": 337,
+          "line": 338,
           "via": null,
           "href": "`/${owner}/${repo}/issues/${issue.number}`",
           "handler": null,
@@ -7533,6 +7608,16 @@
           "handler": null,
           "calls": [],
           "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "@",
+          "line": 14,
+          "via": "BotBadge",
+          "href": "`/${owner}`",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
         }
       ],
       "passive": [
@@ -7574,7 +7659,7 @@
         {
           "tag": "select",
           "label": "i18n:issues.unassigned",
-          "line": 250,
+          "line": 251,
           "via": null,
           "href": null,
           "handler": null,
@@ -7584,7 +7669,7 @@
         {
           "tag": "select",
           "label": "· `, undefined, formatTranslationFallback(milestone.state))}",
-          "line": 259,
+          "line": 260,
           "via": null,
           "href": null,
           "handler": null,
@@ -7594,7 +7679,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 266,
+          "line": 267,
           "via": null,
           "href": null,
           "handler": "saveLinks",
@@ -7619,7 +7704,7 @@
         {
           "tag": "form",
           "label": "i18n:issues.comment_placeholder",
-          "line": 295,
+          "line": 296,
           "via": null,
           "href": null,
           "handler": "handleComment",
@@ -7733,7 +7818,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 296,
+          "line": 297,
           "via": null,
           "href": null,
           "handler": null,
@@ -7743,7 +7828,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.comment",
-          "line": 298,
+          "line": 299,
           "via": null,
           "href": null,
           "handler": null,
@@ -7753,7 +7838,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.close_issue",
-          "line": 299,
+          "line": 300,
           "via": null,
           "href": null,
           "handler": "toggleState",
@@ -8065,6 +8150,26 @@
           "unresolved": false
         },
         {
+          "tag": "a",
+          "label": "@",
+          "line": 14,
+          "via": "BotBadge",
+          "href": "`/${owner}`",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "@",
+          "line": 14,
+          "via": "BotBadge",
+          "href": "`/${owner}`",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
           "tag": "input",
           "label": "",
           "line": 79,
@@ -8141,6 +8246,16 @@
               ]
             }
           ],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "@",
+          "line": 14,
+          "via": "BotBadge",
+          "href": "`/${owner}`",
+          "handler": null,
+          "calls": [],
           "unresolved": false
         },
         {
@@ -11891,7 +12006,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.open",
-          "line": 198,
+          "line": 199,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('open')",
@@ -11916,7 +12031,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.closed",
-          "line": 205,
+          "line": 206,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('closed')",
@@ -11941,7 +12056,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.merged",
-          "line": 212,
+          "line": 213,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('merged')",
@@ -11966,7 +12081,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.new",
-          "line": 220,
+          "line": 221,
           "via": null,
           "href": null,
           "handler": "openCreate",
@@ -11995,7 +12110,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 231,
+          "line": 232,
           "via": null,
           "href": null,
           "handler": "() => loadBranches(owner, repo, routeGeneration)",
@@ -12019,7 +12134,7 @@
         {
           "tag": "form",
           "label": "→ showCreate = false}>",
-          "line": 241,
+          "line": 242,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -12066,7 +12181,7 @@
         {
           "tag": "select",
           "label": "i18n:pulls.create_form.select_branch",
-          "line": 245,
+          "line": 246,
           "via": null,
           "href": null,
           "handler": null,
@@ -12076,7 +12191,7 @@
         {
           "tag": "select",
           "label": "i18n:repo.browser.default_branch",
-          "line": 255,
+          "line": 256,
           "via": null,
           "href": null,
           "handler": null,
@@ -12086,7 +12201,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 268,
+          "line": 269,
           "via": null,
           "href": null,
           "handler": null,
@@ -12096,7 +12211,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 271,
+          "line": 272,
           "via": null,
           "href": null,
           "handler": null,
@@ -12106,7 +12221,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.create_form.submit",
-          "line": 275,
+          "line": 276,
           "via": null,
           "href": null,
           "handler": null,
@@ -12116,7 +12231,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.create_form.cancel",
-          "line": 276,
+          "line": 277,
           "via": null,
           "href": null,
           "handler": "() => showCreate = false",
@@ -12126,7 +12241,7 @@
         {
           "tag": "a",
           "label": "# opened by →",
-          "line": 293,
+          "line": 294,
           "via": null,
           "href": "`/${owner}/${repo}/pulls/${pr.number}`",
           "handler": null,
@@ -12347,6 +12462,16 @@
           "handler": null,
           "calls": [],
           "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "@",
+          "line": 14,
+          "via": "BotBadge",
+          "href": "`/${owner}`",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
         }
       ],
       "passive": [
@@ -12374,7 +12499,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 521,
+          "line": 522,
           "via": null,
           "href": null,
           "handler": "reloadPR",
@@ -12483,7 +12608,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.mark_ready",
-          "line": 542,
+          "line": 543,
           "via": null,
           "href": null,
           "handler": "toggleDraft",
@@ -12512,7 +12637,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.conversation",
-          "line": 562,
+          "line": 563,
           "via": null,
           "href": null,
           "handler": "() => activeTab = 'conversation'",
@@ -12522,7 +12647,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.changes",
-          "line": 565,
+          "line": 566,
           "via": null,
           "href": null,
           "handler": "() => activeTab = 'diff'",
@@ -12532,7 +12657,7 @@
         {
           "tag": "button",
           "label": "( )",
-          "line": 568,
+          "line": 569,
           "via": null,
           "href": null,
           "handler": "() => activeTab = 'review'",
@@ -12542,7 +12667,7 @@
         {
           "tag": "button",
           "label": "×",
-          "line": 585,
+          "line": 586,
           "via": null,
           "href": null,
           "handler": "() => removeReviewer(reviewer.username)",
@@ -12570,7 +12695,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.reviewers.request",
-          "line": 596,
+          "line": 597,
           "via": null,
           "href": null,
           "handler": "requestReviewer",
@@ -12612,7 +12737,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.fork_ci.approving",
-          "line": 609,
+          "line": 610,
           "via": null,
           "href": null,
           "handler": "approveForkCi",
@@ -12734,7 +12859,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.leave_queue",
-          "line": 626,
+          "line": 627,
           "via": null,
           "href": null,
           "handler": "cancelQueuedMerge",
@@ -12859,7 +12984,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.disable_auto",
-          "line": 637,
+          "line": 638,
           "via": null,
           "href": null,
           "handler": "disableAutoMerge",
@@ -12886,7 +13011,7 @@
         {
           "tag": "select",
           "label": "i18n:pulls.merge.strategy.merge",
-          "line": 643,
+          "line": 644,
           "via": null,
           "href": null,
           "handler": null,
@@ -12896,7 +13021,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.merging",
-          "line": 648,
+          "line": 649,
           "via": null,
           "href": null,
           "handler": "handleMerge",
@@ -13019,7 +13144,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.enabling_auto",
-          "line": 651,
+          "line": 652,
           "via": null,
           "href": null,
           "handler": "enableAutoMerge",
@@ -13145,7 +13270,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.joining_queue",
-          "line": 654,
+          "line": 655,
           "via": null,
           "href": null,
           "handler": "enqueueMerge",
@@ -13271,7 +13396,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.dismissing",
-          "line": 702,
+          "line": 703,
           "via": null,
           "href": null,
           "handler": "() => dismissReview(verdict.id)",
@@ -13394,7 +13519,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.dismiss_cancel",
-          "line": 709,
+          "line": 710,
           "via": null,
           "href": null,
           "handler": "cancelDismissal",
@@ -13404,7 +13529,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.dismiss",
-          "line": 712,
+          "line": 713,
           "via": null,
           "href": null,
           "handler": "() => startDismissal(verdict.id)",
@@ -13414,7 +13539,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.suggestion.applying_selected",
-          "line": 726,
+          "line": 727,
           "via": null,
           "href": null,
           "handler": "applySelectedSuggestions",
@@ -13536,7 +13661,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 751,
+          "line": 752,
           "via": null,
           "href": null,
           "handler": "() => toggleSuggestionSelection(comment.id)",
@@ -13546,7 +13671,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.suggestion.apply",
-          "line": 768,
+          "line": 769,
           "via": null,
           "href": null,
           "handler": "() => applySuggestion(comment)",
@@ -13668,7 +13793,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.threads.reopen",
-          "line": 779,
+          "line": 780,
           "via": null,
           "href": null,
           "handler": "() => setThreadResolved(comment, !comment.resolved_at)",
@@ -13704,7 +13829,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 816,
+          "line": 817,
           "via": null,
           "href": null,
           "handler": "() => startInlineComment(target, line.content)",
@@ -13714,7 +13839,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.suggestion.apply",
-          "line": 836,
+          "line": 837,
           "via": null,
           "href": null,
           "handler": "() => applySuggestion(comment)",
@@ -13836,7 +13961,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.threads.reopen",
-          "line": 845,
+          "line": 846,
           "via": null,
           "href": null,
           "handler": "() => setThreadResolved(comment, !comment.resolved_at)",
@@ -13877,7 +14002,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 852,
+          "line": 853,
           "via": null,
           "href": null,
           "handler": null,
@@ -13887,7 +14012,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 854,
+          "line": 855,
           "via": null,
           "href": null,
           "handler": null,
@@ -13897,7 +14022,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 860,
+          "line": 861,
           "via": null,
           "href": null,
           "handler": null,
@@ -13907,7 +14032,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.diff.submit_comment",
-          "line": 864,
+          "line": 865,
           "via": null,
           "href": null,
           "handler": "submitInlineComment",
@@ -13949,7 +14074,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 865,
+          "line": 866,
           "via": null,
           "href": null,
           "handler": "() => commentTarget = null",
@@ -13959,7 +14084,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 876,
+          "line": 877,
           "via": null,
           "href": null,
           "handler": "reloadPR",
@@ -14068,7 +14193,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 890,
+          "line": 891,
           "via": null,
           "href": null,
           "handler": null,
@@ -14078,7 +14203,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 894,
+          "line": 895,
           "via": null,
           "href": null,
           "handler": null,
@@ -14088,7 +14213,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 898,
+          "line": 899,
           "via": null,
           "href": null,
           "handler": null,
@@ -14098,7 +14223,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 902,
+          "line": 903,
           "via": null,
           "href": null,
           "handler": null,
@@ -14108,7 +14233,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.submit",
-          "line": 903,
+          "line": 904,
           "via": null,
           "href": null,
           "handler": "handleSubmitReview",
@@ -14470,6 +14595,26 @@
           "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "@",
+          "line": 14,
+          "via": "BotBadge",
+          "href": "`/${owner}`",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "@",
+          "line": 14,
+          "via": "BotBadge",
+          "href": "`/${owner}`",
           "handler": null,
           "calls": [],
           "unresolved": false
@@ -21237,8 +21382,18 @@
         },
         {
           "tag": "a",
-          "label": "Explore repositories",
+          "label": "Manage agents",
           "line": 28,
+          "via": null,
+          "href": "/settings/agents",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "Explore repositories",
+          "line": 34,
           "via": null,
           "href": "/explore",
           "handler": null,
@@ -21248,7 +21403,7 @@
         {
           "tag": "a",
           "label": "Search code and issues",
-          "line": 29,
+          "line": 35,
           "via": null,
           "href": "/search",
           "handler": null,
@@ -21258,7 +21413,7 @@
         {
           "tag": "a",
           "label": "Import repositories",
-          "line": 30,
+          "line": 36,
           "via": null,
           "href": "/imports",
           "handler": null,
@@ -22635,6 +22790,254 @@
       ]
     },
     {
+      "route": "/settings/agents",
+      "file": "web/src/routes/settings/agents/+page.svelte",
+      "admin": false,
+      "controls": [
+        {
+          "tag": "form",
+          "label": "Username Display name",
+          "line": 249,
+          "via": null,
+          "href": null,
+          "handler": "createBot",
+          "calls": [
+            {
+              "symbol": "bots.create",
+              "method": "POST",
+              "url": "/api/v1/users/bots",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/bots",
+              "access": "User",
+              "handler": "api::bots::create_bot",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "bots.list",
+              "method": "GET",
+              "url": "/api/v1/users/bots",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/bots",
+              "access": "User",
+              "handler": "api::bots::list_bots",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 258,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "@",
+          "line": 277,
+          "via": null,
+          "href": "`/${bot.username}`",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 283,
+          "via": null,
+          "href": null,
+          "handler": "() => openTokens(bot)",
+          "calls": [
+            {
+              "symbol": "bots.listTokens",
+              "method": "GET",
+              "url": "/api/v1/users/bots/{bot}/tokens",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/bots/{bot}/tokens",
+              "access": "User",
+              "handler": "api::bots::list_bot_tokens",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 286,
+          "via": null,
+          "href": null,
+          "handler": "() => deleteBot(bot)",
+          "calls": [
+            {
+              "symbol": "bots.delete",
+              "method": "DELETE",
+              "url": "/api/v1/users/bots/{bot}",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/bots/{bot}",
+              "access": "User",
+              "handler": "api::bots::delete_bot",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "bots.list",
+              "method": "GET",
+              "url": "/api/v1/users/bots",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/bots",
+              "access": "User",
+              "handler": "api::bots::list_bots",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "Copy",
+          "line": 306,
+          "via": null,
+          "href": null,
+          "handler": "copyNewToken",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "form",
+          "label": "Token name Expires Repositories (owner/name, one per line or",
+          "line": 310,
+          "via": null,
+          "href": null,
+          "handler": "mintToken",
+          "calls": [
+            {
+              "symbol": "bots.createToken",
+              "method": "POST",
+              "url": "/api/v1/users/bots/{bot}/tokens",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/bots/{bot}/tokens",
+              "access": "User",
+              "handler": "api::bots::create_bot_token",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "bots.listTokens",
+              "method": "GET",
+              "url": "/api/v1/users/bots/{bot}/tokens",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/bots/{bot}/tokens",
+              "access": "User",
+              "handler": "api::bots::list_bot_tokens",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "textarea",
+          "label": "",
+          "line": 321,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 328,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 331,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 364,
+          "via": null,
+          "href": null,
+          "handler": "() => revokeToken(token)",
+          "calls": [
+            {
+              "symbol": "bots.deleteToken",
+              "method": "DELETE",
+              "url": "/api/v1/users/bots/{bot}/tokens/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/bots/{bot}/tokens/{id}",
+              "access": "User",
+              "handler": "api::bots::delete_bot_token",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            },
+            {
+              "symbol": "bots.listTokens",
+              "method": "GET",
+              "url": "/api/v1/users/bots/{bot}/tokens",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/bots/{bot}/tokens",
+              "access": "User",
+              "handler": "api::bots::list_bot_tokens",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        }
+      ],
+      "passive": []
+    },
+    {
       "route": "/settings/security",
       "file": "web/src/routes/settings/security/+page.svelte",
       "admin": false,
@@ -23163,7 +23566,7 @@
         {
           "tag": "button",
           "label": "Copy",
-          "line": 157,
+          "line": 170,
           "via": null,
           "href": null,
           "handler": "copyNewToken",
@@ -23173,7 +23576,7 @@
         {
           "tag": "form",
           "label": "Name Scopes Expires",
-          "line": 163,
+          "line": 176,
           "via": null,
           "href": null,
           "handler": "createToken",
@@ -23212,7 +23615,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 176,
+          "line": 189,
           "via": null,
           "href": null,
           "handler": null,
@@ -23222,7 +23625,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 211,
+          "line": 227,
           "via": null,
           "href": null,
           "handler": "() => revokeToken(token)",
@@ -23267,7 +23670,7 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 659,
+    "inventoryEntries": 668,
     "coveredEntries": 158,
     "coveredRoutes": 150,
     "maxUiRoutesWithoutFrontendTest": 27

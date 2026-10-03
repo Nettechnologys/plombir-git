@@ -1,81 +1,99 @@
 //! Thin async client for the ForgeKeep REST API.
 //!
-//! Wraps `reqwest::Client` and adds:
-//! - `/api/v1/` prefix
-//! - Bearer token injection
+//! Adds to whichever [`crate::Backend`] the state carries:
+//! - the `/api/v1/` prefix
+//! - Bearer token injection (HTTP backend; the in-process one authenticates
+//!   itself)
 //! - Status-code → `crate::Error` conversion
 
-use super::AppState;
+use super::{AppState, Backend};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 pub struct ApiClient {
-    inner: reqwest::Client,
-    base: String,
+    backend: Backend,
 }
 
 impl ApiClient {
     pub fn new(state: &AppState) -> Self {
         Self {
-            inner: state.http_client(),
-            base: state.api_base.trim_end_matches('/').to_string(),
+            backend: state.backend.clone(),
         }
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}/api/v1/{}", self.base, path.trim_start_matches('/'))
+    fn api_path(path: &str) -> String {
+        format!("/api/v1/{}", path.trim_start_matches('/'))
+    }
+
+    /// One exchange: the status and the whole body, successful or not.
+    async fn exchange(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> crate::Result<(u16, Vec<u8>)> {
+        match &self.backend {
+            Backend::Http { api_base, client } => {
+                let url = format!("{}{}", api_base.trim_end_matches('/'), Self::api_path(path));
+                let mut builder = client.request(method, url);
+                if let Some(json) = body {
+                    builder = builder.json(json);
+                }
+                let resp = builder.send().await?;
+                let status = resp.status().as_u16();
+                Ok((status, resp.bytes().await?.to_vec()))
+            }
+            Backend::InProcess(transport) => {
+                let response = transport
+                    .exchange(method, Self::api_path(path), body.cloned())
+                    .await?;
+                Ok((response.status, response.body))
+            }
+        }
+    }
+
+    /// [`exchange`](Self::exchange), with a non-2xx answer turned into
+    /// `Error::Api` so tool handlers can surface backend errors.
+    async fn success(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> crate::Result<Vec<u8>> {
+        let (status, bytes) = self.exchange(method, path, body).await?;
+        if !(200..300).contains(&status) {
+            return Err(super::Error::Api {
+                status,
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        Ok(bytes)
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> crate::Result<T> {
-        let resp = self.inner.get(self.url(path)).send().await?;
-        let status = resp.status().as_u16();
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(super::Error::Api { status, body });
-        }
-        Ok(resp.json().await?)
+        let bytes = self.success(reqwest::Method::GET, path, None).await?;
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     pub async fn get_raw(&self, path: &str) -> crate::Result<String> {
-        let resp = self.inner.get(self.url(path)).send().await?;
-        let status = resp.status().as_u16();
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(super::Error::Api { status, body });
-        }
-        Ok(resp.text().await?)
+        let bytes = self.success(reqwest::Method::GET, path, None).await?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     pub async fn get_bytes(&self, path: &str) -> crate::Result<Vec<u8>> {
-        let resp = self.inner.get(self.url(path)).send().await?;
-        let status = resp.status().as_u16();
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(super::Error::Api { status, body });
-        }
-        Ok(resp.bytes().await?.to_vec())
+        self.success(reqwest::Method::GET, path, None).await
     }
 
     /// Send a write request (POST/PATCH/PUT/DELETE) with an optional JSON body
-    /// and return the response as text. Non-2xx responses become `Error::Api`,
-    /// mirroring the read helpers so tool handlers can surface backend errors.
+    /// and return the response as text.
     async fn send(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<&Value>,
     ) -> crate::Result<String> {
-        let mut builder = self.inner.request(method, self.url(path));
-        if let Some(json) = body {
-            builder = builder.json(json);
-        }
-        let resp = builder.send().await?;
-        let status = resp.status().as_u16();
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(super::Error::Api { status, body });
-        }
-        Ok(resp.text().await?)
+        let bytes = self.success(method, path, body).await?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// POST with a JSON body.

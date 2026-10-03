@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
+  import BotBadge from '$lib/components/BotBadge.svelte';
   import { pulls, reviews } from '$lib/api/client.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { optionalSection, sectionOr } from '$lib/optionalSection';
@@ -531,7 +532,7 @@
           </span>
           {#if pr.is_draft}<span class="draft-badge">{t('pulls.draft')}</span>{/if}
           <span class="text-secondary">
-            opened {formatDate(pr.created_at)} by <strong>{pr.author || t('common.unknown')}</strong>
+            opened {formatDate(pr.created_at)} by <strong>{pr.author || t('common.unknown')}</strong><BotBadge owner={pr.author_bot_owner} />
           </span>
           <span class="branch-pair">
             <span class="branch-label">{pr.head_branch}</span>
@@ -549,7 +550,7 @@
       {#if pr.body}
         <div class="pr-body">
           <div class="comment-header">
-            <strong>{pr.author || t('common.unknown')}</strong> commented
+            <strong>{pr.author || t('common.unknown')}</strong><BotBadge owner={pr.author_bot_owner} /> commented
           </div>
           <div class="comment-body">{pr.body}</div>
         </div>

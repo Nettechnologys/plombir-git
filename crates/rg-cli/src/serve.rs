@@ -20,10 +20,11 @@ use crate::config::{
     resolve_import_transport_policy, resolve_ldap_transport_policy,
     resolve_mirror_transport_policy, resolve_oidc_transport_policy,
     resolve_package_upload_max_bytes, resolve_settings, resolve_trusted_import_origins,
-    resolve_webhook_transport_policy, CliSettings, ResolvedSettings, DEFAULT_ATTESTATION_ENABLED,
-    DEFAULT_AUDIT_ARCHIVE_DIR, DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX,
-    DEFAULT_AUTH_RATE_LIMIT_WINDOW, DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER,
-    DEFAULT_CI_DOCKER, DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_LOG_MAX_SIZE_MB,
+    resolve_webhook_transport_policy, CliSettings, ResolvedSettings, DEFAULT_AGENT_RATE_LIMIT_MAX,
+    DEFAULT_AGENT_RATE_LIMIT_WINDOW, DEFAULT_ATTESTATION_ENABLED, DEFAULT_AUDIT_ARCHIVE_DIR,
+    DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX, DEFAULT_AUTH_RATE_LIMIT_WINDOW,
+    DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER, DEFAULT_CI_DOCKER,
+    DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_LOG_MAX_SIZE_MB,
     DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
 };
 use crate::dbconn;
@@ -719,6 +720,14 @@ pub(crate) async fn run_serve(
         .as_ref()
         .and_then(|c| c.rate_limit.auth_window_secs)
         .unwrap_or(DEFAULT_AUTH_RATE_LIMIT_WINDOW);
+    let resolved_rate_limit_agent_max = cfg
+        .as_ref()
+        .and_then(|c| c.rate_limit.agent_max)
+        .unwrap_or(DEFAULT_AGENT_RATE_LIMIT_MAX);
+    let resolved_rate_limit_agent_window = cfg
+        .as_ref()
+        .and_then(|c| c.rate_limit.agent_window_secs)
+        .unwrap_or(DEFAULT_AGENT_RATE_LIMIT_WINDOW);
     let resolved_package_upload_max_bytes = resolve_package_upload_max_bytes(cfg.as_ref())?;
     let resolved_trusted_import_origins = resolve_trusted_import_origins(cfg.as_ref())?;
     let resolved_import_transport_policy = resolve_import_transport_policy(cfg.as_ref())?;
@@ -829,6 +838,10 @@ pub(crate) async fn run_serve(
         resolved_db_idle_timeout,
         resolved_rate_limit_window,
         resolved_rate_limit_auth_window,
+    )?;
+    require_positive(
+        "rate_limit.agent_window_secs",
+        resolved_rate_limit_agent_window,
     )?;
 
     // ── Initialize logging + tracing ───────────────────────────
@@ -1329,6 +1342,8 @@ pub(crate) async fn run_serve(
         rate_limit_max_keys: resolved_rate_limit_max_keys,
         rate_limit_auth_max: resolved_rate_limit_auth_max,
         rate_limit_auth_window_secs: resolved_rate_limit_auth_window,
+        rate_limit_agent_max: resolved_rate_limit_agent_max,
+        rate_limit_agent_window_secs: resolved_rate_limit_agent_window,
         smtp_config: smtp_config.clone(),
         tls_config,
         external_url: resolved_external_url.clone(),

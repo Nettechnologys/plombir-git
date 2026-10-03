@@ -1,6 +1,7 @@
 //! Re-exports all entity modules.
 
 pub mod access_token;
+pub mod access_token_repository;
 pub mod artifact;
 pub mod attachment;
 pub mod audit_log;

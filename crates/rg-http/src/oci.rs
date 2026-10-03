@@ -789,6 +789,21 @@ async fn authenticate_basic(
             );
             return Ok(BasicIdentity::Rejected);
         }
+        // The registry token minted from here names repositories by scope
+        // string, not by the allow-list a narrowed token carries, and is not an
+        // MCP tool. A token confined to either is refused the registry rather
+        // than trusted with a credential wider than itself (card_60a80311d512).
+        if token.repo_restricted || token.mcp_tools.is_some() {
+            crate::agent_scope::record_scope_denial(
+                db,
+                &owner,
+                token.id,
+                headers,
+                serde_json::json!({ "reason": "registry", "transport": "oci" }),
+            )
+            .await;
+            return Ok(BasicIdentity::Rejected);
+        }
         return Ok(BasicIdentity::Authenticated {
             username: owner.username,
             user_id: owner.id,

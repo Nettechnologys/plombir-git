@@ -9,6 +9,8 @@ rust-version.workspace = true
 rg-git = { path = "../rg-git" }
 rg-core = { path = "../rg-core" }
 rg-db = { path = "../rg-db" }
+# The MCP tools, served in-process at `POST /api/v1/mcp`.
+rg-mcp = { path = "../rg-mcp" }
 gix = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }

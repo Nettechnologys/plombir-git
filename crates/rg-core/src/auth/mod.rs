@@ -2,6 +2,7 @@
 pub mod at_rest_key;
 pub mod ci_oidc;
 pub mod ci_token;
+pub mod credential_context;
 pub mod encrypted_columns;
 pub mod encryption;
 pub mod instance_key;

@@ -53,6 +53,17 @@ pub(crate) async fn resolve_pat(
         );
         return Ok(None);
     }
+    // A bot answers to the person who owns it and has no standing of its own:
+    // disabling or retiring the owner has to stop the agent too, at every
+    // door this resolver serves (card_60a80311d512).
+    if !rg_core::user::bots::owner_is_usable(db, &owner).await? {
+        tracing::warn!(
+            user_id = tok.user_id,
+            token_id = tok.id,
+            "rejecting personal access token: the bot's owner is disabled or gone"
+        );
+        return Ok(None);
+    }
     // Usage time is observability, not part of the credential proof. Match the
     // SSH/deploy-key contract: record every accepted credential, but do not
     // turn a write-only failure into either an invalid-token answer or an auth
@@ -117,22 +128,98 @@ pub fn required_pat_scope(path: &str) -> Option<&'static str> {
 /// Requests already carrying a valid JWT, or no credentials, pass through
 /// unchanged. The PAT may be presented as `Bearer <pat>`, `token <pat>`, or
 /// HTTP Basic auth (`user:pat`).
+///
+/// A PAT also leaves its [`TokenGrant`] in the request extensions and publishes
+/// its narrowing to `rg-core` for the rest of the request — see
+/// [`crate::agent_scope`]. Two of its rules are decided right here, before any
+/// routing, because they are about the *token* and not the route:
+///
+/// - a token confined to MCP tools is refused everywhere except the MCP
+///   endpoint and the calls that endpoint dispatches (the endpoint itself
+///   decides which tools);
+/// - a bot account's requests are counted against its own budget.
 pub(crate) async fn pat_auth_middleware(
     State(state): State<AppState>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let required_scope = required_pat_scope(req.uri().path());
-    match pat_to_bearer_jwt(&state, req.headers(), required_scope).await {
-        Ok(Some(jwt)) => {
+    let path = req.uri().path().to_string();
+    let required_scope = required_pat_scope(&path);
+    let mcp_call = req
+        .extensions()
+        .get::<crate::agent_scope::McpToolCall>()
+        .cloned();
+    let grant = match pat_to_bearer_jwt(&state, req.headers(), required_scope).await {
+        Ok(Some(Bridged { jwt, grant })) => {
             if let Ok(value) = format!("Bearer {jwt}").parse() {
                 req.headers_mut().insert(header::AUTHORIZATION, value);
             }
+            grant
         }
-        Ok(None) => {}
+        Ok(None) => None,
         Err(err) => return err.into_response(),
+    };
+    // An inner call the MCP endpoint dispatched carries the JWT the outer
+    // request was bridged to, plus the grant resolved for it then — both set
+    // in-process, neither expressible by a client. The raw token never travels
+    // twice; its narrowing does.
+    let grant = grant.or_else(|| {
+        mcp_call.as_ref().and_then(|_| {
+            req.extensions()
+                .get::<crate::agent_scope::TokenGrant>()
+                .cloned()
+        })
+    });
+    let Some(grant) = grant else {
+        return next.run(req).await;
+    };
+
+    // Which tool an inner call may serve was decided by the MCP endpoint, the
+    // only producer of `McpToolCall`, before it dispatched; what is left here is
+    // the token used anywhere else.
+    if mcp_call.is_none() && grant.is_mcp_only() && !crate::agent_scope::is_mcp_endpoint(&path) {
+        return grant
+            .deny(
+                req.headers(),
+                "this token may be used only through the MCP endpoint",
+                serde_json::json!({
+                    "reason": "mcp_only",
+                    "method": req.method().as_str(),
+                    "path": path,
+                }),
+            )
+            .await
+            .into_response();
     }
-    next.run(req).await
+
+    // One budget per bot account, however many tokens or addresses it uses.
+    // The MCP endpoint's own request is what counts for a tool call; the
+    // in-process calls it makes on the agent's behalf are not counted again.
+    if grant.owner().is_bot()
+        && mcp_call.is_none()
+        && !state
+            .agent_rate_limiter
+            .allow_key(&format!("agent:{}", grant.owner().id))
+    {
+        if let Some(c) = crate::metrics::rate_limit::BLOCKED.get() {
+            c.inc();
+        }
+        return error::AppError::rate_limited(
+            "this agent account has exhausted its request budget; try again later",
+        )
+        .into_response();
+    }
+
+    let context = grant.credential_context(mcp_call.map(|call| call.tool));
+    req.extensions_mut().insert(grant);
+    rg_core::auth::credential_context::scope(context, next.run(req)).await
+}
+
+/// What [`pat_to_bearer_jwt`] hands the middleware: the JWT to put in front of
+/// the handlers, and the token behind it when it was a PAT.
+struct Bridged {
+    jwt: String,
+    grant: Option<crate::agent_scope::TokenGrant>,
 }
 
 /// If the Authorization header carries a valid PAT (and not already a valid
@@ -142,7 +229,7 @@ async fn pat_to_bearer_jwt(
     state: &AppState,
     headers: &axum::http::HeaderMap,
     required_scope: Option<&str>,
-) -> Result<Option<String>, error::AppError> {
+) -> Result<Option<Bridged>, error::AppError> {
     let Some(auth) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -193,15 +280,28 @@ async fn pat_to_bearer_jwt(
     for cand in candidates {
         // A JWT carried via Basic auth: pass it through as a Bearer token.
         if rg_core::auth::jwt::validate_token(&cand, &state.jwt_secret).is_some() {
-            return Ok(Some(cand));
+            return Ok(Some(Bridged {
+                jwt: cand,
+                grant: None,
+            }));
         }
         if let Some((pat, owner)) = resolve_pat(&state.db, &cand)
             .await
             .map_err(error::AppError::from)?
         {
-            if required_scope
-                .is_some_and(|scope| !rg_core::auth::pat_scope::has_scope(&pat.scopes, scope))
+            if let Some(scope) = required_scope
+                .filter(|scope| !rg_core::auth::pat_scope::has_scope(&pat.scopes, scope))
             {
+                // Reaching past the token's scope is the same kind of event as
+                // reaching past its repositories, and the journal says so.
+                crate::agent_scope::record_scope_denial(
+                    &state.db,
+                    &owner,
+                    pat.id,
+                    headers,
+                    serde_json::json!({ "reason": "scope", "required_scope": scope }),
+                )
+                .await;
                 return Err(error::AppError::forbidden(
                     "personal access token scope denied",
                 ));
@@ -221,24 +321,41 @@ async fn pat_to_bearer_jwt(
                 1,
             )
             .map_err(error::AppError::from)?;
-            return Ok(Some(jwt));
+            let grant = crate::agent_scope::TokenGrant::load(&state.db, pat, owner)
+                .await
+                .map_err(error::AppError::from)?;
+            return Ok(Some(Bridged {
+                jwt,
+                grant: Some(grant),
+            }));
         }
     }
     Ok(None)
 }
 
-/// Extract the authenticated user id from a git-over-HTTP request.
+/// Who is calling a git-over-HTTP endpoint, and through which token.
+pub(crate) struct GitCredential {
+    pub(crate) user_id: i64,
+    /// The Personal Access Token presented, when it was one; `None` for a
+    /// session JWT.
+    pub(crate) grant: Option<crate::agent_scope::TokenGrant>,
+}
+
+/// Extract the authenticated caller from a git-over-HTTP request.
 ///
 /// Supports both JWT session tokens and Personal Access Tokens (PATs),
 /// presented either as `Authorization: Bearer <token>` or HTTP Basic auth
 /// (`git clone https://user:<token>@host/...`). Returns `Ok(None)` for
 /// anonymous access (public repos still work; private repos are then rejected)
 /// and propagates failures while looking up a presented PAT.
-pub(crate) async fn extract_actor_id(
+///
+/// Git is not behind the REST PAT middleware, so a PAT's narrowing travels out
+/// of here with it and the git handlers apply it themselves.
+pub(crate) async fn extract_git_credential(
     db: &DatabaseConnection,
     headers: &axum::http::HeaderMap,
     jwt_secret: &str,
-) -> anyhow::Result<Option<i64>> {
+) -> anyhow::Result<Option<GitCredential>> {
     let Some(auth_str) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -246,18 +363,9 @@ pub(crate) async fn extract_actor_id(
         return Ok(None);
     };
 
-    if let Some(token) = auth_str.strip_prefix("Bearer ") {
-        // JWT session token first, then fall back to a PAT.
-        if let Some(claims) = rg_core::auth::jwt::validate_token(token, jwt_secret) {
-            return Ok(claims.sub.parse().ok());
-        }
-        return Ok(resolve_pat(db, token)
-            .await?
-            .filter(|(pat, _)| rg_core::auth::pat_scope::has_scope(&pat.scopes, "repo"))
-            .map(|(pat, _)| pat.user_id));
-    }
-
-    if let Some(encoded) = auth_str.strip_prefix("Basic ") {
+    let candidates: Vec<&str> = if let Some(token) = auth_str.strip_prefix("Bearer ") {
+        vec![token]
+    } else if let Some(encoded) = auth_str.strip_prefix("Basic ") {
         use base64::Engine as _;
         let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
             return Ok(None);
@@ -270,21 +378,44 @@ pub(crate) async fn extract_actor_id(
         };
         // Git clients carry the token in either the password (`user:token`) or
         // the username (`token:x-oauth-basic`) field — try both, JWT then PAT.
-        for candidate in [password, username] {
-            if candidate.is_empty() {
-                continue;
-            }
-            if let Some(claims) = rg_core::auth::jwt::validate_token(candidate, jwt_secret) {
-                return Ok(claims.sub.parse().ok());
-            }
-            if let Some((pat, _)) = resolve_pat(db, candidate).await? {
-                if rg_core::auth::pat_scope::has_scope(&pat.scopes, "repo") {
-                    return Ok(Some(pat.user_id));
-                }
+        return git_credential_from(
+            db,
+            jwt_secret,
+            [password, username]
+                .into_iter()
+                .filter(|candidate| !candidate.is_empty()),
+        )
+        .await;
+    } else {
+        Vec::new()
+    };
+    git_credential_from(db, jwt_secret, candidates.into_iter()).await
+}
+
+async fn git_credential_from<'a>(
+    db: &DatabaseConnection,
+    jwt_secret: &str,
+    candidates: impl Iterator<Item = &'a str>,
+) -> anyhow::Result<Option<GitCredential>> {
+    for candidate in candidates {
+        // JWT session token first, then a PAT.
+        if let Some(claims) = rg_core::auth::jwt::validate_token(candidate, jwt_secret) {
+            return Ok(claims.sub.parse().ok().map(|user_id| GitCredential {
+                user_id,
+                grant: None,
+            }));
+        }
+        if let Some((pat, owner)) = resolve_pat(db, candidate).await? {
+            if rg_core::auth::pat_scope::has_scope(&pat.scopes, "repo") {
+                let user_id = pat.user_id;
+                let grant = crate::agent_scope::TokenGrant::load(db, pat, owner).await?;
+                return Ok(Some(GitCredential {
+                    user_id,
+                    grant: Some(grant),
+                }));
             }
         }
     }
-
     Ok(None)
 }
 
@@ -361,7 +492,9 @@ mod tests {
                 expires_at: Set(None),
                 last_used_at: Set(None),
                 created_at: Set(chrono::Utc::now()),
+                ..Default::default()
             },
+            &[],
         )
         .await
         .expect("create PAT");

@@ -133,6 +133,7 @@ pub mod m20260823_000004_drop_user_backup_codes;
 pub mod m20260830_000001_align_ci_schema_types;
 pub mod m20260901_000001_scope_runners_to_repositories;
 pub mod m20260905_000001_add_user_pending_totp_secret;
+pub mod m20261003_000001_agent_accounts;
 
 use sea_orm_migration::prelude::*;
 
@@ -356,6 +357,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260830_000001_align_ci_schema_types::Migration),
             Box::new(m20260901_000001_scope_runners_to_repositories::Migration),
             Box::new(m20260905_000001_add_user_pending_totp_secret::Migration),
+            Box::new(m20261003_000001_agent_accounts::Migration),
         ]
     }
 }

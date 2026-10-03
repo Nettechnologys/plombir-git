@@ -582,6 +582,10 @@ pub struct CreateTokenRequest {
     pub name: String,
     pub scopes: Option<String>,
     pub expires_at: Option<String>,
+    /// Repositories, MCP tools and protected branches the token is confined
+    /// to — see [`super::bots::TokenNarrowing`].
+    #[serde(flatten)]
+    pub narrowing: super::bots::TokenNarrowing,
 }
 
 #[derive(serde::Serialize, ToSchema)]
@@ -592,6 +596,8 @@ pub struct AccessTokenResponse {
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(flatten)]
+    pub narrowing: super::bots::TokenNarrowingResponse,
 }
 
 /// Generate a cryptographically strong Personal Access Token.
@@ -603,20 +609,20 @@ pub struct AccessTokenResponse {
 /// PID-derived fallback that could make a token predictable. Mirrors
 /// `generate_jwt_secret` in `rg-cli`. If the OS entropy source is unavailable
 /// `fill_bytes` panics rather than emitting a guessable token.
-fn generate_token() -> String {
+pub(crate) fn generate_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     format!("ifp_{}", hex::encode(bytes))
 }
 
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-fn parse_token_expiration(
+pub(crate) fn parse_token_expiration(
     value: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
     value
@@ -649,15 +655,23 @@ pub async fn list_tokens(
 ) -> impl IntoResponse {
     match rg_db::ops::token_ops::list_by_user(&state.db, user_id).await {
         Ok(tokens) => {
+            let mut narrowings = match super::bots::narrowing_responses(&state, &tokens).await {
+                Ok(narrowings) => narrowings,
+                Err(error) => return error.into_response(),
+            };
             let tokens: Vec<AccessTokenResponse> = tokens
                 .into_iter()
-                .map(|token| AccessTokenResponse {
-                    id: token.id,
-                    name: token.name,
-                    scopes: token.scopes,
-                    expires_at: token.expires_at,
-                    last_used_at: token.last_used_at,
-                    created_at: token.created_at,
+                .filter_map(|token| {
+                    let narrowing = narrowings.remove(&token.id)?;
+                    Some(AccessTokenResponse {
+                        id: token.id,
+                        name: token.name,
+                        scopes: token.scopes,
+                        expires_at: token.expires_at,
+                        last_used_at: token.last_used_at,
+                        created_at: token.created_at,
+                        narrowing,
+                    })
                 })
                 .collect();
 
@@ -707,6 +721,11 @@ pub async fn create_token(
         Ok(expires_at) => expires_at,
         Err(error) => return error.into_response(),
     };
+    let narrowing =
+        match super::bots::resolve_narrowing(&state, user_id, &body.narrowing, false).await {
+            Ok(narrowing) => narrowing,
+            Err(error) => return error.into_response(),
+        };
     // Generate the credential only after every client-supplied field is known
     // to be valid. A rejected request must never mint even a transient raw PAT.
     let raw_token = generate_token();
@@ -721,8 +740,17 @@ pub async fn create_token(
         expires_at: sea_orm::Set(expires_at),
         last_used_at: sea_orm::Set(None),
         created_at: sea_orm::Set(now),
+        repo_restricted: sea_orm::Set(narrowing.repository_ids.is_some()),
+        mcp_tools: sea_orm::Set(narrowing.mcp_tools),
+        deny_protected_merge: sea_orm::Set(narrowing.deny_protected_merge),
     };
-    match rg_db::ops::token_ops::create(&state.db, model).await {
+    match rg_db::ops::token_ops::create(
+        &state.db,
+        model,
+        narrowing.repository_ids.as_deref().unwrap_or_default(),
+    )
+    .await
+    {
         Ok(token) => {
             // The name and the scopes, and nothing else. `raw_token` is the
             // credential and `token_hash` is what the server authenticates by;
@@ -739,9 +767,22 @@ pub async fn create_token(
                     "token_name": token.name,
                     "scopes": token.scopes,
                     "expires_at": token.expires_at,
+                    "repositories": body.narrowing.repositories,
+                    "mcp_tools": token.mcp_tools,
+                    "deny_protected_merge": token.deny_protected_merge,
                 }),
             )
             .await;
+            let mut narrowings = match super::bots::narrowing_responses(
+                &state,
+                std::slice::from_ref(&token),
+            )
+            .await
+            {
+                Ok(narrowings) => narrowings,
+                Err(error) => return error.into_response(),
+            };
+            let narrowing = narrowings.remove(&token.id);
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
@@ -751,6 +792,9 @@ pub async fn create_token(
                     "scopes": token.scopes,
                     "expires_at": token.expires_at,
                     "created_at": token.created_at,
+                    "repositories": narrowing.as_ref().and_then(|n| n.repositories.clone()),
+                    "mcp_tools": narrowing.as_ref().and_then(|n| n.mcp_tools.clone()),
+                    "deny_protected_merge": token.deny_protected_merge,
                 })),
             )
                 .into_response()

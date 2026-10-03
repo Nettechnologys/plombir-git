@@ -511,9 +511,10 @@ gets a directory created in its place, and the runner then fails with that path.
 `forgekeep-mcp` exposes repositories, issues, pull requests, pipelines and code
 search to an AI agent over the
 [Model Context Protocol](https://modelcontextprotocol.io). It speaks JSON-RPC on
-**stdio** and is meant to be launched by the agent as a subprocess; the HTTP/SSE
-transport is not implemented, and `--sse` exits with an error instead of starting
-a partial server.
+**stdio** and is meant to be launched by the agent as a subprocess; it has no
+HTTP/SSE transport of its own, and `--sse` exits with an error instead of
+starting a partial server. Over HTTP the **server itself** serves the same tools
+— see [MCP over HTTP and agent accounts](#mcp-over-http-and-agent-accounts).
 
 It takes no flags — the whole configuration is three environment variables:
 
@@ -551,6 +552,44 @@ An agent that reads the usual `mcpServers` block:
 
 Logs go to stderr so the stdio channel stays clean; `RUST_LOG` selects what is
 logged.
+
+### MCP over HTTP and agent accounts
+
+The server answers MCP itself at `POST /api/v1/mcp` — one JSON-RPC message per
+request, `Authorization: Bearer <token>` — so an agent needs no local binary:
+
+```json
+{
+  "mcpServers": {
+    "forgekeep": {
+      "type": "http",
+      "url": "https://forge.example.com/api/v1/mcp",
+      "headers": { "Authorization": "Bearer …" }
+    }
+  }
+}
+```
+
+Each tool call is dispatched in-process through the server's own router, with
+the caller's credential and every access check, which is what lets the server
+treat an agent as a participant of its own rather than as its owner:
+
+- **Bot accounts.** *Settings → Agents* (`/api/v1/users/bots`) creates an
+  account for an agent, owned by you. It has no password; you mint its tokens,
+  and it stops working when your account does. Give it access the usual way —
+  as a collaborator on a repository. Its issues, comments and pull requests are
+  shown as the bot's, with you named as the person it acts for.
+- **Token narrowing.** Any token — a bot's or your own — can be confined to
+  named repositories, to named MCP tools (it then works only through
+  `/api/v1/mcp`), and kept off protected branches (no merge, push or
+  server-side commit there; on by default for a bot's token). A bot's token
+  carries the `repo` scope only, so it cannot manage credentials of its own.
+- **Limits and audit.** Every token of one bot shares a request budget,
+  `[rate_limit].agent_max` per `agent_window_secs` (600 a minute by default).
+  Every tool call is written to the audit log as `agent.mcp_tool_call`; a
+  request outside a token's narrowing answers `403` and is written as
+  `agent.scope_denied`; and every audit row made through a token carries
+  `credential.token_id` and, through MCP, `credential.mcp_tool`.
 
 ---
 

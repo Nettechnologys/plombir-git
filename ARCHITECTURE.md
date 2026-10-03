@@ -127,7 +127,7 @@ rg-cli ──> rg-ci, rg-core, rg-db, rg-git, rg-http, rg-process, rg-runner, rg
 rg-core ──> rg-db, rg-git
 rg-db ──> none
 rg-git ──> rg-process
-rg-http ──> rg-core, rg-db, rg-git
+rg-http ──> rg-core, rg-db, rg-git, rg-mcp
 rg-mcp ──> none
 rg-process ──> none
 rg-runner ──> rg-process
@@ -137,7 +137,8 @@ rg-ssh ──> rg-core, rg-db, rg-git
 The graph lists normal/build Cargo dependencies between workspace crates;
 test-only dev-dependencies are intentionally excluded. `rg-runner` and `rg-mcp`
 are HTTP clients of APIs served by `rg-http`, but neither has a Cargo dependency
-on `rg-http`. `rg-git` remains protocol-only: its sole internal dependency is
+on `rg-http`; the edge runs the other way for `rg-mcp`, whose tools `rg-http`
+embeds to serve MCP over HTTP. `rg-git` remains protocol-only: its sole internal dependency is
 the business-agnostic `rg-process` lifecycle helper.
 
 `scripts/architecture-crate-dependency-contract-check.mjs` compares this block
@@ -291,6 +292,25 @@ web UI.
 `forgekeep-mcp` is a Model Context Protocol server (stdio transport) that
 exposes repository data as Tools and Resources to MCP-capable AI agents. It acts
 as an HTTP client of the ForgeKeep REST API and authenticates with a PAT.
+
+The server serves the same tools over HTTP at `POST /api/v1/mcp`, so an agent
+needs no local binary. Each tool call is dispatched in-process through the
+server's own router, with the caller's credential and every middleware layer —
+which is what lets the server enforce what the CLI cannot:
+
+- **Bot accounts.** An agent gets an account of its own, owned by a person
+  (`users.bot_owner_id`). It has no password; its owner mints its tokens
+  (`/api/v1/users/bots/...`, the *Agents* settings page) and it stops working
+  when its owner does. Its actions carry its own name, shown with its owner's.
+- **Token narrowing.** A token can be confined to named repositories, to named
+  MCP tools (then it works only through `/api/v1/mcp`), and kept off protected
+  branches (merge, push, server-side commit). A request outside that narrowing
+  answers `403` and writes `agent.scope_denied` to the audit log.
+- **Rate limit.** Bot accounts share a per-account budget,
+  `[rate_limit].agent_max` per `agent_window_secs`.
+- **Audit.** Every tool call writes `agent.mcp_tool_call`, and every audit row
+  written while a token is the credential carries `credential.token_id` and,
+  through MCP, `credential.mcp_tool`.
 
 ---
 

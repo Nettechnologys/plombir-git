@@ -28,6 +28,7 @@ pub mod route_table;
 pub mod security;
 pub mod ws;
 
+mod agent_scope;
 mod body_limit;
 mod content_disposition;
 mod git_http;
@@ -169,6 +170,16 @@ pub struct AppState {
     /// backed by the `instance_settings` row in `db`. Lazily loaded, so
     /// `Default::default()` is the correct value at every construction site.
     pub instance_settings: instance::InstanceSettingsCache,
+    /// One request budget per bot account, spent by the PAT middleware —
+    /// `[rate_limit].agent_max` per `agent_window_secs`. Unlike the per-IP
+    /// limiters, which live on the router, this one is keyed by an identity the
+    /// router never sees: only the middleware that resolved the token knows
+    /// the request is an agent's.
+    pub agent_rate_limiter: rate_limit::RateLimiter,
+    /// The router this state is mounted in, for the MCP endpoint to dispatch
+    /// tool calls through in-process. Filled by `routes` once the router is
+    /// built; `Default::default()` is correct at every construction site.
+    pub mcp_router: api::mcp::McpRouterSlot,
 }
 
 impl AppState {
@@ -358,6 +369,10 @@ pub struct HttpServerConfig {
     pub rate_limit_auth_max: u32,
     /// Window duration (seconds) for the credential-endpoint limiter.
     pub rate_limit_auth_window_secs: u64,
+    /// Per-account request cap for bot accounts. 0 disables it.
+    pub rate_limit_agent_max: u32,
+    /// Window duration (seconds) for the bot-account limiter.
+    pub rate_limit_agent_window_secs: u64,
     /// SMTP configuration for email notifications (None = disabled).
     pub smtp_config: Option<rg_core::email::SmtpConfig>,
     /// TLS configuration: (cert_path, key_path). None = HTTP only.
@@ -448,8 +463,16 @@ async fn run_with_listener(
     let shutdown_rx = config.shutdown_rx.clone();
     let shutdown_grace = std::time::Duration::from_secs(config.shutdown_grace_secs.max(1));
 
+    // Keyed by bot account rather than address, so neither the trusted-proxy
+    // list nor the address cap applies to it.
+    let agent_rate_limiter = rate_limit::RateLimiter::new(
+        config.rate_limit_agent_max,
+        config.rate_limit_agent_window_secs,
+    );
+
     rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
     auth_rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
+    agent_rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
 
     // Detached webhook delivery is triggered below rg-http from many domains,
     // so publish the one-instance-per-process policy before any route or
@@ -566,9 +589,11 @@ async fn run_with_listener(
         source_url: Arc::from(config.source_url),
         ws_session_recheck_secs: ws::DEFAULT_WS_SESSION_RECHECK_SECS,
         instance_settings: config.instance_settings,
+        agent_rate_limiter,
+        mcp_router: Default::default(),
     };
 
-    // The limiters go to the router and nowhere else. `AppState` used to carry a
+    // The per-IP limiters go to the router and nowhere else. `AppState` used to carry a
     // third clone of the global one that nothing ever read — a handler reaching
     // for "the limiter in the state" would have taken an object whose budget
     // nobody spends, i.e. a limit that limits nothing (card_11cba7708615).

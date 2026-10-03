@@ -220,6 +220,10 @@ pub(crate) struct RateLimitConfig {
     pub(crate) auth_max: Option<u32>,
     /// Window (seconds) for the credential-endpoint limiter.
     pub(crate) auth_window_secs: Option<u64>,
+    /// Per-account request cap shared by every token of one bot account.
+    pub(crate) agent_max: Option<u32>,
+    /// Window (seconds) for the bot-account limiter.
+    pub(crate) agent_window_secs: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -622,6 +626,12 @@ pub(crate) const DEFAULT_RATE_LIMIT_MAX_KEYS: usize = 0;
 /// guessing stay throttled on an instance that disabled the global limit.
 pub(crate) const DEFAULT_AUTH_RATE_LIMIT_MAX: u32 = 10;
 pub(crate) const DEFAULT_AUTH_RATE_LIMIT_WINDOW: u64 = 60;
+
+/// The bot-account limiter: one budget per agent account, however many tokens
+/// or addresses it uses. On by default, independent of `[rate_limit].max`,
+/// because an agent loop is the client most likely to run away.
+pub(crate) const DEFAULT_AGENT_RATE_LIMIT_MAX: u32 = 600;
+pub(crate) const DEFAULT_AGENT_RATE_LIMIT_WINDOW: u64 = 60;
 
 /// `[audit].enabled`: on by default, because an audit log that is never trimmed
 /// grows until the disk does.
@@ -1873,6 +1883,18 @@ mod tests {
                 "auth_window_secs",
                 "DEFAULT_AUTH_RATE_LIMIT_WINDOW",
                 super::DEFAULT_AUTH_RATE_LIMIT_WINDOW.to_string(),
+            ),
+            row(
+                "rate_limit",
+                "agent_max",
+                "DEFAULT_AGENT_RATE_LIMIT_MAX",
+                super::DEFAULT_AGENT_RATE_LIMIT_MAX.to_string(),
+            ),
+            row(
+                "rate_limit",
+                "agent_window_secs",
+                "DEFAULT_AGENT_RATE_LIMIT_WINDOW",
+                super::DEFAULT_AGENT_RATE_LIMIT_WINDOW.to_string(),
             ),
             row(
                 "logging",

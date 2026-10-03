@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
+  import BotBadge from '$lib/components/BotBadge.svelte';
   import { pulls, repos } from '$lib/api/client.svelte';
   import {
     LatestRepositoryRequestFence,
@@ -300,7 +301,7 @@
               {#if pr.is_draft}<span class="draft-badge">{t('pulls.draft')}</span>{/if}
             </div>
             <div class="pr-meta">
-              #{pr.number} opened {formatDate(pr.created_at)} by {pr.author || t('common.unknown')}
+              #{pr.number} opened {formatDate(pr.created_at)} by {pr.author || t('common.unknown')}<BotBadge owner={pr.author_bot_owner} link={false} />
               <span class="branch-label">{pr.head_branch}</span> → <span class="branch-label">{pr.base_branch}</span>
             </div>
           </div>

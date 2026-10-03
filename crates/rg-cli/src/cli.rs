@@ -2238,7 +2238,7 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 16] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 18] = [
         (
             "DEFAULT_SOURCE_URL",
             "config-file-only: `[server].source_url` has no CLI flag, so no help text names it",
@@ -2283,6 +2283,14 @@ const AFTER: &str = "after";
         (
             "DEFAULT_AUTH_RATE_LIMIT_WINDOW",
             "config-file-only: `[rate_limit].auth_window_secs` has no CLI flag",
+        ),
+        (
+            "DEFAULT_AGENT_RATE_LIMIT_MAX",
+            "config-file-only: `[rate_limit].agent_max` has no CLI flag",
+        ),
+        (
+            "DEFAULT_AGENT_RATE_LIMIT_WINDOW",
+            "config-file-only: `[rate_limit].agent_window_secs` has no CLI flag",
         ),
         (
             "DEFAULT_AUDIT_ENABLED",

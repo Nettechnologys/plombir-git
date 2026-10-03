@@ -56,6 +56,8 @@ export interface Issue {
   state: 'open' | 'closed';
   author_id: number;
   author?: string | null;
+  /** When the author is a bot account, the person it acts for. */
+  author_bot_owner?: string | null;
   assignee_id: number | null;
   /** The assignee's username, when the issue is on someone whose account resolves. */
   assignee?: string | null;

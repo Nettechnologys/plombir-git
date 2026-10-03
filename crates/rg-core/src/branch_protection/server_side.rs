@@ -34,6 +34,10 @@ impl ServerSideCommitPolicy {
         branch: &str,
         actor_id: i64,
     ) -> Result<Self> {
+        // The token behind the request may be narrower than its account: one
+        // kept off protected branches is refused here, ahead of the rules that
+        // would otherwise admit the account (card_60a80311d512).
+        crate::auth::credential_context::refuse_protected_write(db, repo_id, branch).await?;
         let protections = rg_db::ops::protected_branch_ops::list_rules_by_repo(db, repo_id).await?;
         let signed_commit_required_refs = signed_commit_required_refs(&protections);
         let rejected_refs = branch_protection_rejected_refs(protections, Some(actor_id))?;

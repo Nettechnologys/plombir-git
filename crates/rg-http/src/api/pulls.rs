@@ -29,6 +29,47 @@ fn spawn_hooks_for_merge(
 
 // ── Request / Response types ────────────────────────────────────────────
 
+/// A pull request as a reader is shown it: the row, plus who opened it.
+///
+/// The row carries `author_id` only, and the listing and detail pages render
+/// `author` — which no response carried, so every pull request read as opened
+/// by "unknown". With bot accounts the name matters twice over: an agent's pull
+/// request has to say it is the agent's, and on whose behalf.
+#[derive(Serialize)]
+pub struct PullRequestResponse {
+    #[serde(flatten)]
+    pub pr: rg_db::entities::pull_request::Model,
+    pub author: Option<String>,
+    /// When the author is a bot, the person it acts for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_bot_owner: Option<String>,
+}
+
+async fn prs_with_authors(
+    db: &sea_orm::DatabaseConnection,
+    prs: Vec<rg_db::entities::pull_request::Model>,
+) -> Result<Vec<PullRequestResponse>, AppError> {
+    let mut names = super::author_names::AuthorNames::default();
+    let mut responses = Vec::with_capacity(prs.len());
+    for pr in prs {
+        let (author, author_bot_owner) = names.author(db, pr.author_id).await?;
+        responses.push(PullRequestResponse {
+            pr,
+            author,
+            author_bot_owner,
+        });
+    }
+    Ok(responses)
+}
+
+async fn pr_with_author(
+    db: &sea_orm::DatabaseConnection,
+    pr: rg_db::entities::pull_request::Model,
+) -> Result<PullRequestResponse, AppError> {
+    let mut responses = prs_with_authors(db, vec![pr]).await?;
+    Ok(responses.remove(0))
+}
+
 #[derive(Deserialize)]
 pub struct CreatePrRequest {
     pub title: String,
@@ -122,11 +163,14 @@ pub async fn list_prs(
     )
     .await
     {
-        Ok((data, total)) => (
-            StatusCode::OK,
-            Json(PaginatedResponse::new(data, &pagination, total as u64)),
-        )
-            .into_response(),
+        Ok((data, total)) => match prs_with_authors(&state.db, data).await {
+            Ok(data) => (
+                StatusCode::OK,
+                Json(PaginatedResponse::new(data, &pagination, total as u64)),
+            )
+                .into_response(),
+            Err(error) => error.into_response(),
+        },
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -151,7 +195,10 @@ pub async fn get_pr(
     RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
-        Ok(pr) => (StatusCode::OK, Json(pr)).into_response(),
+        Ok(pr) => match pr_with_author(&state.db, pr).await {
+            Ok(pr) => (StatusCode::OK, Json(pr)).into_response(),
+            Err(error) => error.into_response(),
+        },
         // `AppError::from`, not `not_found`: only a `rg_core::error::NotFound`
         // means the PR is absent. A failed lookup stays a 5xx and keeps its
         // detail in the operator log instead of in the response body.
@@ -260,7 +307,10 @@ pub async fn create_pr(
                             tracing::warn!(pr_id = pr.id, error = %format!("{error:#}"), "CODEOWNERS diff unavailable");
                         }
                     }
-                    (StatusCode::CREATED, Json(pr)).into_response()
+                    match pr_with_author(&state.db, pr).await {
+                        Ok(pr) => (StatusCode::CREATED, Json(pr)).into_response(),
+                        Err(error) => error.into_response(),
+                    }
                 }
                 // `create_pr` marks the two client-side rejections (empty title,
                 // head == base) with `InvalidRequest`; its git reads and inserts
@@ -436,6 +486,21 @@ pub async fn merge_pr(
     if pr.is_draft {
         return AppError::conflict("draft pull requests cannot be merged").into_response();
     }
+    // A token kept off protected branches may not merge into one, whatever the
+    // rule below would say about its account (card_60a80311d512). Decided here,
+    // where the caller *initiates* the merge, and not in `check_merge_allowed`:
+    // that check also runs for merges the server performs on other people's
+    // behalf — an auto-merge an approval completes, a queue pass — and a
+    // narrowing meant for this caller must not fail those.
+    if let Err(e) = rg_core::auth::credential_context::refuse_protected_write(
+        &state.db,
+        repo_model.id,
+        &pr.base_branch,
+    )
+    .await
+    {
+        return AppError::from(e).into_response();
+    }
     if let Err(e) = rg_core::branch_protection::service::check_merge_allowed(
         &state.db,
         repo_model.id,
@@ -501,13 +566,33 @@ pub async fn merge_pr(
 pub async fn enable_auto_merge(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    RepoWrite { actor_id, .. }: RepoWrite,
+    RepoWrite {
+        repo: repo_model,
+        actor_id,
+    }: RepoWrite,
     Json(req): Json<EnableAutoMergeRequest>,
 ) -> impl IntoResponse {
     let strategy = match rg_core::pull_request::MergeStrategy::parse(&req.strategy) {
         Ok(strategy) => strategy,
         Err(error) => return AppError::bad_request(error).into_response(),
     };
+    // Auto-merge merges later, from a pipeline callback that carries no
+    // credential: a token kept off protected branches has to be refused when
+    // it *schedules* the merge, because nothing will ask it again
+    // (card_60a80311d512).
+    let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
+        Ok(pr) => pr,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    if let Err(error) = rg_core::auth::credential_context::refuse_protected_write(
+        &state.db,
+        repo_model.id,
+        &pr.base_branch,
+    )
+    .await
+    {
+        return AppError::from(error).into_response();
+    }
     if let Err(error) = rg_core::pull_request::enable_auto_merge(
         &state.db, &owner, &repo, number, strategy, actor_id,
     )
@@ -691,6 +776,18 @@ pub async fn enqueue_merge_queue(
         Ok(strategy) => strategy,
         Err(error) => return AppError::bad_request(error).into_response(),
     };
+    // The queue merges this entry on a later pass as readily as on this one, so
+    // a token kept off protected branches is refused at the door
+    // (card_60a80311d512).
+    if let Err(error) = rg_core::auth::credential_context::refuse_protected_write(
+        &state.db,
+        repository.id,
+        &pr.base_branch,
+    )
+    .await
+    {
+        return AppError::from(error).into_response();
+    }
     let entry = match rg_core::pull_request::merge_queue::enqueue(
         &state.db,
         &repository,

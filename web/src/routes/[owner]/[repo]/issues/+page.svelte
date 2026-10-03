@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
+  import BotBadge from '$lib/components/BotBadge.svelte';
   import { issues, labels } from '$lib/api/client.svelte';
   import {
     LatestRepositoryRequestFence,
@@ -341,7 +342,7 @@
           <div class="issue-info">
             <div class="issue-title">{issue.title}</div>
             <div class="issue-meta">
-              {t('issues.meta', { number: issue.number, date: formatDate(issue.created_at), author: issue.author || t('common.unknown') })}
+              {t('issues.meta', { number: issue.number, date: formatDate(issue.created_at), author: issue.author || t('common.unknown') })}<BotBadge owner={issue.author_bot_owner} link={false} />
               {#if issue.labels?.length}
                 {#each issue.labels as label}
                   <span class="label-badge">{label}</span>

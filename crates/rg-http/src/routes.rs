@@ -308,18 +308,24 @@ pub(crate) fn create_router(
 ///   let api_v1 = Router::new()...with_state(api_state);     // different type
 ///   Router::new().nest("/git", git_routes).nest("/api/v1", api_v1)  // ERROR
 fn build_router(
-    state: AppState,
+    mut state: AppState,
     rate_limiter: rate_limit::RateLimiter,
     auth_rate_limiter: rate_limit::RateLimiter,
 ) -> Router {
+    // A slot of this router's own: the MCP endpoint dispatches into the router
+    // that serves it, never into another one built from a clone of the state.
+    state.mcp_router = api::mcp::McpRouterSlot::default();
+    let slot = state.mcp_router.clone();
     let routers = build_all_routes(&state, Some(&auth_rate_limiter));
 
-    apply_middleware(
+    let router = apply_middleware(
         with_spa_fallback(assemble(&routers), &state),
         &state,
         Some(&rate_limiter),
     )
-    .with_state(state)
+    .with_state(state);
+    slot.publish(&router);
+    router
 }
 
 /// The server's middleware stack — the one and only copy of it.
@@ -970,6 +976,7 @@ pub(crate) fn build_all_routes(
         api::packages::package_upload_envelope_limit(state.package_upload_max_bytes);
     let package_envelope = Wrap::body_limit(package_envelope_limit);
     let content_edit_envelope = Wrap::body_limit(api::repo_content::CONTENT_EDIT_JSON_MAX_BYTES);
+    let mcp_request_limit = Wrap::body_limit(api::mcp::MCP_REQUEST_MAX_BYTES);
     // The inbound CI webhook reads its body as raw `Bytes` — the HMAC is
     // computed over the exact wire bytes, before serde sees them — so it
     // buffers, and buffering with nothing declared means Axum's unrelated
@@ -1041,6 +1048,21 @@ pub(crate) fn build_all_routes(
         .get(User, "/users/tokens", api::users::list_tokens)
         .post(User, "/users/tokens", api::users::create_token)
         .delete(User, "/users/tokens/{id}", api::users::delete_token)
+        // Bot accounts — an agent's own identity, managed by its owner
+        .get(User, "/users/bots", api::bots::list_bots)
+        .post(User, "/users/bots", api::bots::create_bot)
+        .delete(User, "/users/bots/{bot}", api::bots::delete_bot)
+        .get(User, "/users/bots/{bot}/tokens", api::bots::list_bot_tokens)
+        .post(
+            User,
+            "/users/bots/{bot}/tokens",
+            api::bots::create_bot_token,
+        )
+        .delete(
+            User,
+            "/users/bots/{bot}/tokens/{id}",
+            api::bots::delete_bot_token,
+        )
         // SSH keys
         .get(User, "/users/ssh-keys", api::ssh_keys::list_ssh_keys)
         .post(User, "/users/ssh-keys", api::ssh_keys::create_ssh_key)
@@ -2538,6 +2560,11 @@ pub(crate) fn build_all_routes(
             "/ai/repos/{owner}/{name}/index",
             api::ai::ai_index_repository,
         )
+        // ── MCP over HTTP ──────────────────────────────────────────────────
+        // The agent tools, dispatched in-process through this very router with
+        // the caller's credential; see `api::mcp`. `GET` answers 405: there is
+        // no server-initiated stream.
+        .post_with(User, "/mcp", api::mcp::mcp_endpoint, &mcp_request_limit)
         // ── WebSocket ──────────────────────────────────────────────────────
         .get(
             WS_SESSION,
@@ -2596,7 +2623,9 @@ pub(crate) fn build_test_router(state: AppState) -> Router {
 /// The sweep test drives the same router the other integration tests use, and
 /// reads the declarations out of the very build that produced it — there is no
 /// second enumeration to fall out of step.
-pub(crate) fn build_test_router_with_facts(state: AppState) -> (Router, Vec<RouteFact>) {
+pub(crate) fn build_test_router_with_facts(mut state: AppState) -> (Router, Vec<RouteFact>) {
+    state.mcp_router = api::mcp::McpRouterSlot::default();
+    let slot = state.mcp_router.clone();
     // No auth limiter in tests: the limiter middleware extracts ConnectInfo,
     // which the test harness does not supply. Passing None skips that layer.
     let routers = build_all_routes(&state, None);
@@ -2609,6 +2638,7 @@ pub(crate) fn build_test_router_with_facts(state: AppState) -> (Router, Vec<Rout
     // other test in the binary (card_08bab0b46e40).
     let router = apply_middleware(with_spa_fallback(assemble(&routers), &state), &state, None)
         .with_state(state);
+    slot.publish(&router);
 
     (router, facts)
 }

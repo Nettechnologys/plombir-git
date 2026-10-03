@@ -11,6 +11,19 @@
     expires_at?: string | null;
     last_used_at?: string | null;
     created_at: string;
+    repositories?: string[] | null;
+    mcp_tools?: string[] | null;
+    deny_protected_merge?: boolean;
+  }
+
+  // What narrows a token beyond its scopes, in one line; empty for a token
+  // that is not narrowed.
+  function narrowing(token: AccessToken): string {
+    const parts: string[] = [];
+    if (token.repositories) parts.push(`repos: ${token.repositories.join(', ') || 'none'}`);
+    if (token.mcp_tools) parts.push(`MCP only: ${token.mcp_tools.join(', ')}`);
+    if (token.deny_protected_merge) parts.push('no protected branches');
+    return parts.join(' · ');
   }
 
   let tokenList = $state<AccessToken[]>([]);
@@ -203,7 +216,10 @@
             {#each tokenList as token (token.id)}
               <tr>
                 <td>{token.name}</td>
-                <td><code>{token.scopes}</code></td>
+                <td>
+                  <code>{token.scopes}</code>
+                  {#if narrowing(token)}<div class="narrowing">{narrowing(token)}</div>{/if}
+                </td>
                 <td>{formatDate(token.created_at)}</td>
                 <td>{formatDate(token.last_used_at)}</td>
                 <td>{formatDate(token.expires_at)}</td>
@@ -345,6 +361,12 @@
 
   .muted {
     color: var(--text-secondary);
+  }
+
+  .narrowing {
+    margin-top: 4px;
+    color: var(--text-secondary);
+    font-size: 12px;
   }
 
   @media (max-width: 760px) {

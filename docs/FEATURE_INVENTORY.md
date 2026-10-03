@@ -45,6 +45,7 @@ _Последняя сверка с кодом: 2026-07-23._
 | Trusted-proxy resolve (XFF/X-Real-IP по allowlist IP) | ✅ 🔒 | `rg-http/src/rate_limit.rs:140` | |
 | `max_keys` cap на карту клиентов | ✅ 🔒 | `rg-http/src/rate_limit.rs` | новый ключ отвергается ДО вставки при заполнении; амортизированный inline-sweep протухших ≤1×/сек; default 100000, `[rate_limit] max_keys` |
 | Per-route / per-endpoint лимиты (register/login) | ✅ 🔒 | `rg-http/src/routes.rs` | отдельный, более жёсткий лимитер per-route на `/users/register` + `/users/login`; всегда включён по умолчанию (10/60s), `[rate_limit] auth_max`/`auth_window_secs` |
+| Лимит на бот-аккаунт (агенты) | ✅ 🔒 | `rg-http/src/pat_auth.rs` | ключ — аккаунт бота, не IP; включён по умолчанию (600/60s), `[rate_limit] agent_max`/`agent_window_secs` |
 | Per-route лимит на git-push | ❌ 🔒 | — | push бьётся только глобальным лимитом; отдельный лимитер не заведён |
 | CAPTCHA / proof-of-work | ❌ | — | сознательно НЕ портируем iCaptcha (внешний сервис); альтернатива — hashcash PoW |
 
@@ -93,6 +94,11 @@ _Последняя сверка с кодом: 2026-07-23._
 | CI-tools (list/get pipeline, retry/cancel, get job) | ✅ | `rg-mcp/src/tools/mod.rs` | `list_pipelines`/`get_pipeline`/`retry_pipeline`/`cancel_pipeline`/`get_ci_job` |
 | `search` через MCP | ✅ | `rg-mcp/src/tools/mod.rs` | обёртка `/search` (q/type/page/per_page) |
 | Обёртки `/ai/*` (summary / issues / prs / tree / search_code) | ✅ | `rg-mcp/src/tools/mod.rs` | оборачивает готовый AI-namespace `rg-http/src/api/ai.rs` |
+| MCP по HTTP (`POST /api/v1/mcp`) | ✅ 🔒 | `rg-http/src/api/mcp.rs` | те же инструменты, вызовы API идут in-process через роутер с учёткой вызывающего; локальный бинарник агенту не нужен |
+| Учётки-боты (агент как отдельный участник) | ✅ 🔒 | `rg-core/src/user/bots.rs`, `rg-http/src/api/bots.rs` | `users.bot_owner_id`; без пароля, токены выпускает владелец, только скоуп `repo`; бот перестаёт работать вместе с владельцем; в UI автор-бот показан с владельцем |
+| Сужение токена: репозитории / MCP-инструменты / защищённые ветки | ✅ 🔒 | `rg-http/src/agent_scope.rs`, `rg-core/src/auth/credential_context.rs` | per-route слой по `Access` и `{owner}/{name}`, git и OCI отдельно; запрет merge/push/server-side commit в защищённые ветки |
+| Отдельный rate-limit агентов | ✅ 🔒 | `rg-http/src/pat_auth.rs` | бюджет на бот-аккаунт, общий для всех его токенов; `[rate_limit] agent_max`/`agent_window_secs` (600/60s) |
+| Аудит действий агента | ✅ 🔒 | `rg-core/src/audit/audit.rs` | `agent.mcp_tool_call`, `agent.scope_denied`; каждая запись через токен несёт `credential.token_id` и `credential.mcp_tool` |
 
 ---
 

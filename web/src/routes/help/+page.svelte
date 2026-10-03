@@ -23,6 +23,12 @@
   </section>
 
   <section class="help-section">
+    <h2>Connect an AI agent</h2>
+    <p>Give an agent a bot account of its own: it acts under its own name, on your behalf, with a token you can confine to repositories, MCP tools and unprotected branches. Point an MCP client at <code>/api/v1/mcp</code> on this server with the bot's token as a Bearer token.</p>
+    <a href="/settings/agents" class="link-button">Manage agents</a>
+  </section>
+
+  <section class="help-section">
     <h2>Find work</h2>
     <div class="quick-links">
       <a href="/explore">Explore repositories</a>

@@ -58,7 +58,13 @@
     "chinese": "中文",
     "security": "安全",
     "ssh_keys": "SSH 密钥",
-    "access_tokens": "访问令牌"
+    "access_tokens": "访问令牌",
+    "agents": "智能体"
+  },
+  "author": {
+    "bot": "机器人",
+    "bot_title": "AI 智能体账户",
+    "on_behalf_of": "代表"
   },
   "ssh_keys": {
     "title": "SSH 密钥",

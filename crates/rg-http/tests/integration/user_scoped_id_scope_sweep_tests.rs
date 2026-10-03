@@ -131,6 +131,12 @@ const NOT_A_ROW_ID: &[(&str, &str)] = &[
         "the `/api-docs/{*tail}` wildcard — a path inside the bundled Swagger UI bundle, held to \
          its gate by `openapi_docs_auth_tests`",
     ),
+    (
+        "bot",
+        "a bot's username — an account the caller owns, addressed by name. `fill` points it at \
+         the owner's seeded bot, so the token id under it is probed here; another person's bot \
+         and no bot at all answering the same `404` is held by `agent_accounts_tests`",
+    ),
 ];
 
 /// Routes this sweep deliberately does not drive, each with the reason.
@@ -194,6 +200,10 @@ struct Seeded {
     passkey: i64,
     import: i64,
     notification: i64,
+    /// A bot the owner owns, and one token of it — the token id under
+    /// `/users/bots/{bot}/tokens/{id}` is an instance-wide key like any other.
+    bot: String,
+    bot_token: i64,
 }
 
 /// What this sweep can do about one resource.
@@ -204,8 +214,9 @@ enum Coverage {
     Unclassified,
 }
 
-fn coverage(resource: &str, seeded: &Seeded) -> Coverage {
+fn coverage(resource: &str, path: &str, seeded: &Seeded) -> Coverage {
     match resource {
+        "tokens" if path.contains("/users/bots/{bot}/") => Coverage::Probe(seeded.bot_token),
         "tokens" => Coverage::Probe(seeded.token),
         "ssh-keys" => Coverage::Probe(seeded.ssh_key),
         "passkeys" => Coverage::Probe(seeded.passkey),
@@ -321,12 +332,29 @@ async fn seed(fx: &Fixture, db: &rg_db::DatabaseConnection, owner_id: i64) -> Se
     .expect("seed notification")
     .id;
 
+    let bot = "userscopeowner-agent".to_string();
+    fx.create(
+        "/api/v1/users/bots",
+        serde_json::json!({ "username": bot }),
+        "bot",
+    )
+    .await;
+    let bot_token = fx
+        .create(
+            &format!("/api/v1/users/bots/{bot}/tokens"),
+            serde_json::json!({ "name": "sweep" }),
+            "bot token",
+        )
+        .await;
+
     Seeded {
         token,
         ssh_key,
         passkey,
         import,
         notification,
+        bot,
+        bot_token,
     }
 }
 
@@ -374,7 +402,10 @@ fn auth_user_handlers() -> BTreeSet<String> {
 /// A path with a second placeholder returns `None`: this sweep seeds one row per
 /// resource and nothing else, so another locator is something it would have to
 /// build, and guessing at it is how a probe comes to prove nothing.
-fn fill(path: &str, id: i64) -> Option<String> {
+fn fill(path: &str, id: i64, seeded: &Seeded) -> Option<String> {
+    // The one named locator this sweep seeds: the owner's bot.
+    let path = path.replace("{bot}", &seeded.bot);
+    let path = path.as_str();
     let open = path.find('{')?;
     let close = path[open..].find('}')? + open;
     if path[close + 1..].contains('{') {
@@ -493,7 +524,7 @@ async fn no_user_scoped_route_confirms_another_accounts_row() {
         let Some(resource) = resource(&fact.path) else {
             continue;
         };
-        let Coverage::Probe(id) = coverage(resource, &seeded) else {
+        let Coverage::Probe(id) = coverage(resource, &fact.path, &seeded) else {
             if !signed_off(&fact.label()) {
                 unclassified.push(format!(
                     "  {} — addresses a `{resource}` row by its instance-wide id and this sweep \
@@ -504,7 +535,10 @@ async fn no_user_scoped_route_confirms_another_accounts_row() {
             }
             continue;
         };
-        let (Some(url), Some(absent)) = (fill(&fact.path, id), fill(&fact.path, ABSENT_ID)) else {
+        let (Some(url), Some(absent)) = (
+            fill(&fact.path, id, &seeded),
+            fill(&fact.path, ABSENT_ID, &seeded),
+        ) else {
             if !signed_off(&fact.label()) {
                 unclassified.push(format!(
                     "  {} — carries a second placeholder besides the id. Teach `fill` to seed that \

@@ -571,7 +571,9 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// The number is written down so that adding a route which takes one is a
 /// deliberate act: the census fails until the new pair is classified *and* this
 /// count is updated. It is the denominator the plan for this guard was missing.
-const CENSUS_TOTAL: usize = 129;
+/// 130 since card_60a80311d512: `api::bots::delete_bot_token` takes a token id,
+/// anchored by `token.user_id == bot.id` for a bot the caller owns.
+const CENSUS_TOTAL: usize = 130;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

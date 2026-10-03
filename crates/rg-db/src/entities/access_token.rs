@@ -17,6 +17,36 @@ pub struct Model {
     pub expires_at: Option<DateTimeUtc>,
     pub last_used_at: Option<DateTimeUtc>,
     pub created_at: DateTimeUtc,
+    /// Whether the token may reach only the repositories listed for it in
+    /// `access_token_repositories`. Kept apart from those rows so a token whose
+    /// last repository was deleted stays confined to nothing rather than
+    /// becoming unrestricted.
+    pub repo_restricted: bool,
+    /// Comma-separated MCP tool names. `Some` makes the token usable only
+    /// through this instance's MCP endpoint, and only for these tools; `None`
+    /// is an ordinary token.
+    pub mcp_tools: Option<String>,
+    /// Whether the token is refused every write that lands on a protected
+    /// branch: a merge into one, a push to one, a server-side commit on one.
+    pub deny_protected_merge: bool,
+}
+
+impl Model {
+    /// The MCP tools this token is confined to, or `None` when it is not.
+    pub fn mcp_tool_list(&self) -> Option<Vec<&str>> {
+        self.mcp_tools.as_deref().map(|tools| {
+            tools
+                .split(',')
+                .map(str::trim)
+                .filter(|tool| !tool.is_empty())
+                .collect()
+        })
+    }
+
+    /// Whether anything narrows this token beyond its scopes.
+    pub fn is_restricted(&self) -> bool {
+        self.repo_restricted || self.mcp_tools.is_some() || self.deny_protected_merge
+    }
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

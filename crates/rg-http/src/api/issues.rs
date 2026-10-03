@@ -5,7 +5,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::api::repo_access::{self, RepoAuthRead, RepoRead, RepoWrite};
 use crate::api::user_ref::UserRef;
@@ -120,6 +119,9 @@ pub struct IssueResponse {
     #[serde(flatten)]
     pub issue: rg_core::issue::IssueWithLabels,
     pub author: Option<String>,
+    /// When the author is a bot, the person it acts for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_bot_owner: Option<String>,
     /// The assignee's username, so a client can show who an issue is on
     /// without a lookup endpoint it does not have. `None` both when the issue
     /// is unassigned and when the assigned account no longer resolves — the
@@ -267,6 +269,9 @@ pub struct CommentResponse {
     #[serde(flatten)]
     pub comment: rg_db::entities::issue_comment::Model,
     pub author: Option<String>,
+    /// When the author is a bot, the person it acts for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_bot_owner: Option<String>,
 }
 
 // ── Issue handlers ──────────────────────────────────────────────────────
@@ -723,32 +728,15 @@ pub async fn add_comment(
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-async fn author_name(
-    db: &sea_orm::DatabaseConnection,
-    cache: &mut HashMap<i64, Option<String>>,
-    user_id: i64,
-) -> Result<Option<String>, AppError> {
-    if let Some(cached) = cache.get(&user_id) {
-        return Ok(cached.clone());
-    }
-
-    let name = rg_db::ops::user_ops::find_by_id(db, user_id)
-        .await
-        .map_err(AppError::from)?
-        .map(|user| user.username);
-    cache.insert(user_id, name.clone());
-    Ok(name)
-}
-
 /// The assignee's username, resolved through the same per-response cache as
 /// the author's — an unassigned issue asks nothing of the database.
 async fn assignee_name(
     db: &sea_orm::DatabaseConnection,
-    cache: &mut HashMap<i64, Option<String>>,
+    names: &mut super::author_names::AuthorNames,
     assignee_id: Option<i64>,
 ) -> Result<Option<String>, AppError> {
     match assignee_id {
-        Some(assignee_id) => author_name(db, cache, assignee_id).await,
+        Some(assignee_id) => names.name(db, assignee_id).await,
         None => Ok(None),
     }
 }
@@ -757,15 +745,16 @@ async fn issue_with_author(
     db: &sea_orm::DatabaseConnection,
     issue: rg_db::entities::issue::Model,
 ) -> Result<IssueResponse, AppError> {
-    let mut cache = HashMap::new();
-    let author = author_name(db, &mut cache, issue.author_id).await?;
-    let assignee = assignee_name(db, &mut cache, issue.assignee_id).await?;
+    let mut names = super::author_names::AuthorNames::default();
+    let (author, author_bot_owner) = names.author(db, issue.author_id).await?;
+    let assignee = assignee_name(db, &mut names, issue.assignee_id).await?;
     let issue = rg_core::issue::issue_with_labels(db, issue)
         .await
         .map_err(AppError::from)?;
     Ok(IssueResponse {
         issue,
         author,
+        author_bot_owner,
         assignee,
     })
 }
@@ -774,17 +763,18 @@ async fn issues_with_authors(
     db: &sea_orm::DatabaseConnection,
     issues: Vec<rg_db::entities::issue::Model>,
 ) -> Result<Vec<IssueResponse>, AppError> {
-    let mut cache = HashMap::new();
+    let mut names = super::author_names::AuthorNames::default();
     let mut responses = Vec::with_capacity(issues.len());
     let issues = rg_core::issue::issues_with_labels(db, issues)
         .await
         .map_err(AppError::from)?;
     for issue in issues {
-        let author = author_name(db, &mut cache, issue.issue.author_id).await?;
-        let assignee = assignee_name(db, &mut cache, issue.issue.assignee_id).await?;
+        let (author, author_bot_owner) = names.author(db, issue.issue.author_id).await?;
+        let assignee = assignee_name(db, &mut names, issue.issue.assignee_id).await?;
         responses.push(IssueResponse {
             issue,
             author,
+            author_bot_owner,
             assignee,
         });
     }
@@ -795,20 +785,28 @@ async fn comment_with_author(
     db: &sea_orm::DatabaseConnection,
     comment: rg_db::entities::issue_comment::Model,
 ) -> Result<CommentResponse, AppError> {
-    let mut cache = HashMap::new();
-    let author = author_name(db, &mut cache, comment.author_id).await?;
-    Ok(CommentResponse { comment, author })
+    let mut names = super::author_names::AuthorNames::default();
+    let (author, author_bot_owner) = names.author(db, comment.author_id).await?;
+    Ok(CommentResponse {
+        comment,
+        author,
+        author_bot_owner,
+    })
 }
 
 async fn comments_with_authors(
     db: &sea_orm::DatabaseConnection,
     comments: Vec<rg_db::entities::issue_comment::Model>,
 ) -> Result<Vec<CommentResponse>, AppError> {
-    let mut cache = HashMap::new();
+    let mut names = super::author_names::AuthorNames::default();
     let mut responses = Vec::with_capacity(comments.len());
     for comment in comments {
-        let author = author_name(db, &mut cache, comment.author_id).await?;
-        responses.push(CommentResponse { comment, author });
+        let (author, author_bot_owner) = names.author(db, comment.author_id).await?;
+        responses.push(CommentResponse {
+            comment,
+            author,
+            author_bot_owner,
+        });
     }
     Ok(responses)
 }

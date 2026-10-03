@@ -1,4 +1,4 @@
-//! MCP **Tools** – dispatched from `main.rs::dispatch`.
+//! MCP **Tools** – dispatched from [`crate::dispatch`].
 //!
 //! Each tool:
 //! 1. parses `req.params` → arguments JSON
@@ -498,10 +498,24 @@ pub fn call_tool(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
         }
     };
 
+    // Every handler reports a failure as text starting with `Error:` — the
+    // backend's status and body included. `isError` is how MCP tells the agent
+    // the call failed rather than returned that text as data.
+    let is_error = result.starts_with("Error:");
     let content = serde_json::json!({
-        "content": [ { "type": "text", "text": result } ]
+        "content": [ { "type": "text", "text": result } ],
+        "isError": is_error,
     });
     make_success(req.id.clone(), content)
+}
+
+/// Every tool this server implements, by name — the dispatch table's keys.
+///
+/// For callers that confine a credential to some of them: the server validates
+/// a token's allowed tools against this list, so a typo is refused when the
+/// token is minted rather than silently matching nothing.
+pub fn tool_names() -> impl Iterator<Item = &'static str> {
+    TOOL_DISPATCH.iter().map(|(name, _)| *name)
 }
 
 // ── helpers ───────────────────────────────────────────────

@@ -13,6 +13,9 @@ pub enum Error {
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("in-process API call failed: {0}")]
+    Transport(String),
+
     #[error("MCP protocol error: {0}")]
     Mcp(String),
 

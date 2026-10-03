@@ -168,8 +168,8 @@ const EXEMPT = [];
 
 // Floors. A parser that stopped understanding its input reports a clean tree
 // rather than a broken parse: with no buffering routes recognised, every route
-// is trivially compliant. The tree has nine such registrations today (two
-// `String`, one `Bytes`, six `Multipart`); the floor sits one under that, so
+// is trivially compliant. The tree has ten such registrations today (two
+// `String`, two `Bytes`, six `Multipart`); the floor sits one under that, so
 // retiring a route does not trip it while any of the three kinds silently
 // falling out of `BUFFERING` does.
 //
@@ -179,7 +179,11 @@ const EXEMPT = [];
 // has nothing for it to hold against a mount. Lowering the floor is what makes
 // that deliberate rather than a hole; the route keeps its declared ceiling, and
 // what proves the ceiling now lives in `runners.rs`'s own spool tests.
-const MIN_BUFFERING_ROUTES = 8;
+//
+// Back up to 9 with the MCP endpoint (`POST /api/v1/mcp`, a `Bytes` body under
+// its own declared ceiling): ten registrations, the floor one under them, so
+// losing the two `String` routes still trips it.
+const MIN_BUFFERING_ROUTES = 9;
 
 /** `api::runners::upload_log` → the file it lives in and the fn name. */
 function locate(handler) {

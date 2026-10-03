@@ -78,6 +78,13 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub deleted_at: Option<DateTimeUtc>,
+    /// The person answerable for this account when it is a bot — an AI agent's
+    /// own identity. `None` for every human account.
+    ///
+    /// A bot authenticates only with Personal Access Tokens its owner minted
+    /// for it (`auth_provider = "bot"`, no password), and it stops working the
+    /// moment its owner does: see `rg_http::pat_auth::resolve_pat`.
+    pub bot_owner_id: Option<i64>,
 }
 
 impl Model {
@@ -95,6 +102,11 @@ impl Model {
     /// tombstoned account must not keep pushing over SSH.
     pub fn is_usable(&self) -> bool {
         self.is_active && self.deleted_at.is_none()
+    }
+
+    /// Whether this account is a bot owned by a person.
+    pub fn is_bot(&self) -> bool {
+        self.bot_owner_id.is_some()
     }
 }
 

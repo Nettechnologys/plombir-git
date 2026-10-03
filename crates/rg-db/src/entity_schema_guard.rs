@@ -67,6 +67,7 @@ macro_rules! probed_entities {
 
 probed_entities!(
     access_token,
+    access_token_repository,
     artifact,
     attachment,
     audit_log,

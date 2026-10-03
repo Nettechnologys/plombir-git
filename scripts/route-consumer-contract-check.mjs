@@ -176,6 +176,9 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
   ['PUT /api/v1/runners/{id}/jobs/{job_id}/artifacts/staging', 'runner'],
   ['POST /api/v1/runners/{id}/jobs/{job_id}/artifacts', 'runner'],
   ['POST /api/v1/ai/repos/{owner}/{name}/index', 'agent'],
+  // The MCP endpoint: an MCP client (an AI agent) speaks JSON-RPC to it with a
+  // bot's token; the settings page only names its URL (card_60a80311d512).
+  ['POST /api/v1/mcp', 'agent'],
   ['POST /api/v1/repos/{owner}/{name}/webhooks/external/ci', 'external-webhook'],
 ]);
 

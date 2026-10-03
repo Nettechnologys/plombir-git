@@ -1,6 +1,7 @@
 //! Minimal MCP (Model Context Protocol) 1.0 implementation.
 //!
-//! Implements JSON-RPC 2.0 over **stdio** transport.
+//! Implements JSON-RPC 2.0, carried over **stdio** by the `forgekeep-mcp`
+//! binary and over **HTTP** by the server's own `POST /api/v1/mcp` endpoint.
 //! Only the subset needed for a working server is included:
 //!
 //! - `initialize` / `notifications/initialized`
@@ -18,9 +19,20 @@ use serde_json::Value;
 #[derive(Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String, // always "2.0"
-    pub id: Value,       // number | string
+    /// number | string; absent (read as `null`) on a notification.
+    #[serde(default)]
+    pub id: Value,
     pub method: String,
     pub params: Option<Value>,
+}
+
+impl JsonRpcRequest {
+    /// Whether this message is a notification, which JSON-RPC forbids
+    /// answering. A message with no `id` used to fail to parse at all, so the
+    /// stdio loop answered `notifications/initialized` with a parse error.
+    pub fn is_notification(&self) -> bool {
+        self.id.is_null()
+    }
 }
 
 #[derive(Serialize, Deserialize)]

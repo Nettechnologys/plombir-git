@@ -284,6 +284,15 @@ pub(crate) fn stamp_security(
         crate::api::users::list_tokens,
         crate::api::users::create_token,
         crate::api::users::delete_token,
+        // Bot accounts
+        crate::api::bots::list_bots,
+        crate::api::bots::create_bot,
+        crate::api::bots::delete_bot,
+        crate::api::bots::list_bot_tokens,
+        crate::api::bots::create_bot_token,
+        crate::api::bots::delete_bot_token,
+        // MCP over HTTP
+        crate::api::mcp::mcp_endpoint,
         crate::api::ssh_keys::list_ssh_keys,
         crate::api::ssh_keys::create_ssh_key,
         crate::api::ssh_keys::delete_ssh_key,
@@ -620,6 +629,12 @@ pub(crate) fn stamp_security(
             crate::api::users::AuthResponse,
             crate::api::users::UserProfile,
             crate::api::users::CreateTokenRequest,
+            crate::api::bots::TokenNarrowing,
+            crate::api::bots::TokenNarrowingResponse,
+            crate::api::bots::BotResponse,
+            crate::api::bots::CreateBotRequest,
+            crate::api::bots::CreateBotTokenRequest,
+            crate::api::bots::BotTokenResponse,
             crate::api::ssh_keys::CreateSshKeyRequest,
             crate::api::ssh_keys::SshKeyResponse,
             crate::api::deploy_keys::CreateDeployKeyRequest,
@@ -742,6 +757,7 @@ pub(crate) fn stamp_security(
         (name = "Passkeys", description = "WebAuthn passkey registration and passwordless login"),
         (name = "Audit", description = "Audit logs"),
         (name = "Packages", description = "Package registry"),
+        (name = "MCP", description = "Model Context Protocol over HTTP: the agent tools, served in-process"),
     )
 )]
 pub struct ApiDoc;
