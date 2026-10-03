@@ -298,6 +298,65 @@ fn serve_and_migrate_refuse_a_new_database_beside_stored_repositories() {
     }
 }
 
+#[test]
+fn serve_creates_a_database_beside_an_empty_repository_root() {
+    let dir = tempfile::tempdir().expect("a clean data directory");
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir(&repo_root).expect("an empty repository root");
+    let database = dir.path().join("plombir-git.db");
+    let config = dir.path().join("plombir-git.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nrepo_root = \"{}\"\nshutdown_grace_secs = 1\n\n[database]\nurl = \"sqlite://{}?mode=rwc\"\n",
+            repo_root.display(),
+            database.display()
+        ),
+    )
+    .expect("write the config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
+            .expect("make the config owner-only");
+    }
+    // Force an exit after startup so the test can inspect what serve created.
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve an HTTP port");
+    let http_addr = occupied.local_addr().expect("reserved address").to_string();
+    let host_key = dir.path().join("host_ed25519");
+    let output = run_in(
+        dir.path(),
+        &[
+            "serve",
+            "--config",
+            config.to_str().expect("UTF-8 config path"),
+            "--http-addr",
+            &http_addr,
+            "--ssh-addr",
+            "127.0.0.1:0",
+            "--host-key",
+            host_key.to_str().expect("UTF-8 host key"),
+            "--jwt-secret",
+            "test-jwt-secret-long-enough-for-startup-validation",
+            "--encryption-key",
+            "test-at-rest-key-independent-from-the-jwt-secret",
+        ],
+    );
+    let text = diagnostic(&output);
+    assert!(
+        !output.status.success(),
+        "the reserved port must stop serve:\n{text}"
+    );
+    assert!(
+        text.contains("Database ready"),
+        "serve must reach the ready database:\n{text}"
+    );
+    assert!(
+        database.exists(),
+        "serve must create the new database:\n{text}"
+    );
+}
+
 /// The rename kept no compatibility layer, so a variable of the former name
 /// is not read. Starting anyway would fall back to the default it was meant to
 /// override, and the server refuses instead, naming the variable but never its

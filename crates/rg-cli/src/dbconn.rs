@@ -9,6 +9,7 @@
 //! `package list`) failed opaquely on exactly the same misconfiguration. Route
 //! all of them through here instead.
 
+use anyhow::Context;
 use rg_db::DatabaseConnection;
 
 /// A database connection paired with the process lease that makes opening it
@@ -144,23 +145,17 @@ pub(crate) fn check_database_presence(
         Ok(true) => return Ok(()),
         Ok(false) => {}
         Err(error) => {
-            // The probe failed, so nothing was established either way. Opening
-            // the database is about to fail for the same reason and will say so
-            // with SQLite's own words; inventing a "does not exist" here would
-            // send the operator after the wrong thing.
-            tracing::debug!(
-                database = %path.display(),
-                %error,
-                "could not establish whether the database file exists; leaving the open path to report it"
-            );
-            return Ok(());
+            // In particular, never let create_if_missing turn an inconclusive
+            // presence check into a new instance.
+            return Err(error)
+                .with_context(|| format!("inspect SQLite database `{}`", path.display()));
         }
     }
 
     let resolved = crate::config::absolute_path(&path);
     match missing {
         MissingDatabase::CreateForANewInstance { repo_root } => {
-            if let Some(repository) = first_stored_repository(repo_root) {
+            if let Some(repository) = first_stored_repository(repo_root)? {
                 anyhow::bail!(
                     "`{operation}` was pointed at the SQLite database `{}`, which does not exist \
                      (resolved to `{}`), while the repository storage root `{}` already holds \
@@ -209,24 +204,50 @@ fn announce_a_new_database(resolved: &std::path::Path) {
 /// layout every repository is stored in.
 ///
 /// Owner-level entries starting with a dot are the server's own scratch space
-/// (`.tmp` upload spools), not namespaces. A root that cannot be listed
-/// answers `None`: nothing was established about it, and the server is about
-/// to touch the same path and report the reason in the filesystem's own words.
-fn first_stored_repository(repo_root: &std::path::Path) -> Option<std::path::PathBuf> {
-    let is_dir = |entry: &std::fs::DirEntry| entry.file_type().is_ok_and(|kind| kind.is_dir());
-    std::fs::read_dir(repo_root)
-        .ok()?
-        .flatten()
-        .filter(|owner| is_dir(owner) && !owner.file_name().as_encoded_bytes().starts_with(b"."))
-        .find_map(|owner| {
-            std::fs::read_dir(owner.path())
-                .ok()?
-                .flatten()
-                .find(|entry| {
-                    entry.file_name().as_encoded_bytes().ends_with(b".git") && is_dir(entry)
-                })
-                .map(|entry| entry.path())
-        })
+/// (`.tmp` upload spools), not namespaces. A missing root is a clean install;
+/// a root that cannot be inspected is not proof that it is empty.
+fn first_stored_repository(
+    repo_root: &std::path::Path,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let owners = match std::fs::read_dir(repo_root) {
+        Ok(owners) => owners,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "inspect repository storage root `{}` before creating a database",
+                    repo_root.display()
+                )
+            })
+        }
+    };
+    for owner in owners {
+        let owner = owner.context("read repository storage root entry")?;
+        if owner.file_name().as_encoded_bytes().starts_with(b".") {
+            continue;
+        }
+        if !owner
+            .metadata()
+            .with_context(|| format!("inspect `{}`", owner.path().display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        for repository in std::fs::read_dir(owner.path())
+            .with_context(|| format!("inspect repository owner `{}`", owner.path().display()))?
+        {
+            let repository = repository.context("read repository owner entry")?;
+            if repository.file_name().as_encoded_bytes().ends_with(b".git")
+                && repository
+                    .metadata()
+                    .with_context(|| format!("inspect `{}`", repository.path().display()))?
+                    .is_dir()
+            {
+                return Ok(Some(repository.path()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// [`connect_online`] with the `[timeouts]` connect/idle budget the server
@@ -488,6 +509,52 @@ mod tests {
             super::MissingDatabase::CreateFromBackup,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn an_uninspectable_repository_root_cannot_authorize_a_new_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repos");
+        std::fs::write(&repo_root, b"not a directory").unwrap();
+        let database = dir.path().join("plombir-git.db");
+        let url = format!("sqlite://{}?mode=rwc", database.display());
+
+        let error = super::check_database_presence(
+            &url,
+            "plombir-git serve",
+            super::MissingDatabase::CreateForANewInstance {
+                repo_root: &repo_root,
+            },
+        )
+        .expect_err("a failed inspection cannot prove this is a clean install");
+        assert!(
+            format!("{error:#}").contains("inspect repository storage root"),
+            "{error:#}"
+        );
+        assert!(!database.exists());
+    }
+
+    #[test]
+    fn an_inconclusive_database_presence_check_cannot_authorize_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("not-a-directory");
+        std::fs::write(&parent, b"file").unwrap();
+        let database = parent.join("plombir-git.db");
+        let url = format!("sqlite://{}?mode=rwc", database.display());
+
+        let error = super::check_database_presence(
+            &url,
+            "plombir-git serve",
+            super::MissingDatabase::CreateForANewInstance {
+                repo_root: dir.path(),
+            },
+        )
+        .expect_err("an unreadable database path must not count as missing");
+        assert!(
+            format!("{error:#}").contains("inspect SQLite database"),
+            "{error:#}"
+        );
+        assert!(!database.exists());
     }
 
     /// The clean install still works: an empty root, a missing root, and a
