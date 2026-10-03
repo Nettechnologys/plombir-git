@@ -285,13 +285,30 @@ pub async fn check_merge_allowed(
     pr_id: i64,
 ) -> Result<MergeVerdict> {
     let mut verdict = MergeVerdict::default();
-    let protection =
-        protected_branch_ops::find_by_repo_and_branch(db, repo_id, target_branch).await?;
+    let target_ref = format!("refs/heads/{target_branch}");
+    // Push checks every matching rule, including glob rules. Merge must do the
+    // same: choosing just the exact row (or one of several matching globs)
+    // would let a less restrictive rule mask another rule's requirements.
+    for protection in protected_branch_ops::list_by_repo(db, repo_id).await? {
+        let rule_ref = format!("refs/heads/{}", protection.branch_name);
+        if !rg_git::protocol::receive_pack::ref_matches_rejection_pattern(&target_ref, &rule_ref) {
+            continue;
+        }
+        check_matching_merge_rule(db, repo_id, target_branch, pr_id, &protection, &mut verdict)
+            .await?;
+    }
 
-    let Some(protection) = protection else {
-        return Ok(verdict);
-    };
+    Ok(verdict)
+}
 
+async fn check_matching_merge_rule(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    target_branch: &str,
+    pr_id: i64,
+    protection: &ProtectedBranch,
+    verdict: &mut MergeVerdict,
+) -> Result<()> {
     if protection.require_signed_commits {
         return Err(crate::error::forbidden(format!(
             "branch '{}' requires cryptographically signed commits; server-side PR merge commits are not signed, so create and push a signed commit with an allowed identity",
@@ -434,8 +451,7 @@ pub async fn check_merge_allowed(
             }
         }
     }
-
-    Ok(verdict)
+    Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────

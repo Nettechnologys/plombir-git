@@ -3657,7 +3657,7 @@ mod branch_protection_check_failure_tests {
 
         // Any failure of the read would do — an unreachable database, a dropped
         // pool. The table going away is the one whose message is unmistakably
-        // internal, and it is where `find_by_repo_and_branch` puts its context.
+        // internal, and it is where the rule-list lookup puts its context.
         fixture
             .db
             .execute_unprepared("DROP TABLE protected_branches")
@@ -3683,7 +3683,7 @@ mod branch_protection_check_failure_tests {
             "the queue must name what it could not check: {rendered}"
         );
         assert!(
-            rendered.contains("db: find protected branch by repo and branch"),
+            rendered.contains("db: list protected branches by repo"),
             "the failed read must reach the operator whole: {rendered}"
         );
 

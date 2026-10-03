@@ -99,7 +99,7 @@ async fn a_protection_rule_that_could_not_be_read_is_not_a_pending_merge() {
 
     // Any failure of the read would do — an unreachable database, a dropped
     // pool. The table going away is the one whose message is unmistakably
-    // internal, and it is where `find_by_repo_and_branch` puts its context.
+    // internal, and it is where the rule-list lookup puts its context.
     db.execute_unprepared("DROP TABLE protected_branches")
         .await
         .expect("take branch-protection storage away");
@@ -123,7 +123,7 @@ async fn a_protection_rule_that_could_not_be_read_is_not_a_pending_merge() {
         "auto-merge must name what it could not check: {rendered}"
     );
     assert!(
-        rendered.contains("db: find protected branch by repo and branch"),
+        rendered.contains("db: list protected branches by repo"),
         "the failed read must reach the operator whole: {rendered}"
     );
 }

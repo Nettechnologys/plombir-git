@@ -248,3 +248,4 @@ mod webhook_transport_policy_tests;
 mod websocket_session_revocation_tests;
 mod wiki_authz_tests;
 mod wiki_tests;
+mod wildcard_branch_protection_tests;
