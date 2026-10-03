@@ -229,6 +229,8 @@ pub async fn create_pr(
         repo: repo_model,
         actor_id: user_id,
     }: RepoAuthRead,
+    headers: HeaderMap,
+    grant: Option<Extension<TokenGrant>>,
     Json(req): Json<CreatePrRequest>,
 ) -> impl IntoResponse {
     let repo_id = repo_model.id;
@@ -236,6 +238,44 @@ pub async fn create_pr(
     if req.head.trim().is_empty() || req.base.trim().is_empty() {
         return AppError::bad_request("head and base branches are required").into_response();
     };
+
+    // The route layer checks the base repository named in the path. A fork
+    // head names another repository in the body, so confine that name before
+    // resolving it. Treat an absent and a disallowed head alike: a narrowed
+    // token must not use the resolver as a repository-existence oracle.
+    if let (Some(Extension(grant)), Some((head_owner, _))) =
+        (grant.as_ref(), req.head.split_once(':'))
+    {
+        if grant.is_repo_restricted() {
+            let head_repo = match rg_core::repo::service::find_repo_by_owner_name(
+                &state.db,
+                head_owner,
+                &repo_model.name,
+            )
+            .await
+            {
+                Ok(repo) => repo,
+                Err(error) => return AppError::from(error).into_response(),
+            };
+            if !head_repo
+                .as_ref()
+                .is_some_and(|head_repo| grant.admits_repository(head_repo.id))
+            {
+                return grant
+                    .deny(
+                        &headers,
+                        "this token may not access the pull request head repository",
+                        serde_json::json!({
+                            "reason": "repository_not_allowed",
+                            "action": "create_pr",
+                            "base_repo_id": repo_id,
+                        }),
+                    )
+                    .await
+                    .into_response();
+            }
+        }
+    }
 
     match rg_core::pull_request::resolve_head_ref(&state.db, repo_id, &req.head).await {
         Ok((head_branch, head_repo_id)) => {

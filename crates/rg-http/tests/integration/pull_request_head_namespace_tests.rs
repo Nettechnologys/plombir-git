@@ -257,14 +257,54 @@ async fn an_org_fork_pr_is_created_and_its_diff_is_readable() {
     );
 
     let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base}/api/v1/users/tokens"))
+        .bearer_auth(&org_owner)
+        .json(&serde_json::json!({
+            "name": "base-only", "scopes": "repo", "repositories": ["hn4-up/shared"],
+        }))
+        .send()
+        .await
+        .expect("mint repository-confined PAT");
+    let status = response.status();
+    let token: serde_json::Value = response.json().await.expect("PAT response");
+    assert_eq!(status, 201, "{token}");
+    let base_only = token["token"].as_str().expect("raw PAT");
+    let create = serde_json::json!({
+        "title": "from the organization",
+        "head": "hn4-acme:feature",
+        "base": "main",
+    });
+    let refused = client
+        .post(format!("{base}/api/v1/repos/hn4-up/shared/pulls"))
+        .bearer_auth(base_only)
+        .json(&create)
+        .send()
+        .await
+        .expect("try fork PR with base-only PAT");
+    assert_eq!(refused.status(), 403);
+    let denied: serde_json::Value = refused.json().await.expect("refusal body");
+    assert_eq!(denied["error"]["code"], "FORBIDDEN", "{denied}");
+    let mut missing_request = create.clone();
+    missing_request["head"] = serde_json::json!("hn4-ghost:feature");
+    let missing = client
+        .post(format!("{base}/api/v1/repos/hn4-up/shared/pulls"))
+        .bearer_auth(base_only)
+        .json(&missing_request)
+        .send()
+        .await
+        .expect("try unknown fork with base-only PAT");
+    assert_eq!(missing.status(), 403);
+    let missing: serde_json::Value = missing.json().await.expect("refusal body");
+    assert_eq!(missing["error"]["code"], "FORBIDDEN", "{missing}");
+    assert_eq!(missing["error"]["message"], denied["error"]["message"]);
+
+    // The account can open this exact PR without repository confinement; the
+    // refusal above must be the PAT boundary, not a broken fork fixture.
     let resp = client
         .post(format!("{base}/api/v1/repos/hn4-up/shared/pulls"))
         .bearer_auth(&org_owner)
-        .json(&serde_json::json!({
-            "title": "from the organization",
-            "head": "hn4-acme:feature",
-            "base": "main",
-        }))
+        .json(&create)
         .send()
         .await
         .expect("create PR");
