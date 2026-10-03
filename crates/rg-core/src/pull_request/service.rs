@@ -4131,14 +4131,14 @@ fn merge_head_rev(
     match strategy {
         MergeStrategy::Merge => {
             let merge_msg = format!("Merge pull request #{} from {}", pr.number, pr.head_branch);
-            gix_merge_no_ff(repo_path, head_rev, &merge_msg)
+            gix_merge_no_ff(repo_path, &pr.base_branch, head_rev, &merge_msg)
         }
         MergeStrategy::Squash => {
             let squash_msg = format!(
                 "Squash merge pull request #{} from {}",
                 pr.number, pr.head_branch
             );
-            gix_squash_merge(repo_path, head_rev, &squash_msg)
+            gix_squash_merge(repo_path, &pr.base_branch, head_rev, &squash_msg)
         }
         MergeStrategy::Rebase => git_rebase_merge(repo_path, &pr.base_branch, head_rev),
     }
@@ -4874,16 +4874,22 @@ fn gix_delete_ref(repo_path: &std::path::Path, ref_name: &str) -> Result<()> {
 }
 
 /// Perform a `--no-ff` merge using gix merge_commits API.
-/// Creates a merge commit with two parents (current HEAD + `head_ref`).
-fn gix_merge_no_ff(repo_path: &std::path::Path, head_ref: &str, message: &str) -> Result<String> {
+/// Creates a merge commit with two parents (the selected base + `head_ref`).
+fn gix_merge_no_ff(
+    repo_path: &std::path::Path,
+    base_branch: &str,
+    head_ref: &str,
+    message: &str,
+) -> Result<String> {
     // `rg_git::repository::open`, not `gix::open`: the bytes of a merge must not
     // depend on the machine — see [`plombir_git_merge_options`].
     let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
+    let base_ref = format!("refs/heads/{base_branch}");
     let our_commit = repo
-        .rev_parse_single("HEAD")
-        .map_err(|e| anyhow::anyhow!("failed to resolve HEAD: {}", e))?;
+        .rev_parse_single(base_ref.as_str())
+        .map_err(|e| anyhow::anyhow!("failed to resolve {base_ref}: {e}"))?;
     let their_commit = repo
         .rev_parse_single(head_ref)
         .with_context(|| format!("failed to resolve merge ref '{}'", head_ref))?;
@@ -4900,7 +4906,7 @@ fn gix_merge_no_ff(repo_path: &std::path::Path, head_ref: &str, message: &str) -
         .commit_as(
             signature,
             signature,
-            "HEAD",
+            base_ref.as_str(),
             message,
             merged_tree_id.detach(),
             [our_commit.detach(), their_commit.detach()],
@@ -4911,14 +4917,20 @@ fn gix_merge_no_ff(repo_path: &std::path::Path, head_ref: &str, message: &str) -
 }
 
 /// Perform a squash merge: merge commits, then create a single-parent commit.
-fn gix_squash_merge(repo_path: &std::path::Path, head_ref: &str, message: &str) -> Result<String> {
+fn gix_squash_merge(
+    repo_path: &std::path::Path,
+    base_branch: &str,
+    head_ref: &str,
+    message: &str,
+) -> Result<String> {
     // Opened the same way `gix_merge_no_ff` is, and for the same reason.
     let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
+    let base_ref = format!("refs/heads/{base_branch}");
     let our_commit = repo
-        .rev_parse_single("HEAD")
-        .map_err(|e| anyhow::anyhow!("failed to resolve HEAD: {}", e))?;
+        .rev_parse_single(base_ref.as_str())
+        .map_err(|e| anyhow::anyhow!("failed to resolve {base_ref}: {e}"))?;
     let their_commit = repo
         .rev_parse_single(head_ref)
         .with_context(|| format!("failed to resolve merge ref '{}'", head_ref))?;
@@ -4933,7 +4945,7 @@ fn gix_squash_merge(repo_path: &std::path::Path, head_ref: &str, message: &str) 
         .commit_as(
             signature,
             signature,
-            "HEAD",
+            base_ref.as_str(),
             message,
             merged_tree_id.detach(),
             [our_commit.detach()],
@@ -6291,20 +6303,22 @@ mod merge_conflict_gate_tests {
         for (label, merge) in [
             (
                 "merge",
-                super::gix_merge_no_ff as fn(&Path, &str, &str) -> anyhow::Result<String>,
+                super::gix_merge_no_ff as fn(&Path, &str, &str, &str) -> anyhow::Result<String>,
             ),
             ("squash", super::gix_squash_merge),
         ] {
             let dir = tempfile::tempdir().expect("fixture directory");
             let worktree = content_merge_fixture(dir.path());
 
-            let sha = merge(&worktree, "refs/heads/feature", "merge #1").unwrap_or_else(|error| {
-                panic!(
-                    "`{label}` rejected a merge git resolves cleanly: {error} — \
+            let sha = merge(&worktree, "main", "refs/heads/feature", "merge #1").unwrap_or_else(
+                |error| {
+                    panic!(
+                        "`{label}` rejected a merge git resolves cleanly: {error} — \
                          gix lists auto-resolved content merges in `conflicts` too, \
                          see card_928f32287e37"
-                )
-            });
+                    )
+                },
+            );
 
             assert_eq!(
                 file_at(&worktree, &sha, "file.txt"),
@@ -6322,14 +6336,14 @@ mod merge_conflict_gate_tests {
         for (label, merge) in [
             (
                 "merge",
-                super::gix_merge_no_ff as fn(&Path, &str, &str) -> anyhow::Result<String>,
+                super::gix_merge_no_ff as fn(&Path, &str, &str, &str) -> anyhow::Result<String>,
             ),
             ("squash", super::gix_squash_merge),
         ] {
             let dir = tempfile::tempdir().expect("fixture directory");
             let worktree = line_conflict_fixture(dir.path());
 
-            let error = match merge(&worktree, "refs/heads/feature", "merge #1") {
+            let error = match merge(&worktree, "main", "refs/heads/feature", "merge #1") {
                 Ok(sha) => {
                     panic!("`{label}` accepted two rewrites of the same line as commit {sha}")
                 }

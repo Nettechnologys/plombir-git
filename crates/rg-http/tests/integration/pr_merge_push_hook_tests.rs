@@ -155,7 +155,9 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
 
     let (jwt, _user_id) = register_full(&base, "mergehook", "mergehook@example.com").await;
     let repo_id = crate::common::create_repo(&base, &jwt, "hook-repo").await;
-    let _worktree = seed_branches(&repo_root.join("mergehook/hook-repo.git"), None);
+    let bare_path = repo_root.join("mergehook/hook-repo.git");
+    let _worktree = seed_branches(&bare_path, Some("develop"));
+    let main_before = git(&["rev-parse", "refs/heads/main"], Some(&bare_path));
 
     // A subscriber to `push`. The delivery target is unresolvable on purpose:
     // what is under test is that the fan-out ran at all, and a failed POST is
@@ -183,7 +185,7 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
         .json(&serde_json::json!({
             "title": "merge me",
             "head": "feature",
-            "base": "main",
+            "base": "develop",
         }))
         .send()
         .await
@@ -208,12 +210,14 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
     let merged: serde_json::Value = merged.json().await.unwrap();
     let merge_sha = merged["merge_commit_sha"].as_str().unwrap().to_string();
     assert_eq!(
-        git(
-            &["rev-parse", "refs/heads/main"],
-            Some(&repo_root.join("mergehook/hook-repo.git"))
-        ),
+        git(&["rev-parse", "refs/heads/develop"], Some(&bare_path)),
         merge_sha,
         "the merge must actually be the new tip of the base branch"
+    );
+    assert_eq!(
+        git(&["rev-parse", "refs/heads/main"], Some(&bare_path)),
+        main_before,
+        "a merge into develop must leave the repository's HEAD branch alone"
     );
 
     drain_delivery_tracker(&delivery_tracker).await;
@@ -223,11 +227,11 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
         triggered,
         vec![(
             merge_sha.clone(),
-            "refs/heads/main".to_string(),
+            "refs/heads/develop".to_string(),
             "push".to_string()
         )],
         "merging a PR must trigger exactly one pipeline, on the merge commit of \
-         the base branch — the whole point of 'CI on every push to main'"
+         the selected base branch"
     );
 
     let deliveries = rg_core::webhook::service::list_deliveries(&db, hook.id)
@@ -240,7 +244,7 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
     let payload: serde_json::Value =
         serde_json::from_str(push_delivery.request_payload.as_deref().unwrap_or("null"))
             .expect("delivery payload is JSON");
-    assert_eq!(payload["ref"], "refs/heads/main");
+    assert_eq!(payload["ref"], "refs/heads/develop");
     assert_eq!(payload["after"], merge_sha);
     assert_ne!(
         payload["before"],

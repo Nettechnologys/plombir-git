@@ -92,14 +92,14 @@ async fn create_repo_and_pr(base: &str, token: &str, repo: &str) {
     assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
 }
 
-async fn open_pr(base: &str, token: &str, repo: &str) {
+async fn open_pr(base: &str, token: &str, repo: &str, base_branch: &str) {
     let response = reqwest::Client::new()
         .post(format!("{base}/api/v1/repos/merge-owner/{repo}/pulls"))
         .bearer_auth(token)
         .json(&serde_json::json!({
             "title": "Merge the feature",
             "head": "feature",
-            "base": "main"
+            "base": base_branch
         }))
         .send()
         .await
@@ -132,7 +132,7 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
         create_repo_and_pr(&base, &token, &repo).await;
         let bare_path = repo_root.join(format!("merge-owner/{repo}.git"));
         let (_worktree, base_sha) = seed_diverged_repository(&bare_path);
-        open_pr(&base, &token, &repo).await;
+        open_pr(&base, &token, &repo, "main").await;
 
         let merged = client
             .post(format!(
@@ -231,6 +231,97 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
 }
 
 #[tokio::test]
+async fn merge_strategies_update_the_selected_base_without_moving_repo_head() {
+    let (db, app_dir) = setup_test_db().await;
+    let repo_root = app_dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let app = rg_http::create_router_for_test(build_test_app_state(db, repo_root.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let base = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _app_dir = app_dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    crate::common::wait_for_listener(&addr).await;
+
+    let (token, _) = register_full(&base, "merge-owner", "merge-owner@example.com").await;
+    let client = reqwest::Client::new();
+
+    for strategy in ["merge", "squash", "rebase"] {
+        let repo = format!("nondefault-{strategy}");
+        create_repo_and_pr(&base, &token, &repo).await;
+        let bare_path = repo_root.join(format!("merge-owner/{repo}.git"));
+        let (worktree, main_before) = seed_diverged_repository(&bare_path);
+        assert_eq!(
+            git(&["symbolic-ref", "HEAD"], Some(&bare_path)),
+            "refs/heads/main"
+        );
+
+        let path = worktree.path();
+        git(&["checkout", "-b", "develop", "main"], Some(path));
+        std::fs::write(path.join("develop-only.txt"), "selected base\n").unwrap();
+        git(&["add", "."], Some(path));
+        git(&["commit", "-m", "advance develop"], Some(path));
+        git(&["push", "origin", "develop"], Some(path));
+        let develop_before = git(&["rev-parse", "refs/heads/develop"], Some(&bare_path));
+        assert_ne!(develop_before, main_before);
+
+        open_pr(&base, &token, &repo, "develop").await;
+        let response = client
+            .post(format!(
+                "{base}/api/v1/repos/merge-owner/{repo}/pulls/1/merge"
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"strategy": strategy}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, 200, "{strategy}: {body}");
+
+        let develop_after = git(&["rev-parse", "refs/heads/develop"], Some(&bare_path));
+        assert_ne!(
+            develop_after, develop_before,
+            "{strategy}: base did not move"
+        );
+        assert_eq!(body["merge_commit_sha"], develop_after, "{strategy}");
+        assert_eq!(
+            git(&["rev-parse", "refs/heads/main"], Some(&bare_path)),
+            main_before,
+            "{strategy}: repository HEAD branch moved"
+        );
+        assert_eq!(
+            git(&["symbolic-ref", "HEAD"], Some(&bare_path)),
+            "refs/heads/main"
+        );
+        assert_eq!(
+            git(&["show", "develop:develop-only.txt"], Some(&bare_path)),
+            "selected base"
+        );
+        assert_eq!(
+            git(&["show", "develop:feature-a.txt"], Some(&bare_path)),
+            "feature a"
+        );
+
+        let pr: serde_json::Value = client
+            .get(format!("{base}/api/v1/repos/merge-owner/{repo}/pulls/1"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pr["state"], "merged");
+        assert_eq!(pr["merge_commit_sha"], develop_after);
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn merge_conflict_keeps_base_ref_and_restores_open_pr_state() {
     let (db, app_dir) = setup_test_db().await;
     let repo_root = app_dir.path().join("repos");
@@ -258,7 +349,7 @@ async fn merge_conflict_keeps_base_ref_and_restores_open_pr_state() {
         create_repo_and_pr(&base, &token, &repo).await;
         let bare_path = repo_root.join(format!("merge-owner/{repo}.git"));
         let (_worktree, base_sha) = seed_conflicting_repository(&bare_path);
-        open_pr(&base, &token, &repo).await;
+        open_pr(&base, &token, &repo, "main").await;
 
         let failed = client
             .post(format!(
