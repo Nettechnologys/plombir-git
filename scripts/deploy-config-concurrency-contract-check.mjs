@@ -55,7 +55,7 @@ function requireSuccess(name, result) {
   }
 }
 
-const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-deploy-config-contract-'));
+const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-deploy-config-contract-'));
 
 try {
   const deploy = join(fixture, 'deploy');
@@ -80,7 +80,7 @@ try {
     // this precondition would hold over a file that can no longer take the
     // gate's isolated env file at all.
     const compose = productionYamlSource(readFileSync(join(deploy, file), 'utf8'));
-    if (!compose.includes('- ${FORGEKEEP_DEPLOY_ENV_FILE:-.env}')) {
+    if (!compose.includes('- ${PLOMBIR_GIT_DEPLOY_ENV_FILE:-.env}')) {
       throw new Error(`${file} no longer lets the gate supply its isolated env file`);
     }
   }
@@ -116,19 +116,19 @@ while [[ \$# -gt 0 ]]; do
 done
 
 [[ -n "\${env_file}" ]]
-[[ "\${env_file}" == "\${FORGEKEEP_DEPLOY_ENV_FILE}" ]]
+[[ "\${env_file}" == "\${PLOMBIR_GIT_DEPLOY_ENV_FILE}" ]]
 [[ -f "\${env_file}" ]]
 
-if [[ -n "\${FORGEKEEP_TEST_EXPECT_ENV:-}" ]]; then
-  [[ "\${env_file}" == "\${FORGEKEEP_TEST_EXPECT_ENV}" ]]
+if [[ -n "\${PLOMBIR_GIT_TEST_EXPECT_ENV:-}" ]]; then
+  [[ "\${env_file}" == "\${PLOMBIR_GIT_TEST_EXPECT_ENV}" ]]
 fi
 
-if [[ -n "\${FORGEKEEP_TEST_BARRIER:-}" ]]; then
-  marker="\${FORGEKEEP_TEST_BARRIER}/\$(basename "\$(dirname "\${env_file}")")"
+if [[ -n "\${PLOMBIR_GIT_TEST_BARRIER:-}" ]]; then
+  marker="\${PLOMBIR_GIT_TEST_BARRIER}/\$(basename "\$(dirname "\${env_file}")")"
   printf '%s\\n' "\${env_file}" >"\${marker}"
   count=0
   for _ in {1..200}; do
-    count="\$(find "\${FORGEKEEP_TEST_BARRIER}" -type f | wc -l)"
+    count="\$(find "\${PLOMBIR_GIT_TEST_BARRIER}" -type f | wc -l)"
     [[ "\${count}" -ge 2 ]] && break
     sleep 0.01
   done
@@ -141,7 +141,7 @@ fi
 
   const env = {
     PATH: `${fakeBin}:${process.env.PATH}`,
-    FORGEKEEP_TEST_BARRIER: barrier,
+    PLOMBIR_GIT_TEST_BARRIER: barrier,
   };
   const parallel = await Promise.all([worker(fixture, env), worker(fixture, env)]);
   parallel.forEach((result, index) => requireSuccess(`parallel worker ${index + 1}`, result));
@@ -163,11 +163,11 @@ fi
   }
 
   const userEnv = join(deploy, '.env');
-  const sentinel = 'FORGEKEEP_JWT_SECRET=user-owned-sentinel\n';
+  const sentinel = 'PLOMBIR_GIT_JWT_SECRET=user-owned-sentinel\n';
   writeFileSync(userEnv, sentinel, { mode: 0o600 });
   const existing = await worker(fixture, {
     PATH: `${fakeBin}:${process.env.PATH}`,
-    FORGEKEEP_TEST_EXPECT_ENV: userEnv,
+    PLOMBIR_GIT_TEST_EXPECT_ENV: userEnv,
   });
   requireSuccess('existing user env worker', existing);
   if (readFileSync(userEnv, 'utf8') !== sentinel) {

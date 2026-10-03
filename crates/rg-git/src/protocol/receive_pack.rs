@@ -262,7 +262,7 @@ fn build_ref_advertisement(ref_list: &[(String, String)], _service: &str) -> Vec
     // - agent: server identification
     // NOTE: We do NOT advertise atomic (all-or-nothing ref updates) because
     // we process refs sequentially.
-    let caps = "report-status report-status-v2 side-band-64k agent=forgekeep/0.1";
+    let caps = "report-status report-status-v2 side-band-64k agent=plombir-git/0.1";
 
     if let Some((sha, refname)) = ref_list.first() {
         let line = format!("{} {}\0{}", sha, refname, caps);
@@ -426,9 +426,9 @@ where
     // Two implementations exist behind a flag (default: the git CLI):
     //   * `index_pack_via_git`    — `git index-pack --fix-thin --stdin` (subprocess).
     //   * `index_pack_native`     — `gix_pack::Bundle::write_to_directory` (in-process,
-    //     interrupt-driven). Opt-in PoC via `FORGEKEEP_NATIVE_INDEX_PACK`, off by default.
+    //     interrupt-driven). Opt-in PoC via `PLOMBIR_GIT_NATIVE_INDEX_PACK`, off by default.
     //
-    // Both must resolve the thin-pack the same way: ForgeKeep advertises the
+    // Both must resolve the thin-pack the same way: Plombir Git advertises the
     // `thin-pack` capability, so clients send deltas whose base objects live in
     // the repo but NOT in the pack. The CLI resolves them with `--fix-thin`; the
     // native path passes the repo as the thin-pack base-object lookup. Omitting
@@ -489,11 +489,11 @@ fn validate_wire_object_id(sha: &str) -> Result<()> {
 /// Whether receive-pack should index the incoming pack with the native gix
 /// indexer instead of the `git index-pack` subprocess.
 ///
-/// PoC, opt-in — **default off**. Enable with `FORGEKEEP_NATIVE_INDEX_PACK` set
+/// PoC, opt-in — **default off**. Enable with `PLOMBIR_GIT_NATIVE_INDEX_PACK` set
 /// to one of `1` / `true` / `yes` / `on` (case-insensitive). Any other value
 /// (or an unset variable) keeps the git CLI path.
 fn native_index_pack_enabled() -> bool {
-    std::env::var("FORGEKEEP_NATIVE_INDEX_PACK")
+    std::env::var("PLOMBIR_GIT_NATIVE_INDEX_PACK")
         .map(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -554,7 +554,7 @@ impl Drop for InterruptOnDrop {
 ///
 /// Two properties are load-bearing and mirror `index_pack_via_git`:
 ///
-///   * **Thin-pack resolution (== `--fix-thin`).** ForgeKeep advertises the
+///   * **Thin-pack resolution (== `--fix-thin`).** Plombir Git advertises the
 ///     `thin-pack` capability, so the client sends a thin pack whose deltas
 ///     reference base objects that already exist in the repo. We pass the opened
 ///     repository as `thin_pack_base_object_lookup`; the writer resolves the
@@ -713,7 +713,7 @@ impl std::error::Error for RequiredSignatureError {}
 /// `Ok(None)` means either the ref does not require signatures or every new
 /// commit is valid.  Git enumeration / verification failures stay `Err`: a
 /// broken verifier is not evidence that the pusher supplied an unsigned
-/// commit.  Receive-pack and ForgeKeep's server-side commit adapter share this
+/// commit.  Receive-pack and Plombir Git's server-side commit adapter share this
 /// function so both paths keep the same matcher and `%G?` semantics.
 pub fn unsigned_commit_for_required_signature(
     repo_path: &Path,
@@ -1567,7 +1567,7 @@ mod required_signature_message_tests {
     use std::time::Duration;
 
     /// A server path shaped like a real deployment, so a leak is unmistakable.
-    const SERVER_REPO_PATH: &str = "/srv/forgekeep/repositories/octocat/private-mirror.git";
+    const SERVER_REPO_PATH: &str = "/srv/plombir-git/repositories/octocat/private-mirror.git";
 
     /// The exact `GitCliError` a timed-out `git rev-list` produces: the gateway
     /// stores the command line it built, and `build_command_line` puts the

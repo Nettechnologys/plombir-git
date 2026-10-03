@@ -92,7 +92,7 @@ mod tests {
 
     /// Optional disposable server database for the cross-backend acceptance
     /// run. Ordinary `cargo test` keeps using an in-memory SQLite database.
-    const TEST_DATABASE_URL_ENV: &str = "FORGEKEEP_PACKAGE_FILE_MIGRATION_TEST_DATABASE_URL";
+    const TEST_DATABASE_URL_ENV: &str = "PLOMBIR_GIT_PACKAGE_FILE_MIGRATION_TEST_DATABASE_URL";
 
     #[tokio::test]
     async fn one_filename_per_version_is_owned_by_the_database() {

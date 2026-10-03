@@ -1,7 +1,7 @@
 //! The SSH transport is the second consumer of the process shutdown signal
 //! (card_5317e172fd25).
 //!
-//! `forgekeep serve` fans one `watch` channel out to the HTTP server and every
+//! `plombir-git serve` fans one `watch` channel out to the HTTP server and every
 //! background worker, and the comment above it says so. This transport was the
 //! consumer it never reached: `SshServerConfig` carried no receiver, `rg-ssh`
 //! contained no `ctrl_c` or `SignalKind` at all, and `run_serve` bound the SSH

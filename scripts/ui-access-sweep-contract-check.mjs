@@ -22,7 +22,7 @@ import {
 } from './lib/ui-access-sweep.mjs';
 
 const root = resolve(
-  process.env.FORGEKEEP_UI_ACCESS_SWEEP_ROOT || join(dirname(fileURLToPath(import.meta.url)), '..'),
+  process.env.PLOMBIR_GIT_UI_ACCESS_SWEEP_ROOT || join(dirname(fileURLToPath(import.meta.url)), '..'),
 );
 const failures = [];
 

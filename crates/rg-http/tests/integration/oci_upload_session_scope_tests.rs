@@ -90,7 +90,7 @@ async fn a_push_elsewhere_cannot_move_another_repositorys_upload_offset() {
     let first = client
         .patch(format!("{base}{victim_location}"))
         .bearer_auth(&victim)
-        .body(b"forgekeep-".to_vec())
+        .body(b"chunk-one-".to_vec())
         .send()
         .await
         .unwrap();
@@ -192,7 +192,7 @@ async fn a_finalize_elsewhere_cannot_delete_another_repositorys_session() {
         register_full(&base, "oci_kill_pusher", "oci_kill_pusher@example.com").await;
     create_repo(&base, &attacker, "pusher-image").await;
 
-    let payload = b"forgekeep-oci-layer";
+    let payload = b"plombir-git-oci-layer";
     let (victim_location, victim_uuid) =
         start_session(&base, &victim, "oci_kill_victim", "victim-image").await;
     let staged = client

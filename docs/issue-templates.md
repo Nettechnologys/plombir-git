@@ -1,12 +1,12 @@
 # Issue and pull-request templates
 
 This is the reference for the template files you commit to **your own**
-repository so that ForgeKeep pre-fills the new-issue and new-pull-request
+repository so that Plombir Git pre-fills the new-issue and new-pull-request
 forms. The format is the Gitea/GitHub Markdown one: a `.md` file whose optional
 YAML front matter names the template and the labels it applies.
 
 **Where the files go** is the awkward part, and it is why this page exists:
-ForgeKeep reads eight different template directories, eight different chooser
+Plombir Git reads eight different template directories, eight different chooser
 configuration paths and six different pull-request template paths, and nothing
 in the UI tells you which. The complete inventories are below — copy a path
 from them rather than guessing.
@@ -35,7 +35,7 @@ Every front-matter key the format accepts, in one file
 ---
 name: Bug report
 title: '[Bug] '
-about: Something in ForgeKeep behaves differently than documented
+about: Something in Plombir Git behaves differently than documented
 labels: bug, triage
 assignees: [alice, bob]
 ref: main
@@ -143,7 +143,7 @@ contact_links:
     url: https://example.com/security
     about: Report a vulnerability privately instead of opening an issue
   - name: Community chat
-    url: https://chat.example.com/forgekeep
+    url: https://chat.example.com/plombir-git
     about: Questions and usage help
 ```
 

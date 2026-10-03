@@ -39,7 +39,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('explore.title')} · ForgeKeep</title>
+  <title>{t('explore.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

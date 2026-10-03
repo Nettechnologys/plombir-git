@@ -18,7 +18,7 @@
 //! }
 //! ```
 //!
-//! ForgeKeep serves this at:
+//! Plombir Git serves this at:
 //!   `GET /api/v1/repos/{owner}/{repo}/packages/composer/packages.json`
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};

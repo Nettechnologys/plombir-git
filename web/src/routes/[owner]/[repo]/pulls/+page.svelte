@@ -188,7 +188,7 @@
 </script>
 
 <svelte:head>
-  <title>Pull Requests · {owner}/{repo} · ForgeKeep</title>
+  <title>Pull Requests · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

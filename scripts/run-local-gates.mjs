@@ -84,7 +84,7 @@ export const CARGO_JOBS = new Map([
   [
     'git-protocol',
     {
-      uncovered: 'drives a real git client over HTTP and SSH against a release build of ForgeKeep; '
+      uncovered: 'drives a real git client over HTTP and SSH against a release build of Plombir Git; '
         + 'needs the binary built and ports bound.',
     },
   ],
@@ -180,7 +180,7 @@ export function runDeployConfig({ cwd = root } = {}) {
 
   // Mirrors the workflow step, including its ratchet: an empty glob fails loudly
   // rather than passing a loop over nothing. Both app compose files require an
-  // env_file, and the main compose reads FORGEKEEP_JWT_SECRET out of it.
+  // env_file, and the main compose reads PLOMBIR_GIT_JWT_SECRET out of it.
   //
   // A missing deploy/.env used to be copied into that shared repository path
   // and removed by a shell trap. Two concurrent pre-push hooks could therefore
@@ -195,17 +195,17 @@ export function runDeployConfig({ cwd = root } = {}) {
 
   if (!existsSync(userEnv)) {
     try {
-      temporaryRoot = mkdtempSync(join(tmpdir(), 'forgekeep-deploy-config-'));
+      temporaryRoot = mkdtempSync(join(tmpdir(), 'plombir-git-deploy-config-'));
       envFile = join(temporaryRoot, '.env');
       const examplePath = join(repoRoot, 'deploy', '.env.example');
       const example = readFileSync(examplePath, 'utf8');
-      const secretLine = /^FORGEKEEP_JWT_SECRET=.*$/m;
+      const secretLine = /^PLOMBIR_GIT_JWT_SECRET=.*$/m;
       if (!secretLine.test(example)) {
-        throw new Error(`${examplePath} no longer declares FORGEKEEP_JWT_SECRET`);
+        throw new Error(`${examplePath} no longer declares PLOMBIR_GIT_JWT_SECRET`);
       }
       writeFileSync(
         envFile,
-        example.replace(secretLine, `FORGEKEEP_JWT_SECRET=${randomBytes(32).toString('hex')}`),
+        example.replace(secretLine, `PLOMBIR_GIT_JWT_SECRET=${randomBytes(32).toString('hex')}`),
         { mode: 0o600 },
       );
       preface = 'deploy/.env is absent; validating with an isolated temporary env file.';
@@ -224,11 +224,11 @@ export function runDeployConfig({ cwd = root } = {}) {
     fi
     for compose in "\${composes[@]}"; do
       echo "Validating \${compose}"
-      docker compose --env-file "\${FORGEKEEP_DEPLOY_ENV_FILE}" -f "\${compose}" config >/dev/null
+      docker compose --env-file "\${PLOMBIR_GIT_DEPLOY_ENV_FILE}" -f "\${compose}" config >/dev/null
     done
   `, {
     cwd: repoRoot,
-    env: { FORGEKEEP_DEPLOY_ENV_FILE: envFile },
+    env: { PLOMBIR_GIT_DEPLOY_ENV_FILE: envFile },
   }));
 
   if (temporaryRoot) {

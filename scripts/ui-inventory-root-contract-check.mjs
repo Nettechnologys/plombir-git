@@ -32,7 +32,7 @@ function assertSame(actual, expected, label) {
   }
 }
 
-const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-inventory-root.'));
+const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-inventory-root.'));
 try {
   const rootJson = join(fixture, 'root.json');
   const rootMd = join(fixture, 'root.md');

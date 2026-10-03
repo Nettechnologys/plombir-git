@@ -266,7 +266,7 @@
 </script>
 
 <svelte:head>
-  <title>Time Tracking · {owner}/{repo} · ForgeKeep</title>
+  <title>Time Tracking · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

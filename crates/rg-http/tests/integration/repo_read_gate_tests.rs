@@ -44,7 +44,7 @@ async fn status(url: &str, auth: Option<(&str, bool)>) -> reqwest::StatusCode {
     match auth {
         // (token, via_cookie): the web UI sends the HttpOnly cookie, API
         // clients send the bearer header — both are the same session.
-        Some((token, true)) => req = req.header("cookie", format!("forgekeep_token={token}")),
+        Some((token, true)) => req = req.header("cookie", format!("plombir_git_token={token}")),
         Some((token, false)) => req = req.bearer_auth(token),
         None => {}
     }
@@ -61,7 +61,7 @@ async fn write_file_status(
         .post(format!(
             "{base}/api/v1/repos/{owner}/{repo}/contents/README.md"
         ))
-        .header("cookie", format!("forgekeep_token={token}"))
+        .header("cookie", format!("plombir_git_token={token}"))
         .json(&serde_json::json!({
             "content": "# cookie write\n",
             "message": "write through cookie session",

@@ -371,7 +371,7 @@ async fn an_escaping_path_is_rejected_before_anything_is_written() {
     // Inside the temp dir the service itself writes into, so the target is
     // writable — the test must fail because the path was rejected, not because
     // the filesystem said no.
-    let target = std::env::temp_dir().join(format!("forgekeep-escape-{}", uuid::Uuid::new_v4()));
+    let target = std::env::temp_dir().join(format!("plombir-git-escape-{}", uuid::Uuid::new_v4()));
     assert!(!target.exists(), "the fixture target must start absent");
     let encoded = target.to_string_lossy().replace('/', "%2F");
 
@@ -410,9 +410,9 @@ async fn a_traversing_path_is_rejected_before_anything_is_written() {
     let (token, _) = register_full(&base, "traverse-owner", "traverse@example.com").await;
     create_repo(&base, &token, "traverse-repo").await;
 
-    // The service builds its working tree as `<temp_dir>/forgekeep-file-<uuid>`,
+    // The service builds its working tree as `<temp_dir>/plombir-git-file-<uuid>`,
     // so one `..` lands back in the temp dir under a name we can look for.
-    let name = format!("forgekeep-traverse-{}", uuid::Uuid::new_v4());
+    let name = format!("plombir-git-traverse-{}", uuid::Uuid::new_v4());
     let target = std::env::temp_dir().join(&name);
     assert!(!target.exists(), "the fixture target must start absent");
 

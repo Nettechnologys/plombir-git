@@ -189,7 +189,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('repo.edit_file')} · {path} · ForgeKeep</title>
+  <title>{t('repo.edit_file')} · {path} · Plombir Git</title>
 </svelte:head>
 
 {#if loading}

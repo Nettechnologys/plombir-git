@@ -264,12 +264,12 @@ fn build_ref_advertisement(ref_list: &[(String, String)], service: &str) -> Vec<
         // - agent: server identification
         // NOTE: We do NOT advertise multi_ack / multi_ack_detailed / no-done because
         // our negotiation loop only handles the simple NAK→packfile flow.
-        let caps = "side-band-64k ofs-delta agent=forgekeep/0.1";
+        let caps = "side-band-64k ofs-delta agent=plombir-git/0.1";
         let line = format!("{} {}\0{}", sha, refname, caps);
         lines.push(PktLine::Data(line.into_bytes()));
     } else {
         // Empty repo — still need capabilities
-        let caps = "side-band-64k ofs-delta agent=forgekeep/0.1";
+        let caps = "side-band-64k ofs-delta agent=plombir-git/0.1";
         let line = format!(
             "0000000000000000000000000000000000000000 capabilities^{}\0{}",
             service, caps

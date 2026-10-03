@@ -344,7 +344,7 @@
 </script>
 
 <svelte:head>
-  <title>Board · {owner}/{repo} · ForgeKeep</title>
+  <title>Board · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

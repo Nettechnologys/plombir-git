@@ -231,14 +231,14 @@ for (const [label, source] of [
   if (!/packageInstallSnippet/.test(source)) {
     failures.push(`${label} must build install commands through the shared packageInstallSnippet helper`);
   }
-  if (/<ForgeKeep URL>/.test(source)) {
+  if (/<Plombir Git URL>/.test(source)) {
     failures.push(`${label} must not print a placeholder instance URL in an install command`);
   }
 }
 
 // `GOPROXY=` is the command form; the prose above the `default:` branch may
 // still name the protocol to explain why there is no command.
-if (/<ForgeKeep URL>|GOPROXY\s*=/.test(packageInstall)) {
+if (/<Plombir Git URL>|GOPROXY\s*=/.test(packageInstall)) {
   failures.push(
     'packageInstall must not advertise a Go module proxy endpoint: this server routes none',
   );

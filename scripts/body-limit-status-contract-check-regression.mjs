@@ -39,7 +39,7 @@ const checkName = 'body-limit-status-contract-check.mjs';
 
 /** A throwaway copy of the tree the check reads: rg-http, the check, its libs. */
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-body-status-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-body-status-'));
   mkdirSync(join(fixture, 'crates', 'rg-http'), { recursive: true });
   mkdirSync(join(fixture, 'scripts'), { recursive: true });
   cpSync(join(root, 'crates', 'rg-http', 'src'), join(fixture, 'crates', 'rg-http', 'src'), {

@@ -97,7 +97,7 @@ git -C "${WORK_DIR}/seed" config user.name "Protocol Matrix"
 git -C "${WORK_DIR}/seed" config user.email "protocol-matrix@example.com"
 printf 'initial\n' >"${WORK_DIR}/seed/README.md"
 python3 - <<'PY' >"${WORK_DIR}/seed/payload.txt"
-print("forgekeep-protocol-matrix-" * 4096)
+print("plombir-git-protocol-matrix-" * 4096)
 PY
 git -C "${WORK_DIR}/seed" add README.md payload.txt
 GIT_AUTHOR_DATE="2026-01-01T00:00:00Z" \

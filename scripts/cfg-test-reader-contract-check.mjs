@@ -80,7 +80,7 @@ const scriptsDir = dirname(fileURLToPath(import.meta.url));
 
 // The mutation stand points this at a fixture tree, so it drives the real sweep
 // rather than a copy of it.
-const override = process.env.FORGEKEEP_CFG_TEST_READER_ROOT;
+const override = process.env.PLOMBIR_GIT_CFG_TEST_READER_ROOT;
 const root = override ? resolve(override) : resolve(scriptsDir, '..');
 
 /** Where code that reads Rust lives — the Rust guards and the JS checks alike. */

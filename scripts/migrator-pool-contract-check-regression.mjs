@@ -28,7 +28,7 @@ const candidateFiles = [
 ];
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-migrator-pool-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-migrator-pool-'));
   for (const file of candidateFiles) {
     const target = join(fixture, file);
     mkdirSync(dirname(target), { recursive: true });
@@ -58,7 +58,7 @@ const DECOY: &str = "Migrator::down(&string_literal, None) connect_with_pool(url
 function run(fixture) {
   const result = spawnSync(process.execPath, [check], {
     cwd: fixture,
-    env: { ...process.env, FORGEKEEP_MIGRATOR_POOL_ROOT: fixture },
+    env: { ...process.env, PLOMBIR_GIT_MIGRATOR_POOL_ROOT: fixture },
     encoding: 'utf8',
   });
   return {

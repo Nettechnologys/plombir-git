@@ -137,7 +137,7 @@
 </script>
 
 <svelte:head>
-  <title>Packages · {owner}/{repo} · ForgeKeep</title>
+  <title>Packages · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

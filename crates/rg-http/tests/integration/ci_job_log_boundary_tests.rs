@@ -192,7 +192,7 @@ async fn an_oversized_runner_log_arrives_trimmed_instead_of_being_lost() {
         stored.len()
     );
     assert!(
-        stored.starts_with("[forgekeep-runner] log truncated:"),
+        stored.starts_with("[plombir-git-runner] log truncated:"),
         "a shortened log has to say so, or it reads as the whole build's output"
     );
     assert!(

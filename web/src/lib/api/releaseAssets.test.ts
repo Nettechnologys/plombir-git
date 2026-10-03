@@ -72,7 +72,7 @@ function asset(): ReleaseAsset {
   return {
     id: 11,
     release_id: 7,
-    filename: 'forgekeep.zip',
+    filename: 'plombir-git.zip',
     size: 7,
     content_type: 'application/zip',
     download_count: 0,
@@ -94,7 +94,7 @@ describe('release asset upload transport', () => {
   });
 
   it('sends the authenticated file request and reports measured progress', async () => {
-    const file = new File(['payload'], 'forgekeep.zip', { type: 'application/zip' });
+    const file = new File(['payload'], 'plombir-git.zip', { type: 'application/zip' });
     const progress = vi.fn();
     const result = releases.uploadAsset('alice', 'demo', 7, file, progress);
     const xhr = FakeXmlHttpRequest.instances[0];
@@ -106,7 +106,7 @@ describe('release asset upload transport', () => {
     expect(xhr.headers).toMatchObject({
       Authorization: 'Bearer test-token',
       'Content-Type': 'application/zip',
-      'Content-Disposition': "attachment; filename*=UTF-8''forgekeep.zip",
+      'Content-Disposition': "attachment; filename*=UTF-8''plombir-git.zip",
     });
     expect(xhr.body).toBe(file);
 
@@ -186,7 +186,7 @@ describe('release asset production wiring', () => {
 			'alice',
 			'demo',
 			11,
-			'forgekeep.zip',
+			'plombir-git.zip',
 		);
 
 		await click(element(rendered.container, '.asset-delete'));

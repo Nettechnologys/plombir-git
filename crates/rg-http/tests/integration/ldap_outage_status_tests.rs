@@ -44,7 +44,7 @@ const PASSWORD: &str = "directory-password";
 // subset that carries `authenticate` end to end — bind, search, unbind — with
 // the result code of each step chosen by the test.
 
-/// What the mock directory does when ForgeKeep binds against it.
+/// What the mock directory does when Plombir Git binds against it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Behaviour {
     /// Everything answers; the login completes.

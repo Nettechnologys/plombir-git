@@ -167,8 +167,8 @@ async fn an_option_shaped_tree_ish_cannot_reach_git() {
     for tree_ish in [
         "--list",
         "--remote=ssh:%2F%2F127.0.0.1:1%2Fx",
-        "--output=%2Ftmp%2Fforgekeep-archive-pwn",
-        "-o%2Ftmp%2Fforgekeep-archive-pwn",
+        "--output=%2Ftmp%2Fplombir-git-archive-pwn",
+        "-o%2Ftmp%2Fplombir-git-archive-pwn",
     ] {
         let resp = client
             .get(format!("{url}/{tree_ish}.zip"))
@@ -189,7 +189,7 @@ async fn an_option_shaped_tree_ish_cannot_reach_git() {
         );
     }
     assert!(
-        !Path::new("/tmp/forgekeep-archive-pwn").exists(),
+        !Path::new("/tmp/plombir-git-archive-pwn").exists(),
         "`git archive --output=` must never have run"
     );
 }

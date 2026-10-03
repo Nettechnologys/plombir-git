@@ -97,7 +97,10 @@ async fn present_pat(
             let scope = format!("repository:{username}/{repo}:pull,push");
             client
                 .get(format!("{base}/v2/auth/token"))
-                .query(&[("service", "forgekeep-registry"), ("scope", scope.as_str())])
+                .query(&[
+                    ("service", "plombir-git-registry"),
+                    ("scope", scope.as_str()),
+                ])
                 .header(
                     reqwest::header::AUTHORIZATION,
                     format!(
@@ -255,7 +258,7 @@ async fn deactivating_an_account_kills_the_session_it_already_issued() {
         (
             "HttpOnly cookie",
             "cookie",
-            format!("forgekeep_token={jwt}"),
+            format!("plombir_git_token={jwt}"),
         ),
     ];
 
@@ -507,7 +510,7 @@ async fn deactivating_an_account_blocks_docker_login() {
         async move {
             client
                 .get(format!("{}/v2/auth/token", base))
-                .query(&[("service", "forgekeep-registry"), ("scope", scope)])
+                .query(&[("service", "plombir-git-registry"), ("scope", scope)])
                 .header(reqwest::header::AUTHORIZATION, auth)
                 .send()
                 .await

@@ -338,7 +338,7 @@
 </script>
 
 <svelte:head>
-  <title>{filePath} · {owner}/{repo} · ForgeKeep</title>
+  <title>{filePath} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

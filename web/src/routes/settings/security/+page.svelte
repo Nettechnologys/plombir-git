@@ -284,7 +284,7 @@
 </script>
 
 <svelte:head>
-  <title>Security · ForgeKeep</title>
+  <title>Security · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container security-page">

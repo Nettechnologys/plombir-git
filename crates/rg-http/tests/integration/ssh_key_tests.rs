@@ -1,7 +1,7 @@
 use crate::common::{register_user, spawn_test_app};
 
 const VALID_KEY: &str =
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA test@forgekeep";
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA test@plombir-git";
 
 #[tokio::test]
 async fn ssh_key_lifecycle_validates_and_enforces_ownership() {

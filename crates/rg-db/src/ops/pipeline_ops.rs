@@ -2396,7 +2396,7 @@ pub async fn settle_pipeline_if_active(
 
 /// Resolve concurrency group template variables.
 ///
-/// Supports `${{ ref }}` / `${{ branch }}` — the `.forgekeep-ci.yml` spelling —
+/// Supports `${{ ref }}` / `${{ branch }}` — the `.plombir-git-ci.yml` spelling —
 /// plus the two Actions names that mean exactly the same thing. A workflow in
 /// `.gitea/workflows/` has already had its full `${{ github.* }}` context
 /// expanded by `gitea_actions::expand_concurrency_group`, so this pass is a

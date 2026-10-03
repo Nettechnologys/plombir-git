@@ -99,7 +99,7 @@ const CONTAINER_REMOVAL_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// container by name, so a name that drifts from the one `docker run --name`
 /// was given leaves a live container behind with nothing pointing at it.
 pub(crate) fn job_container_name(job_id: i64) -> String {
-    format!("forgekeep-job-{job_id}")
+    format!("plombir-git-job-{job_id}")
 }
 
 /// Pipeline runner that executes stages/jobs sequentially.
@@ -272,7 +272,7 @@ impl PipelineRunner {
 
     /// Tell this runner about the process's graceful-shutdown signal.
     ///
-    /// `forgekeep serve` fans one `watch` channel out to the HTTP server, the
+    /// `plombir-git serve` fans one `watch` channel out to the HTTP server, the
     /// SSH transport and every background worker. The embedded pipeline runner
     /// was the consumer it never reached: a `SIGTERM` severed the pipeline
     /// wherever it stood and left its `pipeline_jobs` row `running` until the
@@ -1321,7 +1321,7 @@ impl PipelineRunner {
             }
         }
         env.insert("CI".into(), "true".into());
-        env.insert("FORGEKEEP".into(), "true".into());
+        env.insert("PLOMBIR_GIT".into(), "true".into());
         env.insert("CI_PIPELINE_ID".into(), self.pipeline_id.to_string());
         env.insert("CI_COMMIT_SHA".into(), pipeline.commit_sha.clone());
         env.insert("CI_SHA".into(), pipeline.commit_sha);
@@ -1703,7 +1703,7 @@ where
 /// [`rg_core::platform::fs::CI_CACHE_DIR_HINT`].
 const WORKSPACE_DIR_HINT: &str =
     "CI workspaces live in `_ci_workspaces/<repo_id>/` next to the repository storage root; \
-     that directory must be writable by the user running forgekeep";
+     that directory must be writable by the user running plombir-git";
 
 /// One actionable line for a filesystem failure on a CI cache path.
 ///
@@ -1744,7 +1744,7 @@ fn remove_cache_archive(archive: &std::path::Path, why: &str) {
 
 /// Prefix used for runner-generated lines so they are distinguishable from the
 /// job script's own output.
-const JOB_NOTICE_PREFIX: &str = "[forgekeep] ";
+const JOB_NOTICE_PREFIX: &str = "[plombir-git] ";
 
 /// Append runner diagnostics to a job's captured output.
 ///
@@ -2615,8 +2615,8 @@ mod tests {
         assert_eq!(
             log,
             "building\n\
-             [forgekeep] CI cache save failed: /srv/_ci_cache/1/ab.tar\n\
-             [forgekeep]   hint: chown it\n"
+             [plombir-git] CI cache save failed: /srv/_ci_cache/1/ab.tar\n\
+             [plombir-git]   hint: chown it\n"
         );
         assert_eq!(append_job_notices("kept".into(), &[]), "kept");
     }

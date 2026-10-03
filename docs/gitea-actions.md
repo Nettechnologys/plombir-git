@@ -1,6 +1,6 @@
 # Gitea Actions workflows — the supported subset
 
-ForgeKeep reads `.gitea/workflows/*.yml` in the Gitea/GitHub Actions format, and
+Plombir Git reads `.gitea/workflows/*.yml` in the Gitea/GitHub Actions format, and
 implements a **subset** of it. This page is that subset's boundary.
 
 Reaching for GitHub's own documentation instead will mislead you, which is why
@@ -19,12 +19,12 @@ workflow that has never run is worth checking against this page before assuming
 the event did not fire.
 
 **Which format wins.** `.gitea/workflows/` is tried first. The native
-[`.forgekeep-ci.yml`](ci.md) is used when this directory is absent at the commit
+[`.plombir-git-ci.yml`](ci.md) is used when this directory is absent at the commit
 being built, or when no workflow in it is triggered by the event. The native
 format is also the supported escape hatch for anything on this page marked
 unsupported.
 
-**Source budgets.** ForgeKeep retains every workflow source from the immutable
+**Source budgets.** Plombir Git retains every workflow source from the immutable
 commit while it resolves repository-local reusable workflows. The engine
 therefore refuses a workflow set before loading the file that crosses any of
 these limits; the error names that file:
@@ -194,7 +194,7 @@ jobs:
 | `workflow_call` | Nothing — it declares the file *callable* by another workflow. See [Reusable workflows](#reusable-workflows). |
 
 Every other `on:` name is refused by the name you wrote, with that list in the
-message. That includes names Actions defines and ForgeKeep has no producer for
+message. That includes names Actions defines and Plombir Git has no producer for
 — `schedule` (there is no scheduler in the tree) and `pull_request_target` (it
 would run the workflow from the base branch, which nothing here does):
 
@@ -585,7 +585,7 @@ contexts.
 boundary; they are refused there by field and expression rather than left in the
 configuration as literal `${{ … }}`.
 
-`vars.NAME` is **not** supported anywhere: ForgeKeep has no repository or
+`vars.NAME` is **not** supported anywhere: Plombir Git has no repository or
 organization configuration-variable store, and silently reading `env.NAME`
 instead would be a different Actions context with the same name.
 

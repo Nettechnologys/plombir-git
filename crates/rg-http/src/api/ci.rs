@@ -604,7 +604,7 @@ pub async fn trigger_pipeline(
     };
 
     // Check if CI config exists. The wording lives in `rg_core::ci` next to the
-    // gate itself: this used to say `no .forgekeep-ci.yml found`, which lied to
+    // gate itself: this used to say `no .plombir-git-ci.yml found`, which lied to
     // every repository driving CI from `.gitea/workflows/`.
     if !state.ci_engine.has_ci_config(&repo_path, &commit_sha) {
         return AppError::bad_request(rg_core::ci::NO_CI_CONFIG_MESSAGE).into_response();
@@ -748,7 +748,7 @@ pub async fn retry_pipeline(
             // which is not "this run had none" but "ask the repository as it
             // stands today": the matcher then filters a retried pull request
             // against the *default* branch — so a PR into `develop` selects no
-            // workflow and the retry falls through to `.forgekeep-ci.yml`, a
+            // workflow and the retry falls through to `.plombir-git-ci.yml`, a
             // different graph under the same `201` — and a `paths:` filter
             // diffs against the commit's first parent instead of the range the
             // push actually covered. A row written before the columns existed

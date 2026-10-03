@@ -15,7 +15,7 @@
 //! - `RegistrationsBaseUrl/3.6.0` — registration index
 //! - `SearchQueryService/3.5.0` — search endpoint
 //!
-//! ForgeKeep serves these at:
+//! Plombir Git serves these at:
 //! - Service Index:  `GET /api/v1/repos/{owner}/{repo}/packages/nuget/index.json`
 //! - Registration:   `GET /api/v1/repos/{owner}/{repo}/packages/nuget/registration/{id}/index.json`
 //! - Search:         `GET /api/v1/repos/{owner}/{repo}/packages/nuget/query?q=...`
@@ -660,7 +660,7 @@ fn build_registration_page_leaf(
     entry: &NuGetRegistrationEntry,
     leaf_id: String,
 ) -> serde_json::Value {
-    // ForgeKeep does not advertise a Catalog resource, so the catalog entry's
+    // Plombir Git does not advertise a Catalog resource, so the catalog entry's
     // identity names the object embedded in the registration index. Pointing
     // at a fragment of the standalone leaf would name a node that document
     // does not contain.

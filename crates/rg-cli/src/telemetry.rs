@@ -1,4 +1,4 @@
-//! OpenTelemetry (OTLP) distributed-tracing wiring for the ForgeKeep server.
+//! OpenTelemetry (OTLP) distributed-tracing wiring for the Plombir Git server.
 //!
 //! Layers an OTLP span exporter on top of the existing `tracing` fmt subscriber
 //! **when an OTLP endpoint is configured** — via `[observability].otlp_endpoint`
@@ -27,11 +27,11 @@ use tracing_subscriber::{EnvFilter, Layer};
 /// `service.name` reported to the collector when neither `OTEL_SERVICE_NAME`
 /// nor `[observability].service_name` is set.
 ///
-/// Named rather than written inline because `forgekeep.example.toml` states it
+/// Named rather than written inline because `plombir-git.example.toml` states it
 /// to the operator twice — in the prose above the knob and in the commented
 /// line they are invited to uncomment — and a default nobody can point at is a
 /// default no test can check those statements against.
-pub(crate) const DEFAULT_OTEL_SERVICE_NAME: &str = "forgekeep";
+pub(crate) const DEFAULT_OTEL_SERVICE_NAME: &str = "plombir-git";
 
 /// Head sampling ratio applied when `[observability].sample_ratio` is unset:
 /// every trace is recorded. Named for the same reason as
@@ -266,6 +266,6 @@ mod tests {
         let cfg = resolve_otel_config(Some("http://otel:4318".to_string()), None, None)
             .expect("endpoint present → Some");
         assert_eq!(cfg.endpoint, "http://otel:4318/v1/traces");
-        assert_eq!(cfg.service_name, "forgekeep");
+        assert_eq!(cfg.service_name, "plombir-git");
     }
 }

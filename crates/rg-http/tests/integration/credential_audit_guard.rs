@@ -188,7 +188,7 @@ const CREDENTIALS: [Credential; 13] = [
         ops: "user::service",
         verbs: &["reset_password", "forgot_password"],
     },
-    // The HMAC key ForgeKeep signs every outgoing delivery with. Not a way into
+    // The HMAC key Plombir Git signs every outgoing delivery with. Not a way into
     // this instance — the opposite: it is what a receiver decides by. Which is
     // why rotation is the quiet event of the two, and why the entry exists at
     // all: the receiver goes on trusting a signature made with a different key

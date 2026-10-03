@@ -5,7 +5,7 @@
 // Why this exists: every quick-start told the operator `mkdir -p data`, which
 // takes the ambient umask — 0755 on a stock host. Everything the server
 // persists lands below that one directory: the bare clones of every *private*
-// repository, `forgekeep.db` with its e-mail addresses and argon2 hashes, the
+// repository, `plombir-git.db` with its e-mail addresses and argon2 hashes, the
 // `VACUUM INTO` snapshots of it (0644 by construction), the audit archive, LFS
 // objects and OCI layers. So a single missing `-m 700` handed all of it to
 // every other local account on the host, and no amount of care in the writers
@@ -33,7 +33,7 @@ import { fileURLToPath } from 'node:url';
 import { yamlAnnotatedLines } from './lib/yaml-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
-const root = resolve(process.env.FORGEKEEP_DATA_DIR_MODE_ROOT || join(scriptsDir, '..'));
+const root = resolve(process.env.PLOMBIR_GIT_DATA_DIR_MODE_ROOT || join(scriptsDir, '..'));
 const failures = [];
 
 // The surfaces that tell an operator to create the host data directory, and the

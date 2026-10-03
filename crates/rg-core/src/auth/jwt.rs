@@ -50,7 +50,7 @@ pub struct MfaChallengeClaims {
 }
 
 fn mfa_challenge_key(secret: &str) -> String {
-    format!("forgekeep:mfa-challenge:{secret}")
+    format!("plombir-git:mfa-challenge:{secret}")
 }
 
 /// Generate a signed JWT for a user and its current session generation.

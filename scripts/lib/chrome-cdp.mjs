@@ -140,7 +140,7 @@ export async function launchChromeCdp({
   chromePath,
   chromeArgs = [],
   cdpPort,
-  profilePrefix = 'forgekeep-browser-smoke-',
+  profilePrefix = 'plombir-git-browser-smoke-',
   startupTimeoutMs = 12_000,
 }) {
   const requestedPort = requestedCdpPort(cdpPort);

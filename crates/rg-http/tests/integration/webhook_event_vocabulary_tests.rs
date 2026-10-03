@@ -24,7 +24,7 @@ async fn setup(suffix: &str) -> (String, String) {
 
 fn body(events: &[&str]) -> serde_json::Value {
     serde_json::json!({
-        "url": "https://hooks.example.invalid/forgekeep",
+        "url": "https://hooks.example.invalid/plombir-git",
         "events": events,
     })
 }

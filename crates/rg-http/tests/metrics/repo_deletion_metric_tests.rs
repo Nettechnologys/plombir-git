@@ -1,4 +1,4 @@
-//! card_a02cf2573184: `forgekeep_repos_deleted_total` must count every retired
+//! card_a02cf2573184: `plombir_git_repos_deleted_total` must count every retired
 //! repository, not only the ones a human deleted one at a time.
 //!
 //! The counter had a single producer and it sat in `delete_repo_handler`.
@@ -6,7 +6,7 @@
 //! own no handler of their own — organization retirement
 //! (`retire_org_repositories`) and account retirement
 //! (`retire_account_repositories`) — so deleting an organization holding forty
-//! repositories moved the `forgekeep_repositories` gauge by forty and the
+//! repositories moved the `plombir_git_repositories` gauge by forty and the
 //! counter by nothing. Two series describing the same event disagreed, and the
 //! rate panel is built on the one that undercounted.
 //!
@@ -26,7 +26,7 @@
 
 use crate::common::{register_full, spawn_test_app_with_db};
 
-/// The value an operator would scrape for `forgekeep_repos_deleted_total`.
+/// The value an operator would scrape for `plombir_git_repos_deleted_total`.
 ///
 /// A counter Prometheus has never been given a value for is absent from the
 /// exposition entirely, which reads as zero.
@@ -41,7 +41,7 @@ async fn scraped_deletions(base: &str) -> u64 {
         .expect("read the exposition body");
 
     body.lines()
-        .find_map(|line| line.strip_prefix("forgekeep_repos_deleted_total "))
+        .find_map(|line| line.strip_prefix("plombir_git_repos_deleted_total "))
         .map_or(0, |value| {
             value
                 .trim()

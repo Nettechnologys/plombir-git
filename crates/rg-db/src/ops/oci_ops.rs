@@ -13,7 +13,7 @@ use sea_orm::*;
 
 // ── OCI Repository ─────────────────────────────────────────
 
-/// Find an OCI repository by ForgeKeep repo_id.
+/// Find an OCI repository by Plombir Git repo_id.
 pub async fn find_repo_by_id(
     db: &DatabaseConnection,
     repo_id: i64,

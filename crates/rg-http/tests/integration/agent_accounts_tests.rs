@@ -651,7 +651,7 @@ async fn repository_confinement_holds_over_git_and_for_a_persons_own_token() {
     let registry_login = |token: String| {
         f.http
             .get(format!(
-                "{}/v2/auth/token?service=forgekeep-registry&scope=repository:alice/app:pull",
+                "{}/v2/auth/token?service=plombir-git-registry&scope=repository:alice/app:pull",
                 f.base
             ))
             .basic_auth("alice-agent", Some(token))

@@ -23,7 +23,7 @@ import { testInclusiveRustCode } from './lib/rust-source.mjs';
 import { shellCodeOnly } from './lib/shell-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
-const root = resolve(process.env.FORGEKEEP_RELEASED_PORT_ROOT || join(scriptsDir, '..'));
+const root = resolve(process.env.PLOMBIR_GIT_RELEASED_PORT_ROOT || join(scriptsDir, '..'));
 const failures = [];
 
 function sourceFiles(dir, extensions) {

@@ -769,7 +769,7 @@ pub async fn fork_repo_handler(
     // (card_b38bfb0f2b40). The extractor also widens what counts as a session:
     // the old in-body `extract_bearer_claims` accepted only
     // `Authorization: Bearer`, so the browser — which holds the HttpOnly
-    // `forgekeep_token` cookie and no header — got a `401` from the fork button.
+    // `plombir_git_token` cookie and no header — got a `401` from the fork button.
     RepoAuthRead { repo: source, .. }: RepoAuthRead,
     Path((owner, name)): Path<(String, String)>,
     // The source and destination are independent gates. `RepoAuthRead` above

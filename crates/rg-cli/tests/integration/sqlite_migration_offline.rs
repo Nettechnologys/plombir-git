@@ -3,10 +3,10 @@ use std::process::Command;
 use rg_db::sea_orm::{ConnectionTrait, Statement};
 
 fn command_output(args: &[String]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_forgekeep"))
+    Command::new(env!("CARGO_BIN_EXE_plombir-git"))
         .args(args)
         .output()
-        .unwrap_or_else(|error| panic!("run `forgekeep {}`: {error}", args.join(" ")))
+        .unwrap_or_else(|error| panic!("run `plombir-git {}`: {error}", args.join(" ")))
 }
 
 fn diagnostic(output: &std::process::Output) -> String {
@@ -19,7 +19,7 @@ fn diagnostic(output: &std::process::Output) -> String {
 
 async fn create_pending_database() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
-    let database_path = dir.path().join("forgekeep.db");
+    let database_path = dir.path().join("plombir-git.db");
     let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
     let db = rg_db::connect_with_pool(
         &database_url,
@@ -98,13 +98,13 @@ async fn assert_blocked_before_migrations(database_url: &str, args: &[String]) {
 #[test]
 fn standalone_migrate_process_requires_the_file_backed_sqlite_server_to_stop() {
     let dir = tempfile::tempdir().unwrap();
-    let database_path = dir.path().join("forgekeep.db");
+    let database_path = dir.path().join("plombir-git.db");
     let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
     let server_guard = rg_db::sqlite_process_guard::acquire_server(&database_url)
         .unwrap()
         .unwrap();
 
-    let blocked = Command::new(env!("CARGO_BIN_EXE_forgekeep"))
+    let blocked = Command::new(env!("CARGO_BIN_EXE_plombir-git"))
         .args(["migrate", "--db-url", &database_url])
         .output()
         .expect("run the standalone migrate process while the server lease is held");
@@ -121,7 +121,7 @@ fn standalone_migrate_process_requires_the_file_backed_sqlite_server_to_stop() {
 
     drop(server_guard);
 
-    let migrated = Command::new(env!("CARGO_BIN_EXE_forgekeep"))
+    let migrated = Command::new(env!("CARGO_BIN_EXE_plombir-git"))
         .args(["migrate", "--db-url", &database_url])
         .output()
         .expect("run the standalone migrate process after the server stops");
@@ -210,7 +210,7 @@ fn offline_only_commands_name_the_sqlite_requirement_in_their_help() {
 /// command is pointed at.
 async fn migrated_database() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
-    let database_path = dir.path().join("forgekeep.db");
+    let database_path = dir.path().join("plombir-git.db");
     let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
     let db = rg_db::connect_with_pool(
         &database_url,
@@ -259,7 +259,7 @@ async fn rebuild_fts_refuses_a_live_sqlite_server_and_runs_once_it_stops() {
         "{blocked_output}"
     );
     assert!(
-        blocked_output.contains("forgekeep rebuild-fts"),
+        blocked_output.contains("plombir-git rebuild-fts"),
         "the refusal has to name the command the operator ran, not a migration: {blocked_output}"
     );
     drop(server_guard);
@@ -300,7 +300,7 @@ async fn rotate_encryption_key_dry_run_refuses_a_live_sqlite_server() {
         "{blocked_output}"
     );
     assert!(
-        blocked_output.contains("forgekeep rotate-encryption-key"),
+        blocked_output.contains("plombir-git rotate-encryption-key"),
         "{blocked_output}"
     );
     drop(server_guard);

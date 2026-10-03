@@ -1,7 +1,7 @@
 # Git Protocol Implementation Notes
 
 > This document records the key technical details, protocol specifics, and hard-won
-> lessons from implementing the Git Smart Protocol (V1 + V2) in ForgeKeep.
+> lessons from implementing the Git Smart Protocol (V1 + V2) in Plombir Git.
 > Intended for developers who maintain or extend the `rg-git` crate.
 
 ---
@@ -173,7 +173,7 @@ directly via `exec_request`.
 ### Capabilities (what we advertise)
 
 ```
-side-band-64k ofs-delta agent=forgekeep/0.1
+side-band-64k ofs-delta agent=plombir-git/0.1
 ```
 
 > Note: we do **not** advertise `multi_ack` / `multi_ack_detailed` / `no-done`, because
@@ -181,7 +181,7 @@ side-band-64k ofs-delta agent=forgekeep/0.1
 >
 > Built in `build_ref_advertisement()` in `crates/rg-git/src/protocol/upload_pack.rs`.
 > The HTTP `info/refs` path (`build_info_refs()` in `crates/rg-http/src/lib.rs`) advertises a
-> wider set — `multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=forgekeep/0.1`.
+> wider set — `multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=plombir-git/0.1`.
 
 ### The two forms of want/have
 
@@ -272,7 +272,7 @@ git -C <repo_path> index-pack --fix-thin --stdin
 ```
 
 **Experimental native path (opt-in, default off).** Setting
-`FORGEKEEP_NATIVE_INDEX_PACK=1` (`true`/`yes`/`on`) makes receive-pack index the
+`PLOMBIR_GIT_NATIVE_INDEX_PACK=1` (`true`/`yes`/`on`) makes receive-pack index the
 incoming pack in-process via `gix_pack::Bundle::write_to_directory` instead of
 the `git index-pack` subprocess. The repository is passed as the thin-pack
 base-object lookup — the native equivalent of `--fix-thin` — and the unpack is
@@ -326,7 +326,7 @@ sideband::write_sideband_flush(writer).await?;
 ### Capabilities (what we advertise)
 
 ```
-report-status report-status-v2 side-band-64k agent=forgekeep/0.1
+report-status report-status-v2 side-band-64k agent=plombir-git/0.1
 ```
 
 ---
@@ -623,7 +623,7 @@ The server responds with the V2 capability advertisement, then the client sends 
 
 ```
 <length>version 2\n
-<length>agent=forgekeep/0.1\n
+<length>agent=plombir-git/0.1\n
 <length>ls-refs\n
 <length>fetch=shallow\n
 <length>object-format=sha1\n

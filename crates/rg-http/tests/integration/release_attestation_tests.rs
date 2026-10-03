@@ -309,7 +309,7 @@ async fn an_uncheckable_envelope_is_undeterminable_and_a_wrong_digest_is_a_misma
     // Store an envelope this instance signed itself, binding the asset's real
     // digest, under a predicate type no registered verifier handles. Written
     // straight to the row because the signing endpoint deliberately only ever
-    // issues ForgeKeep's own predicate type.
+    // issues Plombir Git's own predicate type.
     let store_envelope = |statement: rg_core::attestation::Statement| {
         let envelope = rg_core::attestation::sign_statement(&key, &statement)
             .expect("sign the envelope under the instance key");
@@ -366,7 +366,7 @@ async fn an_uncheckable_envelope_is_undeterminable_and_a_wrong_digest_is_a_misma
     store_envelope(rg_core::attestation::Statement::new(
         "notes.txt",
         "0".repeat(64),
-        rg_core::attestation::FORGEKEEP_PROVENANCE_TYPE.to_string(),
+        rg_core::attestation::PLOMBIR_GIT_PROVENANCE_TYPE.to_string(),
         serde_json::json!({ "builder": { "id": "https://forge.example" } }),
     ))
     .await;

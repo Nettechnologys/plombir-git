@@ -499,7 +499,7 @@ const mutations = [
   },
 ];
 
-let fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-inventory-oracle.'));
+let fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-inventory-oracle.'));
 try {
   baseline(fixture);
   const clean = run(fixture);
@@ -510,7 +510,7 @@ try {
 
   for (const mutation of mutations) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-inventory-oracle.'));
+    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-inventory-oracle.'));
     baseline(fixture);
     if (mutation.apply) mutation.apply(fixture);
     else mutateMethod(fixture, mutation);

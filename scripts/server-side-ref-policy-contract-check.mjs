@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Census every production primitive that can move a Git ref without going
-// through another ForgeKeep function.  A new mover must declare which policy
+// through another Plombir Git function.  A new mover must declare which policy
 // owns it; the three user-facing server-side commit producers additionally
 // have to carry `ServerSideCommitPolicy` to the created commit.
 
@@ -12,8 +12,8 @@ import { fileURLToPath } from 'node:url';
 import { productionRustCode, productionRustSource } from './lib/rust-source.mjs';
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
-const root = process.env.FORGEKEEP_SERVER_SIDE_REF_POLICY_ROOT
-  ? path.resolve(process.env.FORGEKEEP_SERVER_SIDE_REF_POLICY_ROOT)
+const root = process.env.PLOMBIR_GIT_SERVER_SIDE_REF_POLICY_ROOT
+  ? path.resolve(process.env.PLOMBIR_GIT_SERVER_SIDE_REF_POLICY_ROOT)
   : path.resolve(scriptsDir, '..');
 const cratesDir = path.join(root, 'crates');
 

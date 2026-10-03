@@ -114,7 +114,8 @@ const SMTP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// Remediation for a failed SMTP probe. `[smtp]` is optional and nothing else
 /// touches it until the first email has to go out, so this check is where a
 /// misconfigured section surfaces — it has to name what to look at.
-const SMTP_HINT: &str = "outbound mail is configured in the `[smtp]` section of forgekeep.toml; a \
+const SMTP_HINT: &str =
+    "outbound mail is configured in the `[smtp]` section of plombir-git.toml; a \
                          timeout usually means a firewall or an egress policy is dropping the \
                          connection, an immediate error means the host does not resolve or \
                          nothing is listening on that port";

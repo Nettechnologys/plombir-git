@@ -35,7 +35,7 @@
 //! and a publication that fails after writing bytes compensates itself through
 //! `discard_stored_blob`. `delete_object` and `delete_object_from_storage` used
 //! to sit here with zero callers — no route, no CLI command, no job
-//! (card_9dc9cac96edc) — which read as "ForgeKeep can delete an LFS object" when
+//! (card_9dc9cac96edc) — which read as "Plombir Git can delete an LFS object" when
 //! nothing ever did.
 //!
 //! What is genuinely missing is a *garbage collector*: an object whose last
@@ -195,7 +195,7 @@ fn action_signature_payload(
     actor: Option<LfsActor>,
 ) -> String {
     format!(
-        "forgekeep-lfs-v4:{}:{}:{}:{}:{}",
+        "plombir-git-lfs-v4:{}:{}:{}:{}:{}",
         action.as_str(),
         repo_id,
         oid,

@@ -522,7 +522,7 @@ async function openPersonaTab({ browser, frontendUrl, token }) {
 
   await tab.send('Network.clearBrowserCookies');
   const cookie = await tab.send('Network.setCookie', {
-    name: 'forgekeep_token',
+    name: 'plombir_git_token',
     value: token,
     url: frontendUrl,
     path: '/',
@@ -794,7 +794,7 @@ export async function main() {
     chromePath: CHROME,
     chromeArgs: ['--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage', 'about:blank'],
     cdpPort: process.env.CDP_PORT,
-    profilePrefix: 'forgekeep-ui-access-sweep-',
+    profilePrefix: 'plombir-git-ui-access-sweep-',
     startupTimeoutMs: CHROME_STARTUP_MS,
   });
   try {

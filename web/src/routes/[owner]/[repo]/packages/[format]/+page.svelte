@@ -69,7 +69,7 @@
 </script>
 
 <svelte:head>
-  <title>{packageFormatLabel(format!)} · {owner}/{repo} · ForgeKeep</title>
+  <title>{packageFormatLabel(format!)} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

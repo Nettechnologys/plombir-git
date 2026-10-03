@@ -1,4 +1,4 @@
-//! Security headers middleware for ForgeKeep.
+//! Security headers middleware for Plombir Git.
 //!
 //! Phase 22-D: Adds defense-in-depth HTTP security headers to all responses.
 //! These headers protect against common web vulnerabilities (XSS, clickjacking,
@@ -133,8 +133,8 @@ fn is_https_uri(uri: &Uri) -> bool {
 }
 
 fn build_content_security_policy(nonce: &str) -> String {
-    let cors_origins = std::env::var("FORGEKEEP_CORS_ORIGINS").ok();
-    let explicit_connect_src = std::env::var("FORGEKEEP_CSP_CONNECT_SRC").ok();
+    let cors_origins = std::env::var("PLOMBIR_GIT_CORS_ORIGINS").ok();
+    let explicit_connect_src = std::env::var("PLOMBIR_GIT_CSP_CONNECT_SRC").ok();
     let connect_src = build_connect_src(cors_origins.as_deref(), explicit_connect_src.as_deref());
 
     format!(

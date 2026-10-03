@@ -131,7 +131,7 @@ impl NoMatchingCiJobs {
 /// while a user-controlled value can still replace it on the other.
 pub const BUILTIN_CI_VARIABLES: [&str; 11] = [
     "CI",
-    "FORGEKEEP",
+    "PLOMBIR_GIT",
     "CI_PIPELINE_ID",
     "CI_COMMIT_SHA",
     "CI_SHA",
@@ -451,7 +451,7 @@ pub struct ConfigurationFailureParams<'a> {
 /// one, not less. Written without its `base_branch`, the retry of a pull
 /// request into a non-default branch is judged against the default branch
 /// instead: its `branches:` workflow then selects nothing and the run falls
-/// through to `.forgekeep-ci.yml`, so a run that honestly failed on "CI
+/// through to `.plombir-git-ci.yml`, so a run that honestly failed on "CI
 /// configuration rejected" can come back green on a different graph under the
 /// same `201` (card_74d58ec3ac1e, for the read half).
 ///
@@ -600,7 +600,7 @@ pub trait CiTrigger: Send + Sync {
 
     /// Whether a workflow at `commit_sha` is actually triggered by `event`.
     ///
-    /// The gate for events the *native* `.forgekeep-ci.yml` format has no notion
+    /// The gate for events the *native* `.plombir-git-ci.yml` format has no notion
     /// of. [`has_ci_config`](Self::has_ci_config) answers the weaker question
     /// "is there a pipeline definition here at all", which for `pull_request`
     /// is a false yes on every repository driving CI from a native config: it
@@ -654,11 +654,11 @@ pub trait CiTrigger: Send + Sync {
 ///
 /// It lives next to [`has_ci_config`] so the message cannot drift from what the
 /// gate actually accepts: the manual-trigger endpoint used to answer
-/// `no .forgekeep-ci.yml found`, while `.gitea/workflows/` has been recognised
+/// `no .plombir-git-ci.yml found`, while `.gitea/workflows/` has been recognised
 /// for just as long — so a repository using Gitea Actions was told its perfectly
 /// valid config did not exist.
 pub const NO_CI_CONFIG_MESSAGE: &str =
-    "no CI config found at this commit — expected `.forgekeep-ci.yml` or `.gitea/workflows/*.yml`";
+    "no CI config found at this commit — expected `.plombir-git-ci.yml` or `.gitea/workflows/*.yml`";
 
 /// Check if a repo has any CI config at the given commit.
 ///
@@ -719,7 +719,7 @@ pub fn has_ci_config_checked(repo_path: &Path, commit_sha: &str) -> Result<bool>
         .peel_to_tree()
         .with_context(|| format!("failed to read CI tree at commit {commit_sha}"))?;
 
-    for path in [".gitea/workflows", ".forgekeep-ci.yml"] {
+    for path in [".gitea/workflows", ".plombir-git-ci.yml"] {
         if commit
             .lookup_entry_by_path(path)
             .with_context(|| format!("failed to look up {path} at commit {commit_sha}"))?
@@ -832,7 +832,7 @@ mod configuration_failure_tests {
         assert_eq!(pipeline.dispatch_inputs, None);
 
         let infrastructure =
-            anyhow::anyhow!("db: repository lookup failed at /srv/private/forgekeep.sqlite");
+            anyhow::anyhow!("db: repository lookup failed at /srv/private/plombir-git.sqlite");
         assert_eq!(
             publish_configuration_failure(params(), &infrastructure)
                 .await
@@ -1005,7 +1005,7 @@ mod tests {
         let git = rg_git::cli_gateway::GitCommandGateway::new().expect("git must be installed");
         git.run_or_bail(&["init", "-q", repo_path.to_str().unwrap()], None)
             .unwrap();
-        std::fs::write(repo_path.join(".forgekeep-ci.yml"), "jobs: {}\n").unwrap();
+        std::fs::write(repo_path.join(".plombir-git-ci.yml"), "jobs: {}\n").unwrap();
         for args in [
             vec!["config", "user.email", "ci@example.com"],
             vec!["config", "user.name", "CI"],
@@ -1052,11 +1052,11 @@ mod tests {
         );
     }
 
-    /// The manual trigger used to name only `.forgekeep-ci.yml`, so a repository
+    /// The manual trigger used to name only `.plombir-git-ci.yml`, so a repository
     /// driving CI from `.gitea/workflows/` was told its config did not exist.
     #[test]
     fn the_operator_message_names_every_accepted_location() {
-        assert!(NO_CI_CONFIG_MESSAGE.contains(".forgekeep-ci.yml"));
+        assert!(NO_CI_CONFIG_MESSAGE.contains(".plombir-git-ci.yml"));
         assert!(NO_CI_CONFIG_MESSAGE.contains(".gitea/workflows"));
     }
 }

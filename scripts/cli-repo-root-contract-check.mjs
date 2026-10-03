@@ -12,7 +12,7 @@
 // beside itself and every step afterwards succeeds against it. `import` is
 // where that stops being a stray directory: the repository's row lands in the
 // real database (`--db-url` / `--config` were right, `--repo-root` was
-// forgotten) while the clone lands where `forgekeep serve` never looks, and the
+// forgotten) while the clone lands where `plombir-git serve` never looks, and the
 // instance then lists a repository whose git directory nobody can open
 // (card_cc8259eba428).
 //
@@ -39,7 +39,7 @@ import { fileURLToPath } from 'node:url';
 import { productionRustCode } from './lib/rust-source.mjs';
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(process.env.FORGEKEEP_CLI_REPO_ROOT_ROOT ?? path.join(scriptsDir, '..'));
+const root = path.resolve(process.env.PLOMBIR_GIT_CLI_REPO_ROOT_ROOT ?? path.join(scriptsDir, '..'));
 const cliSrc = path.join(root, 'crates/rg-cli/src');
 const GATEWAY = 'crates/rg-cli/src/repo_root.rs';
 const DECLARING_FILE = 'crates/rg-cli/src/config.rs';
@@ -63,9 +63,9 @@ const DIRECTORY_CREATORS = [
     file: 'crates/rg-cli/src/commands.rs',
     sites: 3,
     directories: [
-      'the repository storage root (`forgekeep import`)',
-      'the repository storage root (`forgekeep create-repo`)',
-      'the bare repository directory (`forgekeep create-repo`)',
+      'the repository storage root (`plombir-git import`)',
+      'the repository storage root (`plombir-git create-repo`)',
+      'the bare repository directory (`plombir-git create-repo`)',
     ],
     why: '`import` asks `repo_root::check_repo_root_presence` first, so it can only create a root on an instance that owns no repositories; `create-repo` opens no database to ask, and answers the weaker way it can — by announcing the absolute root instead of the relative spelling. `create-repo` makes the root in a call of its own so it can be the owner-only one, while `<owner>/<name>.git` below it keeps the mode the server\'s own repository-creation path gives them — reachability is decided once, at the root',
   },
@@ -91,13 +91,14 @@ const DIRECTORY_CREATORS = [
 const REPO_ROOT_DECIDERS = [
   {
     file: 'crates/rg-cli/src/commands.rs',
-    resolves: 4,
+    resolves: 5,
     checks: 2,
     commands: {
-      'forgekeep import': 'CreateOnACleanInstance — it writes the database row that the clone has to match',
-      'forgekeep index-repo': 'Refuse — it only reads out of the root, so creating one would produce an empty directory and the same failure a step later',
-      'forgekeep create-repo': 'no database of its own to ask; announces the absolute root instead',
-      'forgekeep list-tombstones': 'no database of its own to ask; `rg_core::deletion_inventory::inventory` refuses a root that is not there instead, because the pass exists to report what a deployment actually holds and creating the root would answer that by making the answer empty',
+      'plombir-git migrate': 'never creates the root; reads it only to refuse a new database beside one that already holds repositories (`MissingDatabase::CreateForANewInstance`), since that is an instance whose database was not found',
+      'plombir-git import': 'CreateOnACleanInstance — it writes the database row that the clone has to match',
+      'plombir-git index-repo': 'Refuse — it only reads out of the root, so creating one would produce an empty directory and the same failure a step later',
+      'plombir-git create-repo': 'no database of its own to ask; announces the absolute root instead',
+      'plombir-git list-tombstones': 'no database of its own to ask; `rg_core::deletion_inventory::inventory` refuses a root that is not there instead, because the pass exists to report what a deployment actually holds and creating the root would answer that by making the answer empty',
     },
   },
 ];

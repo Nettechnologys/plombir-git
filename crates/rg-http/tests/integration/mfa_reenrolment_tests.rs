@@ -125,7 +125,7 @@ async fn primary_factor(base: &str, username: &str) -> String {
         .next()
         .expect("empty challenge cookie")
         .to_string();
-    assert!(cookie.starts_with("forgekeep_mfa_challenge="));
+    assert!(cookie.starts_with("plombir_git_mfa_challenge="));
     cookie
 }
 

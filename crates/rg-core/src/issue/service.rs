@@ -212,7 +212,7 @@ pub async fn create_issue(
 /// `import::service::create_imported_issue` replaying somebody else's tracker —
 /// and only this allocator is common to both. With the single producer in the
 /// REST handler, importing a repository with four hundred issues moved
-/// `forgekeep_issues_opened_total` by nothing.
+/// `plombir_git_issues_opened_total` by nothing.
 ///
 /// An imported issue that arrives already closed is counted as closed too. The
 /// alternative — counting the arrival but never its terminal state — makes

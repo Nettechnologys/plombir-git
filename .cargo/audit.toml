@@ -1,7 +1,7 @@
 # cargo-audit configuration — see https://docs.rs/cargo-audit
 #
 # Every entry here is an ADVISORY WE HAVE CONSCIOUSLY ACCEPTED because no fixed
-# release exists yet and the exposure in ForgeKeep is low. Each carries a reason
+# release exists yet and the exposure in Plombir Git is low. Each carries a reason
 # and, where relevant, the follow-up. Keep this list in sync with deny.toml.
 [advisories]
 ignore = [

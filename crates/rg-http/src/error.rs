@@ -1,4 +1,4 @@
-//! Centralized error handling for ForgeKeep HTTP API.
+//! Centralized error handling for Plombir Git HTTP API.
 //!
 //! All API handlers should return `AppError` variants instead of ad-hoc
 //! `(StatusCode, Json)` tuples.
@@ -741,12 +741,12 @@ mod tests {
 
     #[test]
     fn missing_repository_storage_names_the_path_and_repo_root_remedy() {
-        let repo_path = std::path::Path::new("/srv/forgekeep/repos/acme/widgets.git");
+        let repo_path = std::path::Path::new("/srv/plombir-git/repos/acme/widgets.git");
         let error = repository_storage_missing(repo_path);
         let message = error.to_string();
 
         assert!(
-            message.contains("/srv/forgekeep/repos/acme/widgets.git"),
+            message.contains("/srv/plombir-git/repos/acme/widgets.git"),
             "{message}"
         );
         assert!(
@@ -839,7 +839,7 @@ mod tests {
     async fn an_unmarked_error_of_the_same_shape_stays_a_sanitized_500() {
         use axum::response::IntoResponse;
 
-        let err: AppError = anyhow::anyhow!("failed to read CI config object .forgekeep-ci.yml")
+        let err: AppError = anyhow::anyhow!("failed to read CI config object .plombir-git-ci.yml")
             .context("failed to trigger pipeline")
             .into();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -849,7 +849,7 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("Internal server error"), "{body}");
-        assert!(!body.contains(".forgekeep-ci.yml"), "{body}");
+        assert!(!body.contains(".plombir-git-ci.yml"), "{body}");
     }
 
     #[test]

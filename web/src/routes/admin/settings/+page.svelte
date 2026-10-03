@@ -408,7 +408,7 @@
 </script>
 
 <svelte:head>
-  <title>Instance Settings · Admin · ForgeKeep</title>
+  <title>Instance Settings · Admin · Plombir Git</title>
 </svelte:head>
 
 <div class="settings-page">

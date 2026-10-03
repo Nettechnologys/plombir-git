@@ -1,6 +1,6 @@
 //! SSRF-hardened outbound HTTP.
 //!
-//! Anything ForgeKeep POSTs/GETs to a *user-supplied* URL (webhook delivery,
+//! Anything Plombir Git POSTs/GETs to a *user-supplied* URL (webhook delivery,
 //! and any future user-controlled fetch) must go through here so we get, in
 //! one place:
 //!
@@ -301,7 +301,7 @@ fn ssrf_safe_client_builder<R: reqwest::dns::Resolve + 'static>(
 ) -> reqwest::ClientBuilder {
     resolver_bound_client_builder(outbound_client_builder(), resolver)
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("ForgeKeep-Webhook/0.1")
+        .user_agent("PlombirGit-Webhook/0.1")
 }
 
 /// Follow redirects only while they stay on the initiating request's exact
@@ -338,7 +338,7 @@ pub fn outbound_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         outbound_client_builder()
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("ForgeKeep-Webhook/0.1")
+            .user_agent("PlombirGit-Webhook/0.1")
             .build()
             .expect("failed to build hardened outbound HTTP client")
     })
@@ -457,7 +457,7 @@ pub fn check_url_static(raw: &str) -> Result<()> {
 // ([`is_forbidden_ip`]), but a scheme allow-list tuned for git transports and a
 // parser that also understands scp-like `host:path` shorthand.
 
-/// URL schemes ForgeKeep will run a `git` subprocess against for a
+/// URL schemes Plombir Git will run a `git` subprocess against for a
 /// **user-supplied** remote. Everything else — `file://` (local-disk read),
 /// `ext::` (arbitrary transport-helper command), `ftp://`, … — is rejected so a
 /// remote URL can neither read local files nor execute a helper binary.

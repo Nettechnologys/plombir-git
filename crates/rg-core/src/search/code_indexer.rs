@@ -1185,7 +1185,10 @@ mod tests {
         let worktree = dir.path().join("worktree");
         std::fs::create_dir_all(&worktree).expect("worktree directory must be created");
         run_git(&worktree, &["init", "-q", "-b", "main"]);
-        run_git(&worktree, &["config", "user.name", "ForgeKeep Index Test"]);
+        run_git(
+            &worktree,
+            &["config", "user.name", "Plombir Git Index Test"],
+        );
         run_git(&worktree, &["config", "user.email", "indexer@example.test"]);
         for (path, content) in files {
             let file = worktree.join(path);
@@ -1530,10 +1533,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
+    #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
     async fn server_code_index_refresh_is_failure_atomic_and_serialized() {
-        let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-            .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+        let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+            .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
         assert!(
             database_url.starts_with("postgres://") || database_url.starts_with("mysql://"),
             "this proof exercises PostgreSQL or MySQL repository-row locking"

@@ -15,7 +15,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const check = 'scripts/observability-contract-check.mjs';
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-observability-contract-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-observability-contract-'));
   mkdirSync(join(fixture, 'scripts'), { recursive: true });
   mkdirSync(join(fixture, 'crates', 'rg-http', 'src'), { recursive: true });
   cpSync(join(root, check), join(fixture, check));
@@ -97,7 +97,7 @@ function replaceRequired(file, before, after) {
 }
 
 function mutateMainDashboard(fixture, mutate) {
-  const dashboardPath = join(fixture, 'deploy', 'grafana', 'dashboards', 'forgekeep-main.json');
+  const dashboardPath = join(fixture, 'deploy', 'grafana', 'dashboards', 'plombir-git-main.json');
   const dashboard = JSON.parse(readFileSync(dashboardPath, 'utf8'));
   mutate(dashboard);
   writeFileSync(dashboardPath, `${JSON.stringify(dashboard, null, 2)}\n`);
@@ -110,7 +110,7 @@ function runHelperFixture(
   expectedOutput,
   expectedCurl = '',
   {
-    forgekeepPorts = [['8080', '8080'], ['2222', '2222']],
+    plombirGitPorts = [['8080', '8080'], ['2222', '2222']],
     sidecarPorts = [],
   } = {},
 ) {
@@ -135,7 +135,7 @@ ${renderedPorts}
     writeFileSync(
       composeConfig,
       `services:
-${renderService('forgekeep', forgekeepPorts)}${sidecarPorts.length > 0 ? renderService('sidecar', sidecarPorts) : ''}`,
+${renderService('plombir-git', plombirGitPorts)}${sidecarPorts.length > 0 ? renderService('sidecar', sidecarPorts) : ''}`,
     );
     writeFileSync(
       join(bin, 'docker'),
@@ -201,69 +201,69 @@ runMutationFixture(
     '- "8080:8080"   # HTTP',
     '- "8080:8181"   # HTTP',
   ),
-  'Prometheus ForgeKeep target disagrees with the compose container HTTP port: 8080 != 8181',
+  'Prometheus Plombir Git target disagrees with the compose container HTTP port: 8080 != 8181',
 );
 
 runMutationFixture(
   'a changed Prometheus target without an updated compose fails the contract',
   (fixture) => replaceRequired(
     join(fixture, 'deploy', 'prometheus', 'prometheus.yml'),
-    "targets: ['forgekeep:8080']",
-    "targets: ['forgekeep:8181']",
+    "targets: ['plombir-git:8080']",
+    "targets: ['plombir-git:8181']",
   ),
-  'Prometheus ForgeKeep target disagrees with the compose container HTTP port: 8181 != 8080',
+  'Prometheus Plombir Git target disagrees with the compose container HTTP port: 8181 != 8080',
 );
 
 runMutationFixture(
-  'a quoted following scrape job cannot lend its target to the ForgeKeep job',
+  'a quoted following scrape job cannot lend its target to the Plombir Git job',
   (fixture) => {
     const prometheus = join(fixture, 'deploy', 'prometheus', 'prometheus.yml');
-    replaceRequired(prometheus, "targets: ['forgekeep:8080']", "targets: ['sidecar:9999']");
+    replaceRequired(prometheus, "targets: ['plombir-git:8080']", "targets: ['sidecar:9999']");
     replaceRequired(prometheus, "  - job_name: 'prometheus'", '  - "job_name": "prometheus"');
-    replaceRequired(prometheus, "targets: ['localhost:9090']", "targets: ['forgekeep:8080']");
+    replaceRequired(prometheus, "targets: ['localhost:9090']", "targets: ['plombir-git:8080']");
   },
-  'must contain exactly one forgekeep:PORT target in the forgekeep job; parsed 0',
+  'must contain exactly one plombir-git:PORT target in the plombir-git job; parsed 0',
 );
 
 runMutationFixture(
-  'a quoted job_name key in the ForgeKeep scrape job keeps the same contract',
+  'a quoted job_name key in the Plombir Git scrape job keeps the same contract',
   (fixture) => replaceRequired(
     join(fixture, 'deploy', 'prometheus', 'prometheus.yml'),
-    "  - job_name: 'forgekeep'",
-    '  - "job_name": "forgekeep"',
+    "  - job_name: 'plombir-git'",
+    '  - "job_name": "plombir-git"',
   ),
   'Observability contract ok',
   0,
 );
 
 runMutationFixture(
-  'a second ForgeKeep scrape job fails instead of choosing one implicitly',
+  'a second Plombir Git scrape job fails instead of choosing one implicitly',
   (fixture) => replaceRequired(
     join(fixture, 'deploy', 'prometheus', 'prometheus.yml'),
     "  # Prometheus itself\n  - job_name: 'prometheus'",
-    `  # Duplicate ForgeKeep job
-  - job_name: 'forgekeep'
+    `  # Duplicate Plombir Git job
+  - job_name: 'plombir-git'
     static_configs:
-      - targets: ['forgekeep:8080']
+      - targets: ['plombir-git:8080']
 
   # Prometheus itself
   - job_name: 'prometheus'`,
   ),
-  'must contain exactly one scrape_configs job named "forgekeep"; parsed 2',
+  'must contain exactly one scrape_configs job named "plombir-git"; parsed 2',
 );
 
 runMutationFixture(
-  'multiple ForgeKeep targets fail instead of choosing one implicitly',
+  'multiple Plombir Git targets fail instead of choosing one implicitly',
   (fixture) => replaceRequired(
     join(fixture, 'deploy', 'prometheus', 'prometheus.yml'),
-    "targets: ['forgekeep:8080']",
-    "targets: ['forgekeep:8080', 'forgekeep:8181']",
+    "targets: ['plombir-git:8080']",
+    "targets: ['plombir-git:8080', 'plombir-git:8181']",
   ),
-  'must contain exactly one forgekeep:PORT target in the forgekeep job; parsed 2',
+  'must contain exactly one plombir-git:PORT target in the plombir-git job; parsed 2',
 );
 
 runMutationFixture(
-  'a quoted sidecar cannot lend its HTTP mapping to the ForgeKeep service',
+  'a quoted sidecar cannot lend its HTTP mapping to the Plombir Git service',
   (fixture) => {
     const compose = join(fixture, 'deploy', 'docker-compose.yml');
     replaceRequired(compose, '      - "8080:8080"   # HTTP\n', '');
@@ -279,7 +279,7 @@ volumes:
 `,
     );
   },
-  'deploy/docker-compose.yml # HTTP mapping "8080:8080" must identify exactly one services.forgekeep.ports entry',
+  'deploy/docker-compose.yml # HTTP mapping "8080:8080" must identify exactly one services.plombir-git.ports entry',
 );
 
 runMutationFixture(
@@ -299,7 +299,7 @@ volumes:
 `,
     );
   },
-  'deploy/docker-compose.yml # HTTP mapping "8080:8080" must identify exactly one services.forgekeep.ports entry',
+  'deploy/docker-compose.yml # HTTP mapping "8080:8080" must identify exactly one services.plombir-git.ports entry',
 );
 
 runMutationFixture(
@@ -309,17 +309,17 @@ runMutationFixture(
     '# HTTP',
     '# WEB',
   ),
-  'must contain exactly one numeric "HOST:CONTAINER" ForgeKeep port mapping marked "# HTTP"; parsed 0',
+  'must contain exactly one numeric "HOST:CONTAINER" Plombir Git port mapping marked "# HTTP"; parsed 0',
 );
 
 runMutationFixture(
   'a hardcoded helper app endpoint fails the contract',
   (fixture) => replaceRequired(
     join(fixture, 'deploy', 'start-observability.sh'),
-    'http://localhost:${FORGEKEEP_HOST_PORT}/health',
+    'http://localhost:${PLOMBIR_GIT_HOST_PORT}/health',
     'http://localhost:9999/health',
   ),
-  'start-observability.sh hardcodes ForgeKeep app endpoint(s): localhost:9999/health',
+  'start-observability.sh hardcodes Plombir Git app endpoint(s): localhost:9999/health',
 );
 
 runMutationFixture(
@@ -336,7 +336,7 @@ runHelperFixture(
   'the helper checks and prints the shipped compose host port',
   null,
   0,
-  'ForgeKeep:      http://localhost:8080/metrics',
+  'Plombir Git:      http://localhost:8080/metrics',
   'http://localhost:8080/health',
 );
 
@@ -348,9 +348,9 @@ runHelperFixture(
     '- "8181:8080"   # HTTP',
   ),
   0,
-  'ForgeKeep:      http://localhost:8181/metrics',
+  'Plombir Git:      http://localhost:8181/metrics',
   'http://localhost:8181/health',
-  { forgekeepPorts: [['8181', '8080'], ['2222', '2222']] },
+  { plombirGitPorts: [['8181', '8080'], ['2222', '2222']] },
 );
 
 runHelperFixture(
@@ -361,7 +361,7 @@ runHelperFixture(
     '# WEB',
   ),
   1,
-  'expected exactly one numeric HOST:CONTAINER ForgeKeep port mapping marked # HTTP',
+  'expected exactly one numeric HOST:CONTAINER Plombir Git port mapping marked # HTTP',
 );
 
 runHelperFixture(
@@ -382,16 +382,16 @@ volumes:
     );
   },
   1,
-  'does not identify one unique services.forgekeep.ports entry',
+  'does not identify one unique services.plombir-git.ports entry',
   '',
   {
-    forgekeepPorts: [['2222', '2222']],
+    plombirGitPorts: [['2222', '2222']],
     sidecarPorts: [['8181', '8080']],
   },
 );
 
 runHelperFixture(
-  'the helper rejects a sidecar marker even when ForgeKeep exposes the same ports',
+  'the helper rejects a sidecar marker even when Plombir Git exposes the same ports',
   (fixture) => {
     const compose = join(fixture, 'deploy', 'docker-compose.yml');
     replaceRequired(compose, '# HTTP', '# WEB');
@@ -408,7 +408,7 @@ volumes:
     );
   },
   1,
-  'does not identify one unique services.forgekeep.ports entry',
+  'does not identify one unique services.plombir-git.ports entry',
   '',
   { sidecarPorts: [['8080', '8080']] },
 );
@@ -465,7 +465,7 @@ runMutationFixture(
     join(fixture, 'deploy', 'prometheus', 'alerts.yml'),
     `        labels:
           severity: critical
-          service: forgekeep`,
+          service: plombir-git`,
     '        labels: critical',
   ),
   'deploy/prometheus/alerts.yml: groups[0].rules[0].labels must be a mapping',
@@ -484,24 +484,24 @@ runMutationFixture(
 );
 
 runFixture(
-  'a selector can use a label from the ForgeKeep scrape target',
-  `      - alert: ForgeKeepTargetLabel
+  'a selector can use a label from the Plombir Git scrape target',
+  `      - alert: PlombirGitTargetLabel
         expr: http_requests_in_flight{component="api"} > 200
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
-          summary: "ForgeKeep API target"`,
+          summary: "Plombir Git API target"`,
   0,
 );
 
 runFixture(
-  'a label on a neighboring scrape job cannot satisfy a ForgeKeep selector',
+  'a label on a neighboring scrape job cannot satisfy a Plombir Git selector',
   `      - alert: NeighborTargetLabel
         expr: http_requests_in_flight{neighbor_only="yes"} > 200
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "Neighbor-only target label"`,
   1,
@@ -516,14 +516,14 @@ runFixture(
 );
 
 runFixture(
-  'quoted ForgeKeep target label keys and values keep the same contract',
-  `      - alert: QuotedForgeKeepTargetLabel
+  'quoted Plombir Git target label keys and values keep the same contract',
+  `      - alert: QuotedPlombirGitTargetLabel
         expr: http_requests_in_flight{component="api"} > 200
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
-          summary: "Quoted ForgeKeep API target"`,
+          summary: "Quoted Plombir Git API target"`,
   0,
   '',
   {
@@ -536,12 +536,12 @@ runFixture(
 );
 
 runFixture(
-  'a global external label is not a locally queryable ForgeKeep target label',
+  'a global external label is not a locally queryable Plombir Git target label',
   `      - alert: ExternalLabelIsNotTargetLabel
-        expr: http_requests_in_flight{cluster="forgekeep"} > 200
+        expr: http_requests_in_flight{cluster="plombir-git"} > 200
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "External label is not a selector label"`,
   1,
@@ -554,7 +554,7 @@ runFixture(
         expr: sum without (status) (http_requests_total)
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "Route {{ $labels.route }} remains available"`,
   0,
@@ -566,7 +566,7 @@ runFixture(
         expr: sum by (instance) (node_filesystem_avail_bytes)
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "Filesystem {{ $labels.mountpoint }}"`,
   0,
@@ -578,7 +578,7 @@ runFixture(
         expr: sum by (instance) (http_requests_total)
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "Route {{ $labels.route }} disappeared"`,
   1,
@@ -591,7 +591,7 @@ runFixture(
         expr: sum by (instance) (http_requests_total)
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "Route {{ $labels.route }} disappeared"`,
   1,
@@ -614,7 +614,7 @@ runMutationFixture(
   (fixture) => mutateMainDashboard(fixture, (dashboard) => {
     dashboard.panels = dashboard.panels.filter(({ id }) => id !== 13);
   }),
-  'deploy/README.md documents Grafana panel `13` "🖥️ CPU Usage", which forgekeep-main does not contain',
+  'deploy/README.md documents Grafana panel `13` "🖥️ CPU Usage", which plombir-git-main does not contain',
 );
 
 runMutationFixture(
@@ -642,7 +642,7 @@ runMutationFixture(
   (fixture) => mutateMainDashboard(fixture, (dashboard) => {
     dashboard.panels[1].id = dashboard.panels[0].id;
   }),
-  'forgekeep-main.json: forgekeep-main defines panel id 1 more than once',
+  'plombir-git-main.json: plombir-git-main defines panel id 1 more than once',
 );
 
 runMutationFixture(
@@ -663,7 +663,7 @@ runFixture(
         expr: http_requests_in_flight > 200
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "Regression fixture"`,
   1,
@@ -688,11 +688,11 @@ runMutationFixture(
   (fixture) => {
     const readmePath = join(fixture, 'deploy', 'README.md');
     const readme = readFileSync(readmePath, 'utf8');
-    const anchor = '**ForgeKeepDown**';
-    if (!readme.includes(anchor)) throw new Error('fixture anchor for ForgeKeepDown disappeared');
-    writeFileSync(readmePath, readme.replace(anchor, '**ForgeKeepDwn**'));
+    const anchor = '**PlombirGitDown**';
+    if (!readme.includes(anchor)) throw new Error('fixture anchor for PlombirGitDown disappeared');
+    writeFileSync(readmePath, readme.replace(anchor, '**PlombirGitDwn**'));
   },
-  'deploy/README.md does not document alert `ForgeKeepDown` from alerts.yml',
+  'deploy/README.md does not document alert `PlombirGitDown` from alerts.yml',
 );
 
 runMutationFixture(
@@ -760,14 +760,14 @@ function runInhibitFixture(
 }
 
 const DOWN_RULE = `  - source_match:
-      alertname: 'ForgeKeepDown'
+      alertname: 'PlombirGitDown'
     target_match_re:
-      service: 'forgekeep'
+      service: 'plombir-git'
     equal: ['service']`;
 
 // `alertname` is attached by Prometheus when an alerting rule fires; it is not
 // inherited from the expression's input series. DOWN_RULE exercises that fact
-// for the foreign `up` metric, while this pair exercises it for ForgeKeep's own
+// for the foreign `up` metric, while this pair exercises it for Plombir Git's own
 // metrics and also proves that the route label still comes from those metrics.
 runInhibitFixture(
   'alertname matchers select existing local alerts',
@@ -881,9 +881,9 @@ runInhibitFixture(
   'quoted inhibit_rules and rule keys preserve the safe contract',
   `"inhibit_rules":
   - "source_match":
-      alertname: 'ForgeKeepDown'
+      alertname: 'PlombirGitDown'
     "target_match_re":
-      service: 'forgekeep'
+      service: 'plombir-git'
     "equal": ['service']
 
   - "source_matchers":
@@ -914,7 +914,7 @@ runInhibitFixture(
 runInhibitFixture(
   'an inhibit list the parser stops understanding fails closed',
   `  - source_match:
-      alertname: 'ForgeKeepDown'
+      alertname: 'PlombirGitDown'
     equal: ['service']`,
   1,
   'inhibit rule(s) parsed out of alertmanager.yml',
@@ -924,7 +924,7 @@ runInhibitFixture(
   'a non-list inhibit_rules value fails closed',
   `inhibit_rules:
   source_match:
-    alertname: 'ForgeKeepDown'`,
+    alertname: 'PlombirGitDown'`,
   1,
   'deploy/alertmanager/alertmanager.yml.inhibit_rules must be a list',
   { wholeDocument: true },

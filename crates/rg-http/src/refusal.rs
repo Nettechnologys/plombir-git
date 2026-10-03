@@ -33,7 +33,7 @@ pub(crate) fn pre_router_refusal_response(
     if status == StatusCode::UNAUTHORIZED {
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Basic realm=\"ForgeKeep\""),
+            HeaderValue::from_static("Basic realm=\"Plombir Git\""),
         );
     }
     response

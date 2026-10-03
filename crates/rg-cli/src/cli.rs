@@ -2,10 +2,10 @@
 //!
 //! Every doc comment below is *help text*: clap's derive prints it verbatim
 //! under `--help`, so `[server]` and `[database]` here name TOML sections of
-//! `forgekeep.toml`, not markdown links. rustdoc reads them as shortcut
+//! `plombir-git.toml`, not markdown links. rustdoc reads them as shortcut
 //! reference links and cannot resolve them; escaping them the way rustdoc
 //! suggests would put literal backslashes in front of an operator reading
-//! `forgekeep serve --help`. The workspace denies
+//! `plombir-git serve --help`. The workspace denies
 //! `rustdoc::broken_intra_doc_links` for prose that is really documentation —
 //! this file is a user interface that happens to be spelled in doc comments.
 #![allow(rustdoc::broken_intra_doc_links)]
@@ -42,7 +42,7 @@ pub(crate) enum PackageCmd {
         #[arg(long)]
         token: Option<String>,
 
-        /// ForgeKeep server URL (for token-based auth)
+        /// Plombir Git server URL (for token-based auth)
         #[arg(long, default_value = "http://localhost:8080")]
         server_url: String,
 
@@ -54,7 +54,7 @@ pub(crate) enum PackageCmd {
     /// List packages in a repository registry
     ///
     /// File-backed SQLite applies pending migrations before listing and requires
-    /// every ForgeKeep server using that database to be stopped.
+    /// every Plombir Git server using that database to be stopped.
     List {
         /// Owner of the repository
         owner: String,
@@ -66,7 +66,7 @@ pub(crate) enum PackageCmd {
         pkg_type: String,
 
         /// Database URL for direct DB access (SQLite, PostgreSQL, or MySQL)
-        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
         #[arg(long)]
         db_url: Option<String>,
 
@@ -78,7 +78,7 @@ pub(crate) enum PackageCmd {
 }
 
 #[derive(Parser)]
-#[command(name = "forgekeep", about = "A Git hosting platform written in Rust")]
+#[command(name = "plombir-git", about = "A Git hosting platform written in Rust")]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Commands,
@@ -88,12 +88,12 @@ pub(crate) struct Cli {
 /// its own `--config`, and none of the flags those keys feed carries a clap
 /// `default_value` — see the note on [`Commands::Serve`]. Without that, a
 /// deployment whose config file points at Postgres (or at `/data`) had
-/// `forgekeep migrate` quietly create and migrate a *second*, empty
-/// `./forgekeep.db`, and `forgekeep backup-db` "successfully" back up nothing.
+/// `plombir-git migrate` quietly create and migrate a *second*, empty
+/// `./plombir-git.db`, and `plombir-git backup-db` "successfully" back up nothing.
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Commands {
-    /// Start the ForgeKeep server
+    /// Start the Plombir Git server
     ///
     /// Settings that also exist as a `--config` key resolve in the order
     /// CLI arg > config file > built-in default.
@@ -122,7 +122,7 @@ pub(crate) enum Commands {
         host_key: Option<String>,
 
         /// Database URL (sqlite://, postgres://, or mysql://)
-        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
         #[arg(long)]
         db_url: Option<String>,
 
@@ -225,12 +225,12 @@ pub(crate) enum Commands {
 
     /// Run database migrations and exit.
     ///
-    /// File-backed SQLite migrations are offline-only: stop every ForgeKeep
+    /// File-backed SQLite migrations are offline-only: stop every Plombir Git
     /// server using this database first. The command checks that contract
     /// before opening its pool. PostgreSQL and MySQL are unaffected.
     Migrate {
         /// Database URL (sqlite://, postgres://, or mysql://)
-        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
         #[arg(long)]
         db_url: Option<String>,
 
@@ -242,10 +242,10 @@ pub(crate) enum Commands {
 
     /// Generate a cryptographically strong JWT secret and print it to stdout.
     ///
-    /// Use it to seed `[auth].jwt_secret`, `FORGEKEEP_JWT_SECRET`, or
+    /// Use it to seed `[auth].jwt_secret`, `PLOMBIR_GIT_JWT_SECRET`, or
     /// `--jwt-secret` instead of copying a shared default:
-    ///     forgekeep gen-secret
-    ///     FORGEKEEP_JWT_SECRET="$(forgekeep gen-secret)"
+    ///     plombir-git gen-secret
+    ///     PLOMBIR_GIT_JWT_SECRET="$(plombir-git gen-secret)"
     GenSecret,
 
     /// Replace this instance's Ed25519 provenance signing key.
@@ -256,7 +256,7 @@ pub(crate) enum Commands {
     /// Every attestation signed with the previous key stops verifying.
     RotateInstanceKey {
         /// Database URL (sqlite://, postgres://, or mysql://)
-        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
         #[arg(long)]
         db_url: Option<String>,
 
@@ -266,13 +266,13 @@ pub(crate) enum Commands {
         config: Option<String>,
 
         /// JWT signing secret [config: [auth].jwt_secret]
-        /// [env: FORGEKEEP_JWT_SECRET]
+        /// [env: PLOMBIR_GIT_JWT_SECRET]
         #[arg(long)]
         jwt_secret: Option<String>,
 
         /// At-rest encryption key, which is what the stored key material is
         /// sealed with [config: [auth].encryption_key]
-        /// [env: FORGEKEEP_ENCRYPTION_KEY]
+        /// [env: PLOMBIR_GIT_ENCRYPTION_KEY]
         #[arg(long)]
         encryption_key: Option<String>,
 
@@ -290,7 +290,7 @@ pub(crate) enum Commands {
     ///
     /// File-backed SQLite holds the single write lock for that whole
     /// transaction, which turns ordinary user writes into `database is locked`
-    /// while it runs, so it requires every ForgeKeep server using this database
+    /// while it runs, so it requires every Plombir Git server using this database
     /// to be stopped — `--dry-run` included, since it does the identical
     /// traversal and only rolls back at the end. The command checks that
     /// contract before opening its pool.
@@ -300,7 +300,7 @@ pub(crate) enum Commands {
     /// `[auth].key_file` with the new secret.
     RotateEncryptionKey {
         /// Database URL (sqlite://, postgres://, or mysql://)
-        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
         #[arg(long)]
         db_url: Option<String>,
 
@@ -311,17 +311,17 @@ pub(crate) enum Commands {
 
         /// JWT signing secret, used only to work out the current encryption key
         /// when `--old` is omitted [config: [auth].jwt_secret]
-        /// [env: FORGEKEEP_JWT_SECRET]
+        /// [env: PLOMBIR_GIT_JWT_SECRET]
         #[arg(long)]
         jwt_secret: Option<String>,
 
         /// The key the database is encrypted with today. Defaults to the key
-        /// this deployment resolves normally (FORGEKEEP_ENCRYPTION_KEY ›
+        /// this deployment resolves normally (PLOMBIR_GIT_ENCRYPTION_KEY ›
         /// [auth].encryption_key › [auth].key_file)
         #[arg(long)]
         old: Option<String>,
 
-        /// The key to re-encrypt onto. Generate one with `forgekeep gen-secret`
+        /// The key to re-encrypt onto. Generate one with `plombir-git gen-secret`
         #[arg(long)]
         new: String,
 
@@ -339,12 +339,12 @@ pub(crate) enum Commands {
     /// File-backed SQLite rebuilds all three indexes in one write transaction
     /// and holds the single write lock for the whole pass, which turns ordinary
     /// user writes into `database is locked` while it runs, so it requires
-    /// every ForgeKeep server using this database to be stopped. The command
+    /// every Plombir Git server using this database to be stopped. The command
     /// checks that contract before opening its pool. PostgreSQL and MySQL are
     /// unaffected.
     RebuildFts {
         /// Database URL (sqlite://, postgres://, or mysql://)
-        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
         #[arg(long)]
         db_url: Option<String>,
 
@@ -356,8 +356,8 @@ pub(crate) enum Commands {
 
     /// Create a consistent SQLite database backup.
     BackupDb {
-        /// SQLite database URL (e.g. sqlite://./forgekeep.db?mode=rwc)
-        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        /// SQLite database URL (e.g. sqlite://./plombir-git.db?mode=rwc)
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
         #[arg(long)]
         db_url: Option<String>,
 
@@ -377,7 +377,7 @@ pub(crate) enum Commands {
     /// Restore a SQLite database file from a backup.
     RestoreDb {
         /// SQLite database URL to restore into.
-        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
         #[arg(long)]
         db_url: Option<String>,
 
@@ -413,17 +413,17 @@ pub(crate) enum Commands {
         config: Option<String>,
     },
 
-    /// [DEPRECATED] Run as a CI runner — use `forgekeep-runner run` instead
+    /// [DEPRECATED] Run as a CI runner — use `plombir-git-runner run` instead
     ///
     /// Kept as an alias so existing invocations keep working: it now delegates to
-    /// the very same implementation `forgekeep-runner run` uses, flag for flag.
+    /// the very same implementation `plombir-git-runner run` uses, flag for flag.
     /// It used to be a second, much older copy of the runner that never read
     /// `runner.toml` (so every start registered a new runner) and had no
     /// heartbeat, workspace snapshot, job timeout or cache.
     ///
     /// Settings that also exist as a `--config` key resolve in the order
     /// CLI arg > config file > built-in default. The defaults are the runner's
-    /// own and are stated by `forgekeep-runner run --help`; this alias does not
+    /// own and are stated by `plombir-git-runner run --help`; this alias does not
     /// restate them, so there is one page to keep true instead of two.
     // Hence `--server` is an `Option` with no clap `default_value`: a clap
     // default is indistinguishable from a value the operator typed, so with one
@@ -435,7 +435,7 @@ pub(crate) enum Commands {
     // keeps a re-added one honest is a check in the crate that owns the value:
     // `rg-runner/src/config.rs::the_deprecated_alias_promises_no_runner_default_of_its_own`.
     Runner {
-        /// ForgeKeep server URL [config: server]
+        /// Plombir Git server URL [config: server]
         #[arg(long)]
         server: Option<String>,
 
@@ -473,7 +473,7 @@ pub(crate) enum Commands {
         auth_token: Option<String>,
 
         /// Path to the runner config file, written by
-        /// `forgekeep-runner register --save`
+        /// `plombir-git-runner register --save`
         #[arg(long, default_value = DEFAULT_RUNNER_CONFIG)]
         config: String,
     },
@@ -481,7 +481,7 @@ pub(crate) enum Commands {
     /// Import a repository from GitHub or GitLab
     ///
     /// File-backed SQLite applies pending migrations before importing and
-    /// requires every ForgeKeep server using that database to be stopped.
+    /// requires every Plombir Git server using that database to be stopped.
     Import {
         /// Source platform: "github" or "gitlab"
         #[arg(value_parser = ["github", "gitlab"])]
@@ -490,7 +490,7 @@ pub(crate) enum Commands {
         /// Source repository URL (e.g., <https://github.com/user/repo>)
         source_url: String,
 
-        /// Target owner in ForgeKeep
+        /// Target owner in Plombir Git
         #[arg(long)]
         target_owner: String,
 
@@ -508,7 +508,7 @@ pub(crate) enum Commands {
         repo_root: Option<String>,
 
         /// Database URL (sqlite://, postgres://, or mysql://)
-        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
         #[arg(long)]
         db_url: Option<String>,
 
@@ -557,7 +557,7 @@ pub(crate) enum Commands {
         repo_root: Option<String>,
 
         /// Database URL (sqlite://, postgres://, or mysql://)
-        /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
         #[arg(long)]
         db_url: Option<String>,
 
@@ -935,25 +935,30 @@ const AFTER: &str = "after";
     /// has to be written out (only a person knows a runnable positional), but
     /// which subcommands belong on it is clap's to say.
     const FLAGLESS_INVOCATIONS: &[&[&str]] = &[
-        &["forgekeep", "serve"],
-        &["forgekeep", "migrate"],
-        &["forgekeep", "rebuild-fts"],
-        &["forgekeep", "backup-db", "out.db"],
-        &["forgekeep", "restore-db", "in.db"],
-        &["forgekeep", "create-repo", "alice", "site"],
-        &["forgekeep", "rotate-instance-key"],
-        &["forgekeep", "rotate-encryption-key", "--new", "replacement"],
+        &["plombir-git", "serve"],
+        &["plombir-git", "migrate"],
+        &["plombir-git", "rebuild-fts"],
+        &["plombir-git", "backup-db", "out.db"],
+        &["plombir-git", "restore-db", "in.db"],
+        &["plombir-git", "create-repo", "alice", "site"],
+        &["plombir-git", "rotate-instance-key"],
         &[
-            "forgekeep",
+            "plombir-git",
+            "rotate-encryption-key",
+            "--new",
+            "replacement",
+        ],
+        &[
+            "plombir-git",
             "import",
             "github",
             "https://github.com/alice/site",
             "--target-owner",
             "alice",
         ],
-        &["forgekeep", "index-repo", "alice/site"],
-        &["forgekeep", "list-tombstones"],
-        &["forgekeep", "package", "list", "alice", "site", "cargo"],
+        &["plombir-git", "index-repo", "alice/site"],
+        &["plombir-git", "list-tombstones"],
+        &["plombir-git", "package", "list", "alice", "site", "cargo"],
     ];
 
     /// The root cause of the ignored-config bug: a clap `default_value` on
@@ -981,14 +986,14 @@ const AFTER: &str = "after";
     #[test]
     fn serve_accepts_a_file_for_publishing_ephemeral_listen_addresses() {
         let cli = Cli::try_parse_from([
-            "forgekeep",
+            "plombir-git",
             "serve",
             "--http-addr",
             "127.0.0.1:0",
             "--ssh-addr",
             "127.0.0.1:0",
             "--listen-address-file",
-            "/tmp/forgekeep-listen-addresses",
+            "/tmp/plombir-git-listen-addresses",
         ])
         .unwrap();
 
@@ -1005,7 +1010,7 @@ const AFTER: &str = "after";
         assert_eq!(ssh_addr.as_deref(), Some("127.0.0.1:0"));
         assert_eq!(
             listen_address_file.as_deref(),
-            Some("/tmp/forgekeep-listen-addresses")
+            Some("/tmp/plombir-git-listen-addresses")
         );
     }
 
@@ -1016,22 +1021,26 @@ const AFTER: &str = "after";
     fn every_config_backed_subcommand_accepts_a_config_flag() {
         for argv in FLAGLESS_INVOCATIONS {
             let mut argv: Vec<&str> = argv.to_vec();
-            argv.extend(["--config", "/etc/forgekeep/forgekeep.toml"]);
+            argv.extend(["--config", "/etc/plombir-git/plombir-git.toml"]);
             let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
             let (_, _, config) = knobs(&cli.command);
-            assert_eq!(config, Some("/etc/forgekeep/forgekeep.toml"), "{argv:?}");
+            assert_eq!(
+                config,
+                Some("/etc/plombir-git/plombir-git.toml"),
+                "{argv:?}"
+            );
         }
     }
 
     /// The deprecated `runner` alias must be able to reach `runner.toml` at all:
     /// it used to have no `--config` whatsoever, so the file written by
-    /// `forgekeep-runner register --save` was unreachable and every start
+    /// `plombir-git-runner register --save` was unreachable and every start
     /// registered a brand-new runner. Its `--server` must also parse to `None`,
     /// for the same reason `--db-url` does — a clap default would shadow the
     /// file's `server` key forever.
     #[test]
-    fn the_runner_alias_reads_the_same_config_file_as_forgekeep_runner() {
-        let cli = Cli::try_parse_from(["forgekeep", "runner"]).unwrap();
+    fn the_runner_alias_reads_the_same_config_file_as_plombir_git_runner() {
+        let cli = Cli::try_parse_from(["plombir-git", "runner"]).unwrap();
         let Commands::Runner {
             server,
             runner_id,
@@ -1044,13 +1053,13 @@ const AFTER: &str = "after";
         };
         assert_eq!(
             config, DEFAULT_RUNNER_CONFIG,
-            "the alias must default to the path `forgekeep-runner register --save` writes"
+            "the alias must default to the path `plombir-git-runner register --save` writes"
         );
         assert_eq!(server, None, "--server must not carry a clap default");
         assert_eq!(runner_id, None);
         assert_eq!(token, None);
 
-        let cli = Cli::try_parse_from(["forgekeep", "runner", "--config", "/data/runner.toml"])
+        let cli = Cli::try_parse_from(["plombir-git", "runner", "--config", "/data/runner.toml"])
             .expect("the alias must accept --config");
         let Commands::Runner { config, .. } = cli.command else {
             panic!("expected runner");
@@ -1060,11 +1069,11 @@ const AFTER: &str = "after";
 
     /// The alias exists to keep old invocations working, so every flag the
     /// pre-deprecation command accepted must still parse — plus `--labels`,
-    /// which it lacked and `forgekeep-runner run` has.
+    /// which it lacked and `plombir-git-runner run` has.
     #[test]
     fn the_runner_alias_still_accepts_every_flag_it_used_to() {
         let cli = Cli::try_parse_from([
-            "forgekeep",
+            "plombir-git",
             "runner",
             "--server",
             "https://ci.example.com",
@@ -1103,7 +1112,7 @@ const AFTER: &str = "after";
     #[test]
     fn the_runner_alias_preserves_repeated_structural_labels() {
         let cli = Cli::try_parse_from([
-            "forgekeep",
+            "plombir-git",
             "runner",
             "--label",
             "gpu,a100",
@@ -1119,32 +1128,32 @@ const AFTER: &str = "after";
     }
 
     /// The card's acceptance check, end to end through clap, the real config
-    /// loader and the real resolver: `forgekeep migrate --config <file>` with no
+    /// loader and the real resolver: `plombir-git migrate --config <file>` with no
     /// `--db-url` must reach the Postgres URL from the file, not the built-in
     /// SQLite default — and an explicit `--db-url` must still win.
     #[test]
     fn migrate_resolves_the_database_url_from_the_config_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("forgekeep.toml");
+        let path = dir.path().join("plombir-git.toml");
         crate::config::write_test_config(
             &path,
-            "[database]\nurl = \"postgres://forge:pw@db.internal/forgekeep\"\n",
+            "[database]\nurl = \"postgres://forge:pw@db.internal/plombir_git\"\n",
         )
         .unwrap();
         let path = path.to_str().unwrap();
 
-        let cli = Cli::try_parse_from(["forgekeep", "migrate", "--config", path]).unwrap();
+        let cli = Cli::try_parse_from(["plombir-git", "migrate", "--config", path]).unwrap();
         let Commands::Migrate { db_url, config } = cli.command else {
             panic!("expected migrate");
         };
         let cfg = crate::config::load_optional_config_file(config.as_deref()).unwrap();
         assert_eq!(
             crate::config::resolve_db_url(db_url, cfg.as_ref()),
-            "postgres://forge:pw@db.internal/forgekeep"
+            "postgres://forge:pw@db.internal/plombir_git"
         );
 
         let cli = Cli::try_parse_from([
-            "forgekeep",
+            "plombir-git",
             "migrate",
             "--config",
             path,
@@ -1170,7 +1179,7 @@ const AFTER: &str = "after";
     // `config.rs` already holds the config-file half of this contract (the
     // shipped template against the model, `ARCHITECTURE.md`'s section list
     // against the model). What is checked below is the other three surfaces an
-    // operator reads before ever opening `forgekeep.toml` — none of which any
+    // operator reads before ever opening `plombir-git.toml` — none of which any
     // compiler sees. Renaming a flag turns a documented quick-start into
     // `error: unexpected argument`, and renaming a config key turns the help
     // text that names its equivalent into a quiet lie.
@@ -1250,7 +1259,7 @@ const AFTER: &str = "after";
     const SERVE_FLAG_TABLE_LEAD: &str = "Common `serve` flags:";
 
     /// The start of the runnable `serve` invocation the README offers to copy.
-    const SERVE_QUICKSTART_LEAD: &str = "./target/release/forgekeep serve";
+    const SERVE_QUICKSTART_LEAD: &str = "./target/release/plombir-git serve";
 
     /// Every `serve` flag the README shows an operator, from both places it
     /// shows them: the command it invites you to paste into a shell, and the
@@ -1302,7 +1311,7 @@ const AFTER: &str = "after";
         let serve = command
             .get_subcommands()
             .find(|sub| sub.get_name() == "serve")
-            .expect("`serve` must remain a subcommand of `forgekeep`");
+            .expect("`serve` must remain a subcommand of `plombir-git`");
         let accepted: BTreeSet<String> = serve
             .get_arguments()
             .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
@@ -1319,7 +1328,7 @@ const AFTER: &str = "after";
         for flag in &advertised {
             assert!(
                 accepted.contains(*flag),
-                "README.md offers `forgekeep serve {flag}`, which clap does not accept — \
+                "README.md offers `plombir-git serve {flag}`, which clap does not accept — \
                  an operator following the page gets `error: unexpected argument`. \
                  Rename it on the page too, or restore the flag."
             );
@@ -1327,7 +1336,7 @@ const AFTER: &str = "after";
     }
 
     /// The command the deployment files spell out for this binary.
-    const SERVE_INVOCATION: &str = "forgekeep serve";
+    const SERVE_INVOCATION: &str = "plombir-git serve";
 
     /// The files an operator copies a command out of: the shipped compose files,
     /// the image's own default command, and the two guides that quote them.
@@ -1384,7 +1393,7 @@ const AFTER: &str = "after";
     /// together turned into whitespace, and runs of whitespace collapsed.
     ///
     /// Three spellings have to survive it — a folded `command: >` block with one
-    /// flag per line, an exec-form `command: ["forgekeep", "serve", …]` on a
+    /// flag per line, an exec-form `command: ["plombir-git", "serve", …]` on a
     /// single line, and the Dockerfile's backslash-continued `CMD` — plus the
     /// backticks a markdown guide wraps the same command in.
     fn command_lines(text: &str) -> Vec<String> {
@@ -1414,7 +1423,7 @@ const AFTER: &str = "after";
 
             // A whole word on both sides: neither a longer binary name nor a
             // longer subcommand is this invocation. A path separator ends the
-            // word too — `./target/release/forgekeep serve` is the command the
+            // word too — `./target/release/plombir-git serve` is the command the
             // README hands a new operator, not a different binary.
             if before
                 .chars()
@@ -1446,7 +1455,7 @@ const AFTER: &str = "after";
     /// Every leaf subcommand of this binary, keyed by the invocation an operator
     /// types, paired with the long flags clap accepts for it.
     ///
-    /// Leaves only — `forgekeep package list`, never `forgekeep package`: a
+    /// Leaves only — `plombir-git package list`, never `plombir-git package`: a
     /// group matched as a leader would read its child's flags as its own and
     /// fail on every one of them.
     fn subcommand_flags() -> BTreeMap<String, BTreeSet<String>> {
@@ -1517,30 +1526,30 @@ const AFTER: &str = "after";
         // shape, is how this test would go quietly green.
         let fixture = command_lines(concat!(
             "    # command: >\n",
-            "    #   forgekeep serve\n",
-            "    #   --config /app/forgekeep.toml\n",
+            "    #   plombir-git serve\n",
+            "    #   --config /app/plombir-git.toml\n",
             "    networks:\n",
-            "      - forgekeep-net\n",
-            "    command: [\"forgekeep\", \"serve\", \"--http-addr\", \"0.0.0.0:8080\"]\n",
-            "CMD [\"forgekeep\", \"serve\", \\\n",
+            "      - plombir-git-net\n",
+            "    command: [\"plombir-git\", \"serve\", \"--http-addr\", \"0.0.0.0:8080\"]\n",
+            "CMD [\"plombir-git\", \"serve\", \\\n",
             "     \"--repo-root\", \"/data/repos\", \\\n",
-            "     \"--log-file\", \"/data/logs/forgekeep.log\"]\n",
-            "The image runs `forgekeep serve --db-url sqlite:///data/forgekeep.db`.\n",
+            "     \"--log-file\", \"/data/logs/plombir-git.log\"]\n",
+            "The image runs `plombir-git serve --db-url sqlite:///data/plombir-git.db`.\n",
         ));
         assert_eq!(
             invocations(&fixture, SERVE_INVOCATION),
             vec![
-                "--config /app/forgekeep.toml".to_string(),
+                "--config /app/plombir-git.toml".to_string(),
                 "--http-addr 0.0.0.0:8080".to_string(),
-                "--repo-root /data/repos --log-file /data/logs/forgekeep.log".to_string(),
-                "--db-url sqlite:///data/forgekeep.db .".to_string(),
+                "--repo-root /data/repos --log-file /data/logs/plombir-git.log".to_string(),
+                "--db-url sqlite:///data/plombir-git.db .".to_string(),
             ],
             "the invocation scanner no longer reads the deployment files the way they spell \
              the command"
         );
         assert!(
             invocations(
-                &command_lines("forgekeep serve-forever --nope\n"),
+                &command_lines("plombir-git serve-forever --nope\n"),
                 SERVE_INVOCATION
             )
             .is_empty(),
@@ -1550,7 +1559,7 @@ const AFTER: &str = "after";
         let by_subcommand = subcommand_flags();
         assert!(
             by_subcommand.contains_key(SERVE_INVOCATION)
-                && by_subcommand.contains_key("forgekeep package list"),
+                && by_subcommand.contains_key("plombir-git package list"),
             "the subcommand walk no longer reaches a top-level command and a nested one — \
              it has stopped describing this binary"
         );
@@ -1601,7 +1610,7 @@ const AFTER: &str = "after";
         // it on the page moves the text.
         let expected: BTreeSet<String> = SUBCOMMANDS_THE_PAGES_HAND_AN_OPERATOR
             .iter()
-            .map(|name| format!("forgekeep {name}"))
+            .map(|name| format!("plombir-git {name}"))
             .collect();
         let missing: Vec<&String> = expected.difference(&documented).collect();
         assert!(
@@ -1619,7 +1628,7 @@ const AFTER: &str = "after";
     const DB_TOUCHING_CLAIM_LEAD: &str = "every DB-touching subcommand (";
 
     /// Every leaf subcommand clap gives a `--db-url`, spelled the way an
-    /// operator types it — `package list`, not `forgekeep package list`.
+    /// operator types it — `package list`, not `plombir-git package list`.
     ///
     /// This is the definition of "DB-touching": a subcommand addresses a
     /// database exactly when it accepts the flag that names one.
@@ -1627,7 +1636,7 @@ const AFTER: &str = "after";
         subcommand_flags()
             .into_iter()
             .filter(|(_, accepted)| accepted.contains("--db-url"))
-            .filter_map(|(path, _)| path.strip_prefix("forgekeep ").map(str::to_string))
+            .filter_map(|(path, _)| path.strip_prefix("plombir-git ").map(str::to_string))
             .collect()
     }
 
@@ -1664,7 +1673,7 @@ const AFTER: &str = "after";
     ///
     /// Both directions, because both failures land on an operator. A subcommand
     /// clap has and the sentence omits is still covered by the blanket promise:
-    /// whoever passes it `--config /app/forgekeep.toml` on the strength of that
+    /// whoever passes it `--config /app/plombir-git.toml` on the strength of that
     /// promise gets whatever the omitted command actually does with the flag.
     /// A name the sentence has and clap does not is the reverse — the recipe
     /// that spells it fails with `error: unexpected argument`.
@@ -1710,7 +1719,7 @@ const AFTER: &str = "after";
     /// addresses.
     ///
     /// Passing neither `--config` nor `--db-url` is not a shorter spelling of
-    /// the same command — it falls back to `sqlite://./forgekeep.db?mode=rwc`
+    /// the same command — it falls back to `sqlite://./plombir-git.db?mode=rwc`
     /// relative to the image's `WORKDIR /app`, an empty database that nothing
     /// else ever opens. Every command in this set is run once, against a stopped
     /// server, by someone already having a bad day, and each one of them
@@ -1718,7 +1727,7 @@ const AFTER: &str = "after";
     /// `rotate-encryption-key` re-encrypts nothing.
     ///
     /// `serve` is excluded for the same reason it is excluded above — the image
-    /// gives it the URL in its own `CMD`, and its `FORGEKEEP_*` environment is a
+    /// gives it the URL in its own `CMD`, and its `PLOMBIR_GIT_*` environment is a
     /// third way to configure it that these commands do not have.
     #[test]
     fn every_admin_invocation_on_an_operator_page_names_its_database() {
@@ -1726,7 +1735,7 @@ const AFTER: &str = "after";
         let admin: BTreeSet<String> = db_touching_subcommands()
             .into_iter()
             .filter(|name| name != "serve")
-            .map(|name| format!("forgekeep {name}"))
+            .map(|name| format!("plombir-git {name}"))
             .collect();
         assert!(
             admin
@@ -1745,9 +1754,9 @@ const AFTER: &str = "after";
                     assert!(
                         named.contains("--config") || named.contains("--db-url"),
                         "{name} runs `{leader} {command}`, which names no database — it \
-                         falls back to `sqlite://./forgekeep.db?mode=rwc` under the image's \
+                         falls back to `sqlite://./plombir-git.db?mode=rwc` under the image's \
                          `WORKDIR /app` and reports success against an empty file. Add \
-                         `--config /app/forgekeep.toml` or the deployment's `--db-url`."
+                         `--config /app/plombir-git.toml` or the deployment's `--db-url`."
                     );
                     checked += 1;
                 }
@@ -1852,7 +1861,7 @@ const AFTER: &str = "after";
         );
     }
 
-    /// Every leaf subcommand `forgekeep.toml` reaches: one that takes
+    /// Every leaf subcommand `plombir-git.toml` reaches: one that takes
     /// `--config` together with a knob that file feeds (`--db-url` or
     /// `--repo-root`).
     ///
@@ -1865,7 +1874,7 @@ const AFTER: &str = "after";
                 accepted.contains("--config")
                     && (accepted.contains("--db-url") || accepted.contains("--repo-root"))
             })
-            .filter_map(|(path, _)| path.strip_prefix("forgekeep ").map(str::to_string))
+            .filter_map(|(path, _)| path.strip_prefix("plombir-git ").map(str::to_string))
             .collect()
     }
 
@@ -1923,16 +1932,16 @@ const AFTER: &str = "after";
                 documented, expected,
                 "{page} promises the `CLI arg > config file > built-in default` order to \
                  every subcommand it lists here, and the list no longer matches the \
-                 subcommands clap backs with a `forgekeep.toml` knob. Fix the sentence, or \
+                 subcommands clap backs with a `plombir-git.toml` knob. Fix the sentence, or \
                  the declaration."
             );
         }
     }
 
     /// The line that introduces the README's inventory of subcommands.
-    const CLI_TABLE_LEAD: &str = "Beyond `serve`, the `forgekeep` binary offers:";
+    const CLI_TABLE_LEAD: &str = "Beyond `serve`, the `plombir-git` binary offers:";
 
-    /// The README's CLI table claims to be an inventory — "the `forgekeep`
+    /// The README's CLI table claims to be an inventory — "the `plombir-git`
     /// binary offers" — so a subcommand missing from it is a feature an operator
     /// has no way to learn about, and a row clap no longer has is a command that
     /// fails on the first try.
@@ -1987,7 +1996,7 @@ const AFTER: &str = "after";
 
         let expected: BTreeSet<String> = config_backed_subcommands()
             .into_iter()
-            .map(|name| format!("forgekeep {name}"))
+            .map(|name| format!("plombir-git {name}"))
             .collect();
 
         let listed: BTreeSet<String> = FLAGLESS_INVOCATIONS
@@ -2001,8 +2010,8 @@ const AFTER: &str = "after";
                             .strip_prefix(leaf.as_str())
                             .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
                     })
-                    // Longest wins: `forgekeep package list …` starts with no
-                    // other leaf, but a future `forgekeep package` leaf would.
+                    // Longest wins: `plombir-git package list …` starts with no
+                    // other leaf, but a future `plombir-git package` leaf would.
                     .max_by_key(|leaf| leaf.len())
                     .unwrap_or_else(|| {
                         panic!("`{typed}` invokes no leaf subcommand of this binary")
@@ -2021,14 +2030,14 @@ const AFTER: &str = "after";
             listed, expected,
             "FLAGLESS_INVOCATIONS is what `config_backed_flags_have_no_clap_default` and \
              `every_config_backed_subcommand_accepts_a_config_flag` iterate, and it no \
-             longer matches the subcommands clap backs with a `forgekeep.toml` knob. One \
+             longer matches the subcommands clap backs with a `plombir-git.toml` knob. One \
              missing here is a subcommand whose `--config` nothing checks; one listed here \
              that clap no longer backs is a stale row."
         );
     }
 
     /// `[config: key]` markers that name a key of `runner.toml` rather than of
-    /// `forgekeep.toml`: the deprecated `forgekeep runner` alias reads the
+    /// `plombir-git.toml`: the deprecated `plombir-git runner` alias reads the
     /// runner's own config file. `RunnerConfig` is private to `rg-runner`, so
     /// these are listed rather than parsed — the point of the list is that a
     /// *new* unbracketed marker fails the test instead of quietly escaping the
@@ -2045,7 +2054,7 @@ const AFTER: &str = "after";
 
     /// Every `[config: …]` marker in the help text, split by which file it
     /// points at: `(line, section, key)` for the `[section].key` form that names
-    /// a `forgekeep.toml` key, and the bare names that mean `runner.toml`.
+    /// a `plombir-git.toml` key, and the bare names that mean `runner.toml`.
     #[allow(clippy::type_complexity)]
     fn help_config_markers(source: &str) -> (Vec<(usize, &str, &str)>, BTreeSet<&str>) {
         const MARKER: &str = "[config: ";
@@ -2143,7 +2152,7 @@ const AFTER: &str = "after";
         assert!(
             unexpected.is_empty(),
             "cli.rs names {unexpected:?} as `[config: <key>]` without a `[section]`, so the \
-             check above skipped them. A `forgekeep.toml` key must be written \
+             check above skipped them. A `plombir-git.toml` key must be written \
              `[config: [section].key]`; if these really are `runner.toml` keys, add them to \
              RUNNER_CONFIG_MARKERS."
         );
@@ -2173,7 +2182,7 @@ const AFTER: &str = "after";
     /// A built-in default that `--help` and the README both state, bound to the
     /// constant that actually produces it.
     struct DocumentedDefault {
-        /// The `forgekeep.toml` section named by the flag's `[config: …]` marker,
+        /// The `plombir-git.toml` section named by the flag's `[config: …]` marker,
         section: &'static str,
         /// …and the key inside it. Together they locate the help lines to check.
         key: &'static str,
@@ -2269,7 +2278,7 @@ const AFTER: &str = "after";
         (
             "DEFAULT_ATTESTATION_ENABLED",
             "config-file-only: `[releases].attestation_enabled` has no CLI flag (it is \
-             settable as FORGEKEEP_ATTESTATION_ENABLED instead)",
+             settable as PLOMBIR_GIT_ATTESTATION_ENABLED instead)",
         ),
         (
             "DEFAULT_RATE_LIMIT_MAX_KEYS",
@@ -2547,13 +2556,13 @@ const AFTER: &str = "after";
     /// The heading that introduces `deploy/README.md`'s environment table.
     const ENV_TABLE_LEAD: &str = "### Environment variables";
 
-    /// The `FORGEKEEP_*` variables the deploy guide tells an operator to set.
+    /// The `PLOMBIR_GIT_*` variables the deploy guide tells an operator to set.
     fn documented_env_vars() -> BTreeSet<&'static str> {
         let mut names = BTreeSet::new();
 
         for cell in first_table_cells(DEPLOY_README_MD, ENV_TABLE_LEAD) {
             names.extend(cell.split('`').filter(|token| {
-                token.starts_with("FORGEKEEP_")
+                token.starts_with("PLOMBIR_GIT_")
                     && token.chars().all(|c| c.is_ascii_uppercase() || c == '_')
             }));
         }
@@ -2651,35 +2660,35 @@ const AFTER: &str = "after";
     #[test]
     fn env_read_scan_ignores_rust_data_and_requires_a_real_consumer() {
         let decoys = r####"
-// std::env::var("FORGEKEEP_DECOY");
-/* env_secret("FORGEKEEP_DECOY"); */
-let normal = "env::var(\"FORGEKEEP_DECOY\")";
-let raw = r#"std::env::var_os("FORGEKEEP_DECOY")"#;
-let bytes = b"env_secret(\"FORGEKEEP_DECOY\")";
+// std::env::var("PLOMBIR_GIT_DECOY");
+/* env_secret("PLOMBIR_GIT_DECOY"); */
+let normal = "env::var(\"PLOMBIR_GIT_DECOY\")";
+let raw = r#"std::env::var_os("PLOMBIR_GIT_DECOY")"#;
+let bytes = b"env_secret(\"PLOMBIR_GIT_DECOY\")";
 "####;
         let decoy_sources = vec![(PathBuf::from("decoys.rs"), decoys.to_owned())];
         assert_eq!(
-            source_reading_env_var(&decoy_sources, "FORGEKEEP_DECOY"),
+            source_reading_env_var(&decoy_sources, "PLOMBIR_GIT_DECOY"),
             None,
             "a variable named only by Rust data kept the consumer census green"
         );
 
         let live = format!(
-            "{decoys}\nlet direct = std::env::var(r#\"FORGEKEEP_DIRECT\"#);\n\
-             let secret = env_secret(\"FORGEKEEP_SECRET\");\n\
-             let typed = std::env::var::<&str>(\"FORGEKEEP_TYPED\");\n"
+            "{decoys}\nlet direct = std::env::var(r#\"PLOMBIR_GIT_DIRECT\"#);\n\
+             let secret = env_secret(\"PLOMBIR_GIT_SECRET\");\n\
+             let typed = std::env::var::<&str>(\"PLOMBIR_GIT_TYPED\");\n"
         );
         let live_sources = vec![(PathBuf::from("live.rs"), live)];
         assert_eq!(
-            source_reading_env_var(&live_sources, "FORGEKEEP_DIRECT"),
+            source_reading_env_var(&live_sources, "PLOMBIR_GIT_DIRECT"),
             Some(PathBuf::from("live.rs"))
         );
         assert_eq!(
-            source_reading_env_var(&live_sources, "FORGEKEEP_SECRET"),
+            source_reading_env_var(&live_sources, "PLOMBIR_GIT_SECRET"),
             Some(PathBuf::from("live.rs"))
         );
         assert_eq!(
-            source_reading_env_var(&live_sources, "FORGEKEEP_TYPED"),
+            source_reading_env_var(&live_sources, "PLOMBIR_GIT_TYPED"),
             Some(PathBuf::from("live.rs"))
         );
     }
@@ -2758,7 +2767,7 @@ std::env::set_var::<&str, &str>("TYPED", "1");
         // The census has to be able to answer "no" before its "yes" is worth
         // anything (a substring scan that matches everything is vacuously green).
         assert_eq!(
-            source_reading_env_var(&sources, "FORGEKEEP_NOT_A_REAL_VARIABLE"),
+            source_reading_env_var(&sources, "PLOMBIR_GIT_NOT_A_REAL_VARIABLE"),
             None,
             "the source census matches a variable that does not exist, so it cannot \
              detect one that stopped existing"
@@ -2773,9 +2782,9 @@ std::env::set_var::<&str, &str>("TYPED", "1");
     // one: a documented variable that stopped existing wastes an afternoon,
     // while an *undocumented* one cannot be found at all. Two of the three
     // shipped binaries were configured entirely by variables in this state —
-    // `forgekeep-runner` will not register without `FORGEKEEP_AUTH_TOKEN`, and
-    // `forgekeep-mcp` has no configuration besides `FORGEKEEP_URL` /
-    // `FORGEKEEP_PAT` — and the only place either was written down was the
+    // `plombir-git-runner` will not register without `PLOMBIR_GIT_AUTH_TOKEN`, and
+    // `plombir-git-mcp` has no configuration besides `PLOMBIR_GIT_URL` /
+    // `PLOMBIR_GIT_PAT` — and the only place either was written down was the
     // source, or a `//!` comment aimed at whoever edits it.
     // ---------------------------------------------------------------------
 
@@ -2786,8 +2795,8 @@ std::env::set_var::<&str, &str>("TYPED", "1");
         ("README.md", README_MD),
         ("deploy/README.md", DEPLOY_README_MD),
         (
-            "forgekeep.example.toml",
-            include_str!("../../../forgekeep.example.toml"),
+            "plombir-git.example.toml",
+            include_str!("../../../plombir-git.example.toml"),
         ),
         ("deploy/.env.example", ENV_EXAMPLE),
     ];
@@ -2812,8 +2821,8 @@ std::env::set_var::<&str, &str>("TYPED", "1");
 
     /// Does `text` name `variable` as a whole word? A document answers "where
     /// do I read about this" in any spelling — a table cell, a `.env` line, a
-    /// sentence — but `FORGEKEEP_URL` must not be answered by a page that only
-    /// mentions `FORGEKEEP_URLS`.
+    /// sentence — but `PLOMBIR_GIT_URL` must not be answered by a page that only
+    /// mentions `PLOMBIR_GIT_URLS`.
     fn names_the_variable(text: &str, variable: &str) -> bool {
         text.match_indices(variable).any(|(index, _)| {
             let before = text[..index].chars().next_back();
@@ -2829,10 +2838,10 @@ std::env::set_var::<&str, &str>("TYPED", "1");
     /// literal values come from the original source at those offsets. Direct
     /// Rust readers and the server's `env_secret` wrapper accept literals. One
     /// same-file string constant is also supported, but only as the argument of
-    /// a reader: a bare `const NAME = "FORGEKEEP_..."` is data, not provenance.
+    /// a reader: a bare `const NAME = "PLOMBIR_GIT_..."` is data, not provenance.
     ///
     /// `credential_helper_env_read` is the one cross-process exception. It
-    /// renders `$FORGEKEEP_GIT_*` for the inline shell helper, which really does
+    /// renders `$PLOMBIR_GIT_GIT_*` for the inline shell helper, which really does
     /// read the explicit child environment even though Rust itself only writes
     /// it. Naming that boundary keeps the exception auditable instead of
     /// treating every product-prefixed literal as a read.
@@ -2865,21 +2874,21 @@ std::env::set_var::<&str, &str>("TYPED", "1");
     #[test]
     fn env_read_census_is_call_aware_and_resolves_supported_indirection() {
         let source = r####"
-const INDIRECT: &str = r#"FORGEKEEP_INDIRECT"#;
-const PAYLOAD_ONLY: &str = "FORGEKEEP_PAYLOAD_ONLY";
+const INDIRECT: &str = r#"PLOMBIR_GIT_INDIRECT"#;
+const PAYLOAD_ONLY: &str = "PLOMBIR_GIT_PAYLOAD_ONLY";
 
-// std::env::var("FORGEKEEP_LINE_COMMENT");
-/* env_secret("FORGEKEEP_BLOCK_COMMENT"); */
-let normal = "std::env::var(\"FORGEKEEP_NORMAL_LITERAL\")";
-let raw = r#"env::var_os("FORGEKEEP_RAW_LITERAL")"#;
-let bytes = b"env_secret(\"FORGEKEEP_BYTE_LITERAL\")";
-tracing::info!("FORGEKEEP_LOG_ONLY");
-parse_payload("FORGEKEEP_PARSER_FIXTURE");
+// std::env::var("PLOMBIR_GIT_LINE_COMMENT");
+/* env_secret("PLOMBIR_GIT_BLOCK_COMMENT"); */
+let normal = "std::env::var(\"PLOMBIR_GIT_NORMAL_LITERAL\")";
+let raw = r#"env::var_os("PLOMBIR_GIT_RAW_LITERAL")"#;
+let bytes = b"env_secret(\"PLOMBIR_GIT_BYTE_LITERAL\")";
+tracing::info!("PLOMBIR_GIT_LOG_ONLY");
+parse_payload("PLOMBIR_GIT_PARSER_FIXTURE");
 
-let direct = std::env::var("FORGEKEEP_DIRECT");
-let os = env::var_os(r#"FORGEKEEP_OS"#);
-let secret = env_secret("FORGEKEEP_SECRET");
-let typed = std::env::var::<&str>("FORGEKEEP_TYPED");
+let direct = std::env::var("PLOMBIR_GIT_DIRECT");
+let os = env::var_os(r#"PLOMBIR_GIT_OS"#);
+let secret = env_secret("PLOMBIR_GIT_SECRET");
+let typed = std::env::var::<&str>("PLOMBIR_GIT_TYPED");
 let child = credential_helper_env_read(INDIRECT);
 "####;
         let sources = vec![(PathBuf::from("fixture.rs"), source.to_owned())];
@@ -2889,11 +2898,11 @@ let child = credential_helper_env_read(INDIRECT);
                 .into_keys()
                 .collect::<Vec<_>>(),
             [
-                "FORGEKEEP_DIRECT",
-                "FORGEKEEP_INDIRECT",
-                "FORGEKEEP_OS",
-                "FORGEKEEP_SECRET",
-                "FORGEKEEP_TYPED",
+                "PLOMBIR_GIT_DIRECT",
+                "PLOMBIR_GIT_INDIRECT",
+                "PLOMBIR_GIT_OS",
+                "PLOMBIR_GIT_SECRET",
+                "PLOMBIR_GIT_TYPED",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -2907,23 +2916,26 @@ let child = credential_helper_env_read(INDIRECT);
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rg-runner/src/config.rs");
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        let variable = "FORGEKEEP_AUTH_TOKEN";
+        let variable = "PLOMBIR_GIT_AUTH_TOKEN";
         let original_sources = vec![(path.clone(), rust_source::production_rust_source(&source))];
         assert!(
             env_vars_read_by_the_code(&original_sources).contains_key(variable),
             "the production fixture no longer contains the reader this mutation exercises"
         );
 
-        let live_read = "std::env::var(\"FORGEKEEP_AUTH_TOKEN\")";
-        let mut mutated =
-            source.replacen(live_read, "retired_env_reader(\"FORGEKEEP_AUTH_TOKEN\")", 1);
+        let live_read = "std::env::var(\"PLOMBIR_GIT_AUTH_TOKEN\")";
+        let mut mutated = source.replacen(
+            live_read,
+            "retired_env_reader(\"PLOMBIR_GIT_AUTH_TOKEN\")",
+            1,
+        );
         assert_ne!(mutated, source, "the production mutation changed nothing");
         mutated.push_str(
             r####"
-const AUTH_TOKEN_DECOY: &str = "FORGEKEEP_AUTH_TOKEN";
-let normal = "std::env::var(\"FORGEKEEP_AUTH_TOKEN\")";
-let raw = r#"env_secret("FORGEKEEP_AUTH_TOKEN")"#;
-let bytes = b"env::var_os(\"FORGEKEEP_AUTH_TOKEN\")";
+const AUTH_TOKEN_DECOY: &str = "PLOMBIR_GIT_AUTH_TOKEN";
+let normal = "std::env::var(\"PLOMBIR_GIT_AUTH_TOKEN\")";
+let raw = r#"env_secret("PLOMBIR_GIT_AUTH_TOKEN")"#;
+let bytes = b"env::var_os(\"PLOMBIR_GIT_AUTH_TOKEN\")";
 "####,
         );
         let mutated_sources = vec![(path, rust_source::production_rust_source(&mutated))];
@@ -2939,17 +2951,17 @@ let bytes = b"env::var_os(\"FORGEKEEP_AUTH_TOKEN\")";
     /// decision someone made, rather than one that quietly escaped every page.
     const NOT_OPERATOR_FACING: [(&str, &str); 6] = [
         (
-            "FORGEKEEP_GIT_USERNAME",
+            "PLOMBIR_GIT_GIT_USERNAME",
             "internal: the server exports it into the `git` subprocess it spawns and reads it \
              back through the credential helper — an operator never sets it, and setting it \
              would only be overwritten",
         ),
         (
-            "FORGEKEEP_GIT_PASSWORD",
+            "PLOMBIR_GIT_GIT_PASSWORD",
             "internal: the other half of the same credential handoff to the `git` subprocess",
         ),
         (
-            "FORGEKEEP_NATIVE_INDEX_PACK",
+            "PLOMBIR_GIT_NATIVE_INDEX_PACK",
             "developer toggle: an opt-in, default-off PoC of native pack indexing, described \
              in `docs/git-protocol.md` beside the code it switches — not a supported \
              deployment knob",
@@ -2957,12 +2969,12 @@ let bytes = b"env::var_os(\"FORGEKEEP_AUTH_TOKEN\")";
         (
             "HOME",
             "inherited: read to expand a leading `~` in a path the operator gave, not a knob \
-             ForgeKeep asks anyone to set",
+             Plombir Git asks anyone to set",
         ),
         (
             "PATH",
             "inherited: forwarded into CI job processes so the tools on the machine stay \
-             reachable — the value is the machine's, not a ForgeKeep setting",
+             reachable — the value is the machine's, not a Plombir Git setting",
         ),
         (
             "LANG",
@@ -2972,34 +2984,37 @@ let bytes = b"env::var_os(\"FORGEKEEP_AUTH_TOKEN\")";
 
     /// A variable that configures a shipped binary and is named on no page an
     /// operator reads can only be found by reading the source — which is not
-    /// something the person wiring `forgekeep-mcp` into an agent, or registering
+    /// something the person wiring `plombir-git-mcp` into an agent, or registering
     /// a runner on a build machine, has open.
     #[test]
     fn every_environment_variable_the_code_reads_is_named_in_an_operator_document() {
         // Both scanners have to be able to answer "no" before their "yes" means
         // anything: one that matches everything is vacuously green.
         assert!(
-            names_the_variable("set `FORGEKEEP_PAT` in the agent's env", "FORGEKEEP_PAT"),
+            names_the_variable(
+                "set `PLOMBIR_GIT_PAT` in the agent's env",
+                "PLOMBIR_GIT_PAT"
+            ),
             "the document scanner does not see a variable the pages name in backticks"
         );
         assert!(
-            !names_the_variable("set FORGEKEEP_PAT_FILE instead", "FORGEKEEP_PAT"),
+            !names_the_variable("set PLOMBIR_GIT_PAT_FILE instead", "PLOMBIR_GIT_PAT"),
             "the document scanner accepts a longer name as a mention of a shorter one, so a \
              page that documents neither can still pass for one that documents both"
         );
 
         let probe = env_vars_read_by_the_code(&[(
             PathBuf::from("probe.rs"),
-            "let a = env_secret(\"FORGEKEEP_REAL\");\n\
+            "let a = env_secret(\"PLOMBIR_GIT_REAL\");\n\
              let b = std::env::var(\"OTEL_REAL\").ok();\n\
-             // \"FORGEKEEP_COMMENTED\"\n\
-             let prose = \"see $FORGEKEEP_SHELL\";\n\
+             // \"PLOMBIR_GIT_COMMENTED\"\n\
+             let prose = \"see $PLOMBIR_GIT_SHELL\";\n\
              let map = json!({ \"PATH\": 1 });\n"
                 .to_owned(),
         )]);
         assert_eq!(
             probe.into_keys().collect::<Vec<_>>(),
-            vec!["FORGEKEEP_REAL".to_string(), "OTEL_REAL".to_string()],
+            vec!["OTEL_REAL".to_string(), "PLOMBIR_GIT_REAL".to_string()],
             "the source census counts prose, comments and plain string keys as reads, so it \
              cannot tell a variable the code uses from one it merely mentions"
         );
@@ -3059,11 +3074,11 @@ let bytes = b"env::var_os(\"FORGEKEEP_AUTH_TOKEN\")";
     // The third env surface, and the one neither check above can see.
     //
     // Both censuses above run between a document and the *Rust* sources, and
-    // four of the variables `deploy/.env.example` offers — `FORGEKEEP_UID`,
-    // `FORGEKEEP_GID`, `FORGEKEEP_HTTP_PORT`, `FORGEKEEP_SSH_PORT` — are never
+    // four of the variables `deploy/.env.example` offers — `PLOMBIR_GIT_UID`,
+    // `PLOMBIR_GIT_GID`, `PLOMBIR_GIT_HTTP_PORT`, `PLOMBIR_GIT_SSH_PORT` — are never
     // read by any Rust source at all. Their only consumer is a `${NAME}`
     // substitution inside a compose file, and nothing tied the two files
-    // together: renaming `${FORGEKEEP_HTTP_PORT}` in the compose file leaves
+    // together: renaming `${PLOMBIR_GIT_HTTP_PORT}` in the compose file leaves
     // the `.env.example` line looking alive and doing nothing. The symptom is
     // milder than the rest of this phase's — not a refused start but a setting
     // silently ignored — and it shows up only as a port that will not change.
@@ -3305,7 +3320,7 @@ let bytes = b"env::var_os(\"FORGEKEEP_AUTH_TOKEN\")";
     /// says "set this if you need it", not how it says "this is dead".
     ///
     /// The name has to open the line. The file also *talks about* variables —
-    /// `echo "FORGEKEEP_UID=$(id -u)" >> .env` sits in a comment two lines
+    /// `echo "PLOMBIR_GIT_UID=$(id -u)" >> .env` sits in a comment two lines
     /// above the offer itself — and a snippet showing how to append one is not
     /// a second offer of it.
     fn env_vars_offered_in(text: &str) -> BTreeSet<String> {
@@ -3330,7 +3345,7 @@ let bytes = b"env::var_os(\"FORGEKEEP_AUTH_TOKEN\")";
     /// Commented lines count, deliberately. The `runner` service in both
     /// compose files ships commented out and `deploy/.env.example` offers its
     /// credentials under "the commented `runner` service" — uncommenting is
-    /// the documented way to turn it on, so a `${FORGEKEEP_RUNNER_TOKEN}` that
+    /// the documented way to turn it on, so a `${PLOMBIR_GIT_RUNNER_TOKEN}` that
     /// only exists behind a `#` is still the consumer of that offer.
     fn env_vars_substituted_by_compose(files: &[(String, String)]) -> BTreeMap<String, String> {
         let mut substituted = BTreeMap::new();
@@ -3350,13 +3365,13 @@ let bytes = b"env::var_os(\"FORGEKEEP_AUTH_TOKEN\")";
     }
 
     /// Compose substitutions that exist only to let repository tooling control
-    /// Compose itself, rather than to configure a shipped ForgeKeep process.
+    /// Compose itself, rather than to configure a shipped Plombir Git process.
     ///
     /// Each exception carries its reason, and the contract below rejects stale
     /// entries. That keeps this a narrow classification rather than a prefix or
     /// naming loophole that could hide the next operator-facing variable.
     const COMPOSE_SUBSTITUTIONS_NOT_OPERATOR_FACING: [(&str, &str); 1] = [(
-        "FORGEKEEP_DEPLOY_ENV_FILE",
+        "PLOMBIR_GIT_DEPLOY_ENV_FILE",
         "internal: runDeployConfig injects its private temporary env-file path through this \
          Compose override; normal deployments use the `.env` default instead",
     )];
@@ -3377,17 +3392,17 @@ let bytes = b"env::var_os(\"FORGEKEEP_AUTH_TOKEN\")";
         // The scanner has to be able to answer "no" before its "yes" is worth
         // anything: one that matches every line is vacuously green.
         let probe = env_vars_offered_in(
-            "FORGEKEEP_REAL=1\n\
-             # FORGEKEEP_OPTIONAL=2\n\
-             #   echo \"FORGEKEEP_APPENDED=$(id -u)\" >> .env\n\
+            "PLOMBIR_GIT_REAL=1\n\
+             # PLOMBIR_GIT_OPTIONAL=2\n\
+             #   echo \"PLOMBIR_GIT_APPENDED=$(id -u)\" >> .env\n\
              # Empty = the JWT secret is used.\n\
-             # FORGEKEEP_PROSE is named here but never offered.\n",
+             # PLOMBIR_GIT_PROSE is named here but never offered.\n",
         );
         assert_eq!(
             probe.into_iter().collect::<Vec<_>>(),
             vec![
-                "FORGEKEEP_OPTIONAL".to_string(),
-                "FORGEKEEP_REAL".to_string()
+                "PLOMBIR_GIT_OPTIONAL".to_string(),
+                "PLOMBIR_GIT_REAL".to_string()
             ],
             "the `.env` scanner counts prose and shell snippets as offers, so it cannot tell \
              a variable the file offers from one it merely mentions"
@@ -3434,28 +3449,28 @@ let bytes = b"env::var_os(\"FORGEKEEP_AUTH_TOKEN\")";
     fn every_variable_the_deploy_compose_files_substitute_is_offered_in_env_example() {
         let probe = env_vars_substituted_by_compose(&[(
             "probe.yml".to_string(),
-            "      - \"127.0.0.1:${FORGEKEEP_PORT:-8080}:8080\"\n\
-             #     --runner-id ${FORGEKEEP_COMMENTED}\n\
-             env_file: ${FORGEKEEP_DEPLOY_ENV_FILE:-.env}\n\
-             # prose about $FORGEKEEP_BARE and FORGEKEEP_NAKED\n\
+            "      - \"127.0.0.1:${PLOMBIR_GIT_PORT:-8080}:8080\"\n\
+             #     --runner-id ${PLOMBIR_GIT_COMMENTED}\n\
+             env_file: ${PLOMBIR_GIT_DEPLOY_ENV_FILE:-.env}\n\
+             # prose about $PLOMBIR_GIT_BARE and PLOMBIR_GIT_NAKED\n\
              - '--collector.filesystem.mount-points-exclude=^/(sys|proc)($$|/)'\n"
                 .to_owned(),
         )]);
         assert_eq!(
             probe.into_keys().collect::<Vec<_>>(),
             vec![
-                "FORGEKEEP_COMMENTED".to_string(),
-                "FORGEKEEP_DEPLOY_ENV_FILE".to_string(),
-                "FORGEKEEP_PORT".to_string()
+                "PLOMBIR_GIT_COMMENTED".to_string(),
+                "PLOMBIR_GIT_DEPLOY_ENV_FILE".to_string(),
+                "PLOMBIR_GIT_PORT".to_string()
             ],
             "the compose scanner does not read `${{NAME}}` the way compose does — it either \
              misses a substitution or counts a bare `$NAME` mention as one"
         );
         assert!(!compose_substitution_is_operator_facing(
-            "FORGEKEEP_DEPLOY_ENV_FILE"
+            "PLOMBIR_GIT_DEPLOY_ENV_FILE"
         ));
         assert!(compose_substitution_is_operator_facing(
-            "FORGEKEEP_OPERATOR_SETTING"
+            "PLOMBIR_GIT_OPERATOR_SETTING"
         ));
 
         let compose = deploy_compose_files();

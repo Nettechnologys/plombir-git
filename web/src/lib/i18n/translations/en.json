@@ -104,7 +104,7 @@
       "code_review_desc": "PR reviews & branch protection",
       "cicd": "CI/CD",
       "cicd_desc": "Built-in pipeline engine",
-      "title": "Why choose ForgeKeep?",
+      "title": "Why choose Plombir Git?",
       "lightweight": {
         "title": "Lightweight",
         "desc": "Memory usage <50MB, minimal resource footprint"
@@ -139,7 +139,7 @@
       "view_all": "View all",
       "empty": "No public repositories yet"
     },
-    "description": "ForgeKeep is a lightweight Git hosting platform built in Rust, designed as a modern alternative to Gitea. Single binary deployment, memory efficient, full-featured.",
+    "description": "Plombir Git is a lightweight Git hosting platform built in Rust, designed as a modern alternative to Gitea. Single binary deployment, memory efficient, full-featured.",
     "sign_up": "Sign up",
     "sign_in": "Sign in",
     "stats": {
@@ -156,12 +156,12 @@
   },
   "auth": {
     "login": {
-      "title": "Sign in to ForgeKeep",
+      "title": "Sign in to Plombir Git",
       "username": "Username",
       "password": "Password",
       "submit": "Sign in",
       "submitting": "Signing in...",
-      "footer": "New to ForgeKeep? {link}",
+      "footer": "New to Plombir Git? {link}",
       "footer_link": "Create an account",
       "failed": "Login failed",
       "mfa_code": "Authentication code",
@@ -683,7 +683,7 @@
     },
     "timeline": {
       "title": "Review timeline",
-      "system": "ForgeKeep",
+      "system": "Plombir Git",
       "pull_request_opened": "opened this pull request",
       "review_comment": "commented",
       "review_reply": "replied to a review thread",
@@ -783,7 +783,7 @@
     "condition_skipped": "Skipped by condition",
     "no_pipelines": "No pipelines yet.",
     "hint": "Push a commit with {file} to trigger a pipeline.",
-    "file": ".forgekeep-ci.yml",
+    "file": ".plombir-git-ci.yml",
     "detail_title": "Pipeline #{id}",
     "commit": "Commit",
     "branch": "Branch",
@@ -820,7 +820,7 @@
     "backend_health_failed": "Backend health check failed (HTTP {status}).",
     "backend_unhealthy": "The backend is in an abnormal state; some features may be unavailable.",
     "backend_unreachable": "Cannot reach the backend. Make sure the service on port 8080 is running.",
-    "session_check_failed": "ForgeKeep could not verify your session. You have not been signed out.",
+    "session_check_failed": "Plombir Git could not verify your session. You have not been signed out.",
     "session_check_retry": "Retry",
     "session_check_retrying": "Retrying..."
   },

@@ -82,7 +82,7 @@ async fn reset(base: String, token: &'static str, password: &'static str) -> Att
         .iter()
         .filter_map(|value| value.to_str().ok())
         .any(|cookie| {
-            cookie.starts_with("forgekeep_token=") && !cookie.starts_with("forgekeep_token=;")
+            cookie.starts_with("plombir_git_token=") && !cookie.starts_with("plombir_git_token=;")
         });
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
     let session_token = body["token"].as_str().unwrap_or_default().to_string();

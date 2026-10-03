@@ -59,7 +59,7 @@ async fn admin_sso_accepts_httponly_cookie_without_bearer() {
         .get(format!("{}/api/v1/admin/sso/providers", base))
         .header(
             reqwest::header::COOKIE,
-            format!("forgekeep_token={}", admin_token),
+            format!("plombir_git_token={}", admin_token),
         )
         .send()
         .await

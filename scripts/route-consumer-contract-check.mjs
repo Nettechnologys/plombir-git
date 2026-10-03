@@ -119,7 +119,7 @@ const REASONS = new Map([
   ],
   [
     'runner',
-    'the CI runner API: `forgekeep-runner` calls it, and it is a separate binary in `crates/' +
+    'the CI runner API: `plombir-git-runner` calls it, and it is a separate binary in `crates/' +
       'rg-runner`, not the SPA',
   ],
   [

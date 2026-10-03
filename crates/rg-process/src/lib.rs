@@ -11,7 +11,11 @@ compile_error!("rg-process supports Unix and Windows process trees only");
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
-/// Unix permissions for state created by a ForgeKeep process.
+mod retired_environment;
+
+pub use retired_environment::{refuse_retired_environment, RetiredEnvironment};
+
+/// Unix permissions for state created by a Plombir Git process.
 ///
 /// This is a process policy rather than a file helper on purpose. Git, gix,
 /// SQLite, package registries and CI job scripts all create persistent files,
@@ -36,7 +40,7 @@ impl StateCreationPermissions {
     ///
     /// Call this after reading configuration but before the first filesystem
     /// creation. `umask` is process-wide, so changing it after workers start
-    /// would race with their opens; ForgeKeep installs it once during each
+    /// would race with their opens; Plombir Git installs it once during each
     /// state-writing entrypoint's linear startup.
     pub fn install(self) {
         #[cfg(unix)]
@@ -382,7 +386,7 @@ mod bounded_tests {
     #[test]
     fn a_stream_under_the_ceiling_reads_normally() {
         let mut command = std::process::Command::new("sh");
-        command.args(["-c", "printf 'hello, forgekeep\\n'"]);
+        command.args(["-c", "printf 'hello, plombir-git\\n'"]);
 
         let result = output_in_process_tree_with_timeout_and_limit(
             &mut command,
@@ -395,7 +399,7 @@ mod bounded_tests {
         match result {
             TimedOutput::Completed(output) => {
                 assert!(output.status.success(), "child exited non-zero");
-                assert_eq!(output.stdout, b"hello, forgekeep\n");
+                assert_eq!(output.stdout, b"hello, plombir-git\n");
                 assert!(output.stderr.is_empty(), "unexpected stderr");
             }
             other => panic!("expected Completed, got {other:?}"),

@@ -14,7 +14,7 @@
 //! - `GET /gems/{name}-{version}.gem` — gem download
 //! - `POST /api/v1/gems` — gem push
 //!
-//! ForgeKeep serves these at:
+//! Plombir Git serves these at:
 //! - Dependencies: `GET /api/v1/repos/{owner}/{repo}/packages/rubygems/api/v1/dependencies.json?gems={name}`
 //! - Gem info:     `GET /api/v1/repos/{owner}/{repo}/packages/rubygems/api/v1/gems/{name}.json`
 //! - Download:     (standard package download endpoint)
@@ -26,7 +26,7 @@
 //! what it does next depends only on whether that file is there: on a hit it
 //! resolves through the *compact index* (`info/<gem>`), on a miss it falls back
 //! to the legacy Marshal index (`specs.4.8.gz` + `quick/Marshal.4.8/…`), which
-//! ForgeKeep does not serve. So `versions` is the switch, and the three files
+//! Plombir Git does not serve. So `versions` is the switch, and the three files
 //! built below — `versions`, `info/<gem>`, `names` — are the whole read side:
 //! <https://guides.rubygems.org/rubygems-org-compact-index-api/>
 //!

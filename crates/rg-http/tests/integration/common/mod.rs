@@ -249,7 +249,7 @@ fn template_dir_for_this_build() -> std::path::PathBuf {
     let base = exe
         .parent()
         .expect("the test executable's directory")
-        .join(".forgekeep-test-schema");
+        .join(".plombir-git-test-schema");
     std::fs::create_dir_all(&base).expect("create the shared template directory");
     base.join(format!("{name}-{stamp}"))
 }
@@ -362,7 +362,7 @@ pub fn build_test_app_state_with(
 ) -> rg_http::AppState {
     let db_for_queue = db.clone();
     // Keep the registry inside this test's own temp tree. A fixed
-    // `$TMPDIR/forgekeep-test-oci` is shared by every run on the machine, so the
+    // `$TMPDIR/plombir-git-test-oci` is shared by every run on the machine, so the
     // first user to create it owns it and every other user gets
     // `Permission denied (os error 13)` — and concurrent runs stomp each
     // other's uploads even when the uid happens to line up.
@@ -377,7 +377,7 @@ pub fn build_test_app_state_with(
     let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> = overrides
         .blob_storage
         .unwrap_or_else(|| Arc::new(rg_core::blob_storage::LocalBlobStorage::new(&repo_root)));
-    // Production publishes this in `forgekeep serve` and in `AppState::new`;
+    // Production publishes this in `plombir-git serve` and in `AppState::new`;
     // this fixture builds the state by hand, so it owes the same. Without it a
     // webhook delivery cannot open `webhooks.secret_encrypted` to sign with.
     // Every test app shares `TEST_ENCRYPTION_KEY`, which is what makes one

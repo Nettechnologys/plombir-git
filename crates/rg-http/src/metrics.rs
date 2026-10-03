@@ -1,4 +1,4 @@
-//! Prometheus metrics endpoint for ForgeKeep.
+//! Prometheus metrics endpoint for Plombir Git.
 //!
 //! Provides `/metrics` endpoint returning metrics in Prometheus text format.
 //! Uses the `prometheus` crate (default-features = false to avoid OpenSSL).
@@ -292,7 +292,7 @@ pub mod security {
     pub fn register(registry: &Registry) -> Result<(), prometheus::Error> {
         let ae = IntCounterVec::new(
             Opts::new(
-                "forgekeep_auth_events_total",
+                "plombir_git_auth_events_total",
                 "Auth events (login/register/provision/mfa/logout)",
             ),
             &["event", "outcome"],
@@ -304,7 +304,7 @@ pub mod security {
 
         let fl = IntCounterVec::new(
             Opts::new(
-                "forgekeep_failed_logins_total",
+                "plombir_git_failed_logins_total",
                 "Failed login attempts by reason",
             ),
             &["reason"],
@@ -388,41 +388,49 @@ pub mod business {
 
         register_counter!(
             USERS_REGISTERED,
-            "forgekeep_users_registered_total",
+            "plombir_git_users_registered_total",
             "Total user accounts created (self-service registration + LDAP/SSO auto-provision)"
         );
         register_counter!(
             REPOS_CREATED,
-            "forgekeep_repos_created_total",
+            "plombir_git_repos_created_total",
             "Total repositories created"
         );
         register_counter!(
             REPOS_DELETED,
-            "forgekeep_repos_deleted_total",
+            "plombir_git_repos_deleted_total",
             "Total repositories deleted"
         );
         register_counter!(
             REPOS_FORKED,
-            "forgekeep_repos_forked_total",
+            "plombir_git_repos_forked_total",
             "Total repositories forked"
         );
         register_counter!(
             ISSUES_OPENED,
-            "forgekeep_issues_opened_total",
+            "plombir_git_issues_opened_total",
             "Total issues opened"
         );
         register_counter!(
             ISSUES_CLOSED,
-            "forgekeep_issues_closed_total",
+            "plombir_git_issues_closed_total",
             "Total issues closed"
         );
-        register_counter!(PRS_OPENED, "forgekeep_prs_opened_total", "Total PRs opened");
-        register_counter!(PRS_MERGED, "forgekeep_prs_merged_total", "Total PRs merged");
-        register_counter!(STARS_GIVEN, "forgekeep_stars_total", "Total stars given");
+        register_counter!(
+            PRS_OPENED,
+            "plombir_git_prs_opened_total",
+            "Total PRs opened"
+        );
+        register_counter!(
+            PRS_MERGED,
+            "plombir_git_prs_merged_total",
+            "Total PRs merged"
+        );
+        register_counter!(STARS_GIVEN, "plombir_git_stars_total", "Total stars given");
 
         let wh = IntCounterVec::new(
             Opts::new(
-                "forgekeep_webhook_deliveries_total",
+                "plombir_git_webhook_deliveries_total",
                 "Total webhook deliveries",
             ),
             &["status"],
@@ -433,7 +441,7 @@ pub mod business {
         registry.register(Box::new(wh))?;
 
         let ws = IntGauge::with_opts(Opts::new(
-            "forgekeep_ws_connections",
+            "plombir_git_ws_connections",
             "Active WebSocket connections",
         ))?;
         WS_CONNECTIONS
@@ -441,14 +449,14 @@ pub mod business {
             .map_err(|_| prometheus::Error::Msg("WS_CONNECTIONS already set".into()))?;
         registry.register(Box::new(ws))?;
 
-        let ut = IntGauge::with_opts(Opts::new("forgekeep_users", "Total registered users"))?;
+        let ut = IntGauge::with_opts(Opts::new("plombir_git_users", "Total registered users"))?;
         USERS_TOTAL
             .set(ut.clone())
             .map_err(|_| prometheus::Error::Msg("USERS_TOTAL already set".into()))?;
         registry.register(Box::new(ut))?;
 
         let rt = IntGauge::with_opts(Opts::new(
-            "forgekeep_repositories",
+            "plombir_git_repositories",
             "Total non-deleted repositories",
         ))?;
         REPOS_TOTAL
@@ -458,7 +466,7 @@ pub mod business {
 
         let bk = IntCounterVec::new(
             Opts::new(
-                "forgekeep_db_backups_total",
+                "plombir_git_db_backups_total",
                 "Scheduled database backup runs by status",
             ),
             &["status"],
@@ -469,7 +477,7 @@ pub mod business {
         registry.register(Box::new(bk))?;
 
         let bt = IntGauge::with_opts(Opts::new(
-            "forgekeep_db_backup_last_success_timestamp_seconds",
+            "plombir_git_db_backup_last_success_timestamp_seconds",
             "Unix timestamp of the last successful scheduled database backup (0 = never)",
         ))?;
         DB_BACKUP_LAST_SUCCESS
@@ -585,10 +593,10 @@ pub mod recorder {
     /// Record a user account auto-provisioned by an external identity source
     /// (LDAP / SSO first-login) rather than self-service registration.
     ///
-    /// Bumps the same `forgekeep_users_registered_total` counter — so it stays a
-    /// true "accounts created" total that tracks the `forgekeep_users` gauge
+    /// Bumps the same `plombir_git_users_registered_total` counter — so it stays a
+    /// true "accounts created" total that tracks the `plombir_git_users` gauge
     /// instead of silently undercounting directory-backed deployments — and
-    /// records provenance via `forgekeep_auth_events_total{event="provision",
+    /// records provenance via `plombir_git_auth_events_total{event="provision",
     /// outcome=<source>}`. `source` must be a low-cardinality literal
     /// (`"ldap"` / `"sso"`).
     pub fn user_provisioned(source: &str) {
@@ -705,7 +713,7 @@ pub mod recorder {
     /// Record a finished scheduled database backup run.
     ///
     /// A successful run also stamps
-    /// `forgekeep_db_backup_last_success_timestamp_seconds`, because the alert
+    /// `plombir_git_db_backup_last_success_timestamp_seconds`, because the alert
     /// worth having is "the last backup is older than N hours", and a counter
     /// that stops increasing is indistinguishable from a quiet instance.
     pub fn db_backup(success: bool) {

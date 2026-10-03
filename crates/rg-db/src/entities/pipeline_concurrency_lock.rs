@@ -2,7 +2,7 @@
 //!
 //! Rows are durable lock identities, not leases: an UPSERT of one row inside a
 //! transaction holds the database's write lock for exactly that transaction.
-//! This lets every ForgeKeep process arbitrate the same `(repo_id, group_name)`
+//! This lets every Plombir Git process arbitrate the same `(repo_id, group_name)`
 //! before it reads active pipelines or publishes a replacement graph.
 
 use sea_orm::entity::prelude::*;

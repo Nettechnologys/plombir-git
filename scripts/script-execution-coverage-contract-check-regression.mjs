@@ -22,7 +22,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SELF = 'script-execution-coverage-contract-check.mjs';
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-script-execution-coverage-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-script-execution-coverage-'));
   mkdirSync(join(fixture, '.github'), { recursive: true });
   mkdirSync(join(fixture, 'web'), { recursive: true });
   cpSync(join(root, 'scripts'), join(fixture, 'scripts'), { recursive: true });
@@ -61,7 +61,7 @@ function runFixture(name, mutate, expectedStatus, expectedOutput, mutateCheck = 
     if (mutate) mutate(fixture);
     const result = spawnSync(process.execPath, [check], {
       cwd: fixture,
-      env: { ...process.env, FORGEKEEP_SCRIPT_EXECUTION_COVERAGE_ROOT: fixture },
+      env: { ...process.env, PLOMBIR_GIT_SCRIPT_EXECUTION_COVERAGE_ROOT: fixture },
       encoding: 'utf8',
     });
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;

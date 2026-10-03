@@ -1,4 +1,4 @@
-//! Drop `users.ldap_dn` — directory data ForgeKeep copies in and never asks a
+//! Drop `users.ldap_dn` — directory data Plombir Git copies in and never asks a
 //! question of.
 //!
 //! An LDAP first login stores the entry's distinguished name, and every

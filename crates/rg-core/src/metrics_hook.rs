@@ -140,8 +140,8 @@ pub fn record_repo_created() {
 /// (`retire_org_repositories`) and deleting an account
 /// (`retire_account_repositories`) funnel through the same service function and
 /// carry no handler of their own, so an organization with forty repositories
-/// moved the `forgekeep_repositories` gauge by forty and
-/// `forgekeep_repos_deleted_total` by nothing.
+/// moved the `plombir_git_repositories` gauge by forty and
+/// `plombir_git_repos_deleted_total` by nothing.
 static REPO_DELETED_OBSERVER: OnceLock<fn()> = OnceLock::new();
 
 /// Install the repo-deleted observer. Idempotent (first installer wins).

@@ -23,12 +23,12 @@ use crate::sideband;
 /// V2 Protocol constants
 pub const PROTOCOL_VERSION: &str = "2";
 
-/// Capabilities that ForgeKeep currently implements end to end.
+/// Capabilities that Plombir Git currently implements end to end.
 ///
 /// Keep HTTP and SSH advertisements sourced from this list. Unsupported fetch
 /// features must not be appended here until `handle_fetch` implements them.
 pub const ADVERTISED_CAPABILITIES: &[&str] = &[
-    "agent=forgekeep/0.1",
+    "agent=plombir-git/0.1",
     caps::LS_REFS,
     caps::FETCH_SHALLOW,
     "object-format=sha1",

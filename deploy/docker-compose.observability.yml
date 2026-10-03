@@ -1,11 +1,11 @@
-# ForgeKeep Observability Stack (Phase 22-C)
+# Plombir Git Observability Stack (Phase 22-C)
 # Prometheus + Alertmanager + Grafana
 
 services:
   # ── Prometheus (Metrics Storage) ──
   prometheus:
     image: prom/prometheus:v2.55.0
-    container_name: forgekeep-prometheus
+    container_name: plombir-git-prometheus
     restart: unless-stopped
     ports:
       - "9090:9090"
@@ -23,12 +23,12 @@ services:
     depends_on:
       - alertmanager
     networks:
-      - forgekeep-net
+      - plombir-git-net
 
   # ── Alertmanager (Alert Routing) ──
   alertmanager:
     image: prom/alertmanager:v0.27.0
-    container_name: forgekeep-alertmanager
+    container_name: plombir-git-alertmanager
     restart: unless-stopped
     ports:
       - "9093:9093"
@@ -38,12 +38,12 @@ services:
       - '--config.file=/etc/alertmanager/alertmanager.yml'
       - '--storage.path=/alertmanager'
     networks:
-      - forgekeep-net
+      - plombir-git-net
 
   # ── Grafana (Visualization) ──
   grafana:
     image: grafana/grafana:11.3.0
-    container_name: forgekeep-grafana
+    container_name: plombir-git-grafana
     restart: unless-stopped
     ports:
       - "3000:3000"
@@ -60,12 +60,12 @@ services:
     depends_on:
       - prometheus
     networks:
-      - forgekeep-net
+      - plombir-git-net
 
   # ── Node Exporter (Host Metrics) ──
   node-exporter:
     image: prom/node-exporter:v1.8.2
-    container_name: forgekeep-node-exporter
+    container_name: plombir-git-node-exporter
     restart: unless-stopped
     ports:
       - "9100:9100"
@@ -79,7 +79,7 @@ services:
       - '--path.rootfs=/rootfs'
       - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
     networks:
-      - forgekeep-net
+      - plombir-git-net
 
 volumes:
   prometheus-data:
@@ -88,6 +88,6 @@ volumes:
     driver: local
 
 networks:
-  forgekeep-net:
-    name: forgekeep-net
+  plombir-git-net:
+    name: plombir-git-net
     driver: bridge

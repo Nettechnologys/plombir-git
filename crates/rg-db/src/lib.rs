@@ -1,11 +1,11 @@
-//! ForgeKeep database layer — SeaORM + SQLite.
+//! Plombir Git database layer — SeaORM + SQLite.
 //!
 //! # Usage
 //!
 //! ```rust,no_run
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     let db = rg_db::connect("sqlite:///tmp/forgekeep/forgekeep.db?mode=rwc").await?;
+//!     let db = rg_db::connect("sqlite:///tmp/plombir-git/plombir-git.db?mode=rwc").await?;
 //!     rg_db::run_migrations(&db).await?;
 //!     Ok(())
 //! }
@@ -390,7 +390,7 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
 /// Connect to the database selected by `db_url`'s scheme (SQLite / Postgres / MySQL).
-/// URL example: `sqlite:///path/to/db?mode=rwc`, `postgres://user@localhost/forgekeep`.
+/// URL example: `sqlite:///path/to/db?mode=rwc`, `postgres://user@localhost/plombir_git`.
 pub async fn connect(db_url: &str) -> Result<DatabaseConnection> {
     connect_with_timeouts(
         db_url,
@@ -818,24 +818,24 @@ mod tests {
     fn database_urls_are_redacted_before_diagnostics() {
         assert_eq!(
             redact_database_url(
-                "postgres://forgekeep:super-secret@db.internal:5432/forgekeep?sslmode=require"
+                "postgres://plombir-git:super-secret@db.internal:5432/plombir_git?sslmode=require"
             ),
-            "postgres://forgekeep:***@db.internal:5432/forgekeep?sslmode=require"
+            "postgres://plombir-git:***@db.internal:5432/plombir_git?sslmode=require"
         );
         assert_eq!(
-            redact_database_url("mysql://root:p%40ss%3Aword@127.0.0.1:3306/forgekeep"),
-            "mysql://root:***@127.0.0.1:3306/forgekeep"
+            redact_database_url("mysql://root:p%40ss%3Aword@127.0.0.1:3306/plombir_git"),
+            "mysql://root:***@127.0.0.1:3306/plombir_git"
         );
         assert_eq!(
-            redact_database_url("postgres://forgekeep@db.internal/forgekeep"),
-            "postgres://forgekeep@db.internal/forgekeep"
+            redact_database_url("postgres://plombir_git@db.internal/plombir_git"),
+            "postgres://plombir_git@db.internal/plombir_git"
         );
         assert_eq!(
-            redact_database_url("sqlite:///tmp/forgekeep.db?mode=rwc"),
-            "sqlite:///tmp/forgekeep.db?mode=rwc"
+            redact_database_url("sqlite:///tmp/plombir-git.db?mode=rwc"),
+            "sqlite:///tmp/plombir-git.db?mode=rwc"
         );
 
-        let error = detect_backend("custom://root:top-secret@db/forgekeep")
+        let error = detect_backend("custom://root:top-secret@db/plombir-git")
             .expect_err("unsupported scheme")
             .to_string();
         assert!(!error.contains("top-secret"));
@@ -864,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn connect_applies_per_connection_pragmas() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("forgekeep_pragma_test_{}.db", std::process::id()));
+        let path = dir.join(format!("plombir_git_pragma_test_{}.db", std::process::id()));
         discard_sqlite_test_file(&path);
         let url = format!("sqlite://{}?mode=rwc", path.display());
 
@@ -910,7 +910,7 @@ mod tests {
     async fn concurrent_reads_and_writes_do_not_error() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
-            "forgekeep_concurrency_test_{}.db",
+            "plombir_git_concurrency_test_{}.db",
             std::process::id()
         ));
         discard_sqlite_test_files(&path);

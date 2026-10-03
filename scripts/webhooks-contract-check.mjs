@@ -44,7 +44,7 @@ for (const [method, route] of [
 
 // ── The admin gate and the repo-scoping of `{id}` ─────────────────────────
 //
-// A webhook row carries the delivery target and the HMAC key ForgeKeep signs
+// A webhook row carries the delivery target and the HMAC key Plombir Git signs
 // deliveries with, and `{id}` is a global `webhooks` primary key. So every
 // id-taking door owes two refusals: a non-admin, and a hook that belongs to
 // some other repository.

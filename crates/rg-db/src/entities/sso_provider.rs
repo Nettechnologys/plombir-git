@@ -34,7 +34,7 @@ pub struct Model {
     /// LDAP user filter template, e.g. "(uid={username})"
     pub ldap_user_filter: Option<String>,
     pub enabled: bool,
-    /// May a first login through this provider *create* a ForgeKeep account?
+    /// May a first login through this provider *create* a Plombir Git account?
     ///
     /// `enabled` says the provider can be used to sign in; this says whether
     /// signing in is allowed to mint an account for someone who has none. They

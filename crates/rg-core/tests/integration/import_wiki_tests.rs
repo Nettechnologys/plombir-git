@@ -35,7 +35,7 @@ fn git(args: &[&str], cwd: &Path) {
 
 /// A wiki repository as gollum would leave it: pages at the root, an
 /// attachment they link to, a page in a subdirectory, and one page written in a
-/// markup a ForgeKeep wiki page cannot hold.
+/// markup a Plombir Git wiki page cannot hold.
 fn source_wiki(dir: &Path) -> std::path::PathBuf {
     let source = dir.join("source.wiki");
     std::fs::create_dir_all(source.join("assets")).expect("create the source wiki");

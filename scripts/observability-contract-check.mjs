@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Asserts that everything which *queries* ForgeKeep's metrics asks for series
+// Asserts that everything which *queries* Plombir Git's metrics asks for series
 // the exporter actually produces.
 //
 // Why this exists: `deploy/prometheus/` and `deploy/grafana/` are production
@@ -239,15 +239,15 @@ const prometheusDocument = loadYaml(promPath, 'deploy/prometheus/prometheus.yml'
 const alertsDocument = loadYaml(alertsPath, 'deploy/prometheus/alerts.yml');
 const alertmanagerDocument = loadYaml(alertmanagerPath, 'deploy/alertmanager/alertmanager.yml');
 
-const composeForgekeepPorts = servicePorts(
+const composePlombirGitPorts = servicePorts(
   composeDocument,
-  'forgekeep',
+  'plombir-git',
   'deploy/docker-compose.yml',
 );
 // YAML parsers intentionally discard comments, so `# HTTP` may select the
 // candidate value but cannot prove who owns it. Require that value to have one
 // owner in the parsed graph: otherwise a marked sidecar can borrow an identical
-// unmarked ForgeKeep mapping and make a value-only check pass.
+// unmarked Plombir Git mapping and make a value-only check pass.
 //
 // The marker is read through `yamlAnnotatedLines`, which splits each line the
 // way the parser would, rather than with one regex over the raw bytes. A regex
@@ -262,7 +262,7 @@ const composeHttpMappings = yamlAnnotatedLines(composeYml)
 if (composeHttpMappings.length !== 1) {
   failures.push(
     'deploy/docker-compose.yml must contain exactly one numeric "HOST:CONTAINER" ' +
-      `ForgeKeep port mapping marked "# HTTP"; parsed ${composeHttpMappings.length}`,
+      `Plombir Git port mapping marked "# HTTP"; parsed ${composeHttpMappings.length}`,
   );
 }
 let composeHostPort;
@@ -271,12 +271,12 @@ if (composeHttpMappings.length === 1) {
   const [, published, target] = composeHttpMappings[0];
   const value = `${published}:${target}`;
   const owners = servicePortOwners(composeDocument, value);
-  const forgekeepMatches = composeForgekeepPorts.filter((port) => port === value);
-  if (owners.length !== 1 || owners[0]?.service !== 'forgekeep' || forgekeepMatches.length !== 1) {
+  const plombirGitMatches = composePlombirGitPorts.filter((port) => port === value);
+  if (owners.length !== 1 || owners[0]?.service !== 'plombir-git' || plombirGitMatches.length !== 1) {
     const found = owners.map(({ service, index }) => `services.${service}.ports[${index}]`);
     failures.push(
       `deploy/docker-compose.yml # HTTP mapping "${value}" must identify exactly one `
-        + `services.forgekeep.ports entry; found ${found.length > 0 ? found.join(', ') : 'none'}`,
+        + `services.plombir-git.ports entry; found ${found.length > 0 ? found.join(', ') : 'none'}`,
     );
   } else {
     composeHostPort = published;
@@ -284,50 +284,50 @@ if (composeHttpMappings.length === 1) {
   }
 }
 
-const hostdirForgekeepPorts = servicePorts(
+const hostdirPlombirGitPorts = servicePorts(
   hostdirComposeDocument,
-  'forgekeep',
+  'plombir-git',
   'deploy/docker-compose.hostdir.yml',
 );
-const hostdirHttpMappings = hostdirForgekeepPorts.flatMap((port) => {
+const hostdirHttpMappings = hostdirPlombirGitPorts.flatMap((port) => {
   if (typeof port !== 'string') return [];
-  const match = /^127\.0\.0\.1:\$\{FORGEKEEP_HTTP_PORT:-([0-9]+)\}:([0-9]+)$/.exec(port);
+  const match = /^127\.0\.0\.1:\$\{PLOMBIR_GIT_HTTP_PORT:-([0-9]+)\}:([0-9]+)$/.exec(port);
   return match ? [match] : [];
 });
 if (hostdirHttpMappings.length !== 1) {
   failures.push(
-    'deploy/docker-compose.hostdir.yml must contain exactly one loopback ForgeKeep mapping ' +
-      'with a numeric ${FORGEKEEP_HTTP_PORT:-DEFAULT}; parsed ' + hostdirHttpMappings.length,
+    'deploy/docker-compose.hostdir.yml must contain exactly one loopback Plombir Git mapping ' +
+      'with a numeric ${PLOMBIR_GIT_HTTP_PORT:-DEFAULT}; parsed ' + hostdirHttpMappings.length,
   );
 }
 const hostdirDefaultHostPort = hostdirHttpMappings[0]?.[1];
 const hostdirContainerPort = hostdirHttpMappings[0]?.[2];
 
-const forgekeepStaticConfigs = staticConfigsForJob(
+const plombirGitStaticConfigs = staticConfigsForJob(
   prometheusDocument,
-  'forgekeep',
+  'plombir-git',
   'deploy/prometheus/prometheus.yml',
 );
-const forgekeepTargets = [];
-for (const [index, config] of forgekeepStaticConfigs.entries()) {
+const plombirGitTargets = [];
+for (const [index, config] of plombirGitStaticConfigs.entries()) {
   if (!isObject(config) || !Array.isArray(config.targets)) {
     failures.push(
-      'deploy/prometheus/prometheus.yml scrape job "forgekeep" has no targets list at '
+      'deploy/prometheus/prometheus.yml scrape job "plombir-git" has no targets list at '
         + `static_configs[${index}]`,
     );
     continue;
   }
-  forgekeepTargets.push(...config.targets);
+  plombirGitTargets.push(...config.targets);
 }
-const prometheusPorts = forgekeepTargets.flatMap((target) => {
+const prometheusPorts = plombirGitTargets.flatMap((target) => {
   if (typeof target !== 'string') return [];
-  const match = /^forgekeep:([0-9]+)$/.exec(target);
+  const match = /^plombir-git:([0-9]+)$/.exec(target);
   return match ? [match[1]] : [];
 });
 if (prometheusPorts.length !== 1) {
   failures.push(
-    'deploy/prometheus/prometheus.yml must contain exactly one forgekeep:PORT target in the '
-      + `forgekeep job; parsed ${prometheusPorts.length}`,
+    'deploy/prometheus/prometheus.yml must contain exactly one plombir-git:PORT target in the '
+      + `plombir-git job; parsed ${prometheusPorts.length}`,
   );
 }
 const prometheusPort = prometheusPorts[0];
@@ -349,30 +349,30 @@ const readmeHostdirProsePort = exactlyOnePort(
 );
 const readmeScrapePort = exactlyOnePort(
   readme,
-  /Prometheus scrapes the app at `forgekeep:([0-9]+)`/g,
-  'deploy/README.md must contain exactly one numeric ForgeKeep Prometheus target',
+  /Prometheus scrapes the app at `plombir-git:([0-9]+)`/g,
+  'deploy/README.md must contain exactly one numeric Plombir Git Prometheus target',
 );
 const readmeArchitecturePort = exactlyOnePort(
   readme,
   /^│  :([0-9]+)\/metrics\s+│/gm,
-  'deploy/README.md architecture must contain exactly one numeric ForgeKeep metrics endpoint',
+  'deploy/README.md architecture must contain exactly one numeric Plombir Git metrics endpoint',
 );
 
 const hardcodedHelperEndpoints = [
   ...[...helper.matchAll(/http:\/\/localhost:([0-9]+)\/health/g)]
     .map(([, port]) => `localhost:${port}/health`),
-  ...[...helper.matchAll(/^echo "  ForgeKeep:[^\n]*http:\/\/localhost:([0-9]+)\/metrics"$/gm)]
+  ...[...helper.matchAll(/^echo "  Plombir Git:[^\n]*http:\/\/localhost:([0-9]+)\/metrics"$/gm)]
     .map(([, port]) => `localhost:${port}/metrics`),
 ];
 if (hardcodedHelperEndpoints.length > 0) {
   failures.push(
-    `deploy/start-observability.sh hardcodes ForgeKeep app endpoint(s): ${hardcodedHelperEndpoints.join(', ')}`,
+    `deploy/start-observability.sh hardcodes Plombir Git app endpoint(s): ${hardcodedHelperEndpoints.join(', ')}`,
   );
 }
 for (const endpoint of ['health', 'metrics']) {
-  if (helper.includes(`http://localhost:\${FORGEKEEP_HOST_PORT}/${endpoint}`)) continue;
+  if (helper.includes(`http://localhost:\${PLOMBIR_GIT_HOST_PORT}/${endpoint}`)) continue;
   failures.push(
-    `deploy/start-observability.sh must use the compose-derived \${FORGEKEEP_HOST_PORT} for /${endpoint}`,
+    `deploy/start-observability.sh must use the compose-derived \${PLOMBIR_GIT_HOST_PORT} for /${endpoint}`,
   );
 }
 
@@ -390,12 +390,12 @@ comparePorts(
 comparePorts(
   hostdirContainerPort,
   composeContainerPort,
-  'the two shipped app compose files disagree on the ForgeKeep container HTTP port',
+  'the two shipped app compose files disagree on the Plombir Git container HTTP port',
 );
 comparePorts(
   prometheusPort,
   composeContainerPort,
-  'Prometheus ForgeKeep target disagrees with the compose container HTTP port',
+  'Prometheus Plombir Git target disagrees with the compose container HTTP port',
 );
 comparePorts(
   readmeAccessPort,
@@ -464,17 +464,17 @@ if (exported.size < MIN_METRICS) {
 // 2. Labels that exist without the exporter emitting them.
 // ---------------------------------------------------------------------------
 
-// Target labels attached by Prometheus to ForgeKeep's own static scrape
+// Target labels attached by Prometheus to Plombir Git's own static scrape
 // configs, plus the labels the existing expression/alert contract treats as
 // built in. Read the parsed job graph so quoted YAML has identical semantics
-// and a neighboring scrape job cannot lend ForgeKeep one of its labels.
+// and a neighboring scrape job cannot lend Plombir Git one of its labels.
 const targetLabels = new Set(['job', 'instance', 'alertname', 'severity']);
-for (const [index, config] of forgekeepStaticConfigs.entries()) {
+for (const [index, config] of plombirGitStaticConfigs.entries()) {
   if (!isObject(config)) continue; // the target validation above already reports this entry
   if (config.labels === undefined) continue;
   if (!isObject(config.labels)) {
     failures.push(
-      'deploy/prometheus/prometheus.yml scrape job "forgekeep" has a non-mapping labels value at '
+      'deploy/prometheus/prometheus.yml scrape job "plombir-git" has a non-mapping labels value at '
         + `static_configs[${index}]`,
     );
     continue;
@@ -482,7 +482,7 @@ for (const [index, config] of forgekeepStaticConfigs.entries()) {
   for (const label of Object.keys(config.labels)) targetLabels.add(label);
 }
 
-// Metric families that come from somewhere other than ForgeKeep's exporter.
+// Metric families that come from somewhere other than Plombir Git's exporter.
 const FOREIGN_METRIC = /^(up|node_|prometheus_|go_|process_|alertmanager_|grafana_)/;
 
 // PromQL aggregation operators. `topk`/`bottomk` (and the experimental
@@ -674,7 +674,7 @@ for (const { name, expression, staticLabels, annotations } of rules) {
 
 if (alertReferences < MIN_ALERT_REFERENCES) {
   failures.push(
-    `Only ${alertReferences} ForgeKeep metric references found in alerts.yml ` +
+    `Only ${alertReferences} Plombir Git metric references found in alerts.yml ` +
       `(floor ${MIN_ALERT_REFERENCES}) — the rule parse has stopped reading the file`,
   );
 }
@@ -938,34 +938,34 @@ for (const file of dashboards) {
     continue;
   }
 
-  if (dashboard.uid === 'forgekeep-main') {
+  if (dashboard.uid === 'plombir-git-main') {
     mainDashboardCount += 1;
     const panelsById = new Map();
     const panelIdsByTitle = new Map();
 
     if (panels.length === 0) {
-      failures.push(`${file}: forgekeep-main has no panels — the panel inventory is empty`);
+      failures.push(`${file}: plombir-git-main has no panels — the panel inventory is empty`);
     }
 
     for (const panel of panels) {
       const id = panel.id;
       const title = String(panel.title ?? '').trim();
       if (!Number.isInteger(id) || id <= 0) {
-        failures.push(`${file}: forgekeep-main panel has invalid id ${JSON.stringify(id)}`);
+        failures.push(`${file}: plombir-git-main panel has invalid id ${JSON.stringify(id)}`);
         continue;
       }
       if (!title) {
-        failures.push(`${file}: forgekeep-main panel ${id} has no non-empty title`);
+        failures.push(`${file}: plombir-git-main panel ${id} has no non-empty title`);
         continue;
       }
       if (panelsById.has(id)) {
-        failures.push(`${file}: forgekeep-main defines panel id ${id} more than once`);
+        failures.push(`${file}: plombir-git-main defines panel id ${id} more than once`);
         continue;
       }
       const duplicateTitleId = panelIdsByTitle.get(title);
       if (duplicateTitleId !== undefined) {
         failures.push(
-          `${file}: forgekeep-main panels ${duplicateTitleId} and ${id} share title ${JSON.stringify(title)}`,
+          `${file}: plombir-git-main panels ${duplicateTitleId} and ${id} share title ${JSON.stringify(title)}`,
         );
       }
       panelsById.set(id, title);
@@ -1022,7 +1022,7 @@ for (const file of dashboards) {
 
 if (dashboardReferences < MIN_DASHBOARD_REFERENCES) {
   failures.push(
-    `Only ${dashboardReferences} ForgeKeep metric references found across the dashboards ` +
+    `Only ${dashboardReferences} Plombir Git metric references found across the dashboards ` +
       `(floor ${MIN_DASHBOARD_REFERENCES}) — the panel walk has stopped reading them`,
   );
 }
@@ -1079,7 +1079,7 @@ const dashboardPanelSection = readme.match(
   /^## [^\n]*Dashboard Panels[^\n]*\n[\s\S]*?(?=^## |(?![\s\S]))/m,
 )?.[0];
 if (!dashboardPanelSection) {
-  failures.push('deploy/README.md has no "Dashboard Panels" section — the guide no longer inventories forgekeep-main');
+  failures.push('deploy/README.md has no "Dashboard Panels" section — the guide no longer inventories plombir-git-main');
 }
 
 const documentedPanels = new Map();
@@ -1109,7 +1109,7 @@ if (documentedPanels.size === 0) {
 
 if (mainDashboardCount !== 1) {
   failures.push(
-    `Expected exactly one dashboard with uid \`forgekeep-main\`, found ${mainDashboardCount}`,
+    `Expected exactly one dashboard with uid \`plombir-git-main\`, found ${mainDashboardCount}`,
   );
 }
 
@@ -1128,7 +1128,7 @@ for (const [id, title] of mainDashboardPanels ?? []) {
 for (const [id, title] of documentedPanels) {
   if (mainDashboardPanels?.has(id)) continue;
   failures.push(
-    `deploy/README.md documents Grafana panel \`${id}\` ${JSON.stringify(title)}, which forgekeep-main does not contain`,
+    `deploy/README.md documents Grafana panel \`${id}\` ${JSON.stringify(title)}, which plombir-git-main does not contain`,
   );
 }
 
@@ -1201,5 +1201,5 @@ console.log(
     `${alertReferences} alert + ${dashboardReferences} dashboard references, ` +
     `${documented} metric rows + ${documentedAlerts.size} alert rules + ` +
     `${documentedPanels.size} dashboard panels documented, ` +
-    `ForgeKeep ${composeHostPort}:${composeContainerPort})`,
+    `Plombir Git ${composeHostPort}:${composeContainerPort})`,
 );

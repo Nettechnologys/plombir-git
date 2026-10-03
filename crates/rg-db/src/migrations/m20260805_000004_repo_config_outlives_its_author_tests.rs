@@ -16,7 +16,7 @@ impl TempDb {
     fn new(label: &str) -> Self {
         Self {
             path: std::env::temp_dir().join(format!(
-                "forgekeep-ghost-config-{label}-{}.db",
+                "plombir-git-ghost-config-{label}-{}.db",
                 uuid::Uuid::new_v4().simple()
             )),
         }

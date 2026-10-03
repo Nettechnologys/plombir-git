@@ -169,7 +169,7 @@
 </script>
 
 <svelte:head>
-  <title>Edit Release · {owner}/{repo} · ForgeKeep</title>
+  <title>Edit Release · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

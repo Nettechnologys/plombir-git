@@ -23,7 +23,7 @@ struct TempDb(std::path::PathBuf);
 impl TempDb {
     fn new() -> Self {
         Self(std::env::temp_dir().join(format!(
-            "forgekeep-runner-retirement-{}.db",
+            "plombir-git-runner-retirement-{}.db",
             uuid::Uuid::new_v4().simple()
         )))
     }

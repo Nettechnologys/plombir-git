@@ -432,7 +432,7 @@ mod org_retirement_race_tests {
     async fn setup_pooled_db(label: &str) -> (DatabaseConnection, TempDb) {
         let temp = TempDb {
             path: std::env::temp_dir().join(format!(
-                "forgekeep-org-race-{label}-{}.db",
+                "plombir-git-org-race-{label}-{}.db",
                 uuid::Uuid::new_v4().simple()
             )),
         };

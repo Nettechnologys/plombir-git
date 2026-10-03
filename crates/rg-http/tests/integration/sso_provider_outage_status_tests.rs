@@ -24,7 +24,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rg_db::ops::sso_provider_ops::SsoProviderInput;
 
-/// What the mock provider does when ForgeKeep calls it.
+/// What the mock provider does when Plombir Git calls it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Behaviour {
     /// Everything answers; the login completes.
@@ -252,8 +252,8 @@ impl Harness {
             .await
             .unwrap();
         assert!(authorize.status().is_redirection());
-        let state_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_state");
-        let verifier_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_code_verifier");
+        let state_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_state");
+        let verifier_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_code_verifier");
         let state = signed_cookie_value(&state_cookie);
         let callback = self
             .client

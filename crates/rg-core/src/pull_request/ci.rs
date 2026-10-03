@@ -131,7 +131,7 @@ async fn reconcile_published_pull_request_pipeline(
 /// The gate is [`CiTrigger::has_workflow_for_event`](crate::ci::CiTrigger::has_workflow_for_event)
 /// rather than `has_ci_config`, and that distinction is the whole safety of this
 /// path: `has_ci_config` answers "is there any pipeline definition here", which
-/// is a yes for every repository using the native `.forgekeep-ci.yml`. Those
+/// is a yes for every repository using the native `.plombir-git-ci.yml`. Those
 /// repositories would get a second copy of their push pipeline on every PR open
 /// and every PR sync, forever.
 pub async fn trigger_pull_request_ci(
@@ -509,7 +509,7 @@ mod configuration_failure_tests {
     /// again" is the most likely retry of all. Recorded without `base_branch`,
     /// the retry of a PR into a non-default branch is matched against the
     /// default branch: its `branches:` workflow selects nothing and the run
-    /// falls through to `.forgekeep-ci.yml`, so a run that honestly failed on
+    /// falls through to `.plombir-git-ci.yml`, so a run that honestly failed on
     /// "CI configuration rejected" comes back on a different graph.
     #[tokio::test]
     async fn a_refused_pull_request_configuration_records_the_branch_it_targeted() {

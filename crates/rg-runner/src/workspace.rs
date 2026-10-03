@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const RUNNER_DIRECTORY: &str = "forgekeep-runner";
+const RUNNER_DIRECTORY: &str = "plombir-git-runner";
 const JOBS_DIRECTORY: &str = "jobs";
 const WORKSPACE_DOWNLOAD_SUFFIX: &str = ".workspace.download.tar";
 const ARTIFACT_SUFFIX: &str = ".artifact.tar";
@@ -254,7 +254,7 @@ mod tests {
         let commands_code = rust_source::production_rust_code_only(commands);
 
         assert!(!api.contains("workspace.download.tar"));
-        assert!(!api.contains(".join(\"forgekeep-runner\")"));
+        assert!(!api.contains(".join(\"plombir-git-runner\")"));
         assert!(!commands.contains("artifact.tar"));
         assert!(api_code.contains("job_workspace_path(job_id)"));
         assert!(api_code.contains("workspace_download_spool_path(&workspace)"));

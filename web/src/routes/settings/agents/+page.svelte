@@ -213,7 +213,7 @@
 </script>
 
 <svelte:head>
-  <title>Agents · ForgeKeep</title>
+  <title>Agents · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container agents-page">

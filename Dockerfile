@@ -5,17 +5,17 @@
 # stable there, but the daemon's builtin parser rejects it outright
 # (`unknown flag: --parents`).
 #
-# === ForgeKeep Dockerfile ===
+# === Plombir Git Dockerfile ===
 # Multi-stage build: frontend (SvelteKit) + Rust builder + minimal runtime.
 #
 # Build:
-#   docker build -t forgekeep:latest .
+#   docker build -t plombir-git:latest .
 #
 # Run:
 #   docker run -d -p 8080:8080 -p 2222:2222 \
-#     -e FORGEKEEP_JWT_SECRET=your-secret \
-#     -v forgekeep-data:/data \
-#     forgekeep:latest
+#     -e PLOMBIR_GIT_JWT_SECRET=your-secret \
+#     -v plombir-git-data:/data \
+#     plombir-git:latest
 
 # ── Stage 1: Frontend (SvelteKit SPA) ────────────────────────
 FROM node:22-alpine AS frontend-builder
@@ -90,14 +90,14 @@ RUN cargo build --release
 #     the artifacts built from the stubs newer than the sources that replaced
 #     them and skip the rebuild entirely.
 #
-#     FORGEKEEP_SOURCE_COMMIT is the commit these sources are, recorded into the
+#     PLOMBIR_GIT_SOURCE_COMMIT is the commit these sources are, recorded into the
 #     binary so every page can link the exact code it runs (AGPL §13; see
 #     `rg_http::build_info`). It is declared here, after 2c, on purpose: an ARG
 #     is part of the cache key of every later RUN, so declaring it above the
 #     dependency build would rebuild every dependency on every commit. Pass
-#     `--build-arg FORGEKEEP_SOURCE_COMMIT=$(git rev-parse HEAD)`; left empty,
+#     `--build-arg PLOMBIR_GIT_SOURCE_COMMIT=$(git rev-parse HEAD)`; left empty,
 #     the server links the repository instead and warns about it at startup.
-ARG FORGEKEEP_SOURCE_COMMIT=
+ARG PLOMBIR_GIT_SOURCE_COMMIT=
 RUN find crates -name '*.rs' -delete
 COPY crates/ crates/
 RUN find crates -name '*.rs' -exec touch {} + \
@@ -137,14 +137,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #
 # The uid/gid are pinned (and overridable) on purpose: with a bind-mounted data
 # directory the *number* is what matters, not the name — the container's
-# `forgekeep` user has nothing to do with a host user of the same name. Build
-# with `--build-arg FORGEKEEP_UID=$(id -u)` to match the host owner of the
+# `plombir-git` user has nothing to do with a host user of the same name. Build
+# with `--build-arg PLOMBIR_GIT_UID=$(id -u)` to match the host owner of the
 # bind-mount and skip the `chown` step entirely.
-ARG FORGEKEEP_UID=1000
-ARG FORGEKEEP_GID=1000
-RUN groupadd --gid ${FORGEKEEP_GID} forgekeep \
-    && useradd --uid ${FORGEKEEP_UID} --gid ${FORGEKEEP_GID} \
-       --create-home --shell /bin/bash forgekeep
+ARG PLOMBIR_GIT_UID=1000
+ARG PLOMBIR_GIT_GID=1000
+RUN groupadd --gid ${PLOMBIR_GIT_GID} plombir-git \
+    && useradd --uid ${PLOMBIR_GIT_UID} --gid ${PLOMBIR_GIT_GID} \
+       --create-home --shell /bin/bash plombir-git
 
 # Copy the complete Cargo-derived runtime payload.
 COPY --from=builder /out/ /usr/local/bin/
@@ -162,24 +162,24 @@ COPY --from=frontend-builder /build/web/build /app/web/build
 # — and `/app` stays as it is, since the static assets there are served to
 # anyone anyway.
 RUN mkdir -p /data/repos /data/config /data/logs \
-    && chown -R forgekeep:forgekeep /data /app \
+    && chown -R plombir-git:plombir-git /data /app \
     && chmod 700 /data
 
 WORKDIR /app
-USER forgekeep
+USER plombir-git
 
 # Expose ports
 EXPOSE 8080 2222
 
-# Health check (uses forgekeep's built-in /health endpoint)
+# Health check (uses plombir-git's built-in /health endpoint)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 # Default command: serve with config via env vars.
-# Set FORGEKEEP_JWT_SECRET env var before running.
-CMD ["forgekeep", "serve", \
+# Set PLOMBIR_GIT_JWT_SECRET env var before running.
+CMD ["plombir-git", "serve", \
      "--repo-root", "/data/repos", \
      "--http-addr", "0.0.0.0:8080", \
      "--ssh-addr", "0.0.0.0:2222", \
-     "--db-url", "sqlite:///data/forgekeep.db?mode=rwc", \
-     "--log-file", "/data/logs/forgekeep.log"]
+     "--db-url", "sqlite:///data/plombir-git.db?mode=rwc", \
+     "--log-file", "/data/logs/plombir-git.log"]

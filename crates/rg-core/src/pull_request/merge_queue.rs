@@ -1433,7 +1433,7 @@ async fn ensure_merge_group_ci(
     let git_for_base = Arc::clone(&git);
     let base_sha = crate::blocking::run_blocking_git("resolving the merge-group base", move || {
         // The gateway strips host configuration from the environment. The local
-        // invocation also states ForgeKeep's repository-local policy on the
+        // invocation also states Plombir Git's repository-local policy on the
         // command line, where it outranks `.git/config`.
         let output = git_for_base.run(&["rev-parse", &base_ref], Some(&repo_path_for_base))?;
         output.ensure_success()?;
@@ -1534,11 +1534,11 @@ async fn ensure_merge_group_ci(
                 ],
                 Some(&repo_path_for_build),
                 &[
-                    ("GIT_AUTHOR_NAME", "ForgeKeep Merge Queue"),
-                    ("GIT_AUTHOR_EMAIL", "merge-queue@forgekeep.local"),
+                    ("GIT_AUTHOR_NAME", "Plombir Git Merge Queue"),
+                    ("GIT_AUTHOR_EMAIL", "merge-queue@plombir-git.local"),
                     ("GIT_AUTHOR_DATE", commit_date.as_str()),
-                    ("GIT_COMMITTER_NAME", "ForgeKeep Merge Queue"),
-                    ("GIT_COMMITTER_EMAIL", "merge-queue@forgekeep.local"),
+                    ("GIT_COMMITTER_NAME", "Plombir Git Merge Queue"),
+                    ("GIT_COMMITTER_EMAIL", "merge-queue@plombir-git.local"),
                     ("GIT_COMMITTER_DATE", commit_date.as_str()),
                 ],
             )?;
@@ -2580,7 +2580,7 @@ mod merge_group_config_refusal_tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
             Box::pin(async {
                 Err(anyhow::anyhow!(
-                    "db: pipeline insert failed at /var/lib/forgekeep/db.sqlite"
+                    "db: pipeline insert failed at /var/lib/plombir-git/db.sqlite"
                 ))
             })
         }
@@ -3148,7 +3148,7 @@ mod merge_group_conflict_reason_tests {
     /// policy on the command line, or the same pair of commits produces a
     /// different candidate tree in two otherwise-identical repositories.
     #[tokio::test]
-    async fn merge_tree_uses_forgekeeps_conflict_style_not_the_repositorys() {
+    async fn merge_tree_uses_plombir_git_conflict_style_not_the_repositorys() {
         let fixture = fixture("merge-group-owned-conflict-style").await;
         let (base, head) = make_conflicting(&fixture).await;
         let repo_path = repo_path(&fixture);
@@ -3172,7 +3172,7 @@ mod merge_group_conflict_reason_tests {
         drop(config);
 
         let controlled = merge_tree_output(git(), &repo_path, &base, &head)
-            .expect("build the merge tree under ForgeKeep's policy");
+            .expect("build the merge tree under Plombir Git's policy");
         let controlled_stdout = controlled.stdout_str();
         let controlled_tree = merge_tree_object_id(&controlled_stdout)
             .expect("the controlled conflicting merge writes a candidate tree");
@@ -3186,7 +3186,7 @@ mod merge_group_conflict_reason_tests {
                 &["merge-tree", "--write-tree", &base, &head],
                 Some(&repo_path),
             )
-            .expect("run the control without ForgeKeep's local policy");
+            .expect("run the control without Plombir Git's local policy");
         let repository_stdout = repository_control.stdout_str();
         let repository_tree = merge_tree_object_id(&repository_stdout)
             .expect("the raw conflicting merge writes a candidate tree");
@@ -3200,7 +3200,7 @@ mod merge_group_conflict_reason_tests {
     /// guard owns the production wiring: it reads only the non-test view, so the
     /// deliberately raw control in the test cannot satisfy it.
     #[test]
-    fn merge_group_git_runs_under_forgekeeps_repository_policy() {
+    fn merge_group_git_runs_under_plombir_git_repository_policy() {
         let source = include_str!("merge_queue.rs");
 
         assert_eq!(
@@ -3221,7 +3221,7 @@ mod merge_group_conflict_reason_tests {
             )
             .len(),
             1,
-            "the merge-tree helper no longer states ForgeKeep's repository policy"
+            "the merge-tree helper no longer states Plombir Git's repository policy"
         );
         assert!(
             rust_source::production_function_call_sites(
@@ -3240,7 +3240,7 @@ mod merge_group_conflict_reason_tests {
             )
             .len(),
             1,
-            "the direct merge-group ref steps no longer share ForgeKeep's repository policy"
+            "the direct merge-group ref steps no longer share Plombir Git's repository policy"
         );
         assert!(
             rust_source::production_function_call_sites(
@@ -3249,7 +3249,7 @@ mod merge_group_conflict_reason_tests {
                 &["gateway.run", "gateway.run_with_env", "gateway.run_or_bail"]
             )
             .is_empty(),
-            "a direct merge-group ref step bypasses ForgeKeep's repository policy"
+            "a direct merge-group ref step bypasses Plombir Git's repository policy"
         );
     }
 

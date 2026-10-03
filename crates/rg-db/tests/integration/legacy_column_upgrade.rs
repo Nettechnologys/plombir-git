@@ -46,7 +46,7 @@ impl TempDb {
     fn new(label: &str) -> Self {
         Self {
             path: std::env::temp_dir().join(format!(
-                "forgekeep-legacy-column-upgrade-{label}-{}.db",
+                "plombir-git-legacy-column-upgrade-{label}-{}.db",
                 uuid::Uuid::new_v4().simple()
             )),
         }

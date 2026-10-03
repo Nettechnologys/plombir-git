@@ -8,7 +8,7 @@
 //!   Validated by `extract_user_id` and `extract_bearer_claims`.
 //! - **CI Job tokens** (`CI_JOB_TOKEN`): Least-privilege tokens scoped to a
 //!   specific repository. Validated by `extract_ci_job_claims`. Used by CI jobs
-//!   to call selected read-only ForgeKeep APIs.
+//!   to call selected read-only Plombir Git APIs.
 //!
 //! ## H-3: Unified Axum Extractor
 //!
@@ -54,7 +54,7 @@ impl FromRequestParts<crate::AppState> for AuthUser {
 }
 
 /// Cookie name used for HttpOnly JWT storage (M-4).
-pub(crate) const AUTH_COOKIE_NAME: &str = "forgekeep_token";
+pub(crate) const AUTH_COOKIE_NAME: &str = "plombir_git_token";
 
 /// Extract a JWT from the `Cookie` header (M-4: HttpOnly cookie auth).
 ///
@@ -329,7 +329,7 @@ fn presented_session_versions(
 ///
 /// A JWT is a bearer credential that answers for itself: the signature is
 /// valid, the expiry has not passed, and nothing in that answer knows the
-/// account was disabled an hour ago. Every other credential ForgeKeep accepts
+/// account was disabled an hour ago. Every other credential Plombir Git accepts
 /// (password, SSH key, PAT, docker login, reset token) resolves an owner and
 /// consults [`is_usable`](rg_db::entities::user::Model::is_usable) at that
 /// moment; a session issued *before* the deactivation presents no credential to
@@ -573,7 +573,7 @@ mod tests {
             (
                 "WebSocket subprotocol",
                 "sec-websocket-protocol",
-                format!("forgekeep, bearer.{jwt}"),
+                format!("plombir-git, bearer.{jwt}"),
             ),
         ] {
             assert_eq!(
@@ -667,7 +667,7 @@ mod tests {
     #[test]
     fn the_auth_cookie_is_named_on_the_wire_as_the_out_of_crate_callers_expect() {
         assert_eq!(
-            AUTH_COOKIE_NAME, "forgekeep_token",
+            AUTH_COOKIE_NAME, "plombir_git_token",
             "renaming the auth cookie also means updating scripts/browser-admin-smoke.mjs \
              and scripts/notification-websocket-contract-check.mjs"
         );

@@ -1,4 +1,4 @@
-//! Opening a Git repository is a decision ForgeKeep makes, not the host
+//! Opening a Git repository is a decision Plombir Git makes, not the host
 //! (card_aec3bc83e6ea, phase "Host Git Config Must Not Steer the Server").
 //!
 //! `gix::open` applies `gix::open::Permissions::secure()`, and "secure" there
@@ -8,7 +8,7 @@
 //! the system and global `gitattributes`. That is the right default for a
 //! person's own checkout and the wrong one for a server: an operator who set
 //! `merge.renames = false` for their own convenience would be steering what
-//! ForgeKeep does inside *other people's* repositories, and two instances on
+//! Plombir Git does inside *other people's* repositories, and two instances on
 //! differently configured hosts would answer the same request differently
 //! without either of them saying so.
 //!
@@ -150,7 +150,7 @@ fn no_production_code_opens_a_repository_on_the_host_s_terms() {
         offenders.is_empty(),
         "production code opens a Git repository with the host's `Permissions::secure()` — \
          /etc/gitconfig, the server account's ~/.gitconfig, the process's GIT_* and the \
-         system gitattributes all steer what ForgeKeep does inside other people's \
+         system gitattributes all steer what Plombir Git does inside other people's \
          repositories. Open through `rg_git::repository::open` instead (card_aec3bc83e6ea):\n  {}",
         offenders.join("\n  ")
     );

@@ -680,7 +680,7 @@ impl TempDb {
     fn new(label: &str) -> Self {
         Self {
             path: std::env::temp_dir().join(format!(
-                "forgekeep-board-{label}-{}.db",
+                "plombir-git-board-{label}-{}.db",
                 uuid::Uuid::new_v4().simple()
             )),
         }

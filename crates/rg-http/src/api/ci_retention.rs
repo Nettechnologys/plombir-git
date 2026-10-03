@@ -271,7 +271,7 @@ pub async fn cleanup_expired_storage(
     // second scheduler for one more TTL is how the first one stops being the
     // place anybody looks.
     for (upload, oci_repo) in rg_db::ops::oci_ops::list_expired_uploads(&state.db).await? {
-        // `oci_repository.repo_id` is the ForgeKeep repository id, so the routed
+        // `oci_repository.repo_id` is the Plombir Git repository id, so the routed
         // per-repository cleanup filters on it directly — no second lookup that
         // could resolve differently from the one the row was written with.
         if repo_filter.is_some_and(|repo_id| repo_id != oci_repo.repo_id) {

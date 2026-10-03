@@ -236,12 +236,12 @@ async function checkAdminRoute(route, hasToken) {
 
     if (hasToken) {
       // Auth is cookie-based: the frontend no longer reads the token from
-      // localStorage — it relies on the HttpOnly `forgekeep_token` cookie the
+      // localStorage — it relies on the HttpOnly `plombir_git_token` cookie the
       // backend sets on login (crates/rg-http/src/api/auth.rs). Inject that
       // cookie via CDP so fetchUser() (GET /users/me) and the notification
       // WebSocket authenticate and the admin route becomes reachable.
       const { success } = await tab.send('Network.setCookie', {
-        name: 'forgekeep_token',
+        name: 'plombir_git_token',
         value: ADMIN_TOKEN,
         url: FRONTEND_URL,
         path: '/',

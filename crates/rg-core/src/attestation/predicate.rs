@@ -36,7 +36,7 @@ impl VerifierRegistry {
         Self::default()
     }
 
-    /// Registry pre-loaded with the built-in ForgeKeep provenance verifier.
+    /// Registry pre-loaded with the built-in Plombir Git provenance verifier.
     pub fn with_defaults() -> Self {
         let mut reg = Self::new();
         reg.register(Box::new(SlsaProvenanceVerifier));
@@ -66,16 +66,21 @@ impl VerifierRegistry {
     }
 }
 
-/// The ForgeKeep provenance predicate type (SLSA-provenance shaped).
-pub const FORGEKEEP_PROVENANCE_TYPE: &str = "https://forgekeep.dev/provenance/v1";
+/// The Plombir Git provenance predicate type (SLSA-provenance shaped).
+///
+/// The URI keeps the project's former name on purpose: it sits inside every
+/// signed DSSE envelope already issued, and the verifier is looked up by it.
+/// A new type can be registered beside this one; replacing it would leave
+/// those attestations without a verifier.
+pub const PLOMBIR_GIT_PROVENANCE_TYPE: &str = "https://forgekeep.dev/provenance/v1";
 
-/// Verifier for [`FORGEKEEP_PROVENANCE_TYPE`]: requires a `builder.id` string so
+/// Verifier for [`PLOMBIR_GIT_PROVENANCE_TYPE`]: requires a `builder.id` string so
 /// a consumer can attribute the build to an issuing instance.
 pub struct SlsaProvenanceVerifier;
 
 impl PredicateVerifier for SlsaProvenanceVerifier {
     fn predicate_type(&self) -> &str {
-        FORGEKEEP_PROVENANCE_TYPE
+        PLOMBIR_GIT_PROVENANCE_TYPE
     }
 
     fn verify(&self, statement: &Statement) -> Result<()> {
@@ -109,7 +114,7 @@ mod tests {
     fn accepts_well_formed_provenance() {
         let reg = VerifierRegistry::with_defaults();
         let st = statement(
-            FORGEKEEP_PROVENANCE_TYPE,
+            PLOMBIR_GIT_PROVENANCE_TYPE,
             json!({ "builder": { "id": "https://forge.example/instance" } }),
         );
         assert!(reg.verify_predicate(&st).is_ok());
@@ -118,7 +123,7 @@ mod tests {
     #[test]
     fn rejects_provenance_without_builder_id() {
         let reg = VerifierRegistry::with_defaults();
-        let st = statement(FORGEKEEP_PROVENANCE_TYPE, json!({ "builder": {} }));
+        let st = statement(PLOMBIR_GIT_PROVENANCE_TYPE, json!({ "builder": {} }));
         assert!(reg.verify_predicate(&st).is_err());
     }
 

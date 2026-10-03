@@ -25,7 +25,7 @@ const check = 'scripts/observability-compose-contract-check.mjs';
 const compose = 'deploy/docker-compose.observability.yml';
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-observability-compose-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-observability-compose-'));
   mkdirSync(join(fixture, 'scripts'), { recursive: true });
   cpSync(join(root, check), join(fixture, check));
   cpSync(join(root, 'scripts', 'lib'), join(fixture, 'scripts', 'lib'), { recursive: true });

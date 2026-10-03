@@ -1,13 +1,13 @@
-# Pipeline configuration — `.forgekeep-ci.yml`
+# Pipeline configuration — `.plombir-git-ci.yml`
 
-This is the reference for ForgeKeep's **native** pipeline format: the file you
+This is the reference for Plombir Git's **native** pipeline format: the file you
 commit to the root of your own repository. The alternative format, Gitea
 Actions (`.gitea/workflows/*.yml`), has its own page —
 [the supported subset](gitea-actions.md). Read that one rather than Gitea's or
-GitHub's: ForgeKeep implements a subset of Actions, and a workflow that is valid
+GitHub's: Plombir Git implements a subset of Actions, and a workflow that is valid
 by their documentation is often refused whole by this engine.
 
-**Where the file goes:** `.forgekeep-ci.yml` in the repository root, at the
+**Where the file goes:** `.plombir-git-ci.yml` in the repository root, at the
 commit being built. The engine reads it from the commit, not from a checkout,
 so a pipeline always runs the configuration that was committed with the code.
 
@@ -64,7 +64,7 @@ build:
   artifacts:
     name: release-binaries
     paths:
-      - target/release/forgekeep
+      - target/release/plombir-git
 
 test:
   stage: test
@@ -355,10 +355,10 @@ build:
   script:
     - cargo build --release
   artifacts:
-    name: forgekeep-linux
+    name: plombir-git-linux
     paths:
-      - target/release/forgekeep
-      - target/release/forgekeep-runner
+      - target/release/plombir-git
+      - target/release/plombir-git-runner
 ```
 
 | Key | Type | Meaning |
@@ -369,7 +369,7 @@ build:
 - `name` takes 1–100 characters and only ASCII letters, digits, `.`, `-` and
   `_`. Anything else is refused at trigger time rather than stripped, so the
   name you write is the name you download. No suffix is added: the download is
-  the `tar` archive under exactly that name, so write `name: forgekeep.tar`
+  the `tar` archive under exactly that name, so write `name: plombir-git.tar`
   yourself if you want the file to arrive with one.
 - `paths` takes 1–64 entries. Each must stay inside the workspace: an absolute
   path or one containing `..` is refused.

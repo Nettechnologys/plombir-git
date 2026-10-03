@@ -9,7 +9,7 @@
 //! into a background task that warns into a log nobody reads.
 //!
 //! Running inside the server also removes the sharpest edge of the manual
-//! `forgekeep backup-db`: the scheduler snapshots the pool the server itself is
+//! `plombir-git backup-db`: the scheduler snapshots the pool the server itself is
 //! using, so it cannot address a different database than the running instance —
 //! the failure mode where `backup-db` without `--config`/`--db-url` backs up a
 //! freshly-created empty file and reports success.
@@ -24,13 +24,13 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
 use tokio::time;
 
-/// Snapshot file names are `forgekeep-<UTC timestamp>-<uuid>.db`.
+/// Snapshot file names are `plombir-git-<UTC timestamp>-<uuid>.db`.
 ///
 /// The shape is load-bearing for rotation: only files that parse back into
 /// exactly this form are candidates for deletion, so a hand-made backup dropped
-/// into the same directory (the `forgekeep-$(date +%Y%m%d-%H%M%S).db` from the
+/// into the same directory (the `plombir-git-$(date +%Y%m%d-%H%M%S).db` from the
 /// deployment guide, say) is never rotated away by the server.
-const SNAPSHOT_PREFIX: &str = "forgekeep-";
+const SNAPSHOT_PREFIX: &str = "plombir-git-";
 const SNAPSHOT_SUFFIX: &str = ".db";
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%S";
 
@@ -41,8 +41,8 @@ const STARTUP_GRACE: Duration = Duration::from_secs(60);
 /// Hours between snapshots, without a configured `[backup].interval_hours`.
 ///
 /// Named here rather than written into the `unwrap_or` at the resolution site:
-/// the same number is printed at the operator in `forgekeep.example.toml`,
-/// `deploy/forgekeep.docker.toml` and `deploy/README.md`, and a value that has
+/// the same number is printed at the operator in `plombir-git.example.toml`,
+/// `deploy/plombir-git.docker.toml` and `deploy/README.md`, and a value that has
 /// no name in the code is a value no doc-versus-code check can reach.
 pub const DEFAULT_INTERVAL_HOURS: u64 = 24;
 
@@ -351,7 +351,7 @@ where
     // hashes. The mode cannot go on that open (SQLite owns it, and it refuses a
     // path that already exists), but it can go on before the rename, so the
     // name an operator's tooling reads never exists at anything but `0600`.
-    // Without this an operator who narrowed `forgekeep.db` to `0600` got a
+    // Without this an operator who narrowed `plombir-git.db` to `0600` got a
     // world-readable copy of it back every night.
     if let Err(error) = crate::platform::fs::restrict_to_owner_async(&temp_path).await {
         discard_file_async("partial database backup", &temp_path).await;
@@ -490,8 +490,8 @@ fn older_than(entry: &std::fs::DirEntry, now: SystemTime, age: Duration) -> std:
 ///
 /// Deliberately strict — both halves of the name have to parse back — because
 /// this predicate is what stands between the rotation and someone else's file.
-/// The deployment guide's manual recipe (`forgekeep-20260803-101500.db`) fails
-/// it, and so does anything else that merely starts with `forgekeep-`.
+/// The deployment guide's manual recipe (`plombir-git-20260803-101500.db`) fails
+/// it, and so does anything else that merely starts with `plombir-git-`.
 fn is_scheduled_snapshot(name: &str) -> bool {
     let Some(rest) = name
         .strip_prefix(SNAPSHOT_PREFIX)
@@ -507,13 +507,13 @@ fn is_scheduled_snapshot(name: &str) -> bool {
 }
 
 fn is_temp_snapshot(name: &str) -> bool {
-    name.strip_prefix(".forgekeep-backup-")
+    name.strip_prefix(".plombir-git-backup-")
         .and_then(|rest| rest.strip_suffix(".tmp"))
         .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 
 fn temporary_path(dir: &Path, snapshot_id: uuid::Uuid) -> PathBuf {
-    dir.join(format!(".forgekeep-backup-{snapshot_id}.tmp"))
+    dir.join(format!(".plombir-git-backup-{snapshot_id}.tmp"))
 }
 
 #[cfg(test)]
@@ -720,26 +720,30 @@ mod tests {
             "20260103T000000",
             "20260104T000000",
         ] {
-            std::fs::write(backup_dir.join(format!("forgekeep-{stamp}-{id}.db")), b"x").unwrap();
+            std::fs::write(
+                backup_dir.join(format!("plombir-git-{stamp}-{id}.db")),
+                b"x",
+            )
+            .unwrap();
         }
         // A hand-made backup from the deployment guide's recipe, and an
         // unrelated file. Neither is ours to delete.
-        std::fs::write(backup_dir.join("forgekeep-20250101-000000.db"), b"x").unwrap();
+        std::fs::write(backup_dir.join("plombir-git-20250101-000000.db"), b"x").unwrap();
         std::fs::write(backup_dir.join("notes.txt"), b"x").unwrap();
 
         let (pruned, failures) = prune_snapshots(backup_dir, 2, Duration::from_secs(3_600));
 
         assert_eq!((pruned, failures), (2, 0));
         assert!(backup_dir
-            .join(format!("forgekeep-20260104T000000-{id}.db"))
+            .join(format!("plombir-git-20260104T000000-{id}.db"))
             .exists());
         assert!(backup_dir
-            .join(format!("forgekeep-20260103T000000-{id}.db"))
+            .join(format!("plombir-git-20260103T000000-{id}.db"))
             .exists());
         assert!(!backup_dir
-            .join(format!("forgekeep-20260101T000000-{id}.db"))
+            .join(format!("plombir-git-20260101T000000-{id}.db"))
             .exists());
-        assert!(backup_dir.join("forgekeep-20250101-000000.db").exists());
+        assert!(backup_dir.join("plombir-git-20250101-000000.db").exists());
         assert!(backup_dir.join("notes.txt").exists());
     }
 
@@ -751,7 +755,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backup_dir = dir.path();
         let snapshot = backup_dir.join(format!(
-            "forgekeep-20260101T000000-{}.db",
+            "plombir-git-20260101T000000-{}.db",
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&snapshot, b"x").unwrap();
@@ -798,7 +802,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backup_dir = dir.path();
         let unreadable_temp =
-            backup_dir.join(format!(".forgekeep-backup-{}.tmp", uuid::Uuid::new_v4()));
+            backup_dir.join(format!(".plombir-git-backup-{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(&unreadable_temp, b"partial snapshot").unwrap();
         let entry = std::fs::read_dir(backup_dir)
             .unwrap()
@@ -919,7 +923,7 @@ mod tests {
 
         std::fs::write(
             dir.path().join(format!(
-                "forgekeep-20260101T000000-{}.db",
+                "plombir-git-20260101T000000-{}.db",
                 uuid::Uuid::new_v4()
             )),
             b"x",

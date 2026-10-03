@@ -79,14 +79,14 @@ fn set_cookies(resp: &reqwest::Response) -> Vec<String> {
 /// its name and sets nothing.
 fn session_cookie(resp: &reqwest::Response) -> Option<String> {
     set_cookies(resp).into_iter().find(|cookie| {
-        cookie.starts_with("forgekeep_token=") && !cookie.starts_with("forgekeep_token=;")
+        cookie.starts_with("plombir_git_token=") && !cookie.starts_with("plombir_git_token=;")
     })
 }
 
 fn challenge_cookie(resp: &reqwest::Response) -> Option<String> {
     set_cookies(resp).into_iter().find_map(|cookie| {
         cookie
-            .strip_prefix("forgekeep_mfa_challenge=")
+            .strip_prefix("plombir_git_mfa_challenge=")
             .and_then(|rest| rest.split(';').next())
             .filter(|token| !token.is_empty())
             .map(|token| token.to_string())

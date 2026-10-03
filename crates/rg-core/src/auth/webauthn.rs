@@ -1,6 +1,6 @@
 //! WebAuthn / passkey ceremony helpers, wrapping the `webauthn-rs` crate.
 //!
-//! ForgeKeep keeps no server-side session store, so the in-progress ceremony
+//! Plombir Git keeps no server-side session store, so the in-progress ceremony
 //! state (`PasskeyRegistration` / `PasskeyAuthentication`) is persisted between
 //! the *begin* and *finish* HTTP round-trips inside a short-lived, HttpOnly,
 //! signed cookie — the same pattern the MFA login challenge uses
@@ -44,10 +44,14 @@ pub use webauthn_rs::prelude::{
 /// numeric user id. It only needs to be stable and unique per user; it is never
 /// used to resolve a user at login (we authenticate against an explicit
 /// credential allow-list keyed by username).
+///
+/// It keeps the project's former name on purpose: authenticators already hold
+/// the handles derived from it, and a new namespace would give every user a
+/// second identity on the same relying party.
 const USER_HANDLE_NAMESPACE: &[u8] = b"forgekeep:webauthn:user-handle:v1";
 
 /// Default relying-party display name shown by some authenticators.
-const RP_NAME: &str = "ForgeKeep";
+const RP_NAME: &str = "Plombir Git";
 
 /// Derive the stable WebAuthn user handle for a user id.
 ///
@@ -168,7 +172,7 @@ struct Sealed<T> {
 }
 
 fn seal_key(purpose: &str, secret: &str) -> String {
-    format!("forgekeep:webauthn:{purpose}:{secret}")
+    format!("plombir-git:webauthn:{purpose}:{secret}")
 }
 
 /// Sign arbitrary ceremony state into a compact, expiring token (JWT-shaped,

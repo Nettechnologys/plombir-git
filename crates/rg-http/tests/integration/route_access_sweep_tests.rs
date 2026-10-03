@@ -150,7 +150,7 @@ const ABSENT_ID: &str = "999999";
 // a route absent from all of them is driven and asserted.
 //
 // The *protocol* exceptions are not listed here at all — a route whose
-// credentials are not a ForgeKeep session declares `Access::Foreign` with its
+// credentials are not a Plombir Git session declares `Access::Foreign` with its
 // reason in the route table itself, and the sweep skips it on that basis.
 
 /// Routes the fixture cannot reach the gate of, each with the reason.
@@ -3311,7 +3311,7 @@ async fn the_route_table_covers_the_whole_server() {
     }
 }
 
-/// No route a caller can reach *without a ForgeKeep session* names a private
+/// No route a caller can reach *without a Plombir Git session* names a private
 /// repository to an anonymous caller.
 ///
 /// The broad net under both public levels — and over the `Foreign` rows too,

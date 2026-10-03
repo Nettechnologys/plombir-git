@@ -1,4 +1,4 @@
-//! Validation for reference names that cross a ForgeKeep trust boundary.
+//! Validation for reference names that cross a Plombir Git trust boundary.
 //!
 //! gix validates the on-disk ref grammar, but callers also need to distinguish
 //! a fully-qualified wire ref from the short branch spelling accepted by REST
@@ -7,7 +7,7 @@
 
 use gix::bstr::ByteSlice;
 
-/// Why a caller-supplied Git reference cannot be used by ForgeKeep.
+/// Why a caller-supplied Git reference cannot be used by Plombir Git.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RefNameError {
     #[error("refname must be fully qualified under refs/")]
@@ -47,7 +47,7 @@ pub fn validate_refname(refname: &str) -> Result<(), RefNameError> {
     Ok(())
 }
 
-/// Validate the short branch spelling accepted by ForgeKeep's REST APIs.
+/// Validate the short branch spelling accepted by Plombir Git's REST APIs.
 pub fn validate_branch_name(branch: &str) -> Result<(), RefNameError> {
     if branch.starts_with("refs/") {
         return Err(RefNameError::QualifiedBranch);

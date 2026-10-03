@@ -30,7 +30,7 @@ use tokio::sync::{broadcast, RwLock};
 use crate::api::auth::{ws_session, WsSession, WsSessionUser};
 use crate::AppState;
 
-/// RAII guard for the `forgekeep_ws_connections` gauge: bumps it on
+/// RAII guard for the `plombir_git_ws_connections` gauge: bumps it on
 /// construction and decrements on drop, so every exit path of a socket loop
 /// (normal close, welcome-send failure, lag/error break, task cancellation)
 /// settles the gauge through a single construction site — the same pattern as

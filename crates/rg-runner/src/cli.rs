@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "forgekeep-runner", about = "ForgeKeep CI Runner Agent")]
+#[command(name = "plombir-git-runner", about = "Plombir Git CI Runner Agent")]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Commands,
@@ -21,7 +21,7 @@ pub(crate) enum Commands {
     // win — and with `--save` that localhost then overwrote the operator's own
     // server in the file.
     Register {
-        /// ForgeKeep server URL [config: server]
+        /// Plombir Git server URL [config: server]
         /// [default: http://127.0.0.1:8080]
         #[arg(long)]
         server: Option<String>,
@@ -56,7 +56,7 @@ pub(crate) enum Commands {
         auth_token: Option<String>,
 
         /// Config file `--save` writes to — must be the same path `run` reads
-        #[arg(long, default_value = "~/.forgekeep/runner.toml")]
+        #[arg(long, default_value = "~/.plombir-git/runner.toml")]
         config: String,
     },
 
@@ -69,7 +69,7 @@ pub(crate) enum Commands {
     // the config file's `server` could never win over "the flag was not passed".
     // The default lives in `config::DEFAULT_SERVER` and is named in the help.
     Run {
-        /// ForgeKeep server URL [config: server]
+        /// Plombir Git server URL [config: server]
         /// [default: http://127.0.0.1:8080]
         #[arg(long)]
         server: Option<String>,
@@ -108,7 +108,7 @@ pub(crate) enum Commands {
         auth_token: Option<String>,
 
         /// Path to config file
-        #[arg(long, default_value = "~/.forgekeep/runner.toml")]
+        #[arg(long, default_value = "~/.plombir-git/runner.toml")]
         config: String,
     },
 }
@@ -128,15 +128,16 @@ mod tests {
     /// "flag not passed" observable as `None`.
     #[test]
     fn an_omitted_server_flag_stays_none_for_both_subcommands() {
-        let register = Cli::try_parse_from(["forgekeep-runner", "register", "--name", "builder-1"])
-            .expect("register parses without --server");
+        let register =
+            Cli::try_parse_from(["plombir-git-runner", "register", "--name", "builder-1"])
+                .expect("register parses without --server");
         let Commands::Register { server, name, .. } = register.command else {
             panic!("expected the register subcommand");
         };
         assert_eq!(server, None);
         assert_eq!(name.as_deref(), Some("builder-1"));
 
-        let run = Cli::try_parse_from(["forgekeep-runner", "run"]).expect("run parses bare");
+        let run = Cli::try_parse_from(["plombir-git-runner", "run"]).expect("run parses bare");
         let Commands::Run { server, .. } = run.command else {
             panic!("expected the run subcommand");
         };
@@ -147,7 +148,7 @@ mod tests {
     fn repeated_label_flags_preserve_each_label_verbatim() {
         for subcommand in ["register", "run"] {
             let cli = Cli::try_parse_from([
-                "forgekeep-runner",
+                "plombir-git-runner",
                 subcommand,
                 "--label",
                 "gpu,a100",
@@ -165,7 +166,7 @@ mod tests {
 
     #[test]
     fn legacy_labels_stays_available_but_cannot_mix_with_structural_labels() {
-        let parsed = Cli::try_parse_from(["forgekeep-runner", "run", "--labels", "docker,linux"])
+        let parsed = Cli::try_parse_from(["plombir-git-runner", "run", "--labels", "docker,linux"])
             .expect("the legacy comma-separated flag remains compatible");
         let Commands::Run { labels, .. } = parsed.command else {
             panic!("expected run");
@@ -173,7 +174,7 @@ mod tests {
         assert_eq!(labels.as_deref(), Some("docker,linux"));
 
         assert!(Cli::try_parse_from([
-            "forgekeep-runner",
+            "plombir-git-runner",
             "run",
             "--labels",
             "docker,linux",
@@ -184,7 +185,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // The `forgekeep-runner run` command the shipped deployment files invite an
+    // The `plombir-git-runner run` command the shipped deployment files invite an
     // operator to uncomment.
     //
     // Nothing has ever checked it. The block is a YAML *comment*, so
@@ -202,7 +203,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
     /// The command the deployment files spell out for this binary.
-    const RUN_INVOCATION: &str = "forgekeep-runner run";
+    const RUN_INVOCATION: &str = "plombir-git-runner run";
 
     /// The files an operator copies a command out of: the shipped compose
     /// files, the image's own default command, and the two guides that quote
@@ -257,7 +258,7 @@ mod tests {
     /// together turned into whitespace, and runs of whitespace collapsed.
     ///
     /// Three spellings have to survive it — a folded `command: >` block with one
-    /// flag per line, an exec-form `command: ["forgekeep-runner", "run", …]` on
+    /// flag per line, an exec-form `command: ["plombir-git-runner", "run", …]` on
     /// a single line, and the Dockerfile's backslash-continued `CMD` — plus the
     /// backticks a markdown guide wraps the same command in. Most of them sit
     /// behind a `#`, which is exactly why nothing checks them today:
@@ -376,19 +377,19 @@ mod tests {
         // shape, is how this test would go quietly green.
         let fixture = command_lines(concat!(
             "  # command: >\n",
-            "  #   forgekeep-runner run\n",
-            "  #   --server http://forgekeep:8080\n",
-            "  #   --token ${FORGEKEEP_RUNNER_TOKEN}\n",
+            "  #   plombir-git-runner run\n",
+            "  #   --server http://plombir-git:8080\n",
+            "  #   --token ${PLOMBIR_GIT_RUNNER_TOKEN}\n",
             "  # environment:\n",
-            "  #   - FORGEKEEP_RUNNER_ID=1\n",
-            "    command: [\"forgekeep-runner\", \"run\", \"--config\", \"/app/runner.toml\"]\n",
+            "  #   - PLOMBIR_GIT_RUNNER_ID=1\n",
+            "    command: [\"plombir-git-runner\", \"run\", \"--config\", \"/app/runner.toml\"]\n",
             "    networks:\n",
-            "      - forgekeep-net\n",
+            "      - plombir-git-net\n",
         ));
         assert_eq!(
             invocations(&fixture, RUN_INVOCATION),
             vec![
-                "--server http://forgekeep:8080 --token ${FORGEKEEP_RUNNER_TOKEN}".to_string(),
+                "--server http://plombir-git:8080 --token ${PLOMBIR_GIT_RUNNER_TOKEN}".to_string(),
                 "--config /app/runner.toml".to_string(),
             ],
             "the invocation scanner no longer reads the deployment files the way they spell \
@@ -396,7 +397,7 @@ mod tests {
         );
         assert!(
             invocations(
-                &command_lines("forgekeep-runner run-forever --nope\n"),
+                &command_lines("plombir-git-runner run-forever --nope\n"),
                 RUN_INVOCATION
             )
             .is_empty(),

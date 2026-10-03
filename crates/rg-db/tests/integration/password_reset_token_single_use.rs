@@ -33,7 +33,7 @@ impl TempDb {
     fn new(label: &str) -> Self {
         Self {
             path: std::env::temp_dir().join(format!(
-                "forgekeep-reset-token-single-use-{label}-{}.db",
+                "plombir-git-reset-token-single-use-{label}-{}.db",
                 uuid::Uuid::new_v4().simple()
             )),
         }
@@ -59,7 +59,7 @@ impl Drop for TempDb {
 /// A migrated database with more than one pooled connection, so the racing
 /// tasks really do run their statements against separate connections.
 ///
-/// `FORGEKEEP_TEST_DATABASE_URL` points the whole file at PostgreSQL or MySQL
+/// `PLOMBIR_GIT_TEST_DATABASE_URL` points the whole file at PostgreSQL or MySQL
 /// instead — the claim is a statement the *database* arbitrates, so "exactly
 /// one winner" is a claim about each backend and not about SQLite. Same switch
 /// `multi_backend_smoke` uses. The account name carries a uuid so repeated runs
@@ -67,7 +67,7 @@ impl Drop for TempDb {
 async fn setup(label: &str) -> (DatabaseConnection, Option<TempDb>, i64) {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let suffix = &suffix[..10];
-    let (url, temp) = match std::env::var("FORGEKEEP_TEST_DATABASE_URL") {
+    let (url, temp) = match std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL") {
         Ok(url) if !url.is_empty() => (url, None),
         _ => {
             let temp = TempDb::new(label);

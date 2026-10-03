@@ -480,7 +480,7 @@ mod head_sha_refresh_tests {
         fn new(label: &str) -> Self {
             Self {
                 path: std::env::temp_dir().join(format!(
-                    "forgekeep-pr-head-refresh-{label}-{}.db",
+                    "plombir-git-pr-head-refresh-{label}-{}.db",
                     uuid::Uuid::new_v4().simple()
                 )),
             }

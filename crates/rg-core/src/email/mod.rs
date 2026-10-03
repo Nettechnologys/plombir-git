@@ -89,7 +89,7 @@ pub async fn send_html_notification(
   <p style="color: #4b5563; line-height: 1.6;">{message}</p>
   {action_html}
   <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 20px 0;" />
-  <p style="color: #9ca3af; font-size: 12px;">You received this email because you have notifications enabled on ForgeKeep.</p>
+  <p style="color: #9ca3af; font-size: 12px;">You received this email because you have notifications enabled on Plombir Git.</p>
 </div>
 </body></html>"#,
         title = html_escape(title),

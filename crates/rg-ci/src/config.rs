@@ -1,4 +1,4 @@
-//! CI configuration types for `.forgekeep-ci.yml`.
+//! CI configuration types for `.plombir-git-ci.yml`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -55,7 +55,7 @@ pub struct CiConfig {
     pub jobs: HashMap<String, JobConfig>,
 
     /// Whether this config was translated from a Gitea/GitHub Actions workflow
-    /// instead of being written as a native `.forgekeep-ci.yml`.
+    /// instead of being written as a native `.plombir-git-ci.yml`.
     ///
     /// `#[serde(skip)]` for the same reason [`JobConfig::action_templates`] is:
     /// a committed file must not be able to claim it is something else.
@@ -139,7 +139,7 @@ pub struct JobConfig {
     pub artifacts: Option<ArtifactsConfig>,
 
     /// Compiled GitHub/Gitea Actions expressions for fields resolved while
-    /// matrix variants are materialised. Native `.forgekeep-ci.yml` cannot set
+    /// matrix variants are materialised. Native `.plombir-git-ci.yml` cannot set
     /// this field, so its literal strings keep their existing semantics.
     #[serde(skip)]
     pub(crate) action_templates: Option<ActionJobTemplates>,
@@ -161,7 +161,7 @@ impl JobConfig {
     /// format turns a `script` list into the string stored on `pipeline_job`.
     /// The Gitea Actions translation had prepended [`FAIL_FAST`] itself since
     /// `build_job_script` — "GitHub's default bash invocation is fail-fast" —
-    /// while the native `.forgekeep-ci.yml` path joined the author's lines
+    /// while the native `.plombir-git-ci.yml` path joined the author's lines
     /// untouched, so the two formats disagreed about whether a failing command
     /// fails the job. Reading the contract off a shared helper is what stops
     /// them drifting apart a second time; the Actions prefix is kept idempotent
@@ -305,7 +305,7 @@ mod tests {
         ));
     }
 
-    /// The reference an author of a `.forgekeep-ci.yml` reads, by the path they
+    /// The reference an author of a `.plombir-git-ci.yml` reads, by the path they
     /// are pointed at.
     ///
     /// `include_str!` rather than a runtime `read_to_string`: the path is
@@ -583,7 +583,7 @@ pub struct CacheConfig {
             let config: CiConfig = serde_yaml::from_str(&body).unwrap_or_else(|error| {
                 panic!(
                     "{name}:{line}: this ```yaml block is what a reader commits to their own \
-                     repository, and it is not valid `.forgekeep-ci.yml`: {error}"
+                     repository, and it is not valid `.plombir-git-ci.yml`: {error}"
                 )
             });
 
@@ -906,7 +906,7 @@ pub struct CacheConfig {
     /// decision someone wrote down rather than one that slipped past the census.
     const DEFAULTS_NOT_IN_THE_CI_DOCUMENT: [(&str, &str); 1] = [(
         "DEFAULT_CI_TOKEN_SCOPES",
-        "the scopes the engine mints `CI_JOB_TOKEN` with; `.forgekeep-ci.yml` has no key \
+        "the scopes the engine mints `CI_JOB_TOKEN` with; `.plombir-git-ci.yml` has no key \
              for them, so there is no row this could pair with",
     )];
 
@@ -1484,7 +1484,7 @@ pub struct CacheConfig {
                         .iter()
                         .any(|(excused, _)| excused == name),
                 "`{name}` is a built-in default of the CI engine that no row of \
-                 documented_defaults() pairs with a key of `.forgekeep-ci.yml` — state it in \
+                 documented_defaults() pairs with a key of `.plombir-git-ci.yml` — state it in \
                  the matching `Default` cell of docs/ci.md and pair it, or name it in \
                  DEFAULTS_NOT_IN_THE_CI_DOCUMENT with the reason no author ever meets it"
             );

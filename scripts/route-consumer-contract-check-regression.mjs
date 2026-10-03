@@ -22,7 +22,7 @@ const checkName = 'route-consumer-contract-check.mjs';
 const originalCheck = join(root, 'scripts', checkName);
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-route-consumer-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-route-consumer-'));
   mkdirSync(join(fixture, 'crates', 'rg-http', 'src'), { recursive: true });
   mkdirSync(join(fixture, 'scripts'), { recursive: true });
   cpSync(

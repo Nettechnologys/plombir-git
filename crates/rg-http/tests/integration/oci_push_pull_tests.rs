@@ -96,7 +96,7 @@ async fn a_cross_repository_mount_records_the_blob_and_its_manifest_reference() 
     create_repo(&base, &token, "source-image").await;
     create_repo(&base, &token, "target-image").await;
 
-    let payload = b"forgekeep-cross-repository-layer";
+    let payload = b"plombir-git-cross-repository-layer";
     let digest = push_blob(&base, &token, "oci_mount", "source-image", payload).await;
 
     for attempt in 0..2 {
@@ -139,12 +139,12 @@ async fn a_cross_repository_mount_records_the_blob_and_its_manifest_reference() 
         "HEAD must report the mounted blob's stored size, not zero"
     );
 
-    let forgekeep_repo =
+    let plombir_git_repo =
         rg_core::repo::service::find_repo_by_owner_name(&db, "oci_mount", "target-image")
             .await
             .unwrap()
             .unwrap();
-    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, forgekeep_repo.id)
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, plombir_git_repo.id)
         .await
         .unwrap()
         .expect("the mount must create the target OCI repository row");
@@ -350,7 +350,7 @@ async fn a_docker_image_manifest_pushes_pulls_and_heads_back_unchanged() {
     );
 
     let config = br#"{"architecture":"amd64","os":"linux"}"#;
-    let layer = b"\x1f\x8b\x08\x00forgekeep-layer";
+    let layer = b"\x1f\x8b\x08\x00plombir-git-layer";
     let config_digest = push_blob(&base, &token, "oci_wire", "wire-image", config).await;
     let layer_digest = push_blob(&base, &token, "oci_wire", "wire-image", layer).await;
 
@@ -546,7 +546,7 @@ async fn one_image_pushed_under_several_tags_keeps_every_name() {
     create_repo(&base, &token, "many-tags").await;
 
     let config = br#"{"architecture":"amd64","os":"linux"}"#;
-    let layer = b"\x1f\x8b\x08\x00forgekeep-retagged-layer";
+    let layer = b"\x1f\x8b\x08\x00plombir-git-retagged-layer";
     let config_digest = push_blob(&base, &token, "oci_retag", "many-tags", config).await;
     let layer_digest = push_blob(&base, &token, "oci_retag", "many-tags", layer).await;
     let manifest = serde_json::json!({
@@ -638,7 +638,7 @@ async fn one_image_pushed_under_several_tags_keeps_every_name() {
 
     // Promoting a new build onto `latest` moves that one name and leaves the
     // release tag pointing at what it was pinned to.
-    let next_layer = b"\x1f\x8b\x08\x00forgekeep-next-layer";
+    let next_layer = b"\x1f\x8b\x08\x00plombir-git-next-layer";
     let next_layer_digest = push_blob(&base, &token, "oci_retag", "many-tags", next_layer).await;
     let next_manifest = serde_json::json!({
         "schemaVersion": 2,
@@ -1067,7 +1067,7 @@ async fn a_blob_address_that_is_not_a_digest_is_refused_but_a_broken_store_is_ou
     create_repo(&base, &token, "source-image").await;
     create_repo(&base, &token, "target-image").await;
 
-    let payload = b"forgekeep-blob-address-grammar";
+    let payload = b"plombir-git-blob-address-grammar";
     let digest = push_blob(&base, &token, "oci_blobref", "source-image", payload).await;
 
     // The codes are the manifest endpoints': a blob has no tags, so `latest` is
@@ -1218,7 +1218,7 @@ async fn a_manifest_above_the_axum_default_is_accepted_below_the_spec_ceiling() 
         },
         "layers": [],
         "annotations": {
-            "io.forgekeep.test.padding": "p".repeat(3 * 1024 * 1024),
+            "io.plombir-git.test.padding": "p".repeat(3 * 1024 * 1024),
         },
     })
     .to_string();
@@ -1281,7 +1281,7 @@ async fn a_manifest_above_the_declared_ceiling_is_refused() {
         },
         "layers": [],
         "annotations": {
-            "io.forgekeep.test.padding": "p".repeat(5 * 1024 * 1024),
+            "io.plombir-git.test.padding": "p".repeat(5 * 1024 * 1024),
         },
     })
     .to_string();

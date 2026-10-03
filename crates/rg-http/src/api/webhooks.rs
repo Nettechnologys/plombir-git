@@ -1,7 +1,7 @@
 //! Webhook REST API endpoints.
 //!
 //! Every endpoint here is repository *administration*: a webhook carries the
-//! delivery target and the HMAC key ForgeKeep signs deliveries with, exactly
+//! delivery target and the HMAC key Plombir Git signs deliveries with, exactly
 //! like a deploy key or a CI secret. So all seven verbs — reads included — sit
 //! behind the [`RepoAdmin`] extractor, the same door `api::deploy_keys` and
 //! `api::ci_secrets` use. They previously stopped at

@@ -17,7 +17,7 @@ export const pageState: TestPage = {
 	route: { id: null },
 	state: {},
 	status: 200,
-	url: new URL('https://forgekeep.test/'),
+	url: new URL('https://plombir-git.test/'),
 };
 
 export const pageStore = {
@@ -39,7 +39,7 @@ export function setTestPage(
 		route: { id: null },
 		state: {},
 		status: 200,
-		url: new URL(path, 'https://forgekeep.test'),
+		url: new URL(path, 'https://plombir-git.test'),
 	});
 	for (const run of subscribers) run(pageState);
 }

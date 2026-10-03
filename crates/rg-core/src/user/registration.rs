@@ -13,7 +13,7 @@
 //!   already spells the setting out. Self-service sign-up is a product feature
 //!   with more than two states, not a stopgap flag for launch week.
 //! * **Not a gate on LDAP / SSO auto-provision.** Those channels create accounts
-//!   too (`forgekeep_auth_events_total{event="provision"}`), and closing
+//!   too (`plombir_git_auth_events_total{event="provision"}`), and closing
 //!   self-service registration must not simultaneously lock out a whole
 //!   company's directory. That is a separate switch with a separate decision
 //!   behind it, and it exists: [`crate::user::provisioning`] reads
@@ -51,7 +51,7 @@ pub enum RegistrationMode {
 }
 
 impl RegistrationMode {
-    /// The values `[auth].registration` / `FORGEKEEP_REGISTRATION` accept.
+    /// The values `[auth].registration` / `PLOMBIR_GIT_REGISTRATION` accept.
     pub const ACCEPTED: [&'static str; 2] = ["open", "closed"];
 
     /// Parse a configured value, case- and whitespace-insensitively.

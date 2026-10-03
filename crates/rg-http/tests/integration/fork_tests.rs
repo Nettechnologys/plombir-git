@@ -328,7 +328,7 @@ async fn outsider_forks_public_repository_and_the_clone_lands_in_repo_root() {
     );
 }
 
-/// The fork button in the browser sends the HttpOnly `forgekeep_token` cookie
+/// The fork button in the browser sends the HttpOnly `plombir_git_token` cookie
 /// and no `Authorization` header — the web client keeps its token in memory
 /// only, so after a page reload the cookie is the whole session.
 ///
@@ -356,7 +356,7 @@ async fn a_cookie_session_may_fork_and_an_anonymous_caller_may_not() {
 
     let resp = client
         .post(&url)
-        .header("cookie", format!("forgekeep_token={outsider_token}"))
+        .header("cookie", format!("plombir_git_token={outsider_token}"))
         .send()
         .await
         .expect("request");

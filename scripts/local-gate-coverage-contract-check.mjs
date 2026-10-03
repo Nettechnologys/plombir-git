@@ -40,7 +40,7 @@ import {
 import { shellCodeOnly, shellInvokes } from './lib/shell-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
-const root = resolve(process.env.FORGEKEEP_LOCAL_GATE_COVERAGE_ROOT ?? resolve(scriptsDir, '..'));
+const root = resolve(process.env.PLOMBIR_GIT_LOCAL_GATE_COVERAGE_ROOT ?? resolve(scriptsDir, '..'));
 const workflowPath = resolve(root, '.github/workflows/regression.yml');
 const hookPath = resolve(root, '.githooks/pre-push');
 const verifierPath = resolve(root, 'scripts/verify-push-gates.sh');

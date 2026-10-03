@@ -1,9 +1,9 @@
-//! ForgeKeep CLI — main entry point.
+//! Plombir Git CLI — main entry point.
 //!
 //! The command surface is defined in [`cli`]; each subcommand's implementation
 //! lives in a focused module:
 //!  - [`serve`] — the `serve` command (startup validation + HTTP/SSH bootstrap)
-//!  - [`runner`] — the deprecated `runner` alias for `forgekeep-runner run`
+//!  - [`runner`] — the deprecated `runner` alias for `plombir-git-runner run`
 //!  - [`commands`] — the remaining one-shot subcommands
 //!  - [`admin`] — SQLite backup/restore + JWT secret helpers
 //!  - [`config`] — the TOML config model + `CLI > config > default` resolution,
@@ -44,6 +44,7 @@ fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     // Parse CLI args first (without initializing logging, to avoid early output)
     let cli = Cli::parse();
+    rg_process::refuse_retired_environment()?;
     let state_writer = commands::prepare_state_writer(&cli.command)?;
     let state_cfg = || {
         state_writer

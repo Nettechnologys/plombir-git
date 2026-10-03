@@ -66,7 +66,7 @@ impl MigrationTrait for Migration {
                 .join(", ");
             return Err(DbErr::Custom(format!(
                 "refusing to drop `users.mfa_type`: {} account(s) hold a value this server \
-                 cannot honour — ids {ids}. ForgeKeep only ever checks TOTP, so those accounts \
+                 cannot honour — ids {ids}. Plombir Git only ever checks TOTP, so those accounts \
                  already have no second factor beyond it, and this column is the last record \
                  that something else was intended. Decide what those accounts should be \
                  (`UPDATE users SET mfa_type = 'totp'` if TOTP is enrolled, `NULL` if the second \
@@ -129,7 +129,7 @@ mod tests {
     }
 
     /// The ordinary instance: TOTP enrolments and accounts with no second
-    /// factor, which is every account ForgeKeep itself has ever written.
+    /// factor, which is every account Plombir Git itself has ever written.
     #[tokio::test]
     async fn the_column_goes_and_the_accounts_stay() {
         let db = fixture(

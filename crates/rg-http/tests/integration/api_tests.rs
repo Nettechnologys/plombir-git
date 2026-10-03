@@ -322,7 +322,7 @@ async fn test_mfa_verify_requires_a_primary_factor_challenge() {
         .to_str()
         .unwrap()
         .to_string();
-    assert!(challenge_cookie_header.starts_with("forgekeep_mfa_challenge="));
+    assert!(challenge_cookie_header.starts_with("plombir_git_mfa_challenge="));
     assert!(challenge_cookie_header.contains("HttpOnly"));
     let challenge_cookie = challenge_cookie_header
         .split(';')
@@ -353,9 +353,9 @@ async fn test_mfa_verify_requires_a_primary_factor_challenge() {
         .collect();
     assert!(set_cookies
         .iter()
-        .any(|cookie| cookie.starts_with("forgekeep_token=")));
+        .any(|cookie| cookie.starts_with("plombir_git_token=")));
     assert!(set_cookies.iter().any(|cookie| {
-        cookie.starts_with("forgekeep_mfa_challenge=") && cookie.contains("Max-Age=0")
+        cookie.starts_with("plombir_git_mfa_challenge=") && cookie.contains("Max-Age=0")
     }));
 }
 
@@ -455,7 +455,7 @@ async fn test_new_primary_factor_challenge_does_not_reset_mfa_failures() {
             .find_map(|value| {
                 let value = value.to_str().ok()?;
                 value
-                    .starts_with("forgekeep_mfa_challenge=")
+                    .starts_with("plombir_git_mfa_challenge=")
                     .then(|| value.split(';').next().unwrap().to_string())
             })
             .unwrap()
@@ -681,7 +681,7 @@ async fn test_passkey_register_start_issues_challenge_and_cookie() {
         .to_str()
         .unwrap()
         .to_string();
-    assert!(cookie.starts_with("forgekeep_passkey_reg="));
+    assert!(cookie.starts_with("plombir_git_passkey_reg="));
     assert!(cookie.contains("HttpOnly"));
 
     let body: serde_json::Value = resp.json().await.unwrap();

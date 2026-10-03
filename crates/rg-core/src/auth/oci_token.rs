@@ -5,13 +5,13 @@
 //!
 //! ## Token Format
 //!
-//! ForgeKeep issues **signed JWTs** (HS256) with the following claims:
+//! Plombir Git issues **signed JWTs** (HS256) with the following claims:
 //!
 //! ```json
 //! {
-//!   "iss": "forgekeep",
+//!   "iss": "plombir-git",
 //!   "sub": "<username>",
-//!   "aud": "forgekeep-registry",
+//!   "aud": "plombir-git-registry",
 //!   "exp": 1700000000,
 //!   "iat": 1699999900,
 //!   "scope": "repository:owner/repo:pull,push"
@@ -41,13 +41,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// OCI Bearer token JWT claims.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OciTokenClaims {
-    /// Issuer — always `"forgekeep"`.
+    /// Issuer — always `"plombir-git"`.
     pub iss: String,
 
     /// Subject — username (or `anonymous`).
     pub sub: String,
 
-    /// Audience — must match `service` query parameter (`"forgekeep-registry"`).
+    /// Audience — must match `service` query parameter (`"plombir-git-registry"`).
     pub aud: String,
 
     /// Expiration (UNIX seconds).
@@ -161,9 +161,9 @@ fn generate_oci_token_at(
         .as_secs() as usize;
 
     let claims = OciTokenClaims {
-        iss: "forgekeep".to_string(),
+        iss: "plombir-git".to_string(),
         sub: username.to_string(),
-        aud: "forgekeep-registry".to_string(),
+        aud: "plombir-git-registry".to_string(),
         iat: now,
         exp: now + ttl_secs as usize,
         nbf: None,
@@ -187,9 +187,9 @@ fn generate_oci_token_at(
 pub fn validate_oci_token(token: &str, secret: &str) -> Option<OciTokenClaims> {
     let key = DecodingKey::from_secret(secret.as_bytes());
     let mut validation = Validation::default();
-    validation.iss = Some(std::collections::HashSet::from(["forgekeep".to_string()]));
+    validation.iss = Some(std::collections::HashSet::from(["plombir-git".to_string()]));
     validation.aud = Some(std::collections::HashSet::from([
-        "forgekeep-registry".to_string()
+        "plombir-git-registry".to_string()
     ]));
 
     match decode::<OciTokenClaims>(token, &key, &validation) {
@@ -248,7 +248,7 @@ mod tests {
 
         let claims = validate_oci_token(&token, TEST_SECRET).unwrap();
         assert_eq!(claims.sub, "alice");
-        assert_eq!(claims.aud, "forgekeep-registry");
+        assert_eq!(claims.aud, "plombir-git-registry");
         assert!(claims.scope.as_ref().unwrap().contains("pull,push"));
     }
 

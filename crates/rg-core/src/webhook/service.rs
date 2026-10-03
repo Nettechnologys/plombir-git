@@ -14,7 +14,7 @@
 //! AES-256-GCM ciphertext under the instance's at-rest key, like
 //! `ci_secrets.encrypted_value` and `mirrors.password_encrypted`, and it is
 //! registered in [`crate::auth::encrypted_columns`] so the startup preflight
-//! and `forgekeep rotate-encryption-key` cover it without being told twice.
+//! and `plombir-git rotate-encryption-key` cover it without being told twice.
 //!
 //! Writing it takes the key as a parameter ([`create_webhook`],
 //! [`update_webhook`] — both are called straight from a handler that has it).
@@ -127,7 +127,7 @@ fn secret_for_delivery(
 ///
 /// The rename to `secret_encrypted` is a schema change and happens in the
 /// migration runner, which has no access to the at-rest key; this is the other
-/// half, run by `forgekeep serve` right after the key preflight — the first
+/// half, run by `plombir-git serve` right after the key preflight — the first
 /// point in the boot where the migrated schema and the key both exist. Returns
 /// how many rows it sealed.
 ///
@@ -537,7 +537,7 @@ fn spawn_delivery(
         let duration_ms = start.elapsed().as_millis() as i64;
 
         // Meter the delivery outcome (2xx = success) for the
-        // `forgekeep_webhook_deliveries_total` counter. Forwarded through the
+        // `plombir_git_webhook_deliveries_total` counter. Forwarded through the
         // HTTP-layer observer since the Prometheus recorder lives above us.
         let succeeded = matches!(status, Some(s) if (200..300).contains(&s));
         crate::metrics_hook::record_webhook_delivery(succeeded);

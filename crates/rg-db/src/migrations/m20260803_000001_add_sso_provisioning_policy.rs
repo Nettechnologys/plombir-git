@@ -1,7 +1,7 @@
 //! Who an SSO / LDAP provider may create an account *for*.
 //!
 //! `sso_providers` could say whether a provider is usable (`enabled`) but never
-//! whom it may provision: the callback created a ForgeKeep account for anyone
+//! whom it may provision: the callback created a Plombir Git account for anyone
 //! who showed a valid identity at a configured provider. That is the right
 //! reading for a private directory and the wrong one for `github.com`, where
 //! everyone has an identity — and there was nowhere to write the difference

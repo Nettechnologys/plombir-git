@@ -3,7 +3,7 @@
 //!
 //! `ai_search_code` was mounted and `ai_index_repository` was not, so every
 //! hosted instance answered AI code searches out of an index only the server's
-//! own `forgekeep index-repo` shell command could fill. The handler existed in
+//! own `plombir-git index-repo` shell command could fill. The handler existed in
 //! full, carried a complete `#[utoipa::path]` annotation, and no route led to
 //! it — a door described but never cut.
 //!

@@ -1,12 +1,12 @@
 //!
-//! `rg-mcp` - ForgeKeep MCP Server
+//! `rg-mcp` - Plombir Git MCP Server
 //!
-//! MCP (Model Context Protocol) server that exposes ForgeKeep
+//! MCP (Model Context Protocol) server that exposes Plombir Git
 //! repository data as Tools and Resources to AI agents.
 //!
 //! Supported transports:
-//! - **stdio**: run as a subprocess of an MCP-capable agent (`forgekeep-mcp`).
-//! - **HTTP**: the ForgeKeep server embeds this crate and answers
+//! - **stdio**: run as a subprocess of an MCP-capable agent (`plombir-git-mcp`).
+//! - **HTTP**: the Plombir Git server embeds this crate and answers
 //!   `POST /api/v1/mcp` itself, calling its own API in-process through an
 //!   [`ApiTransport`] — so an agent needs no local binary, and the server knows
 //!   which tool every API call serves.
@@ -25,7 +25,7 @@ pub mod tools;
 // Re-export for convenience
 pub use error::{Error, Result};
 
-/// The ForgeKeep API this server talks to when `FORGEKEEP_URL` is unset.
+/// The Plombir Git API this server talks to when `PLOMBIR_GIT_URL` is unset.
 ///
 /// A named constant rather than a literal inside the resolve, because the same
 /// address is restated on both pages that describe this binary — the `//!`
@@ -37,7 +37,7 @@ const DEFAULT_API_BASE: &str = "http://localhost:8080";
 /// unless the operator explicitly accepts it for this one configured server.
 const DEFAULT_ALLOW_INSECURE_HTTP: bool = false;
 
-/// Request timeout for MCP → ForgeKeep API calls (whole request, incl. body),
+/// Request timeout for MCP → Plombir Git API calls (whole request, incl. body),
 /// so a slow/hanging server can't pin a tool call forever.
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Connect timeout (TCP + TLS handshake only).
@@ -62,7 +62,7 @@ fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
-/// Build the `reqwest::Client` used for every ForgeKeep API call: the static
+/// Build the `reqwest::Client` used for every Plombir Git API call: the static
 /// `Bearer` header plus the outbound request + connect timeouts.
 ///
 /// Built once and cached on [`AppState`] — cloning a `reqwest::Client` is a
@@ -120,17 +120,17 @@ fn require_confidential_bearer_server(
 ) -> Result<()> {
     let url = reqwest::Url::parse(api_base).map_err(|error| {
         Error::Config(format!(
-            "FORGEKEEP_URL must be an absolute http(s) URL: {error}"
+            "PLOMBIR_GIT_URL must be an absolute http(s) URL: {error}"
         ))
     })?;
     if url.host_str().is_none() {
         return Err(Error::Config(
-            "FORGEKEEP_URL must name a server host".to_string(),
+            "PLOMBIR_GIT_URL must name a server host".to_string(),
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(Error::Config(
-            "FORGEKEEP_URL must not contain user information".to_string(),
+            "PLOMBIR_GIT_URL must not contain user information".to_string(),
         ));
     }
 
@@ -141,16 +141,16 @@ fn require_confidential_bearer_server(
         "http" if pat.is_empty() || is_loopback_host(&url) => Ok(()),
         "http" if allow_insecure_http => {
             tracing::warn!(
-                "FORGEKEEP_ALLOW_INSECURE_HTTP=true: the MCP PAT may cross plaintext HTTP"
+                "PLOMBIR_GIT_ALLOW_INSECURE_HTTP=true: the MCP PAT may cross plaintext HTTP"
             );
             Ok(())
         }
         "http" => Err(Error::Config(
-            "FORGEKEEP_URL uses plaintext HTTP for a non-loopback server while FORGEKEEP_PAT is set; use HTTPS, keep local development on localhost/loopback, or explicitly set FORGEKEEP_ALLOW_INSECURE_HTTP=true"
+            "PLOMBIR_GIT_URL uses plaintext HTTP for a non-loopback server while PLOMBIR_GIT_PAT is set; use HTTPS, keep local development on localhost/loopback, or explicitly set PLOMBIR_GIT_ALLOW_INSECURE_HTTP=true"
                 .to_string(),
         )),
         scheme => Err(Error::Config(format!(
-            "FORGEKEEP_URL must use http or https, not {scheme}"
+            "PLOMBIR_GIT_URL must use http or https, not {scheme}"
         ))),
     }
 }
@@ -160,7 +160,7 @@ fn parse_allow_insecure_http(raw: &str) -> Result<bool> {
         "true" => Ok(true),
         "false" => Ok(false),
         _ => Err(Error::Config(
-            "FORGEKEEP_ALLOW_INSECURE_HTTP must be `true` or `false`".to_string(),
+            "PLOMBIR_GIT_ALLOW_INSECURE_HTTP must be `true` or `false`".to_string(),
         )),
     }
 }
@@ -169,7 +169,7 @@ fn parse_allow_insecure_http(raw: &str) -> Result<bool> {
 /// embedding server implements the trait without depending on `reqwest`.
 pub use reqwest::Method;
 
-/// One exchange with the ForgeKeep REST API, before any decoding.
+/// One exchange with the Plombir Git REST API, before any decoding.
 pub struct ApiResponse {
     pub status: u16,
     pub body: Vec<u8>,
@@ -179,7 +179,7 @@ pub struct ApiResponse {
 pub type ApiFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<ApiResponse>> + Send + 'a>>;
 
-/// How tool calls reach the ForgeKeep REST API when they do not go over the
+/// How tool calls reach the Plombir Git REST API when they do not go over the
 /// network — the server hosting this crate's tools behind its own MCP endpoint.
 ///
 /// `path` is the full API path including `/api/v1` and any query string. The
@@ -196,7 +196,7 @@ pub trait ApiTransport: Send + Sync {
 /// Where tool calls are sent.
 #[derive(Clone)]
 pub(crate) enum Backend {
-    /// A ForgeKeep server over HTTP(S) — the stdio binary's only mode.
+    /// A Plombir Git server over HTTP(S) — the stdio binary's only mode.
     Http {
         api_base: String,
         /// Pre-built, reusable API client (Bearer header + timeouts baked in).
@@ -206,7 +206,7 @@ pub(crate) enum Backend {
     InProcess(std::sync::Arc<dyn ApiTransport>),
 }
 
-/// ForgeKeep API base URL + PAT cache, or an in-process transport.
+/// Plombir Git API base URL + PAT cache, or an in-process transport.
 ///
 /// The stdio binary constructs it once at startup from environment variables;
 /// the server's own MCP endpoint constructs one per request around the
@@ -219,14 +219,14 @@ pub struct AppState {
 impl AppState {
     pub fn from_env() -> Result<Self> {
         let api_base =
-            std::env::var("FORGEKEEP_URL").unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
-        let pat = std::env::var("FORGEKEEP_PAT").unwrap_or_default();
-        let allow_insecure_http = std::env::var("FORGEKEEP_ALLOW_INSECURE_HTTP")
+            std::env::var("PLOMBIR_GIT_URL").unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
+        let pat = std::env::var("PLOMBIR_GIT_PAT").unwrap_or_default();
+        let allow_insecure_http = std::env::var("PLOMBIR_GIT_ALLOW_INSECURE_HTTP")
             .unwrap_or_else(|_| DEFAULT_ALLOW_INSECURE_HTTP.to_string());
         let allow_insecure_http = parse_allow_insecure_http(&allow_insecure_http)?;
 
         if pat.is_empty() {
-            tracing::warn!("FORGEKEEP_PAT not set – API calls may fail");
+            tracing::warn!("PLOMBIR_GIT_PAT not set – API calls may fail");
         }
 
         Self::try_new_with_transport_policy(api_base, pat, allow_insecure_http)
@@ -323,7 +323,7 @@ fn handle_initialize(req: &protocol::JsonRpcRequest) -> protocol::JsonRpcRespons
     let result = serde_json::json!({
         "protocolVersion": version,
         "serverInfo": {
-            "name": "forgekeep-mcp",
+            "name": "plombir-git-mcp",
             "version": env!("CARGO_PKG_VERSION")
         },
         "capabilities": {
@@ -608,7 +608,9 @@ mod redirect_tests {
             Err(error) => error,
             Ok(_) => panic!("remote HTTP with a PAT must fail closed"),
         };
-        assert!(error.to_string().contains("FORGEKEEP_ALLOW_INSECURE_HTTP"));
+        assert!(error
+            .to_string()
+            .contains("PLOMBIR_GIT_ALLOW_INSECURE_HTTP"));
         assert!(
             sink.await.unwrap().is_none(),
             "the refused MCP origin received a request"
@@ -643,7 +645,7 @@ mod redirect_tests {
 // ---------------------------------------------------------------------------
 // The environment against the pages that describe it.
 //
-// `forgekeep-mcp` takes no flags at all — `--help` states nothing, and the
+// `plombir-git-mcp` takes no flags at all — `--help` states nothing, and the
 // whole configuration is three environment variables. So the only description of
 // them is prose, and it exists twice: the `//!` table of `main.rs`, and the
 // README section whoever wires this binary into an agent reads while writing
@@ -675,7 +677,7 @@ mod documented_environment_tests {
     /// This crate's own doc-comment table.
     ///
     /// Read as prose rather than through its items: `main.rs` is compiled into
-    /// the `forgekeep-mcp` *binary* and this file into the library, so the two
+    /// the `plombir-git-mcp` *binary* and this file into the library, so the two
     /// never see each other — and it is the prose that has to be checked
     /// anyway. `include_str!` makes a moved file break the build instead of
     /// quietly skipping the checks.
@@ -700,7 +702,7 @@ mod documented_environment_tests {
 
     /// The heading that opens the README's half of this binary. Everything up
     /// to the next `## ` heading is the section these checks read.
-    const MCP_SECTION: &str = "## MCP server (`forgekeep-mcp`)";
+    const MCP_SECTION: &str = "## MCP server (`plombir-git-mcp`)";
 
     /// How both pages spell "this variable has no default at all".
     const NO_DEFAULT: &str = "_(none)_";
@@ -739,8 +741,8 @@ mod documented_environment_tests {
     /// The row of a `| Variable | Default | … |` table whose first cell names
     /// `variable`, with the `//!` of a doc-comment table stripped.
     ///
-    /// The first cell has to *equal* the name: `FORGEKEEP_URL` must not be
-    /// answered by a row describing `FORGEKEEP_URL_FILE`.
+    /// The first cell has to *equal* the name: `PLOMBIR_GIT_URL` must not be
+    /// answered by a row describing `PLOMBIR_GIT_URL_FILE`.
     fn table_row<'a>(section: &'a str, variable: &str) -> Option<&'a str> {
         let named = format!("`{variable}`");
 
@@ -1008,7 +1010,7 @@ mod documented_environment_tests {
     }
 
     /// The pairing table. The variable spellings have to be written out — no
-    /// rule derives `DEFAULT_API_BASE` from `FORGEKEEP_URL` — but no value is.
+    /// rule derives `DEFAULT_API_BASE` from `PLOMBIR_GIT_URL` — but no value is.
     fn documented_variables() -> Vec<DocumentedVariable> {
         macro_rules! from_constant {
             ($konst:ident) => {
@@ -1018,15 +1020,15 @@ mod documented_environment_tests {
 
         vec![
             DocumentedVariable {
-                name: "FORGEKEEP_URL",
+                name: "PLOMBIR_GIT_URL",
                 default: from_constant!(DEFAULT_API_BASE),
             },
             DocumentedVariable {
-                name: "FORGEKEEP_PAT",
+                name: "PLOMBIR_GIT_PAT",
                 default: None,
             },
             DocumentedVariable {
-                name: "FORGEKEEP_ALLOW_INSECURE_HTTP",
+                name: "PLOMBIR_GIT_ALLOW_INSECURE_HTTP",
                 default: from_constant!(DEFAULT_ALLOW_INSECURE_HTTP),
             },
         ]
@@ -1116,8 +1118,8 @@ mod documented_environment_tests {
         // worth anything.
         assert_eq!(
             table_row(
-                "//! | `FORGEKEEP_URL` | `http://probe` | base |",
-                "FORGEKEEP_URL"
+                "//! | `PLOMBIR_GIT_URL` | `http://probe` | base |",
+                "PLOMBIR_GIT_URL"
             )
             .and_then(stated_default),
             Some(Stated::Value("http://probe")),
@@ -1125,23 +1127,26 @@ mod documented_environment_tests {
         );
         assert!(
             table_row(
-                "| `FORGEKEEP_URL_FILE` | `http://probe` | base |",
-                "FORGEKEEP_URL"
+                "| `PLOMBIR_GIT_URL_FILE` | `http://probe` | base |",
+                "PLOMBIR_GIT_URL"
             )
             .is_none(),
-            "the row reader answers `FORGEKEEP_URL` with a longer name's row, so a page \
+            "the row reader answers `PLOMBIR_GIT_URL` with a longer name's row, so a page \
              documenting neither could pass for one documenting both"
         );
         assert_eq!(
-            table_row("| `FORGEKEEP_PAT` | _(none)_ | token |", "FORGEKEEP_PAT")
-                .and_then(stated_default),
+            table_row(
+                "| `PLOMBIR_GIT_PAT` | _(none)_ | token |",
+                "PLOMBIR_GIT_PAT"
+            )
+            .and_then(stated_default),
             Some(Stated::Absent),
             "the cell reader does not recognise how both pages spell \"no default\""
         );
         assert_eq!(
             table_row(
-                "| `FORGEKEEP_PAT` | the machine's hostname | t |",
-                "FORGEKEEP_PAT"
+                "| `PLOMBIR_GIT_PAT` | the machine's hostname | t |",
+                "PLOMBIR_GIT_PAT"
             )
             .and_then(stated_default),
             Some(Stated::Prose("the machine's hostname")),
@@ -1157,7 +1162,7 @@ mod documented_environment_tests {
                 let row = table_row(&section, variable.name).unwrap_or_else(|| {
                     panic!(
                         "{name}: the environment table has no `{}` row — that table is where \
-                         the person wiring `forgekeep-mcp` into an agent looks the variable \
+                         the person wiring `plombir-git-mcp` into an agent looks the variable \
                          up, and the source is the only place left without it",
                         variable.name
                     )

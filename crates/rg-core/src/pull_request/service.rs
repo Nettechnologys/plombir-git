@@ -225,7 +225,7 @@ pub async fn create_pr(
 /// [`merge_pr`] records the merges *it* performs, and it is never reached by an
 /// import: the imported row is written with `state = "merged"` in one insert,
 /// so without this the merged half of somebody's migrated history is invisible
-/// to `forgekeep_prs_merged_total` while the opened half is not. A PR created
+/// to `plombir_git_prs_merged_total` while the opened half is not. A PR created
 /// through `create_pr` is always born open, so the two producers cannot both
 /// count the same merge.
 pub(crate) async fn insert_with_repo_number(
@@ -865,7 +865,7 @@ fn diff_head_rev(repo_path: &std::path::Path, pr: &PullRequest, head_ref: &str) 
 /// So the merge base is resolved here, once, and both halves are handed the
 /// same pair of commits — the patch half as two explicit revisions rather than
 /// a `...` range, so there is no second engine left to interpret it.
-fn forgekeep_diff_revs(
+fn plombir_git_diff_revs(
     repo_path: &std::path::Path,
     base_ref: &str,
     head_rev: &str,
@@ -911,7 +911,7 @@ fn forgekeep_diff_revs(
 /// halves name the same entries and count the same lines — see
 /// card_283b386e7091.
 ///
-/// The two revisions arrive already resolved, from [`forgekeep_diff_revs`],
+/// The two revisions arrive already resolved, from [`plombir_git_diff_revs`],
 /// instead of being spelled here as a `base...head` range: the range is the
 /// other thing the two halves used to choose independently, and a `...` range
 /// is git's own reading of it rather than the one the numstat half walked —
@@ -924,7 +924,7 @@ fn forgekeep_diff_revs(
 /// measured to change what this half says about a pull request (git 2.43.0):
 ///
 /// * `diff.algorithm` decides *how many* lines changed, and the numstat half no
-///   longer asks anybody: it states [`forgekeep_diff_algorithm`]. Left
+///   longer asks anybody: it states [`plombir_git_diff_algorithm`]. Left
 ///   unstated here, the same six-line fixture is `2 2` to the numstat half and
 ///   four added lines in the patch under it — one answer, counted twice, by two
 ///   different algorithms (card_4a21d30afb9a). `-c` beats a configuration file
@@ -943,12 +943,12 @@ fn forgekeep_diff_revs(
 ///   the bytes — the numstat half counts the bytes, so the two would describe
 ///   different content. `--no-ext-diff` denies `diff.external`, which is the
 ///   other half of that.
-fn forgekeep_patch_argv<'a>(old_rev: &'a str, new_rev: &'a str) -> [&'a str; 16] {
+fn plombir_git_patch_argv<'a>(old_rev: &'a str, new_rev: &'a str) -> [&'a str; 16] {
     [
         "-c",
         "core.quotePath=false",
         "-c",
-        forgekeep_diff_algorithm_setting(),
+        plombir_git_diff_algorithm_setting(),
         "diff",
         "--no-ext-diff",
         "--no-textconv",
@@ -970,11 +970,11 @@ fn forgekeep_patch_argv<'a>(old_rev: &'a str, new_rev: &'a str) -> [&'a str; 16]
 /// Run through [`rg_git::invocation::local`] rather than on a bare gateway: the
 /// gateway disarms the host's environment for every child it spawns, which is
 /// what puts `/etc/gitconfig` and `~/.gitconfig` out of reach, but it says
-/// nothing about which values ForgeKeep wants when nobody configured any. That
+/// nothing about which values Plombir Git wants when nobody configured any. That
 /// list is `invocation::local`'s, and reading the patch under it is what makes
-/// this half of the answer ForgeKeep's own decision rather than a property of
+/// this half of the answer Plombir Git's own decision rather than a property of
 /// the git binary that happens to be installed.
-fn forgekeep_patch_text(
+fn plombir_git_patch_text(
     repo_path: &std::path::Path,
     old_rev: &str,
     new_rev: &str,
@@ -983,7 +983,7 @@ fn forgekeep_patch_text(
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let git = rg_git::invocation::local(gateway);
-    let patch_output = git.run(&forgekeep_patch_argv(old_rev, new_rev), Some(repo_path))?;
+    let patch_output = git.run(&plombir_git_patch_argv(old_rev, new_rev), Some(repo_path))?;
     patch_output.ensure_success()?;
     Ok(patch_output.stdout_str())
 }
@@ -992,8 +992,8 @@ fn forgekeep_patch_text(
 fn compute_same_repo_diff(repo_path: &std::path::Path, pr: &PullRequest) -> Result<PrDiff> {
     let head_rev = diff_head_rev(repo_path, pr, &format!("refs/heads/{}", pr.head_branch));
 
-    // Both halves below read the same two commits — see `forgekeep_diff_revs`.
-    let (old_rev, new_rev) = forgekeep_diff_revs(
+    // Both halves below read the same two commits — see `plombir_git_diff_revs`.
+    let (old_rev, new_rev) = plombir_git_diff_revs(
         repo_path,
         &format!("refs/heads/{}", pr.base_branch),
         &head_rev,
@@ -1004,7 +1004,7 @@ fn compute_same_repo_diff(repo_path: &std::path::Path, pr: &PullRequest) -> Resu
 
     // Get unified diff patch via gateway (TODO(gix): replace with gix blob-diff
     // when byte-identical output is achievable — see plan.md Phase 3)
-    let patch_text = forgekeep_patch_text(repo_path, &old_rev, &new_rev)?;
+    let patch_text = plombir_git_patch_text(repo_path, &old_rev, &new_rev)?;
 
     let mut files = files_changed;
     attach_patches(&mut files, &patch_text);
@@ -1028,15 +1028,15 @@ fn compute_cross_repo_diff(
     // what the review and the merge are about — see `diff_head_rev`.
     let head_rev = diff_head_rev(repo_path, pr, fork_ref);
 
-    // Both halves below read the same two commits — see `forgekeep_diff_revs`.
+    // Both halves below read the same two commits — see `plombir_git_diff_revs`.
     let (old_rev, new_rev) =
-        forgekeep_diff_revs(repo_path, &format!("refs/heads/{}", base_branch), &head_rev)?;
+        plombir_git_diff_revs(repo_path, &format!("refs/heads/{}", base_branch), &head_rev)?;
 
     // Use gix tree-diff for numstat (files_changed + per-file additions/deletions)
     let (files_changed, stats) = gix_diff_numstat(repo_path, old_rev.clone(), new_rev.clone())?;
 
     // Get unified diff patch via gateway (TODO(gix): replace with gix blob-diff when feasible)
-    let patch_text = forgekeep_patch_text(repo_path, &old_rev, &new_rev)?;
+    let patch_text = plombir_git_patch_text(repo_path, &old_rev, &new_rev)?;
 
     let mut files = files_changed;
     attach_patches(&mut files, &patch_text);
@@ -1375,7 +1375,7 @@ fn parse_range_start(range: &str) -> Option<i64> {
     range.split(',').next()?.parse().ok()
 }
 
-/// The diff algorithm ForgeKeep counts pull-request lines with, stated instead
+/// The diff algorithm Plombir Git counts pull-request lines with, stated instead
 /// of looked up.
 ///
 /// `Repository::diff_resource_cache` fills the blob platform's options from
@@ -1384,7 +1384,7 @@ fn parse_range_start(range: &str) -> Option<i64> {
 /// already puts the host's `/etc/gitconfig`, `~/.gitconfig` and `GIT_*` out of
 /// reach, but the answer to "how many lines does this pull request add" would
 /// still be a property of a config file — the repository's own `.git/config` is
-/// loaded at every permission level — rather than of ForgeKeep. Two instances
+/// loaded at every permission level — rather than of Plombir Git. Two instances
 /// must report the same numbers for the same pull request, and a diff algorithm
 /// is not a rendering preference here: Myers and Histogram genuinely disagree
 /// on how many lines changed.
@@ -1398,39 +1398,39 @@ fn parse_range_start(range: &str) -> Option<i64> {
 /// authoritative, but a `diff=<name>` assignment cannot make a server execute
 /// or trust a matching `diff.<name>` section from `.git/config`.
 ///
-/// [`forgekeep_merge_options`] states the same algorithm for the *merge* text
+/// [`plombir_git_merge_options`] states the same algorithm for the *merge* text
 /// driver and keeps its own copy on purpose: that function spells out every
 /// field of a `gix` options struct so a knob added later breaks the build
 /// instead of defaulting silently.
-fn forgekeep_diff_algorithm() -> gix::diff::blob::Algorithm {
+fn plombir_git_diff_algorithm() -> gix::diff::blob::Algorithm {
     gix::diff::blob::Algorithm::Myers
 }
 
 /// The same decision, spelled the way `git`'s own `diff.algorithm` spells it,
 /// for the half of a pull-request diff that is read from the `git` binary.
 ///
-/// Derived from [`forgekeep_diff_algorithm`] rather than written out a second
+/// Derived from [`plombir_git_diff_algorithm`] rather than written out a second
 /// time: the two halves of one answer disagreeing about how many lines changed
 /// is the whole defect this exists to deny (card_4a21d30afb9a), and a second
 /// literal is how that comes back. The match is exhaustive on purpose — a
 /// `gix` release that adds an algorithm breaks the build here instead of
 /// quietly leaving the CLI half on the old one.
-fn forgekeep_diff_algorithm_setting() -> &'static str {
-    match forgekeep_diff_algorithm() {
+fn plombir_git_diff_algorithm_setting() -> &'static str {
+    match plombir_git_diff_algorithm() {
         gix::diff::blob::Algorithm::Histogram => "diff.algorithm=histogram",
         gix::diff::blob::Algorithm::Myers => "diff.algorithm=myers",
         gix::diff::blob::Algorithm::MyersMinimal => "diff.algorithm=minimal",
     }
 }
 
-const FORGEKEEP_LARGE_FILE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
+const PLOMBIR_GIT_LARGE_FILE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Build the attribute view shared by ForgeKeep's native diff and merge paths.
+/// Build the attribute view shared by Plombir Git's native diff and merge paths.
 ///
 /// Only attributes committed in the repository participate. In particular,
 /// `core.attributesFile` and `$GIT_DIR/info/attributes` are deployment state,
 /// not repository content, so neither is admitted into a server-owned answer.
-fn forgekeep_committed_attribute_stack(repo: &gix::Repository) -> Result<gix::worktree::Stack> {
+fn plombir_git_committed_attribute_stack(repo: &gix::Repository) -> Result<gix::worktree::Stack> {
     let index = repo.index_or_load_from_head_or_empty()?;
     let mut attribute_buffer = Vec::new();
     let mut attribute_collection = gix::attrs::search::MetadataCollection::default();
@@ -1454,7 +1454,7 @@ fn forgekeep_committed_attribute_stack(repo: &gix::Repository) -> Result<gix::wo
     ))
 }
 
-/// Build the blob-diff platform from the parts ForgeKeep owns.
+/// Build the blob-diff platform from the parts Plombir Git owns.
 ///
 /// `Repository::diff_resource_cache` is deliberately Git-compatible: besides
 /// in-tree `.gitattributes`, it reads `core.attributesFile`, `$GIT_DIR/info`,
@@ -1469,8 +1469,8 @@ fn forgekeep_committed_attribute_stack(repo: &gix::Repository) -> Result<gix::wo
 /// gix's unconfigured default, so ordinary instances retain their old boundary
 /// without allowing `.git/config` to turn an arbitrary text blob into a binary
 /// zero-count.
-fn forgekeep_diff_resource_cache(repo: &gix::Repository) -> Result<gix::diff::blob::Platform> {
-    let attribute_stack = forgekeep_committed_attribute_stack(repo)?;
+fn plombir_git_diff_resource_cache(repo: &gix::Repository) -> Result<gix::diff::blob::Platform> {
+    let attribute_stack = plombir_git_committed_attribute_stack(repo)?;
 
     let mut worktree_filter = gix::filter::plumbing::Pipeline::default();
     worktree_filter.options_mut().object_hash = repo.object_hash();
@@ -1479,14 +1479,14 @@ fn forgekeep_diff_resource_cache(repo: &gix::Repository) -> Result<gix::diff::bl
         worktree_filter,
         Vec::new(),
         gix::diff::blob::pipeline::Options {
-            large_file_threshold_bytes: FORGEKEEP_LARGE_FILE_THRESHOLD_BYTES,
+            large_file_threshold_bytes: PLOMBIR_GIT_LARGE_FILE_THRESHOLD_BYTES,
             fs: Default::default(),
         },
     );
 
     Ok(gix::diff::blob::Platform::new(
         gix::diff::blob::platform::Options {
-            algorithm: Some(forgekeep_diff_algorithm()),
+            algorithm: Some(plombir_git_diff_algorithm()),
             skip_internal_diff_if_external_is_configured: false,
         },
         filter,
@@ -1551,7 +1551,7 @@ fn gix_diff_numstat(
     let mut total_additions = 0i64;
     let mut total_deletions = 0i64;
 
-    let mut resource_cache = forgekeep_diff_resource_cache(&repo)?;
+    let mut resource_cache = plombir_git_diff_resource_cache(&repo)?;
 
     let file_count;
     {
@@ -2699,12 +2699,12 @@ mod diff_tests {
                 rust_source::production_function_call_sites(
                     source,
                     function,
-                    &["forgekeep_diff_revs"]
+                    &["plombir_git_diff_revs"]
                 )
                 .len(),
                 1,
                 "`{function}` no longer resolves its revisions through \
-                 `forgekeep_diff_revs`, so the range of its numstat half is chosen \
+                 `plombir_git_diff_revs`, so the range of its numstat half is chosen \
                  independently of its patch half's again — see card_dd105a36fc64"
             );
         }
@@ -2728,11 +2728,11 @@ mod diff_tests {
                 rust_source::production_function_call_sites(
                     source,
                     function,
-                    &["forgekeep_patch_text"]
+                    &["plombir_git_patch_text"]
                 )
                 .len(),
                 1,
-                "`{function}` no longer reads its patch through `forgekeep_patch_text`, \
+                "`{function}` no longer reads its patch through `plombir_git_patch_text`, \
                  so the rename model of its patch half is chosen independently of the \
                  numstat's again — see card_283b386e7091"
             );
@@ -2741,26 +2741,26 @@ mod diff_tests {
         assert_eq!(
             rust_source::production_function_call_sites(
                 source,
-                "forgekeep_patch_text",
-                &["forgekeep_patch_argv"]
+                "plombir_git_patch_text",
+                &["plombir_git_patch_argv"]
             )
             .len(),
             1,
-            "`forgekeep_patch_text` no longer builds its argv through \
-             `forgekeep_patch_argv` — either it was reverted, or this census has \
+            "`plombir_git_patch_text` no longer builds its argv through \
+             `plombir_git_patch_argv` — either it was reverted, or this census has \
              stopped reading the function"
         );
     }
 
-    /// The patch half of a pull-request diff must be a decision of ForgeKeep's,
+    /// The patch half of a pull-request diff must be a decision of Plombir Git's,
     /// the same way the numstat half already is.
     ///
     /// The behavioural cover is
     /// `diff_configuration_ownership_tests::the_patch_half_is_counted_the_way_the_numstat_half_is`,
-    /// which drives `forgekeep_patch_text` itself. What this adds is naming the
-    /// two decisions behind it: running under ForgeKeep's git configuration
+    /// which drives `plombir_git_patch_text` itself. What this adds is naming the
+    /// two decisions behind it: running under Plombir Git's git configuration
     /// instead of a bare gateway, and deriving the stated algorithm from
-    /// `forgekeep_diff_algorithm` instead of spelling `myers` a second time.
+    /// `plombir_git_diff_algorithm` instead of spelling `myers` a second time.
     #[test]
     fn the_patch_half_states_the_configuration_it_is_read_under() {
         let source = include_str!("service.rs");
@@ -2768,29 +2768,29 @@ mod diff_tests {
         assert_eq!(
             rust_source::production_function_call_sites(
                 source,
-                "forgekeep_patch_text",
+                "plombir_git_patch_text",
                 &["rg_git::invocation::local"]
             )
             .len(),
             1,
-            "`forgekeep_patch_text` no longer states the configuration it reads the patch \
+            "`plombir_git_patch_text` no longer states the configuration it reads the patch \
              under — either it was reverted, or this census has stopped reading the function"
         );
         assert!(
             rust_source::production_function_call_sites(
                 source,
-                "forgekeep_patch_text",
+                "plombir_git_patch_text",
                 &["gateway.run", "gateway.run_with_env", "gateway.run_bounded"]
             )
             .is_empty(),
-            "`forgekeep_patch_text` runs git straight off the gateway again, so the patch \
+            "`plombir_git_patch_text` runs git straight off the gateway again, so the patch \
              half is read under whatever the installed git defaults to — see card_4a21d30afb9a"
         );
         assert_eq!(
             rust_source::production_function_call_sites(
                 source,
-                "forgekeep_patch_argv",
-                &["forgekeep_diff_algorithm_setting"]
+                "plombir_git_patch_argv",
+                &["plombir_git_diff_algorithm_setting"]
             )
             .len(),
             1,
@@ -2801,25 +2801,25 @@ mod diff_tests {
         assert_eq!(
             rust_source::production_function_call_sites(
                 source,
-                "forgekeep_diff_algorithm_setting",
-                &["forgekeep_diff_algorithm"]
+                "plombir_git_diff_algorithm_setting",
+                &["plombir_git_diff_algorithm"]
             )
             .len(),
             1,
             "the CLI half's diff algorithm is no longer derived from \
-             `forgekeep_diff_algorithm`, so the two halves of one answer can drift apart \
+             `plombir_git_diff_algorithm`, so the two halves of one answer can drift apart \
              again — see card_4a21d30afb9a"
         );
     }
 }
 
 /// `card_25afc5bcc044` — the number of lines a pull request adds and removes
-/// must be a property of ForgeKeep, not of the machine the instance runs on.
+/// must be a property of Plombir Git, not of the machine the instance runs on.
 ///
 /// A diff algorithm looks like a rendering preference and is not one here:
 /// Myers and Histogram genuinely disagree about *how many* lines changed, and
 /// that count is what a reviewer reads on the pull request page and what the
-/// API answers. Two instances of ForgeKeep must not report different numbers
+/// API answers. Two instances of Plombir Git must not report different numbers
 /// for the same pull request, and neither must say so.
 ///
 /// Two placements reach the algorithm, and a different mechanism denies each,
@@ -2829,9 +2829,9 @@ mod diff_tests {
 ///   opening through `rg_git::repository::open`;
 /// * `diff.algorithm` written into the repository's own `.git/config` — which
 ///   is loaded at every permission level, so an isolated open cannot filter it
-///   out — is denied by [`super::forgekeep_diff_algorithm`] stating the answer.
+///   out — is denied by [`super::plombir_git_diff_algorithm`] stating the answer.
 ///
-/// Each test counts its fixture twice: once the way ForgeKeep counts now,
+/// Each test counts its fixture twice: once the way Plombir Git counts now,
 /// through [`super::gix_diff_numstat`] itself, and once the way it counted
 /// before the fix ([`numstat_before_the_fix`], which asks the opened repository
 /// for its algorithm the way `diff_resource_cache` used to be left to). That
@@ -2853,7 +2853,7 @@ mod diff_configuration_ownership_tests {
 
     /// Marks the child process spawned by
     /// [`the_numstat_ignores_the_hosts_git_configuration`]; also its only input.
-    const HOSTILE_HOST_CONFIG_CHILD: &str = "FORGEKEEP_TEST_HOSTILE_DIFF_CONFIG";
+    const HOSTILE_HOST_CONFIG_CHILD: &str = "PLOMBIR_GIT_TEST_HOSTILE_DIFF_CONFIG";
 
     /// The knob the card names, in whichever file it is planted. `histogram` is
     /// a real answer an operator might prefer for their own reading — it is
@@ -2863,7 +2863,7 @@ mod diff_configuration_ownership_tests {
 
     /// The driver name the host-configuration test binds `counts.txt` to
     /// through a global attributes file.
-    const HOSTILE_DRIVER: &str = "forgekeep-host-probe";
+    const HOSTILE_DRIVER: &str = "plombir-git-host-probe";
 
     /// What the repository's own configuration decides about the *patch* half if
     /// nobody states otherwise: the algorithm its hunks are computed with, and
@@ -2874,7 +2874,7 @@ mod diff_configuration_ownership_tests {
     const BASE_REV: &str = "refs/heads/main";
     const HEAD_REV: &str = "refs/heads/feature";
 
-    /// What the fixture below counts as under Myers, i.e. what ForgeKeep must
+    /// What the fixture below counts as under Myers, i.e. what Plombir Git must
     /// answer whatever the host or the repository prefers: two lines added, two
     /// removed.
     const MYERS_NUMSTAT: (i64, i64) = (2, 2);
@@ -2925,19 +2925,19 @@ mod diff_configuration_ownership_tests {
         worktree
     }
 
-    /// The count as ForgeKeep produces it: the production function, opening the
+    /// The count as Plombir Git produces it: the production function, opening the
     /// repository and stating its algorithm for itself.
-    fn numstat_forgekeeps_way(worktree: &Path) -> (i64, i64) {
+    fn numstat_plombir_git_way(worktree: &Path) -> (i64, i64) {
         let (_files, stats) = super::gix_diff_numstat(
             worktree,
             "refs/heads/main".to_string(),
             "refs/heads/feature".to_string(),
         )
-        .expect("ForgeKeep counts this fixture");
+        .expect("Plombir Git counts this fixture");
         (stats.total_additions, stats.total_deletions)
     }
 
-    /// The count as ForgeKeep produced it before `card_25afc5bcc044`: the same
+    /// The count as Plombir Git produced it before `card_25afc5bcc044`: the same
     /// walk, with the blob platform left holding the algorithm
     /// `diff_resource_cache` read out of the repository's configuration.
     ///
@@ -2984,7 +2984,7 @@ mod diff_configuration_ownership_tests {
         Ok(counts)
     }
 
-    /// The patch as ForgeKeep reads it now, split back into the per-file
+    /// The patch as Plombir Git reads it now, split back into the per-file
     /// entries `attach_patches` keys by path and counted line by line — the same
     /// two readers the API answer is built from, so what this measures is what a
     /// reviewer is shown above and below the numbers.
@@ -3020,7 +3020,7 @@ mod diff_configuration_ownership_tests {
         output.stdout_str()
     }
 
-    /// The patch as ForgeKeep read it before the fix: the argv as it was, run
+    /// The patch as Plombir Git read it before the fix: the argv as it was, run
     /// straight off the gateway.
     fn patch_the_old_way(worktree: &Path) -> String {
         patch_off_the_bare_gateway(
@@ -3037,7 +3037,7 @@ mod diff_configuration_ownership_tests {
         )
     }
 
-    /// The patch as [`super::forgekeep_patch_argv`] states it and *nothing else*
+    /// The patch as [`super::plombir_git_patch_argv`] states it and *nothing else*
     /// does: the same argv, run without the invocation policy wrapped around it
     /// in production.
     ///
@@ -3048,7 +3048,7 @@ mod diff_configuration_ownership_tests {
     /// right, so a probe that only drives the production reader reports a
     /// working fix about a half that no longer works.
     fn patch_from_the_argv_alone(worktree: &Path) -> String {
-        patch_off_the_bare_gateway(worktree, &super::forgekeep_patch_argv(BASE_REV, HEAD_REV))
+        patch_off_the_bare_gateway(worktree, &super::plombir_git_patch_argv(BASE_REV, HEAD_REV))
     }
 
     /// `card_4a21d30afb9a` — the numbers and the patch under them are two halves
@@ -3099,8 +3099,8 @@ mod diff_configuration_ownership_tests {
             "the patch argv does not state its path prefixes on its own:\n{stated}"
         );
 
-        let patch = super::forgekeep_patch_text(&worktree, BASE_REV, HEAD_REV)
-            .expect("ForgeKeep reads this fixture");
+        let patch = super::plombir_git_patch_text(&worktree, BASE_REV, HEAD_REV)
+            .expect("Plombir Git reads this fixture");
         assert_eq!(
             patch_numstat(&patch),
             MYERS_NUMSTAT,
@@ -3109,7 +3109,7 @@ mod diff_configuration_ownership_tests {
         );
         assert_eq!(
             patch_numstat(&patch),
-            numstat_forgekeeps_way(&worktree),
+            numstat_plombir_git_way(&worktree),
             "the two halves of one pull-request diff disagree: the numbers say one thing and \
              the patch printed under them says another:\n{patch}"
         );
@@ -3136,7 +3136,7 @@ mod diff_configuration_ownership_tests {
     /// gateway disarms the environment for every child it spawns, so the
     /// control half of this pair would not bite there.
     #[test]
-    fn the_patch_half_is_read_under_forgekeeps_own_git_configuration() {
+    fn the_patch_half_is_read_under_plombir_git_own_git_configuration() {
         let dir = tempfile::tempdir().expect("fixture directory");
         let worktree = algorithm_sensitive_fixture(dir.path());
         let attributes = dir.path().join("repository-gitattributes");
@@ -3153,8 +3153,8 @@ mod diff_configuration_ownership_tests {
              so this test would stay green with the bug in place:\n{control}"
         );
 
-        let patch = super::forgekeep_patch_text(&worktree, BASE_REV, HEAD_REV)
-            .expect("ForgeKeep reads this fixture");
+        let patch = super::plombir_git_patch_text(&worktree, BASE_REV, HEAD_REV)
+            .expect("Plombir Git reads this fixture");
         assert!(
             !patch.contains("Binary files"),
             "a `core.attributesFile` written into the repository configuration silenced the \
@@ -3163,12 +3163,12 @@ mod diff_configuration_ownership_tests {
         assert_eq!(
             patch_numstat(&patch),
             MYERS_NUMSTAT,
-            "the patch ForgeKeep publishes stopped counting the lines the change really \
+            "the patch Plombir Git publishes stopped counting the lines the change really \
              has:\n{patch}"
         );
 
         assert_eq!(
-            numstat_forgekeeps_way(&worktree),
+            numstat_plombir_git_way(&worktree),
             MYERS_NUMSTAT,
             "a `core.attributesFile` named by repository configuration silenced the numstat \
              half of a pull request"
@@ -3182,7 +3182,7 @@ mod diff_configuration_ownership_tests {
             algorithm_sensitive_fixture_with_attributes(dir.path(), Some("counts.txt -diff\n"));
 
         assert_eq!(
-            numstat_forgekeeps_way(&worktree),
+            numstat_plombir_git_way(&worktree),
             SILENCED_NUMSTAT,
             "the owned resource cache stopped reading committed `.gitattributes`"
         );
@@ -3190,12 +3190,12 @@ mod diff_configuration_ownership_tests {
 
     #[test]
     fn repository_diff_drivers_cannot_silence_numstat() {
-        const REPOSITORY_DRIVER: &str = "forgekeep-repository-probe";
+        const REPOSITORY_DRIVER: &str = "plombir-git-repository-probe";
 
         let dir = tempfile::tempdir().expect("fixture directory");
         let worktree = algorithm_sensitive_fixture_with_attributes(
             dir.path(),
-            Some("counts.txt diff=forgekeep-repository-probe\n"),
+            Some("counts.txt diff=plombir-git-repository-probe\n"),
         );
         plant_repository_config(
             &worktree,
@@ -3210,7 +3210,7 @@ mod diff_configuration_ownership_tests {
              teeth"
         );
         assert_eq!(
-            numstat_forgekeeps_way(&worktree),
+            numstat_plombir_git_way(&worktree),
             MYERS_NUMSTAT,
             "a `diff.<name>.binary` driver from repository configuration silenced numstat"
         );
@@ -3230,18 +3230,18 @@ mod diff_configuration_ownership_tests {
              no teeth"
         );
         assert_eq!(
-            numstat_forgekeeps_way(&worktree),
+            numstat_plombir_git_way(&worktree),
             MYERS_NUMSTAT,
             "a `core.bigFileThreshold` from repository configuration silenced numstat"
         );
     }
 
-    /// Configuration inside the repository ForgeKeep opened is the placement an
+    /// Configuration inside the repository Plombir Git opened is the placement an
     /// isolated open does *not* cover — repository-local config is loaded at
     /// every permission level — so here the stated algorithm, and only the
     /// stated algorithm, has to hold.
     #[test]
-    fn the_numstat_algorithm_comes_from_forgekeep_not_from_the_repository_configuration() {
+    fn the_numstat_algorithm_comes_from_plombir_git_not_from_the_repository_configuration() {
         let dir = tempfile::tempdir().expect("fixture directory");
         let worktree = algorithm_sensitive_fixture(dir.path());
         plant_repository_config(&worktree, HOSTILE_DIFF_CONFIG);
@@ -3254,7 +3254,7 @@ mod diff_configuration_ownership_tests {
              test would stay green with the bug in place"
         );
         assert_eq!(
-            numstat_forgekeeps_way(&worktree),
+            numstat_plombir_git_way(&worktree),
             MYERS_NUMSTAT,
             "diff.algorithm written into the repository configuration changed the numbers a \
              pull request reports"
@@ -3263,7 +3263,7 @@ mod diff_configuration_ownership_tests {
 
     /// The half the isolated open is responsible for, and it still has its own
     /// teeth after the pin: a `diff` driver reaches *past*
-    /// [`super::forgekeep_diff_algorithm`], because `gix` lets a driver named by
+    /// [`super::plombir_git_diff_algorithm`], because `gix` lets a driver named by
     /// an attribute override the platform's algorithm — and `diff.<name>.binary`
     /// overrides the line count altogether. The host can name one through
     /// `core.attributesFile`, which is a global attributes file and therefore a
@@ -3340,7 +3340,7 @@ mod diff_configuration_ownership_tests {
              stay green with the bug in place:\nstdout:\n{stdout}"
         );
         assert_eq!(
-            reported("forgekeep="),
+            reported("plombir-git="),
             rendered(MYERS_NUMSTAT),
             "the host's git configuration changed the numbers a pull request reports:\nstdout:\n\
              {stdout}"
@@ -3369,8 +3369,8 @@ mod diff_configuration_ownership_tests {
             Err(error) => println!("old-way=failed: {error}"),
         }
 
-        let (additions, deletions) = numstat_forgekeeps_way(&worktree);
-        println!("forgekeep={additions},{deletions}");
+        let (additions, deletions) = numstat_plombir_git_way(&worktree);
+        println!("plombir-git={additions},{deletions}");
     }
 
     /// The behavioural tests drive the production function and redden for each
@@ -3411,18 +3411,18 @@ mod diff_configuration_ownership_tests {
             rust_source::production_function_call_sites(
                 source,
                 "gix_diff_numstat",
-                &["forgekeep_diff_resource_cache"]
+                &["plombir_git_diff_resource_cache"]
             )
             .len(),
             1,
-            "`gix_diff_numstat` no longer builds exactly one resource cache from ForgeKeep's \
+            "`gix_diff_numstat` no longer builds exactly one resource cache from Plombir Git's \
              own policy"
         );
         assert_eq!(
             rust_source::production_function_call_sites(
                 source,
-                "forgekeep_diff_resource_cache",
-                &["forgekeep_diff_algorithm"]
+                "plombir_git_diff_resource_cache",
+                &["plombir_git_diff_algorithm"]
             )
             .len(),
             1,
@@ -3432,7 +3432,7 @@ mod diff_configuration_ownership_tests {
         assert!(
             rust_source::production_function_call_sites(
                 source,
-                "forgekeep_diff_resource_cache",
+                "plombir_git_diff_resource_cache",
                 &["diff_resource_cache"]
             )
             .is_empty(),
@@ -4527,7 +4527,7 @@ enum RebaseReplay {
 /// fork head it fetched by object id, which no ref in this repository names.
 ///
 /// Every step runs through [`rg_git::invocation::local`], the subprocess twin of the isolated
-/// open the `gix` strategies use: what a replay produces has to be a property of ForgeKeep and
+/// open the `gix` strategies use: what a replay produces has to be a property of Plombir Git and
 /// not of `/etc/gitconfig`, of the `~/.gitconfig` of the account the server runs under, or of
 /// the server process's own `GIT_*` (card_dfee2b7016b9). The identity below already said *who*
 /// signed the replay; the policy says what the replay is.
@@ -4804,7 +4804,7 @@ fn get_ref_sha(repo_path: &std::path::Path, branch: &str) -> Result<String> {
 
 // ── Gix merge helpers ───────────────────────────────────────────────────
 
-/// The identity ForgeKeep signs merge commits with.
+/// The identity Plombir Git signs merge commits with.
 ///
 /// Load-bearing, not cosmetic: `gix`'s plain `Repository::commit` resolves the
 /// author and committer from the host's git configuration, and refuses with
@@ -4815,11 +4815,11 @@ fn get_ref_sha(repo_path: &std::path::Path, branch: &str) -> Result<String> {
 /// have run `git config --global` on that machine.
 ///
 /// Both halves are the same bug: the commit's identity must come from
-/// ForgeKeep, not from the host it runs on. The rebase strategy already passed
+/// Plombir Git, not from the host it runs on. The rebase strategy already passed
 /// this identity to `git rebase` explicitly; these constants are now the single
 /// place all three strategies read it from.
-const MERGE_SIGNATURE_NAME: &str = "ForgeKeep";
-const MERGE_SIGNATURE_EMAIL: &str = "noreply@forgekeep.local";
+const MERGE_SIGNATURE_NAME: &str = "Plombir Git";
+const MERGE_SIGNATURE_EMAIL: &str = "noreply@plombir-git.local";
 
 /// [`MERGE_SIGNATURE_NAME`] / [`MERGE_SIGNATURE_EMAIL`] as a `gix` signature
 /// stamped at the current time.
@@ -4877,7 +4877,7 @@ fn gix_delete_ref(repo_path: &std::path::Path, ref_name: &str) -> Result<()> {
 /// Creates a merge commit with two parents (current HEAD + `head_ref`).
 fn gix_merge_no_ff(repo_path: &std::path::Path, head_ref: &str, message: &str) -> Result<String> {
     // `rg_git::repository::open`, not `gix::open`: the bytes of a merge must not
-    // depend on the machine — see [`forgekeep_merge_options`].
+    // depend on the machine — see [`plombir_git_merge_options`].
     let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
@@ -4943,7 +4943,7 @@ fn gix_squash_merge(repo_path: &std::path::Path, head_ref: &str, message: &str) 
     Ok(commit_id.detach().to_string())
 }
 
-/// The merge semantics ForgeKeep guarantees, written down instead of looked up.
+/// The merge semantics Plombir Git guarantees, written down instead of looked up.
 ///
 /// `repo.tree_merge_options()` is the natural-looking call and the wrong one:
 /// it *reads* `merge.renames`, `merge.renameLimit`, `diff.renames`,
@@ -4952,7 +4952,7 @@ fn gix_squash_merge(repo_path: &std::path::Path, head_ref: &str, message: &str) 
 /// already puts the host's `/etc/gitconfig`, `~/.gitconfig` and `GIT_*` out of
 /// reach, but a lookup would still leave the answer to "what tree does this
 /// pull request merge to" as a property of a config file rather than of
-/// ForgeKeep — and that answer has to be identical on every instance.
+/// Plombir Git — and that answer has to be identical on every instance.
 ///
 /// The values below are git's own defaults, i.e. exactly what an unconfigured
 /// host produced before: rename tracking on at 50% similarity with a
@@ -4961,11 +4961,11 @@ fn gix_squash_merge(repo_path: &std::path::Path, head_ref: &str, message: &str) 
 /// a knob gix adds later then breaks the build here instead of quietly
 /// defaulting to whatever the upstream default happens to be.
 ///
-/// This owns the tree options; [`forgekeep_merge_resource_cache`] separately
+/// This owns the tree options; [`plombir_git_merge_resource_cache`] separately
 /// owns the blob platform that applies them. Both halves are required because
 /// gix's convenience `Repository::merge_commits` constructs that platform from
 /// repository configuration internally.
-fn forgekeep_merge_options() -> gix::merge::commit::Options {
+fn plombir_git_merge_options() -> gix::merge::commit::Options {
     use gix::merge::blob::builtin_driver::text;
 
     gix::merge::plumbing::tree::Options {
@@ -4992,7 +4992,7 @@ fn forgekeep_merge_options() -> gix::merge::commit::Options {
     .into()
 }
 
-/// Build the blob-merge platform from ForgeKeep-owned policy.
+/// Build the blob-merge platform from Plombir Git-owned policy.
 ///
 /// `Repository::merge_resource_cache` deliberately follows Git configuration:
 /// repository-local `merge.default`, `merge.renormalize`, custom
@@ -5001,28 +5001,28 @@ fn forgekeep_merge_options() -> gix::merge::commit::Options {
 /// must instead depend only on committed attributes and the explicit options
 /// below. Named attributes still select gix's built-in `text`, `binary` and
 /// `union` drivers; no command from `.git/config` is admitted.
-fn forgekeep_merge_resource_cache(repo: &gix::Repository) -> Result<gix::merge::blob::Platform> {
+fn plombir_git_merge_resource_cache(repo: &gix::Repository) -> Result<gix::merge::blob::Platform> {
     let mut worktree_filter = gix::filter::plumbing::Pipeline::default();
     worktree_filter.options_mut().object_hash = repo.object_hash();
     let filter = gix::merge::blob::Pipeline::new(
         Default::default(),
         worktree_filter,
         gix::merge::blob::pipeline::Options {
-            large_file_threshold_bytes: FORGEKEEP_LARGE_FILE_THRESHOLD_BYTES,
+            large_file_threshold_bytes: PLOMBIR_GIT_LARGE_FILE_THRESHOLD_BYTES,
         },
     );
 
     Ok(gix::merge::blob::Platform::new(
         filter,
         gix::merge::blob::pipeline::Mode::ToGit,
-        forgekeep_committed_attribute_stack(repo)?,
+        plombir_git_committed_attribute_stack(repo)?,
         Vec::new(),
         Default::default(),
     ))
 }
 
 /// Merge two commits through gix plumbing while owning both resource caches.
-fn forgekeep_merge_commits<'repo>(
+fn plombir_git_merge_commits<'repo>(
     repo: &'repo gix::Repository,
     our_commit: gix::Id<'repo>,
     their_commit: gix::Id<'repo>,
@@ -5030,8 +5030,8 @@ fn forgekeep_merge_commits<'repo>(
 ) -> Result<gix::merge::plumbing::commit::Outcome<'repo>> {
     use gix::prelude::ObjectIdExt as _;
 
-    let mut diff_cache = forgekeep_diff_resource_cache(repo)?;
-    let mut blob_merge = forgekeep_merge_resource_cache(repo)?;
+    let mut diff_cache = plombir_git_diff_resource_cache(repo)?;
+    let mut blob_merge = plombir_git_merge_resource_cache(repo)?;
     let commit_graph = repo.commit_graph_if_enabled()?;
     let mut graph = repo.revision_graph(commit_graph.as_ref());
 
@@ -5044,7 +5044,7 @@ fn forgekeep_merge_commits<'repo>(
         &mut blob_merge,
         repo,
         &mut |id| id.to_owned().attach(repo).shorten_or_id().to_string(),
-        forgekeep_merge_options().into(),
+        plombir_git_merge_options().into(),
     )?)
 }
 
@@ -5077,7 +5077,7 @@ fn gix_merge_commits_to_tree<'repo>(
         ancestor: None, // auto-determined from merge-base
     };
 
-    let mut outcome = forgekeep_merge_commits(repo, our_commit, their_commit, labels)
+    let mut outcome = plombir_git_merge_commits(repo, our_commit, their_commit, labels)
         .map_err(|e| anyhow::anyhow!("merge failed: {}", e))?;
 
     // Check for conflicts git would leave to a human — see the note above for
@@ -5324,12 +5324,12 @@ mod number_allocation_tests {
 }
 
 /// `card_318ec3e56901` — the tree a pull request merges to must be a property of
-/// ForgeKeep, not of the machine the instance was deployed on.
+/// Plombir Git, not of the machine the instance was deployed on.
 ///
 /// The three ownership boundaries use different probes:
 ///
 /// * the merge *options* (`merge.renames`, `merge.conflictStyle`,
-///   `diff.algorithm`) are ForgeKeep's own values now, so they hold even against
+///   `diff.algorithm`) are Plombir Git's own values now, so they hold even against
 ///   configuration written inside the repository — the one placement an isolated
 ///   open cannot filter out;
 /// * the blob-merge platform ignores repository-local `merge.default`,
@@ -5337,7 +5337,7 @@ mod number_allocation_tests {
 /// * committed `.gitattributes` remains authoritative, including its built-in
 ///   merge-driver selection.
 ///
-/// Each test merges its fixture twice: once the way ForgeKeep merges now, and
+/// Each test merges its fixture twice: once the way Plombir Git merges now, and
 /// once the way it merged before (`gix::open` + `repo.tree_merge_options()`,
 /// kept alive as [`merged_tree_the_old_way`]). That second half is what proves
 /// the planted configuration genuinely reaches a merge — without it, "the tree
@@ -5364,21 +5364,21 @@ mod merge_configuration_ownership_tests {
 
     /// Marks the child process spawned by
     /// [`merge_ignores_the_hosts_git_configuration`]; also its only input.
-    const HOSTILE_HOST_CONFIG_CHILD: &str = "FORGEKEEP_TEST_HOSTILE_HOST_CONFIG";
+    const HOSTILE_HOST_CONFIG_CHILD: &str = "PLOMBIR_GIT_TEST_HOSTILE_HOST_CONFIG";
 
     /// What an operator might have in `~/.gitconfig` for their own convenience.
     /// `merge.default` is the half that only an isolated open can deny —
-    /// ForgeKeep's explicit options never see it, because `gix` reads it while
+    /// Plombir Git's explicit options never see it, because `gix` reads it while
     /// building the blob-merge platform inside `merge_commits`.
     const HOSTILE_HOST_CONFIG: &str =
         "[merge]\n\trenames = false\n\tconflictStyle = diff3\n\tdefault = binary\n";
 
     /// The two knobs the card names, in the placement that survives an isolated
-    /// open. Only ForgeKeep owning its options can answer these.
+    /// open. Only Plombir Git owning its options can answer these.
     const HOSTILE_REPOSITORY_CONFIG: &str = "[merge]\n\trenames = false\n\tconflictStyle = diff3\n";
     const HOSTILE_REPOSITORY_MERGE_DEFAULT: &str = "[merge]\n\tdefault = binary\n";
     const HOSTILE_REPOSITORY_DRIVER: &str =
-        "[merge \"operator-owned\"]\n\tdriver = forgekeep-test-command-that-does-not-exist %O %A %B\n";
+        "[merge \"operator-owned\"]\n\tdriver = plombir-git-test-command-that-does-not-exist %O %A %B\n";
 
     pub(super) fn git(worktree: &Path, args: &[&str]) {
         let output = rg_git::cli_gateway::global_gateway()
@@ -5403,10 +5403,10 @@ mod merge_configuration_ownership_tests {
         let worktree = root.join("repo");
         std::fs::create_dir_all(&worktree).expect("fixture directory");
         git(&worktree, &["init", "-q", "-b", "main"]);
-        git(&worktree, &["config", "user.name", "ForgeKeep Test"]);
+        git(&worktree, &["config", "user.name", "Plombir Git Test"]);
         git(
             &worktree,
-            &["config", "user.email", "forgekeep@example.test"],
+            &["config", "user.email", "plombir-git@example.test"],
         );
         git(&worktree, &["config", "commit.gpgsign", "false"]);
         git(&worktree, &["config", "core.autocrlf", "false"]);
@@ -5519,21 +5519,21 @@ mod merge_configuration_ownership_tests {
         Ok(tree)
     }
 
-    /// The merge as ForgeKeep performs it: the repository opened through
+    /// The merge as Plombir Git performs it: the repository opened through
     /// `rg_git::repository::open`, the options stated by
-    /// [`super::forgekeep_merge_options`].
-    fn merged_tree_forgekeeps_way(worktree: &Path) -> String {
+    /// [`super::plombir_git_merge_options`].
+    fn merged_tree_plombir_git_way(worktree: &Path) -> String {
         let repo = rg_git::repository::open(worktree).expect("open the fixture");
         let our = repo.rev_parse_single("HEAD").expect("our commit");
         let theirs = repo
             .rev_parse_single("refs/heads/feature")
             .expect("their commit");
         super::gix_merge_commits_to_tree(&repo, our, theirs, "refs/heads/feature")
-            .expect("ForgeKeep merges this fixture")
+            .expect("Plombir Git merges this fixture")
             .to_string()
     }
 
-    /// The merge as ForgeKeep performed it before `card_318ec3e56901`: an open
+    /// The merge as Plombir Git performed it before `card_318ec3e56901`: an open
     /// that reaches the host, and options read back out of the configuration.
     /// Only the "this probe has teeth" half of each test calls it.
     fn merged_tree_the_old_way(worktree: &Path) -> anyhow::Result<String> {
@@ -5542,14 +5542,14 @@ mod merge_configuration_ownership_tests {
         merge_tree(&repo, options)
     }
 
-    /// Configuration inside the repository ForgeKeep opened is the placement an
+    /// Configuration inside the repository Plombir Git opened is the placement an
     /// isolated open does *not* cover — repository-local config is loaded at
     /// every permission level — so here the merge options, and only the merge
     /// options, have to hold.
     #[test]
-    fn merge_options_come_from_forgekeep_not_from_the_repository_configuration() {
+    fn merge_options_come_from_plombir_git_not_from_the_repository_configuration() {
         let clean_dir = tempfile::tempdir().expect("baseline fixture directory");
-        let baseline = merged_tree_forgekeeps_way(&rename_fixture(clean_dir.path()));
+        let baseline = merged_tree_plombir_git_way(&rename_fixture(clean_dir.path()));
 
         let dir = tempfile::tempdir().expect("fixture directory");
         let worktree = rename_fixture(dir.path());
@@ -5562,7 +5562,7 @@ mod merge_configuration_ownership_tests {
              would stay green with the bug in place"
         );
         assert_eq!(
-            merged_tree_forgekeeps_way(&worktree),
+            merged_tree_plombir_git_way(&worktree),
             baseline,
             "merge.* written into the repository configuration changed the merged tree"
         );
@@ -5574,7 +5574,7 @@ mod merge_configuration_ownership_tests {
     #[test]
     fn merge_resource_cache_ignores_repository_merge_default() {
         let clean_dir = tempfile::tempdir().expect("baseline fixture directory");
-        let baseline = merged_tree_forgekeeps_way(&content_merge_fixture(clean_dir.path()));
+        let baseline = merged_tree_plombir_git_way(&content_merge_fixture(clean_dir.path()));
 
         let dir = tempfile::tempdir().expect("fixture directory");
         let worktree = content_merge_fixture(dir.path());
@@ -5582,14 +5582,14 @@ mod merge_configuration_ownership_tests {
         let repo = rg_git::repository::open(&worktree).expect("open the fixture");
 
         assert_ne!(
-            merge_tree(&repo, super::forgekeep_merge_options())
+            merge_tree(&repo, super::plombir_git_merge_options())
                 .expect("the repository-owned cache still merges"),
             baseline,
             "the planted `merge.default = binary` never reached gix's repository cache, so \
              this test would stay green with the bug in place"
         );
         assert_eq!(
-            merged_tree_forgekeeps_way(&worktree),
+            merged_tree_plombir_git_way(&worktree),
             baseline,
             "repository-local `merge.default` changed the pull-request merge tree"
         );
@@ -5600,20 +5600,20 @@ mod merge_configuration_ownership_tests {
         let dir = tempfile::tempdir().expect("fixture directory");
         let worktree = attributed_content_merge_fixture(dir.path(), "union");
         let repo = rg_git::repository::open(&worktree).expect("open the fixture");
-        let expected = merge_tree(&repo, super::forgekeep_merge_options())
+        let expected = merge_tree(&repo, super::plombir_git_merge_options())
             .expect("gix's repository cache honours the committed union driver");
 
         assert_eq!(
-            merged_tree_forgekeeps_way(&worktree),
+            merged_tree_plombir_git_way(&worktree),
             expected,
-            "ForgeKeep's owned cache dropped the committed `merge=union` attribute"
+            "Plombir Git's owned cache dropped the committed `merge=union` attribute"
         );
     }
 
     #[test]
     fn repository_configured_merge_drivers_are_not_executed() {
         let clean_dir = tempfile::tempdir().expect("baseline fixture directory");
-        let baseline = merged_tree_forgekeeps_way(&attributed_content_merge_fixture(
+        let baseline = merged_tree_plombir_git_way(&attributed_content_merge_fixture(
             clean_dir.path(),
             "operator-owned",
         ));
@@ -5624,12 +5624,12 @@ mod merge_configuration_ownership_tests {
         let repo = rg_git::repository::open(&worktree).expect("open the fixture");
 
         assert!(
-            merge_tree(&repo, super::forgekeep_merge_options()).is_err(),
+            merge_tree(&repo, super::plombir_git_merge_options()).is_err(),
             "the configured driver command never reached gix's repository cache, so this \
-             test would stay green if ForgeKeep imported configured drivers again"
+             test would stay green if Plombir Git imported configured drivers again"
         );
         assert_eq!(
-            merged_tree_forgekeeps_way(&worktree),
+            merged_tree_plombir_git_way(&worktree),
             baseline,
             "a merge driver from repository configuration changed the pull-request tree"
         );
@@ -5643,7 +5643,7 @@ mod merge_configuration_ownership_tests {
     #[test]
     fn merge_ignores_the_hosts_git_configuration() {
         let clean_dir = tempfile::tempdir().expect("baseline fixture directory");
-        let baseline = merged_tree_forgekeeps_way(&content_merge_fixture(clean_dir.path()));
+        let baseline = merged_tree_plombir_git_way(&content_merge_fixture(clean_dir.path()));
 
         let dir = tempfile::tempdir().expect("host config directory");
         let system = dir.path().join("system-gitconfig");
@@ -5694,7 +5694,7 @@ mod merge_configuration_ownership_tests {
              stay green with the bug in place:\nstdout:\n{stdout}"
         );
         assert_eq!(
-            reported("forgekeep="),
+            reported("plombir-git="),
             baseline,
             "the host's merge.* changed the merged tree:\nstdout:\n{stdout}"
         );
@@ -5717,10 +5717,10 @@ mod merge_configuration_ownership_tests {
             Ok(tree) => println!("old-way={tree}"),
             Err(error) => println!("old-way=failed: {error}"),
         }
-        println!("forgekeep={}", merged_tree_forgekeeps_way(&worktree));
+        println!("plombir-git={}", merged_tree_plombir_git_way(&worktree));
     }
 
-    /// The behavioural tests above drive `forgekeep_merge_options` and
+    /// The behavioural tests above drive `plombir_git_merge_options` and
     /// `rg_git::repository::open` directly, because only a tree id is
     /// comparable against the old way. That leaves the two production call
     /// sites uncovered — reverting either of them to a bare `gix::open` would
@@ -5732,7 +5732,7 @@ mod merge_configuration_ownership_tests {
     /// absence: a census that has stopped finding the function at all would
     /// otherwise report "no bare open here" about a function it never read.
     #[test]
-    fn the_merge_path_opens_and_configures_through_forgekeep() {
+    fn the_merge_path_opens_and_configures_through_plombir_git() {
         let source = include_str!("service.rs");
 
         for opener in ["gix_merge_no_ff", "gix_squash_merge"] {
@@ -5760,11 +5760,11 @@ mod merge_configuration_ownership_tests {
             rust_source::production_function_call_sites(
                 source,
                 "gix_merge_commits_to_tree",
-                &["forgekeep_merge_commits"]
+                &["plombir_git_merge_commits"]
             )
             .len(),
             1,
-            "`gix_merge_commits_to_tree` no longer uses ForgeKeep's owned merge path, or \
+            "`gix_merge_commits_to_tree` no longer uses Plombir Git's owned merge path, or \
              this census has stopped reading the function"
         );
         assert!(
@@ -5781,17 +5781,17 @@ mod merge_configuration_ownership_tests {
         assert_eq!(
             rust_source::production_function_call_sites(
                 source,
-                "forgekeep_merge_commits",
-                &["forgekeep_merge_resource_cache"]
+                "plombir_git_merge_commits",
+                &["plombir_git_merge_resource_cache"]
             )
             .len(),
             1,
-            "the plumbing merge no longer constructs exactly one ForgeKeep-owned blob cache"
+            "the plumbing merge no longer constructs exactly one Plombir Git-owned blob cache"
         );
         assert!(
             rust_source::production_function_call_sites(
                 source,
-                "forgekeep_merge_commits",
+                "plombir_git_merge_commits",
                 &["merge_resource_cache"]
             )
             .is_empty(),
@@ -5808,7 +5808,7 @@ mod merge_configuration_ownership_tests {
 /// subprocess half: `git rebase` runs as a child process, and a child process
 /// reads `/etc/gitconfig`, the `~/.gitconfig` of the account the server runs
 /// under, and the server's own `GIT_*`. The identity that signs the replay was
-/// already ForgeKeep's; what the replay *is* was the host's.
+/// already Plombir Git's; what the replay *is* was the host's.
 ///
 /// The two knobs the card proposed — `merge.conflictStyle = diff3` and
 /// `core.autocrlf = true` — were measured on git 2.43.0 and change nothing
@@ -5842,12 +5842,12 @@ mod rebase_configuration_ownership_tests {
     /// Marks the child process spawned by
     /// [`rebase_ignores_the_hosts_git_configuration`], and carries the one path
     /// it cannot work out for itself.
-    const HOSTILE_HOST_CONFIG_CHILD: &str = "FORGEKEEP_TEST_HOSTILE_REBASE_HOST_CONFIG";
-    const HOOK_MARKER: &str = "FORGEKEEP_TEST_REBASE_HOOK_MARKER";
+    const HOSTILE_HOST_CONFIG_CHILD: &str = "PLOMBIR_GIT_TEST_HOSTILE_REBASE_HOST_CONFIG";
+    const HOOK_MARKER: &str = "PLOMBIR_GIT_TEST_REBASE_HOOK_MARKER";
 
     /// A setting nothing reads, so planting it changes no behaviour — what it
     /// measures is whether the host could have set one at all.
-    const HOST_PROBE_KEY: &str = "forgekeep.hostprobe";
+    const HOST_PROBE_KEY: &str = "plombir-git.hostprobe";
     const HOST_PROBE_VALUE: &str = "the-host-decided-this";
 
     fn hostile_host_config(hooks: &Path) -> String {
@@ -5919,14 +5919,14 @@ mod rebase_configuration_ownership_tests {
         served
     }
 
-    /// The rebase merge as ForgeKeep performs it, reported as the tree it wrote.
+    /// The rebase merge as Plombir Git performs it, reported as the tree it wrote.
     ///
     /// The tree rather than the commit because a commit id also carries the
     /// times the replay happened to run at, which differ between two runs of the
     /// same correct code.
-    fn rebased_tree_forgekeeps_way(served: &Path) -> String {
+    fn rebased_tree_plombir_git_way(served: &Path) -> String {
         let head = super::git_rebase_merge(served, "main", "refs/heads/feature")
-            .expect("ForgeKeep rebases this fixture");
+            .expect("Plombir Git rebases this fixture");
         git_stdout(served, &["rev-parse", &format!("{head}^{{tree}}")])
     }
 
@@ -5943,7 +5943,7 @@ mod rebase_configuration_ownership_tests {
             .collect()
     }
 
-    /// The same replay as ForgeKeep performed it before `card_dfee2b7016b9`: the
+    /// The same replay as Plombir Git performed it before `card_dfee2b7016b9`: the
     /// gateway, with an identity and the host's configuration in reach. Only the
     /// "this probe has teeth" half of the test calls it.
     ///
@@ -6032,7 +6032,7 @@ mod rebase_configuration_ownership_tests {
     #[test]
     fn rebase_ignores_the_hosts_git_configuration() {
         let clean_dir = tempfile::tempdir().expect("baseline fixture directory");
-        let baseline = rebased_tree_forgekeeps_way(&whitespace_fixture(clean_dir.path()));
+        let baseline = rebased_tree_plombir_git_way(&whitespace_fixture(clean_dir.path()));
 
         let dir = tempfile::tempdir().expect("host config directory");
         let (hooks, marker) = planted_hooks(dir.path());
@@ -6054,7 +6054,7 @@ mod rebase_configuration_ownership_tests {
             // The placement neither `GIT_CONFIG_NOSYSTEM` nor `GIT_CONFIG_GLOBAL`
             // answers: indexed configuration injected straight into the
             // environment. Only removing the inherited `GIT_*` closes it, so the
-            // key is one ForgeKeep deliberately does not pin — a pinned key would
+            // key is one Plombir Git deliberately does not pin — a pinned key would
             // be answered by the command line and prove nothing about removal.
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", HOST_PROBE_KEY)
@@ -6100,13 +6100,13 @@ mod rebase_configuration_ownership_tests {
              proves anything:\nstdout:\n{stdout}"
         );
         assert_eq!(
-            reported("forgekeep="),
+            reported("plombir-git="),
             baseline,
             "the host's rebase configuration changed what the pull request merged to:\
              \nstdout:\n{stdout}"
         );
         assert_eq!(
-            reported("forgekeep-hooks="),
+            reported("plombir-git-hooks="),
             "false",
             "the host's `core.hooksPath` ran the operator's scripts inside a server-side \
              rebase merge:\nstdout:\n{stdout}"
@@ -6118,7 +6118,7 @@ mod rebase_configuration_ownership_tests {
              the inherited environment:\nstdout:\n{stdout}"
         );
         assert_eq!(
-            reported("injected-forgekeep="),
+            reported("injected-plombir-git="),
             "",
             "configuration injected through the server process's own `GIT_*` still reaches \
              a repository-local git subprocess:\nstdout:\n{stdout}"
@@ -6156,8 +6156,8 @@ mod rebase_configuration_ownership_tests {
         println!("old-way-hooks={}", hooks_ran(&marker));
 
         clear(&marker);
-        println!("forgekeep={}", rebased_tree_forgekeeps_way(&served));
-        println!("forgekeep-hooks={}", hooks_ran(&marker));
+        println!("plombir-git={}", rebased_tree_plombir_git_way(&served));
+        println!("plombir-git-hooks={}", hooks_ran(&marker));
 
         let probe = ["config", "--get", HOST_PROBE_KEY];
         let host = host_environment();
@@ -6174,7 +6174,7 @@ mod rebase_configuration_ownership_tests {
                 .trim()
         );
         println!(
-            "injected-forgekeep={}",
+            "injected-plombir-git={}",
             rg_git::invocation::local(gateway())
                 .run(&probe, Some(&served))
                 .expect("git must run")
@@ -6194,7 +6194,7 @@ mod rebase_configuration_ownership_tests {
     /// otherwise report "no raw gateway call here" about a function it never
     /// read.
     #[test]
-    fn the_rebase_path_runs_git_under_forgekeeps_configuration() {
+    fn the_rebase_path_runs_git_under_plombir_git_configuration() {
         let source = include_str!("service.rs");
 
         assert_eq!(
@@ -6421,7 +6421,7 @@ mod rebase_merge_status_tests {
             "hint:",
             "error:",
             "fatal:",
-            "forgekeep-rebase",
+            "plombir-git-rebase",
             ".git",
         ] {
             assert!(

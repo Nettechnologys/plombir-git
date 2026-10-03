@@ -316,7 +316,7 @@ mod update_delete_tests {
         fn new(label: &str) -> Self {
             Self {
                 path: std::env::temp_dir().join(format!(
-                    "forgekeep-board-update-{label}-{}.db",
+                    "plombir-git-board-update-{label}-{}.db",
                     uuid::Uuid::new_v4().simple()
                 )),
             }

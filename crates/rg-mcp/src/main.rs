@@ -1,18 +1,18 @@
-//! `forgekeep-mcp` – MCP server entry point.
+//! `plombir-git-mcp` – MCP server entry point.
 //!
 //! # Transports
 //! - **stdio** – run as subprocess of an AI agent.
 //!
-//! Over HTTP the same tools are served by the ForgeKeep server itself at
+//! Over HTTP the same tools are served by the Plombir Git server itself at
 //! `POST /api/v1/mcp`, with no local binary at all. Passing `--sse` exits with
 //! an error instead of silently starting a partial server.
 //!
 //! # Environment
 //! | Variable                        | Default                 | Notes                                      |
 //! |---------------------------------|-------------------------|--------------------------------------------|
-//! | `FORGEKEEP_URL`                 | `http://localhost:8080` | ForgeKeep API base                         |
-//! | `FORGEKEEP_PAT`                 | _(none)_                | Bearer token for API auth                  |
-//! | `FORGEKEEP_ALLOW_INSECURE_HTTP` | `false`                 | Explicit opt-in for remote plaintext HTTP |
+//! | `PLOMBIR_GIT_URL`                 | `http://localhost:8080` | Plombir Git API base                         |
+//! | `PLOMBIR_GIT_PAT`                 | _(none)_                | Bearer token for API auth                  |
+//! | `PLOMBIR_GIT_ALLOW_INSECURE_HTTP` | `false`                 | Explicit opt-in for remote plaintext HTTP |
 
 use std::io::{self, BufRead, BufWriter, Write};
 use std::io::{stdin, stdout};
@@ -71,6 +71,8 @@ fn write_json<W: Write>(w: &mut W, resp: &JsonRpcResponse) -> io::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    rg_process::refuse_retired_environment()?;
+
     // Tools/resources are dispatched synchronously but perform async reqwest
     // calls via `Handle::current().block_on(...)`. Create and enter a runtime
     // for the whole stdio loop so those handlers never panic due to a missing
@@ -95,7 +97,7 @@ fn main() -> anyhow::Result<()> {
 
     if std::env::args().any(|a| a == "--sse") {
         anyhow::bail!(
-            "SSE transport is not implemented; use stdio by running forgekeep-mcp without --sse, or point an HTTP MCP client at <server>/api/v1/mcp"
+            "SSE transport is not implemented; use stdio by running plombir-git-mcp without --sse, or point an HTTP MCP client at <server>/api/v1/mcp"
         );
     }
 

@@ -198,7 +198,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('issues.title')} · {owner}/{repo} · ForgeKeep</title>
+  <title>{t('issues.title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

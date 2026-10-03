@@ -76,7 +76,7 @@ mcp() {
 }
 
 # The server's own refusal message inside a failed tool's
-# `Error: ForgeKeep API error: status=N, body={...}` text.
+# `Error: Plombir Git API error: status=N, body={...}` text.
 refusal() {
   python3 -c '
 import json, sys

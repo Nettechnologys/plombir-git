@@ -42,7 +42,7 @@ pub struct Model {
     /// Absent, the matcher falls back to the repository's *current* default
     /// branch, so the retry of a PR into `develop` is judged as a PR into
     /// `main`: its workflow matches nothing and the run silently falls through
-    /// to `.forgekeep-ci.yml` — a different graph under the same `201`.
+    /// to `.plombir-git-ci.yml` — a different graph under the same `201`.
     pub base_branch: Option<String>,
     /// Where the ref stood before the event that produced this run, for the
     /// `paths:` / `paths-ignore:` filters, or `None` for a producer that had no

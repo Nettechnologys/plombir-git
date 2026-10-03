@@ -1,4 +1,4 @@
-//! The one place a `forgekeep` subcommand decides what a missing repository
+//! The one place a `plombir-git` subcommand decides what a missing repository
 //! storage root means.
 //!
 //! [`crate::config::DEFAULT_REPO_ROOT`] is *relative* (`./repos`), and the
@@ -12,7 +12,7 @@
 //! `import` is where that becomes data loss rather than a stray directory. It
 //! writes the repository's row into the *real* database (`--db-url` or
 //! `--config` was right; `--repo-root` was forgotten) and clones the git
-//! repository into a root `forgekeep serve` never looks at. The instance then
+//! repository into a root `plombir-git serve` never looks at. The instance then
 //! lists a repository whose git directory nobody can open, and no step on the
 //! way reported anything (card_cc8259eba428).
 //!
@@ -109,7 +109,7 @@ pub(crate) async fn check_repo_root_presence(
          the current directory, so a command started somewhere else — `docker exec` without \
          `-w`, a cron entry, another shell — addresses a root that is not the one this instance \
          serves from. Nothing was created: a repository written there would have its row in the \
-         database and its git directory where `forgekeep serve` never looks.\n  hint: pass \
+         database and its git directory where `plombir-git serve` never looks.\n  hint: pass \
          `--repo-root` or `--config`, or run from the data directory \
          (`docker exec -w /data ...`)",
         repo_root.display(),

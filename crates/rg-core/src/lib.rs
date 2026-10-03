@@ -1,4 +1,4 @@
-//! ForgeKeep core business logic.
+//! Plombir Git core business logic.
 //!
 //! Handles users, repositories, authentication, access control,
 //! issues, pull requests, wiki, LFS, webhooks, code reviews,

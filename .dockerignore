@@ -1,4 +1,4 @@
-# === ForgeKeep .dockerignore ===
+# === Plombir Git .dockerignore ===
 # Exclude everything that shouldn't be in Docker build context.
 
 # Rust build artifacts (huge)

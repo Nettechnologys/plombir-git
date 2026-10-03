@@ -43,7 +43,7 @@ const scriptsDir = dirname(fileURLToPath(import.meta.url));
 // The mutation stand points this at a fixture tree. Everything below is
 // relative to it, so the stand exercises the real sweep rather than a copy of
 // it — which is the only way a fixture can say anything about this file.
-const override = process.env.FORGEKEEP_AUTHZ_DIALECT_ROOT;
+const override = process.env.PLOMBIR_GIT_AUTHZ_DIALECT_ROOT;
 const root = override ? resolve(override) : resolve(scriptsDir, '..');
 const cratesDir = resolve(root, 'crates');
 
@@ -62,7 +62,7 @@ const MIN_AUTHZ_NAMES = 20;
 // floor — and only it: without the root override the workspace number is not
 // negotiable, or the floor becomes an environment variable away from useless.
 const minAuthzNames = override
-  ? Number(process.env.FORGEKEEP_AUTHZ_DIALECT_MIN ?? 0)
+  ? Number(process.env.PLOMBIR_GIT_AUTHZ_DIALECT_MIN ?? 0)
   : MIN_AUTHZ_NAMES;
 
 /** Every `.rs` file under `crates/`, as `{ path, relative }`. */

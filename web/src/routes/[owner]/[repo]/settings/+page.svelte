@@ -156,7 +156,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('settings.general')} · {owner}/{repo} · ForgeKeep</title>
+  <title>{t('settings.general')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="settings-page">

@@ -96,7 +96,7 @@
   },
   "home": {
     "tagline": "轻量级自托管 Git 服务",
-    "description": "ForgeKeep 是用 Rust 构建的轻量级 Git 托管平台，作为 Gitea 的现代替代品。单二进制部署，内存高效，功能完整。",
+    "description": "Plombir Git 是用 Rust 构建的轻量级 Git 托管平台，作为 Gitea 的现代替代品。单二进制部署，内存高效，功能完整。",
     "sign_up": "注册",
     "sign_in": "登录",
     "cta": {
@@ -104,7 +104,7 @@
       "create_account": "创建账号"
     },
     "features": {
-      "title": "为什么选择 ForgeKeep？",
+      "title": "为什么选择 Plombir Git？",
       "secure": "安全",
       "secure_desc": "Argon2 + JWT 认证",
       "fast_desc": "Rust 驱动的 HTTP 与 SSH",
@@ -156,7 +156,7 @@
   },
   "auth": {
     "login": {
-      "title": "登录 ForgeKeep",
+      "title": "登录 Plombir Git",
       "username": "用户名",
       "password": "密码",
       "submit": "登录",
@@ -683,7 +683,7 @@
     },
     "timeline": {
       "title": "审查时间线",
-      "system": "ForgeKeep",
+      "system": "Plombir Git",
       "pull_request_opened": "创建了此拉取请求",
       "review_comment": "发表了评论",
       "review_reply": "回复了审查线程",
@@ -783,7 +783,7 @@
     "condition_skipped": "因条件不满足而跳过",
     "no_pipelines": "暂无流水线。",
     "hint": "推送包含 {file} 的提交以触发流水线。",
-    "file": ".forgekeep-ci.yml",
+    "file": ".plombir-git-ci.yml",
     "detail_title": "流水线 #{id}",
     "commit": "提交",
     "branch": "分支",
@@ -820,7 +820,7 @@
     "backend_health_failed": "后端健康检查失败（HTTP {status}）。",
     "backend_unhealthy": "后端状态异常，部分接口可能不可用。",
     "backend_unreachable": "无法连接后端，请确认 8080 服务已启动。",
-    "session_check_failed": "ForgeKeep 无法验证当前会话。您尚未退出登录。",
+    "session_check_failed": "Plombir Git 无法验证当前会话。您尚未退出登录。",
     "session_check_retry": "重试",
     "session_check_retrying": "正在重试..."
   },

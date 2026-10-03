@@ -437,7 +437,7 @@ async fn list(
 /// Where an in-flight attachment is staged and what has to be true about it.
 const ATTACHMENT_STAGING_HINT: &str =
     "attachment uploads are staged in `.tmp/attachments/` under the `[server].repo_root` \
-     directory; that directory must be writable by the user running forgekeep";
+     directory; that directory must be writable by the user running plombir-git";
 
 /// One actionable error for a filesystem failure while staging an upload.
 ///
@@ -927,11 +927,11 @@ mod upload_path_error_tests {
 
     #[tokio::test]
     async fn chunked_multipart_overflow_is_413_and_removes_the_partial_spool() {
-        const BOUNDARY: &str = "forgekeep-boundary";
+        const BOUNDARY: &str = "plombir-git-boundary";
         let head = axum::body::Bytes::from_static(
-            b"--forgekeep-boundary\r\nContent-Disposition: form-data; name=\"attachment\"; filename=\"report.txt\"\r\nContent-Type: text/plain\r\n\r\nabc",
+            b"--plombir-git-boundary\r\nContent-Disposition: form-data; name=\"attachment\"; filename=\"report.txt\"\r\nContent-Type: text/plain\r\n\r\nabc",
         );
-        let tail = axum::body::Bytes::from_static(b"de\r\n--forgekeep-boundary--\r\n");
+        let tail = axum::body::Bytes::from_static(b"de\r\n--plombir-git-boundary--\r\n");
         let transport_limit = head.len() + 1;
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         sender.send(Ok::<_, Infallible>(head)).await.unwrap();

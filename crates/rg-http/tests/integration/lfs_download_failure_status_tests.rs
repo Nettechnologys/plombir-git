@@ -38,7 +38,7 @@ fn payloads_in_distinct_shards(count: usize) -> Vec<Vec<u8>> {
     let mut chosen: Vec<Vec<u8>> = Vec::new();
     let mut shards: Vec<String> = Vec::new();
     for n in 0..10_000u32 {
-        let payload = format!("forgekeep lfs blame payload {n}").into_bytes();
+        let payload = format!("plombir-git lfs blame payload {n}").into_bytes();
         let oid = hex::encode(Sha256::digest(&payload));
         let shard = oid[..2].to_string();
         if shards.contains(&shard) {

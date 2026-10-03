@@ -2,7 +2,7 @@
 //!
 //! Each tool:
 //! 1. parses `req.params` → arguments JSON
-//! 2. calls ForgeKeep REST API
+//! 2. calls Plombir Git REST API
 //! 3. returns `JsonRpcResponse` with `ToolCallResult`
 //!
 //! Every handler is a thin wrapper around one REST call (the `tool_get_pr`
@@ -627,7 +627,7 @@ fn push_query(qs: &mut Vec<String>, key: &str, val: &str) {
     qs.push(format!("{}={}", key, urlencoding::encode(val)));
 }
 
-/// Run a synchronous ForgeKeep read/write returning the raw response text.
+/// Run a synchronous Plombir Git read/write returning the raw response text.
 fn run(fut: impl std::future::Future<Output = crate::Result<String>>) -> String {
     match tokio::runtime::Handle::current().block_on(fut) {
         Ok(text) => text,

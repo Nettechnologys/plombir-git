@@ -221,7 +221,7 @@ mod tests {
         fn new(label: &str) -> Self {
             Self {
                 path: std::env::temp_dir().join(format!(
-                    "forgekeep-fts-migration-{label}-{}.db",
+                    "plombir-git-fts-migration-{label}-{}.db",
                     uuid::Uuid::new_v4().simple()
                 )),
             }
@@ -524,10 +524,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at disposable MySQL 8.4"]
+    #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable MySQL 8.4"]
     async fn mysql_fts_maintenance_holds_an_offline_boundary_and_rolls_back_row_repairs() {
-        let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-            .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+        let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+            .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
         assert!(
             database_url.starts_with("mysql://"),
             "this proof exercises MySQL table-lock and implicit-DDL-commit semantics"

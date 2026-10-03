@@ -2,7 +2,7 @@
 
 // Contract: the notification WebSocket client must build its URL from the
 // configured API_BASE (never the frontend host) and authenticate via the
-// HttpOnly `forgekeep_token` cookie the browser sends automatically on a
+// HttpOnly `plombir_git_token` cookie the browser sends automatically on a
 // same-origin upgrade (M-4/M-5). The token must NOT be leaked into the URL
 // query string, nor passed as a Sec-WebSocket-Protocol subprotocol — the
 // backend `ws_notifications_handler` reads the cookie first, through
@@ -53,7 +53,7 @@ expect(
 // M-4/M-5 cookie auth: the token must never be appended to the URL.
 reject(
   /encodeURIComponent\s*\(\s*token\s*\)/,
-  'Notification WebSocket must not append the token to the URL — auth is the HttpOnly forgekeep_token cookie',
+  'Notification WebSocket must not append the token to the URL — auth is the HttpOnly plombir_git_token cookie',
 );
 reject(
   /[?&]token=/,

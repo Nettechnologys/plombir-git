@@ -102,8 +102,8 @@ pub fn describe_path_error(
 /// or an import.
 pub const REPO_ROOT_HINT: &str =
     "repositories live under the `[server].repo_root` directory (`--repo-root` / \
-     `FORGEKEEP_REPO_ROOT`); that directory, and the `<owner>/` level the server creates below \
-     it, must be writable by the user running forgekeep";
+     `PLOMBIR_GIT_REPO_ROOT`); that directory, and the `<owner>/` level the server creates below \
+     it, must be writable by the user running plombir-git";
 
 /// Remediation for a filesystem failure on a CI cache archive.
 ///
@@ -113,7 +113,7 @@ pub const REPO_ROOT_HINT: &str =
 /// or an operator gets a different story depending on which side failed first.
 pub const CI_CACHE_DIR_HINT: &str =
     "CI cache archives live in `_ci_cache/<repo_id>/` next to the repository storage root; \
-     that directory must be writable by the user running forgekeep";
+     that directory must be writable by the user running plombir-git";
 
 /// Remediation for a filesystem failure inside the blob storage backend.
 ///
@@ -124,7 +124,7 @@ pub const CI_CACHE_DIR_HINT: &str =
 /// same anonymous errno.
 pub const BLOB_STORAGE_HINT: &str =
     "artifacts, packages, OCI images and LFS objects are stored under the `[server].repo_root` \
-     directory; that directory must be writable by the user running forgekeep";
+     directory; that directory must be writable by the user running plombir-git";
 
 /// Remediation for a filesystem failure on an on-disk LFS object.
 ///
@@ -135,7 +135,7 @@ pub const BLOB_STORAGE_HINT: &str =
 /// story whichever one failed first.
 pub const LFS_STORAGE_HINT: &str =
     "LFS objects live in `<owner>.lfs/<repo>/` under the `[server].repo_root` directory; that \
-     directory must be writable by the user running forgekeep";
+     directory must be writable by the user running plombir-git";
 
 /// [`describe_path_error`] as a ready-to-propagate [`anyhow::Error`].
 ///
@@ -177,7 +177,7 @@ pub fn ensure_owner_only(path: &Path, what: &str) -> anyhow::Result<()> {
                     what,
                     path,
                     &error,
-                    "the file must exist and be readable by the user running forgekeep",
+                    "the file must exist and be readable by the user running plombir-git",
                 )
             })?
             .permissions()
@@ -609,12 +609,12 @@ mod tests {
         let error = std::io::Error::new(std::io::ErrorKind::IsADirectory, "Is a directory");
         let message = super::describe_path_error(
             "config file",
-            Path::new("/app/forgekeep.toml"),
+            Path::new("/app/plombir-git.toml"),
             &error,
             "create the file before starting the container",
         );
 
-        assert!(message.contains("/app/forgekeep.toml"), "{message}");
+        assert!(message.contains("/app/plombir-git.toml"), "{message}");
         assert!(message.contains("Is a directory"), "{message}");
         assert!(
             message.contains("create the file before starting the container"),
@@ -907,13 +907,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_relative_path_does_not_walk_past_its_own_root() {
-        let levels = super::levels_to_create(Path::new("forgekeep-no-such-dir/repos"));
+        let levels = super::levels_to_create(Path::new("plombir-git-no-such-dir/repos"));
 
         assert_eq!(
             levels,
             vec![
-                Path::new("forgekeep-no-such-dir/repos"),
-                Path::new("forgekeep-no-such-dir"),
+                Path::new("plombir-git-no-such-dir/repos"),
+                Path::new("plombir-git-no-such-dir"),
             ],
             "the empty ancestor must not be handed to set_permissions"
         );

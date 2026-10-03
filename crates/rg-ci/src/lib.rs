@@ -1,9 +1,9 @@
-//! ForgeKeep CI/CD Engine.
+//! Plombir Git CI/CD Engine.
 //!
-//! Parses `.forgekeep-ci.yml` or `.gitea/workflows/*.yml` (Gitea Actions format)
+//! Parses `.plombir-git-ci.yml` or `.gitea/workflows/*.yml` (Gitea Actions format)
 //! from the repository and executes pipelines.
 //!
-//! ## Native format (`.forgekeep-ci.yml`)
+//! ## Native format (`.plombir-git-ci.yml`)
 //!
 //! ```yaml
 //! stages:
@@ -333,7 +333,7 @@ fn resolved_concurrency_group(
              ${{{{ github.ref_name }}}}, ${{{{ github.workflow }}}}, ${{{{ github.sha }}}}, \
              ${{{{ github.event_name }}}}, ${{{{ github.repository }}}}, \
              ${{{{ github.repository_owner }}}} — and ${{{{ ref }}}} / ${{{{ branch }}}} in \
-             .forgekeep-ci.yml. Left unresolved it is one literal group shared by every ref of \
+             .plombir-git-ci.yml. Left unresolved it is one literal group shared by every ref of \
              this repository."
         )));
     }
@@ -343,7 +343,7 @@ fn resolved_concurrency_group(
 /// Trigger a CI pipeline for a push event.
 ///
 /// This function:
-/// 1. Reads `.forgekeep-ci.yml` from the repo at the given commit
+/// 1. Reads `.plombir-git-ci.yml` from the repo at the given commit
 /// 2. Parses the CI configuration
 /// 3. Checks concurrency control (if configured)
 /// 4. Creates pipeline/stage/job records in the DB
@@ -1163,7 +1163,7 @@ const DEFAULT_ALLOW_FAILURE: bool = false;
 
 /// The ordered stage list this config actually runs, `default` included.
 ///
-/// `stages:` is optional, so a `.forgekeep-ci.yml` that declares only jobs is a
+/// `stages:` is optional, so a `.plombir-git-ci.yml` that declares only jobs is a
 /// valid file — and every one of its jobs resolves to [`DEFAULT_STAGE`]. Reading
 /// the stage set off `stages:` alone therefore built an empty set, dropped every
 /// job for want of a stage, and published a pipeline of zero jobs that the
@@ -1697,7 +1697,7 @@ struct WorkflowInvocation<'a> {
 ///
 /// Tries formats in order:
 /// 1. `.gitea/workflows/*.yml` (Gitea Actions format)
-/// 2. `.forgekeep-ci.yml` (native format)
+/// 2. `.plombir-git-ci.yml` (native format)
 ///
 /// For Gitea Actions workflows, multiple files are merged into a single `CiConfig`.
 /// Jobs from different workflow files are placed in separate stages.
@@ -1774,7 +1774,7 @@ fn read_ci_config_with_inputs(
     // `.expect("the CI config was found above")`, an invariant that held only
     // because two independent operations happened to agree about a tree the
     // client committed.
-    let (ci_filename, entry) = [".forgekeep-ci.yml"]
+    let (ci_filename, entry) = [".plombir-git-ci.yml"]
         .into_iter()
         .find_map(|name| {
             tree.lookup_entry_by_path(name)
@@ -1789,7 +1789,7 @@ fn read_ci_config_with_inputs(
             // hunting for a file that is already there.
             if workflows_untriggered {
                 rg_core::error::invalid_request(format!(
-                    "no workflow in {}/ is triggered by event {} on {}, and no native CI config (.forgekeep-ci.yml) at commit {}",
+                    "no workflow in {}/ is triggered by event {} on {}, and no native CI config (.plombir-git-ci.yml) at commit {}",
                     WORKFLOW_DIR,
                     invocation.event,
                     ref_name,
@@ -1797,7 +1797,7 @@ fn read_ci_config_with_inputs(
                 ))
             } else {
                 rg_core::error::invalid_request(format!(
-                    "no CI config found (.gitea/workflows/*.yml or .forgekeep-ci.yml) at commit {}",
+                    "no CI config found (.gitea/workflows/*.yml or .plombir-git-ci.yml) at commit {}",
                     commit_sha
                 ))
             }
@@ -1807,7 +1807,7 @@ fn read_ci_config_with_inputs(
     // describes what its oid happens to point at. A gitlink (mode `160000`)
     // carries the oid of a commit that lives in the submodule's own repository
     // and is therefore normally absent from this object store, so asking for its
-    // header first turned a healthy submodule named `.forgekeep-ci.yml` into
+    // header first turned a healthy submodule named `.plombir-git-ci.yml` into
     // `failed to read CI config object header` — a storage 5xx for a tree shape
     // only the client can change. Classify by mode before any object lookup, the
     // way the workflow directory below already does.
@@ -1966,7 +1966,7 @@ enum GiteaWorkflows {
 /// The one pipeline-wide request contract formed by every workflow that asks
 /// for `workflow_dispatch` at this commit.
 ///
-/// ForgeKeep merges all matching workflow files into one pipeline, so the HTTP
+/// Plombir Git merges all matching workflow files into one pipeline, so the HTTP
 /// request necessarily carries one input map. The declarations remain local:
 /// each workflow receives only the keys it declared, while a key declared by
 /// none of them is rejected once against the aggregate. The schema endpoint
@@ -2096,7 +2096,7 @@ impl WorkflowDispatchContract {
 
 /// Parse and validate every committed workflow before event matching.
 ///
-/// A workflow that names a trigger ForgeKeep cannot emit will never match, so
+/// A workflow that names a trigger Plombir Git cannot emit will never match, so
 /// validation placed inside the triggered branch would make that declaration
 /// silently unreachable. Both the schema probe and the real trigger go through
 /// this helper to preserve the same fail-loud boundary and file-qualified
@@ -2125,7 +2125,7 @@ fn parse_gitea_workflows(
 /// Try to find and parse Gitea Actions workflow files in `.gitea/workflows/`.
 ///
 /// `Absent` / `NoneTriggered` are the two legitimate fallbacks to the native
-/// `.forgekeep-ci.yml`, and they are told apart so the caller can explain which
+/// `.plombir-git-ci.yml`, and they are told apart so the caller can explain which
 /// one happened.
 ///
 /// Anything else — a workflow that is not valid UTF-8, does not parse as YAML,
@@ -2319,7 +2319,7 @@ fn merge_concurrency(
                 "{WORKFLOW_DIR}/{first_file} and {WORKFLOW_DIR}/{file} are both triggered by this \
                  event and declare different `concurrency:` blocks (group '{}' \
                  cancel-in-progress: {} vs group '{}' cancel-in-progress: {}). \
-                 ForgeKeep runs every workflow triggered by one event as a single pipeline, which \
+                 Plombir Git runs every workflow triggered by one event as a single pipeline, which \
                  carries one concurrency group — make the blocks agree, or split the workflows \
                  onto different events.",
                 first.group, first.cancel_in_progress, other.group, other.cancel_in_progress
@@ -2638,7 +2638,7 @@ pub(crate) mod test_notifier {
             smtp_config: Some(rg_core::email::SmtpConfig {
                 host: "smtp.example.com".into(),
                 port: 587,
-                user: "forgekeep".into(),
+                user: "plombir-git".into(),
                 pass: "unused".into(),
                 from: "ci@example.com".into(),
             }),
@@ -2998,7 +2998,7 @@ mod matrix_tests {
     async fn matrix_job_conditions_persist_and_skip_only_false_variants() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
-            temp.path().join(".forgekeep-ci.yml"),
+            temp.path().join(".plombir-git-ci.yml"),
             "stages: [test, deploy]\nconditional:\n  stage: test\n  if: matrix.os == 'linux' && github.ref_name == 'main'\n  script: [echo ok]\n  matrix:\n    os: [linux, macos]\ndeploy:\n  stage: deploy\n  if: github.ref_name == 'main'\n  script: [echo deploy]\n",
         ).unwrap();
         let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
@@ -3015,7 +3015,7 @@ mod matrix_tests {
             .unwrap()
             .success());
         assert!(git
-            .run(&["add", ".forgekeep-ci.yml"], Some(temp.path()))
+            .run(&["add", ".plombir-git-ci.yml"], Some(temp.path()))
             .unwrap()
             .success());
         assert!(git
@@ -3232,7 +3232,7 @@ mod matrix_tests {
         // is not part of `validate_execution_semantics`, so the failure lands
         // after the pipeline row and both stages already exist.
         std::fs::write(
-            temp.path().join(".forgekeep-ci.yml"),
+            temp.path().join(".plombir-git-ci.yml"),
             "stages: [build, test]\nfirst:\n  stage: build\n  script: [echo one]\nsecond:\n  stage: test\n  script: [echo two]\n  matrix:\n    arch: []\n",
         )
         .unwrap();
@@ -3250,7 +3250,7 @@ mod matrix_tests {
             .unwrap()
             .success());
         assert!(git
-            .run(&["add", ".forgekeep-ci.yml"], Some(temp.path()))
+            .run(&["add", ".plombir-git-ci.yml"], Some(temp.path()))
             .unwrap()
             .success());
         assert!(git
@@ -3422,7 +3422,7 @@ mod matrix_tests {
         rg_db::entities::user::Model,
         rg_db::entities::repository::Model,
     ) {
-        let (temp, sha) = commit_repo(&[(".forgekeep-ci.yml", config)]);
+        let (temp, sha) = commit_repo(&[(".plombir-git-ci.yml", config)]);
         let db = rg_db::connect_with_pool(
             &format!(
                 "sqlite://{}?mode=rwc",
@@ -3497,7 +3497,7 @@ mod matrix_tests {
         }
     }
 
-    /// card_d92cd3260864, on the production path: `.forgekeep-ci.yml` without a
+    /// card_d92cd3260864, on the production path: `.plombir-git-ci.yml` without a
     /// `stages:` key parses, and every one of its jobs resolved to a stage the
     /// graph never created. `create_jobs` dropped them one `warn!` at a time,
     /// the pipeline was published holding nothing, and `run_pipeline` walked its
@@ -3896,7 +3896,7 @@ mod matrix_tests {
         use sea_orm::ConnectionTrait;
 
         let (temp, sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"concurrency:\n  group: ${{ ref }}\n  cancel_in_progress: true\nbuild:\n  script: [echo one]\n"
                 as &[u8],
         )]);
@@ -4050,7 +4050,7 @@ mod matrix_tests {
         use sea_orm::ConnectionTrait;
 
         let (temp, sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"concurrency:\n  group: ${{ ref }}\nbuild:\n  script: [echo one]\n" as &[u8],
         )]);
         let db = rg_db::connect_with_pool(
@@ -4235,7 +4235,7 @@ mod matrix_tests {
     #[tokio::test]
     async fn concurrency_serializes_by_group_and_leaves_other_groups_alone() {
         let (temp, sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"concurrency:\n  group: deploy-production\n  cancel_in_progress: true\nbuild:\n  script: [echo one]\n"
                 as &[u8],
         )]);
@@ -4740,13 +4740,13 @@ mod matrix_tests {
     #[test]
     fn broken_workflow_yaml_reports_the_file_and_the_parse_error() {
         // Present-but-broken must never degrade into "no CI config found":
-        // the `.forgekeep-ci.yml` fallback below would otherwise hide the typo.
+        // the `.plombir-git-ci.yml` fallback below would otherwise hide the typo.
         let (temp, sha) = commit_repo(&[
             (
                 ".gitea/workflows/ci.yml",
                 b"on: push\njobs:\n  build:\n   steps:\n  - run: echo broken\n" as &[u8],
             ),
-            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+            (".plombir-git-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
         let error =
@@ -4772,7 +4772,7 @@ mod matrix_tests {
     fn non_utf8_workflow_reports_the_file_instead_of_parsing_an_empty_string() {
         let (temp, sha) = commit_repo(&[
             (".gitea/workflows/ci.yml", &[0xff, 0xfe, b'o', b'n', b':']),
-            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+            (".plombir-git-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
         let error =
@@ -4788,7 +4788,7 @@ mod matrix_tests {
     #[test]
     fn an_oversized_native_config_is_refused_before_parsing() {
         let oversized = vec![b'#'; MAX_CI_CONFIG_BYTES as usize + 1];
-        let (temp, sha) = commit_repo(&[(".forgekeep-ci.yml", oversized.as_slice())]);
+        let (temp, sha) = commit_repo(&[(".plombir-git-ci.yml", oversized.as_slice())]);
 
         let error =
             read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
@@ -4800,7 +4800,7 @@ mod matrix_tests {
             "a repository-owned config is a client-correctable refusal: {error:#}"
         );
         let message = format!("{error:#}");
-        assert!(message.contains(".forgekeep-ci.yml"), "{message}");
+        assert!(message.contains(".plombir-git-ci.yml"), "{message}");
         assert!(
             message.contains(&format!("larger than {MAX_CI_CONFIG_BYTES} bytes")),
             "{message}"
@@ -4894,7 +4894,7 @@ mod matrix_tests {
     /// the client can change.
     #[test]
     fn a_gitlink_named_like_the_native_config_is_a_client_error() {
-        let (_dir, repo_path, sha) = commit_repo_with_submodule_at(".forgekeep-ci.yml");
+        let (_dir, repo_path, sha) = commit_repo_with_submodule_at(".plombir-git-ci.yml");
 
         let error =
             read_ci_config_for_test(&repo_path, &sha, "refs/heads/main", "push", None, None)
@@ -4907,7 +4907,8 @@ mod matrix_tests {
         );
         let message = format!("{error:#}");
         assert!(
-            message.contains(".forgekeep-ci.yml") && message.contains("is a submodule, not a file"),
+            message.contains(".plombir-git-ci.yml")
+                && message.contains("is a submodule, not a file"),
             "{message}"
         );
         assert!(
@@ -4952,12 +4953,15 @@ mod matrix_tests {
     #[test]
     fn a_lost_native_config_object_stays_a_server_error() {
         let (temp, sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"build:\n  script: [echo native]\n" as &[u8],
         )]);
         let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
         let blob = git
-            .run(&["rev-parse", "HEAD:.forgekeep-ci.yml"], Some(temp.path()))
+            .run(
+                &["rev-parse", "HEAD:.plombir-git-ci.yml"],
+                Some(temp.path()),
+            )
             .unwrap()
             .stdout_str()
             .trim()
@@ -4975,7 +4979,7 @@ mod matrix_tests {
         );
         let message = format!("{error:#}");
         assert!(
-            message.contains(".forgekeep-ci.yml"),
+            message.contains(".plombir-git-ci.yml"),
             "the server error must still name the file: {message}"
         );
     }
@@ -4998,7 +5002,7 @@ mod matrix_tests {
 
         // `git mktree` refuses a type it can disprove, so the tree object is
         // assembled byte-for-byte and stored with `--literally`.
-        let mut raw = b"100644 .forgekeep-ci.yml\0".to_vec();
+        let mut raw = b"100644 .plombir-git-ci.yml\0".to_vec();
         raw.extend((0..tree_oid.len()).step_by(2).map(|i| {
             u8::from_str_radix(&tree_oid[i..i + 2], 16).expect("git prints a hex object id")
         }));
@@ -5041,7 +5045,7 @@ mod matrix_tests {
         );
         let message = format!("{error:#}");
         assert!(
-            message.contains(".forgekeep-ci.yml") && message.contains("committed as a file"),
+            message.contains(".plombir-git-ci.yml") && message.contains("committed as a file"),
             "{message}"
         );
         assert!(
@@ -5247,7 +5251,7 @@ mod matrix_tests {
     /// is not an error but the *removal* of the dependency — the job is swept
     /// into stage 0 and runs beside the one it declared it was waiting for.
     ///
-    /// The repository also carries a native `.forgekeep-ci.yml`: a refusal that
+    /// The repository also carries a native `.plombir-git-ci.yml`: a refusal that
     /// fell through to it would build a green pipeline out of a file the
     /// committer never triggered.
     #[test]
@@ -5257,7 +5261,7 @@ mod matrix_tests {
                 ".gitea/workflows/ci.yml",
                 b"on: push\njobs:\n  build:\n    steps:\n      - run: cargo build\n  deploy:\n    needs: [buidl]\n    steps:\n      - run: deploy.sh\n" as &[u8],
             ),
-            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+            (".plombir-git-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
         let error =
@@ -5286,7 +5290,7 @@ mod matrix_tests {
     #[test]
     fn broken_native_config_reports_the_reason_not_the_whole_file() {
         let (temp, sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"build:\n  script: [echo ok]\n   nested: bad\n" as &[u8],
         )]);
 
@@ -5295,7 +5299,7 @@ mod matrix_tests {
                 .unwrap_err();
         let rendered = format!("{error}");
         assert!(
-            rendered.contains(".forgekeep-ci.yml") && rendered.contains("line"),
+            rendered.contains(".plombir-git-ci.yml") && rendered.contains("line"),
             "error must name the file and the parse position: {rendered}"
         );
         assert!(
@@ -5307,7 +5311,7 @@ mod matrix_tests {
     #[test]
     fn missing_workflow_directory_still_falls_back_to_the_native_config() {
         let (temp, sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"build:\n  script: [echo native]\n" as &[u8],
         )]);
 
@@ -5325,7 +5329,7 @@ mod matrix_tests {
                 ".gitea/workflows/tags.yml",
                 b"on:\n  push:\n    tags: [v*]\njobs:\n  build:\n    steps:\n      - run: echo tagged\n" as &[u8],
             ),
-            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+            (".plombir-git-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
         let config =
@@ -5373,13 +5377,13 @@ mod matrix_tests {
     #[test]
     fn a_missing_native_config_object_is_not_no_config() {
         let (temp, sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"build:\n  script: [echo native]\n" as &[u8],
         )]);
         let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
         let object_id = git
             .run(
-                &["rev-parse", &format!("{sha}:.forgekeep-ci.yml")],
+                &["rev-parse", &format!("{sha}:.plombir-git-ci.yml")],
                 Some(temp.path()),
             )
             .unwrap()
@@ -5406,7 +5410,7 @@ mod matrix_tests {
                 ".gitea/workflows/ci.yml",
                 b"on: push\njobs:\n  build:\n    steps:\n      - run: echo workflow\n" as &[u8],
             ),
-            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+            (".plombir-git-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
         let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
         let object_id = git
@@ -5479,7 +5483,7 @@ mod matrix_tests {
         }
 
         let (repo, sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"build:\n  script: [echo ok]\n  image: alpine\n  tags: [gpu]\n" as &[u8],
         )]);
 
@@ -5562,7 +5566,7 @@ mod matrix_tests {
         //    known exactly. That is the definition of "checked, and it is not
         //    allowed", and it has to arrive as such.
         let (typo, typo_sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"build:\n  script: [echo ok]\n  when: allways\n" as &[u8],
         )]);
         let error = trigger(typo.path(), &typo_sha).await;
@@ -5584,7 +5588,7 @@ mod matrix_tests {
         // 2. YAML that does not parse at all. The reason travels; the server's
         //    filesystem does not (H-05).
         let (broken, broken_sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"build:\n  script: [echo ok\n" as &[u8],
         )]);
         let error = trigger(broken.path(), &broken_sha).await;
@@ -5593,7 +5597,7 @@ mod matrix_tests {
             .unwrap_or_else(|| panic!("unparseable YAML must be a 400, got: {error:#}"));
         let message = invalid.to_string();
         assert!(
-            message.contains(".forgekeep-ci.yml"),
+            message.contains(".plombir-git-ci.yml"),
             "the answer names the offending file: {message}"
         );
         let repo_dir = broken.path().to_string_lossy().into_owned();
@@ -5606,13 +5610,13 @@ mod matrix_tests {
         //    from the object database. Answering 400 here would tell the client
         //    to fix a file that is already correct, and would hide the outage.
         let (dangling, dangling_sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"build:\n  script: [echo ok]\n" as &[u8],
         )]);
         let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
         let object_id = git
             .run(
-                &["rev-parse", &format!("{dangling_sha}:.forgekeep-ci.yml")],
+                &["rev-parse", &format!("{dangling_sha}:.plombir-git-ci.yml")],
                 Some(dangling.path()),
             )
             .unwrap()
@@ -5649,7 +5653,7 @@ mod matrix_tests {
             );
             let (temp, sha) = commit_repo(&[
                 (".gitea/workflows/ci.yml", workflow.as_bytes()),
-                (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+                (".plombir-git-ci.yml", b"build:\n  script: [echo native]\n"),
             ]);
 
             let error =
@@ -5677,7 +5681,7 @@ mod matrix_tests {
     /// consumes must stop the trigger, not produce a job that ran none of what
     /// the workflow asked for.
     ///
-    /// The repository also carries a native `.forgekeep-ci.yml`, so a refusal
+    /// The repository also carries a native `.plombir-git-ci.yml`, so a refusal
     /// that quietly fell through to it would look like a green pipeline. The
     /// assertion is that the trigger fails, names the key, and never gets far
     /// enough to build anything.
@@ -5688,7 +5692,7 @@ mod matrix_tests {
                 ".gitea/workflows/ci.yml",
                 b"on: push\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          submodules: true\n      - run: echo workflow\n" as &[u8],
             ),
-            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+            (".plombir-git-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
         let db = rg_db::connect_with_pool(
@@ -6106,7 +6110,7 @@ mod matrix_tests {
         .unwrap());
 
         let (native_repo, native_sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"build:\n  script: [echo native]\n" as &[u8],
         )]);
         assert!(
@@ -6532,7 +6536,7 @@ mod matrix_tests {
     #[test]
     fn a_negative_timeout_in_the_committed_yaml_is_rejected_with_the_job_name() {
         let (temp, sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"stages:\n  - test\n\ndeploy:\n  stage: test\n  timeout_seconds: -1\n  script:\n    - echo ok\n",
         )]);
 
@@ -6572,7 +6576,7 @@ mod matrix_tests {
             let (temp, sha) = commit_repo(&[
                 (".gitea/workflows/environment.yml", workflow.as_bytes()),
                 (
-                    ".forgekeep-ci.yml",
+                    ".plombir-git-ci.yml",
                     b"fallback:\n  script: [echo must-not-run]\n" as &[u8],
                 ),
             ]);
@@ -6608,7 +6612,7 @@ mod matrix_tests {
             let (temp, sha) = commit_repo(&[
                 (".gitea/workflows/runs-on.yml", workflow.as_bytes()),
                 (
-                    ".forgekeep-ci.yml",
+                    ".plombir-git-ci.yml",
                     b"fallback:\n  script: [echo must-not-run]\n" as &[u8],
                 ),
             ]);
@@ -6731,7 +6735,7 @@ mod matrix_tests {
             let (temp, sha) = commit_repo(&[
                 (".gitea/workflows/unknown.yml", workflow.as_bytes()),
                 (
-                    ".forgekeep-ci.yml",
+                    ".plombir-git-ci.yml",
                     b"fallback:\n  script: [echo must-not-run]\n" as &[u8],
                 ),
             ]);
@@ -7104,7 +7108,7 @@ jobs:
     }
 
     /// A called workflow's `concurrency` applies only to that reusable
-    /// workflow's jobs, while ForgeKeep flattens those jobs into the caller's
+    /// workflow's jobs, while Plombir Git flattens those jobs into the caller's
     /// single pipeline. Silently keeping the caller's value loses the called
     /// declaration; copying the called value would also put the caller's own
     /// jobs into the called workflow's cancellation group. Refuse the
@@ -7147,7 +7151,7 @@ jobs:
     #[test]
     fn an_unknown_native_job_key_is_reported_with_its_file_and_key() {
         let (temp, sha) = commit_repo(&[(
-            ".forgekeep-ci.yml",
+            ".plombir-git-ci.yml",
             b"build:\n  retry: 2\n  script: [echo ok]\n",
         )]);
 
@@ -7162,7 +7166,7 @@ jobs:
             "a committed native config mistake is a client error: {message}"
         );
         assert!(
-            message.contains(".forgekeep-ci.yml") && message.contains("retry"),
+            message.contains(".plombir-git-ci.yml") && message.contains("retry"),
             "the refusal must name the native config and key: {message}"
         );
     }
@@ -7184,7 +7188,7 @@ jobs:
                 &["key", "paths"],
             ),
         ] {
-            let (temp, sha) = commit_repo(&[(".forgekeep-ci.yml", yaml.as_bytes())]);
+            let (temp, sha) = commit_repo(&[(".plombir-git-ci.yml", yaml.as_bytes())]);
 
             let error =
                 read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
@@ -7197,7 +7201,7 @@ jobs:
                 "a committed native config mistake is a client error: {message}"
             );
             assert!(
-                message.contains(".forgekeep-ci.yml") && message.contains(key),
+                message.contains(".plombir-git-ci.yml") && message.contains(key),
                 "the refusal must name the native config and {key:?}: {message}"
             );
             for field in supported {
@@ -7452,7 +7456,7 @@ jobs:
         }
     }
 
-    /// card_d3036cf8db7f: ForgeKeep merges every matching workflow into one
+    /// card_d3036cf8db7f: Plombir Git merges every matching workflow into one
     /// pipeline, so its one request map is the union of their declarations —
     /// not a request that every workflow must declare every key from.
     #[test]
@@ -8085,7 +8089,7 @@ jobs:
         let (temp, sha) = commit_repo(&[
             (".gitea/workflows/pr.yml", BOTH_EVENTS),
             (
-                ".forgekeep-ci.yml",
+                ".plombir-git-ci.yml",
                 b"native:\n  script:\n    - echo native\n",
             ),
         ]);
@@ -8117,7 +8121,7 @@ jobs:
         assert!(
             rebuilt.jobs.contains_key("native"),
             "without the base branch the workflow matches nothing and the run falls through \
-             to .forgekeep-ci.yml — the graph a retry used to publish under the id of a run \
+             to .plombir-git-ci.yml — the graph a retry used to publish under the id of a run \
              that never contained it: {:?}",
             rebuilt.jobs.keys().collect::<Vec<_>>()
         );

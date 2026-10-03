@@ -29,7 +29,7 @@ let failed = 0;
  * wrong reason is not evidence about the reason it was written for.
  */
 function runCase(name, { files, env = {}, withLib = true, expect }) {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-raw-rust-assert-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-raw-rust-assert-'));
   try {
     mkdirSync(join(fixture, 'scripts'), { recursive: true });
     if (withLib) cpSync(join(root, 'scripts', 'lib'), join(fixture, 'scripts', 'lib'), { recursive: true });
@@ -39,7 +39,7 @@ function runCase(name, { files, env = {}, withLib = true, expect }) {
 
     const result = spawnSync(process.execPath, [check], {
       cwd: fixture,
-      env: { ...process.env, FORGEKEEP_RAW_SOURCE_ASSERT_ROOT: fixture, ...env },
+      env: { ...process.env, PLOMBIR_GIT_RAW_SOURCE_ASSERT_ROOT: fixture, ...env },
       encoding: 'utf8',
     });
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
@@ -100,7 +100,7 @@ const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
 if (!backend.includes('path = "/demo"')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -115,7 +115,7 @@ const fn = rustFnBlock(backend, 'demo');
 if (fn === null || !fn.body.includes('RepoRead')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -268,7 +268,7 @@ const message = 'backend.includes() is the shape this gate rejects';
 if (!backend.includes('path = "/demo"') || message === '') process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -318,7 +318,7 @@ if (!/href="\\/demo"/.test(page)) process.exit(1);
 if (body === null) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
   expect: { red: false },
 });
 
@@ -330,7 +330,7 @@ runCase('a raw .includes() over a .sh file is rejected', {
     'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
 
 const helper = readFileSync('deploy/start-observability.sh', 'utf8');
-if (!helper.includes('curl http://localhost:\${FORGEKEEP_HOST_PORT}/health')) process.exit(1);
+if (!helper.includes('curl http://localhost:\${PLOMBIR_GIT_HOST_PORT}/health')) process.exit(1);
 `,
   },
   expect: { red: true, mentions: ['demo-contract-check.mjs:4', '`helper`', 'Shell source file'] },
@@ -345,10 +345,10 @@ runCase('the same assertion through shellCodeOnly is accepted', {
 import { shellCodeOnly } from './lib/shell-source.mjs';
 
 const helper = shellCodeOnly(readFileSync('deploy/start-observability.sh', 'utf8'));
-if (!helper.includes('curl http://localhost:\${FORGEKEEP_HOST_PORT}/health')) process.exit(1);
+if (!helper.includes('curl http://localhost:\${PLOMBIR_GIT_HOST_PORT}/health')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_SHELL: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_SHELL: '1' },
   expect: { red: false },
 });
 
@@ -423,7 +423,7 @@ function declaresDemo(source) {
 if (!declaresDemo(readFileSync('web/src/lib/api/demo.ts', 'utf8'))) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
   expect: { red: false },
 });
 
@@ -453,7 +453,7 @@ const workflow = productionYamlSource(readFileSync('.github/workflows/regression
 if (!workflow.includes('run: node scripts/run-contract-checks.mjs')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_YAML: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_YAML: '1' },
   expect: { red: false },
 });
 
@@ -471,7 +471,7 @@ const marked = yamlAnnotatedLines(readFileSync('deploy/docker-compose.yml', 'utf
 if (marked.length !== 1) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_YAML: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_YAML: '1' },
   expect: { red: false },
 });
 
@@ -487,7 +487,7 @@ import { join } from 'node:path';
 
 for (const file of ['docker-compose.yml', 'docker-compose.hostdir.yml']) {
   const compose = readFileSync(join('deploy', file), 'utf8');
-  if (!compose.includes('- \${FORGEKEEP_DEPLOY_ENV_FILE:-.env}')) process.exit(1);
+  if (!compose.includes('- \${PLOMBIR_GIT_DEPLOY_ENV_FILE:-.env}')) process.exit(1);
 }
 `,
   },
@@ -515,7 +515,7 @@ for (const file of sourceFiles('crates', ['.rs'])) {
 }
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: true, mentions: ['`source`', 'Rust source file'] },
 });
 
@@ -535,7 +535,7 @@ for (const name of readdirSync('crates/rg-demo/src')) {
 }
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: true, mentions: ['`backend`', 'Rust source file'] },
 });
 
@@ -556,7 +556,7 @@ for (const name of readdirSync('crates/rg-demo/src')) {
 }
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -581,7 +581,7 @@ for (const name of readdirSync('scripts')) {
 }
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -606,7 +606,7 @@ for (const name of readdirSync('crates/rg-demo/src')) {
 }
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -636,7 +636,7 @@ for (const file of readdirSync('scripts')) {
 }
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1', FORGEKEEP_RAW_SOURCE_ASSERT_MIN_SHELL: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1', PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_SHELL: '1' },
   expect: { red: false },
 });
 
@@ -662,7 +662,7 @@ for (const file of readdirSync('crates/rg-other/src')) {
 }
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: true, mentions: ['`source`', 'Rust source file'] },
 });
 
@@ -691,7 +691,7 @@ for (const file of files) {
 }
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: true, mentions: ['`backend`', 'Rust source file'] },
 });
 
@@ -716,7 +716,7 @@ const view = productionRustSource(source);
 if (lineAt(view, view.indexOf('pub async fn demo')) < 1) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -745,7 +745,7 @@ for (const [file, source] of clients) {
 if (failures.length > 0) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
   expect: { red: true, mentions: ['`source`', 'expect'], silent: ['`file`'] },
 });
 
@@ -775,7 +775,7 @@ for (const [file, source] of clients) {
 if (failures.length > 0) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
   expect: { red: false },
 });
 
@@ -799,7 +799,7 @@ const blob = readdirSync(SRC)
 if (!blob.includes('pub async fn demo')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: true, mentions: ['`blob`', 'Rust source file'] },
 });
 
@@ -825,7 +825,7 @@ if (!blob.includes('pub async fn demo')) process.exit(1);
   // the one this file adds. The number is what gives the case teeth — against a
   // reader that cannot see a `.map` element the read is not counted at all, and
   // a fixture that merely stayed green would not have told the two apart.
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '4' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '4' },
   expect: { red: false },
 });
 
@@ -945,7 +945,7 @@ const backend = await loadBackend(backendPath);
 if (!backend.includes('path = "/demo"')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -993,7 +993,7 @@ const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
 if (!backend.trim().toLowerCase().includes('path = "/demo"')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -1103,7 +1103,7 @@ const backend = demoView(readFileSync(backendPath, 'utf8'));
 if (!backend.includes('path = "/demo"')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -1119,7 +1119,7 @@ const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
 if (!backend.includes('path = "/demo"')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -1132,7 +1132,7 @@ const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
 if (!backend.includes('path = "/demo"')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -1150,7 +1150,7 @@ const client = productionTsSource(readFileSync('web/src/lib/api/demo.ts', 'utf8'
 if (!client.includes('export async function demo(')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '2' },
+  env: { PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '2' },
   expect: { red: true, mentions: ['recognised'] },
 });
 

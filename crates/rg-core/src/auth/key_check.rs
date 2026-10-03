@@ -1,7 +1,7 @@
 //! Startup preflight: does the configured encryption key still open the data
 //! this instance already wrote?
 //!
-//! Every at-rest secret in ForgeKeep is AES-GCM encrypted under
+//! Every at-rest secret in Plombir Git is AES-GCM encrypted under
 //! [`encryption::derive_key`] of the instance's durable encryption secret.
 //! Before the durable key file and marker existed, changing the effective key
 //! announced nothing: the server started, and every path that touched an encrypted column
@@ -48,6 +48,9 @@ const SAMPLE_LIMIT: u64 = 5;
 /// Domain-separated plaintext of the singleton key-check marker. The value is
 /// not secret; AES-GCM authentication is what proves the configured key opened
 /// it. Keeping it fixed makes an unexpected plaintext a corruption signal.
+///
+/// It keeps the project's former name on purpose: the marker is stored sealed
+/// in every existing database, and a different plaintext refuses the start.
 const MARKER_PLAINTEXT: &str = "forgekeep-encryption-key-check-v1";
 
 /// What the probe saw. `probed` counts only values that structurally look like
@@ -202,7 +205,7 @@ fn verify_marker(value_encrypted: &str, key: &[u8; 32]) -> Result<()> {
         anyhow::anyhow!(
             "the configured encryption key does not open this database's encryption-key check marker. \\
              Nothing has been changed. Restore the key from [auth].key_file, \\
-             FORGEKEEP_ENCRYPTION_KEY or --encryption-key that this instance used before; \\
+             PLOMBIR_GIT_ENCRYPTION_KEY or --encryption-key that this instance used before; \\
              a substituted key file cannot open the existing database."
         )
     })?;
@@ -229,7 +232,7 @@ fn wrong_key_message(probe: &KeyProbe) -> String {
          durable at-rest key. Starting anyway would fail every one of those operations \
          separately, at runtime, with no indication why.\n\
          \n\
-         Restore the key from [auth].key_file, [auth].encryption_key, FORGEKEEP_ENCRYPTION_KEY or \
+         Restore the key from [auth].key_file, [auth].encryption_key, PLOMBIR_GIT_ENCRYPTION_KEY or \
          --encryption-key that this instance used before. If the key file was deleted or \
          substituted, restore its original contents from the instance backup; rotating \
          jwt_secret alone must not change it.\n\
@@ -238,7 +241,7 @@ fn wrong_key_message(probe: &KeyProbe) -> String {
          by anyone: clear them and have MFA re-enrolled, CI secrets, mirror and LDAP \
          passwords and SSO client secrets re-entered. The instance's provenance signing key \
          is in that set — losing it means release attestations signed so far can no longer \
-         be verified, and `forgekeep rotate-instance-key` is what mints a new identity.",
+         be verified, and `plombir-git rotate-instance-key` is what mints a new identity.",
         probed = probe.probed,
         columns = probe.unopened_columns.join(", "),
     )
@@ -345,6 +348,6 @@ mod tests {
         let message = wrong_key_message(&probe);
         assert!(message.contains("users.totp_secret"));
         assert!(message.contains("encryption_key"));
-        assert!(message.contains("FORGEKEEP_ENCRYPTION_KEY"));
+        assert!(message.contains("PLOMBIR_GIT_ENCRYPTION_KEY"));
     }
 }

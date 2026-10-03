@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptsDir, '..');
 const check = path.join(scriptsDir, 'server-side-ref-policy-contract-check.mjs');
-const fixture = mkdtempSync(path.join(tmpdir(), 'forgekeep-ref-policy-'));
+const fixture = mkdtempSync(path.join(tmpdir(), 'plombir-git-ref-policy-'));
 const sources = [
   'crates/rg-git/src/protocol/receive_pack.rs',
   'crates/rg-core/src/repo/service.rs',
@@ -34,7 +34,7 @@ for (const relative of sources) {
 function run() {
   return spawnSync(process.execPath, [check], {
     cwd: root,
-    env: { ...process.env, FORGEKEEP_SERVER_SIDE_REF_POLICY_ROOT: fixture },
+    env: { ...process.env, PLOMBIR_GIT_SERVER_SIDE_REF_POLICY_ROOT: fixture },
     encoding: 'utf8',
   });
 }

@@ -163,7 +163,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('admin.runners.title')} · ForgeKeep</title>
+  <title>{t('admin.runners.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="container">

@@ -1,6 +1,6 @@
 //! OCI Repository entity — maps to the `oci_repository` table.
 //!
-//! Links an ForgeKeep repository to an OCI container registry namespace.
+//! Links a Plombir Git repository to an OCI container registry namespace.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};

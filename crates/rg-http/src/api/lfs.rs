@@ -287,7 +287,7 @@ fn issuing_actor(headers: &HeaderMap, state: &AppState) -> Option<rg_core::lfs::
 /// both are covered by the HMAC — so a half-present pair is not a URL this
 /// server ever minted, and saying so plainly beats letting it fall through to a
 /// signature mismatch. A URL signed before the generation was folded in
-/// (`forgekeep-lfs-v2`) lands here too, which is the intended end for it.
+/// (`plombir-git-lfs-v2`) lands here too, which is the intended end for it.
 fn signed_actor(
     query: &LfsActionQuery,
 ) -> Result<Option<rg_core::lfs::service::LfsActor>, AppError> {
@@ -376,7 +376,7 @@ pub async fn batch(
     let lfs_root = rg_core::lfs::service::lfs_root(&state.repo_root, &owner, &repo);
 
     // Prefer the configured public URL so signed actions retain HTTPS and the
-    // externally visible host when ForgeKeep runs behind a reverse proxy.
+    // externally visible host when Plombir Git runs behind a reverse proxy.
     let base_url = state
         .external_url
         .as_deref()

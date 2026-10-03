@@ -19,7 +19,7 @@ use uuid::Uuid;
 /// registry handed back.
 const UPLOAD_DIR_HINT: &str =
     "chunked OCI uploads are staged in `_oci_uploads/` under the `[server].repo_root` directory; \
-     that directory must be writable by the user running forgekeep";
+     that directory must be writable by the user running plombir-git";
 
 /// Where the registry's own directories live, for an error that names one.
 ///
@@ -29,7 +29,7 @@ const UPLOAD_DIR_HINT: &str =
 /// actually set, so the hint names that root and nothing else.
 const REGISTRY_DIR_HINT: &str =
     "the OCI registry's directories live under the `[server].repo_root` directory; that \
-     directory must be writable by the user running forgekeep";
+     directory must be writable by the user running plombir-git";
 
 /// A blob that has reached its content-addressed key, and how it got there.
 ///
@@ -91,7 +91,7 @@ pub struct StagedOciRepository {
 }
 
 /// Everything one repository owns in the registry, moved to another live
-/// namespace while its ForgeKeep repository row is being transferred.
+/// namespace while its Plombir Git repository row is being transferred.
 ///
 /// The database and both registry backends cannot share a transaction.  Keep
 /// each successful move so the caller can put it back if a later storage move
@@ -1150,7 +1150,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::sync::Arc;
 
-    /// A registry built the way `forgekeep serve` builds one: the shared local
+    /// A registry built the way `plombir-git serve` builds one: the shared local
     /// backend, the `_oci_uploads` staging tree, and `root` as the legacy
     /// layout to fall back on.
     fn local_storage(root: &std::path::Path) -> OciStorage {

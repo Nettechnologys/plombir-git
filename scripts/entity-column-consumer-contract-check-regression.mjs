@@ -32,7 +32,7 @@ const check = join(root, 'scripts', 'entity-column-consumer-contract-check.mjs')
 // library. Both sides of the question live in `crates/`: the columns in
 // `rg-db/src/entities`, the readers and writers everywhere else.
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-entity-column-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-entity-column-'));
   mkdirSync(join(fixture, 'crates'), { recursive: true });
   cpSync(join(root, 'crates'), join(fixture, 'crates'), {
     recursive: true,
@@ -192,7 +192,7 @@ runFixture(
 runFixture(
   'a check that cannot read the production sources fails instead of passing',
   ({ fixture, entities }) => {
-    const kept = mkdtempSync(join(tmpdir(), 'forgekeep-entity-column-kept-'));
+    const kept = mkdtempSync(join(tmpdir(), 'plombir-git-entity-column-kept-'));
     cpSync(entities, join(kept, 'entities'), { recursive: true });
     rmSync(join(fixture, 'crates'), { recursive: true, force: true });
     mkdirSync(join(fixture, 'crates', 'rg-db', 'src'), { recursive: true });

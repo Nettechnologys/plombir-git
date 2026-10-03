@@ -41,7 +41,8 @@ use sha2::{Digest, Sha256};
 use crate::auth::encryption;
 
 /// Domain separator of the original derivation. Frozen: changing these bytes
-/// changes the identity of every instance that has not yet stored a key.
+/// changes the identity of every instance that has not yet stored a key, which
+/// is why it still carries the project's former name.
 const LEGACY_DOMAIN: &[u8] = b"forgekeep-ci-oidc-ed25519-v1\0";
 
 /// The instance's Ed25519 key pair plus the `kid` its public half advertises.
@@ -364,7 +365,7 @@ mod tests {
         let statement = crate::attestation::Statement::new(
             "app.tar.gz",
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            crate::attestation::FORGEKEEP_PROVENANCE_TYPE.to_string(),
+            crate::attestation::PLOMBIR_GIT_PROVENANCE_TYPE.to_string(),
             serde_json::json!({ "builder": { "id": "https://forge.example" } }),
         );
         let envelope = crate::attestation::sign_statement(&earlier, &statement).unwrap();

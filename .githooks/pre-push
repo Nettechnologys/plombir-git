@@ -17,7 +17,7 @@ repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
 head_sha=$(git rev-parse HEAD)
-receipt_path=$(git rev-parse --git-path forgekeep-push-gates.receipt)
+receipt_path=$(git rev-parse --git-path plombir-git-push-gates.receipt)
 receipt_sha=''
 if [ -r "$receipt_path" ]; then
     IFS= read -r receipt_sha < "$receipt_path" || receipt_sha=''

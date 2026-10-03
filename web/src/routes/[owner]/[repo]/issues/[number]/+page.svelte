@@ -209,7 +209,7 @@
 </script>
 
 <svelte:head>
-  <title>{issue?.title || `${t('issues.title')} #${number}`} · {owner}/{repo} · ForgeKeep</title>
+  <title>{issue?.title || `${t('issues.title')} #${number}`} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

@@ -1,7 +1,7 @@
 //! Operator-owned transport policy for repository mirrors.
 //!
 //! Repository owners choose mirror URLs, but the instance operator owns the
-//! network, the fetched repository content, and the credentials ForgeKeep
+//! network, the fetched repository content, and the credentials Plombir Git
 //! presents to those remotes. Plain HTTP is therefore a separate instance-level
 //! decision, not something a repository owner can enable by spelling `http://`
 //! in a settings form. The native `git://` protocol has no encrypted mode and

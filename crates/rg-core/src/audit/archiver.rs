@@ -16,7 +16,7 @@ use tokio::time;
 /// Named here rather than written into the `unwrap_or` at the resolution site
 /// for the reason `[mirror]` already is: a number that exists only inside one
 /// `unwrap_or` is a number no contract can reach, so nothing ties it to the
-/// `archive_after_days = 90` line `forgekeep.example.toml` shows the operator.
+/// `archive_after_days = 90` line `plombir-git.example.toml` shows the operator.
 pub const DEFAULT_ARCHIVE_AFTER_DAYS: i64 = 90;
 
 /// Minutes between archival passes, without a configured

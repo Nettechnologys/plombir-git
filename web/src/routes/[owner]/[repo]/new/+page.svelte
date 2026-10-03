@@ -63,7 +63,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('repo.new_file')} · {owner}/{repo} · ForgeKeep</title>
+  <title>{t('repo.new_file')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 {#key editorKey}

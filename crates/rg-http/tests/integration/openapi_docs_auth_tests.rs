@@ -96,7 +96,7 @@ async fn commit_log_openapi_documents_client_and_storage_outcomes() {
 /// through the trailing-slash UI route.
 ///
 /// Swagger UI is a browser surface, and a browser cannot put a header on a
-/// plain navigation — it sends the HttpOnly `forgekeep_token` cookie. Both UI
+/// plain navigation — it sends the HttpOnly `plombir_git_token` cookie. Both UI
 /// spellings are independent Axum registrations, so each one must accept that
 /// cookie, a JWT and a PAT, and each one must still refuse an anonymous caller.
 /// Redirects are disabled deliberately: one alias redirecting to (or otherwise
@@ -114,7 +114,7 @@ async fn both_swagger_ui_aliases_share_the_live_auth_contract_without_redirects(
     for path in ["/api-docs", "/api-docs/"] {
         let with_cookie = client
             .get(format!("{}{}", base, path))
-            .header("cookie", format!("forgekeep_token={jwt}"))
+            .header("cookie", format!("plombir_git_token={jwt}"))
             .send()
             .await
             .unwrap();

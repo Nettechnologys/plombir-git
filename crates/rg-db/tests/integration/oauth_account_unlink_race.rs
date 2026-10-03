@@ -25,7 +25,7 @@ struct TempDb {
 impl TempDb {
     fn new(label: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "forgekeep-oauth-unlink-{label}-{}.db",
+            "plombir-git-oauth-unlink-{label}-{}.db",
             uuid::Uuid::new_v4().simple()
         ));
         Self { path }

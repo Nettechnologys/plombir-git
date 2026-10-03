@@ -46,7 +46,7 @@ let failed = 0;
 
 /** Run the real check over a fixture whose `crates/demo/src/lib.rs` is `body`. */
 function runCase(name, { body, min = 1, expect }) {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-authz-dialect-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-authz-dialect-'));
   try {
     mkdirSync(join(fixture, 'crates/demo/src'), { recursive: true });
     writeFileSync(join(fixture, 'crates/demo/src/lib.rs'), body);
@@ -55,8 +55,8 @@ function runCase(name, { body, min = 1, expect }) {
       cwd: fixture,
       env: {
         ...process.env,
-        FORGEKEEP_AUTHZ_DIALECT_ROOT: fixture,
-        FORGEKEEP_AUTHZ_DIALECT_MIN: String(min),
+        PLOMBIR_GIT_AUTHZ_DIALECT_ROOT: fixture,
+        PLOMBIR_GIT_AUTHZ_DIALECT_MIN: String(min),
       },
       encoding: 'utf8',
     });

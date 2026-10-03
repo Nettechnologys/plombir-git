@@ -4,7 +4,7 @@
 //! This is the other half, and the one that was actually broken: what the
 //! operator posts to `.../hooks` used to land in `webhooks.secret` verbatim, so
 //! a database dump handed out the key every delivery to that receiver is signed
-//! with — and `forgekeep rotate-encryption-key` reported success without ever
+//! with — and `plombir-git rotate-encryption-key` reported success without ever
 //! touching the column.
 //!
 //! Driven through the HTTP handler on purpose: the encryption happens in the
@@ -36,7 +36,7 @@ async fn post_hook(base: &str, token: &str, owner: &str, repo: &str, secret: &st
         .post(format!("{base}/api/v1/repos/{owner}/{repo}/hooks"))
         .bearer_auth(token)
         .json(&serde_json::json!({
-            "url": "https://hooks.example.invalid/forgekeep",
+            "url": "https://hooks.example.invalid/plombir-git",
             "secret": secret,
             "events": ["push"],
         }))

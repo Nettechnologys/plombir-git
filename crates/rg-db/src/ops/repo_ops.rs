@@ -19,7 +19,7 @@ use crate::entities::{
     package_version, repository_transfer_lease, user,
 };
 
-/// Count non-deleted repositories — backs the `forgekeep_repositories` gauge.
+/// Count non-deleted repositories — backs the `plombir_git_repositories` gauge.
 pub async fn count_non_deleted(db: &DatabaseConnection) -> Result<u64> {
     RepoEntity::find()
         .filter(repository::Column::DeletedAt.is_null())
@@ -1146,7 +1146,7 @@ mod forks_count_tests {
         fn new() -> Self {
             Self {
                 path: std::env::temp_dir().join(format!(
-                    "forgekeep-forks-count-race-{}.db",
+                    "plombir-git-forks-count-race-{}.db",
                     uuid::Uuid::new_v4().simple()
                 )),
             }

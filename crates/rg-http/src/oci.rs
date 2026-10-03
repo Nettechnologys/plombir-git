@@ -37,7 +37,7 @@ const DOCKER_API_VERSION: HeaderName = HeaderName::from_static("docker-distribut
 
 const OCI_UPLOAD_STORAGE_HINT: &str =
     "chunked OCI uploads are staged in `_oci_uploads/` under the `[server].repo_root` \
-     directory; that directory must be writable by the user running forgekeep";
+     directory; that directory must be writable by the user running plombir-git";
 
 /// The `sub` an OCI token minted without credentials carries. It is a literal,
 /// not a username: no account may hold it, and `token_subject` reads it as
@@ -47,7 +47,7 @@ const ANONYMOUS_SUBJECT: &str = "anonymous";
 /// The `service` every challenge advertises and every token is minted for. It
 /// is one value in three places (the version check, the refusal challenge, the
 /// token's `aud`), so it is one constant.
-const REGISTRY_SERVICE: &str = "forgekeep-registry";
+const REGISTRY_SERVICE: &str = "plombir-git-registry";
 
 /// Largest manifest or image index this registry accepts, in bytes.
 ///
@@ -378,7 +378,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-/// The ForgeKeep user behind a normal user JWT in `Authorization: Bearer`.
+/// The Plombir Git user behind a normal user JWT in `Authorization: Bearer`.
 ///
 /// Deliberately *not* `api::auth::extract_user_id`: that one also accepts the
 /// browser session cookie, and the registry is not a browser surface. An OCI
@@ -481,7 +481,7 @@ async fn token_subject(state: &AppState, sub: &str) -> Result<TokenSubject, AppE
 
 /// Check if the request has access to perform an OCI repo action.
 ///
-/// The registry decides *who* is calling — a ForgeKeep user JWT, an OCI scoped
+/// The registry decides *who* is calling — a Plombir Git user JWT, an OCI scoped
 /// bearer token, or nobody — and the shared repository gate in
 /// `api::repo_access` decides what that caller may do. That holds for the
 /// scoped token too: it names its caller by username rather than by id, so
@@ -503,7 +503,7 @@ async fn check_access(
         None => return Ok((false, None)),
     };
 
-    // A normal ForgeKeep JWT is a user, so the answer is the same one the REST
+    // A normal Plombir Git JWT is a user, so the answer is the same one the REST
     // API would give that user for this repository.
     if let Some(uid) = bearer_user_id(headers, &state.jwt_secret) {
         let allowed = match required_action {
@@ -600,7 +600,7 @@ async fn require_access(
 }
 
 /// Resolve owner/repo from OCI namespace string.
-/// In ForgeKeep, the OCI name is always "{owner}/{repo}".
+/// In Plombir Git, the OCI name is always "{owner}/{repo}".
 fn parse_namespace(name: &str) -> Option<(&str, &str)> {
     let parts: Vec<&str> = name.splitn(2, '/').collect();
     if parts.len() == 2 {
@@ -945,7 +945,7 @@ pub async fn get_token(
     let _service = params
         .get("service")
         .cloned()
-        .unwrap_or_else(|| "forgekeep-registry".to_string());
+        .unwrap_or_else(|| "plombir-git-registry".to_string());
     let scope = params.get("scope").cloned().unwrap_or_default();
 
     let (username, authenticated_user_id) = match authenticate_basic(&state.db, &headers).await {
@@ -1511,7 +1511,7 @@ async fn put_manifest_under_lease(
 /// and the person who actually ran `docker push` the second time left no trace
 /// at all.
 ///
-/// `audit_log` is where the rest of ForgeKeep records mutations, it holds the
+/// `audit_log` is where the rest of Plombir Git records mutations, it holds the
 /// address the push was made to, and every publication gets its own row —
 /// including the ones the column could not represent. Fire-and-forget, like
 /// every other audit write: the image is already stored and the client is owed
@@ -2902,15 +2902,15 @@ async fn stream_body_to_file(
 // ── DB helpers ────────────────────────────────────────────────
 
 /// Find an OCI repository, auto-creating if it doesn't exist.
-/// Uses the ForgeKeep repo as the owner.
+/// Uses the Plombir Git repo as the owner.
 async fn find_oci_repo(
     db: &DatabaseConnection,
     owner: &str,
     repo: &str,
 ) -> anyhow::Result<Option<rg_db::entities::oci_repository::Model>> {
-    // Look up the ForgeKeep repository
-    let forgekeep_repo = rg_core::repo::service::find_repo_by_owner_name(db, owner, repo).await?;
-    match forgekeep_repo {
+    // Look up the Plombir Git repository
+    let plombir_git_repo = rg_core::repo::service::find_repo_by_owner_name(db, owner, repo).await?;
+    match plombir_git_repo {
         Some(r) => {
             let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(db, r.id).await?;
             Ok(oci_repo)
@@ -2938,16 +2938,16 @@ async fn find_or_create_oci_repo(
     owner: &str,
     repo: &str,
 ) -> anyhow::Result<rg_db::entities::oci_repository::Model> {
-    let forgekeep_repo = rg_core::repo::service::find_repo_by_owner_name(db, owner, repo)
+    let plombir_git_repo = rg_core::repo::service::find_repo_by_owner_name(db, owner, repo)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repository {}/{} not found", owner, repo))?;
 
     let namespace = format!("{}/{}", owner, repo);
     rg_db::ops::oci_ops::find_or_create_repo(
         db,
-        forgekeep_repo.id,
+        plombir_git_repo.id,
         &namespace,
-        forgekeep_repo.owner_id,
+        plombir_git_repo.owner_id,
     )
     .await
     .map_err(Into::into)

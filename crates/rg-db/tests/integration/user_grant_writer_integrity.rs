@@ -17,7 +17,7 @@ impl TempDb {
     fn new() -> Self {
         Self {
             path: std::env::temp_dir().join(format!(
-                "forgekeep-user-grant-writer-{}.db",
+                "plombir-git-user-grant-writer-{}.db",
                 uuid::Uuid::new_v4().simple()
             )),
         }

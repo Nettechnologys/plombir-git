@@ -106,7 +106,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('auth.login.title')} · ForgeKeep</title>
+  <title>{t('auth.login.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="login-page">

@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(
-  process.env.FORGEKEEP_ARCHITECTURE_DEPENDENCY_ROOT ?? resolve(scriptsDir, '..'),
+  process.env.PLOMBIR_GIT_ARCHITECTURE_DEPENDENCY_ROOT ?? resolve(scriptsDir, '..'),
 );
 const architecturePath = resolve(root, 'ARCHITECTURE.md');
 

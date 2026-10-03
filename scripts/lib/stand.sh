@@ -1,11 +1,11 @@
 # shellcheck shell=bash
 #
-# Shared loader for an ephemeral ForgeKeep stand: its own binary, an empty
+# Shared loader for an ephemeral Plombir Git stand: its own binary, an empty
 # database, a throwaway `repo_root`, and — when asked for — the built frontend
 # behind `vite preview`, so a browser can drive the real product.
 #
 # Why this is a library and not a copy: `scripts/git-protocol-e2e.sh` grew the
-# only working spelling of "boot a private ForgeKeep and wait until it is
+# only working spelling of "boot a private Plombir Git and wait until it is
 # actually up" — ephemeral ports published through `--listen-address-file`, a
 # health poll that notices a server which exited instead of polling until the
 # timeout, and a trap that takes the process down with the script. A browser
@@ -74,7 +74,7 @@ stand_open() {
   # ten); and a secret spelled on the command line is readable in `ps` by every
   # account on the host for as long as the stand runs.
   : "${STAND_JWT_SECRET:="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"}"
-  STAND_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/forgekeep-stand.XXXXXX")"
+  STAND_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/plombir-git-stand.XXXXXX")"
   mkdir -p "${STAND_WORK_DIR}/repos"
   trap 'stand_trap' EXIT INT TERM
 }
@@ -146,7 +146,7 @@ stand_cleanup() {
   STAND_PIDS=()
 
   if [[ -n "${STAND_WORK_DIR:-}" ]]; then
-    if [[ "${FORGEKEEP_STAND_KEEP_TMP:-0}" == "1" ]]; then
+    if [[ "${PLOMBIR_GIT_STAND_KEEP_TMP:-0}" == "1" ]]; then
       echo "stand: kept workspace ${STAND_WORK_DIR}" >&2
     else
       rm -rf "${STAND_WORK_DIR}"
@@ -178,12 +178,12 @@ stand_wait_for() {
 }
 
 stand_resolve_binary() {
-  STAND_BIN="${FORGEKEEP_BIN:-${STAND_ROOT_DIR}/target/release/forgekeep}"
+  STAND_BIN="${PLOMBIR_GIT_BIN:-${STAND_ROOT_DIR}/target/release/plombir-git}"
   if [[ "${STAND_BIN}" != /* ]]; then
     STAND_BIN="${STAND_ROOT_DIR}/${STAND_BIN}"
   fi
   if [[ ! -x "${STAND_BIN}" ]]; then
-    echo "stand: ForgeKeep binary not found: ${STAND_BIN}" >&2
+    echo "stand: Plombir Git binary not found: ${STAND_BIN}" >&2
     echo "stand: build it first with: cargo build --release -p rg-cli -j 6" >&2
     return 1
   fi
@@ -222,7 +222,7 @@ stand_start_backend() {
     config_args=(--config "${STAND_CONFIG_PATH}")
   fi
 
-  export FORGEKEEP_JWT_SECRET="${STAND_JWT_SECRET}"
+  export PLOMBIR_GIT_JWT_SECRET="${STAND_JWT_SECRET}"
   stand_spawn "${STAND_SERVER_LOG}" "${STAND_WORK_DIR}" \
     "${STAND_BIN}" serve \
     "${config_args[@]}" \
@@ -231,7 +231,7 @@ stand_start_backend() {
     --ssh-addr "127.0.0.1:0" \
     --listen-address-file "${STAND_LISTEN_FILE}" \
     --host-key "${STAND_WORK_DIR}/host-key" \
-    --db-url "sqlite://${STAND_WORK_DIR}/forgekeep.db?mode=rwc"
+    --db-url "sqlite://${STAND_WORK_DIR}/plombir-git.db?mode=rwc"
   STAND_SERVER_PID="${STAND_LAST_PID}"
 
   stand_wait_for "${STAND_SERVER_PID}" "the server to publish its listen addresses" \
@@ -287,7 +287,7 @@ stand_frontend_reachable() {
 # to this stand's backend — a preview without the proxy boots, serves every
 # page, and answers every API call with its own 404, which is a stand that
 # tests nothing while looking healthy. `web/vite.config.ts` reads the target out
-# of FORGEKEEP_BACKEND_ORIGIN for exactly this reason: the stand's port is only
+# of PLOMBIR_GIT_BACKEND_ORIGIN for exactly this reason: the stand's port is only
 # known at run time.
 stand_start_frontend() {
   local web_dir="${STAND_ROOT_DIR}/web"
@@ -307,7 +307,7 @@ stand_start_frontend() {
   fi
 
   STAND_FRONTEND_LOG="${STAND_WORK_DIR}/frontend.log"
-  export FORGEKEEP_BACKEND_ORIGIN="${STAND_BACKEND_URL}"
+  export PLOMBIR_GIT_BACKEND_ORIGIN="${STAND_BACKEND_URL}"
   stand_spawn "${STAND_FRONTEND_LOG}" "${web_dir}" \
     node "${vite_bin}" preview --host 127.0.0.1 --port "${STAND_FRONTEND_PORT:-0}"
   STAND_FRONTEND_PID="${STAND_LAST_PID}"

@@ -719,7 +719,7 @@ fn attestation_builder_id(state: &AppState) -> String {
         .external_url
         .as_deref()
         .map(|u| u.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| "urn:forgekeep:instance".to_string())
+        .unwrap_or_else(|| "urn:plombir-git:instance".to_string())
 }
 
 /// POST /api/v1/repos/:owner/:name/releases/assets/:asset_id/attestation

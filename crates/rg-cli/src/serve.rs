@@ -1,4 +1,4 @@
-//! `forgekeep serve` subcommand: startup validation and the HTTP + SSH server
+//! `plombir-git serve` subcommand: startup validation and the HTTP + SSH server
 //! bootstrap.
 //!
 //! The TOML model and the `CLI arg > config file > built-in default` resolution
@@ -111,7 +111,7 @@ fn publish_listen_addresses(
 /// build did not record the commit it came from.
 ///
 /// The warning is the only place an operator learns that their image was built
-/// without `FORGEKEEP_SOURCE_COMMIT`: the UI still links the repository, so
+/// without `PLOMBIR_GIT_SOURCE_COMMIT`: the UI still links the repository, so
 /// nothing looks broken — it just stops naming the code that is running.
 fn announce_source_link(source_url: &str) {
     use rg_http::build_info::{self, SourceCommit};
@@ -124,14 +124,14 @@ fn announce_source_link(source_url: &str) {
         }
         SourceCommit::Unrecorded => tracing::warn!(
             %link,
-            "this binary was built without FORGEKEEP_SOURCE_COMMIT, so the UI links the \
+            "this binary was built without PLOMBIR_GIT_SOURCE_COMMIT, so the UI links the \
              repository instead of the commit that is running; pass it at build time \
-             (docker build --build-arg FORGEKEEP_SOURCE_COMMIT=$(git rev-parse HEAD))"
+             (docker build --build-arg PLOMBIR_GIT_SOURCE_COMMIT=$(git rev-parse HEAD))"
         ),
         SourceCommit::Malformed(raw) => tracing::warn!(
             %link,
             recorded = raw,
-            "FORGEKEEP_SOURCE_COMMIT was set at build time to something that is not a full \
+            "PLOMBIR_GIT_SOURCE_COMMIT was set at build time to something that is not a full \
              commit id, so it is ignored and the UI links the repository instead; pass the \
              full `git rev-parse HEAD`"
         ),
@@ -316,7 +316,7 @@ fn validate_numeric_ranges(
 /// Read a secret-carrying environment variable, treating a blank value as unset.
 ///
 /// `std::env::var` reports `FOO=` as `Ok("")`, and `deploy/.env.example` ships
-/// exactly that line for `FORGEKEEP_JWT_SECRET`. Taken literally, an operator
+/// exactly that line for `PLOMBIR_GIT_JWT_SECRET`. Taken literally, an operator
 /// who copied the file and forgot to fill it in got a server that started
 /// cleanly and signed every token with the empty string — and the same file
 /// promised them "startup validation will fail loudly". A blank line in an
@@ -332,7 +332,7 @@ fn non_blank_env_value(value: Option<String>) -> Option<String> {
 }
 
 /// Resolve whether this instance accepts self-service registrations:
-/// `FORGEKEEP_REGISTRATION` > `[auth].registration` > `"open"`.
+/// `PLOMBIR_GIT_REGISTRATION` > `[auth].registration` > `"open"`.
 ///
 /// A value neither source recognises is a **hard startup error**. Every other
 /// unparseable knob in this file behaves the same way, and this one has the
@@ -352,7 +352,7 @@ fn resolve_registration_mode(
 
     if let Some(raw) = env_value.map(str::trim).filter(|value| !value.is_empty()) {
         return RegistrationMode::parse(raw)
-            .map_err(|reason| anyhow::anyhow!("env FORGEKEEP_REGISTRATION: {reason}"));
+            .map_err(|reason| anyhow::anyhow!("env PLOMBIR_GIT_REGISTRATION: {reason}"));
     }
 
     match cfg.and_then(|config| config.auth.registration.as_deref()) {
@@ -379,9 +379,9 @@ pub(crate) fn resolve_auth_secrets(
     key_file: &Path,
 ) -> anyhow::Result<AuthSecrets> {
     // Resolve JWT secret: env var > CLI args > config file > error
-    let resolved_jwt_secret = if let Some(env_secret) = env_secret("FORGEKEEP_JWT_SECRET") {
-        validate_jwt_secret(&env_secret, "environment variable FORGEKEEP_JWT_SECRET")?;
-        tracing::info!("Using JWT secret from environment variable FORGEKEEP_JWT_SECRET");
+    let resolved_jwt_secret = if let Some(env_secret) = env_secret("PLOMBIR_GIT_JWT_SECRET") {
+        validate_jwt_secret(&env_secret, "environment variable PLOMBIR_GIT_JWT_SECRET")?;
+        tracing::info!("Using JWT secret from environment variable PLOMBIR_GIT_JWT_SECRET");
         env_secret
     } else if let Some(cli_secret) = jwt_secret {
         validate_jwt_secret(&cli_secret, "--jwt-secret CLI argument")?;
@@ -391,7 +391,7 @@ pub(crate) fn resolve_auth_secrets(
         cfg_secret
     } else {
         anyhow::bail!(
-            "No JWT secret provided. Set FORGEKEEP_JWT_SECRET, use --jwt-secret, or configure [auth].jwt_secret in config file"
+            "No JWT secret provided. Set PLOMBIR_GIT_JWT_SECRET, use --jwt-secret, or configure [auth].jwt_secret in config file"
         );
     };
 
@@ -400,10 +400,10 @@ pub(crate) fn resolve_auth_secrets(
     // preflight: legacy ciphertext first proves the effective JWT-era key,
     // while an empty database receives a new random key.
     let (resolved_encryption_key, missing_key_file) = if let Some(env_key) =
-        env_secret("FORGEKEEP_ENCRYPTION_KEY")
+        env_secret("PLOMBIR_GIT_ENCRYPTION_KEY")
     {
-        validate_jwt_secret(&env_key, "environment variable FORGEKEEP_ENCRYPTION_KEY")?;
-        tracing::info!("Using at-rest encryption key from FORGEKEEP_ENCRYPTION_KEY");
+        validate_jwt_secret(&env_key, "environment variable PLOMBIR_GIT_ENCRYPTION_KEY")?;
+        tracing::info!("Using at-rest encryption key from PLOMBIR_GIT_ENCRYPTION_KEY");
         (env_key, None)
     } else if let Some(cli_key) = encryption_key {
         validate_jwt_secret(&cli_key, "--encryption-key CLI argument")?;
@@ -577,7 +577,7 @@ async fn establish_encryption_key(
     rg_core::auth::key_check::ensure_encryption_key_check(db, &secrets.encryption_key).await
 }
 
-/// Initialise and run the ForgeKeep server (HTTP + SSH).
+/// Initialise and run the Plombir Git server (HTTP + SSH).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_serve(
     repo_root: Option<String>,
@@ -684,10 +684,10 @@ pub(crate) async fn run_serve(
         .unwrap_or_else(rg_core::ci::default_runner_labels);
     let resolved_registration = resolve_registration_mode(
         cfg.as_ref(),
-        std::env::var("FORGEKEEP_REGISTRATION").ok().as_deref(),
+        std::env::var("PLOMBIR_GIT_REGISTRATION").ok().as_deref(),
     )?;
     // Env var wins over config file; both default off (opt-in).
-    let resolved_attestation_enabled = match std::env::var("FORGEKEEP_ATTESTATION_ENABLED") {
+    let resolved_attestation_enabled = match std::env::var("PLOMBIR_GIT_ATTESTATION_ENABLED") {
         Ok(v) => matches!(v.trim(), "1" | "true" | "yes" | "on"),
         Err(_) => cfg
             .as_ref()
@@ -793,7 +793,7 @@ pub(crate) async fn run_serve(
 
     // Inbound-webhook HMAC secret: env var wins, fallback to config file.
     // Unset ⇒ signature verification stays off (endpoints are auth-gated).
-    let resolved_external_webhook_secret = env_secret("FORGEKEEP_EXTERNAL_WEBHOOK_SECRET")
+    let resolved_external_webhook_secret = env_secret("PLOMBIR_GIT_EXTERNAL_WEBHOOK_SECRET")
         .or_else(|| {
             cfg.as_ref()
                 .and_then(|c| c.webhooks.external_secret.clone())
@@ -860,7 +860,7 @@ pub(crate) async fn run_serve(
         let log_prefix = std::path::Path::new(log_path)
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("forgekeep");
+            .unwrap_or("plombir-git");
         let log_suffix = std::path::Path::new(log_path)
             .extension()
             .and_then(|s| s.to_str())
@@ -980,6 +980,7 @@ pub(crate) async fn run_serve(
     );
     let server_db = dbconn::connect_server_with_timeouts(
         &resolved_db_url,
+        &repo_root,
         resolved_db_connect_timeout,
         resolved_db_idle_timeout,
     )
@@ -1182,7 +1183,7 @@ pub(crate) async fn run_serve(
         // must not have to infer the answer from the absence of a line.
         tracing::info!(
             "Scheduled database backups are OFF ([backup].enabled): this database is only backed \
-             up when someone runs `forgekeep backup-db`. Note that repositories under repo_root \
+             up when someone runs `plombir-git backup-db`. Note that repositories under repo_root \
              are never covered by a database backup — snapshot the data volume for those."
         );
         None
@@ -1685,19 +1686,19 @@ mod serve_tests {
     }
 
     /// `[auth].encryption_key` must actually parse — the struct carries
-    /// `deny_unknown_fields`, so a key documented in `forgekeep.example.toml`
+    /// `deny_unknown_fields`, so a key documented in `plombir-git.example.toml`
     /// but missing from the model turns every config file that uses it into a
     /// hard startup failure.
     #[test]
     fn the_encryption_key_is_a_real_config_key() {
         let config: ConfigFile =
-            toml::from_str("[auth]\njwt_secret = \"signing\"\nencryption_key = \"at-rest\"\nkey_file = \"/srv/forgekeep/encryption_key\"\n")
+            toml::from_str("[auth]\njwt_secret = \"signing\"\nencryption_key = \"at-rest\"\nkey_file = \"/srv/plombir-git/encryption_key\"\n")
                 .expect("[auth].encryption_key must be part of the config model");
         assert_eq!(config.auth.jwt_secret.as_deref(), Some("signing"));
         assert_eq!(config.auth.encryption_key.as_deref(), Some("at-rest"));
         assert_eq!(
             config.auth.key_file.as_deref(),
-            Some("/srv/forgekeep/encryption_key")
+            Some("/srv/plombir-git/encryption_key")
         );
     }
 
@@ -1718,7 +1719,7 @@ mod serve_tests {
         );
     }
 
-    /// `[mirror]` is documented in `forgekeep.example.toml`, and the config
+    /// `[mirror]` is documented in `plombir-git.example.toml`, and the config
     /// model carries `deny_unknown_fields` — a section that exists in the
     /// documentation but not in the struct turns every config file that uses it
     /// into a hard startup failure.
@@ -1802,7 +1803,7 @@ mod serve_tests {
         let err = super::resolve_registration_mode(None, Some("disabled"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("FORGEKEEP_REGISTRATION"), "no source: {err}");
+        assert!(err.contains("PLOMBIR_GIT_REGISTRATION"), "no source: {err}");
     }
 
     /// Omitting it is the supported (and most common) state: existing
@@ -2139,12 +2140,12 @@ mod serve_tests {
     }
 
     /// `serve` shares one resolution path with the one-shot subcommands, so the
-    /// server and a later `forgekeep migrate --config <same file>` cannot end up
+    /// server and a later `plombir-git migrate --config <same file>` cannot end up
     /// pointed at two different databases.
     #[test]
     fn serve_and_the_one_shot_subcommands_resolve_the_same_database() {
         let config: ConfigFile =
-            toml::from_str("[database]\nurl = \"postgres://forge@db/forgekeep\"\n[server]\nrepo_root = \"/data/repos\"\n")
+            toml::from_str("[database]\nurl = \"postgres://forge@db/plombir_git\"\n[server]\nrepo_root = \"/data/repos\"\n")
                 .unwrap();
 
         let resolved = crate::config::resolve_settings(CliSettings::default(), Some(&config));
@@ -2167,7 +2168,7 @@ mod serve_tests {
     fn owner_only_default_protects_a_real_gix_repository_in_an_operator_directory() {
         use std::os::unix::fs::PermissionsExt;
 
-        const CHILD_ROOT: &str = "FORGEKEEP_STATE_UMASK_TEST_CHILD_ROOT";
+        const CHILD_ROOT: &str = "PLOMBIR_GIT_STATE_UMASK_TEST_CHILD_ROOT";
         if let Some(root) = std::env::var_os(CHILD_ROOT) {
             // SAFETY: this is an isolated child process which exits at the end
             // of this branch; no other test runs in it (`--exact`).

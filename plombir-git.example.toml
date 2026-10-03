@@ -1,6 +1,6 @@
-# ForgeKeep Configuration File
-# Copy this to forgekeep.toml and customize for your deployment, then start the
-# server with `forgekeep serve --config forgekeep.toml`.
+# Plombir Git Configuration File
+# Copy this to plombir-git.toml and customize for your deployment, then start the
+# server with `plombir-git serve --config plombir-git.toml`.
 #
 # Precedence: CLI arg > this file > built-in default. A key you leave commented
 # out falls through to the default; a flag passed on the command line overrides
@@ -35,17 +35,17 @@ package_upload_max_mb = 512
 # shutdown_grace_secs = 30
 # Repository holding this instance's source code. Every page links
 # `<source_url>/tree/<commit>` for the commit the binary was built from (the
-# Docker build takes it as FORGEKEEP_SOURCE_COMMIT) — the source offer AGPL §13
+# Docker build takes it as PLOMBIR_GIT_SOURCE_COMMIT) — the source offer AGPL §13
 # asks of anyone who modifies the code and serves it over a network. Point it at
 # your fork if you run a modified build.
 # source_url = "https://github.com/Yahook/ForgeKeep"
 
 [database]
-url = "sqlite://./forgekeep.db?mode=rwc"
+url = "sqlite://./plombir-git.db?mode=rwc"
 
 [auth]
 # Signs session tokens, PAT-derived tokens and CI job tokens. Generate one with
-# `forgekeep gen-secret`. Also settable as FORGEKEEP_JWT_SECRET, which wins.
+# `plombir-git gen-secret`. Also settable as PLOMBIR_GIT_JWT_SECRET, which wins.
 jwt_secret = "change-me-in-production"
 
 # Encrypts data at rest: TOTP secrets, CI secrets, mirror and LDAP passwords,
@@ -54,25 +54,25 @@ jwt_secret = "change-me-in-production"
 # start (mode 0600) and reuses it across restarts. It is independent of the JWT
 # signing secret, so rotating jwt_secret is safe without a manual .env step.
 # `key_file` defaults beside [server].host_key.
-# Also settable as FORGEKEEP_ENCRYPTION_KEY / --encryption-key (env wins).
+# Also settable as PLOMBIR_GIT_ENCRYPTION_KEY / --encryption-key (env wins).
 # encryption_key = "the-secret-your-data-was-encrypted-with"
 # key_file = "/path/to/encryption_key"
 #
-# If this key leaks, stop the server and use `forgekeep rotate-encryption-key
+# If this key leaks, stop the server and use `plombir-git rotate-encryption-key
 # --old <current> --new <fresh> --dry-run`; re-run with --yes to apply it.
 #
 # There is no third key to configure here: the Ed25519 key that signs release
 # attestations and backs /api/v1/ci/oidc/jwks is established on first start and
 # kept in the database, precisely so that rotating `jwt_secret` cannot change
 # this instance's public identity. Replace it only with
-# `forgekeep rotate-instance-key --yes`, which permanently invalidates every
+# `plombir-git rotate-instance-key --yes`, which permanently invalidates every
 # attestation signed with the previous key.
 
 # Whether POST /api/v1/users/register accepts new accounts from outside:
 #   "open"   — anyone who can reach the endpoint may sign up (the default).
 #   "closed" — the endpoint answers 403 before hashing a password or touching
 #              the database.
-# Also settable as FORGEKEEP_REGISTRATION, which wins. An unrecognised value
+# Also settable as PLOMBIR_GIT_REGISTRATION, which wins. An unrecognised value
 # (e.g. "close") fails the start instead of quietly leaving the instance open.
 #
 # [rate_limit].auth_max below is NOT a substitute: it throttles registration to
@@ -104,7 +104,7 @@ allow_insecure_ldap_endpoints = []
 # When set, the request must carry an `X-Hub-Signature-256: sha256=<hex>` header
 # whose HMAC over the raw body matches (constant-time check) — defense-in-depth
 # on top of the JWT/PAT the endpoint already requires. Leave unset to keep the
-# endpoint auth-only. The FORGEKEEP_EXTERNAL_WEBHOOK_SECRET env var overrides this.
+# endpoint auth-only. The PLOMBIR_GIT_EXTERNAL_WEBHOOK_SECRET env var overrides this.
 # external_secret = "change-me-shared-with-your-ci"
 # Outbound webhook payloads and their X-Hub-Signature-256 value require HTTPS
 # by default. Enable plaintext HTTP only for an operator-controlled development
@@ -114,7 +114,7 @@ allow_insecure_http = false
 
 [ci]
 docker = false
-# Accept jobs from runners registered with `forgekeep-runner register`, i.e.
+# Accept jobs from runners registered with `plombir-git-runner register`, i.e.
 # execution on a separate machine. Off means this instance only runs the jobs
 # it can execute itself (Docker, or the host shell below).
 external_runners = false
@@ -136,7 +136,7 @@ allow_host_runner = false
 # POST .../releases/assets/{id}/attestation, and the envelope is published next
 # to the asset. Nothing is signed on upload by itself. Opt-in: the key is
 # created on first start regardless (see [auth] above), this only decides
-# whether the endpoints answer. Also settable as FORGEKEEP_ATTESTATION_ENABLED=1,
+# whether the endpoints answer. Also settable as PLOMBIR_GIT_ATTESTATION_ENABLED=1,
 # which wins.
 attestation_enabled = false
 
@@ -144,7 +144,7 @@ attestation_enabled = false
 max = 0          # 0 = disabled (global per-IP limit for every request)
 window_secs = 60
 # Only these proxy source IPs may supply X-Forwarded-For / X-Real-IP for rate limiting.
-# Leave empty when ForgeKeep is directly exposed.
+# Leave empty when Plombir Git is directly exposed.
 trusted_proxies = []
 # trusted_proxies = ["127.0.0.1", "::1", "10.0.0.10"]
 # Hard cap on the number of distinct client IPs tracked at once. Bounds memory
@@ -168,7 +168,7 @@ agent_window_secs = 60
 # port = 587
 # user = "noreply@example.com"
 # pass = "your-password"
-# from = "ForgeKeep <noreply@example.com>"
+# from = "Plombir Git <noreply@example.com>"
 
 [tls]
 # cert = "/path/to/cert.pem"
@@ -178,7 +178,7 @@ agent_window_secs = 60
 # (`chmod 600`), exactly like this config file and [auth].key_file.
 
 [logging]
-# file = "/var/log/forgekeep/forgekeep.log"
+# file = "/var/log/plombir-git/plombir-git.log"
 max_size_mb = 10
 max_files = 5
 
@@ -203,7 +203,7 @@ batch_size = 1000
 # answered by this file rather than by whether someone remembered to add a cron
 # entry on one particular host — and the snapshot is taken from the same pool
 # the server uses, so it cannot end up addressing a different database the way
-# `forgekeep backup-db` without `--config`/`--db-url` does.
+# `plombir-git backup-db` without `--config`/`--db-url` does.
 #
 # Defaults to false in code so an upgrade never starts consuming
 # keep_last x database-size of disk unannounced; it is on here because a fresh
@@ -221,7 +221,7 @@ dir = "./data/backups"
 # good snapshots out.
 interval_hours = 24
 # How many snapshots to keep. The N+1-th evicts the oldest. Only files this
-# scheduler wrote (`forgekeep-<timestamp>-<uuid>.db`) are ever deleted — a
+# scheduler wrote (`plombir-git-<timestamp>-<uuid>.db`) are ever deleted — a
 # hand-made backup left in the same directory is not touched.
 keep_last = 7
 #
@@ -315,9 +315,9 @@ batch_size = 10
 # automatically, so the base URL is enough. Overridden by the standard
 # OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_TRACES_ENDPOINT env vars.
 # otlp_endpoint = "http://localhost:4318"
-# service.name resource attribute reported to the collector (default "forgekeep").
+# service.name resource attribute reported to the collector (default "plombir-git").
 # Overridden by OTEL_SERVICE_NAME.
-# service_name = "forgekeep"
+# service_name = "plombir-git"
 # Head sampling ratio in 0.0..=1.0 (default 1.0 = record every trace). Lower it
 # on a busy instance to reduce export volume, e.g. 0.1 = sample 10%.
 # sample_ratio = 1.0

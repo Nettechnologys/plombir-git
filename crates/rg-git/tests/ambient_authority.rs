@@ -27,9 +27,9 @@ use std::sync::{Arc, Mutex};
 use rg_git::cli_gateway::global_gateway;
 use rg_git::credentials::credential_invocation;
 
-const TRANSPORT_CHILD_URL: &str = "FORGEKEEP_TEST_TRANSPORT_URL";
-const TRANSPORT_CHILD_DESTINATION: &str = "FORGEKEEP_TEST_TRANSPORT_DESTINATION";
-const TRANSPORT_CHILD_HARDENED: &str = "FORGEKEEP_TEST_TRANSPORT_HARDENED";
+const TRANSPORT_CHILD_URL: &str = "PLOMBIR_GIT_TEST_TRANSPORT_URL";
+const TRANSPORT_CHILD_DESTINATION: &str = "PLOMBIR_GIT_TEST_TRANSPORT_DESTINATION";
+const TRANSPORT_CHILD_HARDENED: &str = "PLOMBIR_GIT_TEST_TRANSPORT_HARDENED";
 
 /// One HTTP request the stub remote saw.
 #[derive(Clone, Debug)]
@@ -84,7 +84,7 @@ fn spawn_recording_remote() -> (String, Arc<Mutex<Vec<Seen>>>) {
             if stream
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\n\
-                      WWW-Authenticate: Basic realm=\"forgekeep-test\"\r\n\
+                      WWW-Authenticate: Basic realm=\"plombir-git-test\"\r\n\
                       Content-Length: 0\r\n\r\n",
                 )
                 .is_err()
@@ -257,7 +257,7 @@ fn transport_environment_is_not_inherited() {
     let proxy_marker = directory.path().join("git-proxy-command-ran");
     std::fs::write(
         &proxy_script,
-        "#!/bin/sh\n: > \"$FORGEKEEP_TEST_PROXY_MARKER\"\nexit 1\n",
+        "#!/bin/sh\n: > \"$PLOMBIR_GIT_TEST_PROXY_MARKER\"\nexit 1\n",
     )
     .expect("write proxy command");
     let mut permissions = std::fs::metadata(&proxy_script)
@@ -271,7 +271,10 @@ fn transport_environment_is_not_inherited() {
     let git_url = "git://127.0.0.1:9/upstream.git";
     let git_proxy_env = [
         ("GIT_PROXY_COMMAND", proxy_script.as_str()),
-        ("FORGEKEEP_TEST_PROXY_MARKER", proxy_marker_string.as_str()),
+        (
+            "PLOMBIR_GIT_TEST_PROXY_MARKER",
+            proxy_marker_string.as_str(),
+        ),
     ];
     run_transport_child(
         false,

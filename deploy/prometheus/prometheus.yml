@@ -1,11 +1,11 @@
-# ForgeKeep Prometheus Configuration
+# Plombir Git Prometheus Configuration
 # Phase 22-C: Observability Stack
 
 global:
   scrape_interval: 15s          # Scrape targets every 15s
   evaluation_interval: 15s      # Evaluate rules every 15s
   external_labels:
-    cluster: 'forgekeep'
+    cluster: 'plombir-git'
     environment: 'production'
 
 # Load rules
@@ -20,15 +20,15 @@ alerting:
 
 # Scrape targets
 scrape_configs:
-  # ForgeKeep main app
-  - job_name: 'forgekeep'
+  # Plombir Git main app
+  - job_name: 'plombir-git'
     metrics_path: '/metrics'
     scrape_interval: 15s
     scrape_timeout: 10s
     static_configs:
-      - targets: ['forgekeep:8080']
+      - targets: ['plombir-git:8080']
         labels:
-          service: 'forgekeep-api'
+          service: 'plombir-git-api'
           component: 'api'
 
   # Prometheus itself

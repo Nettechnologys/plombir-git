@@ -19,14 +19,14 @@ const check = join(scriptsDir, 'parked-task-assertion-contract-check.mjs');
 function run(fixture) {
   const result = spawnSync(process.execPath, [check], {
     cwd: fixture,
-    env: { ...process.env, FORGEKEEP_PARKED_TASK_ROOT: fixture },
+    env: { ...process.env, PLOMBIR_GIT_PARKED_TASK_ROOT: fixture },
     encoding: 'utf8',
   });
   return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
 }
 
-const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-parked-task-contract.'));
-const empty = mkdtempSync(join(tmpdir(), 'forgekeep-parked-task-empty.'));
+const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-parked-task-contract.'));
+const empty = mkdtempSync(join(tmpdir(), 'plombir-git-parked-task-empty.'));
 
 try {
   mkdirSync(join(fixture, 'crates/demo/src'), { recursive: true });

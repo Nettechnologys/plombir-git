@@ -26,7 +26,7 @@ pub struct StartImportRequest {
     pub platform: String,
     /// Source repository URL (e.g., <https://github.com/user/repo>)
     pub source_url: String,
-    /// Target owner in ForgeKeep
+    /// Target owner in Plombir Git
     pub target_owner: String,
     /// Target repository name (defaults to source repo name)
     #[serde(default)]

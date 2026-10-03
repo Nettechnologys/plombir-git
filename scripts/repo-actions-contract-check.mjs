@@ -323,7 +323,7 @@ if (!/VITE_SSH_HOST/.test(base) || !/VITE_SSH_PORT/.test(base)) {
 }
 
 if (!/configuredSshPort\s*\|\|\s*'2222'/.test(base)) {
-  failures.push('Shared SSH clone URL helper must default to ForgeKeep SSH port 2222');
+  failures.push('Shared SSH clone URL helper must default to Plombir Git SSH port 2222');
 }
 
 const buildSshCloneUrlBody = requireBlock(

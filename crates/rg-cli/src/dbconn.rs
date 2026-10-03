@@ -1,10 +1,10 @@
-//! The one place any `forgekeep` subcommand opens the database.
+//! The one place any `plombir-git` subcommand opens the database.
 //!
 //! `rg_db::connect` reports a failed SQLite open as the bare string `unable to
 //! open database file` — no path, no reason — and an unwritable `/data`
 //! bind-mount is the single most likely first-boot failure of a container. The
 //! diagnostic that turns that into an actionable message used to live inside
-//! `serve.rs` and therefore only helped `forgekeep serve`; every other
+//! `serve.rs` and therefore only helped `plombir-git serve`; every other
 //! subcommand (`migrate`, `rebuild-fts`, `import`, `index-repo`, `backup-db`,
 //! `package list`) failed opaquely on exactly the same misconfiguration. Route
 //! all of them through here instead.
@@ -27,11 +27,23 @@ impl GuardedDatabaseConnection {
 /// What a subcommand does when the file-backed SQLite database it resolved is
 /// not there.
 #[derive(Clone, Copy)]
-pub(crate) enum MissingDatabase {
-    /// Create it, after saying so. Reserved for the two commands whose job is
-    /// to bring an instance into existence: `serve` on first boot and `migrate`
-    /// on install.
-    Create,
+pub(crate) enum MissingDatabase<'a> {
+    /// Create it, after saying so, but only beside a repository storage root
+    /// that holds no repositories yet. Reserved for the two commands whose job
+    /// is to bring an instance into existence: `serve` on first boot and
+    /// `migrate` on install.
+    ///
+    /// A root that already holds repositories means the instance exists, and a
+    /// database that is not there is a mistake about *which* database: a typo
+    /// in `[database].url`, or a renamed file. Creating one there hands the
+    /// instance to whoever registers first, since the first account on an
+    /// empty database becomes its administrator even when registration is
+    /// closed.
+    CreateForANewInstance { repo_root: &'a std::path::Path },
+    /// Create it, after saying so, whatever the repository root holds. Only
+    /// `restore-db` may do this: a machine that kept its repositories and lost
+    /// its database is exactly the case that command exists for.
+    CreateFromBackup,
     /// Refuse before opening anything. Every other subcommand operates on an
     /// instance that already exists, so a database that is not there is a
     /// mistake about *which* database — never an invitation to make one.
@@ -107,7 +119,7 @@ pub(crate) async fn connect_online(
 /// Refuse — or, for the two commands allowed to create one, announce — a
 /// file-backed SQLite database that does not exist yet.
 ///
-/// [`crate::config::DEFAULT_DB_URL`] is *relative* (`sqlite://./forgekeep.db`),
+/// [`crate::config::DEFAULT_DB_URL`] is *relative* (`sqlite://./plombir-git.db`),
 /// and the missing file is created rather than reported: `rg_db::connect_sqlite`
 /// sets `create_if_missing` unconditionally, so demoting the URL to `?mode=rw`
 /// would not hold this line either. Together that means any subcommand started
@@ -123,7 +135,7 @@ pub(crate) async fn connect_online(
 pub(crate) fn check_database_presence(
     db_url: &str,
     operation: &str,
-    missing: MissingDatabase,
+    missing: MissingDatabase<'_>,
 ) -> anyhow::Result<()> {
     let Some(path) = rg_db::sqlite_database_file(db_url) else {
         return Ok(());
@@ -147,12 +159,28 @@ pub(crate) fn check_database_presence(
 
     let resolved = crate::config::absolute_path(&path);
     match missing {
-        MissingDatabase::Create => {
-            tracing::warn!(
-                database = %resolved.display(),
-                "creating a NEW, empty SQLite database — if this instance already has one, stop \
-                 now and point `--db-url` / `--config` at it"
-            );
+        MissingDatabase::CreateForANewInstance { repo_root } => {
+            if let Some(repository) = first_stored_repository(repo_root) {
+                anyhow::bail!(
+                    "`{operation}` was pointed at the SQLite database `{}`, which does not exist \
+                     (resolved to `{}`), while the repository storage root `{}` already holds \
+                     repositories (for example `{}`).\n  That is an existing instance whose \
+                     database was not found, not a new one. A new, empty database would make \
+                     the first account registered on it the administrator, even with \
+                     registration closed. Nothing was created.\n  hint: point `--db-url` / \
+                     `[database].url` at this instance's database, or bring it back with \
+                     `plombir-git restore-db`",
+                    path.display(),
+                    resolved.display(),
+                    crate::config::absolute_path(repo_root).display(),
+                    repository.display()
+                );
+            }
+            announce_a_new_database(&resolved);
+            Ok(())
+        }
+        MissingDatabase::CreateFromBackup => {
+            announce_a_new_database(&resolved);
             Ok(())
         }
         MissingDatabase::Refuse => anyhow::bail!(
@@ -160,7 +188,7 @@ pub(crate) fn check_database_presence(
              (resolved to `{}`).\n  A relative database URL resolves against the current \
              directory, so a command started somewhere else — `docker exec` without `-w`, a cron \
              entry, another shell — addresses a database that is not there. Nothing was created: \
-             only `forgekeep serve` and `forgekeep migrate` may bring a database into \
+             only `plombir-git serve` and `plombir-git migrate` may bring a database into \
              existence.\n  hint: pass `--db-url` or `--config`, or run from the data directory \
              (`docker exec -w /data ...`)",
             path.display(),
@@ -169,14 +197,51 @@ pub(crate) fn check_database_presence(
     }
 }
 
+fn announce_a_new_database(resolved: &std::path::Path) {
+    tracing::warn!(
+        database = %resolved.display(),
+        "creating a NEW, empty SQLite database — if this instance already has one, stop \
+         now and point `--db-url` / `--config` at it"
+    );
+}
+
+/// The first bare repository under `repo_root`, in the `<owner>/<name>.git`
+/// layout every repository is stored in.
+///
+/// Owner-level entries starting with a dot are the server's own scratch space
+/// (`.tmp` upload spools), not namespaces. A root that cannot be listed
+/// answers `None`: nothing was established about it, and the server is about
+/// to touch the same path and report the reason in the filesystem's own words.
+fn first_stored_repository(repo_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let is_dir = |entry: &std::fs::DirEntry| entry.file_type().is_ok_and(|kind| kind.is_dir());
+    std::fs::read_dir(repo_root)
+        .ok()?
+        .flatten()
+        .filter(|owner| is_dir(owner) && !owner.file_name().as_encoded_bytes().starts_with(b"."))
+        .find_map(|owner| {
+            std::fs::read_dir(owner.path())
+                .ok()?
+                .flatten()
+                .find(|entry| {
+                    entry.file_name().as_encoded_bytes().ends_with(b".git") && is_dir(entry)
+                })
+                .map(|entry| entry.path())
+        })
+}
+
 /// [`connect_online`] with the `[timeouts]` connect/idle budget the server
 /// configures.
 pub(crate) async fn connect_server_with_timeouts(
     db_url: &str,
+    repo_root: &std::path::Path,
     connect_secs: u64,
     idle_secs: u64,
 ) -> anyhow::Result<GuardedDatabaseConnection> {
-    check_database_presence(db_url, "forgekeep serve", MissingDatabase::Create)?;
+    check_database_presence(
+        db_url,
+        "plombir-git serve",
+        MissingDatabase::CreateForANewInstance { repo_root },
+    )?;
     let process_guard = rg_db::sqlite_process_guard::acquire_server(db_url)?;
     let connection = rg_db::connect_with_timeouts(db_url, connect_secs, idle_secs)
         .await
@@ -197,7 +262,7 @@ pub(crate) async fn connect_server_with_timeouts(
 pub(crate) async fn connect_offline_migration(
     db_url: &str,
     operation: &str,
-    missing: MissingDatabase,
+    missing: MissingDatabase<'_>,
 ) -> anyhow::Result<GuardedDatabaseConnection> {
     check_database_presence(db_url, operation, missing)?;
     let process_guard = rg_db::sqlite_process_guard::acquire_migration(db_url)?;
@@ -255,7 +320,7 @@ enum DirWriteProbe {
 
 /// Try to create (and remove) a file in `dir`, reporting what that proved.
 fn probe_dir_writable(dir: &std::path::Path) -> DirWriteProbe {
-    let probe = dir.join(".forgekeep_db_write_test");
+    let probe = dir.join(".plombir_git_db_write_test");
     match std::fs::write(&probe, b"") {
         Ok(()) => {
             // Best-effort cleanup: failing to remove the probe says nothing
@@ -334,16 +399,16 @@ mod tests {
         use std::path::PathBuf;
 
         assert_eq!(
-            rg_db::sqlite_database_file("sqlite:///data/forgekeep.db?mode=rwc"),
-            Some(PathBuf::from("/data/forgekeep.db"))
+            rg_db::sqlite_database_file("sqlite:///data/plombir-git.db?mode=rwc"),
+            Some(PathBuf::from("/data/plombir-git.db"))
         );
         assert_eq!(
-            rg_db::sqlite_database_file("sqlite://./forgekeep.db"),
-            Some(PathBuf::from("./forgekeep.db"))
+            rg_db::sqlite_database_file("sqlite://./plombir-git.db"),
+            Some(PathBuf::from("./plombir-git.db"))
         );
         assert_eq!(rg_db::sqlite_database_file("sqlite::memory:"), None);
         assert_eq!(
-            rg_db::sqlite_database_file("postgres://user:pw@localhost/forgekeep"),
+            rg_db::sqlite_database_file("postgres://user:pw@localhost/plombir_git"),
             None
         );
     }
@@ -351,8 +416,9 @@ mod tests {
     #[tokio::test]
     async fn server_connection_holds_the_sqlite_lease_for_its_lifetime() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite://{}/forgekeep.db?mode=rwc", dir.path().display());
-        let server = super::connect_server_with_timeouts(&url, 10, 60)
+        let url = format!("sqlite://{}/plombir-git.db?mode=rwc", dir.path().display());
+        let repo_root = dir.path().join("repos");
+        let server = super::connect_server_with_timeouts(&url, &repo_root, 10, 60)
             .await
             .unwrap();
 
@@ -360,8 +426,10 @@ mod tests {
             "{:#}",
             super::connect_offline_migration(
                 &url,
-                "forgekeep migrate",
-                super::MissingDatabase::Create
+                "plombir-git migrate",
+                super::MissingDatabase::CreateForANewInstance {
+                    repo_root: &repo_root
+                }
             )
             .await
             .err()
@@ -372,12 +440,79 @@ mod tests {
         drop(server);
         let migration = super::connect_offline_migration(
             &url,
-            "forgekeep migrate",
-            super::MissingDatabase::Create,
+            "plombir-git migrate",
+            super::MissingDatabase::CreateForANewInstance {
+                repo_root: &repo_root,
+            },
         )
         .await
         .unwrap();
         drop(migration);
+    }
+
+    /// A data directory with repositories in it and no database where the URL
+    /// points: the shape a typo in `[database].url` (or a renamed database
+    /// file) leaves behind. Creating a database there would hand the instance
+    /// to whoever registers first, so the two creating commands refuse it and
+    /// leave no file behind.
+    #[test]
+    fn a_new_database_is_refused_beside_a_populated_repository_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repos");
+        std::fs::create_dir_all(repo_root.join("alice/site.git")).unwrap();
+        let database = dir.path().join("plombir-git-typo.db");
+        let url = format!("sqlite://{}?mode=rwc", database.display());
+
+        for operation in ["plombir-git serve", "plombir-git migrate"] {
+            let message = format!(
+                "{:#}",
+                super::check_database_presence(
+                    &url,
+                    operation,
+                    super::MissingDatabase::CreateForANewInstance {
+                        repo_root: &repo_root
+                    },
+                )
+                .expect_err("a populated root must refuse a new database")
+            );
+            assert!(message.contains(operation), "{message}");
+            assert!(message.contains("alice/site.git"), "{message}");
+            assert!(message.contains("Nothing was created"), "{message}");
+        }
+        assert!(!database.exists());
+
+        // `restore-db` is the way back for exactly this machine.
+        super::check_database_presence(
+            &url,
+            "plombir-git restore-db",
+            super::MissingDatabase::CreateFromBackup,
+        )
+        .unwrap();
+    }
+
+    /// The clean install still works: an empty root, a missing root, and a
+    /// root holding only the server's own scratch space are all a new instance.
+    #[test]
+    fn a_new_database_is_created_beside_a_root_without_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/plombir-git.db?mode=rwc", dir.path().display());
+
+        let missing = dir.path().join("repos");
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(scratch.join(".tmp/upload.git")).unwrap();
+        std::fs::create_dir_all(scratch.join("alice")).unwrap();
+        std::fs::write(scratch.join("alice/notes.git"), b"not a directory").unwrap();
+
+        for repo_root in [&missing, &empty, &scratch] {
+            super::check_database_presence(
+                &url,
+                "plombir-git serve",
+                super::MissingDatabase::CreateForANewInstance { repo_root },
+            )
+            .unwrap_or_else(|error| panic!("{}: {error:#}", repo_root.display()));
+        }
     }
 
     /// The `/data` bind-mount case: the directory is unwritable, so the opaque
@@ -394,7 +529,7 @@ mod tests {
         let data = dir.path().join("data");
         std::fs::create_dir(&data).unwrap();
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let url = format!("sqlite://{}/forgekeep.db?mode=rwc", data.display());
+        let url = format!("sqlite://{}/plombir-git.db?mode=rwc", data.display());
 
         let annotated = format!(
             "{:#}",
@@ -427,7 +562,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, b"i am a file").unwrap();
-        let url = format!("sqlite://{}/data/forgekeep.db?mode=rwc", blocker.display());
+        let url = format!(
+            "sqlite://{}/data/plombir-git.db?mode=rwc",
+            blocker.display()
+        );
 
         let annotated = format!(
             "{:#}",
@@ -443,7 +581,7 @@ mod tests {
     fn a_missing_directory_is_named_as_missing_rather_than_unwritable() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("never-created");
-        let url = format!("sqlite://{}/forgekeep.db?mode=rwc", missing.display());
+        let url = format!("sqlite://{}/plombir-git.db?mode=rwc", missing.display());
 
         let annotated = format!(
             "{:#}",
@@ -462,7 +600,7 @@ mod tests {
     #[test]
     fn writable_sqlite_directory_leaves_the_connect_error_untouched() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite://{}/forgekeep.db?mode=rwc", dir.path().display());
+        let url = format!("sqlite://{}/plombir-git.db?mode=rwc", dir.path().display());
 
         let annotated = format!(
             "{:#}",

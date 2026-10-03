@@ -42,7 +42,7 @@ import { rustFiles } from './lib/rust-consumer-contract.mjs';
 import { productionRustCode } from './lib/rust-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
-const root = resolve(process.env.FORGEKEEP_SECRET_FILE_MODE_ROOT ?? join(scriptsDir, '..'));
+const root = resolve(process.env.PLOMBIR_GIT_SECRET_FILE_MODE_ROOT ?? join(scriptsDir, '..'));
 const cratesDir = join(root, 'crates');
 const failures = [];
 

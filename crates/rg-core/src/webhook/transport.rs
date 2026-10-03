@@ -3,7 +3,7 @@
 //! Webhook dispatch is detached from the request that caused it and can start
 //! from issue, pull-request, release, or git-push code. Threading one operator
 //! setting through every one of those service signatures would make unrelated
-//! domains own webhook configuration. ForgeKeep serves one instance per
+//! domains own webhook configuration. Plombir Git serves one instance per
 //! process, so the resolved policy is published once at server start and read
 //! only at the final delivery boundary.
 //!

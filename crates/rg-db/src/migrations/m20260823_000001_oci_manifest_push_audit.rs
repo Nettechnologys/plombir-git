@@ -8,7 +8,7 @@
 //! `docker push` of the same bytes under a new tag keeps the existing row and
 //! the existing `push_by` — the person who ran that push left no trace at all.
 //!
-//! `audit_log` is where the rest of ForgeKeep records mutations, and
+//! `audit_log` is where the rest of Plombir Git records mutations, and
 //! `rg-http`'s `record_manifest_push` now writes an `oci.manifest.push` event
 //! for *every* publication, including the re-tags the column could not
 //! represent.

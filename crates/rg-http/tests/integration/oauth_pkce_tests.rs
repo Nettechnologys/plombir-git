@@ -221,8 +221,8 @@ async fn sso_logins_without_a_usable_email_are_refused_instead_of_merged() {
             .send()
             .await
             .unwrap();
-        let state_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_state");
-        let verifier_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_code_verifier");
+        let state_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_state");
+        let verifier_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_code_verifier");
         let state = signed_cookie_value(&state_cookie);
         let callback = client
             .get(format!(
@@ -356,8 +356,8 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .await
         .unwrap();
     assert!(authorize.status().is_redirection());
-    let state_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_state");
-    let verifier_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_code_verifier");
+    let state_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_state");
+    let verifier_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_code_verifier");
     let state = signed_cookie_value(&state_cookie);
     let verifier = signed_cookie_value(&verifier_cookie);
     assert!((43..=128).contains(&verifier.len()));
@@ -400,12 +400,12 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .collect::<Vec<_>>();
     assert!(set_cookies
         .iter()
-        .any(|cookie| cookie.starts_with("forgekeep_token=")));
-    assert!(set_cookies
-        .iter()
-        .any(|cookie| cookie.starts_with("forgekeep_sso_state=;") && cookie.contains("Max-Age=0")));
+        .any(|cookie| cookie.starts_with("plombir_git_token=")));
+    assert!(set_cookies.iter().any(
+        |cookie| cookie.starts_with("plombir_git_sso_state=;") && cookie.contains("Max-Age=0")
+    ));
     assert!(set_cookies.iter().any(|cookie| {
-        cookie.starts_with("forgekeep_sso_code_verifier=;") && cookie.contains("Max-Age=0")
+        cookie.starts_with("plombir_git_sso_code_verifier=;") && cookie.contains("Max-Age=0")
     }));
     assert_eq!(token_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -430,7 +430,10 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .send()
         .await
         .unwrap();
-    let state_cookie = cookie_pair(authorize_without_verifier.headers(), "forgekeep_sso_state");
+    let state_cookie = cookie_pair(
+        authorize_without_verifier.headers(),
+        "plombir_git_sso_state",
+    );
     let state = signed_cookie_value(&state_cookie);
     let missing_verifier = client
         .get(format!(
@@ -448,8 +451,11 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .send()
         .await
         .unwrap();
-    let state_cookie = cookie_pair(authorize_mismatch.headers(), "forgekeep_sso_state");
-    let verifier_cookie = cookie_pair(authorize_mismatch.headers(), "forgekeep_sso_code_verifier");
+    let state_cookie = cookie_pair(authorize_mismatch.headers(), "plombir_git_sso_state");
+    let verifier_cookie = cookie_pair(
+        authorize_mismatch.headers(),
+        "plombir_git_sso_code_verifier",
+    );
     let mismatch = client
         .get(format!(
             "{base}/api/v1/auth/sso/oidc-test/callback?code=valid-code&state=wrong-state"
@@ -469,8 +475,11 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .send()
         .await
         .unwrap();
-    let state_cookie = cookie_pair(authorize_lifecycle.headers(), "forgekeep_sso_state");
-    let verifier_cookie = cookie_pair(authorize_lifecycle.headers(), "forgekeep_sso_code_verifier");
+    let state_cookie = cookie_pair(authorize_lifecycle.headers(), "plombir_git_sso_state");
+    let verifier_cookie = cookie_pair(
+        authorize_lifecycle.headers(),
+        "plombir_git_sso_code_verifier",
+    );
     let state = signed_cookie_value(&state_cookie);
     let successful_logins_before = scalar(
         &db,
@@ -511,8 +520,8 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
             .get_all(header::SET_COOKIE)
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .all(|cookie| !cookie.starts_with("forgekeep_token=")
-                || cookie.starts_with("forgekeep_token=;")),
+            .all(|cookie| !cookie.starts_with("plombir_git_token=")
+                || cookie.starts_with("plombir_git_token=;")),
         "the losing SSO callback issued an auth cookie"
     );
     assert_eq!(
@@ -605,8 +614,8 @@ async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_t
             .await
             .unwrap();
         assert!(authorize.status().is_redirection());
-        let state_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_state");
-        let verifier_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_code_verifier");
+        let state_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_state");
+        let verifier_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_code_verifier");
         let state = signed_cookie_value(&state_cookie);
 
         let callback = client
@@ -622,7 +631,7 @@ async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_t
             "the SSO callback failed: {}",
             callback.status()
         );
-        let session = cookie_pair(callback.headers(), "forgekeep_token");
+        let session = cookie_pair(callback.headers(), "plombir_git_token");
         session.split_once('=').unwrap().1.to_string()
     };
 
@@ -823,8 +832,8 @@ async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_t
         .send()
         .await
         .unwrap();
-    let state_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_state");
-    let verifier_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_code_verifier");
+    let state_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_state");
+    let verifier_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_code_verifier");
     let state = signed_cookie_value(&state_cookie);
     let raced_callback = client
         .get(format!(

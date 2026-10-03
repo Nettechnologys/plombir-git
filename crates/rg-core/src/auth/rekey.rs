@@ -164,7 +164,7 @@ pub async fn rekey(
     if old_secret == new_secret {
         bail!(
             "the new encryption key is identical to the old one — nothing to re-encrypt. \
-             Generate a fresh one with `forgekeep gen-secret`."
+             Generate a fresh one with `plombir-git gen-secret`."
         );
     }
 

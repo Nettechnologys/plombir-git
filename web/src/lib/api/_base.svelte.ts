@@ -1,4 +1,4 @@
-// ForgeKeep API Client — shared internals
+// Plombir Git API Client — shared internals
 
 import { ApiError } from './error';
 
@@ -82,9 +82,9 @@ let authToken = $state<string | null>(null);
 export function getToken(): string | null {
   if (typeof window === 'undefined') return null;
   // M-4: Clean up legacy localStorage tokens on first access
-  const legacy = localStorage.getItem('forgekeep_token');
+  const legacy = localStorage.getItem('plombir_git_token');
   if (legacy) {
-    localStorage.removeItem('forgekeep_token');
+    localStorage.removeItem('plombir_git_token');
   }
   return authToken;
 }
@@ -97,7 +97,7 @@ export function setToken(token: string | null) {
   authToken = token;
   if (typeof window === 'undefined') return;
   // M-4: Clean up legacy localStorage tokens
-  localStorage.removeItem('forgekeep_token');
+  localStorage.removeItem('plombir_git_token');
 }
 
 /** Default request timeout: 30 seconds. */

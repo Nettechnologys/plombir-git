@@ -1,6 +1,6 @@
 //! card_4f2a72c62d95: an imported tracker has to reach the business counters.
 //!
-//! `forgekeep_issues_opened_total` and `forgekeep_prs_opened_total` each had a
+//! `plombir_git_issues_opened_total` and `plombir_git_prs_opened_total` each had a
 //! single producer, and both sat in a REST handler. The import subsystem builds
 //! its `issue` / `pull_request` rows through the same repository-local number
 //! allocators the handlers' services use, but it owns no handler of its own —
@@ -124,7 +124,7 @@ async fn spawn_fake_github() -> String {
     format!("http://{address}")
 }
 
-/// The ForgeKeep instance under test, trusting the loopback origin the fake
+/// The Plombir Git instance under test, trusting the loopback origin the fake
 /// forge listens on (a private address is refused without an explicit entry).
 async fn spawn_app(source_origin: &str) -> String {
     let (db, dir) = setup_test_db().await;
@@ -184,10 +184,10 @@ async fn scraped(base: &str, metric: &str) -> u64 {
 /// values describe the same moment.
 async fn counters(base: &str) -> [u64; 4] {
     [
-        scraped(base, "forgekeep_issues_opened_total").await,
-        scraped(base, "forgekeep_issues_closed_total").await,
-        scraped(base, "forgekeep_prs_opened_total").await,
-        scraped(base, "forgekeep_prs_merged_total").await,
+        scraped(base, "plombir_git_issues_opened_total").await,
+        scraped(base, "plombir_git_issues_closed_total").await,
+        scraped(base, "plombir_git_prs_opened_total").await,
+        scraped(base, "plombir_git_prs_merged_total").await,
     ]
 }
 

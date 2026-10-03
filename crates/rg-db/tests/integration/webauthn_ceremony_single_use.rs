@@ -49,7 +49,7 @@ impl TempDb {
     fn new(label: &str) -> Self {
         Self {
             path: std::env::temp_dir().join(format!(
-                "forgekeep-webauthn-ceremony-single-use-{label}-{}.db",
+                "plombir-git-webauthn-ceremony-single-use-{label}-{}.db",
                 uuid::Uuid::new_v4().simple()
             )),
         }
@@ -75,13 +75,13 @@ impl Drop for TempDb {
 /// A migrated database with more than one pooled connection, so the racing
 /// tasks really do run their statements against separate connections.
 ///
-/// `FORGEKEEP_TEST_DATABASE_URL` points the whole file at PostgreSQL or MySQL
+/// `PLOMBIR_GIT_TEST_DATABASE_URL` points the whole file at PostgreSQL or MySQL
 /// instead — "exactly one caller spends the challenge" is a claim the
 /// *database* arbitrates, so it is a claim about each backend and not about
 /// SQLite. Same switch `totp_step_single_use` and
 /// `passkey_counter_compare_and_swap` use.
 async fn setup(label: &str) -> (DatabaseConnection, Option<TempDb>) {
-    let (url, temp) = match std::env::var("FORGEKEEP_TEST_DATABASE_URL") {
+    let (url, temp) = match std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL") {
         Ok(url) if !url.is_empty() => (url, None),
         _ => {
             let temp = TempDb::new(label);

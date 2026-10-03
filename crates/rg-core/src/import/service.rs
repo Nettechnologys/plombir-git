@@ -1,7 +1,7 @@
 //! Import pipeline service — orchestrates full repository migration.
 //!
 //! Supports importing from GitHub and GitLab, including:
-//! - Repository cloning (git clone --bare) + ForgeKeep DB registration
+//! - Repository cloning (git clone --bare) + Plombir Git DB registration
 //! - Labels and milestones
 //! - Issues with comments
 //! - Pull/Merge requests with reviews/comments
@@ -646,7 +646,7 @@ async fn run_github_import(
     let api_destination = trusted_origins.api_destination(&api_base_url)?;
     let client = GitHubClient::new(token.to_string(), api_destination)?;
 
-    // Resolve (or create) the target repo in ForgeKeep DB
+    // Resolve (or create) the target repo in Plombir Git DB
     let repo_id = resolve_or_create_target_repo(
         db,
         task.repo_id,
@@ -857,7 +857,7 @@ async fn run_gitlab_import(
     let api_destination = trusted_origins.api_destination(&api_base_url)?;
     let client = GitLabClient::new(token.to_string(), api_destination)?;
 
-    // Resolve (or create) the target repo in ForgeKeep DB
+    // Resolve (or create) the target repo in Plombir Git DB
     let repo_id = resolve_or_create_target_repo(
         db,
         task.repo_id,
@@ -1045,7 +1045,7 @@ async fn run_gitlab_import(
 // Target repo resolution
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Find the target repo in ForgeKeep DB, or create it if it doesn't exist.
+/// Find the target repo in Plombir Git DB, or create it if it doesn't exist.
 /// Returns the repo_id for use in all subsequent import operations.
 ///
 /// `anchored_repo_id` is the repository the import was accepted for, recorded
@@ -1093,9 +1093,9 @@ async fn resolve_or_create_target_repo(
             (org.owner_id, Some(org.id))
         } else {
             anyhow::bail!(
-                "target owner '{}' not found (must be an existing ForgeKeep user or organization)",
-                target_owner
-            );
+            "target owner '{}' not found (must be an existing Plombir Git user or organization)",
+            target_owner
+        );
         };
 
     // Create the repo via the repo service
@@ -1320,7 +1320,7 @@ fn install_clone(
     Ok(())
 }
 
-/// Clone a repository (bare) into the ForgeKeep repo root.
+/// Clone a repository (bare) into the Plombir Git repo root.
 ///
 /// ## Why this does not simply clone into the target path
 ///
@@ -1487,14 +1487,14 @@ async fn clone_repo(
 /// The file extensions an imported wiki page may carry.
 ///
 /// Both platforms keep a wiki as a gollum repository, and gollum renders
-/// textile, rdoc, org, creole and rst besides Markdown. A ForgeKeep wiki page
+/// textile, rdoc, org, creole and rst besides Markdown. A Plombir Git wiki page
 /// is Markdown — that is what `wiki_pages.content` holds and what the page view
 /// renders — so a page written in one of the others would be stored as text
 /// this wiki then renders as something it is not. Those are counted and named
 /// in a warning rather than carried in under a format they are not written in.
 const WIKI_PAGE_EXTENSIONS: [&str; 2] = ["md", "markdown"];
 
-/// Page formats gollum renders and a ForgeKeep wiki page cannot hold.
+/// Page formats gollum renders and a Plombir Git wiki page cannot hold.
 ///
 /// Only used to tell "this repository holds pages we left behind" from "this
 /// repository holds the images its pages link to", which is the ordinary case
@@ -1806,7 +1806,7 @@ fn collect_wiki_pages(staging: &Path) -> Result<SourceWikiClone> {
         tracing::warn!(
             count = foreign.len(),
             pages = %foreign.join(", "),
-            "the source wiki holds pages written in a markup a ForgeKeep wiki page does not \
+            "the source wiki holds pages written in a markup a Plombir Git wiki page does not \
              render — they were not imported"
         );
     }
@@ -1897,7 +1897,7 @@ fn report_wiki_without_pages(
     );
 }
 
-/// Clone a source wiki and create its pages in `repo_id`'s ForgeKeep wiki.
+/// Clone a source wiki and create its pages in `repo_id`'s Plombir Git wiki.
 /// Returns the number of pages created.
 ///
 /// `staging` is a directory that does not exist yet: the wiki is cloned into it
@@ -1986,7 +1986,7 @@ async fn import_wiki_pages_from_destination(
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             let invocation = remote.bind_invocation(credential_invocation(credentials.as_ref()))?;
             let destination = staged_clone.path.to_string_lossy();
-            // `--depth 1`: only the pages as they stand are imported. A ForgeKeep wiki
+            // `--depth 1`: only the pages as they stand are imported. A Plombir Git wiki
             // keeps its own revision history from the first edit onwards, and there is
             // nowhere to put the source's.
             let cloned = invocation
@@ -5144,7 +5144,7 @@ mod clone_path_tests {
         let target_dir = repo_root.join("alice/site.git");
         git.run_or_bail(&["init", "--bare", &target_dir.to_string_lossy()], None)
             .expect("the skeleton the creation left");
-        std::fs::write(target_dir.join("forgekeep-skeleton"), b"the skeleton")
+        std::fs::write(target_dir.join("plombir-git-skeleton"), b"the skeleton")
             .expect("mark the skeleton");
         std::fs::create_dir_all(repo_root.join("_deleted")).expect("journal parent");
         std::fs::write(repo_root.join("_deleted/journal"), b"not a directory")
@@ -5156,7 +5156,7 @@ mod clone_path_tests {
             .expect_err("an import that cannot record its move must not make it");
 
         assert_eq!(
-            std::fs::read_to_string(target_dir.join("forgekeep-skeleton"))
+            std::fs::read_to_string(target_dir.join("plombir-git-skeleton"))
                 .expect("the skeleton is untouched"),
             "the skeleton",
             "the refused import moved the repository it had not recorded: {error:#}"

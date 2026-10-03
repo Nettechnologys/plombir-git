@@ -31,7 +31,7 @@ async fn token_request(base: &str, auth: Option<&str>) -> reqwest::Response {
     let request = reqwest::Client::new()
         .get(format!("{}/v2/auth/token", base))
         .query(&[
-            ("service", "forgekeep-registry"),
+            ("service", "plombir-git-registry"),
             ("scope", "repository:reg_lock/image:pull"),
         ]);
     let request = match auth {

@@ -1,6 +1,6 @@
 //! Whose git configuration a subprocess started by the gateway answers to.
 //!
-//! Every `git` ForgeKeep runs on its own repositories goes through
+//! Every `git` Plombir Git runs on its own repositories goes through
 //! [`rg_git::cli_gateway::GitCommandGateway`], and until the gateway disarmed
 //! its children each of them read `/etc/gitconfig` and the `~/.gitconfig` of
 //! whichever account the server process runs under. That is the host deciding
@@ -32,13 +32,13 @@ use std::process::Command;
 use rg_git::cli_gateway::global_gateway;
 
 /// Marks the child process spawned by the acceptance test below.
-const HOSTILE_HOST_CONFIG_CHILD: &str = "FORGEKEEP_TEST_HOST_CONFIG_CHILD";
+const HOSTILE_HOST_CONFIG_CHILD: &str = "PLOMBIR_GIT_TEST_HOST_CONFIG_CHILD";
 
 /// A setting nothing reads, so planting it changes no behaviour — what it
 /// measures is whether the host could have set one at all. Deliberately not a
 /// key any invocation policy pins: a pinned key would be answered on the
 /// command line and would prove nothing about the environment.
-const HOST_PROBE_KEY: &str = "forgekeep.hostprobe";
+const HOST_PROBE_KEY: &str = "plombir-git.hostprobe";
 const HOST_PROBE_VALUE: &str = "the-host-decided-this";
 
 /// The file whose archived mode `tar.umask` moves.
@@ -259,8 +259,8 @@ fn fixture(root: &Path) -> PathBuf {
     };
 
     run(&["init", "-q", "-b", "main"]);
-    run(&["config", "user.name", "ForgeKeep Test"]);
-    run(&["config", "user.email", "forgekeep@example.test"]);
+    run(&["config", "user.name", "Plombir Git Test"]);
+    run(&["config", "user.email", "plombir-git@example.test"]);
     std::fs::write(repository.join(FIXTURE_FILE), "one\ntwo\nthree\n").expect("fixture blob");
     run(&["add", "-A"]);
     run(&["commit", "-q", "-m", "the fixture commit"]);

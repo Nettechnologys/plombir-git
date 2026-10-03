@@ -27,7 +27,7 @@ const check = join(scriptsDir, 'cli-repo-root-contract-check.mjs');
 
 function run(fixture) {
   const result = spawnSync(process.execPath, [check], {
-    env: { ...process.env, FORGEKEEP_CLI_REPO_ROOT_ROOT: fixture },
+    env: { ...process.env, PLOMBIR_GIT_CLI_REPO_ROOT_ROOT: fixture },
     encoding: 'utf8',
   });
   return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
@@ -48,12 +48,13 @@ pub(crate) fn announce_a_new_repo_root(resolved: &std::path::Path) {}
 `;
 
 /**
- * The tree the real inventories describe: four resolution sites and two
+ * The tree the real inventories describe: five resolution sites and two
  * decisions in `commands.rs`, and eight directory-creating sites spread over
- * the three files that own one. The fourth resolver is the one that decides
- * neither way — `list-tombstones` reads a deployment and refuses a root that
- * is not there, so the baseline has to carry a resolver with no gateway
- * decision beside it or the count would only ever describe the other three. Every fixture starts from this, so a red below
+ * the three files that own one. Two resolvers decide neither way —
+ * `list-tombstones` reads a deployment and refuses a root that is not there,
+ * and `migrate` reads the root only to refuse a new database beside stored
+ * repositories — so the baseline has to carry resolvers with no gateway
+ * decision beside them or the count would only ever describe the other three. Every fixture starts from this, so a red below
  * is about the mutation rather than about a fixture that never matched.
  *
  * Both spellings appear on purpose. `create-repo` makes its root through the
@@ -92,13 +93,19 @@ pub(crate) fn cmd_create_repo(repo_root: Option<String>) -> anyhow::Result<()> {
 
 pub(crate) async fn cmd_import(repo_root: Option<String>) -> anyhow::Result<()> {
     let repo_root = config::resolve_repo_root(repo_root, cfg.as_ref());
-    repo_root::check_repo_root_presence(db.connection(), &repo_root, "forgekeep import", repo_root::MissingRepoRoot::CreateOnACleanInstance).await?;
+    repo_root::check_repo_root_presence(db.connection(), &repo_root, "plombir-git import", repo_root::MissingRepoRoot::CreateOnACleanInstance).await?;
     std::fs::create_dir_all(&repo_root)?;
     Ok(())
 }
 
 pub(crate) async fn cmd_index_repo() -> anyhow::Result<()> {
-    repo_root::check_repo_root_presence(&db, path, "forgekeep index-repo", repo_root::MissingRepoRoot::Refuse).await?;
+    repo_root::check_repo_root_presence(&db, path, "plombir-git index-repo", repo_root::MissingRepoRoot::Refuse).await?;
+    Ok(())
+}
+
+pub(crate) async fn cmd_migrate() -> anyhow::Result<()> {
+    let repo_root = std::path::PathBuf::from(config::resolve_repo_root(None, cfg));
+    dbconn::connect_offline_migration(&db_url, "plombir-git migrate", dbconn::MissingDatabase::CreateForANewInstance { repo_root: &repo_root }).await?;
     Ok(())
 }
 
@@ -195,7 +202,7 @@ pub(crate) async fn cmd_import(repo_root: Option<String>) -> anyhow::Result<()> 
 }
 
 pub(crate) async fn cmd_index_repo() -> anyhow::Result<()> {
-    repo_root::check_repo_root_presence(&db, path, "forgekeep index-repo", repo_root::MissingRepoRoot::Refuse).await?;
+    repo_root::check_repo_root_presence(&db, path, "plombir-git index-repo", repo_root::MissingRepoRoot::Refuse).await?;
     Ok(())
 }
 
@@ -316,7 +323,7 @@ mod tests {
       writeFileSync(
         join(fixture, 'crates/rg-cli/src/commands.rs'),
         `pub(crate) async fn cmd_import() -> anyhow::Result<()> {
-    repo_root::check_repo_root_presence(db, path, "forgekeep import", repo_root::MissingRepoRoot::Refuse).await?;
+    repo_root::check_repo_root_presence(db, path, "plombir-git import", repo_root::MissingRepoRoot::Refuse).await?;
     std::fs::create_dir_all(&repo_root)?;
     std::fs::create_dir_all(&repo_dir)?;
     Ok(())
@@ -330,7 +337,7 @@ mod tests {
 
 const failures = [];
 for (const testCase of cases) {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-repo-root-stand-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-repo-root-stand-'));
   try {
     testCase.build(fixture);
     const { status, output } = run(fixture);

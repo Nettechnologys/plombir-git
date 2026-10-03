@@ -1,4 +1,4 @@
-//! Thin async client for the ForgeKeep REST API.
+//! Thin async client for the Plombir Git REST API.
 //!
 //! Adds to whichever [`crate::Backend`] the state carries:
 //! - the `/api/v1/` prefix

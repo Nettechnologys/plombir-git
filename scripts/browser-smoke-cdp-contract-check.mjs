@@ -51,7 +51,7 @@ async function runChromeFixture(marker) {
     join(profileDir, 'DevToolsActivePort'),
     `${address.port}\n/devtools/browser/${marker}\n`,
   );
-  const resultFile = process.env.FORGEKEEP_CDP_FIXTURE_RESULT;
+  const resultFile = process.env.PLOMBIR_GIT_CDP_FIXTURE_RESULT;
   if (resultFile) {
     writeFileSync(resultFile, JSON.stringify({ marker, profileDir, requestedPort, port: address.port }));
   }
@@ -62,8 +62,8 @@ function runSmoke(fixtureRoot, scriptName, marker, cdpPort = null) {
   const env = {
     ...process.env,
     CHROME: fixtureExecutable,
-    FORGEKEEP_CDP_FIXTURE_MARKER: marker,
-    FORGEKEEP_CDP_FIXTURE_RESULT: resultFile,
+    PLOMBIR_GIT_CDP_FIXTURE_MARKER: marker,
+    PLOMBIR_GIT_CDP_FIXTURE_RESULT: resultFile,
   };
   if (cdpPort === null) delete env.CDP_PORT;
   else env.CDP_PORT = String(cdpPort);
@@ -143,7 +143,7 @@ async function runContract() {
     throw new Error('chrome-cdp helper must discover Chrome-owned default endpoints from DevToolsActivePort');
   }
 
-  const fixtureRoot = mkdtempSync(join(tmpdir(), 'forgekeep-browser-cdp-contract-'));
+  const fixtureRoot = mkdtempSync(join(tmpdir(), 'plombir-git-browser-cdp-contract-'));
   try {
     const defaultRuns = await Promise.all(smokeFiles.flatMap((scriptName, scriptIndex) => [
       runSmoke(fixtureRoot, scriptName, `default-${scriptIndex}-A`),
@@ -168,8 +168,8 @@ async function runContract() {
   console.log('✅ browser smoke CDP: both entrypoints isolate parallel endpoints, preserve overrides, and clean profiles');
 }
 
-if (process.env.FORGEKEEP_CDP_FIXTURE_MARKER) {
-  await runChromeFixture(process.env.FORGEKEEP_CDP_FIXTURE_MARKER);
+if (process.env.PLOMBIR_GIT_CDP_FIXTURE_MARKER) {
+  await runChromeFixture(process.env.PLOMBIR_GIT_CDP_FIXTURE_MARKER);
 } else {
   await runContract();
 }

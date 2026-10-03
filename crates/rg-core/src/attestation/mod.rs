@@ -2,7 +2,7 @@
 //!
 //! An attestation binds a release asset (by its SHA-256) to a signed, typed
 //! provenance statement. The design is deliberately standards-shaped so it is
-//! verifiable *outside* ForgeKeep:
+//! verifiable *outside* Plombir Git:
 //!
 //! - **Payload**: an [in-toto Statement v1](types::Statement) — `_type`,
 //!   `subject[].digest.sha256`, `predicateType`, `predicate`.
@@ -33,7 +33,7 @@ use ed25519_dalek::{Signature, Verifier};
 use serde_json::Value;
 
 use crate::auth::instance_key::InstanceKey;
-pub use predicate::{PredicateVerifier, VerifierRegistry, FORGEKEEP_PROVENANCE_TYPE};
+pub use predicate::{PredicateVerifier, VerifierRegistry, PLOMBIR_GIT_PROVENANCE_TYPE};
 pub use types::{Envelope, Signature as EnvelopeSignature, Statement, Subject, DSSE_PAYLOAD_TYPE};
 
 /// DSSE Pre-Authentication Encoding: `"DSSEv1" SP len(type) SP type SP
@@ -74,7 +74,7 @@ pub fn sign_statement(key: &InstanceKey, statement: &Statement) -> Result<Envelo
     })
 }
 
-/// Convenience: build a ForgeKeep provenance statement for an asset and sign it.
+/// Convenience: build a Plombir Git provenance statement for an asset and sign it.
 ///
 /// `builder_id` attributes the build to the issuing instance (e.g. its external
 /// URL); `predicate_extra` is merged into the predicate for extra context
@@ -97,7 +97,7 @@ pub fn sign_asset_provenance(
     let statement = Statement::new(
         filename,
         sha256_hex,
-        FORGEKEEP_PROVENANCE_TYPE.to_string(),
+        PLOMBIR_GIT_PROVENANCE_TYPE.to_string(),
         predicate,
     );
     sign_statement(key, &statement)
@@ -331,7 +331,7 @@ mod tests {
         Statement::new(
             "app-1.0.tar.gz",
             EMPTY_SHA256,
-            FORGEKEEP_PROVENANCE_TYPE.to_string(),
+            PLOMBIR_GIT_PROVENANCE_TYPE.to_string(),
             json!({ "builder": { "id": "https://forge.example/instance" } }),
         )
     }
@@ -463,7 +463,7 @@ mod tests {
         let statement = Statement::new(
             "app-1.0.tar.gz",
             EMPTY_SHA256,
-            FORGEKEEP_PROVENANCE_TYPE.to_string(),
+            PLOMBIR_GIT_PROVENANCE_TYPE.to_string(),
             json!({ "builder": { "id": "" } }),
         );
         let env = sign_statement(&instance_key(), &statement).unwrap();

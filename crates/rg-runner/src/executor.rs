@@ -193,7 +193,7 @@ const DOCKER_CPU_LIMIT: &str = "2";
 /// that outran its deadline; and the stop path, which removes the container of a
 /// job interrupted mid-flight. The last two spelt the name out inline.
 pub(crate) fn job_container_name(job_id: i64) -> String {
-    format!("forgekeep-runner-job-{job_id}")
+    format!("plombir-git-runner-job-{job_id}")
 }
 
 /// Execute a job script inside a Docker container.
@@ -356,7 +356,7 @@ mod tests {
             "echo hi",
             &variables,
             std::path::Path::new("/workspace/repo"),
-            "forgekeep-runner-job-7",
+            "plombir-git-runner-job-7",
         );
 
         // Defense-in-depth flags aligned with rg-ci PipelineRunner.
@@ -405,7 +405,7 @@ mod tests {
     async fn local_executor_injects_polled_variables_with_a_clean_environment() {
         let variables = vec![("RUNNER_MESSAGE".into(), "hello".into())];
         let (code, log) = run_job_local(
-            "test \"$RUNNER_MESSAGE\" = hello && test -z \"$FORGEKEEP_HOST_SECRET\" && echo ok",
+            "test \"$RUNNER_MESSAGE\" = hello && test -z \"$PLOMBIR_GIT_HOST_SECRET\" && echo ok",
             &variables,
             std::path::Path::new("."),
         )

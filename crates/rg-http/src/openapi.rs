@@ -1,4 +1,4 @@
-//! OpenAPI (Swagger) documentation for ForgeKeep REST API.
+//! OpenAPI (Swagger) documentation for Plombir Git REST API.
 //!
 //! Provides auto-generated OpenAPI 3.0 spec via utoipa.
 //! Access at:
@@ -26,7 +26,7 @@ use crate::route_table::{Access, RouteFact};
 /// lookup below miss, which the same guard fails on.
 pub const API_SERVER_PREFIX: &str = "/api/v1";
 
-/// The scheme a ForgeKeep session satisfies.
+/// The scheme a Plombir Git session satisfies.
 ///
 /// A Personal Access Token satisfies it too: `pat_auth::pat_auth_middleware`
 /// translates a PAT into the session JWT the handlers read, on the way in.
@@ -87,7 +87,7 @@ impl Modify for SecurityAddon {
                     .scheme(HttpAuthScheme::Bearer)
                     .bearer_format("JWT")
                     .description(Some(
-                        "A ForgeKeep session token, or a Personal Access Token — the API accepts \
+                        "A Plombir Git session token, or a Personal Access Token — the API accepts \
                          either, because a PAT is translated into a session token on the way in. \
                          Obtain one from `POST /users/login` or `POST /users/tokens`.",
                     ))
@@ -236,13 +236,13 @@ pub(crate) fn stamp_security(
     stamp
 }
 
-/// ForgeKeep API — OpenAPI specification.
+/// Plombir Git API — OpenAPI specification.
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "ForgeKeep API",
+        title = "Plombir Git API",
         version = "0.1.0",
-        description = "ForgeKeep is a self-hosted Git platform written in Rust. \
+        description = "Plombir Git is a self-hosted Git platform written in Rust. \
             This API provides repository management, issue tracking, pull requests, \
             CI/CD pipelines, wiki, LFS, webhooks, and more.",
     ),

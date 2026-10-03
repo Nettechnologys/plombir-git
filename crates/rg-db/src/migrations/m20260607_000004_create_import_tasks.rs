@@ -2,7 +2,7 @@
 //!
 //! An import task tracks the progress of migrating a repository and its
 //! metadata (issues, PRs, labels, milestones, releases, wiki) from
-//! external platforms (GitHub, GitLab) into ForgeKeep.
+//! external platforms (GitHub, GitLab) into Plombir Git.
 
 use sea_orm_migration::prelude::*;
 

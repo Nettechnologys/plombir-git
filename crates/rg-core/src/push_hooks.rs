@@ -589,7 +589,7 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
             }
         }
 
-        // 1. Trigger CI pipeline if .forgekeep-ci.yml exists
+        // 1. Trigger CI pipeline if .plombir-git-ci.yml exists
         trigger_ci_for_push(params, &target, &update).await;
 
         // 2-3. Push + branch/tag webhooks and the real-time notification
@@ -771,7 +771,7 @@ async fn adopt_unborn_head(
 /// indexing reads every blob of the tree and stores its text a second time, and
 /// an instance where nobody uses AI code search should not pay that on every
 /// push to every repository. Taking the first snapshot stays an explicit act
-/// (`POST /ai/repos/{owner}/{name}/index`, or `forgekeep index-repo`); what this
+/// (`POST /ai/repos/{owner}/{name}/index`, or `plombir-git index-repo`); what this
 /// fixes is that the act used to be permanent.
 ///
 /// Detached onto the run's tracker rather than awaited, for the same reason the
@@ -1011,7 +1011,7 @@ async fn post_push_branch_maintenance(
 }
 
 /// Section 1 of the post-push hook: trigger a CI pipeline when a
-/// `.forgekeep-ci.yml` is present at the pushed commit, then fan out the
+/// `.plombir-git-ci.yml` is present at the pushed commit, then fan out the
 /// real-time owner notification and the optional SMTP email.
 async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, update: &RefUpdate) {
     if !params
@@ -1133,7 +1133,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
         .filter(|owner_user| !owner_user.is_bot())
         {
             let subject = format!(
-                "[ForgeKeep] CI pipeline #{} triggered for {}/{}",
+                "[Plombir Git] CI pipeline #{} triggered for {}/{}",
                 pipeline_id, target.owner, target.name
             );
             let body = format!(

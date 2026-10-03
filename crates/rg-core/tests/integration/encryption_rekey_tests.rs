@@ -96,7 +96,7 @@ async fn live_instance(db: &DatabaseConnection, secret: &str) {
         db,
         repo.id,
         &rg_core::webhook::service::CreateWebhookRequest {
-            url: "https://hooks.example.invalid/forgekeep".to_string(),
+            url: "https://hooks.example.invalid/plombir-git".to_string(),
             content_type: None,
             secret: Some(WEBHOOK_SECRET_PLAINTEXT.to_string()),
             active: Some(true),

@@ -671,7 +671,7 @@ pub async fn poll_job(
                         }
                     }
                     variables.insert("CI".into(), serde_json::json!("true"));
-                    variables.insert("FORGEKEEP".into(), serde_json::json!("true"));
+                    variables.insert("PLOMBIR_GIT".into(), serde_json::json!("true"));
                     variables.insert("CI_PIPELINE_ID".into(), serde_json::json!(pipeline_id));
                     variables.insert(
                         "CI_COMMIT_SHA".into(),

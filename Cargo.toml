@@ -68,7 +68,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "fs", "limit"] }
 russh = "0.60.3"
 
 # Database — SeaORM's default features already bundle all three sqlx backends
-# (sqlite + postgres + mysql) plus with-chrono/with-uuid, so ForgeKeep can select
+# (sqlite + postgres + mysql) plus with-chrono/with-uuid, so Plombir Git can select
 # the backend at runtime via the `database_url` scheme without a feature rebuild.
 # Database — keep SeaORM default features (with-chrono/with-uuid/…) and enable
 # all three sqlx backends so the backend is chosen at runtime via the
@@ -145,7 +145,7 @@ rand = "0.8"
 # WebAuthn / passkeys. `danger-allow-state-serialisation` lets us persist the
 # in-progress registration/authentication ceremony state (PasskeyRegistration /
 # PasskeyAuthentication) into a short-lived signed cookie between the begin and
-# finish HTTP round-trips — ForgeKeep keeps no server-side session store.
+# finish HTTP round-trips — Plombir Git keeps no server-side session store.
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 
 # LDAP

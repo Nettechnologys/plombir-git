@@ -149,7 +149,7 @@ const DISARMED_HOME: &str = "/dev/null";
 /// the same request differently, and neither of them says so.
 ///
 /// What this deliberately does **not** state is which values git should use:
-/// that is a policy question, it differs between a repository ForgeKeep owns
+/// that is a policy question, it differs between a repository Plombir Git owns
 /// and a remote the user named, and it lives in [`crate::invocation`] and
 /// [`crate::credentials`] respectively. The gateway only takes the decision
 /// away from the machine.
@@ -365,7 +365,7 @@ impl GitCommandGateway {
     /// of *what the command is for*, not of the call site, so the decision is
     /// made by one of the two invocation policies this crate exports and by
     /// nothing else. `credentials` states it for a remote the user named;
-    /// `invocation` states it for ForgeKeep's own repositories.
+    /// `invocation` states it for Plombir Git's own repositories.
     pub(crate) fn run_with_env_removed(
         &self,
         args: &[&str],

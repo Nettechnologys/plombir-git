@@ -10,13 +10,13 @@
 //!
 //! It is not a theoretical gap. [`sea_orm_migration::MigratorTrait::up`] is not
 //! idempotent with respect to a concurrent copy of itself on a server backend:
-//! two ForgeKeep processes migrating one PostgreSQL database race inside
+//! two Plombir Git processes migrating one PostgreSQL database race inside
 //! `CREATE TABLE` and one of them dies with
 //! `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`
 //! — an error that names a PostgreSQL system index and tells the operator
 //! neither the cause nor the remedy. Two replicas, a `docker compose up
 //! --scale`, a restart overlapping a still-running old process, or an operator
-//! running `forgekeep migrate` while the server boots all produce it.
+//! running `plombir-git migrate` while the server boots all produce it.
 //!
 //! So take the lock inside the database instead of in the filesystem:
 //! `pg_advisory_lock` on PostgreSQL, `GET_LOCK` on MySQL. Both are held by a
@@ -32,7 +32,7 @@
 //! A server backend has no such cache — every connection sees the committed
 //! schema — so the loser has something useful to do: wait, then apply whatever
 //! the winner did not. It gets [`DEFAULT_WAIT`] to do it, after which it fails
-//! with a message naming ForgeKeep and the action, because at that point the
+//! with a message naming Plombir Git and the action, because at that point the
 //! holder is more likely stuck than slow.
 
 use std::time::{Duration, Instant};
@@ -66,14 +66,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// this process and every failure a completed statement.
 const POSTGRES_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The advisory-lock key ForgeKeep migrations use: `FORGEKEP` in ASCII.
+/// The advisory-lock key Plombir Git migrations use: `FORGEKEP` in ASCII.
 ///
 /// PostgreSQL advisory locks are scoped to the current *database*, so two
-/// ForgeKeep databases in one cluster do not contend on this constant.
+/// Plombir Git databases in one cluster do not contend on this constant.
 const POSTGRES_ADVISORY_KEY: i64 = 0x464F_5247_454B_4550;
 
 /// Prefix of the MySQL user-level lock name.
-const MYSQL_LOCK_PREFIX: &str = "forgekeep_migrations";
+const MYSQL_LOCK_PREFIX: &str = "plombir_git_migrations";
 
 /// MySQL rejects a user-level lock name longer than this.
 const MYSQL_LOCK_NAME_MAX: usize = 64;
@@ -130,12 +130,12 @@ pub async fn acquire(db: &DatabaseConnection, wait: Duration) -> Result<Migratio
                     .await
                     .map_err(|_| {
                         anyhow::anyhow!(
-                    "opening the PostgreSQL session for the ForgeKeep migration lock timed out \
+                    "opening the PostgreSQL session for the Plombir Git migration lock timed out \
                      after {}s",
                     CONNECT_TIMEOUT.as_secs()
                 )
                     })?
-                    .context("open a PostgreSQL session for the ForgeKeep migration lock")?;
+                    .context("open a PostgreSQL session for the Plombir Git migration lock")?;
             acquire_postgres(&mut connection, wait).await?;
             Ok(MigrationLock {
                 held: Some(Held::Postgres(Box::new(connection))),
@@ -148,12 +148,12 @@ pub async fn acquire(db: &DatabaseConnection, wait: Duration) -> Result<Migratio
                     .await
                     .map_err(|_| {
                         anyhow::anyhow!(
-                    "opening the MySQL session for the ForgeKeep migration lock timed out after \
+                    "opening the MySQL session for the Plombir Git migration lock timed out after \
                      {}s",
                     CONNECT_TIMEOUT.as_secs()
                 )
                     })?
-                    .context("open a MySQL session for the ForgeKeep migration lock")?;
+                    .context("open a MySQL session for the Plombir Git migration lock")?;
             let name = acquire_mysql(&mut connection, wait).await?;
             Ok(MigrationLock {
                 held: Some(Held::MySql {
@@ -184,7 +184,7 @@ impl MigrationLock {
                 {
                     tracing::warn!(
                         %error,
-                        "failed to release the ForgeKeep migration advisory lock; closing its \
+                        "failed to release the Plombir Git migration advisory lock; closing its \
                          PostgreSQL session instead"
                     );
                 }
@@ -200,7 +200,7 @@ impl MigrationLock {
                     tracing::warn!(
                         %error,
                         lock = %name,
-                        "failed to release the ForgeKeep migration lock; closing its MySQL \
+                        "failed to release the Plombir Git migration lock; closing its MySQL \
                          session instead"
                     );
                 }
@@ -217,7 +217,7 @@ fn close_quietly(result: Result<(), sea_orm::sqlx::Error>) {
     if let Err(error) = result {
         tracing::debug!(
             %error,
-            "closing the ForgeKeep migration lock session reported an error"
+            "closing the Plombir Git migration lock session reported an error"
         );
     }
 }
@@ -232,10 +232,10 @@ async fn acquire_postgres(connection: &mut PgConnection, wait: Duration) -> Resu
             .bind(POSTGRES_ADVISORY_KEY)
             .fetch_one(&mut *connection)
             .await
-            .context("ask PostgreSQL for the ForgeKeep migration lock")?;
+            .context("ask PostgreSQL for the Plombir Git migration lock")?;
         if granted {
             if announced {
-                tracing::info!("Acquired the ForgeKeep migration lock");
+                tracing::info!("Acquired the Plombir Git migration lock");
             }
             return Ok(());
         }
@@ -249,7 +249,7 @@ async fn acquire_postgres(connection: &mut PgConnection, wait: Duration) -> Resu
             })
         else {
             anyhow::bail!(
-                "another ForgeKeep process has held the migration lock on this PostgreSQL \
+                "another Plombir Git process has held the migration lock on this PostgreSQL \
                  database for more than {}s; wait for that migration to finish or stop that \
                  process, then run this again",
                 wait.as_secs()
@@ -260,7 +260,7 @@ async fn acquire_postgres(connection: &mut PgConnection, wait: Duration) -> Resu
             announced = true;
             tracing::info!(
                 wait_secs = wait.as_secs(),
-                "Another ForgeKeep process is migrating this PostgreSQL database; waiting for it \
+                "Another Plombir Git process is migrating this PostgreSQL database; waiting for it \
                  to finish"
             );
         }
@@ -273,7 +273,7 @@ async fn acquire_mysql(connection: &mut MySqlConnection, wait: Duration) -> Resu
     let schema: Option<String> = sea_orm::sqlx::query_scalar("SELECT DATABASE()")
         .fetch_one(&mut *connection)
         .await
-        .context("read the current schema name for the ForgeKeep migration lock")?;
+        .context("read the current schema name for the Plombir Git migration lock")?;
     let name = mysql_lock_name(schema.as_deref().unwrap_or_default());
 
     // A zero-second attempt first, purely so a wait can be announced before it
@@ -285,19 +285,19 @@ async fn acquire_mysql(connection: &mut MySqlConnection, wait: Duration) -> Resu
     tracing::info!(
         wait_secs = wait.as_secs(),
         lock = %name,
-        "Another ForgeKeep process is migrating this MySQL database; waiting for it to finish"
+        "Another Plombir Git process is migrating this MySQL database; waiting for it to finish"
     );
 
     // `GET_LOCK` takes whole seconds and treats a negative timeout as "wait
     // forever", which is precisely the outcome this budget exists to prevent.
     let timeout = i64::try_from(wait.as_secs()).unwrap_or(i64::MAX);
     if get_lock(connection, &name, timeout).await? {
-        tracing::info!(lock = %name, "Acquired the ForgeKeep migration lock");
+        tracing::info!(lock = %name, "Acquired the Plombir Git migration lock");
         return Ok(name);
     }
 
     anyhow::bail!(
-        "another ForgeKeep process has held the migration lock `{name}` on this MySQL server for \
+        "another Plombir Git process has held the migration lock `{name}` on this MySQL server for \
          more than {}s; wait for that migration to finish or stop that process, then run this \
          again",
         wait.as_secs()
@@ -311,7 +311,7 @@ async fn get_lock(connection: &mut MySqlConnection, name: &str, timeout: i64) ->
         .bind(timeout)
         .fetch_one(&mut *connection)
         .await
-        .context("ask MySQL for the ForgeKeep migration lock")?;
+        .context("ask MySQL for the Plombir Git migration lock")?;
     match outcome {
         Some(1) => Ok(true),
         Some(0) => Ok(false),
@@ -319,7 +319,7 @@ async fn get_lock(connection: &mut MySqlConnection, name: &str, timeout: i64) ->
         // or a killed session). Waiting longer would not help, and proceeding
         // would migrate unserialised — which is the whole thing being prevented.
         other => anyhow::bail!(
-            "MySQL could not arbitrate the ForgeKeep migration lock `{name}` (GET_LOCK returned \
+            "MySQL could not arbitrate the Plombir Git migration lock `{name}` (GET_LOCK returned \
              {}); migrations were not applied",
             other.map_or_else(|| "NULL".to_string(), |value| value.to_string())
         ),
@@ -329,7 +329,7 @@ async fn get_lock(connection: &mut MySqlConnection, name: &str, timeout: i64) ->
 /// The user-level lock name for a MySQL schema.
 ///
 /// `GET_LOCK` names are scoped to the *server*, not the schema, so the schema
-/// name has to be part of the name or two unrelated ForgeKeep databases on one
+/// name has to be part of the name or two unrelated Plombir Git databases on one
 /// MySQL server would serialise their migrations against each other. MySQL
 /// rejects a name over [`MYSQL_LOCK_NAME_MAX`] characters outright, and a schema
 /// name may occupy all 64 of them by itself, so an over-long one is folded into
@@ -354,8 +354,8 @@ mod tests {
     #[test]
     fn a_short_schema_name_is_readable_in_the_lock_name() {
         assert_eq!(
-            mysql_lock_name("forgekeep"),
-            "forgekeep_migrations:forgekeep"
+            mysql_lock_name("plombir-git"),
+            "plombir_git_migrations:plombir-git"
         );
     }
 

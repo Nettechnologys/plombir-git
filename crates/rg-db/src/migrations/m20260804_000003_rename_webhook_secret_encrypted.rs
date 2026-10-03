@@ -1,18 +1,18 @@
 //! Migration: `webhooks.secret` held the HMAC signing key in the clear — give
 //! the column the name the value is about to have.
 //!
-//! Every delivery ForgeKeep sends is signed with this value
+//! Every delivery Plombir Git sends is signed with this value
 //! (`X-Hub-Signature-256`), so unlike a runner token it cannot be hashed: the
 //! server has to read it back on every dispatch. That leaves encryption, the
 //! same treatment `ci_secrets.encrypted_value` and `mirrors.password_encrypted`
 //! already get — and the column joins
 //! `rg_core::auth::encrypted_columns` so the startup preflight and
-//! `forgekeep rotate-encryption-key` see it like any other at-rest secret.
+//! `plombir-git rotate-encryption-key` see it like any other at-rest secret.
 //!
 //! **The rename is all this migration can do.** Sealing the existing values
 //! needs the instance's at-rest key, which lives in a key file / config and
 //! never reaches the migration runner. So the values are sealed one step later,
-//! by `rg_core::webhook::service::seal_legacy_secrets`, which `forgekeep serve`
+//! by `rg_core::webhook::service::seal_legacy_secrets`, which `plombir-git serve`
 //! runs immediately after the key preflight — the first moment in the boot
 //! where both the migrated schema and the key exist. Until that pass runs the
 //! column name promises more than the bytes deliver; the dispatcher knows it

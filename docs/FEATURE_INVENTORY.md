@@ -1,4 +1,4 @@
-# ForgeKeep — Feature Inventory
+# Plombir Git — Feature Inventory
 
 > Живой реестр того, **что реально реализовано** в кодовой базе, с упором на
 > security-поверхность. Цель — чтобы перед «а давайте добавим X» можно было за
@@ -58,7 +58,7 @@ _Последняя сверка с кодом: 2026-07-23._
 | HMAC-SHA256 подпись исходящих (`X-Hub-Signature-256`) | ✅ 🔒 | `rg-core/src/webhook/service.rs:188` | GitHub-совместимо |
 | Timeout на исходящем HTTP-клиенте | ✅ 🔒 | `rg-core/src/net.rs`, `auth/sso.rs` | общий `outbound_client()` с `timeout(30s)` + `connect_timeout(10s)`; все 7 SSO/OIDC call-site'ов идут через него |
 | Запрет редиректов / SSRF-защита (private/loopback IP) | ✅ 🔒 | `rg-core/src/net.rs`, `webhook/service.rs`, `auth/sso.rs` | Webhook-клиент: `redirect(Policy::none())` + proxy-off + кастомный `reqwest::dns::Resolve`, который reject'ит private/loopback/link-local/ULA/CGNAT и отдаёт коннектору те же проверенные адреса без DNS-rebinding TOCTOU. SSO-outbound: timeout + redirect-ban применены; private-IP guard сознательно НЕ навешен (admin-config / OIDC-discovery endpoint'ы, self-hosted internal IdP — легитимен). Import API/git subprocess destination pinning вынесен в отдельные cards. |
-| Верификация HMAC на входящих вебхуках | ✅ 🔒 | `rg-http/src/api/webhooks_external.rs` | opt-in `[webhooks].external_secret` / `FORGEKEEP_EXTERNAL_WEBHOOK_SECRET`; при заданном секрете `X-Hub-Signature-256` над сырым телом проверяется constant-time (`hmac::verify_slice`), формат `sha256=<hex>` симметричен исходящим; не задан → auth-only как раньше |
+| Верификация HMAC на входящих вебхуках | ✅ 🔒 | `rg-http/src/api/webhooks_external.rs` | opt-in `[webhooks].external_secret` / `PLOMBIR_GIT_EXTERNAL_WEBHOOK_SECRET`; при заданном секрете `X-Hub-Signature-256` над сырым телом проверяется constant-time (`hmac::verify_slice`), формат `sha256=<hex>` симметричен исходящим; не задан → auth-only как раньше |
 | SSRF-защита mirror-sync (git-субпроцесс на user-URL) | ✅ 🔒 | `rg-core/src/net.rs`, `mirror/service.rs` | Общий git allow-list остаётся `https/http/git` для mirror/import SSRF-классификации, но mirror-owned transport policy поверх него допускает только `https` и явно opt-in `http`; `git://` fail-closed. `check_git_url_static()` на create/update + DNS `guard_git_url()` перед `git clone --mirror`/`remote update`; тот же `is_forbidden_ip` (private/loopback/link-local/ULA/CGNAT). Timeout — общий git-gateway. Оставшийся import `git://` scope вынесен в `card_7dac1a31bba3` |
 
 ## 5. Robustness / эксплуатация
@@ -82,7 +82,7 @@ _Последняя сверка с кодом: 2026-07-23._
 | BlobStorage trait + локальный atomic backend | ✅ | `rg-core/src/blob_storage.rs:88` | чистый trait-based дизайн |
 | OCI package registry (content-addressed digests) | ✅ | `rg-core/src/package_registry/oci/` | digest для content-addressing, не provenance |
 | SHA-256 digest для релизных ассетов | ✅ 🔒 | `rg-core/src/release/service.rs:154,214` | `upload_asset` пишет `sha256`, `download_asset` сверяет целостность (bail при mismatch), отдаётся `X-Checksum-Sha256`; legacy-ассеты (NULL) без guard'а |
-| Подпись/attestation релизных ассетов (in-toto + DSSE, SLSA/Sigstore-совместимо) | ✅ 🔒 | `rg-core/src/attestation/`, `rg-core/src/release/service.rs` | opt-in (`[releases] attestation_enabled` / `FORGEKEEP_ATTESTATION_ENABLED`); detached DSSE-envelope с JCS-каноникализацией (RFC 8785), Ed25519-подпись **тем же** ключом, что и CI OIDC JWKS (`/ci/oidc/jwks`); pluggable verifier-registry по `predicateType`; API `POST/GET .../assets/:id/attestation` + `.../verify`; неверная подпись/подменённый ассет → verify FAIL |
+| Подпись/attestation релизных ассетов (in-toto + DSSE, SLSA/Sigstore-совместимо) | ✅ 🔒 | `rg-core/src/attestation/`, `rg-core/src/release/service.rs` | opt-in (`[releases] attestation_enabled` / `PLOMBIR_GIT_ATTESTATION_ENABLED`); detached DSSE-envelope с JCS-каноникализацией (RFC 8785), Ed25519-подпись **тем же** ключом, что и CI OIDC JWKS (`/ci/oidc/jwks`); pluggable verifier-registry по `predicateType`; API `POST/GET .../assets/:id/attestation` + `.../verify`; неверная подпись/подменённый ассет → verify FAIL |
 
 ## 7. Agent-native / MCP
 

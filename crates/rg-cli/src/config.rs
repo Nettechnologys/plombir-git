@@ -1,4 +1,4 @@
-//! TOML configuration model shared by **every** `forgekeep` subcommand, plus
+//! TOML configuration model shared by **every** `plombir-git` subcommand, plus
 //! the `CLI arg > config file > built-in default` resolution.
 //!
 //! This lives outside `serve.rs` on purpose: the config file is not a
@@ -6,9 +6,9 @@
 //! `create-repo`, `import`, `index-repo` and `package list` all address the same
 //! `[database].url` / `[server].repo_root`, and while `load_config_file` was
 //! private to the `serve` module they *could not* read it — every one of them
-//! silently fell back to `sqlite://./forgekeep.db?mode=rwc`, so an operator
-//! running `forgekeep migrate` on a Postgres deployment migrated a brand-new
-//! empty SQLite file and `forgekeep backup-db` happily "backed up" nothing.
+//! silently fell back to `sqlite://./plombir-git.db?mode=rwc`, so an operator
+//! running `plombir-git migrate` on a Postgres deployment migrated a brand-new
+//! empty SQLite file and `plombir-git backup-db` happily "backed up" nothing.
 
 use std::path::{Path, PathBuf};
 
@@ -58,7 +58,7 @@ pub(crate) struct ConfigFile {
 
 // No `#[allow(dead_code)]` here on purpose: every field below must actually be
 // consumed by `resolve_settings` / `run_serve`. If a key is added to the struct
-// (and to `forgekeep.example.toml`) but never wired up, the dead-code lint says
+// (and to `plombir-git.example.toml`) but never wired up, the dead-code lint says
 // so at build time instead of the operator finding out that their setting is
 // silently ignored.
 #[derive(Debug, serde::Deserialize, Default)]
@@ -125,7 +125,7 @@ pub(crate) struct AuthConfig {
     /// A string rather than a bool so a third mode (`"invite"`) can be added
     /// without breaking every config file that already spells this out —
     /// self-service sign-up is a product decision with more than two states.
-    /// Also settable as `FORGEKEEP_REGISTRATION`, which wins; an unrecognised
+    /// Also settable as `PLOMBIR_GIT_REGISTRATION`, which wins; an unrecognised
     /// value fails the start rather than falling back to `"open"`.
     pub(crate) registration: Option<String>,
 }
@@ -146,7 +146,7 @@ pub(crate) fn default_host_key_path() -> PathBuf {
 /// `[server].shutdown_grace_secs`.
 ///
 /// A function beside the other defaults rather than an `unwrap_or(30)` at the
-/// resolution site: `forgekeep.example.toml` offers `# shutdown_grace_secs = 30`
+/// resolution site: `plombir-git.example.toml` offers `# shutdown_grace_secs = 30`
 /// as the value an operator gets by leaving it commented, and a number that
 /// exists only inside one `unwrap_or` is a number no contract can reach — which
 /// is exactly how `timeouts.job_secs` came to be resolved by a literal `3600`
@@ -202,7 +202,7 @@ pub(crate) struct CiConfig {
 #[allow(dead_code)]
 pub(crate) struct ReleasesConfig {
     /// Enable opt-in Ed25519 provenance attestation of release assets (default
-    /// false). Also settable via `FORGEKEEP_ATTESTATION_ENABLED=1`, which wins.
+    /// false). Also settable via `PLOMBIR_GIT_ATTESTATION_ENABLED=1`, which wins.
     #[serde(default)]
     pub(crate) attestation_enabled: Option<bool>,
 }
@@ -267,7 +267,7 @@ pub(crate) struct AuditConfig {
 /// snapshot every `interval_hours` with `keep_last` copies retained multiplies
 /// the database's disk footprint, and that is not a cost to impose on an
 /// existing install during an upgrade. The shipped deployment configs
-/// (`forgekeep.example.toml`, `deploy/forgekeep.docker.toml`) turn it on, so a
+/// (`plombir-git.example.toml`, `deploy/plombir-git.docker.toml`) turn it on, so a
 /// new instance is backed up from the first start; and a server with it off says
 /// so at startup, which is the point — "are there backups?" should be answerable
 /// from the config file and the log, not from an admin's memory of a cron entry.
@@ -334,7 +334,7 @@ pub(crate) struct ObservabilityConfig {
     /// appended automatically). Overridden by `OTEL_EXPORTER_OTLP_ENDPOINT` /
     /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. Unset ⇒ tracing disabled.
     pub(crate) otlp_endpoint: Option<String>,
-    /// `service.name` resource attribute (default "forgekeep"). Overridden by
+    /// `service.name` resource attribute (default "plombir-git"). Overridden by
     /// `OTEL_SERVICE_NAME`.
     pub(crate) service_name: Option<String>,
     /// Head sampling ratio in 0.0..=1.0 (default 1.0 = sample every trace).
@@ -348,7 +348,7 @@ pub(crate) struct WebhooksConfig {
     /// Shared secret for verifying HMAC-SHA256 signatures on *inbound* external
     /// webhooks (`/webhooks/external/*`). Unset = signature checking disabled
     /// (endpoints rely on JWT/PAT auth alone). Also settable via the
-    /// `FORGEKEEP_EXTERNAL_WEBHOOK_SECRET` environment variable, which wins.
+    /// `PLOMBIR_GIT_EXTERNAL_WEBHOOK_SECRET` environment variable, which wins.
     pub(crate) external_secret: Option<String>,
     /// Permit outbound webhook payloads and HMAC signatures over plaintext
     /// `http://`. Off by default; intended only for an operator-controlled
@@ -432,7 +432,7 @@ pub(crate) fn default_db_idle_timeout() -> u64 {
 /// read it, so a bad path fails with a message that names the path and says
 /// what to do about it.
 ///
-/// The motivating incident: a Docker bind-mount whose source `forgekeep.toml`
+/// The motivating incident: a Docker bind-mount whose source `plombir-git.toml`
 /// did not exist made the daemon auto-create a **directory** at the mount
 /// point, and `read_to_string` reported nothing but `Is a directory (os error
 /// 21)` — no path, no cause. The container crash-looped 268 times on it.
@@ -460,14 +460,14 @@ pub(crate) fn ensure_regular_file(
 /// Remediation appended to every `--config` failure: the file the deployer was
 /// supposed to create in the first place.
 const CONFIG_FILE_HINT: &str =
-    "create it first: `install -m 600 forgekeep.example.toml forgekeep.toml` (and bind-mount that file, \
+    "create it first: `install -m 600 plombir-git.example.toml plombir-git.toml` (and bind-mount that file, \
      not a directory)";
 
 /// Return the TOML table active at `byte_offset`, for actionable parse errors.
 ///
 /// `toml::de::Error` names an unknown field and its line, but not the table the
 /// field belongs to. For a file with several operator-facing sections that
-/// leaves `unknown field htp_addr` unnecessarily ambiguous. ForgeKeep's config
+/// leaves `unknown field htp_addr` unnecessarily ambiguous. Plombir Git's config
 /// model uses ordinary top-level tables, so the closest preceding `[table]`
 /// header is the section the operator has to fix.
 fn config_section_at(content: &str, byte_offset: usize) -> Option<&str> {
@@ -508,9 +508,9 @@ pub(crate) fn load_config_file(path: &str) -> anyhow::Result<ConfigFile> {
 /// Load the file named by `--config`, or `None` when the flag was not passed.
 ///
 /// A `--config` that *was* passed but cannot be read is always an error, never a
-/// fallback to the built-in defaults: that is precisely how `forgekeep migrate
-/// --config /data/forgekeep.toml` would end up migrating a fresh, empty
-/// `./forgekeep.db` while the real database stayed untouched.
+/// fallback to the built-in defaults: that is precisely how `plombir-git migrate
+/// --config /data/plombir-git.toml` would end up migrating a fresh, empty
+/// `./plombir-git.db` while the real database stayed untouched.
 pub(crate) fn load_optional_config_file(path: Option<&str>) -> anyhow::Result<Option<ConfigFile>> {
     match path {
         Some(path) => Ok(Some(load_config_file(path)?)),
@@ -537,12 +537,12 @@ pub(crate) fn write_test_config(
 /// purpose: a clap default is indistinguishable from a value the operator
 /// typed, so with one the config file could never win over "the flag was not
 /// passed" — which is exactly why `[server].repo_root` and `[database].url`
-/// were silently ignored, first by `forgekeep serve --config …` and then by
+/// were silently ignored, first by `plombir-git serve --config …` and then by
 /// every other subcommand.
 pub(crate) const DEFAULT_REPO_ROOT: &str = "./repos";
 pub(crate) const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8080";
 pub(crate) const DEFAULT_SSH_ADDR: &str = "0.0.0.0:2222";
-pub(crate) const DEFAULT_DB_URL: &str = "sqlite://./forgekeep.db?mode=rwc";
+pub(crate) const DEFAULT_DB_URL: &str = "sqlite://./plombir-git.db?mode=rwc";
 pub(crate) const DEFAULT_SMTP_PORT: u16 = 587;
 pub(crate) const DEFAULT_RATE_LIMIT_MAX: u32 = 0;
 pub(crate) const DEFAULT_RATE_LIMIT_WINDOW: u64 = 60;
@@ -599,7 +599,7 @@ pub(crate) fn resolve_source_url(cfg: Option<&ConfigFile>) -> anyhow::Result<Str
 /// a bare literal inside the `.unwrap_or(…)` that resolves it, which is the one
 /// shape no doc-versus-code check can reach — a number with no name has nothing
 /// to be compared against, and every one of these is *also* written out in
-/// `forgekeep.example.toml` and `deploy/forgekeep.docker.toml`.
+/// `plombir-git.example.toml` and `deploy/plombir-git.docker.toml`.
 ///
 /// The precedent is `[mirror]`, whose numeric knobs already resolve through
 /// `rg_core::mirror::scheduler::DEFAULT_*`; the values that live in rg-core
@@ -701,7 +701,7 @@ pub(crate) fn resolve_package_upload_max_bytes(cfg: Option<&ConfigFile>) -> anyh
 }
 
 /// Parse the exact admin-managed origins consumed by both `serve` and the
-/// one-shot `forgekeep import --config ...` command.
+/// one-shot `plombir-git import --config ...` command.
 pub(crate) fn resolve_trusted_import_origins(
     cfg: Option<&ConfigFile>,
 ) -> anyhow::Result<rg_core::import::trust::TrustedImportOrigins> {
@@ -749,8 +749,8 @@ pub(crate) fn resolve_ldap_transport_policy(
 /// `--db-url` > `[database].url` > [`DEFAULT_DB_URL`].
 ///
 /// The single resolution point for the database URL, used both by `serve` (via
-/// [`resolve_settings`]) and by every one-shot subcommand, so `forgekeep serve`
-/// and `forgekeep migrate` given the same config file can never disagree about
+/// [`resolve_settings`]) and by every one-shot subcommand, so `plombir-git serve`
+/// and `plombir-git migrate` given the same config file can never disagree about
 /// which database they are talking to.
 pub(crate) fn resolve_db_url(cli: Option<String>, cfg: Option<&ConfigFile>) -> String {
     cli.or_else(|| cfg.and_then(|c| c.database.url.clone()))
@@ -967,7 +967,7 @@ mod tests {
         keys
     }
 
-    /// The configuration files ForgeKeep actually ships, by the path an
+    /// The configuration files Plombir Git actually ships, by the path an
     /// operator is told to copy.
     ///
     /// `include_str!` rather than a runtime `read_to_string`: the paths are
@@ -976,17 +976,17 @@ mod tests {
     /// rebuilds — and therefore re-runs — the tests below.
     const SHIPPED_CONFIGS: [(&str, &str); 2] = [
         (
-            "forgekeep.example.toml",
-            include_str!("../../../forgekeep.example.toml"),
+            "plombir-git.example.toml",
+            include_str!("../../../plombir-git.example.toml"),
         ),
         (
-            "deploy/forgekeep.docker.toml",
-            include_str!("../../../deploy/forgekeep.docker.toml"),
+            "deploy/plombir-git.docker.toml",
+            include_str!("../../../deploy/plombir-git.docker.toml"),
         ),
     ];
 
     /// The documented first step of every install is `install -m 600
-    /// forgekeep.example.toml forgekeep.toml`. With `deny_unknown_fields` on
+    /// plombir-git.example.toml plombir-git.toml`. With `deny_unknown_fields` on
     /// `ConfigFile` and on every section, one stale key in a file we ship is not
     /// a cosmetic drift — it is a hard startup failure for whoever followed the
     /// instructions.
@@ -1003,7 +1003,7 @@ mod tests {
 
             super::load_config_file(path.to_str().unwrap()).unwrap_or_else(|error| {
                 panic!(
-                    "`install -m 600 {name} forgekeep.toml` is the documented first step of an install, \
+                    "`install -m 600 {name} plombir-git.toml` is the documented first step of an install, \
                      and the result does not load: {error:#}"
                 )
             });
@@ -1019,42 +1019,42 @@ mod tests {
             (
                 "README.md",
                 include_str!("../../../README.md"),
-                "install -m 600 forgekeep.example.toml forgekeep.toml",
+                "install -m 600 plombir-git.example.toml plombir-git.toml",
             ),
             (
                 "deploy/README.md",
                 include_str!("../../../deploy/README.md"),
-                "install -m 600 forgekeep.docker.toml forgekeep.toml",
+                "install -m 600 plombir-git.docker.toml plombir-git.toml",
             ),
             (
-                "deploy/forgekeep.docker.toml",
-                include_str!("../../../deploy/forgekeep.docker.toml"),
-                "install -m 600 forgekeep.docker.toml forgekeep.toml",
+                "deploy/plombir-git.docker.toml",
+                include_str!("../../../deploy/plombir-git.docker.toml"),
+                "install -m 600 plombir-git.docker.toml plombir-git.toml",
             ),
             (
                 "deploy/docker-compose.hostdir.yml",
                 include_str!("../../../deploy/docker-compose.hostdir.yml"),
-                "install -m 600 forgekeep.docker.toml forgekeep.toml",
+                "install -m 600 plombir-git.docker.toml plombir-git.toml",
             ),
         ];
 
         for (name, body, safe_install) in SURFACES {
             assert!(
                 body.contains(safe_install),
-                "{name} must create forgekeep.toml with owner-only permissions: {safe_install}"
+                "{name} must create plombir-git.toml with owner-only permissions: {safe_install}"
             );
             assert!(
-                !body.contains("cp forgekeep.example.toml forgekeep.toml")
-                    && !body.contains("cp forgekeep.docker.toml forgekeep.toml"),
+                !body.contains("cp plombir-git.example.toml plombir-git.toml")
+                    && !body.contains("cp plombir-git.docker.toml plombir-git.toml"),
                 "{name} must not recommend a umask-dependent config copy"
             );
         }
     }
 
-    /// `deploy/.env` ends up holding `FORGEKEEP_JWT_SECRET` and
-    /// `FORGEKEEP_ENCRYPTION_KEY` in plain text — the token-signing key and the
+    /// `deploy/.env` ends up holding `PLOMBIR_GIT_JWT_SECRET` and
+    /// `PLOMBIR_GIT_ENCRYPTION_KEY` in plain text — the token-signing key and the
     /// at-rest key, either of which is enough on its own to take the instance
-    /// over. Unlike `forgekeep.toml` nothing validates its mode at startup
+    /// over. Unlike `plombir-git.toml` nothing validates its mode at startup
     /// (docker compose reads it, not us), so the copy instruction is the only
     /// place the permission can be got right, and `cp` under a stock umask
     /// gets it wrong every time.
@@ -1098,7 +1098,7 @@ mod tests {
 
     /// The two checks above each guard one *file*. This one guards the
     /// directory that everything else the server persists ends up inside — the
-    /// private repositories, `forgekeep.db`, the `VACUUM INTO` snapshots of it,
+    /// private repositories, `plombir-git.db`, the `VACUUM INTO` snapshots of it,
     /// the audit archive, LFS objects and OCI layers.
     ///
     /// It is the same defect one level up, and the level where it can be fixed
@@ -1232,7 +1232,7 @@ mod tests {
     /// The documentation an operator reads *before* copying anything. The
     /// shipped configs above are checked because they are copied; these files
     /// are checked because they are copied *from* — the `[section]` blocks in
-    /// a README are pasted into `forgekeep.toml` exactly as often, and
+    /// a README are pasted into `plombir-git.toml` exactly as often, and
     /// `deny_unknown_fields` does not care which of the two the operator used.
     const DOCUMENTED_CONFIGS: [(&str, &str); 2] = [
         ("README.md", include_str!("../../../README.md")),
@@ -1244,7 +1244,7 @@ mod tests {
 
     /// Root sections that belong to some *other* TOML document — a
     /// `Cargo.toml` excerpt in a contributor note, say. Everything else in a
-    /// ```toml block is read as ForgeKeep configuration on purpose: a section
+    /// ```toml block is read as Plombir Git configuration on purpose: a section
     /// that quietly stopped being one of ours is the drift being hunted here,
     /// so the list is an allow-list of foreigners, never of our own sections.
     const FOREIGN_TOML_SECTIONS: [&str; 8] = [
@@ -1290,7 +1290,7 @@ mod tests {
         blocks
     }
 
-    /// README sections whose ```toml blocks describe a **different** ForgeKeep
+    /// README sections whose ```toml blocks describe a **different** Plombir Git
     /// document, each with the test that checks them instead.
     ///
     /// `FOREIGN_TOML_SECTIONS` above tells a foreigner apart by its first line;
@@ -1301,7 +1301,7 @@ mod tests {
     /// fail, and a block excused here has to be checked somewhere.
     const FOREIGN_TOML_DOCUMENTS: [(&str, &str, &str); 1] = [(
         "README.md",
-        "## CI runner (`forgekeep-runner`)",
+        "## CI runner (`plombir-git-runner`)",
         "`runner.toml`, checked against the `RunnerConfig` declaration by \
          `rg-runner/src/config.rs::every_toml_block_in_the_readme_runner_section_loads_as_a_runner_config`",
     )];
@@ -1367,8 +1367,8 @@ mod tests {
                 toml::from_str::<ConfigFile>(&body).unwrap_or_else(|error| {
                     panic!(
                         "{name}:{line}: the `[{section}]` block on the page an operator reads \
-                         first is not valid ForgeKeep configuration — pasting it into \
-                         forgekeep.toml would stop the server starting: {error}"
+                         first is not valid Plombir Git configuration — pasting it into \
+                         plombir-git.toml would stop the server starting: {error}"
                     )
                 });
                 checked += 1;
@@ -1457,7 +1457,7 @@ mod tests {
     const QUOTATION_LEAD: &str = "ships with:";
 
     /// The path a quotation sentence names in backticks — ``**Backs itself
-    /// up.** `deploy/forgekeep.docker.toml` ships with:`` → the path.
+    /// up.** `deploy/plombir-git.docker.toml` ships with:`` → the path.
     fn quoted_file(line: &str) -> Option<&str> {
         line.split_once(QUOTATION_LEAD)
             .map(|(before, _)| before.trim_end())
@@ -1506,7 +1506,7 @@ mod tests {
     /// Every other test on this page asks whether a block would work: it loads
     /// as a `ConfigFile`, its keys are real, its values match the code. A
     /// quotation also asserts something about a **file** — and that assertion
-    /// is the one nothing held. `deploy/forgekeep.docker.toml` can have its
+    /// is the one nothing held. `deploy/plombir-git.docker.toml` can have its
     /// `[backup]` section retuned without the page that quotes it changing a
     /// character, and both sides stay individually valid: the file still loads,
     /// the block still parses, every number in it is still a real default. The
@@ -1520,8 +1520,8 @@ mod tests {
     #[test]
     fn every_block_quoting_a_shipped_config_states_what_that_file_says() {
         assert_eq!(
-            quoted_file("**Backs itself up.** `deploy/forgekeep.docker.toml` ships with:"),
-            Some("deploy/forgekeep.docker.toml"),
+            quoted_file("**Backs itself up.** `deploy/plombir-git.docker.toml` ships with:"),
+            Some("deploy/plombir-git.docker.toml"),
             "the reader does not find the file a quotation sentence names"
         );
         assert_eq!(
@@ -1634,7 +1634,7 @@ mod tests {
         offered
     }
 
-    /// Keys the model accepts that `forgekeep.example.toml` deliberately does
+    /// Keys the model accepts that `plombir-git.example.toml` deliberately does
     /// not show, each with the reason it is held back. The list exists so that
     /// adding a knob without a line in the operator's template is a decision
     /// someone made, rather than something nobody noticed.
@@ -1651,15 +1651,15 @@ mod tests {
     ///
     /// A knob nobody can discover is a quiet loss rather than a loud one — the
     /// built-in default may be wrong for a deployment, and the operator, who
-    /// reads `forgekeep.example.toml` and not `config.rs`, never learns there
+    /// reads `plombir-git.example.toml` and not `config.rs`, never learns there
     /// was anything to set. Only the example file is held to this:
-    /// `deploy/forgekeep.docker.toml` is one deployment's answers, not the
+    /// `deploy/plombir-git.docker.toml` is one deployment's answers, not the
     /// catalogue of questions.
     #[test]
     fn every_key_the_model_accepts_is_shown_in_the_example_config() {
         let (name, content) = SHIPPED_CONFIGS[0];
         assert_eq!(
-            name, "forgekeep.example.toml",
+            name, "plombir-git.example.toml",
             "SHIPPED_CONFIGS has been reordered — this test is about the operator template"
         );
 
@@ -2060,7 +2060,7 @@ mod tests {
     ///
     /// Keyed by file, because the same key is a default in one and a decision in
     /// the other: `[audit].archive_dir` is the built-in fallback in
-    /// `forgekeep.example.toml` and `/data/audit-archive` in the Docker one.
+    /// `plombir-git.example.toml` and `/data/audit-archive` in the Docker one.
     ///
     /// This list is what makes the check below a closed contract rather than
     /// rows that happen to be right today — a new `key = 42` line is either
@@ -2068,20 +2068,20 @@ mod tests {
     /// reason.
     const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 30] = [
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "server",
             "host_key",
             "a placeholder path; the real default is derived from $HOME at run time \
              by default_host_key_path()",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "server",
             "external_url",
             "no default: left unset, links point at the address the server bound to",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "auth",
             "jwt_secret",
             "the placeholder every install has to replace; that it is a secret the \
@@ -2089,74 +2089,74 @@ mod tests {
              the_shipped_jwt_placeholder_is_a_secret_the_server_refuses",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "auth",
             "encryption_key",
             "a secret to paste, not a value the server picks",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "auth",
             "key_file",
             "a placeholder path; left unset it is derived beside [server].host_key",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "webhooks",
             "external_secret",
             "a secret to paste; unset means inbound signature checking stays off",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "rate_limit",
             "trusted_proxies",
             "the empty list is what unset means, and the commented line below it is \
              an illustration of the shape — neither is a value the code names",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "smtp",
             "host",
             "a placeholder host; unset means no email",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "smtp",
             "user",
             "a placeholder account name",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "smtp",
             "pass",
             "a secret to paste",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "smtp",
             "from",
             "a placeholder sender address",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "tls",
             "cert",
             "a placeholder path; unset means plain HTTP",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "tls",
             "key",
             "a placeholder path; unset means plain HTTP",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "logging",
             "file",
             "a placeholder path; unset means logs go to stdout only",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "backup",
             "enabled",
             "deliberately the opposite of the code default: an upgrade must not \
@@ -2166,101 +2166,101 @@ mod tests {
              DEFAULT_BACKUP_ENABLED",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "imports",
             "trusted_origins",
             "the empty list is what unset means, and the commented line below it is \
              an illustration of the shape — neither is a value the code names",
         ),
         (
-            "forgekeep.example.toml",
+            "plombir-git.example.toml",
             "observability",
             "otlp_endpoint",
             "an example collector address; unset is what keeps tracing off, so there \
              is no default to state",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "server",
             "repo_root",
             "a path inside the container, mounted from the host `./data` volume",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "server",
             "host_key",
             "a path inside the container: the host key has to live on the volume so \
              client known_hosts entries survive a rebuild",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "server",
             "external_url",
             "no default: left unset, links point at the address the server bound to",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "database",
             "url",
             "a path inside the container, on the mounted volume rather than the \
              image's WORKDIR",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "auth",
             "jwt_secret",
             "an elision, not a value: the secret belongs in deploy/.env, which wins \
              over this file",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "auth",
             "encryption_key",
             "an elision, not a value: unset means the server generates and keeps one",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "auth",
             "key_file",
             "a path inside the container, on the mounted volume",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "rate_limit",
             "trusted_proxies",
             "an illustration of the shape, with the address a default Docker bridge \
              happens to use",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "logging",
             "file",
             "a placeholder path; unset is deliberate here so `docker compose logs` \
              keeps working",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "audit",
             "archive_dir",
             "a path inside the container: the archive has to land on the mounted \
              volume, not in the image layer",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "backup",
             "enabled",
             "deliberately the opposite of the code default, for the reason spelled \
-             out on the same key in forgekeep.example.toml",
+             out on the same key in plombir-git.example.toml",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "backup",
             "dir",
             "a path inside the container: snapshots have to land on the mounted \
              volume, not in the image layer",
         ),
         (
-            "deploy/forgekeep.docker.toml",
+            "deploy/plombir-git.docker.toml",
             "imports",
             "trusted_origins",
             "the empty list is what unset means, and the commented line below it is \
@@ -2326,8 +2326,8 @@ mod tests {
             "the reader does not split a commented assignment into key and value"
         );
         assert_eq!(
-            commented_assignment_parts("# service_name = \"forgekeep\""),
-            Some(("service_name", "\"forgekeep\"")),
+            commented_assignment_parts("# service_name = \"plombir-git\""),
+            Some(("service_name", "\"plombir-git\"")),
             "the reader strips the quotes TOML spells a string with"
         );
         assert!(
@@ -2343,8 +2343,8 @@ mod tests {
             "the live reader keeps the trailing comment as part of the value"
         );
         assert_eq!(
-            live_assignment_parts("url = \"sqlite://./forgekeep.db?mode=rwc\""),
-            Some(("url", "\"sqlite://./forgekeep.db?mode=rwc\"")),
+            live_assignment_parts("url = \"sqlite://./plombir-git.db?mode=rwc\""),
+            Some(("url", "\"sqlite://./plombir-git.db?mode=rwc\"")),
             "the live reader mis-splits a quoted value that contains an `=`"
         );
         assert_eq!(
@@ -2451,8 +2451,8 @@ mod tests {
     /// server must refuse to sign with — and the two are written in different
     /// files, with nothing between them.
     ///
-    /// Change the template's placeholder alone and `cp forgekeep.example.toml
-    /// forgekeep.toml` produces an instance that starts cleanly and signs every
+    /// Change the template's placeholder alone and `cp plombir-git.example.toml
+    /// plombir-git.toml` produces an instance that starts cleanly and signs every
     /// token with a secret published in this repository. The rejection is not a
     /// nicety: `validate_jwt_secret` is what turns "no secret was ever set" into
     /// a failed start.
@@ -2676,7 +2676,7 @@ mod tests {
 
         vec![
             row(
-                "forgekeep.example.toml",
+                "plombir-git.example.toml",
                 "0 = built-in default",
                 "rg_http::rate_limit::DEFAULT_MAX_KEYS",
                 format!("({})", rg_http::rate_limit::DEFAULT_MAX_KEYS),
@@ -2685,13 +2685,13 @@ mod tests {
             // both deliberately ship the opposite value. Without this row the
             // sentence is the last unchecked copy of it.
             row(
-                "forgekeep.example.toml",
+                "plombir-git.example.toml",
                 "so an upgrade never starts consuming",
                 "DEFAULT_BACKUP_ENABLED",
                 format!("Defaults to {} in code", super::DEFAULT_BACKUP_ENABLED),
             ),
             row(
-                "forgekeep.example.toml",
+                "plombir-git.example.toml",
                 "unlike [backup]",
                 "DEFAULT_MIRROR_ENABLED",
                 format!("Defaults to {} in code", super::DEFAULT_MIRROR_ENABLED),
@@ -2701,14 +2701,14 @@ mod tests {
             // live line below it. The live line is pinned by
             // template_defaults(); this is the other copy.
             row_in(
-                "forgekeep.example.toml",
+                "plombir-git.example.toml",
                 "audit",
                 "the same volume as the rest of the state; otherwise",
                 "DEFAULT_AUDIT_ARCHIVE_DIR",
                 format!("`{}`", super::DEFAULT_AUDIT_ARCHIVE_DIR),
             ),
             row_in(
-                "forgekeep.example.toml",
+                "plombir-git.example.toml",
                 "backup",
                 "the same volume as the rest of the state; otherwise",
                 "DEFAULT_DB_BACKUP_DIR",
@@ -2731,7 +2731,7 @@ mod tests {
                 format!("{} seconds", super::DEFAULT_AUTH_RATE_LIMIT_WINDOW),
             ),
             row(
-                "forgekeep.example.toml",
+                "plombir-git.example.toml",
                 "service.name resource attribute",
                 "telemetry::DEFAULT_OTEL_SERVICE_NAME",
                 format!(
@@ -2740,7 +2740,7 @@ mod tests {
                 ),
             ),
             row(
-                "forgekeep.example.toml",
+                "plombir-git.example.toml",
                 "Head sampling ratio",
                 "telemetry::DEFAULT_OTEL_SAMPLE_RATIO",
                 format!(
@@ -2928,7 +2928,7 @@ mod tests {
                 "ConfigFile section [{section}] ({config_type}) must deny unknown fields"
             );
 
-            let unknown_key = "definitely_not_a_forgekeep_setting";
+            let unknown_key = "definitely_not_a_plombir_git_setting";
             let toml = format!("[{section}]\n{unknown_key} = true\n");
             let error = toml::from_str::<ConfigFile>(&toml).unwrap_err().to_string();
             assert!(
@@ -3118,8 +3118,8 @@ allow_insecure_ldap_endpoints = ["ldap://directory.internal:1389"]
 
     /// `[server].repo_root` / `[database].url` from the config file were parsed
     /// and then thrown away: `run_serve` assigned the clap value verbatim. A
-    /// `forgekeep serve --config …` with no flags therefore wrote repos and the
-    /// SQLite file into `./repos` / `./forgekeep.db` relative to the working
+    /// `plombir-git serve --config …` with no flags therefore wrote repos and the
+    /// SQLite file into `./repos` / `./plombir-git.db` relative to the working
     /// directory (inside the container: an ephemeral `/app`), not where the
     /// config said.
     #[test]
@@ -3127,14 +3127,14 @@ allow_insecure_ldap_endpoints = ["ldap://directory.internal:1389"]
         let config: ConfigFile = toml::from_str(
             r#"
 [server]
-repo_root = "/srv/forgekeep/repos"
+repo_root = "/srv/plombir-git/repos"
 state_permissions = "group-writable"
 http_addr = "127.0.0.1:9000"
 ssh_addr = "127.0.0.1:2323"
-host_key = "/srv/forgekeep/ssh_host_key"
+host_key = "/srv/plombir-git/ssh_host_key"
 
 [database]
-url = "sqlite:////srv/forgekeep/forgekeep.db?mode=rwc"
+url = "sqlite:////srv/plombir-git/plombir-git.db?mode=rwc"
 
 [smtp]
 port = 2525
@@ -3152,20 +3152,20 @@ max_files = 7
 
         let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
 
-        assert_eq!(resolved.repo_root, "/srv/forgekeep/repos");
+        assert_eq!(resolved.repo_root, "/srv/plombir-git/repos");
         assert_eq!(
             resolved.state_permissions,
             rg_process::StateCreationPermissions::GroupWritable
         );
         assert_eq!(
             resolved.db_url,
-            "sqlite:////srv/forgekeep/forgekeep.db?mode=rwc"
+            "sqlite:////srv/plombir-git/plombir-git.db?mode=rwc"
         );
         assert_eq!(resolved.http_addr, "127.0.0.1:9000");
         assert_eq!(resolved.ssh_addr, "127.0.0.1:2323");
         assert_eq!(
             resolved.host_key.as_deref(),
-            Some("/srv/forgekeep/ssh_host_key")
+            Some("/srv/plombir-git/ssh_host_key")
         );
         assert_eq!(resolved.smtp_port, 2525);
         assert_eq!(resolved.rate_limit_max, 500);
@@ -3306,11 +3306,11 @@ max_files = 7
     #[test]
     fn example_config_locations_are_actually_applied() {
         let config: ConfigFile =
-            toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
+            toml::from_str(include_str!("../../../plombir-git.example.toml")).unwrap();
         let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
 
         assert_eq!(resolved.repo_root, "./repos");
-        assert_eq!(resolved.db_url, "sqlite://./forgekeep.db?mode=rwc");
+        assert_eq!(resolved.db_url, "sqlite://./plombir-git.db?mode=rwc");
         assert_eq!(resolved.http_addr, "0.0.0.0:8080");
         assert_eq!(resolved.ssh_addr, "0.0.0.0:2222");
     }
@@ -3318,10 +3318,10 @@ max_files = 7
     #[test]
     fn config_path_pointing_at_a_directory_names_path_and_remediation() {
         // The exact crash-loop shape: `docker compose` bind-mounted a missing
-        // `forgekeep.toml`, so the daemon created a directory there and the
+        // `plombir-git.toml`, so the daemon created a directory there and the
         // server died with a bare `Is a directory (os error 21)`.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("forgekeep.toml");
+        let path = dir.path().join("plombir-git.toml");
         std::fs::create_dir(&path).unwrap();
 
         let err = super::load_config_file(path.to_str().unwrap())
@@ -3332,7 +3332,7 @@ max_files = 7
         assert!(err.contains("is a directory"), "no cause: {err}");
         assert!(err.contains("bind-mount"), "no diagnosis: {err}");
         assert!(
-            err.contains("install -m 600 forgekeep.example.toml forgekeep.toml"),
+            err.contains("install -m 600 plombir-git.example.toml plombir-git.toml"),
             "no remediation: {err}"
         );
     }
@@ -3349,7 +3349,7 @@ max_files = 7
         assert!(err.contains(path.to_str().unwrap()), "no path: {err}");
         assert!(err.contains("does not exist"), "no cause: {err}");
         assert!(
-            err.contains("install -m 600 forgekeep.example.toml forgekeep.toml"),
+            err.contains("install -m 600 plombir-git.example.toml plombir-git.toml"),
             "no remediation: {err}"
         );
     }
@@ -3374,7 +3374,7 @@ max_files = 7
     #[test]
     fn a_readable_config_file_still_loads() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("forgekeep.toml");
+        let path = dir.path().join("plombir-git.toml");
         super::write_test_config(&path, "[rate_limit]\nmax = 0\n").unwrap();
 
         let config = super::load_config_file(path.to_str().unwrap()).unwrap();
@@ -3387,7 +3387,7 @@ max_files = 7
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("forgekeep.toml");
+        let path = dir.path().join("plombir-git.toml");
         super::write_test_config(&path, "[rate_limit]\nmax = 0\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
@@ -3434,17 +3434,17 @@ max_files = 7
     /// The one-shot subcommands (`migrate`, `backup-db`, `rebuild-fts`, …) had
     /// no way to reach the config file at all: `--db-url` carried a clap default
     /// so an operator on Postgres silently migrated / "backed up" a brand-new
-    /// empty `./forgekeep.db`.
+    /// empty `./plombir-git.db`.
     #[test]
     fn one_shot_db_url_resolves_config_then_default() {
         let config: ConfigFile =
-            toml::from_str("[database]\nurl = \"postgres://forge:pw@db.internal/forgekeep\"\n")
+            toml::from_str("[database]\nurl = \"postgres://forge:pw@db.internal/plombir_git\"\n")
                 .unwrap();
 
         // No flag → the config file wins over the built-in SQLite default.
         assert_eq!(
             super::resolve_db_url(None, Some(&config)),
-            "postgres://forge:pw@db.internal/forgekeep"
+            "postgres://forge:pw@db.internal/plombir_git"
         );
         // Flag → wins over the config file.
         assert_eq!(
@@ -3484,11 +3484,11 @@ max_files = 7
     #[test]
     fn docker_example_config_keeps_all_state_in_the_data_directory() {
         let config: ConfigFile =
-            toml::from_str(include_str!("../../../deploy/forgekeep.docker.toml")).unwrap();
+            toml::from_str(include_str!("../../../deploy/plombir-git.docker.toml")).unwrap();
 
         let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
         assert_eq!(resolved.repo_root, "/data/repos");
-        assert_eq!(resolved.db_url, "sqlite:///data/forgekeep.db?mode=rwc");
+        assert_eq!(resolved.db_url, "sqlite:///data/plombir-git.db?mode=rwc");
         assert_eq!(resolved.host_key.as_deref(), Some("/data/ssh_host_key"));
         // No log file: a container logs to stdout, otherwise `docker compose
         // logs` shows nothing and the operator debugs a silent box.
@@ -3505,7 +3505,7 @@ max_files = 7
     #[test]
     fn example_config_includes_valid_audit_archive_settings() {
         let config: ConfigFile =
-            toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
+            toml::from_str(include_str!("../../../plombir-git.example.toml")).unwrap();
         // Read from the sources rather than typed out again: a test that keeps
         // its own copy of `90` is one more place the default has to be changed,
         // and one more place it can be forgotten.
@@ -3533,7 +3533,7 @@ max_files = 7
     #[test]
     fn the_shipped_configs_schedule_backups_onto_durable_storage() {
         let example: ConfigFile =
-            toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
+            toml::from_str(include_str!("../../../plombir-git.example.toml")).unwrap();
         // `enabled` stays a literal `true` on purpose — it is the decision this
         // test exists to hold, and it is deliberately the opposite of
         // DEFAULT_BACKUP_ENABLED. The schedule is not a decision, so it is read
@@ -3549,7 +3549,7 @@ max_files = 7
         );
 
         let docker: ConfigFile =
-            toml::from_str(include_str!("../../../deploy/forgekeep.docker.toml")).unwrap();
+            toml::from_str(include_str!("../../../deploy/plombir-git.docker.toml")).unwrap();
         assert_eq!(docker.backup.enabled, Some(true));
         assert_eq!(docker.backup.dir.as_deref(), Some("/data/backups"));
     }

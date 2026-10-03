@@ -44,7 +44,7 @@ import { fileURLToPath } from 'node:url';
 import { productionRustCode } from './lib/rust-source.mjs';
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(process.env.FORGEKEEP_CLI_DB_OPENER_ROOT ?? path.join(scriptsDir, '..'));
+const root = path.resolve(process.env.PLOMBIR_GIT_CLI_DB_OPENER_ROOT ?? path.join(scriptsDir, '..'));
 const cliSrc = path.join(root, 'crates/rg-cli/src');
 const GATEWAY = 'crates/rg-cli/src/dbconn.rs';
 
@@ -63,13 +63,13 @@ const ONLINE_POOL_COMMANDS = [
   {
     file: 'crates/rg-cli/src/commands.rs',
     sites: 2,
-    commands: ['forgekeep rotate-instance-key', 'forgekeep index-repo'],
+    commands: ['plombir-git rotate-instance-key', 'plombir-git index-repo'],
     why: 'one writes a single row through one statement; the other runs exactly what `POST /repos/{owner}/{repo}/ai/index` runs on request',
   },
   {
     file: 'crates/rg-cli/src/admin.rs',
     sites: 1,
-    commands: ['forgekeep backup-db'],
+    commands: ['plombir-git backup-db'],
     why: '`VACUUM INTO` reads the source and writes a different file, so it never asks for the source write lock',
   },
 ];

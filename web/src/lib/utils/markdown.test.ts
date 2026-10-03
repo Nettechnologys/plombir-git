@@ -59,7 +59,7 @@ function expectInertTree(root: Element, label: string) {
 			expect(name, `attribute ${name} survived in ${label}`).not.toBe('style');
 
 			if (name === 'href' || name === 'src') {
-				const resolved = new URL(attr.value, 'https://forgekeep.local');
+				const resolved = new URL(attr.value, 'https://plombir-git.local');
 				expect(SAFE_SCHEMES, `${name}="${attr.value}" survived in ${label}`).toContain(
 					resolved.protocol
 				);

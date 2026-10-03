@@ -30,7 +30,7 @@ struct TempDb(std::path::PathBuf);
 impl TempDb {
     fn new() -> Self {
         Self(std::env::temp_dir().join(format!(
-            "forgekeep-mirror-queue-{}.db",
+            "plombir-git-mirror-queue-{}.db",
             uuid::Uuid::new_v4().simple()
         )))
     }

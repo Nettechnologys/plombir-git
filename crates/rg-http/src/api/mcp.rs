@@ -1,7 +1,7 @@
 //! `POST /api/v1/mcp` — the MCP tools, served by the server itself
 //! (card_60a80311d512).
 //!
-//! The `forgekeep-mcp` binary speaks MCP over stdio and calls this API over the
+//! The `plombir-git-mcp` binary speaks MCP over stdio and calls this API over the
 //! network with a PAT. That works, and it is also why the server could never
 //! tell an agent's request from its owner's, nor which tool a request served:
 //! all it saw was REST calls. Here the same tools (`rg-mcp`) run inside the
@@ -46,7 +46,7 @@ pub const MCP_REQUEST_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// call can make the server hold for them.
 const INNER_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-/// Per-call ceiling, the in-process twin of `forgekeep-mcp`'s HTTP timeout.
+/// Per-call ceiling, the in-process twin of `plombir-git-mcp`'s HTTP timeout.
 const INNER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// JSON-RPC error code for a tool the caller's token does not admit.

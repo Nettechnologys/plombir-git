@@ -125,7 +125,7 @@
 </script>
 
 <svelte:head>
-  <title>New Release · {owner}/{repo} · ForgeKeep</title>
+  <title>New Release · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const check = resolve(scriptsDir, 'architecture-crate-dependency-contract-check.mjs');
-const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-architecture-deps-'));
+const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-architecture-deps-'));
 
 function write(path, body) {
   const full = resolve(fixture, path);
@@ -29,7 +29,7 @@ function run() {
   return spawnSync(process.execPath, [check], {
     cwd: fixture,
     encoding: 'utf8',
-    env: { ...process.env, FORGEKEEP_ARCHITECTURE_DEPENDENCY_ROOT: fixture },
+    env: { ...process.env, PLOMBIR_GIT_ARCHITECTURE_DEPENDENCY_ROOT: fixture },
   });
 }
 

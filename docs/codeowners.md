@@ -1,9 +1,9 @@
 # CODEOWNERS — automatic reviewer requests
 
 This is the reference for the `CODEOWNERS` file you commit to **your own**
-repository so that ForgeKeep requests reviewers on a new pull request by
+repository so that Plombir Git requests reviewers on a new pull request by
 itself. The format is the GitHub/Gitea one — a pattern followed by the owners
-of everything it matches — but the matcher is ForgeKeep's own, so the rules
+of everything it matches — but the matcher is Plombir Git's own, so the rules
 below are the ones that decide, not the ones you remember from elsewhere.
 
 **Nothing in the product mentions this file**, which is why this page exists:
@@ -79,7 +79,7 @@ whitespace.
 Four ways a line produces **no executable rule**:
 
 - It is blank, or a comment. This is intentional and produces no diagnostic.
-- It names no owner (`*` on its own). ForgeKeep logs the line and reason.
+- It names no owner (`*` on its own). Plombir Git logs the line and reason.
 - None of its owners starts with `@`. An email address — which GitHub
   accepts — is not an owner here, and neither is a bare `alice`. A line whose
   owners are all unusable does not become an ownerless rule that wins; it

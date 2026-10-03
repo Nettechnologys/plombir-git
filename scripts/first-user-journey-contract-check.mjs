@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { shellCodeOnly } from './lib/shell-source.mjs';
 import { productionTsSource } from './lib/ts-source.mjs';
 
-const root = resolve(process.env.FORGEKEEP_FIRST_USER_JOURNEY_ROOT || join(dirname(fileURLToPath(import.meta.url)), '..'));
+const root = resolve(process.env.PLOMBIR_GIT_FIRST_USER_JOURNEY_ROOT || join(dirname(fileURLToPath(import.meta.url)), '..'));
 const failures = [];
 
 function read(path) {

@@ -1,4 +1,4 @@
-# ForgeKeep
+# Plombir Git
 
 > A lightweight, self-hosted Git forge for teams where code is written by
 > people and AI agents alike.
@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.95%2B-orange)](https://www.rust-lang.org/)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 
-ForgeKeep hosts repositories, issues, pull requests, code review, CI, a wiki
+Plombir Git hosts repositories, issues, pull requests, code review, CI, a wiki
 and package registries — and treats an AI agent as a participant of its own:
 its own account, its own narrowed token, its own audit trail, while a person
 keeps the approval that opens the merge. One server process speaks Git over
@@ -14,12 +14,12 @@ HTTPS and SSH and serves the REST API, MCP and the CI scheduler; the web UI is
 a static SvelteKit bundle served next to it. It sits in the same space as
 [Gitea](https://gitea.com/) and [Forgejo](https://forgejo.org/).
 
-> **Origin.** ForgeKeep is a fork of [IronForge](https://github.com/lengyuqu/ironforge).
+> **Origin.** Plombir Git is a fork of [IronForge](https://github.com/lengyuqu/ironforge).
 > See [NOTICE](NOTICE) for provenance and licensing details.
 
 ---
 
-## Why ForgeKeep
+## Why Plombir Git
 
 Three things, each with something you can check.
 
@@ -70,14 +70,14 @@ already issued (see [Secrets and rotation](#secrets-and-rotation)).
 
 ### 3. CI that runs what you wrote, or refuses by name
 
-ForgeKeep runs `.gitea/workflows/*.yml` as a **strict subset** of Actions. A key
+Plombir Git runs `.gitea/workflows/*.yml` as a **strict subset** of Actions. A key
 it accepts is executed; a key, trigger or action it does not implement fails the
 whole workflow with a message naming the file, the job and the key. It is never
 quietly dropped, so you never get a green run of a shortened workflow. A
 protected `environment:` holds the job until a person approves it.
 
 The table below is the honest trade. Gitea runs much more of the Actions
-ecosystem; ForgeKeep's promise is narrower and stricter.
+ecosystem; Plombir Git's promise is narrower and stricter.
 
 ## Actions compatibility
 
@@ -85,10 +85,10 @@ Compared with **Gitea 28.0.0** and **Gitea Runner 2.0.0**, as of 2026-10-03.
 Gitea documents its Actions as GitHub-compatible except for the differences on
 [its comparison page](https://docs.gitea.com/usage/actions/comparison/); a ✅ in
 the Gitea column means the key is not listed there, or that the release notes
-cited in the row added it. ForgeKeep's side is specified in full in
+cited in the row added it. Plombir Git's side is specified in full in
 [docs/gitea-actions.md](docs/gitea-actions.md).
 
-| Workflow syntax | ForgeKeep | Gitea 28 |
+| Workflow syntax | Plombir Git | Gitea 28 |
 |-----------------|-----------|----------|
 | `on:` `push`, `pull_request`, `workflow_dispatch`, `workflow_call` | ✅ | ✅ |
 | `on:` `schedule`, `pull_request_target`; `on.<event>.types` | ❌ refused by name | ✅ |
@@ -110,8 +110,8 @@ cited in the row added it. ForgeKeep's side is specified in full in
 | `permissions`, `vars.*` | ❌ refused | ✅ |
 
 If your workflows lean on marketplace actions, services or step outputs, Gitea
-will run them and ForgeKeep will not. ForgeKeep also has its own pipeline format,
-[`.forgekeep-ci.yml`](docs/ci.md), for what the subset cannot express.
+will run them and Plombir Git will not. Plombir Git also has its own pipeline format,
+[`.plombir-git-ci.yml`](docs/ci.md), for what the subset cannot express.
 
 ## Memory: measured, and not good yet
 
@@ -130,7 +130,7 @@ is a goal rather than a measured claim.
 
 ## How it is built
 
-ForgeKeep is developed with AI coding agents. They write the code; the
+Plombir Git is developed with AI coding agents. They write the code; the
 maintainer decides what to build and reviews it. The repository's pre-push hook
 (`.githooks/pre-push`) lets a push through only once
 `scripts/verify-push-gates.sh` has passed on that exact commit:
@@ -157,14 +157,14 @@ gate; it is run before a piece of work is closed.
 | Pull requests | Diff, three merge strategies (merge / squash / rebase), cross-repo (fork) PRs, code review (approve / request changes / inline comments), branch protection, repository pull-request template ([reference](docs/issue-templates.md#pull-request-templates)), CODEOWNERS auto-review ([reference](docs/codeowners.md)) |
 | Wiki | Page CRUD backed by Git |
 | Git LFS | Batch API, object upload/download, zstd compression |
-| CI/CD | Native `.forgekeep-ci.yml` pipelines ([schema reference](docs/ci.md)) and Gitea Actions (`.gitea/workflows/*.yml`, [supported subset](docs/gitea-actions.md)); embedded or external runners, optional Docker execution, artifacts, live job logs over WebSocket |
+| CI/CD | Native `.plombir-git-ci.yml` pipelines ([schema reference](docs/ci.md)) and Gitea Actions (`.gitea/workflows/*.yml`, [supported subset](docs/gitea-actions.md)); embedded or external runners, optional Docker execution, artifacts, live job logs over WebSocket |
 | Webhooks | Registration, delivery, HMAC-SHA256 signatures, delivery history |
 | Notifications | In-app, email (SMTP), and real-time WebSocket delivery |
 | Registries | Package registry and OCI container registry |
 | Search | Full-text search (FTS) and per-repository code indexing |
 | Import | Pull repositories, issues, PRs, labels, milestones, releases and wiki from GitHub / GitLab |
 | Operations | TLS/HTTPS, TOML config, rate limiting, log rotation, unified pagination, GPG signature verification, audit log, health checks |
-| AI agents | Model Context Protocol built into the server (`POST /api/v1/mcp`) and as a stdio binary (`forgekeep-mcp`); bot accounts, narrowed tokens, per-bot rate limits and audit ([details](#mcp-over-http-and-agent-accounts)) |
+| AI agents | Model Context Protocol built into the server (`POST /api/v1/mcp`) and as a stdio binary (`plombir-git-mcp`); bot accounts, narrowed tokens, per-bot rate limits and audit ([details](#mcp-over-http-and-agent-accounts)) |
 | Releases | Release assets with optional in-toto / DSSE attestations signed by the instance key |
 | Web UI | SvelteKit (Svelte 5) SPA (login, repos, issues, PRs, wiki, CI, review, orgs, notifications), English + Chinese i18n |
 
@@ -190,30 +190,30 @@ cd ForgeKeep
 cargo build --release
 ```
 
-The main binary is `target/release/forgekeep`. The workspace also produces
-`forgekeep-runner` (standalone CI runner) and `forgekeep-mcp` (MCP server).
+The main binary is `target/release/plombir-git`. The workspace also produces
+`plombir-git-runner` (standalone CI runner) and `plombir-git-mcp` (MCP server).
 
 ### Generate an SSH host key
 
 The server needs an SSH host key on first run:
 
 ```bash
-ssh-keygen -t ed25519 -f ./forgekeep_host_key -N ""
+ssh-keygen -t ed25519 -f ./plombir_git_host_key -N ""
 ```
 
 ### Run the server
 
 ```bash
-./target/release/forgekeep serve \
+./target/release/plombir-git serve \
   --repo-root ./repos \
   --http-addr 0.0.0.0:8080 \
   --ssh-addr  0.0.0.0:2222 \
-  --host-key  ./forgekeep_host_key \
-  --db-url    "sqlite://./forgekeep.db?mode=rwc" \
-  --jwt-secret "$(forgekeep gen-secret)"
+  --host-key  ./plombir_git_host_key \
+  --db-url    "sqlite://./plombir-git.db?mode=rwc" \
+  --jwt-secret "$(plombir-git gen-secret)"
 ```
 
-`forgekeep gen-secret` prints a fresh 256-bit secret (the `openssl rand -base64
+`plombir-git gen-secret` prints a fresh 256-bit secret (the `openssl rand -base64
 32` equivalent). The server refuses to start with the shipped
 `change-me-in-production` placeholder, so generate your own and keep it out of
 version control. Database migrations run automatically on startup. Set the log
@@ -227,7 +227,7 @@ Common `serve` flags:
 | `--http-addr` | HTTP listen address | `0.0.0.0:8080` |
 | `--ssh-addr` | SSH listen address | `0.0.0.0:2222` |
 | `--host-key` | SSH host key path | — |
-| `--db-url` | `sqlite://` / `postgres://` / `mysql://` URL | `sqlite://./forgekeep.db?mode=rwc` |
+| `--db-url` | `sqlite://` / `postgres://` / `mysql://` URL | `sqlite://./plombir-git.db?mode=rwc` |
 | `--jwt-secret` | JWT signing key (use a long random value) | — |
 | `--encryption-key` | Key for data at rest — see [Secrets and rotation](#secrets-and-rotation) | `[auth].key_file` |
 | `--config` | TOML config file; a flag you pass wins over its config key | — |
@@ -239,11 +239,11 @@ Common `serve` flags:
 | `--log-file` / `--log-max-files` | Enable rotating file logs | — / `5` |
 
 Prefer a config file? Create it with
-`install -m 600 forgekeep.example.toml forgekeep.toml`, edit it, and pass
-`--config forgekeep.toml`. ForgeKeep refuses group- or world-readable config
+`install -m 600 plombir-git.example.toml plombir-git.toml`, edit it, and pass
+`--config plombir-git.toml`. Plombir Git refuses group- or world-readable config
 files because they can carry signing keys, database credentials and service
 tokens. Every flag in the table above has a config-file equivalent (named in
-`forgekeep serve --help`), and values resolve as **CLI arg > config file >
+`plombir-git serve --help`), and values resolve as **CLI arg > config file >
 built-in default** — so a config-only deployment needs no flags at all.
 
 ### Passkeys need one canonical public URL
@@ -256,7 +256,7 @@ external_url = "https://git.example.com"
 ```
 
 WebAuthn credentials are bound to a relying-party hostname. Without this
-setting ForgeKeep has to use each request's `Host`, so the same person opening
+setting Plombir Git has to use each request's `Host`, so the same person opening
 the instance through another proxy name will not see the credential in their
 browser. Credentials registered after this setting is present retain that RP
 id and are deliberately excluded from challenges at a different host. Existing
@@ -265,13 +265,13 @@ startup warning names them so they can be re-enrolled at the canonical URL.
 
 ### Secrets and rotation
 
-ForgeKeep holds two configured secrets and one stored key. They do different
+Plombir Git holds two configured secrets and one stored key. They do different
 jobs, and telling them apart is what makes rotation safe.
 
 | Secret | Sources (first wins) | Protects |
 |--------|----------------------|----------|
-| **JWT secret** | `FORGEKEEP_JWT_SECRET` › `--jwt-secret` › `[auth].jwt_secret` | Signatures: session tokens, PAT-derived tokens, CI job tokens |
-| **Encryption key** | `FORGEKEEP_ENCRYPTION_KEY` › `--encryption-key` › `[auth].encryption_key` › `[auth].key_file` | Data at rest: TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets, OAuth tokens, the instance signing key below |
+| **JWT secret** | `PLOMBIR_GIT_JWT_SECRET` › `--jwt-secret` › `[auth].jwt_secret` | Signatures: session tokens, PAT-derived tokens, CI job tokens |
+| **Encryption key** | `PLOMBIR_GIT_ENCRYPTION_KEY` › `--encryption-key` › `[auth].encryption_key` › `[auth].key_file` | Data at rest: TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets, OAuth tokens, the instance signing key below |
 | **Instance signing key** | Stored in the database, established on first start | This instance's public identity: release-asset provenance attestations and the CI OIDC JWKS |
 
 **The encryption key establishes itself.** With no explicit key source, first
@@ -305,27 +305,27 @@ Replace it only if the key itself is compromised, and knowing that every
 attestation signed with it stops verifying for good:
 
 ```bash
-forgekeep rotate-instance-key --config forgekeep.toml --yes
+plombir-git rotate-instance-key --config plombir-git.toml --yes
 ```
 
 **Rotating the encryption key** is a different operation — the stored
 ciphertext has to be re-encrypted — so it has its own command. It refuses to
-start while a ForgeKeep server holds a file-backed SQLite database, for two
+start while a Plombir Git server holds a file-backed SQLite database, for two
 reasons that both point the same way: a handler writing an encrypted column
 mid-pass would leave a value under the old key, and the pass holds the single
 write lock for its whole duration. Stop the server first, and look before you
 leap:
 
 ```bash
-forgekeep rotate-encryption-key --config forgekeep.toml \
-    --old "<the current key>" --new "$(forgekeep gen-secret)" --dry-run
+plombir-git rotate-encryption-key --config plombir-git.toml \
+    --old "<the current key>" --new "$(plombir-git gen-secret)" --dry-run
 ```
 
 The dry run reports, per column, how many stored values the old key opens and
 how many it does not, and writes nothing. Re-run it with `--yes` instead of
 `--dry-run` to apply: every value is re-sealed in one transaction, and then
 the configured source has to carry the new secret before the server is started
-again: update `[auth].encryption_key` / `FORGEKEEP_ENCRYPTION_KEY`, or replace
+again: update `[auth].encryption_key` / `PLOMBIR_GIT_ENCRYPTION_KEY`, or replace
 `[auth].key_file` with mode `0600`.
 
 `--old` defaults to the key this deployment already resolves, so you only need
@@ -351,7 +351,7 @@ and attestations signed under the old one stay unverifiable.
 ### Create a test repository
 
 ```bash
-./target/release/forgekeep create-repo testuser testrepo --repo-root ./repos
+./target/release/plombir-git create-repo testuser testrepo --repo-root ./repos
 # → ./repos/testuser/testrepo.git
 ```
 
@@ -432,7 +432,7 @@ curl -H "Authorization: Bearer ${TOKEN}" http://localhost:8080/api-docs/openapi.
 
 ## CLI
 
-Beyond `serve`, the `forgekeep` binary offers:
+Beyond `serve`, the `plombir-git` binary offers:
 
 | Command | Purpose |
 |---------|---------|
@@ -457,7 +457,7 @@ Every subcommand that touches the database or the repository directory
 takes the same `--config` as `serve` and resolves `--db-url` / `--repo-root` as
 **CLI arg > config file > built-in default**. On a config-file deployment, pass
 `--config` rather than repeating the URL: with neither,
-they fall back to `sqlite://./forgekeep.db?mode=rwc` in the working directory,
+they fall back to `sqlite://./plombir-git.db?mode=rwc` in the working directory,
 so `migrate` would migrate an empty database and `backup-db` would back it up.
 
 For a file-backed SQLite deployment, two groups of commands are deliberately
@@ -473,7 +473,7 @@ writer that meets a held write lock is refused with `database is locked` rather
 than queued behind it, so running one of these against a live instance turns
 ordinary user writes into errors for as long as the pass takes.
 
-Either way: stop every ForgeKeep server using the database, run the command,
+Either way: stop every Plombir Git server using the database, run the command,
 then restart the server. The processes coordinate through a persistent sidecar
 lease next to the database; a live server makes these commands fail before they
 open a pool.
@@ -483,7 +483,7 @@ they are no longer unserialised. Every migrator takes a lock inside the database
 itself (`pg_advisory_lock` / `GET_LOCK`) first, so two replicas booting at once,
 a restart overlapping its predecessor, or a `migrate` run alongside a starting
 server queue up instead of racing inside `CREATE TABLE`. A migrator that waits
-more than five minutes for the holder gives up with a message naming ForgeKeep
+more than five minutes for the holder gives up with a message naming Plombir Git
 and what to do, rather than a PostgreSQL system-index name. The lock belongs to
 a database session, so a crashed migrator releases it without leaving anything
 to clean up.
@@ -492,14 +492,14 @@ That trap is the reason backups are not left to a manual command: enable
 `[backup]` in the config file and the server takes a `VACUUM INTO` snapshot
 every `interval_hours` from the pool it is already using, keeping the newest
 `keep_last`. An unwritable `[backup].dir` fails the start rather than surfacing a
-day later, and `forgekeep_db_backup_last_success_timestamp_seconds` lets
+day later, and `plombir_git_db_backup_last_success_timestamp_seconds` lets
 monitoring alert on "the last backup is older than N hours". It covers the
 database only — repositories under `repo_root` need a volume snapshot of their
 own. See `deploy/README.md` for the details.
 
-Run `forgekeep <command> --help` for the full flag list.
+Run `plombir-git <command> --help` for the full flag list.
 
-`forgekeep package publish --token ...` follows the same boundary as the
+`plombir-git package publish --token ...` follows the same boundary as the
 standalone clients: remote `--server-url http://...` is refused, while loopback
 HTTP remains usable for local development. `--allow-insecure-http` is the
 explicit exception for a deliberately plaintext remote package server; it does
@@ -507,11 +507,11 @@ not relax the exact-origin redirect policy.
 
 ---
 
-## CI runner (`forgekeep-runner`)
+## CI runner (`plombir-git-runner`)
 
 Out of the box the server executes CI jobs itself: in Docker when `[ci].docker`
 is on, or as a shell on the host only when `[ci].allow_host_runner` explicitly
-allows it. `forgekeep-runner` moves that work to a build machine. It is a
+allows it. `plombir-git-runner` moves that work to a build machine. It is a
 separate binary: it registers once, then polls the server for jobs whose `tags:`
 its own labels satisfy and executes them — natively, or in a container when the
 job names an image (see [docs/ci.md](docs/ci.md)).
@@ -524,16 +524,16 @@ a registered runner polls without ever being given one.
 
 Registration mints the runner's identity, and it needs an **admin user's JWT** —
 not a runner token, which is what registration produces. Pass it as
-`--auth-token`, or as `FORGEKEEP_AUTH_TOKEN` to keep the secret out of the
+`--auth-token`, or as `PLOMBIR_GIT_AUTH_TOKEN` to keep the secret out of the
 process list:
 
 ```bash
-FORGEKEEP_AUTH_TOKEN="$ADMIN_JWT" forgekeep-runner register \
+PLOMBIR_GIT_AUTH_TOKEN="$ADMIN_JWT" plombir-git-runner register \
   --server https://forge.example.com \
   --repository owner/project \
   --name builder-1 \
   --label docker --label linux --label amd64 \
-  --save --config ~/.forgekeep/runner.toml
+  --save --config ~/.plombir-git/runner.toml
 ```
 
 `--repository owner/project` is the runner token's hard capability boundary:
@@ -550,15 +550,15 @@ saved id/token pair.
 ### Run
 
 ```bash
-forgekeep-runner run --config ~/.forgekeep/runner.toml
+plombir-git-runner run --config ~/.plombir-git/runner.toml
 ```
 
 `run` registers on its own when the config file carries no identity yet — which
-needs `--auth-token` / `FORGEKEEP_AUTH_TOKEN` for the same reason. Ordinary
+needs `--auth-token` / `PLOMBIR_GIT_AUTH_TOKEN` for the same reason. Ordinary
 settings resolve as **CLI arg > config file > built-in default**. The
 `allow_insecure_http` safety exception is additive: explicit `true` in the file
-or `--allow-insecure-http` enables it. `forgekeep runner` is a deprecated alias
-for `forgekeep-runner run`; it delegates to the same implementation, flag for
+or `--allow-insecure-http` enables it. `plombir-git runner` is a deprecated alias
+for `plombir-git-runner run`; it delegates to the same implementation, flag for
 flag.
 
 Runner credentials require HTTPS for a remote server. Plaintext HTTP remains
@@ -593,7 +593,7 @@ labels = ["docker", "linux", "amd64"]
 
 | Key | Flag | Meaning |
 |-----|------|---------|
-| `server` | `--server` | ForgeKeep base URL (default `http://127.0.0.1:8080`) |
+| `server` | `--server` | Plombir Git base URL (default `http://127.0.0.1:8080`) |
 | `state_permissions` | config only | Creation policy inherited by workspaces, caches, artifacts and job processes (default `owner-only`; shared-group alternatives: `group-readable`, `group-writable`) |
 | `allow_insecure_http` | `--allow-insecure-http` | Permit credentials on the configured non-loopback `http://` server (default `false`) |
 | `runner_id` | `--runner-id` (`run`) | Identity issued by `register` |
@@ -623,7 +623,7 @@ The file holds a live credential, so `register --save` writes it `0600` and
 `run` refuses one that carries any group or world permission bit — a runner
 token claims jobs and receives their secrets, so a readable `runner.toml` hands
 the runner's place to every other account on the host. A file edited by hand
-into `0644` is fixed with `chmod 600 ~/.forgekeep/runner.toml`, which is what
+into `0644` is fixed with `chmod 600 ~/.plombir-git/runner.toml`, which is what
 the refusal says.
 
 Keep it owned by the user running the
@@ -636,13 +636,13 @@ gets a directory created in its place, and the runner then fails with that path.
 
 | Variable | Purpose |
 |----------|---------|
-| `FORGEKEEP_AUTH_TOKEN` | Admin JWT for `register`, and for the auto-registration `run` may do — the environment spelling of `--auth-token` |
+| `PLOMBIR_GIT_AUTH_TOKEN` | Admin JWT for `register`, and for the auto-registration `run` may do — the environment spelling of `--auth-token` |
 
 ---
 
-## MCP server (`forgekeep-mcp`)
+## MCP server (`plombir-git-mcp`)
 
-`forgekeep-mcp` exposes repositories, issues, pull requests, pipelines and code
+`plombir-git-mcp` exposes repositories, issues, pull requests, pipelines and code
 search to an AI agent over the
 [Model Context Protocol](https://modelcontextprotocol.io). It speaks JSON-RPC on
 **stdio** and is meant to be launched by the agent as a subprocess; it has no
@@ -654,17 +654,17 @@ It takes no flags — the whole configuration is three environment variables:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `FORGEKEEP_URL` | `http://localhost:8080` | Base URL of the ForgeKeep API |
-| `FORGEKEEP_PAT` | _(none)_ | Personal access token, sent as `Authorization: Bearer` |
-| `FORGEKEEP_ALLOW_INSECURE_HTTP` | `false` | Explicitly permit the PAT on a non-loopback plaintext HTTP server |
+| `PLOMBIR_GIT_URL` | `http://localhost:8080` | Base URL of the Plombir Git API |
+| `PLOMBIR_GIT_PAT` | _(none)_ | Personal access token, sent as `Authorization: Bearer` |
+| `PLOMBIR_GIT_ALLOW_INSECURE_HTTP` | `false` | Explicitly permit the PAT on a non-loopback plaintext HTTP server |
 
-Without `FORGEKEEP_PAT` the server still starts: it logs a warning, and every API
+Without `PLOMBIR_GIT_PAT` the server still starts: it logs a warning, and every API
 call goes out unauthenticated, so anything non-public fails at the first tool
 call. Issue the token from the web UI under user settings.
 
 With a PAT, remote `http://` is rejected before the first request. Loopback HTTP
 remains available for local development. Set
-`FORGEKEEP_ALLOW_INSECURE_HTTP=true` only for a deliberately plaintext remote
+`PLOMBIR_GIT_ALLOW_INSECURE_HTTP=true` only for a deliberately plaintext remote
 deployment; the redirect policy still prevents the PAT moving to another
 scheme, host, or port.
 
@@ -673,11 +673,11 @@ An agent that reads the usual `mcpServers` block:
 ```json
 {
   "mcpServers": {
-    "forgekeep": {
-      "command": "forgekeep-mcp",
+    "plombir-git": {
+      "command": "plombir-git-mcp",
       "env": {
-        "FORGEKEEP_URL": "https://forge.example.com",
-        "FORGEKEEP_PAT": "…"
+        "PLOMBIR_GIT_URL": "https://forge.example.com",
+        "PLOMBIR_GIT_PAT": "…"
       }
     }
   }
@@ -695,7 +695,7 @@ request, `Authorization: Bearer <token>` — so an agent needs no local binary:
 ```json
 {
   "mcpServers": {
-    "forgekeep": {
+    "plombir-git": {
       "type": "http",
       "url": "https://forge.example.com/api/v1/mcp",
       "headers": { "Authorization": "Bearer …" }
@@ -769,17 +769,17 @@ ForgeKeep/
 ├── Cargo.toml              # workspace root
 ├── ARCHITECTURE.md         # architecture overview
 ├── CONTRIBUTING.md         # development guide
-├── forgekeep.example.toml  # sample configuration
+├── plombir-git.example.toml  # sample configuration
 ├── crates/
-│   ├── rg-cli/     # main binary  → forgekeep
+│   ├── rg-cli/     # main binary  → plombir-git
 │   ├── rg-core/    # business logic (users, repos, issues, PRs, wiki, LFS, webhooks, ...)
 │   ├── rg-git/     # Git protocol layer (pkt-line, upload/receive-pack, sideband)
 │   ├── rg-ssh/     # SSH server (russh)
 │   ├── rg-http/    # HTTP server + REST API + WebSocket (axum)
 │   ├── rg-db/      # database layer (SeaORM entities + migrations)
 │   ├── rg-ci/      # CI/CD engine (YAML parsing + pipeline executor)
-│   ├── rg-runner/  # CI runner agent  → forgekeep-runner
-│   └── rg-mcp/     # MCP server  → forgekeep-mcp
+│   ├── rg-runner/  # CI runner agent  → plombir-git-runner
+│   └── rg-mcp/     # MCP server  → plombir-git-mcp
 ├── web/            # SvelteKit frontend (standalone SPA)
 ├── docs/           # design and protocol notes
 ├── deploy/         # deployment assets
@@ -787,8 +787,8 @@ ForgeKeep/
 ```
 
 > **Crate vs. binary naming.** Library crates keep a neutral `rg-*` prefix;
-> the user-facing binaries are `forgekeep`, `forgekeep-runner`, and
-> `forgekeep-mcp`.
+> the user-facing binaries are `plombir-git`, `plombir-git-runner`, and
+> `plombir-git-mcp`.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for subsystem design and
 [CONTRIBUTING.md](CONTRIBUTING.md) for development, testing, and crate
@@ -831,7 +831,7 @@ environment toggles.
 
 ## License
 
-ForgeKeep is free software under the
+Plombir Git is free software under the
 [GNU Affero General Public License v3.0 or later](LICENSE), © [Yahook](https://github.com/Yahook).
 You may use, study, modify and share it. If you run a modified version for
 other people over a network, the AGPL asks you to offer them its source.

@@ -30,7 +30,7 @@
 </script>
 
 <svelte:head>
-  <title>Forgot Password · ForgeKeep</title>
+  <title>Forgot Password · Plombir Git</title>
 </svelte:head>
 
 <div class="login-page">

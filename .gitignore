@@ -52,12 +52,17 @@ deploy/docker-compose.override.yml
 .playwright-cli/
 
 # Local runtime configs containing real secrets (keep only *.example.toml in VCS)
+/plombir-git.toml
+/plombir-git-simple.toml
+# The deployed copy of deploy/plombir-git.docker.toml and the host data directory
+# it points at (repos, DB, logs, generated SSH host key).
+deploy/plombir-git.toml
+deploy/data/
+# The same files under the project's former name, still present in checkouts
+# made before the rename. They hold the same secrets.
 /forgekeep.toml
 /forgekeep-simple.toml
-# The deployed copy of deploy/forgekeep.docker.toml and the host data directory
-# it points at (repos, DB, logs, generated SSH host key).
 deploy/forgekeep.toml
-deploy/data/
 
 # Python bytecode from the scripts/ helpers
 __pycache__/

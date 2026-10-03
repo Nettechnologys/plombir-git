@@ -15,7 +15,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const check = join(root, 'scripts', 'grafana-provisioning-contract-check.mjs');
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-grafana-provisioning-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-grafana-provisioning-'));
   cpSync(join(root, 'deploy'), join(fixture, 'deploy'), { recursive: true });
   return fixture;
 }

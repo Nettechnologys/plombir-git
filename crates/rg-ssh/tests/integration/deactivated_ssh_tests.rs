@@ -1,6 +1,6 @@
 //! Deactivating an account has to close the SSH door too.
 //!
-//! SSH is the most durable way back into a ForgeKeep instance: the key is
+//! SSH is the most durable way back into a Plombir Git instance: the key is
 //! already on the laptop, `git push` needs no browser, and nothing in the
 //! pubkey path ever looked at the key's *owner* — the fingerprint matched, so
 //! the session was accepted. An administrator who deactivates a departing

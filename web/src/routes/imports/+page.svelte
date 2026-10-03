@@ -194,7 +194,7 @@
 </script>
 
 <svelte:head>
-  <title>Imports · ForgeKeep</title>
+  <title>Imports · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

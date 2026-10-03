@@ -22,7 +22,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('auth.register.title')} · ForgeKeep</title>
+  <title>{t('auth.register.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="login-page">

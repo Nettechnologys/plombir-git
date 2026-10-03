@@ -26,7 +26,7 @@ use crate::{
     security, ws, AppState,
 };
 
-/// Sign-off for the routes whose credentials are not a ForgeKeep session, so
+/// Sign-off for the routes whose credentials are not a Plombir Git session, so
 /// the sweep cannot drive them with one. Spelled out here rather than at each
 /// call site so the whole set reads in one place.
 ///
@@ -190,15 +190,15 @@ fn cors_origin_defect(entry: &str) -> Option<&'static str> {
 
 /// Build a restrictive CORS layer.
 ///
-/// If `FORGEKEEP_CORS_ORIGINS` is set (comma-separated URLs), only those
+/// If `PLOMBIR_GIT_CORS_ORIGINS` is set (comma-separated URLs), only those
 /// origins are allowed. Otherwise CORS is disabled: same-origin browser use
 /// needs no CORS headers, and non-browser clients carrying `Authorization`
 /// are not governed by CORS at all.
 ///
 /// Replaces `CorsLayer::permissive()` — restricts allowed methods and headers
-/// to only what ForgeKeep needs.
+/// to only what Plombir Git needs.
 fn build_cors_layer() -> CorsLayer {
-    let configured = std::env::var("FORGEKEEP_CORS_ORIGINS").ok();
+    let configured = std::env::var("PLOMBIR_GIT_CORS_ORIGINS").ok();
     cors_layer_for_origins(configured.as_deref())
 }
 
@@ -225,13 +225,13 @@ fn cors_layer_for_origins(configured: Option<&str>) -> CorsLayer {
                 tracing::warn!(
                     entry = %entry,
                     reason = defect,
-                    "FORGEKEEP_CORS_ORIGINS: ignoring an entry that is not a usable origin"
+                    "PLOMBIR_GIT_CORS_ORIGINS: ignoring an entry that is not a usable origin"
                 );
             }
 
             if origins.is_empty() {
                 tracing::warn!(
-                    "FORGEKEEP_CORS_ORIGINS set but no valid origins parsed — CORS disabled"
+                    "PLOMBIR_GIT_CORS_ORIGINS set but no valid origins parsed — CORS disabled"
                 );
                 CorsLayer::new()
                     .allow_methods(methods)
@@ -247,7 +247,7 @@ fn cors_layer_for_origins(configured: Option<&str>) -> CorsLayer {
             }
         }
         _ => {
-            tracing::info!("FORGEKEEP_CORS_ORIGINS not set — CORS disabled");
+            tracing::info!("PLOMBIR_GIT_CORS_ORIGINS not set — CORS disabled");
             CorsLayer::new()
                 .allow_methods(methods)
                 .allow_headers(headers_list)
@@ -755,7 +755,7 @@ fn build_docs_routes(
 /// [`MAVEN_MAX_GROUP_SEGMENTS`] — two past the longest groups in the wild
 /// (`com.fasterxml.jackson.core` is four).
 ///
-/// Depth 1 doubles as the flat spelling ForgeKeep's own API and UI use: a single
+/// Depth 1 doubles as the flat spelling Plombir Git's own API and UI use: a single
 /// segment that already carries the dots joins back to the same `groupId`, so
 /// `.../maven/com.example/matrix-maven/maven-metadata.xml` keeps working.
 ///
@@ -763,7 +763,7 @@ fn build_docs_routes(
 /// a SNAPSHOT's `<group…>/<artifact>/<version>/maven-metadata.xml` matches the
 /// metadata shape (the static filename wins over `{m…}`) and answers an empty
 /// version list, and a stored file name containing a `/` is no longer reachable
-/// under `maven/` through the generic `{*file}` route. ForgeKeep publishes
+/// under `maven/` through the generic `{*file}` route. Plombir Git publishes
 /// neither.
 fn maven_layout_routes(table: RouteTable) -> RouteTable {
     const METADATA: [&str; MAVEN_MAX_GROUP_SEGMENTS] = [
@@ -821,7 +821,7 @@ const MAVEN_MAX_GROUP_SEGMENTS: usize = 6;
 ///
 /// As in [`maven_layout_routes`], a catch-all is not an option — it would sit
 /// above the generic `{pkg_type}` package API — so each depth is registered
-/// instead. Depth 1 is ForgeKeep's own flat spelling (`index/{crate}`), which
+/// instead. Depth 1 is Plombir Git's own flat spelling (`index/{crate}`), which
 /// its API and UI use; the layout never produces a single segment, so the two
 /// cannot collide, and `config.json` is static and so wins over `{c1}`.
 fn cargo_index_routes(table: RouteTable) -> RouteTable {
@@ -868,7 +868,7 @@ fn cargo_index_routes(table: RouteTable) -> RouteTable {
 /// taste: `Gem::Source` asks for `versions` before anything else and reads the
 /// answer as a protocol choice. Served, and it resolves through `info/{gem}`;
 /// missing, and it falls back to the legacy Marshal index (`specs.4.8.gz`,
-/// `quick/Marshal.4.8/…`), which ForgeKeep does not serve either — so the
+/// `quick/Marshal.4.8/…`), which Plombir Git does not serve either — so the
 /// client's next stop is a 404 with no explanation.
 ///
 /// `gems/{file}` is not advertised anywhere and does not need to be: the client
@@ -877,7 +877,7 @@ fn cargo_index_routes(table: RouteTable) -> RouteTable {
 /// instance root, where the SPA lives — handed `gem` an HTML page.
 ///
 /// One edge, the same shape as the ones [`maven_layout_routes`] documents: a
-/// gem named `versions`, `names`, `info` or `gems` shadows part of ForgeKeep's
+/// gem named `versions`, `names`, `info` or `gems` shadows part of Plombir Git's
 /// own `{pkg_type}/{pkg_name}` API for that one name. RubyGems has no such gem,
 /// and the protocol spelling is the one a client cannot be asked to give up.
 fn rubygems_protocol_routes(table: RouteTable) -> RouteTable {
@@ -905,7 +905,7 @@ fn rubygems_protocol_routes(table: RouteTable) -> RouteTable {
         // The write side. `gem push` derives this URL from the same `--host`
         // the read routes above hang off, and sends the `.gem` as the body —
         // there was no route under it to reach at all, so a gem could be
-        // installed from ForgeKeep but never pushed to it (card_11a578ae1820).
+        // installed from Plombir Git but never pushed to it (card_11a578ae1820).
         .post(
             RepoWrite,
             "/repos/{owner}/{name}/packages/rubygems/api/v1/gems",

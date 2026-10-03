@@ -37,7 +37,7 @@ const EMAIL = 'journey-founder@example.com';
 const PASSWORD = 'Qz7$wRtm';
 const REPO = 'journey-repo';
 const BLOB = 'journey.txt';
-const BLOB_MARKER = 'forgekeep first-user journey reached the blob';
+const BLOB_MARKER = 'plombir-git first-user journey reached the blob';
 const ISSUE_TITLE = 'First-user journey issue';
 const ISSUE_BODY = 'Created and closed through the real browser UI.';
 
@@ -286,7 +286,7 @@ try {
     chromePath: CHROME,
     chromeArgs: ['--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage', 'about:blank'],
     cdpPort: process.env.CDP_PORT,
-    profilePrefix: 'forgekeep-first-user-',
+    profilePrefix: 'plombir-git-first-user-',
     startupTimeoutMs: JOURNEY_STARTUP_TIMEOUT_MS,
   });
   cdpRoot = browser.cdpRoot;
@@ -328,8 +328,8 @@ try {
   let jwt = '';
   await step('create an empty repository through the UI', async () => {
     const cookies = await tab.send('Network.getCookies', { urls: [FRONTEND_URL] });
-    jwt = cookies.cookies?.find((cookie) => cookie.name === 'forgekeep_token')?.value || '';
-    if (!jwt) throw new Error('login set no forgekeep_token HttpOnly cookie');
+    jwt = cookies.cookies?.find((cookie) => cookie.name === 'plombir_git_token')?.value || '';
+    if (!jwt) throw new Error('login set no plombir_git_token HttpOnly cookie');
 
     await click(tab, '.dashboard-header button.btn-primary');
     await fill(tab, '.create-form input[type="text"][required]', REPO);

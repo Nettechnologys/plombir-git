@@ -36,7 +36,7 @@ import { fileURLToPath } from 'node:url';
 import { productionRustCode, productionRustSource, rustFnBlock } from './lib/rust-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
-const root = resolve(process.env.FORGEKEEP_ARCHIVE_STREAMING_ROOT || join(scriptsDir, '..'));
+const root = resolve(process.env.PLOMBIR_GIT_ARCHIVE_STREAMING_ROOT || join(scriptsDir, '..'));
 const failures = [];
 
 const ARCHIVE = 'crates/rg-http/src/api/archive.rs';

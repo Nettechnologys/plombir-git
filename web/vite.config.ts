@@ -12,7 +12,7 @@ import { defineConfig } from 'vite';
 // own 404, and the failure looked like a broken app rather than a missing
 // proxy. `scripts/lib/stand.sh` serves the built app this way and binds its
 // backend to port 0, so the target cannot be a literal here — it
-// comes in through FORGEKEEP_BACKEND_ORIGIN, defaulting to the documented dev
+// comes in through PLOMBIR_GIT_BACKEND_ORIGIN, defaulting to the documented dev
 // port so `npm run dev` keeps working with nothing set.
 // This file is the one module of the frontend that runs in Node rather than in
 // the browser, and the project ships no `@types/node`. Declaring the single
@@ -21,7 +21,7 @@ import { defineConfig } from 'vite';
 // `Buffer` type-checking clean would be a bug the checker is supposed to catch.
 declare const process: { env: Record<string, string | undefined> };
 
-const backendOrigin = process.env.FORGEKEEP_BACKEND_ORIGIN || 'http://127.0.0.1:8080';
+const backendOrigin = process.env.PLOMBIR_GIT_BACKEND_ORIGIN || 'http://127.0.0.1:8080';
 
 // `ws: true` on the API prefix is what carries the notification socket
 // (`/api/v1/ws/notifications`, `web/src/lib/api/websockets.ts`): without the

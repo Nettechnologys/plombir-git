@@ -37,7 +37,7 @@ async fn attempt_login(base: &str, username: &str) -> reqwest::Response {
 
 /// The value of the auth cookie the response sets, if it sets one to anything.
 ///
-/// The MFA branch deliberately emits `forgekeep_token=` with `Max-Age=0` to
+/// The MFA branch deliberately emits `plombir_git_token=` with `Max-Age=0` to
 /// clear a stale session, so "a `Set-Cookie` naming the auth cookie" is not the
 /// question — "a session the browser will send back" is.
 fn issued_session(response: &reqwest::Response) -> Option<String> {
@@ -47,7 +47,7 @@ fn issued_session(response: &reqwest::Response) -> Option<String> {
         .iter()
         .filter_map(|value| value.to_str().ok())
         .filter_map(|cookie| cookie.split(';').next())
-        .filter_map(|pair| pair.trim().strip_prefix("forgekeep_token="))
+        .filter_map(|pair| pair.trim().strip_prefix("plombir_git_token="))
         .find(|token| !token.is_empty())
         .map(str::to_string)
 }

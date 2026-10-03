@@ -1,8 +1,8 @@
-# ForgeKeep Alert Rules
+# Plombir Git Alert Rules
 # Phase 22-C: Observability Stack
 groups:
   # HTTP/API alerts
-  - name: forgekeep_http
+  - name: plombir_git_http
     interval: 30s
     rules:
       # High error rate
@@ -15,7 +15,7 @@ groups:
         for: 5m
         labels:
           severity: critical
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "High HTTP 5xx error rate on {{ $labels.route }}"
           description: "{{ $labels.route }} has error rate {{ $value | humanizePercentage }} for 5+ minutes."
@@ -28,7 +28,7 @@ groups:
         for: 10m
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "P95 latency on {{ $labels.route }} exceeds 1s"
           description: "P95 = {{ $value }}s for route {{ $labels.route }}."
@@ -39,13 +39,13 @@ groups:
         for: 5m
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "High number of in-flight requests: {{ $value }}"
           description: "May indicate traffic spike or service degradation."
 
   # Database alerts
-  - name: forgekeep_database
+  - name: plombir_git_database
     interval: 30s
     rules:
       # Slow DB queries
@@ -56,7 +56,7 @@ groups:
         for: 10m
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "P95 DB query duration exceeds 500ms for {{ $labels.operation }}"
           description: "P95 = {{ $value }}s. Check for missing indexes or slow queries."
@@ -67,13 +67,13 @@ groups:
         for: 5m
         labels:
           severity: info
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "High DB QPS for {{ $labels.operation }}: {{ $value }} req/s"
           description: "May indicate hot table or missing cache."
 
   # Git operations alerts
-  - name: forgekeep_git
+  - name: plombir_git_git
     interval: 30s
     rules:
       # Slow Git fetch/clone/pull (upload-pack). The server emits the "fetch"
@@ -87,7 +87,7 @@ groups:
         for: 15m
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "P95 git operation latency exceeds 30s"
           description: "P95 = {{ $value }}s. Check disk I/O and pack file access."
@@ -100,13 +100,13 @@ groups:
         for: 5m
         labels:
           severity: critical
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "High Git operation failure rate"
           description: "Git endpoints returning 5xx errors at {{ $value }} req/s."
 
   # CI/CD alerts
-  - name: forgekeep_cicd
+  - name: plombir_git_cicd
     interval: 30s
     rules:
       # Pipeline failure rate
@@ -119,7 +119,7 @@ groups:
         for: 30m
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "Pipeline failure rate exceeds 30%"
           description: "{{ $value | humanizePercentage }} of pipelines failed in the last hour."
@@ -130,24 +130,24 @@ groups:
         for: 15m
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "CI job queue buildup: {{ $value }} jobs running"
           description: "Consider adding more runners."
 
   # Health/availability alerts
-  - name: forgekeep_health
+  - name: plombir_git_health
     interval: 15s
     rules:
       # Health check failure (requires blackbox or up{} check)
-      - alert: ForgeKeepDown
-        expr: up{job="forgekeep"} == 0
+      - alert: PlombirGitDown
+        expr: up{job="plombir-git"} == 0
         for: 2m
         labels:
           severity: critical
-          service: forgekeep
+          service: plombir-git
         annotations:
-          summary: "ForgeKeep is DOWN"
+          summary: "Plombir Git is DOWN"
           description: "Target has been unreachable for 2+ minutes. Page on-call!"
 
       # High memory usage
@@ -158,7 +158,7 @@ groups:
         for: 10m
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "Host memory usage > 90%"
           description: "Memory pressure: {{ $value | humanizePercentage }}. Consider scaling or investigating leak."
@@ -171,7 +171,7 @@ groups:
         for: 10m
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "Disk usage > 85% on {{ $labels.instance }}"
           description: "Filesystem: {{ $labels.mountpoint }} at {{ $value | humanizePercentage }}."
@@ -182,7 +182,7 @@ groups:
   # the series does not exist and the alerts stay silent by design — the "is
   # this instance backed up at all?" question is answered by the config file and
   # the startup log line, not by an alert that cannot tell "off" from "broken".
-  - name: forgekeep_backup
+  - name: plombir_git_backup
     interval: 60s
     rules:
       # The one that matters: a backup task can keep running while every run
@@ -191,23 +191,23 @@ groups:
       # also worth paging about once the grace window has passed.
       - alert: BackupTooOld
         expr: |
-          (time() - forgekeep_db_backup_last_success_timestamp_seconds > 36 * 3600)
+          (time() - plombir_git_db_backup_last_success_timestamp_seconds > 36 * 3600)
           or
-          (forgekeep_db_backup_last_success_timestamp_seconds == 0)
+          (plombir_git_db_backup_last_success_timestamp_seconds == 0)
         for: 30m
         labels:
           severity: critical
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "No successful database backup in over 36h"
           description: "Check `docker compose logs | grep 'database backup'` — the run fails with the reason and the directory. Tuned for the default [backup].interval_hours = 24; raise the threshold if you lengthened the interval."
 
       - alert: BackupRunsFailing
-        expr: increase(forgekeep_db_backups_total{status="failed"}[1h]) > 0
+        expr: increase(plombir_git_db_backups_total{status="failed"}[1h]) > 0
         for: 5m
         labels:
           severity: warning
-          service: forgekeep
+          service: plombir-git
         annotations:
           summary: "Scheduled database backup run failed"
           description: "{{ $value }} failed run(s) in the last hour. The warning in the server log names the directory and the cause."

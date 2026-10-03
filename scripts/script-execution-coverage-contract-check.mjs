@@ -43,7 +43,7 @@ import {
 
 const sourceScriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(
-  process.env.FORGEKEEP_SCRIPT_EXECUTION_COVERAGE_ROOT ?? resolve(sourceScriptsDir, '..'),
+  process.env.PLOMBIR_GIT_SCRIPT_EXECUTION_COVERAGE_ROOT ?? resolve(sourceScriptsDir, '..'),
 );
 const scriptsDir = join(root, 'scripts');
 const SELF = basename(fileURLToPath(import.meta.url));

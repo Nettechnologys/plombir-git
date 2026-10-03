@@ -1,7 +1,7 @@
-//! ForgeKeep CI runner agent — the register / poll / execute implementation.
+//! Plombir Git CI runner agent — the register / poll / execute implementation.
 //!
-//! The crate ships both a library and the `forgekeep-runner` binary on purpose:
-//! `forgekeep runner` (the deprecated subcommand of the main `forgekeep` binary)
+//! The crate ships both a library and the `plombir-git-runner` binary on purpose:
+//! `plombir-git runner` (the deprecated subcommand of the main `plombir-git` binary)
 //! used to carry its **own**, much older copy of this loop, which drifted badly —
 //! it never read `runner.toml`, so it registered a fresh runner on every start,
 //! and it also lacked the heartbeat, the per-job workspace snapshot, the job

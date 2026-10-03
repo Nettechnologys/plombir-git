@@ -42,14 +42,14 @@ use crate::AppState;
 pub(crate) const EXTERNAL_CI_WEBHOOK_MAX_BYTES: usize = 64 * 1024;
 
 /// HTTP header carrying the hex HMAC-SHA256 signature of the raw webhook body,
-/// in the `sha256=<hex>` form ForgeKeep also emits on *outgoing* webhooks
+/// in the `sha256=<hex>` form Plombir Git also emits on *outgoing* webhooks
 /// (`rg-core/src/webhook/service.rs`). Same scheme in both directions.
 const SIGNATURE_HEADER: &str = "X-Hub-Signature-256";
 
 /// Verify the `X-Hub-Signature-256` header against the raw request body using
 /// HMAC-SHA256 with `secret`, comparing in **constant time**.
 ///
-/// Mirrors the signature ForgeKeep produces for outgoing deliveries, so a repo
+/// Mirrors the signature Plombir Git produces for outgoing deliveries, so a repo
 /// can be pointed at its own inbound endpoint symmetrically. Returns a short,
 /// caller-facing reason on failure (logged, never sent verbatim to the client).
 fn verify_hub_signature(

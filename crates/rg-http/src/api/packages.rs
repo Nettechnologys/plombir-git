@@ -206,7 +206,7 @@ impl UploadSpool {
 ///
 /// This deliberately takes `Body`, not `Bytes`: the latter invokes Axum's
 /// hidden 2 MiB extractor and buffers the complete request before the handler
-/// can enforce ForgeKeep's configured boundary.
+/// can enforce Plombir Git's configured boundary.
 async fn stage_package_upload(
     body: Body,
     repo_root: &FsPath,
@@ -1195,7 +1195,7 @@ struct InspectedNpmProvenance {
 
 /// Whether the access the packument asks for is the access the registry gives.
 ///
-/// ForgeKeep has no per-package visibility: a package is exactly as readable as
+/// Plombir Git has no per-package visibility: a package is exactly as readable as
 /// the repository holding it. So `access` cannot be *applied*, only agreed with
 /// or refused — and refusing is the only honest answer, in both directions. A
 /// `restricted` package in a public repository is world-readable while its
@@ -1226,7 +1226,7 @@ fn npm_access_matches_repository(access: Option<&str>, is_private: bool) -> Resu
     let repository = if is_private { "private" } else { "public" };
     Err(format!(
         "npm access '{access}' does not match the {repository} repository this package is \
-         published to. ForgeKeep has no per-package visibility — a package is readable by \
+         published to. Plombir Git has no per-package visibility — a package is readable by \
          exactly whoever can read its repository — so change the repository's visibility \
          instead of the publish's --access"
     ))
@@ -1240,7 +1240,7 @@ fn npm_package_purl(name: &str, version: &str) -> String {
 }
 
 /// Parse the Sigstore bundle shape emitted by npm and the in-toto statement it
-/// signs. Trust-chain verification remains npm/Sigstore's job; ForgeKeep's
+/// signs. Trust-chain verification remains npm/Sigstore's job; Plombir Git's
 /// publish boundary enforces the registry-specific invariant: the one subject
 /// in that signed payload must name and hash the tarball in the same request.
 fn inspect_npm_provenance_bytes(
@@ -2196,7 +2196,7 @@ async fn decode_twine_text_field(
 /// carries, so dropping it into the ignored-field arm loses it for good while
 /// the upload still answers 200 (`card_b25bd1cbc60c`).
 ///
-/// A detached `gpg_signature` is evidence for the same reason, but ForgeKeep
+/// A detached `gpg_signature` is evidence for the same reason, but Plombir Git
 /// does not currently verify, store, or serve GPG sidecars. Reject it before
 /// publication instead of claiming that a `twine upload --sign` succeeded.
 async fn decode_twine_upload(
@@ -2263,7 +2263,7 @@ async fn decode_twine_upload(
 ///
 /// The upload side of the legacy PyPI API used by Twine. The simple index is
 /// the read side; without this protocol endpoint a package could be installed
-/// from ForgeKeep but no standard Python client could publish it there.
+/// from Plombir Git but no standard Python client could publish it there.
 #[utoipa::path(
     post,
     path = "/repos/{owner}/{name}/packages/pypi/legacy/",
@@ -2454,7 +2454,7 @@ mod package_multipart_error_tests {
     use tower::ServiceExt as _;
     use tower_http::limit::RequestBodyLimitLayer;
 
-    const BOUNDARY: &str = "forgekeep-package-boundary";
+    const BOUNDARY: &str = "plombir-git-package-boundary";
 
     /// Where these handlers spool their fields.
     ///
@@ -2792,7 +2792,7 @@ mod package_multipart_error_tests {
 /// `dotnet nuget push` sends PUT to the advertised `PackagePublish` resource,
 /// with the nupkg in a multipart field named `package`. Its part filename is
 /// always the generic `package.nupkg`, not the artifact's own name. Keep raw
-/// bodies too: ForgeKeep exposed that contract before the native-client route
+/// bodies too: Plombir Git exposed that contract before the native-client route
 /// existed, and the explicit POST route still serves those publishers.
 pub async fn nuget_publish(
     State(state): State<AppState>,
@@ -3810,7 +3810,7 @@ fn layout_segments(params: &axum::extract::RawPathParams) -> (String, String, Ve
 /// Does `prefix` spell out `name` the way Cargo lays the index out?
 ///
 /// Compared case-insensitively: Cargo lowercases the path, but a hand-written
-/// request (or ForgeKeep's own UI) may carry the manifest's spelling, and a
+/// request (or Plombir Git's own UI) may carry the manifest's spelling, and a
 /// case mismatch is not a different crate.
 fn matches_index_prefix(prefix: &[String], name: &str) -> bool {
     let expected = rg_core::package_registry::cargo_index_prefix(name);
@@ -3856,7 +3856,7 @@ pub async fn cargo_index_config(
 /// the name rather than ignored: an unverified prefix would serve any crate
 /// under any path, and the index would stop being addressable.
 ///
-/// A single segment is ForgeKeep's own flat spelling, `index/{crate}`, which
+/// A single segment is Plombir Git's own flat spelling, `index/{crate}`, which
 /// its API and UI use. The layout never produces one segment, so the two cannot
 /// be confused.
 pub async fn cargo_sparse_index(
@@ -4514,7 +4514,7 @@ impl MavenRequest {
     /// `<group…>/<artifact>` → the `groupId:artifactId` the registry stores.
     ///
     /// The group is everything before the artifact, joined back with the dots
-    /// the client replaced by slashes — so the flat spelling ForgeKeep's own
+    /// the client replaced by slashes — so the flat spelling Plombir Git's own
     /// API uses (`com.example/matrix-maven`) resolves to the same name.
     fn coordinates(group_and_artifact: &[String]) -> Option<(String, String)> {
         let (artifact_id, group) = group_and_artifact.split_last()?;
@@ -4715,7 +4715,7 @@ async fn hash_package_file(
 //
 // `cargo publish` / `cargo yank` derive these URLs from the `api` key of the
 // sparse index's `config.json`. Reading the index was served long before any of
-// this was, so a crate could be resolved from ForgeKeep but never put there by
+// this was, so a crate could be resolved from Plombir Git but never put there by
 // the tool that builds it (card_5a790cc6ac35).
 
 /// Split cargo's publish body into its metadata and its `.crate`.
@@ -5730,7 +5730,7 @@ pub async fn nuget_autocomplete(
 /// GET /api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/dependencies.json?gems={name}
 ///
 /// RubyGems dependencies JSON API. The extensionless endpoint uses Ruby
-/// Marshal; ForgeKeep leaves it unregistered rather than returning JSON bytes
+/// Marshal; Plombir Git leaves it unregistered rather than returning JSON bytes
 /// that legacy Bundler will try to pass to `Marshal.load`.
 pub async fn rubygems_dependencies_json(
     State(state): State<AppState>,
@@ -6012,7 +6012,7 @@ fn gem_platform(filename: &str, gem_name: &str, version: &str) -> Option<String>
 /// The compact index's entry point, and the request that decides which protocol
 /// the client speaks for the rest of the session: `Gem::Source` asks for this
 /// file first, resolves through `info/{gem}` when it is served, and falls back
-/// to the legacy Marshal index (which ForgeKeep does not serve) when it is not.
+/// to the legacy Marshal index (which Plombir Git does not serve) when it is not.
 ///
 /// A repository with no gems answers an empty index rather than a 404, for that
 /// reason: the 404 would not read as "nothing published yet", it would push the
@@ -6187,7 +6187,7 @@ pub async fn rubygems_gem_download(
 // ── RubyGems write API ────────────────────────────────────
 //
 // The read side was completed long before this existed (card_01ee27252197), so
-// a gem could be resolved and installed from ForgeKeep but never put there by
+// a gem could be resolved and installed from Plombir Git but never put there by
 // the tool that builds it (card_11a578ae1820).
 
 /// POST /api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems

@@ -95,7 +95,7 @@ pub(crate) async fn handle_git_upload_pack(
 };
 
 function writeFixture(overrides = {}) {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-pack-streaming-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-pack-streaming-'));
   for (const [surface, body] of Object.entries({ ...BASELINE, ...overrides })) {
     const target = join(fixture, surface);
     mkdirSync(dirname(target), { recursive: true });
@@ -106,7 +106,7 @@ function writeFixture(overrides = {}) {
 
 function run(fixture) {
   const result = spawnSync(process.execPath, [check], {
-    env: { ...process.env, FORGEKEEP_PACK_STREAMING_ROOT: fixture },
+    env: { ...process.env, PLOMBIR_GIT_PACK_STREAMING_ROOT: fixture },
     encoding: 'utf8',
   });
   return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };

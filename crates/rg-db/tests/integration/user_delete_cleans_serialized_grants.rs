@@ -12,7 +12,7 @@ struct TempDb {
 impl TempDb {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "forgekeep-serialized-user-grants-{}.db",
+            "plombir-git-serialized-user-grants-{}.db",
             uuid::Uuid::new_v4().simple()
         ));
         Self { path }

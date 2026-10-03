@@ -26,7 +26,7 @@ const MIRROR = join('crates', 'rg-core', 'src', 'mirror', 'service.rs');
 
 /** A copy of the Rust workspace plus the check's own library. */
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-encrypted-columns-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-encrypted-columns-'));
   mkdirSync(join(fixture, 'crates'), { recursive: true });
   cpSync(join(root, 'crates'), join(fixture, 'crates'), {
     recursive: true,

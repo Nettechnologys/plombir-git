@@ -82,7 +82,7 @@ mod tests {
     use super::*;
     use sea_orm_migration::sea_orm::Database;
 
-    const TEST_DATABASE_URL_ENV: &str = "FORGEKEEP_WIKI_EDIT_VERSION_TEST_DATABASE_URL";
+    const TEST_DATABASE_URL_ENV: &str = "PLOMBIR_GIT_WIKI_EDIT_VERSION_TEST_DATABASE_URL";
 
     #[tokio::test]
     async fn existing_pages_start_at_their_latest_revision() {

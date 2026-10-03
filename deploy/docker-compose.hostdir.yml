@@ -1,15 +1,15 @@
-# ForgeKeep — config file + persistent host directory
+# Plombir Git — config file + persistent host directory
 #
 # The alternative to the default `docker-compose.yml` (env vars + named
 # volume). Use this one when you want the data on a path you can see, back up
-# and restore from the host, and the settings in a `forgekeep.toml` you edit.
+# and restore from the host, and the settings in a `plombir-git.toml` you edit.
 #
 # Quick start (from this directory — the full version is in README.md):
 #   install -m 600 .env.example .env   # it will hold both secrets in plain text
-#   sed -i "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=$(openssl rand -hex 32)/" .env
-#   echo "FORGEKEEP_UID=$(id -u)" >> .env
-#   echo "FORGEKEEP_GID=$(id -g)" >> .env
-#   install -m 600 forgekeep.docker.toml forgekeep.toml  # MUST exist before `up`
+#   sed -i "s/^PLOMBIR_GIT_JWT_SECRET=.*/PLOMBIR_GIT_JWT_SECRET=$(openssl rand -hex 32)/" .env
+#   echo "PLOMBIR_GIT_UID=$(id -u)" >> .env
+#   echo "PLOMBIR_GIT_GID=$(id -g)" >> .env
+#   install -m 600 plombir-git.docker.toml plombir-git.toml  # MUST exist before `up`
 #   install -d -m 700 data   # private repos, the DB and its backups live here
 #   docker compose -f docker-compose.hostdir.yml up -d --build
 #
@@ -17,84 +17,84 @@
 #
 #   1. **Bind-mounting a file that does not exist yet.** Docker creates a
 #      *directory* at the mount point, and the server dies on a config file
-#      that is a directory. Copy `forgekeep.toml` into place *before* `up`.
+#      that is a directory. Copy `plombir-git.toml` into place *before* `up`.
 #      That is also why the SSH host key is NOT mounted from the host here: it
 #      lives at `/data/ssh_host_key` inside the data directory and the server
 #      generates it on first start.
 #
-#   2. **uid mismatch on the data directory.** The container's `forgekeep` user
+#   2. **uid mismatch on the data directory.** The container's `plombir-git` user
 #      is not the host user of the same name — only the *number* matters. The
-#      image is built with uid/gid 1000 by default; `FORGEKEEP_UID` /
-#      `FORGEKEEP_GID` in `.env` rebuild it as *your* host user so `./data`
+#      image is built with uid/gid 1000 by default; `PLOMBIR_GIT_UID` /
+#      `PLOMBIR_GIT_GID` in `.env` rebuild it as *your* host user so `./data`
 #      needs no `chown` at all. If you keep the default, run:
 #          sudo chown -R 1000:1000 ./data
 #      A wrong owner shows up as `repo_root … is unusable: Permission denied`,
 #      and that error names the uid to chown to.
 
 services:
-  forgekeep:
+  plombir-git:
     build:
       # Context is the repo root (this file lives in deploy/).
       context: ..
       dockerfile: Dockerfile
       args:
         # Match the host owner of ./data. Defaults to 1000 when unset in .env.
-        FORGEKEEP_UID: ${FORGEKEEP_UID:-1000}
-        FORGEKEEP_GID: ${FORGEKEEP_GID:-1000}
+        PLOMBIR_GIT_UID: ${PLOMBIR_GIT_UID:-1000}
+        PLOMBIR_GIT_GID: ${PLOMBIR_GIT_GID:-1000}
         # The commit being built, so every page links its exact source. Set it
         # from the shell at build time rather than in .env, where it would go
         # stale with the next pull:
-        #   FORGEKEEP_SOURCE_COMMIT=$(git rev-parse HEAD) docker compose ... up -d --build
-        FORGEKEEP_SOURCE_COMMIT: ${FORGEKEEP_SOURCE_COMMIT:-}
-    container_name: forgekeep
+        #   PLOMBIR_GIT_SOURCE_COMMIT=$(git rev-parse HEAD) docker compose ... up -d --build
+        PLOMBIR_GIT_SOURCE_COMMIT: ${PLOMBIR_GIT_SOURCE_COMMIT:-}
+    container_name: plombir-git
     restart: unless-stopped
     ports:
       # HTTP is bound to loopback: put a TLS-terminating reverse proxy in front
       # of it. Drop the "127.0.0.1:" prefix only if you really want it exposed
       # to the world without a proxy. Override the host port in .env when 8080
       # is already taken on the machine.
-      - "127.0.0.1:${FORGEKEEP_HTTP_PORT:-8080}:8080"
+      - "127.0.0.1:${PLOMBIR_GIT_HTTP_PORT:-8080}:8080"
       # Git-over-SSH has to be reachable by clients.
-      - "${FORGEKEEP_SSH_PORT:-2222}:2222"
+      - "${PLOMBIR_GIT_SSH_PORT:-2222}:2222"
     volumes:
-      # Everything persistent lives here: repos/, forgekeep.db, logs/,
+      # Everything persistent lives here: repos/, plombir-git.db, logs/,
       # audit-archive/ and the generated ssh_host_key.
       - ./data:/data
       # Settings. Read-only inside the container; edit it on the host and
-      # `docker compose restart forgekeep`.
-      - ./forgekeep.toml:/app/forgekeep.toml:ro
-    # FORGEKEEP_JWT_SECRET lives here rather than in forgekeep.toml — the env
+      # `docker compose restart plombir-git`.
+      - ./plombir-git.toml:/app/plombir-git.toml:ro
+    # PLOMBIR_GIT_JWT_SECRET lives here rather than in plombir-git.toml — the env
     # var wins over the config file, and .env is easier to keep out of git.
     env_file:
       # The override is used by the local config gate to validate against an
       # isolated throwaway file; normal deployments keep reading this .env.
-      - ${FORGEKEEP_DEPLOY_ENV_FILE:-.env}
+      - ${PLOMBIR_GIT_DEPLOY_ENV_FILE:-.env}
     # The image's default CMD passes --repo-root/--db-url/--log-file flags, and
-    # a CLI flag always beats the config file. Override it so forgekeep.toml is
+    # a CLI flag always beats the config file. Override it so plombir-git.toml is
     # the single source of truth.
-    command: ["forgekeep", "serve", "--config", "/app/forgekeep.toml"]
+    command: ["plombir-git", "serve", "--config", "/app/plombir-git.toml"]
     networks:
-      - forgekeep-net
+      - plombir-git-net
 
   # ── Optional: CI Runner ─────────────────────────────────
-  # Needs an identity, and only `forgekeep-runner register` mints one — the
+  # Needs an identity, and only `plombir-git-runner register` mints one — the
   # server has no subcommand that does. Run it once against an admin JWT (see
   # "CI runner" in the repository README), then put the issued id and token in
-  # .env as FORGEKEEP_RUNNER_ID / FORGEKEEP_RUNNER_TOKEN.
+  # .env as PLOMBIR_GIT_RUNNER_ID / PLOMBIR_GIT_RUNNER_TOKEN.
   # runner:
   #   build:
   #     context: ..
   #     dockerfile: Dockerfile
   #     args:
-  #       FORGEKEEP_UID: ${FORGEKEEP_UID:-1000}
-  #       FORGEKEEP_GID: ${FORGEKEEP_GID:-1000}
-  #   container_name: forgekeep-runner
+  #       PLOMBIR_GIT_UID: ${PLOMBIR_GIT_UID:-1000}
+  #       PLOMBIR_GIT_GID: ${PLOMBIR_GIT_GID:-1000}
+  #   container_name: plombir-git-runner
   #   restart: unless-stopped
   #   command: >
-  #     forgekeep-runner run
-  #     --server http://forgekeep:8080
-  #     --runner-id ${FORGEKEEP_RUNNER_ID}
-  #     --token ${FORGEKEEP_RUNNER_TOKEN}
+  #     plombir-git-runner run
+  #     --server http://plombir-git:8080
+  #     --runner-id ${PLOMBIR_GIT_RUNNER_ID}
+  #     --token ${PLOMBIR_GIT_RUNNER_TOKEN}
   #   env_file:
   #     - .env
   #   volumes:
@@ -104,11 +104,11 @@ services:
   #     - /var/run/docker.sock:/var/run/docker.sock
   #     - ./data:/data
   #   depends_on:
-  #     - forgekeep
+  #     - plombir-git
   #   networks:
-  #     - forgekeep-net
+  #     - plombir-git-net
 
 networks:
-  forgekeep-net:
-    name: forgekeep-net
+  plombir-git-net:
+    name: plombir-git-net
     driver: bridge

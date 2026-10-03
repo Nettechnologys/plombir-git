@@ -141,7 +141,7 @@ fn require_confidential_runner_server(server: &str, allow_insecure_http: bool) -
     }
 }
 
-/// Handle `forgekeep-runner register`: register a runner and optionally persist
+/// Handle `plombir-git-runner register`: register a runner and optionally persist
 /// its token to the config file.
 ///
 /// The config file is read first, and every setting resolves `CLI arg > config
@@ -210,7 +210,7 @@ pub async fn cmd_register(command: RegisterCommand) -> Result<()> {
     )?;
 
     let auth_token = resolve_auth_token(auth_token)
-        .context("runner registration requires --auth-token or FORGEKEEP_AUTH_TOKEN")?;
+        .context("runner registration requires --auth-token or PLOMBIR_GIT_AUTH_TOKEN")?;
     require_confidential_runner_server(&server, allow_insecure_http)?;
     let client = build_runner_client();
 
@@ -244,7 +244,7 @@ pub async fn cmd_register(command: RegisterCommand) -> Result<()> {
         saved.repository = Some(repository);
         saved.name = Some(name);
         saved.labels = Some(labels_vec);
-        // `--config`, not a hardcoded `~/.forgekeep/runner.toml`: `run` reads the
+        // `--config`, not a hardcoded `~/.plombir-git/runner.toml`: `run` reads the
         // path it was given, so writing the identity anywhere else means `run`
         // never finds it and registers yet another runner on every start.
         save_config(&config, &saved)?;
@@ -254,7 +254,7 @@ pub async fn cmd_register(command: RegisterCommand) -> Result<()> {
     Ok(())
 }
 
-/// Handle `forgekeep-runner run`: resolve/register the runner, then run the
+/// Handle `plombir-git-runner run`: resolve/register the runner, then run the
 /// poll-and-execute loop until this process is asked to stop.
 /// Pack and publish the artifact this job declared, if it declared one.
 ///
@@ -336,7 +336,7 @@ async fn publish_job_artifact(
 /// Inputs to the long-running runner command.
 ///
 /// Keep the command boundary typed: all fields originate in Clap, but both the
-/// dedicated binary and the deprecated `forgekeep runner` alias call it.
+/// dedicated binary and the deprecated `plombir-git runner` alias call it.
 pub struct RunCommand {
     pub server: Option<String>,
     pub allow_insecure_http: bool,
@@ -436,7 +436,7 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
                 resolved_name, repository, resolved_server
             );
             let auth_token = resolve_auth_token(auth_token).context(
-                "runner auto-registration requires --auth-token or FORGEKEEP_AUTH_TOKEN; \
+                "runner auto-registration requires --auth-token or PLOMBIR_GIT_AUTH_TOKEN; \
                  alternatively pass --runner-id and --token",
             )?;
             let (id, tok) = register_runner(

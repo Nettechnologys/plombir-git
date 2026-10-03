@@ -101,12 +101,12 @@ async fn assert_no_published_login(
         "{context} was not classified as a rejected authentication"
     );
     assert_eq!(
-        live_cookie(&response, "forgekeep_token"),
+        live_cookie(&response, "plombir_git_token"),
         None,
         "{context} issued an auth cookie"
     );
     assert_eq!(
-        live_cookie(&response, "forgekeep_mfa_challenge"),
+        live_cookie(&response, "plombir_git_mfa_challenge"),
         None,
         "{context} issued an MFA challenge"
     );
@@ -243,7 +243,7 @@ async fn mfa_completion_losing_to_retirement_or_delete_issues_no_session() {
         let secret = setup_mfa(&base, &token).await;
         let primary = login(&base, &username).await;
         assert_eq!(primary.status(), reqwest::StatusCode::OK);
-        let challenge = live_cookie(&primary, "forgekeep_mfa_challenge")
+        let challenge = live_cookie(&primary, "plombir_git_mfa_challenge")
             .expect("the healthy primary factor issued an MFA challenge");
         let audit_before = audit_count(&db).await;
         let log_before = successful_login_count(&db).await;
@@ -259,7 +259,7 @@ async fn mfa_completion_losing_to_retirement_or_delete_issues_no_session() {
             .post(format!("{base}/api/v1/users/mfa/verify"))
             .header(
                 reqwest::header::COOKIE,
-                format!("forgekeep_mfa_challenge={challenge}"),
+                format!("plombir_git_mfa_challenge={challenge}"),
             )
             .json(&serde_json::json!({
                 "username": username,
@@ -304,7 +304,7 @@ async fn login_finalizer_failure_is_a_server_error_not_a_credential_verdict() {
         response.status()
     );
     assert_ne!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
-    assert_eq!(live_cookie(&response, "forgekeep_token"), None);
+    assert_eq!(live_cookie(&response, "plombir_git_token"), None);
     assert_eq!(audit_count(&db).await, audit_before);
     assert_eq!(successful_login_count(&db).await, log_before);
 }

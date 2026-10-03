@@ -1,10 +1,10 @@
-# ForgeKeep — Architecture
+# Plombir Git — Architecture
 
-ForgeKeep is a self-hosted Git platform written in Rust, organized as a single
+Plombir Git is a self-hosted Git platform written in Rust, organized as a single
 Cargo workspace. This document describes the high-level architecture, the
 technology choices, and the design of the core subsystems.
 
-> ForgeKeep is a fork of [IronForge](https://github.com/lengyuqu/ironforge);
+> Plombir Git is a fork of [IronForge](https://github.com/lengyuqu/ironforge);
 > see [NOTICE](NOTICE) for provenance.
 
 ---
@@ -106,18 +106,18 @@ ForgeKeep/
 │   │   └── src/{api,git_v2,security,ws,oci,...}
 │   ├── rg-db/                    # SeaORM entities + migrations
 │   ├── rg-ci/                    # CI/CD engine (native + Gitea Actions)
-│   ├── rg-cli/                   # main binary  → forgekeep
-│   ├── rg-runner/                # CI runner agent  → forgekeep-runner
+│   ├── rg-cli/                   # main binary  → plombir-git
+│   ├── rg-runner/                # CI runner agent  → plombir-git-runner
 │   ├── rg-process/               # bounded child-process lifecycle helpers
-│   └── rg-mcp/                   # MCP server  → forgekeep-mcp
+│   └── rg-mcp/                   # MCP server  → plombir-git-mcp
 ├── web/                          # SvelteKit frontend
-├── forgekeep.example.toml        # sample configuration
+├── plombir-git.example.toml        # sample configuration
 ├── deploy/                       # deployment assets (Dockerfile, etc.)
 └── docs/                         # design and protocol notes
 ```
 
 > Library crates keep a neutral `rg-*` prefix; the user-facing binaries are
-> `forgekeep`, `forgekeep-runner`, and `forgekeep-mcp`.
+> `plombir-git`, `plombir-git-runner`, and `plombir-git-mcp`.
 
 ### Crate dependency direction
 
@@ -128,7 +128,7 @@ rg-core ──> rg-db, rg-git
 rg-db ──> none
 rg-git ──> rg-process
 rg-http ──> rg-core, rg-db, rg-git, rg-mcp
-rg-mcp ──> none
+rg-mcp ──> rg-process
 rg-process ──> none
 rg-runner ──> rg-process
 rg-ssh ──> rg-core, rg-db, rg-git
@@ -138,7 +138,8 @@ The graph lists normal/build Cargo dependencies between workspace crates;
 test-only dev-dependencies are intentionally excluded. `rg-runner` and `rg-mcp`
 are HTTP clients of APIs served by `rg-http`, but neither has a Cargo dependency
 on `rg-http`; the edge runs the other way for `rg-mcp`, whose tools `rg-http`
-embeds to serve MCP over HTTP. `rg-git` remains protocol-only: its sole internal dependency is
+embeds to serve MCP over HTTP. `rg-mcp` takes `rg-process` only for the start-up
+refusal every binary shares (`refuse_retired_environment`). `rg-git` remains protocol-only: its sole internal dependency is
 the business-agnostic `rg-process` lifecycle helper.
 
 `scripts/architecture-crate-dependency-contract-check.mjs` compares this block
@@ -250,7 +251,7 @@ PRs are supported by tracking a separate head repository.
 
 ### 6.3 CI/CD engine (`rg-ci`)
 
-Pipelines are defined either in the native `.forgekeep-ci.yml` format or in the
+Pipelines are defined either in the native `.plombir-git-ci.yml` format or in the
 Gitea Actions format (`.gitea/workflows/*.yml`). A push to a branch triggers a
 pipeline in the background after `receive-pack`; tags and manual triggers are
 also supported. The native format's keys, and the rules the engine enforces on
@@ -289,9 +290,9 @@ web UI.
 
 ### 6.5 MCP server (`rg-mcp`)
 
-`forgekeep-mcp` is a Model Context Protocol server (stdio transport) that
+`plombir-git-mcp` is a Model Context Protocol server (stdio transport) that
 exposes repository data as Tools and Resources to MCP-capable AI agents. It acts
-as an HTTP client of the ForgeKeep REST API and authenticates with a PAT.
+as an HTTP client of the Plombir Git REST API and authenticates with a PAT.
 
 The server serves the same tools over HTTP at `POST /api/v1/mcp`, so an agent
 needs no local binary. Each tool call is dispatched in-process through the
@@ -336,7 +337,7 @@ which is what lets the server enforce what the CLI cannot:
 ## 8. Configuration
 
 Configuration is resolved as **CLI args > config file > defaults**. The config
-file is TOML (`forgekeep.toml`; see `forgekeep.example.toml` for the operator
+file is TOML (`plombir-git.toml`; see `plombir-git.example.toml` for the operator
 template). Model sections include `server`, `database`, `auth`, `ci`, `releases`,
 `rate_limit`, `smtp`, `tls`, `logging`, `audit`, `backup`, `mirror`, `imports`,
 `timeouts`, `webhooks`, and `observability`. The model and the resolution live in
@@ -353,7 +354,7 @@ Correspondingly, **no flag that has a config-file equivalent may carry a clap
 `default_value`** — a clap default is indistinguishable from a value the operator
 typed, so it makes the config key unreachable; the built-in defaults live in
 `config::DEFAULT_*` and are named in each flag's `--help`.
-Environment variables use the `FORGEKEEP_*` prefix.
+Environment variables use the `PLOMBIR_GIT_*` prefix.
 
 **Path-typed keys are checked at startup, not on first use.** `server.repo_root`,
 `tls.cert` / `tls.key`, `logging.file`, `audit.archive_dir` and `backup.dir` are

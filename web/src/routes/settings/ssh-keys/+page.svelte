@@ -106,7 +106,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('ssh_keys.title')} · ForgeKeep</title>
+  <title>{t('ssh_keys.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container ssh-keys-page">

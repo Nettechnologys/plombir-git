@@ -159,7 +159,7 @@ const scriptsDir = dirname(fileURLToPath(import.meta.url));
 
 // The mutation stand points this at a fixture tree, so it drives the real sweep
 // rather than a copy of it.
-const override = process.env.FORGEKEEP_RUST_VIEW_ROOT;
+const override = process.env.PLOMBIR_GIT_RUST_VIEW_ROOT;
 const root = override ? resolve(override) : resolve(scriptsDir, '..');
 
 /** Where Rust that reads Rust lives. */
@@ -310,7 +310,7 @@ const PASSTHROUGH_CALL = String.raw`\.\s*(?:${PASSTHROUGH.join('|')})\s*\([^()]*
  * carries; it is allowed to grow and is not allowed to quietly collapse.
  */
 const MIN_READS = 60;
-const minReads = override ? Number(process.env.FORGEKEEP_RUST_VIEW_MIN ?? 0) : MIN_READS;
+const minReads = override ? Number(process.env.PLOMBIR_GIT_RUST_VIEW_MIN ?? 0) : MIN_READS;
 
 /** Every `.rs` file below `dir`, recursively. */
 function rustFiles(dir) {

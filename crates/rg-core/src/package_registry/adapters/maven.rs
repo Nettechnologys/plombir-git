@@ -23,7 +23,7 @@
 //!   `{artifactId}-{version}.jar`
 //!   `maven-metadata.xml`
 //!
-//! ForgeKeep serves the directory listing at:
+//! Plombir Git serves the directory listing at:
 //!   `GET /api/v1/repos/{owner}/{repo}/packages/maven/{groupId}/{artifactId}/`
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};

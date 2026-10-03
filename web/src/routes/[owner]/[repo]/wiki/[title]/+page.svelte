@@ -247,7 +247,7 @@
 </script>
 
 <svelte:head>
-  <title>{title} · {owner}/{repo} Wiki · ForgeKeep</title>
+  <title>{title} · {owner}/{repo} Wiki · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

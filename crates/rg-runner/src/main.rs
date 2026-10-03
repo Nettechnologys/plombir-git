@@ -1,16 +1,16 @@
-//! ForgeKeep Runner Agent — polls jobs from the server and executes them.
+//! Plombir Git Runner Agent — polls jobs from the server and executes them.
 //!
 //! ## Usage
 //!
 //! ```bash
 //! # Register and start running
-//! forgekeep-runner run --server http://127.0.0.1:8080 --name my-runner
+//! plombir-git-runner run --server http://127.0.0.1:8080 --name my-runner
 //!
 //! # Using a config file
-//! forgekeep-runner run --config ~/.forgekeep/runner.toml
+//! plombir-git-runner run --config ~/.plombir-git/runner.toml
 //!
 //! # Register only (get token for later use)
-//! forgekeep-runner register --server http://127.0.0.1:8080 --name my-runner
+//! plombir-git-runner register --server http://127.0.0.1:8080 --name my-runner
 //! ```
 //!
 //! Remote servers require HTTPS unless `--allow-insecure-http` (or the matching
@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    rg_process::refuse_retired_environment()?;
 
     match cli.command {
         Commands::Register {

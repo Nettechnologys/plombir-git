@@ -77,7 +77,7 @@ async fn app_with_a_spa_bundle() -> String {
     std::fs::create_dir_all(&spa_build_dir).expect("create SPA build dir");
     std::fs::write(
         spa_build_dir.join("index.html"),
-        r#"<!doctype html><title>forgekeep spa shell</title>"#,
+        r#"<!doctype html><title>plombir-git spa shell</title>"#,
     )
     .expect("write SPA fixture");
 
@@ -111,7 +111,7 @@ async fn a_page_the_server_does_not_route_is_still_the_spa_shell() {
         );
         let body = response.text().await.unwrap();
         assert!(
-            body.contains("forgekeep spa shell"),
+            body.contains("plombir-git spa shell"),
             "{path} was answered by something other than index.html: {body}"
         );
     }

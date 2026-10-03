@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
-const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-released-port-contract.'));
+const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-released-port-contract.'));
 
 try {
   mkdirSync(join(fixture, 'crates/demo/src'), { recursive: true });
@@ -54,7 +54,7 @@ PY
 
   const result = spawnSync(process.execPath, [join(scriptsDir, 'released-port-contract-check.mjs')], {
     cwd: fixture,
-    env: { ...process.env, FORGEKEEP_RELEASED_PORT_ROOT: fixture },
+    env: { ...process.env, PLOMBIR_GIT_RELEASED_PORT_ROOT: fixture },
     encoding: 'utf8',
   });
   const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;

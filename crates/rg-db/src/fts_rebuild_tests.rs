@@ -22,7 +22,7 @@ impl TempDb {
     fn new() -> Self {
         Self {
             path: std::env::temp_dir().join(format!(
-                "forgekeep-fts-rebuild-{}.db",
+                "plombir-git-fts-rebuild-{}.db",
                 uuid::Uuid::new_v4().simple()
             )),
         }

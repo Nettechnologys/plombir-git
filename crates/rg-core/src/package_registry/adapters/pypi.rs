@@ -20,7 +20,7 @@
 //! </body></html>
 //! ```
 //!
-//! ForgeKeep serves this at:
+//! Plombir Git serves this at:
 //!   `GET /api/v1/repos/{owner}/{repo}/packages/pypi/simple/{pkg_name}/`
 //!
 //! The trailing slash is part of the spec, not decoration: a client builds the
@@ -489,20 +489,20 @@ const PEP_740_PREDICATE_TYPES: [&str; 2] = [
 /// be hit deliberately.
 const PEP_740_MAX_ATTESTATIONS: usize = 8;
 
-/// The publisher identity ForgeKeep can honestly state for a Twine upload.
+/// The publisher identity Plombir Git can honestly state for a Twine upload.
 ///
 /// PEP 740's provenance object describes *who* published, and on PyPI that is a
 /// Trusted Publisher: an OIDC workload identity whose claims the index verified
-/// itself. A ForgeKeep upload is authenticated by a repository write token,
+/// itself. A Plombir Git upload is authenticated by a repository write token,
 /// which proves the caller may write here and nothing about the build that
 /// produced the artifact. Emitting a `GitHub`-shaped publisher with invented
 /// claims would turn that token into a verified workload identity on paper, so
 /// the bundle names the registry as the publisher, carries no claims, and says
-/// `trusted_publisher: false` outright. When ForgeKeep grows Trusted Publisher
+/// `trusted_publisher: false` outright. When Plombir Git grows Trusted Publisher
 /// support this is the one place that changes.
 pub fn pypi_upload_token_publisher(owner: &str, repo: &str) -> serde_json::Value {
     serde_json::json!({
-        "kind": "ForgeKeep",
+        "kind": "Plombir Git",
         "claims": {},
         "repository": format!("{owner}/{repo}"),
         "trusted_publisher": false,
@@ -531,7 +531,7 @@ fn non_empty_string<'a>(
 /// Check one PEP 740 attestation against the distribution it was uploaded with.
 ///
 /// Signature and certificate-chain verification is Sigstore's job and needs a
-/// trust root ForgeKeep does not carry — the same boundary the npm provenance
+/// trust root Plombir Git does not carry — the same boundary the npm provenance
 /// path draws. What the registry *can* decide, and what nobody else can decide
 /// for it, is whether this signed statement is about *this* upload: an
 /// attestation whose subject names another file or hashes other bytes is
@@ -892,7 +892,7 @@ mod pep_740_tests {
         assert_eq!(bundle["attestations"][0], valid());
         // The upload was authenticated by a write token, not by a verified
         // workload identity, and the document has to say so.
-        assert_eq!(bundle["publisher"]["kind"], "ForgeKeep");
+        assert_eq!(bundle["publisher"]["kind"], "Plombir Git");
         assert_eq!(bundle["publisher"]["trusted_publisher"], false);
         assert_eq!(bundle["publisher"]["claims"], serde_json::json!({}));
     }

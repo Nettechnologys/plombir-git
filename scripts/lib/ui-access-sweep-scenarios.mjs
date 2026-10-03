@@ -425,7 +425,7 @@ async function seedRepositorySurface(context) {
     },
   );
 
-  await context.fetchJson(`${api}/contents/.forgekeep-ci.yml`, {
+  await context.fetchJson(`${api}/contents/.plombir-git-ci.yml`, {
     method: 'POST',
     json: {
       branch: 'main',

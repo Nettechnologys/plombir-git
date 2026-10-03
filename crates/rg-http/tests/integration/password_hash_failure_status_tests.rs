@@ -47,7 +47,7 @@ async fn registry_token_for_a_broken_hash_is_not_an_anonymous_token() {
     register_user(&base, "ocihash", "ocihash@example.com", PASSWORD).await;
     let client = reqwest::Client::new();
     let url = format!(
-        "{base}/v2/auth/token?service=forgekeep-registry&scope=repository:ocihash/app:pull,push"
+        "{base}/v2/auth/token?service=plombir-git-registry&scope=repository:ocihash/app:pull,push"
     );
 
     // Baseline on a healthy hash. Without it the assertion below cannot tell

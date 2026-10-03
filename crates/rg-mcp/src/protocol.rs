@@ -1,6 +1,6 @@
 //! Minimal MCP (Model Context Protocol) 1.0 implementation.
 //!
-//! Implements JSON-RPC 2.0, carried over **stdio** by the `forgekeep-mcp`
+//! Implements JSON-RPC 2.0, carried over **stdio** by the `plombir-git-mcp`
 //! binary and over **HTTP** by the server's own `POST /api/v1/mcp` endpoint.
 //! Only the subset needed for a working server is included:
 //!

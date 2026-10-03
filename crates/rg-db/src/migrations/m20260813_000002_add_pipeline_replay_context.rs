@@ -11,7 +11,7 @@
 //! * `base_branch` falls back to the repository's default branch, so a retried
 //!   `pull_request` run for a PR into `develop` was matched against `main`. The
 //!   workflow filtered on `branches: [develop]` then selects nothing, and the
-//!   fallthrough to `.forgekeep-ci.yml` means the retry can publish a
+//!   fallthrough to `.plombir-git-ci.yml` means the retry can publish a
 //!   *different graph* under the same `201` — or, with no native config, a
 //!   `400` about a pipeline that ran an hour ago.
 //! * `previous_sha` falls back to the commit's first parent, so a `paths:`

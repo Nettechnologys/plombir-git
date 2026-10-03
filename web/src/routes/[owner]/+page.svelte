@@ -85,7 +85,7 @@
 </script>
 
 <svelte:head>
-  <title>{owner} · ForgeKeep</title>
+  <title>{owner} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container-narrow">

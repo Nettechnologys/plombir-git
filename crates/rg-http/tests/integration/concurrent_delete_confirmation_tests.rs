@@ -17,7 +17,7 @@ use crate::common::{
 };
 
 const VALID_KEY: &str =
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA race@forgekeep";
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA race@plombir-git";
 
 /// Number of DELETEs fired at the same row. One is enough to state the
 /// property; several make an interleaving that only `rows_affected` can catch

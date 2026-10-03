@@ -12,7 +12,7 @@
 //!
 //! The in-progress ceremony state is carried between the *start* and *finish*
 //! calls in a short-lived, HttpOnly, signed cookie (see
-//! [`rg_core::auth::webauthn`]) — ForgeKeep keeps no server-side session store.
+//! [`rg_core::auth::webauthn`]) — Plombir Git keeps no server-side session store.
 //! The one thing the server does keep is that a ceremony's challenge has been
 //! answered (`rg_db::ops::webauthn_ceremony_ops::spend`), because single use is
 //! not a property a signature can carry and both *finish* calls depend on it.
@@ -35,9 +35,9 @@ use crate::AppState;
 use rg_core::auth::webauthn as wa;
 
 /// Cookie holding the sealed passkey **registration** ceremony state.
-const PASSKEY_REG_COOKIE: &str = "forgekeep_passkey_reg";
+const PASSKEY_REG_COOKIE: &str = "plombir_git_passkey_reg";
 /// Cookie holding the sealed passkey **authentication** ceremony state.
-const PASSKEY_AUTH_COOKIE: &str = "forgekeep_passkey_auth";
+const PASSKEY_AUTH_COOKIE: &str = "plombir_git_passkey_auth";
 /// Ceremony state lifetime (seconds) — matches the browser dialog timeout.
 const CEREMONY_TTL_SECS: i64 = 300;
 /// How long a spent ceremony stays on record.
@@ -46,7 +46,7 @@ const CEREMONY_TTL_SECS: i64 = 300;
 /// record is dropped while the challenge it refuses is still live and the
 /// replay window reopens. That is longer than [`CEREMONY_TTL_SECS`]:
 /// `jsonwebtoken`'s default validation allows 60 seconds of leeway past `exp`,
-/// and two instances of ForgeKeep need not agree on the clock to the second.
+/// and two instances of Plombir Git need not agree on the clock to the second.
 /// Three minutes of margin costs a table that holds a few more minutes of
 /// ceremonies; being short by one second costs the property.
 const CEREMONY_SPEND_RETENTION_SECS: i64 = CEREMONY_TTL_SECS + 180;

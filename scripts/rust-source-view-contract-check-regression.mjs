@@ -83,7 +83,7 @@ pub(crate) fn rust_files(dir: &str, out: &mut Vec<String>) {
  * to be able to put one somewhere other than the guard.
  */
 function runCase(name, { body, min = 1, support = SUPPORT, files = {}, expect }) {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-rust-view-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-rust-view-'));
   try {
     mkdirSync(join(fixture, 'crates/demo/src'), { recursive: true });
     mkdirSync(join(fixture, 'tests/support'), { recursive: true });
@@ -98,8 +98,8 @@ function runCase(name, { body, min = 1, support = SUPPORT, files = {}, expect })
       cwd: fixture,
       env: {
         ...process.env,
-        FORGEKEEP_RUST_VIEW_ROOT: fixture,
-        FORGEKEEP_RUST_VIEW_MIN: String(min),
+        PLOMBIR_GIT_RUST_VIEW_ROOT: fixture,
+        PLOMBIR_GIT_RUST_VIEW_MIN: String(min),
       },
       encoding: 'utf8',
     });
@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn the_readme_module_still_documents_the_alias() {
         let source = rust_source::production_rust_code_only(include_str!("../../other/src/readme.rs"));
-        assert!(source.contains("forgekeep-runner"));
+        assert!(source.contains("plombir-git-runner"));
     }
 
     #[test]

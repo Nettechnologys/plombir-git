@@ -22,11 +22,11 @@ import { fileURLToPath } from 'node:url';
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptsDir, '..');
 const automation = join(scriptsDir, 'codex-hourly-automation.mjs');
-const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-codex-hourly-contract-'));
+const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-codex-hourly-contract-'));
 const results = join(fixture, 'results');
 const bin = join(fixture, 'bin');
 const standTmp = join(fixture, 'tmp');
-const fakeServer = join(fixture, 'forgekeep-fixture');
+const fakeServer = join(fixture, 'plombir-git-fixture');
 const activeRuns = new Set();
 
 function executable(path, source) {
@@ -66,7 +66,7 @@ async function requireProcessGone(path) {
 }
 
 function standWorkspaces() {
-  return readdirSync(standTmp).filter((name) => name.startsWith('forgekeep-stand.'));
+  return readdirSync(standTmp).filter((name) => name.startsWith('plombir-git-stand.'));
 }
 
 function startAutomation(runId, stubborn) {
@@ -76,7 +76,7 @@ function startAutomation(runId, stubborn) {
       ...process.env,
       PATH: `${bin}:${process.env.PATH}`,
       TMPDIR: standTmp,
-      FORGEKEEP_BIN: fakeServer,
+      PLOMBIR_GIT_BIN: fakeServer,
       FIXTURE_RESULTS: results,
       FIXTURE_RUN_ID: runId,
       FIXTURE_STUBBORN: stubborn ? '1' : '0',
@@ -145,7 +145,7 @@ executable(join(bin, 'cargo'), [
 ].join('\n'));
 
 // `ephemeral-stand.sh` deliberately invokes `node` by name for its consumer.
-// Shadow only that command: the wrapper and fake ForgeKeep server themselves
+// Shadow only that command: the wrapper and fake Plombir Git server themselves
 // still run under process.execPath.
 executable(join(bin, 'node'), [
   '#!/usr/bin/env bash',

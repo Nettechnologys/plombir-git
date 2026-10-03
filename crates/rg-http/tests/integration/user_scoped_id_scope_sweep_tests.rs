@@ -111,7 +111,7 @@ const ABSENT_ID: i64 = 999_999;
 /// A valid ed25519 public key. SSH keys are unique instance-wide, so the value
 /// only has to be distinct from the ones other tests register.
 const OWNER_SSH_KEY: &str =
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC sweep@forgekeep";
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC sweep@plombir-git";
 
 /// Placeholders on an `Access::User` route that do **not** name a row, each with
 /// the reason.

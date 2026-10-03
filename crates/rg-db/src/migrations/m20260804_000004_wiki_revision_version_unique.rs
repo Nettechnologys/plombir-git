@@ -118,7 +118,7 @@ mod tests {
 
     /// Optional disposable server database for the cross-backend acceptance
     /// run. Ordinary `cargo test` keeps using an in-memory SQLite database.
-    const TEST_DATABASE_URL_ENV: &str = "FORGEKEEP_WIKI_MIGRATION_TEST_DATABASE_URL";
+    const TEST_DATABASE_URL_ENV: &str = "PLOMBIR_GIT_WIKI_MIGRATION_TEST_DATABASE_URL";
 
     const OLD_SCHEMA: &str = "CREATE TABLE wiki_revisions (\
         id BIGINT PRIMARY KEY, \

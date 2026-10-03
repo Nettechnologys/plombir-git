@@ -1,16 +1,16 @@
-ForgeKeep
+Plombir Git
 Copyright (c) 2026 Yahook (https://github.com/Yahook)
 
-ForgeKeep is free software: you can redistribute it and/or modify it under the
+Plombir Git is free software: you can redistribute it and/or modify it under the
 terms of the GNU Affero General Public License as published by the Free
 Software Foundation, either version 3 of the License, or (at your option) any
 later version. The full license text is in the LICENSE file.
 
-ForgeKeep is distributed in the hope that it will be useful, but WITHOUT ANY
+Plombir Git is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
 PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
 
-Commercial licensing: the copyright holder can license ForgeKeep under terms
+Commercial licensing: the copyright holder can license Plombir Git under terms
 other than the AGPL (for example, to embed it in a product or run a modified
 version as a service without publishing the changes). Contact Yahook through
 https://github.com/Yahook. Contributions are accepted under the Contributor
@@ -20,7 +20,8 @@ License Agreement in CLA.md, which is what keeps this option available.
 Upstream origin
 ------------------------------------------------------------------------------
 
-ForgeKeep began as a fork of IronForge:
+Plombir Git was developed under the name ForgeKeep until October 2026, and
+began as a fork of IronForge:
 
     https://github.com/lengyuqu/ironforge
 
@@ -35,7 +36,7 @@ This NOTICE is provided in good faith to credit the upstream project and to
 record the fork's provenance accurately. The upstream author's stated intent
 was to release the project under the MIT License; the omission was the license
 file itself, not the license grant. Anyone reusing code that originates from
-upstream IronForge (rather than ForgeKeep's own changes) should preserve this
+upstream IronForge (rather than Plombir Git's own changes) should preserve this
 attribution and, before wider distribution, confirm the applicable terms with
 the upstream author directly.
 

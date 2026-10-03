@@ -1,4 +1,4 @@
-//! ForgeKeep SSH server implementation using russh.
+//! Plombir Git SSH server implementation using russh.
 //!
 //! Phase 2: auth_publickey queries the database for matching SSH keys.
 //! auth_password queries the database and verifies via Argon2.
@@ -192,7 +192,7 @@ pub struct SshServerConfig {
     pub git_idle_timeout_secs: u64,
     /// The process-wide graceful-shutdown signal, when the embedder has one.
     ///
-    /// `forgekeep serve` fans a single `watch` channel out to the HTTP server
+    /// `plombir-git serve` fans a single `watch` channel out to the HTTP server
     /// and every background worker; this transport used to be the one consumer
     /// it never reached, so a `SIGTERM` cut an SSH push mid-objects while the
     /// same push over HTTP was drained (card_5317e172fd25). `None` for a
@@ -245,7 +245,7 @@ struct SharedState {
     git_sessions: rg_core::task_tracker::TaskTracker,
 }
 
-/// The ForgeKeep SSH server — implements `russh::server::Server`.
+/// The Plombir Git SSH server — implements `russh::server::Server`.
 struct SshServer {
     config: Arc<Config>,
     shared: Arc<SharedState>,
@@ -368,8 +368,8 @@ fn write_new_host_key(path: &std::path::Path, pem: &[u8]) -> std::io::Result<boo
 /// Both failure modes are one-way tickets to an unhelpful message otherwise:
 /// a bind-mount whose source file was missing leaves a **directory** behind
 /// (russh then reports a parse failure), and a key owned by a different uid —
-/// the norm for a container, whose `forgekeep` user is not the host's
-/// `forgekeep` user — surfaces as a bare `Permission denied (os error 13)`
+/// the norm for a container, whose `plombir-git` user is not the host's
+/// `plombir-git` user — surfaces as a bare `Permission denied (os error 13)`
 /// with no clue which uid to chown to.
 fn check_host_key_readable(path: &std::path::Path) -> Result<()> {
     let metadata = std::fs::metadata(path).map_err(|e| {
@@ -540,7 +540,7 @@ impl russh::server::Server for SshServer {
     }
 }
 
-/// russh Handler implementation for ForgeKeep.
+/// russh Handler implementation for Plombir Git.
 /// One SshHandler per client connection.
 struct SshHandler {
     shared: Arc<SharedState>,
@@ -2076,7 +2076,7 @@ mod tests {
         );
     }
 
-    /// The public address-based entry point used by ordinary `forgekeep serve`
+    /// The public address-based entry point used by ordinary `plombir-git serve`
     /// must reach the same shutdown-aware accept loop as the pre-bound listener
     /// entry point used by the integration harness.
     ///

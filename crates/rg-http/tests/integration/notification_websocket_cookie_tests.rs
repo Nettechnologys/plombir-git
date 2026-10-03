@@ -79,7 +79,7 @@ async fn a_cookie_session_may_open_the_notification_socket_and_an_anonymous_call
     let (jwt, user_id) = register_full(&base, "wscookie", "wscookie@example.com").await;
 
     let (status, selected_protocol, welcome) =
-        open_notification_socket(&base, Some(&format!("forgekeep_token={jwt}")))
+        open_notification_socket(&base, Some(&format!("plombir_git_token={jwt}")))
             .await
             .expect("a valid cookie must open the notification socket");
     assert_eq!(status, 101, "the cookie handshake was not upgraded");
@@ -114,7 +114,8 @@ async fn a_cookie_under_another_name_does_not_authenticate_the_notification_sock
     let base = spawn_test_app().await;
     let (jwt, _) = register_full(&base, "wsothername", "wsothername@example.com").await;
 
-    let refusal = open_notification_socket(&base, Some(&format!("forgekeep_session={jwt}"))).await;
+    let refusal =
+        open_notification_socket(&base, Some(&format!("plombir_git_session={jwt}"))).await;
     match refusal {
         Err(Error::Http(response)) => assert_eq!(response.status(), 401),
         other => panic!("a valid JWT under the wrong cookie name was accepted: {other:?}"),

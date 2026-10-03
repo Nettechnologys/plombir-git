@@ -125,7 +125,7 @@ expect(
 
 // The comment-bearing reader, for assertions that are *about* a marker comment.
 const COMPOSE = `services:
-  forgekeep:
+  plombir-git:
     ports:
       - "8080:8080" # HTTP
       # - "9090:9090" # HTTP
@@ -178,7 +178,7 @@ if (!parser) {
   process.exit(1);
 }
 
-const scratch = mkdtempSync(join(tmpdir(), 'forgekeep-yaml-view-'));
+const scratch = mkdtempSync(join(tmpdir(), 'plombir-git-yaml-view-'));
 try {
   const viewPath = join(scratch, 'view.yml');
   for (const name of corpus) {

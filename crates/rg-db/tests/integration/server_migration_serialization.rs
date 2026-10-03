@@ -2,14 +2,14 @@
 //!
 //! The file-backed SQLite gate is a lock on the database *file*, so it excluded
 //! nothing at all on a server backend — and `Migrator::up` is not idempotent
-//! with respect to a concurrent copy of itself there. Two ForgeKeep processes
+//! with respect to a concurrent copy of itself there. Two Plombir Git processes
 //! migrating one PostgreSQL database used to race inside `CREATE TABLE`, and the
 //! loser died with `duplicate key value violates unique constraint
 //! "pg_type_typname_nsp_index"`.
 //!
 //! Run against a **disposable** server database, same switch as
 //! `multi_backend_smoke`:
-//! `FORGEKEEP_TEST_DATABASE_URL=... cargo test -p rg-db --test server_migration_serialization -- --ignored`
+//! `PLOMBIR_GIT_TEST_DATABASE_URL=... cargo test -p rg-db --test server_migration_serialization -- --ignored`
 //!
 //! What these tests guard:
 //!
@@ -34,8 +34,8 @@ use rg_db::sea_orm::{ConnectionTrait, Statement};
 /// `sqlite_process_guard`, so pointing this file at a SQLite URL would measure a
 /// lock that deliberately holds nothing and report it as a defect.
 fn server_database_url() -> String {
-    let url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     assert!(
         !url.starts_with("sqlite"),
         "this file measures the server-side migration lock; a SQLite database is guarded by \
@@ -45,7 +45,7 @@ fn server_database_url() -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable PostgreSQL or MySQL database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable PostgreSQL or MySQL database"]
 async fn concurrent_holders_of_the_migration_lock_never_overlap() {
     let db = rg_db::connect_with_pool(
         &server_database_url(),
@@ -97,12 +97,12 @@ async fn concurrent_holders_of_the_migration_lock_never_overlap() {
     assert_eq!(
         peak.load(Ordering::SeqCst),
         1,
-        "two ForgeKeep processes were inside the migration section at once"
+        "two Plombir Git processes were inside the migration section at once"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable PostgreSQL or MySQL database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable PostgreSQL or MySQL database"]
 async fn a_migrator_that_runs_out_of_patience_says_what_to_do_about_it() {
     let db = rg_db::connect_with_pool(
         &server_database_url(),
@@ -125,8 +125,8 @@ async fn a_migrator_that_runs_out_of_patience_says_what_to_do_about_it() {
     // and what to do, instead of reading a PostgreSQL system-index name.
     let message = format!("{refusal:#}");
     assert!(
-        message.contains("ForgeKeep") && message.contains("migration lock"),
-        "the refusal must name ForgeKeep and what is held: {message}"
+        message.contains("Plombir Git") && message.contains("migration lock"),
+        "the refusal must name Plombir Git and what is held: {message}"
     );
     assert!(
         message.contains("stop that process"),
@@ -135,7 +135,7 @@ async fn a_migrator_that_runs_out_of_patience_says_what_to_do_about_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable PostgreSQL or MySQL database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable PostgreSQL or MySQL database"]
 async fn concurrent_run_migrations_on_one_server_database_all_succeed() {
     let url = server_database_url();
 

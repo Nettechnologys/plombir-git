@@ -20,7 +20,7 @@ function command(command, args, cwd, env = process.env) {
 }
 
 function fixture(mode) {
-  const dir = mkdtempSync(join(tmpdir(), 'forgekeep-push-warning-'));
+  const dir = mkdtempSync(join(tmpdir(), 'plombir-git-push-warning-'));
   mkdirSync(join(dir, 'scripts'), { recursive: true });
   mkdirSync(join(dir, 'bin'), { recursive: true });
   writeFileSync(
@@ -36,7 +36,7 @@ function fixture(mode) {
   writeFileSync(join(dir, 'tracked'), 'fixture\n');
 
   command('git', ['init', '-q', '-b', 'main'], dir);
-  command('git', ['config', 'user.name', 'ForgeKeep gate fixture'], dir);
+  command('git', ['config', 'user.name', 'Plombir Git gate fixture'], dir);
   command('git', ['config', 'user.email', 'fixture@example.invalid'], dir);
   command('git', ['add', '.'], dir);
   command('git', ['commit', '-q', '-m', 'fixture'], dir);
@@ -52,7 +52,7 @@ function run(mode) {
       encoding: 'utf8',
     });
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
-    const receipt = join(dir, '.git', 'forgekeep-push-gates.receipt');
+    const receipt = join(dir, '.git', 'plombir-git-push-gates.receipt');
     return { status: result.status, output, receipt: existsSync(receipt) };
   } finally {
     rmSync(dir, { recursive: true, force: true });

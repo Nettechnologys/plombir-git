@@ -10,7 +10,7 @@
 //! filesystem the tests happen to have.
 //!
 //! These tests drive `rg-runner`'s own client functions — the code the shipped
-//! `forgekeep-runner` binary runs — against the live router, and then read the
+//! `plombir-git-runner` binary runs — against the live router, and then read the
 //! artifact back through the two routes a user actually uses.
 
 use crate::common::{register_full, spawn_test_app_with_db};

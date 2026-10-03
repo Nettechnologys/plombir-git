@@ -10,7 +10,7 @@ cd "$repo_root"
 # real status without relying on non-POSIX `pipefail`, and reject warning
 # diagnostics before the receipt can be written.
 run_warning_free() {
-    gate_log=$(mktemp "${TMPDIR:-/tmp}/forgekeep-push-gate.XXXXXX")
+    gate_log=$(mktemp "${TMPDIR:-/tmp}/plombir-git-push-gate.XXXXXX")
     gate_status="${gate_log}.status"
 
     if (
@@ -70,7 +70,7 @@ printf '%s\n' 'push-gates: running cargo-free regression gates'
 run_warning_free node scripts/run-local-gates.mjs
 
 head_sha=$(git rev-parse HEAD)
-receipt_path=$(git rev-parse --git-path forgekeep-push-gates.receipt)
+receipt_path=$(git rev-parse --git-path plombir-git-push-gates.receipt)
 receipt_tmp="${receipt_path}.tmp.$$"
 trap 'rm -f "$receipt_tmp"' EXIT HUP INT TERM
 umask 077

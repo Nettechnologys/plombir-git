@@ -58,14 +58,14 @@ impl MigrationTrait for Migration {
                 manager
                     .get_connection()
                     .execute_unprepared(&format!(
-                        "DO $forgekeep$ BEGIN \
+                        "DO $plombir_git$ BEGIN \
                          IF EXISTS (SELECT 1 FROM information_schema.columns \
                            WHERE table_schema = current_schema() \
                              AND table_name = '{table}' AND column_name = '{column}' \
                              AND data_type = 'timestamp without time zone') THEN \
                            ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" TYPE TIMESTAMPTZ \
                              USING \"{column}\" AT TIME ZONE 'UTC'; \
-                         END IF; END $forgekeep$;"
+                         END IF; END $plombir_git$;"
                     ))
                     .await?;
             }
@@ -83,14 +83,14 @@ impl MigrationTrait for Migration {
                 manager
                     .get_connection()
                     .execute_unprepared(&format!(
-                        "DO $forgekeep$ BEGIN \
+                        "DO $plombir_git$ BEGIN \
                          IF EXISTS (SELECT 1 FROM information_schema.columns \
                            WHERE table_schema = current_schema() \
                              AND table_name = '{table}' AND column_name = '{column}' \
                              AND data_type = 'timestamp with time zone') THEN \
                            ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" TYPE TIMESTAMP \
                              USING \"{column}\" AT TIME ZONE 'UTC'; \
-                         END IF; END $forgekeep$;"
+                         END IF; END $plombir_git$;"
                     ))
                     .await?;
             }

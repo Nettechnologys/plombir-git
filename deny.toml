@@ -1,4 +1,4 @@
-# cargo-deny configuration for ForgeKeep.
+# cargo-deny configuration for Plombir Git.
 # Run locally with `cargo deny check`. Enforced in CI (see .github/workflows).
 #
 # Three gates:
@@ -40,7 +40,7 @@ ignore = [
 version = 2
 # Confidence required for the license detector to accept a text match.
 confidence-threshold = 0.8
-# OSI-approved permissive licenses only. ForgeKeep itself is AGPL-3.0-or-later,
+# OSI-approved permissive licenses only. Plombir Git itself is AGPL-3.0-or-later,
 # and every entry here is AGPL-compatible; keeping dependencies permissive also
 # keeps the commercial-license option (see NOTICE) free of third-party
 # copyleft. Extend deliberately when a new dependency needs it.
@@ -62,7 +62,7 @@ allow = [
     "0BSD",
 ]
 
-# ForgeKeep's own crates carry the project license. AGPL is allowed for them by
+# Plombir Git's own crates carry the project license. AGPL is allowed for them by
 # name only, so a copyleft *dependency* still fails the gate above.
 exceptions = [
     { name = "rg-ci", allow = ["AGPL-3.0-or-later"] },
@@ -88,5 +88,5 @@ wildcards = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# crates.io is the only registry ForgeKeep pulls from.
+# crates.io is the only registry Plombir Git pulls from.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

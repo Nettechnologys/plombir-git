@@ -689,7 +689,7 @@ async fn a_corrupt_attestations_field_is_refused_rather_than_ignored() {
 }
 
 /// Acceptance for card_68133b6fb79d: Twine sends `gpg_signature` as a file
-/// part next to `content`. Until ForgeKeep can preserve and serve that sidecar,
+/// part next to `content`. Until Plombir Git can preserve and serve that sidecar,
 /// rejecting the request is the only honest result; the wheel must not be
 /// published after its detached signature was refused.
 #[tokio::test]

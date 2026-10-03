@@ -1,4 +1,4 @@
-//! Push-policy adapter for commits created by ForgeKeep itself.
+//! Push-policy adapter for commits created by Plombir Git itself.
 //!
 //! HTTP and SSH pushes enter `rg-git` receive-pack, but the contents editor and
 //! review suggestions create a local commit and push it over `file://`.  This

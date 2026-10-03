@@ -10,7 +10,7 @@
 //! These tests hold both halves of the fix: the event is now produced, and it is
 //! produced *only* where a workflow actually asked for it. The second half is
 //! not a detail — the gate is what keeps every repository driving CI from the
-//! native `.forgekeep-ci.yml` from getting a duplicate of its push pipeline on
+//! native `.plombir-git-ci.yml` from getting a duplicate of its push pipeline on
 //! every PR open and every PR sync, forever.
 
 use std::path::Path;
@@ -36,7 +36,7 @@ type TriggeredPipeline = (String, String, String, Option<i64>, Option<String>);
 /// `workflow_for_event` is the answer of the gate the producer consults, and it
 /// is settable per test: `true` stands for a repository with a matching
 /// `on: pull_request` workflow, `false` for one whose only CI is a native
-/// `.forgekeep-ci.yml` — which `has_ci_config` reports as "CI present" either
+/// `.plombir-git-ci.yml` — which `has_ci_config` reports as "CI present" either
 /// way.
 struct RecordingCiEngine {
     triggered: Mutex<Vec<TriggeredPipeline>>,
@@ -415,7 +415,7 @@ async fn synchronising_a_pr_with_a_refused_ci_config_records_a_failed_pipeline()
 }
 
 /// The other half of the fix. `has_ci_config` is true for every repository with
-/// a native `.forgekeep-ci.yml`, so gating on it would give all of them a
+/// a native `.plombir-git-ci.yml`, so gating on it would give all of them a
 /// second, identical pipeline on every PR open. The producer asks the
 /// event-aware gate instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

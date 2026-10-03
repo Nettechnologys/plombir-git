@@ -29,7 +29,7 @@
 // document is the right subject and `scripts/lib/workflow.mjs` is the boundary
 // for it. This file is for the claims that are genuinely textual: a value that
 // no parser exposes, or a marker comment that a parser deliberately throws away
-// (`deploy/docker-compose.yml` marks its ForgeKeep HTTP mapping with `# HTTP`).
+// (`deploy/docker-compose.yml` marks its Plombir Git HTTP mapping with `# HTTP`).
 //
 // Every view here is byte-aligned with its input, so an offset found in one
 // addresses the same character in the other.
@@ -161,7 +161,7 @@ export function productionYamlSource(source) {
  * kind of claim a production view cannot express: an assertion *about* a marker
  * comment.
  *
- * `deploy/docker-compose.yml` marks the ForgeKeep HTTP port mapping with a
+ * `deploy/docker-compose.yml` marks the Plombir Git HTTP port mapping with a
  * trailing `# HTTP`, because a parser discards comments and the value alone
  * cannot say which service owns it. Reading that with a regex over the raw
  * bytes works until a `#` appears inside a quoted scalar; splitting the line

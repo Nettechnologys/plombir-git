@@ -118,7 +118,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('packages.upload')} · {owner}/{repo} · ForgeKeep</title>
+  <title>{t('packages.upload')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

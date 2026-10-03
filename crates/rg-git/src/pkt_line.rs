@@ -205,13 +205,13 @@ mod tests {
     async fn test_write_and_read_roundtrip() {
         use tokio::io::duplex;
         let (mut writer, read_end) = duplex(1024);
-        let data = PktLine::text("agent=forgekeep/0.1");
+        let data = PktLine::text("agent=plombir-git/0.1");
         write_pkt_line(&mut writer, &data).await.unwrap();
         writer.flush().await.unwrap();
 
         let mut reader = BufReader::new(read_end);
         let pkt = read_pkt_line(&mut reader).await.unwrap();
-        assert_eq!(pkt, PktLine::text("agent=forgekeep/0.1"));
+        assert_eq!(pkt, PktLine::text("agent=plombir-git/0.1"));
     }
 
     #[test]

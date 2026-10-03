@@ -1,4 +1,4 @@
-//! HTTP client calls against the ForgeKeep server's runner API
+//! HTTP client calls against the Plombir Git server's runner API
 //! (registration, job polling, heartbeats, workspace/cache/artifact transfer,
 //! status).
 
@@ -339,7 +339,7 @@ fn trim_log_for_upload(log: &str) -> std::borrow::Cow<'_, str> {
         cut += 1;
     }
     let notice = format!(
-        "[forgekeep-runner] log truncated: {cut} of {} bytes dropped, the tail follows\n",
+        "[plombir-git-runner] log truncated: {cut} of {} bytes dropped, the tail follows\n",
         log.len()
     );
     debug_assert!(
@@ -1122,7 +1122,7 @@ mod tests {
             trimmed.len()
         );
         assert!(
-            trimmed.starts_with("[forgekeep-runner] log truncated:"),
+            trimmed.starts_with("[plombir-git-runner] log truncated:"),
             "the loss has to be visible in the log the operator reads: {}",
             &trimmed[..trimmed.len().min(120)]
         );

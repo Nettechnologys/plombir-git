@@ -44,7 +44,7 @@ const ROUTING_ONLY = String(process.env.OPENAPI_SMOKE_ROUTING_ONLY || '0') === '
 // A path no route will ever claim, used to learn what "not routed" looks like
 // on this server. Deliberately not a plausible endpoint name: the calibration
 // is worthless if the probe ever matches something.
-const ABSENT_PATH = '/__forgekeep_openapi_smoke_absent__';
+const ABSENT_PATH = '/__plombir_git_openapi_smoke_absent__';
 
 // A path the spec declares for POST only. Probed with GET, it must draw a
 // router answer (405) — the control that proves the calibration above still

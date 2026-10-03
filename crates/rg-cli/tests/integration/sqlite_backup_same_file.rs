@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 use rg_db::sea_orm::{self, ConnectionTrait};
 
 fn run_backup(database_url: &str, output: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_forgekeep"))
+    Command::new(env!("CARGO_BIN_EXE_plombir-git"))
         .args([
             "backup-db",
             output.to_str().expect("temporary path must be UTF-8"),
@@ -164,7 +164,7 @@ fn same_file_output(alias: SameFileAlias, source: &Path) -> PathBuf {
 #[tokio::test]
 async fn backup_force_same_path_preserves_the_live_marker() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("forgekeep.db");
+    let source = dir.path().join("plombir-git.db");
     let database_url = format!("sqlite://{}?mode=rwc", source.display());
     seed_database(&source, "must-survive")
         .await
@@ -194,7 +194,7 @@ async fn backup_rejects_every_same_file_alias_before_touching_database_files() {
         SameFileAlias::Hardlink,
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("forgekeep.db");
+        let source = dir.path().join("plombir-git.db");
         let database_url = format!("sqlite://{}?mode=rwc", source.display());
         let live = seed_database(&source, &format!("marker-{alias:?}")).await;
         let wal = PathBuf::from(format!("{}-wal", source.display()));
@@ -260,7 +260,7 @@ async fn backup_rejects_every_same_file_alias_before_touching_database_files() {
 #[tokio::test]
 async fn backup_force_to_a_different_file_produces_a_restorable_snapshot() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("forgekeep.db");
+    let source = dir.path().join("plombir-git.db");
     let database_url = format!("sqlite://{}?mode=rwc", source.display());
     let live = seed_database(&source, "copied-snapshot").await;
     let output = dir.path().join("backup.db");

@@ -151,7 +151,7 @@ fn template_dir_for_this_build() -> std::path::PathBuf {
     let base = exe
         .parent()
         .expect("the test executable's directory")
-        .join(".forgekeep-test-schema");
+        .join(".plombir-git-test-schema");
     std::fs::create_dir_all(&base).expect("create the shared template directory");
     base.join(format!("{name}-{stamp}"))
 }

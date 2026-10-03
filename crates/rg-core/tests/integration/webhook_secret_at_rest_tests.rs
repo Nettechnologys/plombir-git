@@ -2,7 +2,7 @@
 //!
 //! `webhooks.secret` used to store the operator's signing key verbatim: a
 //! database dump handed out the key every delivery to that receiver is signed
-//! with, and `forgekeep rotate-encryption-key` reported success without ever
+//! with, and `plombir-git rotate-encryption-key` reported success without ever
 //! looking at the column. It cannot be hashed the way a runner token is — the
 //! dispatcher reads it back on every delivery — so the fix is the treatment
 //! every other recoverable secret here gets: AES-256-GCM under the instance's
@@ -59,7 +59,7 @@ async fn repo_id(db: &DatabaseConnection) -> i64 {
 
 fn create_request(secret: Option<&str>) -> CreateWebhookRequest {
     CreateWebhookRequest {
-        url: "https://hooks.example.invalid/forgekeep".to_string(),
+        url: "https://hooks.example.invalid/plombir-git".to_string(),
         content_type: None,
         secret: secret.map(str::to_string),
         active: Some(true),
@@ -239,7 +239,7 @@ async fn the_startup_pass_seals_what_the_migration_could_not_and_repeats_harmles
 }
 
 /// The registry is the gate: membership is what makes the startup preflight
-/// sample this column and `forgekeep rotate-encryption-key` rewrite it. Being
+/// sample this column and `plombir-git rotate-encryption-key` rewrite it. Being
 /// encrypted but unregistered is the half-fix that leaves a rotation reporting
 /// success over a column still sealed under the discarded key.
 #[test]

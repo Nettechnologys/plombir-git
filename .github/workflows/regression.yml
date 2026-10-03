@@ -161,7 +161,7 @@ jobs:
 
       - name: Fresh DB migration smoke
         run: |
-          db_path="${RUNNER_TEMP}/forgekeep-ci-migration.db"
+          db_path="${RUNNER_TEMP}/plombir-git-ci-migration.db"
           cargo run -p rg-cli -- migrate --db-url "sqlite://${db_path}?mode=rwc"
 
   security-audit:
@@ -233,12 +233,12 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build ForgeKeep
+      - name: Build Plombir Git
         run: cargo build -p rg-cli
 
       - name: Run HTTP and SSH protocol matrix
         env:
-          FORGEKEEP_BIN: ${{ github.workspace }}/target/debug/forgekeep
+          PLOMBIR_GIT_BIN: ${{ github.workspace }}/target/debug/plombir-git
         run: scripts/git-protocol-e2e.sh
 
   postgres-smoke:
@@ -249,18 +249,18 @@ jobs:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_USER: forgekeep
-          POSTGRES_PASSWORD: forgekeep
-          POSTGRES_DB: forgekeep
+          POSTGRES_USER: plombir_git
+          POSTGRES_PASSWORD: plombir_git
+          POSTGRES_DB: plombir_git
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U forgekeep -d forgekeep"
+          --health-cmd "pg_isready -U plombir_git -d plombir_git"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
     env:
-      FORGEKEEP_TEST_DATABASE_URL: postgres://forgekeep:forgekeep@127.0.0.1:5432/forgekeep
+      PLOMBIR_GIT_TEST_DATABASE_URL: postgres://plombir_git:plombir_git@127.0.0.1:5432/plombir_git
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -287,7 +287,7 @@ jobs:
 
       # Single-use and compare-and-swap are claims the *database* arbitrates, so
       # they are claims about each backend. Both files honour
-      # FORGEKEEP_TEST_DATABASE_URL for exactly this step.
+      # PLOMBIR_GIT_TEST_DATABASE_URL for exactly this step.
       - name: Prove single-use credentials hold on PostgreSQL
         run: >-
           cargo test -p rg-db -j 6 --test integration -- --nocapture
@@ -309,7 +309,7 @@ jobs:
       # this disposable database to exercise the pre-migration schema directly.
       - name: Prove package filename uniqueness on PostgreSQL
         env:
-          FORGEKEEP_PACKAGE_FILE_MIGRATION_TEST_DATABASE_URL: ${{ env.FORGEKEEP_TEST_DATABASE_URL }}
+          PLOMBIR_GIT_PACKAGE_FILE_MIGRATION_TEST_DATABASE_URL: ${{ env.PLOMBIR_GIT_TEST_DATABASE_URL }}
         run: cargo test -p rg-db -j 6 one_filename_per_version_is_owned_by_the_database -- --nocapture
 
   mysql-smoke:
@@ -321,18 +321,18 @@ jobs:
         image: mysql:8.4
         env:
           MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: forgekeep
-          MYSQL_USER: forgekeep
-          MYSQL_PASSWORD: forgekeep
+          MYSQL_DATABASE: plombir_git
+          MYSQL_USER: plombir_git
+          MYSQL_PASSWORD: plombir_git
         ports:
           - 3306:3306
         options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -uforgekeep -pforgekeep"
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uplombir_git -pplombir_git"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 30
     env:
-      FORGEKEEP_TEST_DATABASE_URL: mysql://forgekeep:forgekeep@127.0.0.1:3306/forgekeep
+      PLOMBIR_GIT_TEST_DATABASE_URL: mysql://plombir_git:plombir_git@127.0.0.1:3306/plombir_git
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -385,7 +385,7 @@ jobs:
       # migration proof, not another consumer of the runtime-smoke fixtures.
       - name: Prove package filename uniqueness on MySQL
         env:
-          FORGEKEEP_PACKAGE_FILE_MIGRATION_TEST_DATABASE_URL: ${{ env.FORGEKEEP_TEST_DATABASE_URL }}
+          PLOMBIR_GIT_PACKAGE_FILE_MIGRATION_TEST_DATABASE_URL: ${{ env.PLOMBIR_GIT_TEST_DATABASE_URL }}
         run: cargo test -p rg-db -j 6 one_filename_per_version_is_owned_by_the_database -- --nocapture
 
   contract-checks:
@@ -487,14 +487,14 @@ jobs:
       # this fails loudly instead of quietly passing a loop over nothing.
       #
       # deploy/.env is created first because hostdir's `env_file` requires it to
-      # exist, and the main compose reads FORGEKEEP_JWT_SECRET out of it. It is
+      # exist, and the main compose reads PLOMBIR_GIT_JWT_SECRET out of it. It is
       # a throwaway secret for a throwaway runner, but it is still removed after.
       - name: Validate every compose file
         run: |
           set -euo pipefail
           install -m 600 deploy/.env.example deploy/.env
           secret="$(openssl rand -hex 32)"
-          sed -i "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" deploy/.env
+          sed -i "s/^PLOMBIR_GIT_JWT_SECRET=.*/PLOMBIR_GIT_JWT_SECRET=${secret}/" deploy/.env
           trap 'rm -f deploy/.env' EXIT
 
           shopt -s nullglob
@@ -738,9 +738,9 @@ jobs:
           file: Dockerfile
           push: false
           load: true
-          tags: forgekeep:ci
-          cache-from: type=gha,scope=forgekeep-image
-          cache-to: type=gha,scope=forgekeep-image,mode=max
+          tags: plombir-git:ci
+          cache-from: type=gha,scope=plombir-git-image
+          cache-to: type=gha,scope=plombir-git-image,mode=max
 
       # A built image is not yet a working one. The runtime stage is a different
       # base (debian:bookworm-slim) from the builder (rust:1.95.0-slim-bookworm),
@@ -764,7 +764,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t binaries < <(
-            docker run --rm --entrypoint find forgekeep:ci \
+            docker run --rm --entrypoint find plombir-git:ci \
               /usr/local/bin -mindepth 1 -maxdepth 1 -type f -printf '%f\n' \
               | sort
           )
@@ -774,7 +774,7 @@ jobs:
           fi
           for binary in "${binaries[@]}"; do
             echo "Running ${binary}"
-            timeout 300 docker run --rm forgekeep:ci "${binary}" --help >/dev/null
+            timeout 300 docker run --rm plombir-git:ci "${binary}" --help >/dev/null
           done
 
       # And a binary that starts is not yet a server that serves. This boots the
@@ -807,30 +807,30 @@ jobs:
         if: steps.scope.outputs.build == 'true'
         run: |
           set -euo pipefail
-          trap 'docker rm -f forgekeep-smoke >/dev/null 2>&1 || true' EXIT
+          trap 'docker rm -f plombir-git-smoke >/dev/null 2>&1 || true' EXIT
 
-          docker run -d --name forgekeep-smoke \
-            -e FORGEKEEP_JWT_SECRET="$(openssl rand -hex 32)" \
+          docker run -d --name plombir-git-smoke \
+            -e PLOMBIR_GIT_JWT_SECRET="$(openssl rand -hex 32)" \
             -p 127.0.0.1:18080:8080 \
-            forgekeep:ci
+            plombir-git:ci
 
           # Silent while polling (`-fs`, no `-S`): a refused connection during
           # the first second is the expected state, not a diagnostic, and
           # printing it once per attempt makes a passing run read like a failing
           # one. The authoritative attempt below keeps `-S` and does report.
           for _ in $(seq 1 60); do
-            if curl -fs http://127.0.0.1:18080/health >/tmp/forgekeep-health.json; then
+            if curl -fs http://127.0.0.1:18080/health >/tmp/plombir-git-health.json; then
               break
             fi
             sleep 1
           done
 
-          if ! curl -fsS http://127.0.0.1:18080/health >/tmp/forgekeep-health.json; then
+          if ! curl -fsS http://127.0.0.1:18080/health >/tmp/plombir-git-health.json; then
             echo "The container never became healthy. Its logs:" >&2
-            docker logs forgekeep-smoke >&2 || true
+            docker logs plombir-git-smoke >&2 || true
             exit 1
           fi
-          cat /tmp/forgekeep-health.json
+          cat /tmp/plombir-git-health.json
 
           # The body is checked as well as the status code, and the two are not
           # the same assertion today only by the handler's choice: `health` in
@@ -841,16 +841,16 @@ jobs:
           # handler usually drifts, since "degraded" reads as something short of
           # a hard failure. `/health`'s body, not its code, is what the image's
           # own HEALTHCHECK and the frontend's readiness banner go by.
-          if ! grep -q '"status":"ok"' /tmp/forgekeep-health.json; then
+          if ! grep -q '"status":"ok"' /tmp/plombir-git-health.json; then
             echo "The container is up but reports an unhealthy subsystem." >&2
-            docker logs forgekeep-smoke >&2 || true
+            docker logs plombir-git-smoke >&2 || true
             exit 1
           fi
 
           if ! curl -fsS http://127.0.0.1:18080/ | grep -qi '<!doctype html'; then
             echo "The server is healthy but / is not the frontend — check the" >&2
             echo "web/build copy in the Dockerfile's runtime stage." >&2
-            docker logs forgekeep-smoke >&2 || true
+            docker logs plombir-git-smoke >&2 || true
             exit 1
           fi
 
@@ -877,6 +877,6 @@ jobs:
           BACKEND_URL=http://127.0.0.1:18080 \
             node scripts/openapi-interface-smoke.mjs || {
               echo "The published OpenAPI spec does not match the routes this image serves." >&2
-              docker logs forgekeep-smoke >&2 || true
+              docker logs plombir-git-smoke >&2 || true
               exit 1
             }

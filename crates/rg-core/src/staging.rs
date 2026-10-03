@@ -37,7 +37,7 @@
 //!
 //! The fifth is there for the opposite reason: it is never renamed anywhere,
 //! and it used to be written into the system temp directory — a tree under no
-//! ForgeKeep root, which nothing here can sweep and which is a tmpfs on a
+//! Plombir Git root, which nothing here can sweep and which is a tmpfs on a
 //! typical deployment. Putting it beside the blob it protects is what brings it
 //! inside the walk.
 //!
@@ -64,7 +64,7 @@
 //! `discard_dir` behind the body, or a `Drop`. What none of them covered is the
 //! case this whole module exists for, a stop that runs no destructors — and
 //! there the asymmetry bit hardest, because a spool under `<repo_root>` is
-//! swept by the pass below while `TMPDIR` is a directory ForgeKeep never
+//! swept by the pass below while `TMPDIR` is a directory Plombir Git never
 //! claimed and has no business walking. So the leak was a full clone of the
 //! repository per interrupted request, under a name nothing would ever read
 //! again, on what is a tmpfs share of RAM on a typical deployment.
@@ -175,7 +175,7 @@ pub fn audit_archive_spool_name(archive_id: uuid::Uuid) -> String {
 /// it, so a metadata delete that fails can put the bytes back.
 ///
 /// Written beside the blob it protects rather than in the system temp
-/// directory, which is where it used to go. `TMPDIR` is under no ForgeKeep
+/// directory, which is where it used to go. `TMPDIR` is under no Plombir Git
 /// root, so nothing swept it — and on a typical deployment `/tmp` is a tmpfs,
 /// which makes a leaked 100 MiB copy memory rather than disk. Beside the blob
 /// it is inside the tree [`sweep_stale_sibling_spools`] walks, and it inherits
@@ -332,7 +332,7 @@ impl WorktreePurpose {
     /// The label this purpose carries inside a staged tree's name.
     ///
     /// These are the words the five producers already used when they spelled
-    /// their own `forgekeep-<purpose>-<uuid>` under `TMPDIR`, kept as they were
+    /// their own `plombir-git-<purpose>-<uuid>` under `TMPDIR`, kept as they were
     /// so an operator who has seen one before recognises it in its new place.
     pub const fn label(self) -> &'static str {
         match self {
@@ -1202,7 +1202,7 @@ mod tests {
             "pkg.00000000-0000-0000-0000-000000000000.tmp",
             // The database backup's own temp file, which is `backup`'s to
             // rotate and must not be taken by this sweep.
-            ".forgekeep-backup-00000000-0000-0000-0000-000000000000.tmp",
+            ".plombir-git-backup-00000000-0000-0000-0000-000000000000.tmp",
             // A finished audit archive, and the spool shape without a real id.
             "audit-20260908T101500-00000000-0000-0000-0000-000000000000.ndjson.zst",
             ".audit-.tmp",
@@ -1461,7 +1461,7 @@ mod tests {
     #[test]
     fn a_working_tree_is_staged_beside_the_repository_it_clones() {
         let token = uuid::Uuid::new_v4();
-        let bare = std::path::Path::new("/srv/forgekeep/octocat/payloads.git");
+        let bare = std::path::Path::new("/srv/plombir-git/octocat/payloads.git");
 
         let staged = worktree_staging_path(bare, WorktreePurpose::Rebase, token)
             .expect("a bare repository path can host a sibling");
@@ -1482,7 +1482,7 @@ mod tests {
             staged.display()
         );
 
-        for unplaceable in ["/srv/forgekeep/octocat/payloads", "/", ".git"] {
+        for unplaceable in ["/srv/plombir-git/octocat/payloads", "/", ".git"] {
             assert!(
                 worktree_staging_path(
                     std::path::Path::new(unplaceable),
@@ -1820,12 +1820,12 @@ mod tests {
     /// A producer that took its name from this module and then created the
     /// directory under `std::env::temp_dir()` would keep
     /// `staging_is_the_only_producer_of_sibling_spool_names` green and leak
-    /// exactly as before — `TMPDIR` is under no ForgeKeep root, so
+    /// exactly as before — `TMPDIR` is under no Plombir Git root, so
     /// [`sweep_stale_sibling_spools`] never walks it, and on a typical
     /// deployment it is a tmpfs share of RAM rather than disk. Five server-side
     /// operations used to stage a full clone of the repository there.
     ///
-    /// The one exemption is `forgekeep-runner`: it is a different binary, its
+    /// The one exemption is `plombir-git-runner`: it is a different binary, its
     /// workspace root is its own and it retires it itself, and this server's
     /// startup sweep cannot reach that machine. Both calls must live in the
     /// runner's registry: one constructs the producer root and one hands that
@@ -1873,7 +1873,7 @@ mod tests {
 
         assert!(
             staged_in_tmpdir.is_empty(),
-            "these stage into the system temporary directory, which no ForgeKeep pass walks — a \
+            "these stage into the system temporary directory, which no Plombir Git pass walks — a \
              stop that runs no destructors leaves what they wrote there forever: {}",
             staged_in_tmpdir.join(", ")
         );

@@ -140,7 +140,7 @@ const repoRoot = resolve(scriptsDir, '..');
 
 // The mutation stand points this at a fixture tree. Everything below is
 // relative to it, so the stand exercises the real reader, not a copy of it.
-const override = process.env.FORGEKEEP_RAW_SOURCE_ASSERT_ROOT;
+const override = process.env.PLOMBIR_GIT_RAW_SOURCE_ASSERT_ROOT;
 const root = override ? resolve(override) : repoRoot;
 const subjectDir = join(root, 'scripts');
 const libDir = join(subjectDir, 'lib');
@@ -1363,7 +1363,7 @@ const subjects = listScripts(subjectDir)
 // reads of the other, and a single shared number would redden every such case
 // for the wrong reason.
 const standFloor = (lang) => (
-  override ? Number(process.env[`FORGEKEEP_RAW_SOURCE_ASSERT_MIN_${lang.name.toUpperCase()}`] ?? 0) : lang.minReads
+  override ? Number(process.env[`PLOMBIR_GIT_RAW_SOURCE_ASSERT_MIN_${lang.name.toUpperCase()}`] ?? 0) : lang.minReads
 );
 
 const summary = [];

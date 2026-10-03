@@ -74,7 +74,7 @@ fn resolve_db_url(db_url: Option<String>, config: Option<String>) -> anyhow::Res
     Ok(config::resolve_db_url(db_url, cfg.as_ref()))
 }
 
-/// `forgekeep migrate` — run pending database migrations and exit.
+/// `plombir-git migrate` — run pending database migrations and exit.
 pub(crate) async fn cmd_migrate(
     db_url: Option<String>,
     cfg: Option<&config::ConfigFile>,
@@ -86,14 +86,19 @@ pub(crate) async fn cmd_migrate(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
+    // `migrate` takes no `--repo-root`; the root it checks is the one `serve`
+    // given the same config file would serve from.
+    let repo_root = std::path::PathBuf::from(config::resolve_repo_root(None, cfg));
     let db = dbconn::connect_offline_migration(
         &db_url,
-        "forgekeep migrate",
+        "plombir-git migrate",
         // The one command whose job includes standing an instance up. It still
         // says so out loud when it creates one, because "installed a second,
         // empty database" and "upgraded the real one" print the same success
         // line otherwise (card_8baddb74fa82).
-        dbconn::MissingDatabase::Create,
+        dbconn::MissingDatabase::CreateForANewInstance {
+            repo_root: &repo_root,
+        },
     )
     .await?;
     tracing::info!("Running database migrations...");
@@ -102,14 +107,14 @@ pub(crate) async fn cmd_migrate(
     Ok(())
 }
 
-/// `forgekeep gen-secret` — print a fresh JWT secret to stdout.
+/// `plombir-git gen-secret` — print a fresh JWT secret to stdout.
 pub(crate) fn cmd_gen_secret() {
     // Print only the secret to stdout so it can be captured directly,
-    // e.g. FORGEKEEP_JWT_SECRET="$(forgekeep gen-secret)".
+    // e.g. PLOMBIR_GIT_JWT_SECRET="$(plombir-git gen-secret)".
     println!("{}", admin::generate_jwt_secret());
 }
 
-/// `forgekeep rotate-instance-key` — replace this instance's provenance
+/// `plombir-git rotate-instance-key` — replace this instance's provenance
 /// signing key.
 ///
 /// The deliberate, destructive counterpart to the key's whole point. Since
@@ -144,7 +149,7 @@ pub(crate) async fn cmd_rotate_instance_key(
     // a contract with nothing behind it (card_74c8b8754e97).
     let db = dbconn::connect_online(
         &db_url,
-        "forgekeep rotate-instance-key",
+        "plombir-git rotate-instance-key",
         dbconn::OnlineAccess::SingleRowWrite,
     )
     .await?;
@@ -193,7 +198,7 @@ pub(crate) async fn cmd_rotate_instance_key(
     Ok(())
 }
 
-/// `forgekeep rotate-encryption-key` — move every at-rest secret onto a new
+/// `plombir-git rotate-encryption-key` — move every at-rest secret onto a new
 /// at-rest encryption key.
 ///
 /// The missing half of card_d740512de0a8. Splitting `encryption_key` out of
@@ -249,7 +254,7 @@ pub(crate) async fn cmd_rotate_encryption_key(
     // the lease too — it does the identical traversal and only rolls back at
     // the end, so it holds the lock for exactly as long as the real thing.
     let guarded =
-        dbconn::connect_offline_maintenance(&db_url, "forgekeep rotate-encryption-key").await?;
+        dbconn::connect_offline_maintenance(&db_url, "plombir-git rotate-encryption-key").await?;
     let db = guarded.connection();
     let report = rg_core::auth::rekey::rekey(db, &old_key, &new, dry_run).await?;
 
@@ -306,14 +311,14 @@ pub(crate) async fn cmd_rotate_encryption_key(
 
     println!(
         "\n{} value(s) re-encrypted. Now set the new key — [auth].encryption_key, \
-         FORGEKEEP_ENCRYPTION_KEY or --encryption-key — before starting the server; \
+         PLOMBIR_GIT_ENCRYPTION_KEY or --encryption-key — before starting the server; \
          starting it under the old one is refused by the startup key check.",
         report.rewritten()
     );
     Ok(())
 }
 
-/// `forgekeep rebuild-fts` — rebuild full-text search indexes.
+/// `plombir-git rebuild-fts` — rebuild full-text search indexes.
 ///
 /// Offline on file-backed SQLite, and for a duration reason rather than a
 /// schema one. `rebuild_sqlite_fts_indexes` rebuilds all three FTS tables under
@@ -344,7 +349,7 @@ pub(crate) async fn cmd_rebuild_fts(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
-    let guarded = dbconn::connect_offline_maintenance(&db_url, "forgekeep rebuild-fts").await?;
+    let guarded = dbconn::connect_offline_maintenance(&db_url, "plombir-git rebuild-fts").await?;
     let db = guarded.connection();
 
     rg_db::rebuild_fts_indexes(db).await?;
@@ -353,7 +358,7 @@ pub(crate) async fn cmd_rebuild_fts(
     Ok(())
 }
 
-/// `forgekeep backup-db` — create a consistent SQLite backup.
+/// `plombir-git backup-db` — create a consistent SQLite backup.
 pub(crate) async fn cmd_backup_db(
     db_url: Option<String>,
     config: Option<String>,
@@ -375,7 +380,7 @@ pub(crate) async fn cmd_backup_db(
     Ok(())
 }
 
-/// `forgekeep restore-db` — restore a SQLite database from a backup.
+/// `plombir-git restore-db` — restore a SQLite database from a backup.
 pub(crate) fn cmd_restore_db(
     db_url: Option<String>,
     cfg: Option<&config::ConfigFile>,
@@ -389,7 +394,7 @@ pub(crate) fn cmd_restore_db(
     Ok(())
 }
 
-/// `forgekeep create-repo` — create a bare repository with no DB record.
+/// `plombir-git create-repo` — create a bare repository with no DB record.
 pub(crate) fn cmd_create_repo(
     owner: String,
     name: String,
@@ -458,7 +463,7 @@ pub(crate) fn cmd_create_repo(
     Ok(())
 }
 
-/// `forgekeep import` — import a repository from GitHub or GitLab.
+/// `plombir-git import` — import a repository from GitHub or GitLab.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_import(
     platform: String,
@@ -508,7 +513,7 @@ pub(crate) async fn cmd_import(
 
     println!("╔══════════════════════════════════════════════════╗");
     println!(
-        "║  ForgeKeep Import — {} → ForgeKeep",
+        "║  Plombir Git Import — {} → Plombir Git",
         platform.to_uppercase()
     );
     println!("╠══════════════════════════════════════════════════╣");
@@ -546,7 +551,7 @@ pub(crate) async fn cmd_import(
     );
     let db = dbconn::connect_offline_migration(
         &db_url,
-        "forgekeep import",
+        "plombir-git import",
         dbconn::MissingDatabase::Refuse,
     )
     .await?;
@@ -570,7 +575,7 @@ pub(crate) async fn cmd_import(
     repo_root::check_repo_root_presence(
         db.connection(),
         &repo_root,
-        "forgekeep import",
+        "plombir-git import",
         repo_root::MissingRepoRoot::CreateOnACleanInstance,
     )
     .await?;
@@ -711,7 +716,7 @@ fn require_confidential_package_server(
     }
 }
 
-/// `forgekeep package` — package registry management (publish / list).
+/// `plombir-git package` — package registry management (publish / list).
 pub(crate) async fn cmd_package(
     cmd: PackageCmd,
     state_cfg: Option<&config::ConfigFile>,
@@ -815,7 +820,7 @@ pub(crate) async fn cmd_package(
             );
             let db = dbconn::connect_offline_migration(
                 &db_url,
-                "forgekeep package list",
+                "plombir-git package list",
                 dbconn::MissingDatabase::Refuse,
             )
             .await?;
@@ -854,7 +859,7 @@ pub(crate) async fn cmd_package(
     Ok(())
 }
 
-/// `forgekeep index-repo` — index a repository for code search.
+/// `plombir-git index-repo` — index a repository for code search.
 pub(crate) async fn cmd_index_repo(
     repo_slug: String,
     repo_root: Option<String>,
@@ -890,7 +895,7 @@ pub(crate) async fn cmd_index_repo(
     // (card_d5612b049af6, card_74c8b8754e97).
     let db = dbconn::connect_online(
         &db_url,
-        "forgekeep index-repo",
+        "plombir-git index-repo",
         dbconn::OnlineAccess::SameWorkAsALiveHandler,
     )
     .await?;
@@ -904,7 +909,7 @@ pub(crate) async fn cmd_index_repo(
     repo_root::check_repo_root_presence(
         &db,
         std::path::Path::new(&repo_root),
-        "forgekeep index-repo",
+        "plombir-git index-repo",
         repo_root::MissingRepoRoot::Refuse,
     )
     .await?;
@@ -966,7 +971,7 @@ pub(crate) async fn cmd_index_repo(
     Ok(())
 }
 
-/// `forgekeep list-tombstones` — report what interrupted deletions left behind.
+/// `plombir-git list-tombstones` — report what interrupted deletions left behind.
 ///
 /// Every cross-store deletion moves the live bytes aside with a rename before
 /// it touches the metadata, so a process that dies in between leaves them under
@@ -1041,7 +1046,7 @@ pub(crate) async fn cmd_list_tombstones(
     );
     if found.journalled > 0 {
         println!(
-            "{} staged name(s) belong to deletions the journal still records; `forgekeep serve` \
+            "{} staged name(s) belong to deletions the journal still records; `plombir-git serve` \
              finishes those on its own and they are not listed here.",
             found.journalled
         );
@@ -1396,7 +1401,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config_path = dir.path().join("forgekeep.toml");
+        let config_path = dir.path().join("plombir-git.toml");
         crate::config::write_test_config(
             &config_path,
             format!(
@@ -1445,7 +1450,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config_path = dir.path().join("forgekeep.toml");
+        let config_path = dir.path().join("plombir-git.toml");
         crate::config::write_test_config(
             &config_path,
             format!(
@@ -1520,7 +1525,7 @@ mod tests {
             .expect("a staged package version");
         std::fs::write(&staged_package, b"package bytes").expect("write the staged package");
 
-        let config_path = directory.path().join("forgekeep.toml");
+        let config_path = directory.path().join("plombir-git.toml");
         std::fs::write(
             &config_path,
             format!(

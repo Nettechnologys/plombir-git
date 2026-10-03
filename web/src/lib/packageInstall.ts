@@ -63,8 +63,8 @@ export function packageInstallSnippet(target: PackageInstallTarget): PackageInst
       // Cargo resolves an alternative registry through its sparse index, and
       // the index root is the whole URL with the `sparse+` scheme prefix.
       return {
-        setup: `# .cargo/config.toml\n[registries.forgekeep]\nindex = "sparse+${root}/index/"`,
-        install: `cargo add ${withVersion(name, version, '@')} --registry forgekeep`,
+        setup: `# .cargo/config.toml\n[registries.plombir-git]\nindex = "sparse+${root}/index/"`,
+        install: `cargo add ${withVersion(name, version, '@')} --registry plombir-git`,
       };
     case 'npm':
       return {
@@ -76,7 +76,7 @@ export function packageInstallSnippet(target: PackageInstallTarget): PackageInst
       };
     case 'maven':
       return {
-        setup: `<!-- pom.xml -->\n<repositories>\n  <repository>\n    <id>forgekeep</id>\n    <url>${root}</url>\n  </repository>\n</repositories>`,
+        setup: `<!-- pom.xml -->\n<repositories>\n  <repository>\n    <id>plombir-git</id>\n    <url>${root}</url>\n  </repository>\n</repositories>`,
         install: `<dependency>\n  <groupId>...</groupId>\n  <artifactId>${name}</artifactId>\n  <version>${version || '...'}</version>\n</dependency>`,
       };
     case 'docker': {
@@ -98,12 +98,12 @@ export function packageInstallSnippet(target: PackageInstallTarget): PackageInst
       };
     case 'helm':
       return {
-        setup: `helm repo add forgekeep ${root}\nhelm repo update`,
-        install: `helm install my-release forgekeep/${name}${versionFlag('--version', version)}`,
+        setup: `helm repo add plombir-git ${root}\nhelm repo update`,
+        install: `helm install my-release plombir-git/${name}${versionFlag('--version', version)}`,
       };
     case 'composer':
       return {
-        setup: `composer config repositories.forgekeep composer ${root}`,
+        setup: `composer config repositories.plombir-git composer ${root}`,
         install: `composer require ${withVersion(name, version, ':')}`,
       };
     default:

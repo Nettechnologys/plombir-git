@@ -1,12 +1,12 @@
-# ForgeKeep Grafana Dashboard Provisioning
+# Plombir Git Grafana Dashboard Provisioning
 # Auto-load dashboards from /var/lib/grafana/dashboards
 
 apiVersion: 1
 
 providers:
-  - name: 'ForgeKeep'
+  - name: 'Plombir Git'
     orgId: 1
-    folder: 'ForgeKeep'
+    folder: 'Plombir Git'
     type: file
     disableDeletion: false
     updateIntervalSeconds: 10

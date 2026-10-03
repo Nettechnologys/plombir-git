@@ -38,7 +38,7 @@ function baseline(fixture) {
 function runCheck(fixture) {
   const result = spawnSync(process.execPath, [CHECK], {
     cwd: fixture,
-    env: { ...process.env, FORGEKEEP_EPHEMERAL_STAND_ROOT: fixture },
+    env: { ...process.env, PLOMBIR_GIT_EPHEMERAL_STAND_ROOT: fixture },
     encoding: 'utf8',
   });
   return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
@@ -77,19 +77,19 @@ const MUTATIONS = [
       patch(
         fixture,
         'web/vite.config.ts',
-        "process.env.FORGEKEEP_BACKEND_ORIGIN || 'http://127.0.0.1:8080'",
+        "process.env.PLOMBIR_GIT_BACKEND_ORIGIN || 'http://127.0.0.1:8080'",
         "'http://127.0.0.1:8080'",
       ),
-    expect: 'does not read FORGEKEEP_BACKEND_ORIGIN',
+    expect: 'does not read PLOMBIR_GIT_BACKEND_ORIGIN',
   },
   {
     name: 'a second script boots its own server',
     apply: (fixture) =>
       writeFileSync(
         join(fixture, 'scripts/browser-e2e.sh'),
-        '#!/usr/bin/env bash\n"${FORGEKEEP_BIN}" serve --listen-address-file "${WORK_DIR}/addrs" &\n',
+        '#!/usr/bin/env bash\n"${PLOMBIR_GIT_BIN}" serve --listen-address-file "${WORK_DIR}/addrs" &\n',
       ),
-    expect: 'scripts/browser-e2e.sh starts its own ForgeKeep',
+    expect: 'scripts/browser-e2e.sh starts its own Plombir Git',
   },
   {
     name: 'the hourly wrapper regrows its own server boot',
@@ -97,10 +97,10 @@ const MUTATIONS = [
       const file = join(fixture, 'scripts/codex-hourly-automation.mjs');
       writeFileSync(
         file,
-        `${readFileSync(file, 'utf8')}\nspawn('forgekeep', ['serve', '--listen-address-file', 'fixture']);\n`,
+        `${readFileSync(file, 'utf8')}\nspawn('plombir-git', ['serve', '--listen-address-file', 'fixture']);\n`,
       );
     },
-    expect: 'scripts/codex-hourly-automation.mjs starts its own ForgeKeep',
+    expect: 'scripts/codex-hourly-automation.mjs starts its own Plombir Git',
   },
   {
     name: 'teardown stops removing the temporary workspace',
@@ -195,12 +195,12 @@ const VALID_VARIANTS = [
     apply: (fixture) =>
       writeFileSync(
         join(fixture, 'scripts/source-view-positive.mjs'),
-        "const healthUrl = 'https://stand.invalid/health';\nvoid healthUrl; // spawn('forgekeep', ['serve', '--listen-address-file']);\n",
+        "const healthUrl = 'https://stand.invalid/health';\nvoid healthUrl; // spawn('plombir-git', ['serve', '--listen-address-file']);\n",
       ),
   },
 ];
 
-let fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ephemeral-stand-contract.'));
+let fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ephemeral-stand-contract.'));
 try {
   baseline(fixture);
   const clean = runCheck(fixture);
@@ -211,7 +211,7 @@ try {
 
   for (const mutation of MUTATIONS) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ephemeral-stand-contract.'));
+    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ephemeral-stand-contract.'));
     baseline(fixture);
     mutation.apply(fixture);
 
@@ -231,7 +231,7 @@ try {
 
   for (const variant of VALID_VARIANTS) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ephemeral-stand-contract.'));
+    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ephemeral-stand-contract.'));
     baseline(fixture);
     variant.apply(fixture);
 

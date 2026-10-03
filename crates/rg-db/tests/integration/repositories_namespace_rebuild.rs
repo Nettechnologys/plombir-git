@@ -37,7 +37,7 @@ struct TempDb {
 impl TempDb {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "forgekeep-namespace-rebuild-{}.db",
+            "plombir-git-namespace-rebuild-{}.db",
             uuid::Uuid::new_v4().simple()
         ));
         Self { path }

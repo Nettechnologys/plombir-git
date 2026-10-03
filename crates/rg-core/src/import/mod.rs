@@ -1,4 +1,4 @@
-//! Data migration import — GitHub / GitLab → ForgeKeep.
+//! Data migration import — GitHub / GitLab → Plombir Git.
 //!
 //! Supports importing repositories and their metadata (issues, PRs,
 //! labels, milestones, releases, wiki) from external platforms.

@@ -78,7 +78,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('repo.social.title')} · {owner}/{repo} · ForgeKeep</title>
+  <title>{t('repo.social.title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

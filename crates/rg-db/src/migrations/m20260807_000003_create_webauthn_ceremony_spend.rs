@@ -3,7 +3,7 @@
 //!
 //! A WebAuthn challenge is single-use by design: the relying party issues a
 //! nonce for one ceremony, and the assertion signed over it may be accepted
-//! once. ForgeKeep kept no state at all for it. The in-progress ceremony lives
+//! once. Plombir Git kept no state at all for it. The in-progress ceremony lives
 //! in a signed, short-lived cookie (`rg_core::auth::webauthn::seal_state`), and
 //! a signature plus an `exp` answer only "did we issue this, and is it still
 //! young" — never "has it already been used". So one intercepted

@@ -1,8 +1,8 @@
-# ForgeKeep configuration for the containerised deployment.
+# Plombir Git configuration for the containerised deployment.
 #
-#   install -m 600 forgekeep.docker.toml forgekeep.toml
+#   install -m 600 plombir-git.docker.toml plombir-git.toml
 #
-# and edit `forgekeep.toml` — that is the file `docker-compose.hostdir.yml`
+# and edit `plombir-git.toml` — that is the file `docker-compose.hostdir.yml`
 # bind-mounts. It has to exist *before* `docker compose up`, otherwise Docker
 # creates a directory at the mount point and the server refuses to start.
 #
@@ -27,17 +27,17 @@ host_key = "/data/ssh_host_key"
 # external_url = "https://git.example.com"
 
 [database]
-url = "sqlite:///data/forgekeep.db?mode=rwc"
+url = "sqlite:///data/plombir-git.db?mode=rwc"
 
 [auth]
 # Left unset on purpose: keep the secret in deploy/.env as
-# FORGEKEEP_JWT_SECRET (the env var wins over this file), so a config file that
+# PLOMBIR_GIT_JWT_SECRET (the env var wins over this file), so a config file that
 # accidentally lands in git carries no credentials.
 # jwt_secret = "..."
 #
 # The at-rest encryption key needs no .env value: on first start the server
 # creates /data/encryption_key (next to the SSH host key, mode 0600) and keeps
-# using it across rebuilds. FORGEKEEP_ENCRYPTION_KEY remains available for KMS
+# using it across rebuilds. PLOMBIR_GIT_ENCRYPTION_KEY remains available for KMS
 # or vault-backed deployments and wins over the file.
 # encryption_key = "..."
 # key_file = "/data/encryption_key"
@@ -47,7 +47,7 @@ url = "sqlite:///data/forgekeep.db?mode=rwc"
 # instance) and LDAP/SSO auto-provision still go through. [rate_limit].auth_max
 # below only throttles sign-up; this is what refuses it. Set it to "closed"
 # before exposing the HTTP port to anything you do not control.
-# Also settable as FORGEKEEP_REGISTRATION in deploy/.env, which wins.
+# Also settable as PLOMBIR_GIT_REGISTRATION in deploy/.env, which wins.
 registration = "open"
 
 # Keep custom OIDC discovery, client secrets and access tokens on HTTPS. A
@@ -95,7 +95,7 @@ agent_window_secs = 60
 # a file here silently empties `docker compose logs`.
 # Uncomment to log into the data directory instead (rotated daily,
 # max_files caps how many are kept):
-# file = "/data/logs/forgekeep.log"
+# file = "/data/logs/plombir-git.log"
 max_files = 5
 
 [audit]
@@ -112,7 +112,7 @@ batch_size = 1000
 # `docker compose up --force-recreate`; a path under the image's `WORKDIR /app`
 # would not.
 #
-# Budget for this: keep_last x the size of /data/forgekeep.db.
+# Budget for this: keep_last x the size of /data/plombir-git.db.
 enabled = true
 dir = "/data/backups"
 interval_hours = 24

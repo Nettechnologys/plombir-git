@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_generate_secret() {
-        let (secret, _url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
+        let (secret, _url, _qr) = generate_secret("testuser", "Plombir Git").unwrap();
         assert!(!secret.is_empty());
     }
 
@@ -189,7 +189,7 @@ mod tests {
     /// to the authenticator app must verify against the secret we stored.
     #[test]
     fn code_from_enrollment_url_verifies_against_stored_secret() {
-        let (stored_secret, url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
+        let (stored_secret, url, _qr) = generate_secret("testuser", "Plombir Git").unwrap();
 
         // What the authenticator app does: parse the otpauth:// URL it scanned
         // and generate the current code from it.
@@ -215,7 +215,7 @@ mod tests {
     /// The secret we show for manual entry must be the one in the QR code.
     #[test]
     fn returned_secret_matches_the_otpauth_url_parameter() {
-        let (stored_secret, url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
+        let (stored_secret, url, _qr) = generate_secret("testuser", "Plombir Git").unwrap();
         let url_secret = url
             .split("secret=")
             .nth(1)
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn a_clock_before_the_epoch_is_an_error_not_a_wrong_code() {
-        let (secret, url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
+        let (secret, url, _qr) = generate_secret("testuser", "Plombir Git").unwrap();
         let totp = TOTP::from_url(&url).expect("otpauth URL must be parseable");
         let clock_before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
 
@@ -249,7 +249,7 @@ mod tests {
     /// second factor for its whole 90-second window (card_9585caf5692d).
     #[test]
     fn a_valid_code_reports_the_step_it_was_derived_from() {
-        let (stored_secret, url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
+        let (stored_secret, url, _qr) = generate_secret("testuser", "Plombir Git").unwrap();
         let app_totp = TOTP::from_url(&url).expect("otpauth URL must be parseable");
 
         // Fixed instant rather than `now()`: the assertion is about which step
@@ -276,7 +276,7 @@ mod tests {
     /// mark the wrong one as spent.
     #[test]
     fn each_step_in_the_skew_window_reports_itself() {
-        let (_secret, url, _qr) = generate_secret("testuser", "ForgeKeep").unwrap();
+        let (_secret, url, _qr) = generate_secret("testuser", "Plombir Git").unwrap();
         let totp = TOTP::from_url(&url).expect("otpauth URL must be parseable");
 
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_777_777_777);

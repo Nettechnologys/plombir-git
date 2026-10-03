@@ -141,7 +141,7 @@
 </script>
 
 <svelte:head>
-  <title>Access Tokens · ForgeKeep</title>
+  <title>Access Tokens · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container tokens-page">

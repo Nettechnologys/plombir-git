@@ -1,7 +1,7 @@
 //! Gitea Actions / GitHub Actions workflow compatibility layer.
 //!
 //! Parses `.gitea/workflows/*.yml` (GitHub Actions-compatible format) and
-//! translates them into ForgeKeep's internal `CiConfig` model.
+//! translates them into Plombir Git's internal `CiConfig` model.
 //!
 //! Supported features:
 //! - `on: push`, `on: pull_request` triggers with branch filtering
@@ -601,7 +601,7 @@ pub struct GiteaJob {
     pub strategy: Option<GiteaStrategy>,
 }
 
-/// The two `runs-on` forms ForgeKeep can preserve without weakening runner
+/// The two `runs-on` forms Plombir Git can preserve without weakening runner
 /// selection: one label, or a non-empty list in which every entry is a label.
 #[derive(Debug, Clone)]
 pub enum GiteaRunsOn {
@@ -649,10 +649,10 @@ impl<'de> Deserialize<'de> for GiteaRunsOn {
     }
 }
 
-/// The two environment forms ForgeKeep can honour end to end.
+/// The two environment forms Plombir Git can honour end to end.
 ///
 /// The mapping intentionally contains only `name`: Actions also defines `url`,
-/// but ForgeKeep has no model or UI consumer for it. [`GiteaWorkflow::parse`]
+/// but Plombir Git has no model or UI consumer for it. [`GiteaWorkflow::parse`]
 /// validates the raw mapping first so a refusal can name the job and qualified
 /// key instead of serde's context-free "untagged enum" error.
 #[derive(Debug, Clone, Deserialize)]
@@ -684,7 +684,7 @@ pub struct GiteaStrategy {
     pub matrix: std::collections::BTreeMap<String, Vec<GiteaMatrixValue>>,
 }
 
-/// A matrix value ForgeKeep can preserve as one concrete job variant.
+/// A matrix value Plombir Git can preserve as one concrete job variant.
 ///
 /// Keeping this closed after the raw-YAML diagnostic pass makes loss impossible
 /// in `to_ci_config`: every value in the typed workflow has a string form, so
@@ -807,7 +807,7 @@ pub struct GiteaConcurrency {
 
 /// The `with:` inputs `actions/checkout` has an honest answer for.
 ///
-/// ForgeKeep does not run the action; the pipeline workspace is a
+/// Plombir Git does not run the action; the pipeline workspace is a
 /// `git worktree add --detach <pipeline sha>` of the repository the workflow
 /// lives in. That satisfies exactly one of the action's inputs and no others:
 /// `fetch-depth` asks for *at least* that much history, and the worktree always
@@ -824,7 +824,7 @@ const CHECKOUT_INPUTS: &[&str] = &["fetch-depth"];
 /// The `with:` inputs `actions/cache` is translated from.
 ///
 /// `build_job_script` reads these two into a [`CacheConfig`]. The rest change
-/// behaviour that ForgeKeep's cache does not implement — `restore-keys` turns a
+/// behaviour that Plombir Git's cache does not implement — `restore-keys` turns a
 /// miss into a fallback hit, `fail-on-cache-miss` turns a miss into a job
 /// failure, `lookup-only` skips the restore — so accepting them would report the
 /// opposite of what the workflow asked for.
@@ -833,7 +833,7 @@ const CACHE_INPUTS: &[&str] = &["path", "key"];
 /// The `with:` inputs `actions/upload-artifact` is translated from.
 ///
 /// `build_job_script` reads these two into an [`ArtifactsConfig`]. The rest
-/// change behaviour ForgeKeep's artifact store does not implement —
+/// change behaviour Plombir Git's artifact store does not implement —
 /// `retention-days` overrides a policy the repository owns, `overwrite`,
 /// `if-no-files-found` and `include-hidden-files` decide what an empty or
 /// partial match means, `compression-level` picks an archive format that is
@@ -911,7 +911,7 @@ fn supported_run_expression(key: &str) -> bool {
     GITHUB_RUN_EXPRESSIONS
         .iter()
         .any(|(supported, _)| key == *supported)
-        // `vars.*` is deliberately absent. ForgeKeep has no repository,
+        // `vars.*` is deliberately absent. Plombir Git has no repository,
         // organization, or environment configuration-variable source, and an
         // `env.*` value with the same name is a different Actions context.
         || ["env", "secrets", "matrix", "inputs"]
@@ -1768,7 +1768,7 @@ impl GiteaWorkflow {
     }
 
     /// Reject workflows that would otherwise appear successful after silently
-    /// dropping an action step. ForgeKeep's native `.forgekeep-ci.yml` format
+    /// dropping an action step. Plombir Git's native `.plombir-git-ci.yml` format
     /// is the supported escape hatch for commands that do not have an Actions
     /// runtime.
     pub fn validate_supported_actions(&self) -> Result<()> {
@@ -1866,7 +1866,7 @@ impl GiteaWorkflow {
                 .map(|_| format!("{job_name}: container.options"))
         }));
 
-        // An action ForgeKeep implements natively still has to be honest about
+        // An action Plombir Git implements natively still has to be honest about
         // *which* of its inputs it implements. `actions/checkout` was skipped
         // whole — `has_checkout = true; continue` — so every `with:` key on it
         // was accepted and ignored, and a job asking for `ref:` or `submodules:`
@@ -1903,7 +1903,7 @@ impl GiteaWorkflow {
             Ok(())
         } else {
             anyhow::bail!(
-                "unsupported workflow feature(s): {}. Convert them to run: commands or use .forgekeep-ci.yml",
+                "unsupported workflow feature(s): {}. Convert them to run: commands or use .plombir-git-ci.yml",
                 unsupported.join(", ")
             )
         }
@@ -2085,7 +2085,7 @@ impl GiteaWorkflow {
         }
     }
 
-    /// Convert this workflow into an ForgeKeep `CiConfig`.
+    /// Convert this workflow into a Plombir Git `CiConfig`.
     ///
     /// The conversion:
     /// - Groups jobs by their dependency order (needs) into stages
@@ -2303,7 +2303,7 @@ impl GiteaWorkflow {
 
         if let Some(uses) = &job.uses {
             script.push(format!(
-                "echo \"ForgeKeep does not support reusable workflow '{}'; use explicit jobs or .forgekeep-ci.yml\" >&2; exit 78",
+                "echo \"Plombir Git does not support reusable workflow '{}'; use explicit jobs or .plombir-git-ci.yml\" >&2; exit 78",
                 uses
             ));
         }
@@ -2345,7 +2345,7 @@ impl GiteaWorkflow {
                     continue;
                 }
             }
-            // Handle `uses: actions/checkout@vX` — implicit in ForgeKeep, skip
+            // Handle `uses: actions/checkout@vX` — implicit in Plombir Git, skip
             if let Some(ref uses) = step.uses {
                 if uses.starts_with("actions/checkout") {
                     has_checkout = true;
@@ -2412,7 +2412,7 @@ impl GiteaWorkflow {
                 // Direct callers should still fail visibly even if they
                 // skipped `validate_supported_actions`.
                 script.push(format!(
-                    "echo \"ForgeKeep does not support action '{}'; use run: or .forgekeep-ci.yml\" >&2; exit 78",
+                    "echo \"Plombir Git does not support action '{}'; use run: or .plombir-git-ci.yml\" >&2; exit 78",
                     uses
                 ));
                 continue;
@@ -2453,7 +2453,7 @@ impl GiteaWorkflow {
         if !has_checkout && !script.is_empty() {
             script.insert(
                 0,
-                "# [ForgeKeep] Repository is already checked out at /workspace".to_string(),
+                "# [Plombir Git] Repository is already checked out at /workspace".to_string(),
             );
         }
 
@@ -4771,7 +4771,7 @@ jobs:
         let workflow = GiteaWorkflow::parse(yml).unwrap();
         let error = workflow.validate_supported_actions().unwrap_err();
         assert!(error.to_string().contains("actions/setup-node@v4"));
-        assert!(error.to_string().contains(".forgekeep-ci.yml"));
+        assert!(error.to_string().contains(".plombir-git-ci.yml"));
     }
 
     #[cfg(unix)]

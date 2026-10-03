@@ -25,7 +25,7 @@ const check = join(scriptsDir, 'cli-db-opener-contract-check.mjs');
 
 function run(fixture) {
   const result = spawnSync(process.execPath, [check], {
-    env: { ...process.env, FORGEKEEP_CLI_DB_OPENER_ROOT: fixture },
+    env: { ...process.env, PLOMBIR_GIT_CLI_DB_OPENER_ROOT: fixture },
     encoding: 'utf8',
   });
   return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
@@ -40,12 +40,12 @@ function writeOnlineInventory(fixture, { adminExtra = '', commandsExtra = '' } =
   writeFileSync(
     join(fixture, 'crates/rg-cli/src/commands.rs'),
     `pub(crate) async fn cmd_rotate_instance_key(db_url: &str) -> anyhow::Result<()> {
-    let _db = dbconn::connect_online(db_url, "forgekeep rotate-instance-key", dbconn::OnlineAccess::SingleRowWrite).await?;
+    let _db = dbconn::connect_online(db_url, "plombir-git rotate-instance-key", dbconn::OnlineAccess::SingleRowWrite).await?;
     Ok(())
 }
 
 pub(crate) async fn cmd_index_repo(db_url: &str) -> anyhow::Result<()> {
-    let _db = dbconn::connect_online(db_url, "forgekeep index-repo", dbconn::OnlineAccess::SameWorkAsALiveHandler).await?;
+    let _db = dbconn::connect_online(db_url, "plombir-git index-repo", dbconn::OnlineAccess::SameWorkAsALiveHandler).await?;
     Ok(())
 }
 ${commandsExtra}`,
@@ -53,7 +53,7 @@ ${commandsExtra}`,
   writeFileSync(
     join(fixture, 'crates/rg-cli/src/admin.rs'),
     `pub(crate) async fn backup_sqlite_db(db_url: &str) -> anyhow::Result<()> {
-    let _db = crate::dbconn::connect_online(db_url, "forgekeep backup-db", crate::dbconn::OnlineAccess::NoWriteLockOnTheSource).await?;
+    let _db = crate::dbconn::connect_online(db_url, "plombir-git backup-db", crate::dbconn::OnlineAccess::NoWriteLockOnTheSource).await?;
     Ok(())
 }
 ${adminExtra}`,
@@ -63,7 +63,7 @@ ${adminExtra}`,
 function writeGateway(fixture) {
   writeFileSync(
     join(fixture, 'crates/rg-cli/src/dbconn.rs'),
-    `//! The one place any \`forgekeep\` subcommand opens the database.
+    `//! The one place any \`plombir-git\` subcommand opens the database.
 
 pub(crate) async fn connect_online(
     db_url: &str,
@@ -89,11 +89,11 @@ pub(crate) async fn connect_offline_maintenance(db_url: &str) -> anyhow::Result<
   );
 }
 
-const bypass = mkdtempSync(join(tmpdir(), 'forgekeep-cli-db-opener-bypass.'));
-const missingGateway = mkdtempSync(join(tmpdir(), 'forgekeep-cli-db-opener-gateway.'));
-const honest = mkdtempSync(join(tmpdir(), 'forgekeep-cli-db-opener-honest.'));
-const newOnline = mkdtempSync(join(tmpdir(), 'forgekeep-cli-db-opener-new-online.'));
-const grownOnline = mkdtempSync(join(tmpdir(), 'forgekeep-cli-db-opener-grown-online.'));
+const bypass = mkdtempSync(join(tmpdir(), 'plombir-git-cli-db-opener-bypass.'));
+const missingGateway = mkdtempSync(join(tmpdir(), 'plombir-git-cli-db-opener-gateway.'));
+const honest = mkdtempSync(join(tmpdir(), 'plombir-git-cli-db-opener-honest.'));
+const newOnline = mkdtempSync(join(tmpdir(), 'plombir-git-cli-db-opener-new-online.'));
+const grownOnline = mkdtempSync(join(tmpdir(), 'plombir-git-cli-db-opener-grown-online.'));
 
 try {
   for (const fixture of [bypass, missingGateway, honest]) {
@@ -191,7 +191,7 @@ mod tests {
     `pub(crate) async fn cmd_prune(db_url: &str) -> anyhow::Result<()> {
     // Copied from a neighbour, variant and all — which is exactly how a new
     // command joins the unleased set without anybody deciding it should.
-    let _db = dbconn::connect_online(db_url, "forgekeep prune", dbconn::OnlineAccess::SingleRowWrite).await?;
+    let _db = dbconn::connect_online(db_url, "plombir-git prune", dbconn::OnlineAccess::SingleRowWrite).await?;
     Ok(())
 }
 `,
@@ -213,7 +213,7 @@ mod tests {
   writeOnlineInventory(grownOnline, {
     adminExtra: `
 pub(crate) async fn cmd_compact(db_url: &str) -> anyhow::Result<()> {
-    let _db = crate::dbconn::connect_online(db_url, "forgekeep compact", crate::dbconn::OnlineAccess::SingleRowWrite).await?;
+    let _db = crate::dbconn::connect_online(db_url, "plombir-git compact", crate::dbconn::OnlineAccess::SingleRowWrite).await?;
     Ok(())
 }
 `,

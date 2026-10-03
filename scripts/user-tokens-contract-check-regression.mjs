@@ -22,7 +22,7 @@ const copied = [
 ];
 
 function fixtureTree() {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-user-tokens-contract.'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-user-tokens-contract.'));
   for (const path of copied) {
     const target = join(fixture, path);
     mkdirSync(dirname(target), { recursive: true });

@@ -11,7 +11,7 @@
 // a fresh manual sweep, because nothing objected to the next copy.
 //
 // Each case writes a small tree into a fixture, points the real check at it
-// through `FORGEKEEP_CFG_TEST_READER_ROOT`, and judges it by exit code AND by
+// through `PLOMBIR_GIT_CFG_TEST_READER_ROOT`, and judges it by exit code AND by
 // what the diagnostic names. The second half matters as much as the first: a
 // ratchet that goes red at the wrong file sends the reader somewhere that is
 // fine, and the two are indistinguishable from a non-zero exit.
@@ -77,7 +77,7 @@ const JS_CANONICAL = `export function cfgTestItemRanges(source) {
 
 /** A fixture tree that the check passes over, before a case breaks one thing. */
 function buildFixture() {
-  const dir = mkdtempSync(join(tmpdir(), 'forgekeep-cfg-test-reader-'));
+  const dir = mkdtempSync(join(tmpdir(), 'plombir-git-cfg-test-reader-'));
   for (const sub of ['crates/rg-x/src', 'crates/rg-x/tests/common', 'tests/support', 'scripts/lib']) {
     mkdirSync(join(dir, sub), { recursive: true });
   }
@@ -92,7 +92,7 @@ function run(dir) {
   const result = spawnSync(process.execPath, [check], {
     cwd: repoRoot,
     encoding: 'utf8',
-    env: { ...process.env, FORGEKEEP_CFG_TEST_READER_ROOT: dir },
+    env: { ...process.env, PLOMBIR_GIT_CFG_TEST_READER_ROOT: dir },
   });
   return {
     red: result.status !== 0,

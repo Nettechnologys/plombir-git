@@ -17,7 +17,7 @@ fn write_config(path: &Path, contents: &str) {
 }
 
 fn run_with_umask(cwd: &Path, args: &[&str], umask: u32) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_forgekeep"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_plombir-git"));
     command.args(args).current_dir(cwd);
     // SAFETY: `pre_exec` runs after fork and before exec in the child. `umask`
     // is async-signal-safe and touches no Rust-managed memory.
@@ -29,7 +29,7 @@ fn run_with_umask(cwd: &Path, args: &[&str], umask: u32) -> Output {
     }
     command
         .output()
-        .unwrap_or_else(|error| panic!("run `forgekeep {}`: {error}", args.join(" ")))
+        .unwrap_or_else(|error| panic!("run `plombir-git {}`: {error}", args.join(" ")))
 }
 
 fn diagnostic(output: &Output) -> String {
@@ -52,8 +52,8 @@ fn mode(path: &Path) -> u32 {
 fn create_repo_and_first_sqlite_file_use_the_configured_policy() {
     let directory = tempfile::tempdir().expect("a temporary instance root");
     let repo_root = directory.path().join("repos");
-    let database = directory.path().join("forgekeep.db");
-    let config = directory.path().join("forgekeep.toml");
+    let database = directory.path().join("plombir-git.db");
+    let config = directory.path().join("plombir-git.toml");
     write_config(
         &config,
         &format!(
@@ -61,6 +61,23 @@ fn create_repo_and_first_sqlite_file_use_the_configured_policy() {
             repo_root.display(),
             database.display()
         ),
+    );
+
+    let migrate = run_with_umask(
+        directory.path(),
+        &[
+            "migrate",
+            "--config",
+            config.to_str().expect("UTF-8 config path"),
+        ],
+        0o002,
+    );
+    let migrate_text = diagnostic(&migrate);
+    assert!(migrate.status.success(), "{migrate_text}");
+    assert_eq!(
+        mode(&database),
+        0o640,
+        "SQLite's first open must inherit the configured group-readable policy:\n{migrate_text}"
     );
 
     let create = run_with_umask(
@@ -88,30 +105,13 @@ fn create_repo_and_first_sqlite_file_use_the_configured_policy() {
             && create_text.contains("0027"),
         "the selected one-shot policy must be explicit in the log:\n{create_text}"
     );
-
-    let migrate = run_with_umask(
-        directory.path(),
-        &[
-            "migrate",
-            "--config",
-            config.to_str().expect("UTF-8 config path"),
-        ],
-        0o002,
-    );
-    let migrate_text = diagnostic(&migrate);
-    assert!(migrate.status.success(), "{migrate_text}");
-    assert_eq!(
-        mode(&database),
-        0o640,
-        "SQLite's first open must inherit the configured group-readable policy:\n{migrate_text}"
-    );
 }
 
 #[test]
 fn explicit_backup_output_keeps_the_operators_creation_contract() {
     let directory = tempfile::tempdir().expect("a temporary instance root");
-    let database = directory.path().join("forgekeep.db");
-    let config = directory.path().join("forgekeep.toml");
+    let database = directory.path().join("plombir-git.db");
+    let config = directory.path().join("plombir-git.toml");
     write_config(
         &config,
         &format!(

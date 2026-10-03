@@ -1,6 +1,6 @@
 //! Cross-backend full-text-search (FTS) SQL dialect helpers.
 //!
-//! ForgeKeep supports three database backends. Each expresses full-text search
+//! Plombir Git supports three database backends. Each expresses full-text search
 //! very differently:
 //!
 //! | Backend    | FTS mechanism                                  |

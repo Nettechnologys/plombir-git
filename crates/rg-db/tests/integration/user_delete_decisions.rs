@@ -344,7 +344,7 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// Scalar column names which mean "this row stores a users.id" in ForgeKeep.
+/// Scalar column names which mean "this row stores a users.id" in Plombir Git.
 ///
 /// Serialized arrays are deliberately not pretended into this scalar guard;
 /// card_ce8b75ca7ed2 tracks the three JSON allow-lists and their own source
@@ -378,7 +378,7 @@ impl TempDb {
     fn new() -> Self {
         Self {
             path: std::env::temp_dir().join(format!(
-                "forgekeep-user-fk-decisions-{}.db",
+                "plombir-git-user-fk-decisions-{}.db",
                 uuid::Uuid::new_v4().simple()
             )),
         }

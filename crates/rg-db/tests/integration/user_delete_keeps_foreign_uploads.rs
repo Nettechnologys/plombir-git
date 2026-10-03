@@ -30,7 +30,7 @@ struct TempDb {
 impl TempDb {
     fn new(label: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "forgekeep-ghost-uploads-{label}-{}.db",
+            "plombir-git-ghost-uploads-{label}-{}.db",
             uuid::Uuid::new_v4().simple()
         ));
         Self { path }

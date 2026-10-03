@@ -1,7 +1,7 @@
 // The one fixture table both readers of a test-gating `#[cfg(…)]` attribute
 // answer.
 //
-// ForgeKeep has two of those readers and must never grow a third:
+// Plombir Git has two of those readers and must never grow a third:
 // `is_test_only_cfg_attribute` in `tests/support/rust_source.rs`, and
 // `cfgTestItemRanges` in `scripts/lib/rust-consumer-contract.mjs`. They decide
 // the same question — is the item below this attribute invisible to a

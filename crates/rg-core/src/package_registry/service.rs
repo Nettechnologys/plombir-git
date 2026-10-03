@@ -61,7 +61,7 @@ pub struct PublishInfo {
     pub homepage: Option<String>,
     pub repository_url: Option<String>,
     /// The mutable npm selector carried by a real publish packument. `None`
-    /// for every other package protocol and for ForgeKeep's generic uploader.
+    /// for every other package protocol and for Plombir Git's generic uploader.
     pub npm_dist_tag: Option<String>,
     pub author_id: i64,
     /// File name → the artifact's bytes.

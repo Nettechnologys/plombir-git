@@ -1,6 +1,6 @@
-# Contributing to ForgeKeep
+# Contributing to Plombir Git
 
-Thanks for your interest in ForgeKeep! This guide covers the development
+Thanks for your interest in Plombir Git! This guide covers the development
 setup, crate boundaries, coding conventions, and the common workflows.
 
 ---
@@ -65,7 +65,7 @@ sh scripts/verify-push-gates.sh
 cargo build -j 6            # verify dependencies fetch and compile
 
 # Generate a test SSH host key (one-off)
-ssh-keygen -t ed25519 -f ./forgekeep_host_key -N ""
+ssh-keygen -t ed25519 -f ./plombir_git_host_key -N ""
 ```
 
 ---
@@ -80,7 +80,7 @@ responsibilities here and the edge list there: duplicating the graph in both
 documents previously let the two hand-maintained copies drift independently.
 
 Library crates keep a neutral `rg-*` prefix. The user-facing binaries are
-`forgekeep` (`rg-cli`), `forgekeep-runner` (`rg-runner`), and `forgekeep-mcp`
+`plombir-git` (`rg-cli`), `plombir-git-runner` (`rg-runner`), and `plombir-git-mcp`
 (`rg-mcp`).
 
 ### Crate boundary rules
@@ -133,7 +133,7 @@ logic (delegate to `rg-core`).
 - Guard non-idempotent statements (`ADD COLUMN`, `CREATE`, …) with
   `manager.has_table()` / `has_column()` so a half-applied migration can be
   safely re-run.
-- Verify a new migration against a fresh database: `forgekeep migrate` then
+- Verify a new migration against a fresh database: `plombir-git migrate` then
   check table names.
 - When adding a field to `AppState`, also update
   `crates/rg-http/tests/common/mod.rs::build_test_app_state`.
@@ -144,7 +144,7 @@ logic (delegate to `rg-core`).
 
 **Forbidden:** business logic (delegate to the other crates).
 
-#### `rg-runner` — CI runner (library + the `forgekeep-runner` binary)
+#### `rg-runner` — CI runner (library + the `plombir-git-runner` binary)
 
 **Allowed:** runner registration and heartbeat; polling jobs from the server;
 job execution (local shell or Docker); uploading logs and artifacts.
@@ -153,7 +153,7 @@ job execution (local shell or Docker); uploading logs and artifacts.
 `rg-http` API); business logic.
 
 This is the **only** external-runner implementation: the deprecated
-`forgekeep runner` subcommand of `rg-cli` is a thin alias that delegates here.
+`plombir-git runner` subcommand of `rg-cli` is a thin alias that delegates here.
 A second copy of the poll-and-execute loop is exactly what that alias used to be,
 and it silently drifted (no `runner.toml`, no heartbeat, no workspace snapshot),
 so new runner behaviour belongs here and nowhere else. The separate
@@ -399,7 +399,7 @@ inert on macOS/Windows, but on Linux without `mold` it simply does not link.
 Cargo never garbage-collects artifacts from earlier builds, and this tree links
 a lot of large binaries — every `cargo build` of the workspace leaves another
 set of test binaries behind. One clean build is about 17 GB; left alone, this
-`target/` reached 316 GB (233 stale copies of the `forgekeep` binary). If the
+`target/` reached 316 GB (233 stale copies of the `plombir-git` binary). If the
 disk gets tight, `cargo clean` is the whole fix — the next build is cold
 (~7 min on a 24-core machine), and nothing else is lost.
 
@@ -511,7 +511,7 @@ Before a PR is merged into `main`:
 
 ## License and CLA
 
-ForgeKeep is licensed under the
+Plombir Git is licensed under the
 [GNU Affero General Public License v3.0 or later](LICENSE). The copyright
 holder also offers it under a commercial license (see [NOTICE](NOTICE)).
 

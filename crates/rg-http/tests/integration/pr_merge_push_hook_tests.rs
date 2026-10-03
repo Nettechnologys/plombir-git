@@ -164,7 +164,7 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
         &db,
         repo_id,
         &rg_core::webhook::service::CreateWebhookRequest {
-            url: "https://hooks.example.invalid/forgekeep".to_string(),
+            url: "https://hooks.example.invalid/plombir-git".to_string(),
             content_type: None,
             secret: None,
             active: Some(true),
@@ -287,7 +287,7 @@ async fn a_pipeline_going_green_runs_the_hooks_for_the_merge_it_triggers() {
         &db,
         repo_id,
         &rg_core::webhook::service::CreateWebhookRequest {
-            url: "https://hooks.example.invalid/forgekeep".to_string(),
+            url: "https://hooks.example.invalid/plombir-git".to_string(),
             content_type: None,
             secret: None,
             active: Some(true),
@@ -627,7 +627,7 @@ async fn a_queue_pass_that_fails_later_still_runs_the_hooks_for_what_it_merged()
         &db,
         repo_id,
         &rg_core::webhook::service::CreateWebhookRequest {
-            url: "https://hooks.example.invalid/forgekeep".to_string(),
+            url: "https://hooks.example.invalid/plombir-git".to_string(),
             content_type: None,
             secret: None,
             active: Some(true),

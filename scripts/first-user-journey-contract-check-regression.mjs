@@ -58,7 +58,7 @@ function run(fixture) {
     [join(fixture, 'scripts/first-user-journey-contract-check.mjs')],
     {
       cwd: fixture,
-      env: { ...process.env, FORGEKEEP_FIRST_USER_JOURNEY_ROOT: fixture },
+      env: { ...process.env, PLOMBIR_GIT_FIRST_USER_JOURNEY_ROOT: fixture },
       encoding: 'utf8',
     },
   );
@@ -303,12 +303,12 @@ const VALID_VARIANTS = [
       fixture,
       'scripts/first-user-journey-e2e.mjs',
       "    const cookies = await tab.send('Network.getCookies', { urls: [FRONTEND_URL] });",
-      "    const probe = 'https://forgekeep.invalid/session'; void probe; const cookies = await tab.send('Network.getCookies', { urls: [FRONTEND_URL] });",
+      "    const probe = 'https://plombir-git.invalid/session'; void probe; const cookies = await tab.send('Network.getCookies', { urls: [FRONTEND_URL] });",
     ),
   },
 ];
 
-let fixture = mkdtempSync(join(tmpdir(), 'forgekeep-first-user-contract.'));
+let fixture = mkdtempSync(join(tmpdir(), 'plombir-git-first-user-contract.'));
 try {
   baseline(fixture);
   const clean = run(fixture);
@@ -319,7 +319,7 @@ try {
 
   for (const mutation of [...INLINE_COMMENT_MUTATIONS, ...DIRECT_MUTATIONS]) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'forgekeep-first-user-contract.'));
+    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-first-user-contract.'));
     baseline(fixture);
     mutation.apply(fixture);
     const result = run(fixture);
@@ -335,7 +335,7 @@ try {
 
   for (const variant of VALID_VARIANTS) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'forgekeep-first-user-contract.'));
+    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-first-user-contract.'));
     baseline(fixture);
     variant.apply(fixture);
     const result = run(fixture);

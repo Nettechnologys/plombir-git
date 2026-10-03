@@ -1755,7 +1755,7 @@ async fn sso_provider_secret_events_are_journalled_and_the_secrets_are_not() {
         "enabled": true,
         "ldap_host": "ldap.example.com",
         "ldap_port": 636,
-        "ldap_bind_dn": "cn=forgekeep,ou=services,dc=example,dc=com",
+        "ldap_bind_dn": "cn=plombir-git,ou=services,dc=example,dc=com",
         "ldap_bind_password": LDAP_BIND_PASSWORD,
         "ldap_base_dn": "ou=people,dc=example,dc=com",
     }))

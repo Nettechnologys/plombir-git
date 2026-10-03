@@ -54,7 +54,7 @@ async fn ceremony_cookie(base: &str, token: &str) -> String {
         .split(';')
         .next()
         .expect("a cookie has a value")
-        .trim_start_matches("forgekeep_passkey_reg=")
+        .trim_start_matches("plombir_git_passkey_reg=")
         .to_string()
 }
 

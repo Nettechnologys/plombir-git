@@ -94,7 +94,7 @@ pub enum PasswordResetOutcome {
 /// the string and never stops being true; "this name is a page of the
 /// application" became true on the day the page was added, and an account that
 /// predates it is still a working account whose owner logs in. An LDAP identity
-/// is exactly that case — the directory owns the name and ForgeKeep cannot
+/// is exactly that case — the directory owns the name and Plombir Git cannot
 /// rename it — so re-resolving one asks this question and not the other.
 ///
 /// Returns `Ok(())` if valid, `Err` with a descriptive message otherwise.
@@ -644,12 +644,12 @@ async fn resolve_ldap_identity(
         .as_deref()
         .unwrap_or(&ldap_user.username)
         .trim();
-    // Shape only, and deliberately: the directory owns this name, ForgeKeep
+    // Shape only, and deliberately: the directory owns this name, Plombir Git
     // cannot rename it, and an account provisioned before a page claimed that
     // segment is still a working account. Refusing the *login* would take
     // everything away to fix an unreachable profile page. The reservation is
     // applied below, on the branch that would create a new one.
-    validate_username_shape(username).context("LDAP username is not valid for ForgeKeep")?;
+    validate_username_shape(username).context("LDAP username is not valid for Plombir Git")?;
 
     if let Some(user) = existing {
         if user.auth_provider != "ldap"
@@ -684,7 +684,7 @@ async fn resolve_ldap_identity(
     // honest answer is to refuse the provision and say which name it was —
     // silently creating an account with no page is what this refusal replaces.
     validate_username(username)
-        .context("LDAP username cannot be provisioned as a new ForgeKeep account")?;
+        .context("LDAP username cannot be provisioned as a new Plombir Git account")?;
     let email = ldap_user
         .email
         .as_deref()
@@ -818,7 +818,7 @@ async fn resolve_raced_ldap_identity(
     Ok(None)
 }
 
-/// The shape every stored address must have, wherever it enters ForgeKeep:
+/// The shape every stored address must have, wherever it enters Plombir Git:
 /// self-registration, an LDAP directory entry, or an SSO provider's profile.
 /// One rule in one place — the three call sites used to spell it out
 /// separately, and an address is an account lookup key in all three.
@@ -1273,12 +1273,12 @@ async fn forgot_password_inner(
         let recipient = user.email.clone();
         let user_id = user.id;
         let message = format!(
-            "We received a request to reset the password for your ForgeKeep account ({}). \
+            "We received a request to reset the password for your Plombir Git account ({}). \
              Click the button below to set a new password. This link expires in 15 minutes.",
             user.username
         );
         crate::task_tracker::delivery_tracker().spawn(async move {
-            let subject = "Reset your ForgeKeep password";
+            let subject = "Reset your Plombir Git password";
             if let Err(e) = crate::email::send_html_notification(
                 &smtp,
                 &recipient,
@@ -1537,7 +1537,7 @@ mod tests {
     /// A reserved name is refused at provision and tolerated at sign-in
     /// (card_e3f6f110a622).
     ///
-    /// The directory owns the name and ForgeKeep cannot rename it, so the two
+    /// The directory owns the name and Plombir Git cannot rename it, so the two
     /// halves have to answer differently. Creating `search` would make an
     /// account whose `/{owner}` page is the repository search screen and always
     /// will be — refuse it, and say which name. Signing in an account already
@@ -1726,7 +1726,7 @@ mod tests {
                 .expect("read LDAP identity")
                 .map(|user| user.id),
             Some(winner.id),
-            "the provider and uid still name one ForgeKeep identity"
+            "the provider and uid still name one Plombir Git identity"
         );
         assert!(
             user_ops::find_by_username(&db, "alice")
@@ -2008,7 +2008,7 @@ mod account_retirement_race_tests {
     async fn setup_pooled_db(label: &str) -> (DatabaseConnection, TempDb) {
         let temp = TempDb {
             path: std::env::temp_dir().join(format!(
-                "forgekeep-account-race-{label}-{}.db",
+                "plombir-git-account-race-{label}-{}.db",
                 uuid::Uuid::new_v4().simple()
             )),
         };

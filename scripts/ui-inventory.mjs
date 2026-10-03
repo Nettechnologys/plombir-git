@@ -831,7 +831,7 @@ export function renderMarkdown(inv) {
   const frontendTested = (r) => ['web', 'smoke', 'browser'].some((suite) => r.testedIn.includes(suite));
   const out = [];
 
-  out.push('# ForgeKeep — UI Inventory (generated)');
+  out.push('# Plombir Git — UI Inventory (generated)');
   out.push('');
   out.push('> **Сгенерировано.** Не править руками — перегенерировать:');
   out.push('> `node scripts/ui-inventory.mjs`');

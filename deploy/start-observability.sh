@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ForgeKeep Observability Quick Start
+# Plombir Git Observability Quick Start
 # Phase 22-C
 
 set -e
@@ -14,7 +14,7 @@ compose_http_ports() {
     local -a marked_mappings normalized_mappings
 
     if [ ! -r "${compose}" ]; then
-        echo "❌ Cannot read ${compose}; cannot determine the ForgeKeep HTTP port." >&2
+        echo "❌ Cannot read ${compose}; cannot determine the Plombir Git HTTP port." >&2
         return 1
     fi
 
@@ -26,7 +26,7 @@ compose_http_ports() {
 
     if [ "${#marked_mappings[@]}" -ne 1 ] ||
         [[ ! "${marked_mappings[0]}" =~ ^[[:space:]]*-[[:space:]]*\"?([0-9]+):([0-9]+)\"?[[:space:]]*#[[:space:]]*HTTP[[:space:]]*$ ]]; then
-        echo "❌ ${compose}: expected exactly one numeric HOST:CONTAINER ForgeKeep port mapping marked # HTTP." >&2
+        echo "❌ ${compose}: expected exactly one numeric HOST:CONTAINER Plombir Git port mapping marked # HTTP." >&2
         return 1
     fi
 
@@ -36,14 +36,14 @@ compose_http_ports() {
     if ! normalized_compose="$(
         docker compose -f "${compose}" config --no-interpolate
     )"; then
-        echo "❌ ${compose}: docker compose config failed; cannot determine the ForgeKeep HTTP port." >&2
+        echo "❌ ${compose}: docker compose config failed; cannot determine the Plombir Git HTTP port." >&2
         return 1
     fi
 
     # Docker Compose owns YAML semantics here. Its normalized output expands
     # every port into long syntax, so this scanner only has to walk the stable
     # services.*.ports[*].{published,target} paths. The service name stays in
-    # the result: a same-valued sidecar mapping must not impersonate ForgeKeep.
+    # the result: a same-valued sidecar mapping must not impersonate Plombir Git.
     mapfile -t normalized_mappings < <(
         awk '
             function flush_port() {
@@ -90,21 +90,21 @@ compose_http_ports() {
     )
 
     local matching_entries=0
-    local forgekeep_entries=0
+    local plombir_git_entries=0
     local mapping
     local service published target
     for mapping in "${normalized_mappings[@]}"; do
         read -r service published target <<<"${mapping}"
         if [ "${published} ${target}" = "${marked_host_port} ${marked_container_port}" ]; then
             ((matching_entries += 1))
-            if [ "${service}" = "forgekeep" ]; then
-                ((forgekeep_entries += 1))
+            if [ "${service}" = "plombir-git" ]; then
+                ((plombir_git_entries += 1))
             fi
         fi
     done
 
-    if [ "${matching_entries}" -ne 1 ] || [ "${forgekeep_entries}" -ne 1 ]; then
-        echo "❌ ${compose}: mapping marked # HTTP does not identify one unique services.forgekeep.ports entry after docker compose config." >&2
+    if [ "${matching_entries}" -ne 1 ] || [ "${plombir_git_entries}" -ne 1 ]; then
+        echo "❌ ${compose}: mapping marked # HTTP does not identify one unique services.plombir-git.ports entry after docker compose config." >&2
         return 1
     fi
 
@@ -116,22 +116,22 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-if ! FORGEKEEP_HTTP_PORTS="$(compose_http_ports "${MAIN_COMPOSE}")"; then
+if ! PLOMBIR_GIT_HTTP_PORTS="$(compose_http_ports "${MAIN_COMPOSE}")"; then
     exit 1
 fi
-read -r FORGEKEEP_HOST_PORT FORGEKEEP_CONTAINER_PORT <<<"${FORGEKEEP_HTTP_PORTS}"
+read -r PLOMBIR_GIT_HOST_PORT PLOMBIR_GIT_CONTAINER_PORT <<<"${PLOMBIR_GIT_HTTP_PORTS}"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  ForgeKeep Observability Stack — Phase 22-C"
+echo "  Plombir Git Observability Stack — Phase 22-C"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# Check if ForgeKeep is running
-echo "🔍 Checking if ForgeKeep is running on :${FORGEKEEP_HOST_PORT}..."
-if curl -s -o /dev/null -w "%{http_code}" "http://localhost:${FORGEKEEP_HOST_PORT}/health" 2>/dev/null | grep -q "200\|404\|401"; then
-    echo "✅ ForgeKeep detected"
+# Check if Plombir Git is running
+echo "🔍 Checking if Plombir Git is running on :${PLOMBIR_GIT_HOST_PORT}..."
+if curl -s -o /dev/null -w "%{http_code}" "http://localhost:${PLOMBIR_GIT_HOST_PORT}/health" 2>/dev/null | grep -q "200\|404\|401"; then
+    echo "✅ Plombir Git detected"
 else
-    echo "⚠️  ForgeKeep not detected on :${FORGEKEEP_HOST_PORT} (will still start the stack)"
+    echo "⚠️  Plombir Git not detected on :${PLOMBIR_GIT_HOST_PORT} (will still start the stack)"
 fi
 
 # Start the stack
@@ -165,14 +165,14 @@ echo "  Grafana:        http://localhost:3000  (admin/admin)"
 echo "  Alertmanager:   http://localhost:9093"
 echo "  Node Exporter:  http://localhost:9100/metrics"
 echo ""
-echo "  ForgeKeep:      http://localhost:${FORGEKEEP_HOST_PORT}/metrics"
+echo "  Plombir Git:      http://localhost:${PLOMBIR_GIT_HOST_PORT}/metrics"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "📈 Try these PromQL queries in Prometheus:"
 echo "  • sum(rate(http_requests_total[5m]))  (QPS)"
 echo "  • histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))"
-echo "  • forgekeep_repositories  (total repos)"
-echo "  • up{job=\"forgekeep\"}  (health)"
+echo "  • plombir_git_repositories  (total repos)"
+echo "  • up{job=\"plombir-git\"}  (health)"
 echo ""
 echo "🔥 To stop the stack:"
 echo "  docker compose -f docker-compose.observability.yml down"

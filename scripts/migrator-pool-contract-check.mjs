@@ -18,7 +18,7 @@ import {
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(
-  process.env.FORGEKEEP_MIGRATOR_POOL_ROOT ?? path.resolve(scriptsDir, '..'),
+  process.env.PLOMBIR_GIT_MIGRATOR_POOL_ROOT ?? path.resolve(scriptsDir, '..'),
 );
 const cratesDir = path.join(root, 'crates');
 const MIN_MIGRATOR_TEST_FILES = 7;

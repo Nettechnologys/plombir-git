@@ -5,7 +5,7 @@
 //! `[server].source_url`. A fork that changes the code changes that one URL and
 //! its users are pointed at the fork, at the very commit they are running.
 //!
-//! The commit is recorded at compile time from `FORGEKEEP_SOURCE_COMMIT`. It is
+//! The commit is recorded at compile time from `PLOMBIR_GIT_SOURCE_COMMIT`. It is
 //! deliberately not read from `.git` by a build script: the image build copies
 //! `crates/` alone, so a build script would find no repository exactly where
 //! the production binary is made, and would quietly print nothing. The
@@ -13,7 +13,7 @@
 //! puts the variable in rustc's dep-info, so changing it rebuilds this crate.
 
 /// The raw compile-time value, before validation.
-const RAW_SOURCE_COMMIT: Option<&str> = option_env!("FORGEKEEP_SOURCE_COMMIT");
+const RAW_SOURCE_COMMIT: Option<&str> = option_env!("PLOMBIR_GIT_SOURCE_COMMIT");
 
 /// What the build recorded about its own source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +65,7 @@ fn is_full_object_id(value: &str) -> bool {
 ///
 /// `source_url` is the repository, already validated and without a trailing
 /// slash. With a known commit the link is `<source_url>/tree/<commit>` — the
-/// layout of GitHub, GitLab and ForgeKeep itself. Without one it is the
+/// layout of GitHub, GitLab and Plombir Git itself. Without one it is the
 /// repository: still the right project, but no claim about which commit.
 pub fn source_link(source_url: &str, commit: Option<&str>) -> String {
     match commit {
@@ -91,7 +91,7 @@ mod tests {
         );
     }
 
-    /// Compose passes `${FORGEKEEP_SOURCE_COMMIT:-}`, so an operator who did not
+    /// Compose passes `${PLOMBIR_GIT_SOURCE_COMMIT:-}`, so an operator who did not
     /// set it builds with an *empty* value, not an absent one. Both mean the
     /// same thing and neither is worth a warning.
     #[test]

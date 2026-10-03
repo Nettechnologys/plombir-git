@@ -1,4 +1,4 @@
-//! Shared HTTP middleware for ForgeKeep.
+//! Shared HTTP middleware for Plombir Git.
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{MatchedPath, Request, State};

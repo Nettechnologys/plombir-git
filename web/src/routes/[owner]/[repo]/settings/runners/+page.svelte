@@ -9,7 +9,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('admin.runners.title')} · {owner}/{repo} · ForgeKeep</title>
+  <title>{t('admin.runners.title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <section class="panel">

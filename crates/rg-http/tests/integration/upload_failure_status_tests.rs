@@ -257,7 +257,7 @@ async fn a_finalize_over_a_vanished_staging_file_is_not_the_client_s_digest() {
     let (token, _user_id) = register_full(&base, "stage_blame", "stage_blame@example.com").await;
     create_repo(&base, &token, "blamed-layer").await;
 
-    let payload = b"forgekeep-staged-layer";
+    let payload = b"plombir-git-staged-layer";
     let digest = format!(
         "sha256:{}",
         hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))
@@ -345,7 +345,7 @@ async fn a_digest_the_client_got_wrong_is_still_the_client_s() {
     let (token, _user_id) = register_full(&base, "wrong_digest", "wrong_digest@example.com").await;
     create_repo(&base, &token, "mismatched-layer").await;
 
-    let payload = b"forgekeep-honest-layer";
+    let payload = b"plombir-git-honest-layer";
     // A well-formed digest of something else entirely.
     let claimed = format!(
         "sha256:{}",

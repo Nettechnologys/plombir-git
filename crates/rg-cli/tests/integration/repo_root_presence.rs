@@ -6,7 +6,7 @@
 //! that. So an operator who gets `--db-url` / `--config` right and forgets
 //! `--repo-root` writes the repository's row into the real database and clones
 //! the repository into a root beside whatever directory the command was started
-//! from. `forgekeep serve` then lists a repository whose git directory nobody
+//! from. `plombir-git serve` then lists a repository whose git directory nobody
 //! can open, and no step on the way said anything (card_cc8259eba428).
 //!
 //! The sibling half of `sqlite_db_presence`, and tested the same way: the real
@@ -19,11 +19,11 @@ use std::process::{Command, Output};
 use rg_db::sea_orm::ConnectionTrait;
 
 fn run_in(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_forgekeep"))
+    Command::new(env!("CARGO_BIN_EXE_plombir-git"))
         .args(args)
         .current_dir(cwd)
         .output()
-        .unwrap_or_else(|error| panic!("run `forgekeep {}`: {error}", args.join(" ")))
+        .unwrap_or_else(|error| panic!("run `plombir-git {}`: {error}", args.join(" ")))
 }
 
 fn diagnostic(output: &Output) -> String {
@@ -38,7 +38,7 @@ fn diagnostic(output: &Output) -> String {
 /// the schema the count runs against is the shipped one rather than a fixture's
 /// idea of it.
 fn migrated_database(dir: &Path) -> String {
-    let path = dir.join("forgekeep.db");
+    let path = dir.join("plombir-git.db");
     let url = format!("sqlite://{}?mode=rwc", path.display());
     let migrated = run_in(dir, &["migrate", "--db-url", &url]);
     assert!(

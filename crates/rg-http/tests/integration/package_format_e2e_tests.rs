@@ -2108,7 +2108,7 @@ async fn maven_repository_layout_serves_metadata_and_artifacts() {
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
     // ── The routes the layout ones sit on top of still answer ───────────────
-    // The flat spelling ForgeKeep's own API and UI use: one segment that
+    // The flat spelling Plombir Git's own API and UI use: one segment that
     // already carries the dots resolves to the same package.
     let flat = client
         .get(package_url(
@@ -2267,7 +2267,7 @@ async fn a_second_file_published_into_one_version_is_kept_and_a_repeat_is_refuse
 /// Cargo reads a sparse registry the way RFC 2789 spells it: `config.json`
 /// first, and then a crate at the path its name expands to — `matrix-cargo`
 /// lives at `ma/tr/matrix-cargo`, never at the bare name. This walks those
-/// URLs; the flat spelling the rest of the suite uses is ForgeKeep's own, and a
+/// URLs; the flat spelling the rest of the suite uses is Plombir Git's own, and a
 /// registry that answers only that one is unreachable from `cargo`.
 #[tokio::test]
 async fn cargo_sparse_index_serves_the_layout_cargo_requests() {
@@ -2593,7 +2593,7 @@ async fn npm_metadata_carries_the_manifest_dependencies() {
     );
 }
 
-/// `npm publish` does not POST a tarball to ForgeKeep's generic upload route.
+/// `npm publish` does not POST a tarball to Plombir Git's generic upload route.
 /// It PUTs a CouchDB-shaped packument to the package URL, with the tarball in a
 /// base64 `_attachments` entry. The scoped spelling matters twice: npm escapes
 /// the slash in the request URL but retains it in the attachment key.
@@ -2756,7 +2756,7 @@ async fn npm_packument_metadata_and_provenance_over_their_ceiling_are_413() {
 /// restricted` answered `201` for a package left exactly as readable as its
 /// public repository.
 ///
-/// ForgeKeep has no per-package visibility, so the honest answer is a refusal
+/// Plombir Git has no per-package visibility, so the honest answer is a refusal
 /// in both directions: `restricted` into a public repository, and `public` into
 /// a private one. An absent `access` is not a claim and still publishes.
 #[tokio::test]
@@ -3655,7 +3655,7 @@ async fn every_index_publishes_the_digest_of_the_file_its_link_points_at() {
 /// `info/<gem>`, then a `.gem` at a path the client builds itself by appending
 /// `gems/<file>` to the source URL. This walks those three, in that order, and
 /// then follows the published `gem_uri`; the `api/v1/gems/<gem>.json` spelling
-/// the rest of the suite uses is ForgeKeep's own and no client asks for it.
+/// the rest of the suite uses is Plombir Git's own and no client asks for it.
 #[tokio::test]
 async fn rubygems_compact_index_serves_the_layout_gem_requests() {
     let (base, _db) = spawn_test_app_with_db().await;
@@ -3889,7 +3889,7 @@ dependencies:
         "the runtime dependency is missing, or the development one leaked in"
     );
 
-    // The extensionless endpoint is Ruby Marshal upstream. Until ForgeKeep
+    // The extensionless endpoint is Ruby Marshal upstream. Until Plombir Git
     // implements that wire format, a miss lets clients fall back instead of
     // handing JSON bytes to `Marshal.load`.
     let mut legacy_deps_url = package_url(&base, &["rubygems", "api", "v1", "dependencies"]);
@@ -4838,7 +4838,7 @@ async fn maven_deploys_by_layout_and_resolves_the_same_paths_back() {
 /// their URLs: from the `api` key of the sparse index's `config.json`.
 ///
 /// Reading the index was served long before any write route existed, so a crate
-/// could be resolved out of ForgeKeep but never put there by the tool that
+/// could be resolved out of Plombir Git but never put there by the tool that
 /// builds it — and `api` was deliberately withheld to keep cargo saying "this
 /// registry does not support API commands" instead of walking into a 404
 /// (card_5a790cc6ac35). Both halves are asserted together here: the key is only
@@ -5401,7 +5401,7 @@ async fn equivalent_composer_version_is_a_conflict_without_a_second_entry() {
 /// what it pushed is resolvable and downloadable afterwards.
 ///
 /// The read side was finished first (card_01ee27252197), which left the gem the
-/// odd one out: installable from ForgeKeep, never publishable to it, because
+/// odd one out: installable from Plombir Git, never publishable to it, because
 /// nothing under `/packages/rubygems/` answered a `POST` at all
 /// (card_11a578ae1820). The download half is asserted here and not taken on
 /// trust: `gem push` sends no filename, and the name the file is stored under is

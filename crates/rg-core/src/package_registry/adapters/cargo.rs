@@ -5,7 +5,7 @@
 //! ## Sparse index protocol
 //!
 //! Cargo ≥ 1.68 uses the "sparse index" protocol (RFC 2789). The registry root
-//! is the index URL a user writes into `.cargo/config.toml`; ForgeKeep's is
+//! is the index URL a user writes into `.cargo/config.toml`; Plombir Git's is
 //!   `sparse+{base}/api/v1/repos/{owner}/{repo}/packages/cargo/index/`
 //! and two shapes hang off it:
 //!
@@ -629,12 +629,12 @@ pub fn cargo_index_prefix(name: &str) -> Vec<String> {
 /// Cargo fetches this first, before any crate, and refuses the registry without
 /// it. Only `dl` is required — where to download a `.crate` from. The markers
 /// `{crate}` and `{version}` are substituted by Cargo, which lets the URL point
-/// straight at ForgeKeep's existing package-download route instead of needing a
+/// straight at Plombir Git's existing package-download route instead of needing a
 /// redirect endpoint of its own; the filename is the one `cargo package`
 /// produces, `{crate}-{version}.crate`.
 ///
 /// `api` is deliberately absent. It is the base for `cargo publish` / `yank` /
-/// `owner`, and ForgeKeep serves none of those (publishing goes through
+/// `owner`, and Plombir Git serves none of those (publishing goes through
 /// `POST .../packages/cargo/publish`). Advertising an `api` we do not implement
 /// would turn `cargo publish` into an unexplained failure; without the key
 /// Cargo says outright that the registry does not support the command.

@@ -101,12 +101,12 @@ function declaredModifiers(source) {
 //
 // Every entry here is an ecosystem-native protocol surface: the URL, the media
 // type and the response shape are dictated by a third-party client (cargo, npm,
-// pip, dotnet, gem, helm, composer, mvn), not by ForgeKeep. Describing them in
-// ForgeKeep's own REST spec would document somebody else's protocol badly —
+// pip, dotnet, gem, helm, composer, mvn), not by Plombir Git. Describing them in
+// Plombir Git's own REST spec would document somebody else's protocol badly —
 // they are exercised by the package-registry protocol tests and the
 // `*-contract-check.mjs` scripts for each ecosystem instead.
 //
-// ForgeKeep's own package API — publish, list, get, versions, yank, download —
+// Plombir Git's own package API — publish, list, get, versions, yank, download —
 // IS documented; only the client-dictated spellings are exempt.
 const UNDOCUMENTED = new Map([
   ['api::packages::cargo_index_config', 'Cargo sparse index (RFC 2789) — layout fixed by cargo'],

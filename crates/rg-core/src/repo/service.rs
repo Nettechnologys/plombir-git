@@ -928,7 +928,7 @@ where
                             .filter(|name| !name.trim().is_empty())
                             .unwrap_or_else(|| {
                                 if opts_for_init.owner_display_name.trim().is_empty() {
-                                    "ForgeKeep"
+                                    "Plombir Git"
                                 } else {
                                     opts_for_init.owner_display_name.as_str()
                                 }
@@ -937,7 +937,7 @@ where
                             .git_author_email
                             .as_deref()
                             .filter(|email| !email.trim().is_empty())
-                            .unwrap_or("forgekeep@example.invalid"),
+                            .unwrap_or("plombir-git@example.invalid"),
                     )
                     .context("auto-initialization failed")?;
                 }
@@ -1889,7 +1889,7 @@ pub(crate) struct StagedRepositoryFilesystemDirectory {
 
 /// The absolute paths of this repository's pre-migration package files.
 ///
-/// `package_files.storage_path` holds a [`BlobKey`] for everything ForgeKeep
+/// `package_files.storage_path` holds a [`BlobKey`] for everything Plombir Git
 /// itself writes, but rows inherited from before the blob-storage migration
 /// hold an absolute filesystem path instead. Those bytes sit outside
 /// `packages/<owner>/<repo>`, so the prefix move cannot reach them — and every
@@ -4592,7 +4592,7 @@ mod path_diagnostic_tests {
         let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let rendered = temp_tree_error(
             "commit working tree",
-            std::path::Path::new("/srv/forgekeep/octocat/.notes.git.worktree-files-1"),
+            std::path::Path::new("/srv/plombir-git/octocat/.notes.git.worktree-files-1"),
             &error,
         )
         .to_string();

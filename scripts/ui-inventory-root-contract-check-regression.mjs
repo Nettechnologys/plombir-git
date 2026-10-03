@@ -59,7 +59,7 @@ const mutations = [
   },
 ];
 
-let fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-inventory-root-regression.'));
+let fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-inventory-root-regression.'));
 try {
   baseline(fixture);
   const clean = run(fixture);
@@ -70,7 +70,7 @@ try {
 
   for (const mutation of mutations) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-inventory-root-regression.'));
+    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-inventory-root-regression.'));
     baseline(fixture);
     patch(fixture, mutation.from, mutation.to);
     const result = run(fixture);

@@ -1,7 +1,7 @@
 //! Runtime smoke for PostgreSQL/MySQL CI service containers.
 //!
 //! Run with:
-//! `FORGEKEEP_TEST_DATABASE_URL=... cargo test -p rg-core --test multi_backend_smoke -- --ignored`
+//! `PLOMBIR_GIT_TEST_DATABASE_URL=... cargo test -p rg-core --test multi_backend_smoke -- --ignored`
 
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
@@ -2388,10 +2388,10 @@ async fn exercise_release_asset_mutation_contract(
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn ci_secret_conditional_update_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2420,10 +2420,10 @@ async fn ci_secret_conditional_update_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn commit_status_parent_delete_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2452,10 +2452,10 @@ async fn commit_status_parent_delete_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn retention_and_watch_parent_deletes_are_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2506,10 +2506,10 @@ async fn retention_and_watch_parent_deletes_are_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn merge_queue_parent_deletes_are_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2550,10 +2550,10 @@ async fn merge_queue_parent_deletes_are_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn ci_cache_eviction_upsert_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2582,10 +2582,10 @@ async fn ci_cache_eviction_upsert_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn mfa_lifecycle_account_delete_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2596,10 +2596,10 @@ async fn mfa_lifecycle_account_delete_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn admin_user_mutations_account_delete_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2610,10 +2610,10 @@ async fn admin_user_mutations_account_delete_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn login_finalization_account_delete_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2624,10 +2624,10 @@ async fn login_finalization_account_delete_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn standing_credential_finalization_account_delete_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2638,10 +2638,10 @@ async fn standing_credential_finalization_account_delete_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn ci_job_token_finalization_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2652,10 +2652,10 @@ async fn ci_job_token_finalization_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn ci_graph_transitions_are_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2666,10 +2666,10 @@ async fn ci_graph_transitions_are_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn password_reset_account_delete_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2680,10 +2680,10 @@ async fn password_reset_account_delete_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn ldap_identity_sync_delete_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2694,10 +2694,10 @@ async fn ldap_identity_sync_delete_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn oauth_account_touch_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2720,10 +2720,10 @@ async fn oauth_account_touch_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn notification_read_mutations_are_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2746,10 +2746,10 @@ async fn notification_read_mutations_are_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn organization_patch_concurrent_delete_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2782,10 +2782,10 @@ async fn organization_patch_concurrent_delete_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn package_version_yank_concurrent_delete_is_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");
@@ -2814,10 +2814,10 @@ async fn package_version_yank_concurrent_delete_is_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn release_asset_mutations_are_portable() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
         .await
         .expect("connect to test database");
@@ -2846,10 +2846,10 @@ async fn release_asset_mutations_are_portable() {
 }
 
 #[tokio::test]
-#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn migrations_crud_counters_and_fts_work_on_server_database() {
-    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to test database");

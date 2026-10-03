@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 use rg_db::sea_orm::{self, ConnectionTrait};
 
 fn run_restore(database_url: &str, backup: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_forgekeep"))
+    Command::new(env!("CARGO_BIN_EXE_plombir-git"))
         .args([
             "restore-db",
             backup.to_str().expect("temporary path must be UTF-8"),
@@ -144,7 +144,7 @@ fn restore_rejects_every_same_file_alias_before_touching_database_files() {
         std::fs::write(&shm, format!("SHM for {alias:?}")).unwrap();
 
         let canonical_target = target.canonicalize().unwrap();
-        let lock = PathBuf::from(format!("{}.forgekeep.lock", canonical_target.display()));
+        let lock = PathBuf::from(format!("{}.plombir-git.lock", canonical_target.display()));
         assert!(!lock.exists(), "test precondition failed for {alias:?}");
 
         let before = [
@@ -198,11 +198,12 @@ fn restore_rejects_every_same_file_alias_before_touching_database_files() {
 #[tokio::test]
 async fn restore_refuses_a_live_sqlite_pool_without_touching_any_database_file() {
     let dir = tempfile::tempdir().unwrap();
-    let database_path = dir.path().join("forgekeep.db");
+    let database_path = dir.path().join("plombir-git.db");
     let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
     let wal_path = Path::new(&format!("{}-wal", database_path.display())).to_path_buf();
     let shm_path = Path::new(&format!("{}-shm", database_path.display())).to_path_buf();
-    let lock_path = Path::new(&format!("{}.forgekeep.lock", database_path.display())).to_path_buf();
+    let lock_path =
+        Path::new(&format!("{}.plombir-git.lock", database_path.display())).to_path_buf();
     let backup_path = dir.path().join("backup.db");
     let backup_url = format!("sqlite://{}?mode=rwc", backup_path.display());
 
@@ -245,7 +246,7 @@ async fn restore_refuses_a_live_sqlite_pool_without_touching_any_database_file()
     let blocked_output = command_output(&blocked);
     assert!(!blocked.status.success(), "{blocked_output}");
     assert!(
-        blocked_output.contains("SQLite restore requires the ForgeKeep server to be stopped"),
+        blocked_output.contains("SQLite restore requires the Plombir Git server to be stopped"),
         "{blocked_output}"
     );
     assert_eq!(bytes(&database_path), before[0], "target database changed");

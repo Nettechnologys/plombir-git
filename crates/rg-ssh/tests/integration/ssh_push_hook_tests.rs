@@ -3,7 +3,7 @@
 //! The hooks — CI trigger, webhook fan-out, open-PR head-SHA refresh — used to
 //! live inside `rg-http`'s Smart-HTTP handler and were reachable from nowhere
 //! else, so a push over SSH ran *none* of them: no pipeline for a repo carrying
-//! a `.forgekeep-ci.yml`, no `push` webhook, and an open PR left pointing at the
+//! a `.plombir-git-ci.yml`, no `push` webhook, and an open PR left pointing at the
 //! commit it was opened on. SSH is the default transport once a key is
 //! registered, so half the users had no automation at all and nothing said so.
 //!

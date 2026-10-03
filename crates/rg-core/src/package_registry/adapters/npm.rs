@@ -47,7 +47,7 @@
 //! [`npm_protocol_metadata`] for what the adapter lifts out of `package.json`
 //! to keep that from happening.
 //!
-//! ForgeKeep serves this at:
+//! Plombir Git serves this at:
 //!   `GET /api/v1/repos/{owner}/{repo}/packages/npm/{pkg_name}`
 
 use anyhow::Result;
@@ -234,7 +234,7 @@ const ABBREVIATED_FIELDS: [&str; 13] = [
 /// an npm tarball. This key can never come from `package.json`: publish stores
 /// only the whitelist above, then adds this marker after validating the
 /// Sigstore bundle against the tarball.
-const PROVENANCE_METADATA_KEY: &str = "_forgekeepNpmProvenance";
+const PROVENANCE_METADATA_KEY: &str = "_plombirGitNpmProvenance";
 
 /// Record that a validated npm provenance bundle belongs to this version.
 ///

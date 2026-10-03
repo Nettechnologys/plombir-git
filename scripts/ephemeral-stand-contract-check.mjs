@@ -6,7 +6,7 @@
 // Why this exists — three ways this stand can rot, each of which looks green:
 //
 //   1. A second boot sequence. `scripts/git-protocol-e2e.sh` was the only
-//      script that knew how to start a private ForgeKeep and wait until it was
+//      script that knew how to start a private Plombir Git and wait until it was
 //      really up; a browser test needs the same thing, and the cheap way to get
 //      it is to copy the block. Then one copy learns about a new flag and the
 //      other does not. The invariant here is that `--listen-address-file` — the
@@ -43,12 +43,12 @@ import { shellCodeOnly } from './lib/shell-source.mjs';
 import { productionTsSource } from './lib/ts-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
-const root = resolve(process.env.FORGEKEEP_EPHEMERAL_STAND_ROOT || join(scriptsDir, '..'));
+const root = resolve(process.env.PLOMBIR_GIT_EPHEMERAL_STAND_ROOT || join(scriptsDir, '..'));
 
 const LIB = 'scripts/lib/stand.sh';
 const ENTRY = 'scripts/ephemeral-stand.sh';
 const VITE_CONFIG = 'web/vite.config.ts';
-const BACKEND_ORIGIN_ENV = 'FORGEKEEP_BACKEND_ORIGIN';
+const BACKEND_ORIGIN_ENV = 'PLOMBIR_GIT_BACKEND_ORIGIN';
 const LISTEN_FLAG = '--listen-address-file';
 
 const failures = [];
@@ -151,7 +151,7 @@ function scriptsUnder(dir, prefix, extensions) {
 // reporting those would make this check something nobody can keep green.
 const STARTS_A_SERVER = [
   /\$\{[A-Za-z_]*BIN[^}]*\}"?\s+serve\b/, // "${STAND_BIN}" serve …
-  /forgekeep['"]\s*,\s*\[\s*['"]serve['"]/, // spawn('…/forgekeep', ['serve', …
+  /plombir-git['"]\s*,\s*\[\s*['"]serve['"]/, // spawn('…/plombir-git', ['serve', …
 ];
 
 // This file and its mutation stand quote the antipattern on purpose — the stand
@@ -182,7 +182,7 @@ if (!booters.includes(LIB)) {
 }
 for (const script of booters.filter((script) => script !== LIB)) {
   failures.push(
-    `${script} starts its own ForgeKeep with \`${LISTEN_FLAG}\` instead of reusing ${LIB}; two boot ` +
+    `${script} starts its own Plombir Git with \`${LISTEN_FLAG}\` instead of reusing ${LIB}; two boot ` +
       'sequences drift, and the copy is what the tests then inherit. Reuse the loader.',
   );
 }

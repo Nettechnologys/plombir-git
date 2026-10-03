@@ -719,7 +719,7 @@
 </script>
 
 <svelte:head>
-  <title>CI/CD · {owner}/{repo} · ForgeKeep</title>
+  <title>CI/CD · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

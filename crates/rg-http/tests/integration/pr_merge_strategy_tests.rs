@@ -180,7 +180,7 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
             "feature b"
         );
 
-        // The commit this merge produced must be signed by ForgeKeep, not by
+        // The commit this merge produced must be signed by Plombir Git, not by
         // whatever identity the host happens to carry. `gix`'s plain
         // `Repository::commit` read that from the host's git configuration:
         // where there was none — a container — `merge` and `squash` answered
@@ -199,7 +199,7 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
             Some(&bare_path),
         );
         assert_eq!(
-            committer, "ForgeKeep <noreply@forgekeep.local>",
+            committer, "Plombir Git <noreply@plombir-git.local>",
             "{strategy} merge took its committer from the host's git config"
         );
         if strategy != "rebase" {
@@ -208,7 +208,7 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
                 Some(&bare_path),
             );
             assert_eq!(
-                author, "ForgeKeep <noreply@forgekeep.local>",
+                author, "Plombir Git <noreply@plombir-git.local>",
                 "{strategy} merge took its author from the host's git config"
             );
         }
@@ -289,7 +289,7 @@ async fn merge_conflict_keeps_base_ref_and_restores_open_pr_state() {
             "fatal:",
             "CONFLICT (",
             "Merge conflict in",
-            "forgekeep-rebase",
+            "plombir-git-rebase",
             ".git",
         ] {
             assert!(

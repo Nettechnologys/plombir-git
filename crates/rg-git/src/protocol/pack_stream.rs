@@ -216,7 +216,7 @@ mod tests {
     /// A server path shaped like a real deployment, inside a message shaped
     /// like one git actually prints from its object database.
     const SERVER_STDERR: &str =
-        "fatal: unable to create '/srv/forgekeep/repositories/octocat/private.git/objects/pack/tmp.lock': File exists";
+        "fatal: unable to create '/srv/plombir-git/repositories/octocat/private.git/objects/pack/tmp.lock': File exists";
 
     /// A `git pack-objects` stand-in that writes `SERVER_STDERR` to stderr, no
     /// pack at all, and exits non-zero — the shape `stream_pack_objects` reports
@@ -276,7 +276,7 @@ mod tests {
             "the client still has to learn the pack stopped on the server: {announced:?}"
         );
         assert!(
-            !announced.contains("/srv/forgekeep"),
+            !announced.contains("/srv/plombir-git"),
             "band 3 is printed verbatim to whoever ran `git clone`: {announced:?}"
         );
 
@@ -287,7 +287,7 @@ mod tests {
              pass on a fixture whose stderr was empty: {chained}"
         );
         assert!(
-            logs.rendered().contains("/srv/forgekeep"),
+            logs.rendered().contains("/srv/plombir-git"),
             "the operator still gets the whole reason: {}",
             logs.rendered()
         );

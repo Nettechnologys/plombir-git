@@ -38,7 +38,7 @@ async fn request_oci_token_raw(base: &str, scope: &str, auth_header: Option<Stri
     let client = reqwest::Client::new();
     let mut req = client
         .get(format!("{}/v2/auth/token", base))
-        .query(&[("service", "forgekeep-registry"), ("scope", scope)]);
+        .query(&[("service", "plombir-git-registry"), ("scope", scope)]);
     if let Some(auth) = auth_header {
         req = req.header(reqwest::header::AUTHORIZATION, auth);
     }
@@ -241,7 +241,7 @@ async fn the_version_check_accepts_the_credentials_docker_login_presents() {
     assert_eq!(
         with_user_jwt.status(),
         200,
-        "a ForgeKeep user JWT is a credential the registry accepts"
+        "a Plombir Git user JWT is a credential the registry accepts"
     );
 
     // The token `docker login` actually comes back with — minted by the realm
@@ -371,7 +371,7 @@ async fn the_advertised_token_realm_is_a_path_the_registry_serves() {
     let resp = client
         .get(&realm)
         .query(&[
-            ("service", "forgekeep-registry"),
+            ("service", "plombir-git-registry"),
             ("scope", "repository:oci_realm_owner/realm-image:pull"),
         ])
         .send()
@@ -411,7 +411,7 @@ async fn a_created_blob_is_retrievable_right_after_the_push() {
         register_full(&base, "oci_push_owner", "oci_push_owner@example.com").await;
     create_repo(&base, &token, "pushed-image", false).await;
 
-    let payload = b"forgekeep-oci-blob-roundtrip";
+    let payload = b"plombir-git-oci-blob-roundtrip";
     let digest = format!(
         "sha256:{}",
         hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))
@@ -613,7 +613,7 @@ async fn a_failed_finalize_separates_a_wrong_digest_from_a_broken_registry() {
         register_full(&base, "oci_blame_owner", "oci_blame_owner@example.com").await;
     create_repo(&base, &token, "blamed-image", false).await;
 
-    let payload = b"forgekeep-oci-blame";
+    let payload = b"plombir-git-oci-blame";
     let digest = format!(
         "sha256:{}",
         hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))

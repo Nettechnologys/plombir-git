@@ -56,7 +56,7 @@ pub struct InstanceInfo {
     /// to are everyone the instance serves, logged in or not.
     pub source_url: String,
     /// The commit this binary was built from, or `null` when the build was not
-    /// told (`FORGEKEEP_SOURCE_COMMIT` unset at compile time).
+    /// told (`PLOMBIR_GIT_SOURCE_COMMIT` unset at compile time).
     ///
     /// `null` rather than a guess: [`source_url`](Self::source_url) then names
     /// the repository without claiming a commit, and the UI can say the commit

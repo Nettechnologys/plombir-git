@@ -178,7 +178,7 @@
 </script>
 
 <svelte:head>
-  <title>{query ? `${query} · ` : ''}{t('search.title')} · ForgeKeep</title>
+  <title>{query ? `${query} · ` : ''}{t('search.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container search-page">

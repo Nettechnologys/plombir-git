@@ -40,7 +40,7 @@ function patch(fixture, path, from, to) {
 function run(fixture) {
   const result = spawnSync(process.execPath, [join(fixture, 'scripts/ui-access-sweep-contract-check.mjs')], {
     cwd: fixture,
-    env: { ...process.env, FORGEKEEP_UI_ACCESS_SWEEP_ROOT: fixture },
+    env: { ...process.env, PLOMBIR_GIT_UI_ACCESS_SWEEP_ROOT: fixture },
     encoding: 'utf8',
   });
   return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
@@ -257,7 +257,7 @@ const mutations = [
   },
 ];
 
-let fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-access-sweep-contract.'));
+let fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-access-sweep-contract.'));
 try {
   baseline(fixture);
   const clean = run(fixture);
@@ -276,7 +276,7 @@ try {
     fixture,
     'scripts/ui-access-sweep-e2e.mjs',
     'for (const persona of personaOrder) {',
-    "void 'https://forgekeep.invalid/persona'; for (const persona of personaOrder) {",
+    "void 'https://plombir-git.invalid/persona'; for (const persona of personaOrder) {",
   );
   const literalAware = run(fixture);
   if (literalAware.status !== 0) {
@@ -289,7 +289,7 @@ try {
 
   for (const mutation of mutations) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-access-sweep-contract.'));
+    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-access-sweep-contract.'));
     baseline(fixture);
     mutation.apply(fixture);
     const result = run(fixture);

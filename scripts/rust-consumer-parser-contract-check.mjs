@@ -29,7 +29,7 @@ import {
   utoipaRowFor,
 } from './lib/rust-source.mjs';
 
-const root = mkdtempSync(path.join(tmpdir(), 'forgekeep-consumer-contract-'));
+const root = mkdtempSync(path.join(tmpdir(), 'plombir-git-consumer-contract-'));
 try {
   const src = path.join(root, 'crates/demo/src');
   mkdirSync(src, { recursive: true });

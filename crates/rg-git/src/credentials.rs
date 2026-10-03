@@ -20,8 +20,8 @@ use crate::cli_gateway::{GitCommandGateway, GitOutput};
 /// Environment variables the credential helper reads the secret out of. Named
 /// after the product so they cannot collide with something the operator has
 /// already exported for their own git usage.
-pub const USERNAME_ENV: &str = "FORGEKEEP_GIT_USERNAME";
-pub const PASSWORD_ENV: &str = "FORGEKEEP_GIT_PASSWORD";
+pub const USERNAME_ENV: &str = "PLOMBIR_GIT_GIT_USERNAME";
+pub const PASSWORD_ENV: &str = "PLOMBIR_GIT_GIT_PASSWORD";
 
 /// A path which cannot contain user configuration or credential files.
 ///
@@ -452,7 +452,7 @@ mod tests {
             );
         }
 
-        for key in ["PATH", "LANG", "FORGEKEEP_GIT_PASSWORD", "DATABASE_URL"] {
+        for key in ["PATH", "LANG", "PLOMBIR_GIT_GIT_PASSWORD", "DATABASE_URL"] {
             assert!(
                 !is_ambient_transport_env(OsStr::new(key)),
                 "unrelated server variable was removed from outbound git: {key}"

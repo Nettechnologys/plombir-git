@@ -48,7 +48,7 @@
 </script>
 
 <svelte:head>
-  <title>{owner}/{repo} · {t('repo.tabs.commits')} · ForgeKeep</title>
+  <title>{owner}/{repo} · {t('repo.tabs.commits')} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">

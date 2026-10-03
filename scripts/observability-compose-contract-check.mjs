@@ -38,7 +38,7 @@
 // script instead of the file.
 //
 // The subject is deliberately this one compose file. `docker-compose.hostdir.
-// yml` mounts `./forgekeep.toml` and `./data`, which the operator creates and
+// yml` mounts `./plombir-git.toml` and `./data`, which the operator creates and
 // the repository must not contain — asserting their existence here would fail on
 // purpose, on a correct checkout.
 //

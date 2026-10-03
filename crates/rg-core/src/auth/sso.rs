@@ -113,7 +113,7 @@ pub struct SsoUserInfo {
     pub avatar_url: Option<String>,
 }
 
-/// Why a provider's answer cannot be used to identify a ForgeKeep account.
+/// Why a provider's answer cannot be used to identify a Plombir Git account.
 ///
 /// Each variant is the provider's answer being refused, not a server fault:
 /// they reach the person signing in as a `400` with the reason, because the fix
@@ -148,7 +148,7 @@ impl SsoIdentityDefect {
                  confirm it with the provider and sign in again"
             }
             Self::UnusableUsername => {
-                "no ForgeKeep username could be derived from this SSO profile"
+                "no Plombir Git username could be derived from this SSO profile"
             }
         }
     }
@@ -542,7 +542,7 @@ async fn fetch_github_user(
     let user_resp = client
         .get(user_endpoint)
         .header("Authorization", format!("Bearer {}", access_token))
-        .header("User-Agent", "ForgeKeep/0.1")
+        .header("User-Agent", "PlombirGit/0.1")
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await
@@ -614,7 +614,7 @@ async fn fetch_github_email(
     let resp = client
         .get(endpoint)
         .header("Authorization", format!("Bearer {}", access_token))
-        .header("User-Agent", "ForgeKeep/0.1")
+        .header("User-Agent", "PlombirGit/0.1")
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await

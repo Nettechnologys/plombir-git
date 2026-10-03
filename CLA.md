@@ -1,13 +1,13 @@
 # Contributor License Agreement
 
-Thank you for contributing to ForgeKeep. This agreement explains the rights
+Thank you for contributing to Plombir Git. This agreement explains the rights
 you give the project when you send a contribution. It is modelled on the
 Apache Software Foundation Individual CLA. You keep the copyright in your
-work. You give Yahook (the "Maintainer"), the copyright holder of ForgeKeep, a
+work. You give Yahook (the "Maintainer"), the copyright holder of Plombir Git, a
 license broad enough to ship your work both under the AGPL and under the
 commercial license described in [NOTICE](NOTICE).
 
-> **Why a CLA?** ForgeKeep is AGPL-3.0-or-later and is also offered under a
+> **Why a CLA?** Plombir Git is AGPL-3.0-or-later and is also offered under a
 > commercial license. Without this agreement, code from outside contributors
 > would be available only under the AGPL, and the project could no longer
 > offer that second license for the codebase as a whole.
@@ -17,7 +17,7 @@ commercial license described in [NOTICE](NOTICE).
 - **"You"** means the person or legal entity making this agreement.
 - **"Contribution"** means any original work of authorship, including any
   changes or additions to existing work, that You intentionally submit to the
-  Maintainer for inclusion in ForgeKeep. A submission is any form of
+  Maintainer for inclusion in Plombir Git. A submission is any form of
   electronic, verbal or written communication sent to the Maintainer or its
   representatives, including pull requests, patches, issue comments that carry
   code, and mailing-list posts. It excludes communication that You
@@ -77,4 +77,4 @@ On your first pull request, comment:
 > I have read the CLA Document and I hereby sign the CLA
 
 Your signature covers that pull request and all later Contributions You make
-to ForgeKeep.
+to Plombir Git.

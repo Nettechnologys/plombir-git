@@ -228,7 +228,7 @@
 </script>
 
 <svelte:head>
-  <title>{t('dashboard.title')} · ForgeKeep</title>
+  <title>{t('dashboard.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="dashboard">

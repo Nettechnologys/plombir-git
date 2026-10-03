@@ -65,7 +65,7 @@ pub(crate) async fn backup_sqlite_db(
     // `sol_47b6de319ff0`, one step later in the sequence.
     let db = crate::dbconn::connect_online(
         db_url,
-        "forgekeep backup-db",
+        "plombir-git backup-db",
         // `VACUUM INTO` reads the source and writes a *different* file, so it
         // never asks for the source's write lock and a live writer is not held
         // off by it. The server runs the same statement on a schedule against
@@ -111,14 +111,14 @@ pub(crate) async fn backup_sqlite_db(
 /// Refuse to back up a database that has no tables in it.
 ///
 /// The presence check in `dbconn` stops the *first* backup taken from the wrong
-/// directory — but that first run already left an empty `forgekeep.db` behind,
+/// directory — but that first run already left an empty `plombir-git.db` behind,
 /// and on the instance where this was found it did exactly that. From then on
 /// the file exists, presence says yes, and the same wrong database is copied
 /// out under the right name. Nothing else on this path can notice: the
 /// connection opens, `VACUUM INTO` faithfully copies nothing, and the operator
 /// reads `Backup written`.
 ///
-/// A ForgeKeep database always carries `seaql_migrations` plus its schema, so
+/// A Plombir Git database always carries `seaql_migrations` plus its schema, so
 /// zero tables is never a backup worth taking — it is an answer about which
 /// database was addressed (card_8baddb74fa82).
 async fn refuse_an_empty_source(
@@ -147,7 +147,7 @@ async fn refuse_an_empty_source(
         .unwrap_or_else(|| rg_db::redact_database_url(db_url));
     anyhow::bail!(
         "refusing to write a backup of `{source}`: it contains no tables, so it is not the \
-         ForgeKeep database this instance runs on — check `--db-url` / `--config` and the \
+         Plombir Git database this instance runs on — check `--db-url` / `--config` and the \
          directory the command was started from"
     )
 }
@@ -187,7 +187,7 @@ pub(crate) fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> a
     }
     if target.exists() && !force {
         anyhow::bail!(
-            "target database already exists: {} (stop ForgeKeep and use --force to overwrite)",
+            "target database already exists: {} (stop Plombir Git and use --force to overwrite)",
             target.display()
         );
     }
@@ -210,8 +210,8 @@ pub(crate) fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> a
     // like the one that worked (card_8baddb74fa82).
     crate::dbconn::check_database_presence(
         db_url,
-        "forgekeep restore-db",
-        crate::dbconn::MissingDatabase::Create,
+        "plombir-git restore-db",
+        crate::dbconn::MissingDatabase::CreateFromBackup,
     )?;
 
     // The lease has to precede the first destructive step and remain alive
@@ -284,14 +284,14 @@ pub(crate) fn validate_jwt_secret(jwt_secret: &str, source: &str) -> anyhow::Res
     // A blank secret is not a weak secret to warn about — it is no secret at
     // all, and every token this instance ever signs would be forgeable by
     // anyone. It reached this far because `deploy/.env.example` ships
-    // `FORGEKEEP_JWT_SECRET=` and `std::env::var` reports that as `Ok("")`, so
+    // `PLOMBIR_GIT_JWT_SECRET=` and `std::env::var` reports that as `Ok("")`, so
     // an operator who followed the file and forgot step 2 got a server that
     // started cleanly and signed everything with "" — while the same file
     // promised "startup validation will fail loudly". Now it does.
     if jwt_secret.trim().is_empty() {
         tracing::error!(
             "FATAL: the secret from {} is empty. Generate one with \
-             `forgekeep gen-secret`",
+             `plombir-git gen-secret`",
             source
         );
         anyhow::bail!("refusing to start with an empty secret from {source}");
@@ -299,8 +299,8 @@ pub(crate) fn validate_jwt_secret(jwt_secret: &str, source: &str) -> anyhow::Res
     if KNOWN_BAD_JWT_SECRETS.contains(&jwt_secret) {
         tracing::error!(
             "FATAL: jwt_secret from {} is a known default/compromised value. \
-             Generate a fresh one with `forgekeep gen-secret` and set it via \
-             FORGEKEEP_JWT_SECRET, --jwt-secret, or config file [auth].jwt_secret",
+             Generate a fresh one with `plombir-git gen-secret` and set it via \
+             PLOMBIR_GIT_JWT_SECRET, --jwt-secret, or config file [auth].jwt_secret",
             source
         );
         anyhow::bail!("refusing to start with default/compromised jwt_secret");
@@ -334,7 +334,7 @@ mod scheduled_backup_restore_tests {
     #[tokio::test]
     async fn a_scheduled_snapshot_restores_into_a_working_database() {
         let dir = tempfile::tempdir().unwrap();
-        let live_path = dir.path().join("forgekeep.db");
+        let live_path = dir.path().join("plombir-git.db");
         let live_url = format!("sqlite://{}?mode=rwc", live_path.display());
         let live = connect(&live_url).await;
         live.execute_unprepared("CREATE TABLE marker (v TEXT)")
@@ -389,7 +389,7 @@ mod jwt_secret_tests {
         );
     }
 
-    /// `deploy/.env.example` ships `FORGEKEEP_JWT_SECRET=`, and `env::var`
+    /// `deploy/.env.example` ships `PLOMBIR_GIT_JWT_SECRET=`, and `env::var`
     /// hands that back as `Ok("")` — so this is not a hypothetical value, it is
     /// the one an operator gets by forgetting a step. Signing tokens with it
     /// makes every session forgeable.

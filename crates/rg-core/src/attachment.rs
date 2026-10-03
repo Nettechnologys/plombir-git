@@ -408,7 +408,7 @@ pub async fn delete_attachment(
     let backup = if let Some(source) = storage.local_path(&key) {
         // Beside the blob, not in the system temp directory. This copy is up to
         // `MAX_ATTACHMENT_SIZE`, and a stop that runs no destructors leaves it
-        // behind: written under `TMPDIR` it was outside every root ForgeKeep
+        // behind: written under `TMPDIR` it was outside every root Plombir Git
         // sweeps, so it stayed there for good — on a deployment whose `/tmp` is
         // a tmpfs, as memory rather than disk. Here it is one of
         // `staging::SiblingSpool`'s families, which is what the startup pass
@@ -982,7 +982,7 @@ mod tests {
     /// Where the rollback copy is put, asserted at the one instant it exists.
     ///
     /// It used to go to `std::env::temp_dir()`, which is under no root
-    /// ForgeKeep sweeps: a stop that ran no destructors left up to 100 MiB
+    /// Plombir Git sweeps: a stop that ran no destructors left up to 100 MiB
     /// there for good, on a deployment whose `/tmp` is a tmpfs as memory rather
     /// than disk. Written beside the blob it is one of
     /// [`SiblingSpool::AttachmentBackup`]'s, which the startup pass walks the

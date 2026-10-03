@@ -35,7 +35,7 @@ assert.equal(shellInvokes('value=${VERSION#v}; cargo clippy', 'cargo clippy'), t
 console.log('✅ shell source view distinguishes comments, quoted data, and live commands');
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-local-gate-coverage-'));
+  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-local-gate-coverage-'));
   mkdirSync(join(fixture, '.github', 'workflows'), { recursive: true });
   mkdirSync(join(fixture, '.githooks'), { recursive: true });
   mkdirSync(join(fixture, 'scripts'), { recursive: true });
@@ -71,7 +71,7 @@ function runFixture(name, mutate, expectedStatus, expectedOutput, forbiddenOutpu
     }
     const result = spawnSync(process.execPath, [check], {
       cwd: fixture,
-      env: { ...process.env, FORGEKEEP_LOCAL_GATE_COVERAGE_ROOT: fixture },
+      env: { ...process.env, PLOMBIR_GIT_LOCAL_GATE_COVERAGE_ROOT: fixture },
       encoding: 'utf8',
     });
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;

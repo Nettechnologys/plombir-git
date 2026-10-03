@@ -25,8 +25,8 @@ use crate::AppState;
 // ── Cookie helpers ───────────────────────────────────────────────
 
 /// Cookie names for secure OAuth2 flow.
-const SSO_STATE_COOKIE: &str = "forgekeep_sso_state";
-const SSO_VERIFIER_COOKIE: &str = "forgekeep_sso_code_verifier";
+const SSO_STATE_COOKIE: &str = "plombir_git_sso_state";
+const SSO_VERIFIER_COOKIE: &str = "plombir_git_sso_code_verifier";
 
 fn append_set_cookie(response: &mut axum::response::Response, cookie: String) {
     if let Ok(header_value) = HeaderValue::from_str(&cookie) {
@@ -793,7 +793,7 @@ fn sso_identity_link_changed() -> AppError {
     AppError::conflict("identity link changed; restart SSO")
 }
 
-/// Resolve the callback's identity to a ForgeKeep account, creating the link —
+/// Resolve the callback's identity to a Plombir Git account, creating the link —
 /// and, on a first login, the account — when there is none yet.
 ///
 /// The provider's access and refresh tokens are used to read the identity and
@@ -916,7 +916,7 @@ fn oauth_link_details(account: &rg_db::entities::oauth_account::Model) -> serde_
 /// persistent constraint failure into a spin.
 const SSO_PROVISION_ATTEMPTS: usize = 3;
 
-/// Create the ForgeKeep account behind a first SSO login, tolerating a
+/// Create the Plombir Git account behind a first SSO login, tolerating a
 /// concurrent callback for the same identity.
 ///
 /// `users.username` and `users.email` are both UNIQUE
@@ -1118,7 +1118,7 @@ mod tests {
     }
 
     /// Held for the length of any test that reads
-    /// `forgekeep_users_registered_total` as a before/after pair.
+    /// `plombir_git_users_registered_total` as a before/after pair.
     ///
     /// The counter is process-global and this binary runs its tests in parallel
     /// threads, so a provisioning that happens in the neighbouring test lands
@@ -1127,7 +1127,7 @@ mod tests {
     static REGISTRATION_COUNTER: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-    /// Reads `forgekeep_users_registered_total`, initialising the registry the
+    /// Reads `plombir_git_users_registered_total`, initialising the registry the
     /// first time so the counter exists to be read at all.
     fn registered_total() -> u64 {
         #[allow(
@@ -1352,11 +1352,11 @@ mod tests {
         assert!(cookies[0]
             .to_str()
             .unwrap()
-            .starts_with("forgekeep_sso_state="));
+            .starts_with("plombir_git_sso_state="));
         assert!(cookies[1]
             .to_str()
             .unwrap()
-            .starts_with("forgekeep_sso_code_verifier="));
+            .starts_with("plombir_git_sso_code_verifier="));
     }
 
     #[test]

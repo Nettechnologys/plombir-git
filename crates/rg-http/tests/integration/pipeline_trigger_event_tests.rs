@@ -920,7 +920,7 @@ async fn a_retry_replays_the_dispatch_inputs_of_the_run_it_repeats() {
 /// "this run had none" but "work it out from the repository as it stands now":
 /// the matcher then judges a retried pull request against the default branch —
 /// so a PR into `develop` selects no workflow and the run falls through to
-/// `.forgekeep-ci.yml`, a different graph under the same `201` — and a `paths:`
+/// `.plombir-git-ci.yml`, a different graph under the same `201` — and a `paths:`
 /// filter diffs against the head commit's first parent instead of the range the
 /// push covered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -231,7 +231,7 @@ async fn runner_register_accepts_admin_httponly_cookie() {
         .post(format!("{}/api/v1/runners/register", base))
         .header(
             reqwest::header::COOKIE,
-            format!("forgekeep_token={}", admin_token),
+            format!("plombir_git_token={}", admin_token),
         )
         .json(&serde_json::json!({
             "repository": "runner_cookie/runner-cookie-scope",

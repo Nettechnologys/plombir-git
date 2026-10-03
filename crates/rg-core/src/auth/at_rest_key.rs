@@ -15,7 +15,7 @@
 //! reaches for its process-wide wiring the same way (the delivery tracker, the
 //! metrics observer), so the key is published here instead.
 //!
-//! Publishing is the server's job and happens twice on purpose: `forgekeep
+//! Publishing is the server's job and happens twice on purpose: `plombir-git
 //! serve` publishes right after the key preflight, before anything can
 //! dispatch, and `rg_http::AppState::new` publishes as well so an embedder or a
 //! test that builds a state without the full boot is covered too. Both pass the

@@ -2,7 +2,7 @@
 //!
 //! Tracks the progress of migrating a repository and its metadata
 //! (issues, PRs, labels, milestones, releases, wiki) from
-//! external platforms (GitHub, GitLab) into ForgeKeep.
+//! external platforms (GitHub, GitLab) into Plombir Git.
 //!
 //! ## The source platform's access token is deliberately absent
 //!
@@ -35,7 +35,7 @@ pub struct Model {
     pub platform: String,
     /// Source repository URL (e.g., <https://github.com/user/repo>)
     pub source_url: String,
-    /// Target owner in ForgeKeep
+    /// Target owner in Plombir Git
     pub target_owner: String,
     /// Target repository name
     pub target_name: String,

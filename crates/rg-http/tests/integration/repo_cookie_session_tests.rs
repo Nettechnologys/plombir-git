@@ -7,7 +7,7 @@
 //! the caller in the body with `extract_bearer_claims`, purely to put a name in
 //! the audit trail. That reader accepts `Authorization: Bearer` and nothing
 //! else, while the gate above it resolves the session through `extract_user_id`,
-//! which reads the HttpOnly `forgekeep_token` cookie first. So the owner passed
+//! which reads the HttpOnly `plombir_git_token` cookie first. So the owner passed
 //! the gate and got a `401` out of the handler body.
 //!
 //! The cookie is not an exotic shape: the web client holds its token in memory
@@ -77,7 +77,7 @@ async fn a_cookie_session_owner_may_delete_their_repository_and_an_anonymous_cal
 
     let resp = client
         .delete(&url)
-        .header("cookie", format!("forgekeep_token={token}"))
+        .header("cookie", format!("plombir_git_token={token}"))
         .send()
         .await
         .expect("request");
@@ -159,7 +159,7 @@ async fn a_cookie_session_owner_may_transfer_their_repository_and_an_anonymous_c
 
     let resp = client
         .post(&url)
-        .header("cookie", format!("forgekeep_token={token}"))
+        .header("cookie", format!("plombir_git_token={token}"))
         .json(&payload)
         .send()
         .await

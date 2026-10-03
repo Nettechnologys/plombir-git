@@ -337,7 +337,7 @@ pub async fn ai_search_code(
 
     if indexed_count == 0 {
         return Err(AppError::bad_request(
-            "Repository not indexed. Build the index first with POST /api/v1/ai/repos/{owner}/{name}/index (or the `forgekeep index-repo` command); \
+            "Repository not indexed. Build the index first with POST /api/v1/ai/repos/{owner}/{name}/index (or the `plombir-git index-repo` command); \
              later pushes to the default branch keep it up to date."
                 .to_string(),
         ));
@@ -380,7 +380,7 @@ pub struct IndexResponse {
 ///
 /// The write half of the AI code-search surface. `ai_search_code` reads
 /// `code_fts`, and until this door was mounted nothing outside the server's own
-/// shell could fill it: the only producer was the `forgekeep index-repo` CLI
+/// shell could fill it: the only producer was the `plombir-git index-repo` CLI
 /// command, so a hosted instance answered every AI code search out of an index
 /// that could never be built (card_928d72df493a).
 ///

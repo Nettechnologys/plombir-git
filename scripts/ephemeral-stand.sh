@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Bring up a throwaway ForgeKeep — own binary, empty database, temporary
+# Bring up a throwaway Plombir Git — own binary, empty database, temporary
 # `repo_root`, and optionally the built frontend behind `vite preview` — print
 # the URLs, and take all of it down again on the way out.
 #
@@ -50,7 +50,7 @@ done
 stand_require_commands curl python3 ps mktemp
 
 if [[ ${BUILD_BINARY} -eq 1 ]]; then
-  echo "stand: building target/release/forgekeep" >&2
+  echo "stand: building target/release/plombir-git" >&2
   (cd "${ROOT_DIR}" && cargo build --release -p rg-cli -j 6)
 fi
 

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 /// comfortably exceeding any realistic legitimate client population.
 ///
 /// Public for the same reason `DEFAULT_PACKAGE_UPLOAD_MAX_BYTES` is:
-/// `forgekeep.example.toml` states this number to the operator beside
+/// `plombir-git.example.toml` states this number to the operator beside
 /// `[rate_limit].max_keys = 0`, and the only way to check that statement
 /// against the value the limiter actually uses is for a test in `rg-cli` to be
 /// able to read it.

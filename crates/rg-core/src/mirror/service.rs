@@ -7,7 +7,7 @@
 //!
 //! `mirrors.password_encrypted` holds the password/token for the upstream
 //! remote. It is AES-256-GCM ciphertext, keyed the same way as every other
-//! secret at rest in ForgeKeep (`derive_key(encryption_key)` — see
+//! secret at rest in Plombir Git (`derive_key(encryption_key)` — see
 //! `crate::auth::encryption`), and it is decrypted for exactly the duration of
 //! one sync. That is why every entry point here takes `encryption_key`.
 //!
@@ -843,7 +843,7 @@ fn mask_credential(message: &str, credentials: Option<&Option<GitCredentials>>) 
 ///
 /// The create/update path splits every URL it is handed, but a row written
 /// before it did still holds `https://user:token@host/repo.git` in a plaintext
-/// column. Run by `forgekeep serve` right after the key preflight — the first
+/// column. Run by `plombir-git serve` right after the key preflight — the first
 /// point in the boot where the schema and the at-rest key both exist, and
 /// before any sync can quote such a URL into `last_sync_error`. Returns how
 /// many rows it rewrote.

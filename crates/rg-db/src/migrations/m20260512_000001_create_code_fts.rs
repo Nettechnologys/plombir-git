@@ -218,7 +218,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 path: std::env::temp_dir().join(format!(
-                    "forgekeep-code-fts-create-{}.db",
+                    "plombir-git-code-fts-create-{}.db",
                     uuid::Uuid::new_v4().simple()
                 )),
             }
@@ -288,10 +288,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
+    #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
     async fn server_create_preserves_live_rows_and_recovers_after_every_stage() {
-        let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
-            .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+        let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+            .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
         assert!(
             database_url.starts_with("postgres://") || database_url.starts_with("mysql://"),
             "this proof exercises PostgreSQL or MySQL create/index DDL"

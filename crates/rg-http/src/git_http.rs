@@ -269,7 +269,7 @@ async fn check_git_access(
         // credentials. The String body carries the default text/plain type.
         Ok(false) if actor_id.is_none() => Err((
             StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"ForgeKeep\"")],
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"Plombir Git\"")],
             "authentication required".to_string(),
         )),
         // Authenticated but lacking permission → 403.
@@ -995,9 +995,9 @@ fn build_info_refs(repo_path: &std::path::Path, service: &str) -> Result<String>
     }
 
     let caps = if service == "git-upload-pack" {
-        "multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=forgekeep/0.1"
+        "multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=plombir-git/0.1"
     } else {
-        "report-status report-status-v2 side-band-64k agent=forgekeep/0.1"
+        "report-status report-status-v2 side-band-64k agent=plombir-git/0.1"
     };
 
     if let Some((sha, refname)) = ref_list.first() {

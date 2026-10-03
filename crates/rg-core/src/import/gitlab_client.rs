@@ -202,7 +202,7 @@ impl GitLabClient {
         let client = builder
             .default_headers(headers)
             .redirect(crate::net::same_origin_redirect_policy())
-            .user_agent("ForgeKeep/0.1")
+            .user_agent("PlombirGit/0.1")
             .build()
             .context("failed to build GitLab HTTP client")?;
 

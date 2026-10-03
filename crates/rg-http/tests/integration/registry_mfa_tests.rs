@@ -47,7 +47,7 @@ async fn token_request(base: &str, auth: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}/v2/auth/token", base))
         .query(&[
-            ("service", "forgekeep-registry"),
+            ("service", "plombir-git-registry"),
             ("scope", "repository:reg_mfa/image:pull"),
         ])
         .header(reqwest::header::AUTHORIZATION, auth)

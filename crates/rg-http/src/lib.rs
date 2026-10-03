@@ -1,4 +1,4 @@
-//! ForgeKeep HTTP server implementation using Axum.
+//! Plombir Git HTTP server implementation using Axum.
 //!
 //! Provides:
 //!  - Git Smart HTTP protocol endpoints (`/git/...`)
@@ -499,7 +499,7 @@ async fn run_with_listener(
     // Same reason, for the one secret a detached task has to open rather than
     // report: a webhook delivery signs with `webhooks.secret_encrypted`, and it
     // is dispatched from too many call sites to be handed the at-rest key as a
-    // parameter. `forgekeep serve` publishes it too; this covers a state built
+    // parameter. `plombir-git serve` publishes it too; this covers a state built
     // without the full boot.
     rg_core::auth::at_rest_key::publish(&config.encryption_key);
 
@@ -532,7 +532,7 @@ async fn run_with_listener(
     );
     // One registry shape, not two. The branch that used to stand here was
     // selected by a `[server]` key inherited from upstream that reached
-    // neither `ServerConfig` nor `forgekeep.example.toml`, so `serve` wrote a
+    // neither `ServerConfig` nor `plombir-git.example.toml`, so `serve` wrote a
     // `None` literal into it and only a test fixture ever produced anything
     // else — while an OCI error told operators to configure it, which
     // `deny_unknown_fields` would have turned into a refused start
@@ -894,7 +894,7 @@ async fn refresh_entity_gauges(db: &DatabaseConnection) {
 }
 
 /// Background task that periodically refreshes the entity-count gauges
-/// (`forgekeep_users`, `forgekeep_repositories`) so the business dashboard shows
+/// (`plombir_git_users`, `plombir_git_repositories`) so the business dashboard shows
 /// live totals without every create/delete handler having to recompute them.
 /// Runs once immediately at startup, then every 60s until shutdown.
 async fn run_metrics_gauge_sink(

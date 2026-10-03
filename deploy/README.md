@@ -1,13 +1,13 @@
-# ForgeKeep Deployment Guide
+# Plombir Git Deployment Guide
 
 Two compose files, pick one:
 
 | File | Data lives in | Settings come from | Use it when |
 |------|---------------|--------------------|-------------|
-| `docker-compose.yml` | Docker named volume `forgekeep-data` | env vars + the image's default flags | trying ForgeKeep out |
-| `docker-compose.hostdir.yml` | host directory `deploy/data/` | `deploy/forgekeep.toml` | running it for real: you want to see, back up and restore the data yourself |
+| `docker-compose.yml` | Docker named volume `plombir-git-data` | env vars + the image's default flags | trying Plombir Git out |
+| `docker-compose.hostdir.yml` | host directory `deploy/data/` | `deploy/plombir-git.toml` | running it for real: you want to see, back up and restore the data yourself |
 
-## 🚀 Quick Start — ForgeKeep Application
+## 🚀 Quick Start — Plombir Git Application
 
 ```bash
 cd deploy
@@ -19,11 +19,11 @@ cd deploy
 #    stock umask would leave it readable by every other account on the host.
 install -m 600 .env.example .env
 secret="$(openssl rand -hex 32)"
-sed -i.bak "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" .env
-sed -i.bak "s/^FORGEKEEP_ENCRYPTION_KEY=.*/FORGEKEEP_ENCRYPTION_KEY=${secret}/" .env
+sed -i.bak "s/^PLOMBIR_GIT_JWT_SECRET=.*/PLOMBIR_GIT_JWT_SECRET=${secret}/" .env
+sed -i.bak "s/^PLOMBIR_GIT_ENCRYPTION_KEY=.*/PLOMBIR_GIT_ENCRYPTION_KEY=${secret}/" .env
 rm -f .env.bak
 
-# 2. Start ForgeKeep
+# 2. Start Plombir Git
 docker compose up -d
 
 # 3. Check status
@@ -38,7 +38,7 @@ Access: **http://localhost:8080**
 ## 🏠 Production Setup — config file + host directory
 
 `docker-compose.hostdir.yml` bind-mounts `deploy/data/` onto `/data` and runs
-`forgekeep serve --config /app/forgekeep.toml`. Everything the server persists —
+`plombir-git serve --config /app/plombir-git.toml`. Everything the server persists —
 repos, the SQLite DB, the audit archive and the generated SSH host key — lands
 in that one host directory. Logs go to stdout, so `docker compose logs` and
 your log driver work as usual; set `[logging].file` if you want them in
@@ -52,13 +52,13 @@ cd deploy
 #    plain text. `sed -i.bak` preserves the mode it finds.
 install -m 600 .env.example .env
 secret="$(openssl rand -hex 32)"
-sed -i.bak "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" .env
-sed -i.bak "s/^FORGEKEEP_ENCRYPTION_KEY=.*/FORGEKEEP_ENCRYPTION_KEY=${secret}/" .env
+sed -i.bak "s/^PLOMBIR_GIT_JWT_SECRET=.*/PLOMBIR_GIT_JWT_SECRET=${secret}/" .env
+sed -i.bak "s/^PLOMBIR_GIT_ENCRYPTION_KEY=.*/PLOMBIR_GIT_ENCRYPTION_KEY=${secret}/" .env
 rm -f .env.bak
-printf 'FORGEKEEP_UID=%s\nFORGEKEEP_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+printf 'PLOMBIR_GIT_UID=%s\nPLOMBIR_GIT_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 
 # 2. Config file. It MUST exist before `up` — see the bind-mount trap below.
-install -m 600 forgekeep.docker.toml forgekeep.toml
+install -m 600 plombir-git.docker.toml plombir-git.toml
 
 # 3. Data directory, owned by the uid from step 1. `install -d -m 700` and not
 #    `mkdir`: under a stock umask this directory would be 0755, and everything
@@ -68,9 +68,9 @@ install -m 600 forgekeep.docker.toml forgekeep.toml
 #    once, on the directory; the server never narrows it for you.
 install -d -m 700 data
 
-# 4. Build + start. The build bakes FORGEKEEP_UID into the image, and the
+# 4. Build + start. The build bakes PLOMBIR_GIT_UID into the image, and the
 #    commit being built into the binary: every page links that commit's source.
-FORGEKEEP_SOURCE_COMMIT=$(git rev-parse HEAD) \
+PLOMBIR_GIT_SOURCE_COMMIT=$(git rev-parse HEAD) \
   docker compose -f docker-compose.hostdir.yml up -d --build
 
 # 5. Verify both listeners are up.
@@ -82,36 +82,36 @@ ssh -p 2222 -o StrictHostKeyChecking=no git@localhost 2>&1 | head -1
 HTTP is published on `127.0.0.1:8080` only — put a TLS-terminating reverse
 proxy in front of it. Git-over-SSH listens on `0.0.0.0:2222`.
 
-`forgekeep.toml` and `data/` are git-ignored, so a rebuilt container keeps
+`plombir-git.toml` and `data/` are git-ignored, so a rebuilt container keeps
 reading the settings and data you edited on the host.
 
 ### The two traps this layout avoids
 
 **1. Bind-mounting a file that does not exist yet.** Docker silently creates a
-*directory* at the mount point. Mounting a missing `forgekeep.toml` therefore
+*directory* at the mount point. Mounting a missing `plombir-git.toml` therefore
 gives the server a directory to parse — which is why step 2 above copies the
 file into place *before* `up`. For the same reason the SSH host key is **not**
 mounted from the host here: `[server].host_key = "/data/ssh_host_key"` puts it
 inside the data directory, where the server generates it on first start and it
 persists across rebuilds.
 
-**2. uid mismatch on the bind-mount.** The container's `forgekeep` user is not
+**2. uid mismatch on the bind-mount.** The container's `plombir-git` user is not
 the host user of the same name — only the numeric uid matters. Three ways out,
 in order of preference:
 
 ```bash
 # a. Build the image as your host user (what step 1 does).
-printf 'FORGEKEEP_UID=%s\nFORGEKEEP_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+printf 'PLOMBIR_GIT_UID=%s\nPLOMBIR_GIT_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 docker compose -f docker-compose.hostdir.yml up -d --build
 
 # b. Keep the image default (uid 1000) and chown the host directory.
 sudo chown -R 1000:1000 ./data
 
 # c. Check what the image actually runs as, if you inherited it from someone.
-docker compose -f docker-compose.hostdir.yml run --rm --entrypoint id forgekeep
+docker compose -f docker-compose.hostdir.yml run --rm --entrypoint id plombir-git
 ```
 
-Note that `FORGEKEEP_UID` is a **build** argument: after changing it you must
+Note that `PLOMBIR_GIT_UID` is a **build** argument: after changing it you must
 `up --build`, not just `restart`.
 
 ### Troubleshooting a failed first start
@@ -121,9 +121,9 @@ failures, prints the uid to `chown` to.
 
 | Log line | Cause | Fix |
 |----------|-------|-----|
-| `config file … is a directory, not a file` | mounted a `forgekeep.toml` that did not exist | `rm -rf forgekeep.toml && install -m 600 forgekeep.docker.toml forgekeep.toml` |
-| `config file … has mode 0644` | config is readable by another local account | `chmod 600 forgekeep.toml` |
-| `repo_root … Permission denied` + `this process runs as uid=…` | `data/` owned by a different uid | `chown` to the uid from the message, or rebuild with `FORGEKEEP_UID` |
+| `config file … is a directory, not a file` | mounted a `plombir-git.toml` that did not exist | `rm -rf plombir-git.toml && install -m 600 plombir-git.docker.toml plombir-git.toml` |
+| `config file … has mode 0644` | config is readable by another local account | `chmod 600 plombir-git.toml` |
+| `repo_root … Permission denied` + `this process runs as uid=…` | `data/` owned by a different uid | `chown` to the uid from the message, or rebuild with `PLOMBIR_GIT_UID` |
 | `SQLite database … is not writable` | same, for the DB and its `-wal`/`-shm` sidecars | as above — the *directory* must be writable, not just the file |
 | `SSH host key … Permission denied` | key file readable only by another uid | `chown <uid> data/ssh_host_key && chmod 600 data/ssh_host_key` |
 | `SSH host key path … is a directory` | bind-mounted a host key file that did not exist | remove the directory and let the server generate the key |
@@ -142,11 +142,11 @@ directory, or take a hot SQLite backup with the commands in the
 ### Environment variables (used with default CMD):
 | Variable | Required | Default |
 |----------|----------|---------|
-| `FORGEKEEP_JWT_SECRET` | **Yes** | set in `deploy/.env` |
-| `FORGEKEEP_ENCRYPTION_KEY` | Strongly recommended | `[auth].key_file` — a durable key file the server creates on first start |
-| `FORGEKEEP_CORS_ORIGINS` | No | unset — CORS disabled |
-| `FORGEKEEP_CSP_CONNECT_SRC` | No | unset |
-| `FORGEKEEP_REGISTRATION` | No (set it before exposing the port) | `open` — `[auth].registration` |
+| `PLOMBIR_GIT_JWT_SECRET` | **Yes** | set in `deploy/.env` |
+| `PLOMBIR_GIT_ENCRYPTION_KEY` | Strongly recommended | `[auth].key_file` — a durable key file the server creates on first start |
+| `PLOMBIR_GIT_CORS_ORIGINS` | No | unset — CORS disabled |
+| `PLOMBIR_GIT_CSP_CONNECT_SRC` | No | unset |
+| `PLOMBIR_GIT_REGISTRATION` | No (set it before exposing the port) | `open` — `[auth].registration` |
 
 On Linux with glibc, the server limits malloc to two arenas before starting
 worker threads. To override this for a measured high-concurrency deployment,
@@ -156,7 +156,7 @@ it through the service's `environment:` block; placing it only in the Compose
 
 ### Who may create an account
 
-`FORGEKEEP_REGISTRATION=closed` (or `[auth].registration = "closed"`, the env
+`PLOMBIR_GIT_REGISTRATION=closed` (or `[auth].registration = "closed"`, the env
 var wins) makes `POST /api/v1/users/register` answer `403` before it hashes a
 password or writes anything. Leave it at `open` and the endpoint accepts anyone
 who can reach it — `[rate_limit].auth_max` throttles that to 10 accounts per
@@ -171,8 +171,8 @@ Two things `closed` still admits, on purpose:
   registration before the port is reachable by anyone else — the bootstrap
   window is open until it is used.
 * **LDAP / SSO first-login provisioning.** It is a separate channel
-  (`forgekeep_auth_events_total{event="provision"}`) with its own switch, per
-  provider — see below. `FORGEKEEP_REGISTRATION` does not reach it in either
+  (`plombir_git_auth_events_total{event="provision"}`) with its own switch, per
+  provider — see below. `PLOMBIR_GIT_REGISTRATION` does not reach it in either
   direction.
 
 A value neither `open` nor `closed` fails the start with the accepted spellings
@@ -202,61 +202,61 @@ its email — so the switch is safe to flip on a live instance.
 > an upgrade changes nothing about who can log in. If one of them is a public
 > IdP (`github.com`, `google.com`), that is the setting to revisit first: with it
 > on, anyone with an account *there* can have one *here*, and
-> `FORGEKEEP_REGISTRATION=closed` does not change that.
+> `PLOMBIR_GIT_REGISTRATION=closed` does not change that.
 
 ### Secrets and rotation
 
-`FORGEKEEP_JWT_SECRET` signs tokens. The at-rest key encrypts TOTP secrets, CI
+`PLOMBIR_GIT_JWT_SECRET` signs tokens. The at-rest key encrypts TOTP secrets, CI
 secrets, mirror and LDAP passwords, SSO client secrets, and OAuth tokens. On a
 normal first start the server generates `/data/encryption_key`, mode `0600`, and
 keeps reusing it from the bind-mounted data directory. It is deliberately not
-derived from the JWT secret, so rotating `FORGEKEEP_JWT_SECRET` only invalidates
+derived from the JWT secret, so rotating `PLOMBIR_GIT_JWT_SECRET` only invalidates
 sessions and never needs a second manual `.env` step.
 
-`FORGEKEEP_ENCRYPTION_KEY` still wins over the file for an external KMS or
+`PLOMBIR_GIT_ENCRYPTION_KEY` still wins over the file for an external KMS or
 vault. `[auth].key_file` changes its location; by default it is beside
 `[server].host_key`. The startup marker in the database makes a substituted or
 deleted key file fail immediately with the recovery source named, rather than
 letting MFA, CI and mirror operations fail later. A blank
-`FORGEKEEP_JWT_SECRET=` in `.env` counts as unset, not as "the empty secret".
+`PLOMBIR_GIT_JWT_SECRET=` in `.env` counts as unset, not as "the empty secret".
 
 If the encryption key itself leaks, move the database onto a new one with the
 server stopped. The `docker compose stop` below is not advisory: on a
-file-backed SQLite database the command refuses to start while a ForgeKeep
+file-backed SQLite database the command refuses to start while a Plombir Git
 server holds it — `--dry-run` too, since the dry run walks the same rows under
 the same write lock and only rolls back at the end.
 
 ```bash
-docker compose stop forgekeep
-docker compose run --rm forgekeep rotate-encryption-key \
-    --db-url "sqlite:///data/forgekeep.db?mode=rwc" \
+docker compose stop plombir-git
+docker compose run --rm plombir-git rotate-encryption-key \
+    --db-url "sqlite:///data/plombir-git.db?mode=rwc" \
     --old "$OLD_KEY" --new "$NEW_KEY" --dry-run   # reports, changes nothing
-docker compose run --rm forgekeep rotate-encryption-key \
-    --db-url "sqlite:///data/forgekeep.db?mode=rwc" \
+docker compose run --rm plombir-git rotate-encryption-key \
+    --db-url "sqlite:///data/plombir-git.db?mode=rwc" \
     --old "$OLD_KEY" --new "$NEW_KEY" --yes
 # then replace /data/encryption_key with the new value (mode 0600),
-# or update FORGEKEEP_ENCRYPTION_KEY in .env for an external key source
-docker compose up -d forgekeep
+# or update PLOMBIR_GIT_ENCRYPTION_KEY in .env for an external key source
+docker compose up -d plombir-git
 ```
 
 `docker compose run` replaces the image's own command, so the database has to be
-named here: without `--db-url` (or `--config /app/forgekeep.toml`, if you deploy
-with a config file) the command falls back to `sqlite://./forgekeep.db?mode=rwc`
+named here: without `--db-url` (or `--config /app/plombir-git.toml`, if you deploy
+with a config file) the command falls back to `sqlite://./plombir-git.db?mode=rwc`
 under `WORKDIR /app` and re-encrypts an empty file it just created. The same
 applies to every admin subcommand below.
 
 Keep the old key until the server has come up under the new one — it is what
 opens anything the pass reported as unreadable.
 
-For a separately hosted frontend, set `FORGEKEEP_CORS_ORIGINS` to the browser
-origin. ForgeKeep also adds those origins, plus matching `ws://` or `wss://`
-origins, to CSP `connect-src`. Use `FORGEKEEP_CSP_CONNECT_SRC` only for extra
-API/WebSocket origins not covered by CORS. With `FORGEKEEP_CORS_ORIGINS` unset
-or blank, ForgeKeep emits no CORS permission headers.
+For a separately hosted frontend, set `PLOMBIR_GIT_CORS_ORIGINS` to the browser
+origin. Plombir Git also adds those origins, plus matching `ws://` or `wss://`
+origins, to CSP `connect-src`. Use `PLOMBIR_GIT_CSP_CONNECT_SRC` only for extra
+API/WebSocket origins not covered by CORS. With `PLOMBIR_GIT_CORS_ORIGINS` unset
+or blank, Plombir Git emits no CORS permission headers.
 
 Outbound webhooks require `https://` by default. For a deliberately plaintext
 receiver on an operator-controlled development network, set
-`[webhooks].allow_insecure_http = true` in `forgekeep.toml`; the private,
+`[webhooks].allow_insecure_http = true` in `plombir-git.toml`; the private,
 loopback, and link-local SSRF checks remain active.
 
 ### Volumes
@@ -270,13 +270,13 @@ The Docker image includes all runtime binaries:
 
 | Binary | Purpose |
 |--------|---------|
-| `forgekeep` | Main server and admin CLI |
-| `forgekeep-runner` | Standalone CI runner agent |
-| `forgekeep-mcp` | MCP stdio server |
+| `plombir-git` | Main server and admin CLI |
+| `plombir-git-runner` | Standalone CI runner agent |
+| `plombir-git-mcp` | MCP stdio server |
 
 ### SQLite Backup / Restore
 
-**The server backs itself up.** `deploy/forgekeep.docker.toml` ships with:
+**The server backs itself up.** `deploy/plombir-git.docker.toml` ships with:
 
 ```toml
 [backup]
@@ -291,18 +291,18 @@ A background task inside the server takes a `VACUUM INTO` snapshot every
 no cron entry to forget on one particular host — and the snapshot is taken from
 the pool the server is already using, which is the one thing a manual
 `backup-db` cannot guarantee. Snapshots are named
-`forgekeep-<UTC timestamp>-<uuid>.db`; rotation only ever deletes files matching
+`plombir-git-<UTC timestamp>-<uuid>.db`; rotation only ever deletes files matching
 that exact shape, so a hand-made backup left in the same directory is safe.
 
 Things worth knowing before you rely on it:
 
 | | |
 |-|-|
-| **Disk** | Budget `keep_last` × the size of `/data/forgekeep.db`. |
+| **Disk** | Budget `keep_last` × the size of `/data/plombir-git.db`. |
 | **Startup check** | An unwritable `dir` fails the start with the path and the uid, rather than surfacing a day later as a warning. Set `enabled = false` if you do not want scheduled backups. |
 | **Non-SQLite** | `enabled = true` on PostgreSQL/MySQL fails the start by design — `VACUUM INTO` cannot snapshot them. Schedule `pg_dump` / `mysqldump` and leave this off. |
 | **Not covered** | `/data/repos`. A database backup restores users, issues, PRs and settings; the git data is a separate artifact. Snapshot the whole `/data` volume, or decide explicitly that bare repos are recoverable from developer clones. |
-| **Monitoring** | `forgekeep_db_backup_last_success_timestamp_seconds` and `forgekeep_db_backups_total{status}`. The `BackupTooOld` / `BackupRunsFailing` rules in `deploy/prometheus/alerts.yml` read them. |
+| **Monitoring** | `plombir_git_db_backup_last_success_timestamp_seconds` and `plombir_git_db_backups_total{status}`. The `BackupTooOld` / `BackupRunsFailing` rules in `deploy/prometheus/alerts.yml` read them. |
 | **Verify it** | Restore one. A backup that has never been restored is a file, not a backup — use the `restore-db` recipe below against a throwaway `--db-url`. |
 
 The first snapshot of a process is due from the newest file already in `dir`,
@@ -312,34 +312,34 @@ in a crash loop does not snapshot on every boot and rotate the good copies out.
 
 #### Taking one by hand
 
-Backups use SQLite `VACUUM INTO`, so they can be taken while ForgeKeep is
+Backups use SQLite `VACUUM INTO`, so they can be taken while Plombir Git is
 running:
 
 ```bash
-docker compose exec forgekeep sh -lc \
-  'mkdir -p /data/backups && forgekeep backup-db \
-    --db-url "sqlite:///data/forgekeep.db?mode=rw" \
-    "/data/backups/forgekeep-$(date +%Y%m%d-%H%M%S).db"'
+docker compose exec plombir-git sh -lc \
+  'mkdir -p /data/backups && plombir-git backup-db \
+    --db-url "sqlite:///data/plombir-git.db?mode=rw" \
+    "/data/backups/plombir-git-$(date +%Y%m%d-%H%M%S).db"'
 ```
 
 Restore requires the main service to be stopped so the database file is not in
 use:
 
 ```bash
-docker compose stop forgekeep
-docker compose run --rm forgekeep restore-db \
-  --db-url "sqlite:///data/forgekeep.db?mode=rwc" \
+docker compose stop plombir-git
+docker compose run --rm plombir-git restore-db \
+  --db-url "sqlite:///data/plombir-git.db?mode=rwc" \
   --force \
-  /data/backups/forgekeep-YYYYMMDD-HHMMSS.db
-docker compose up -d forgekeep
+  /data/backups/plombir-git-YYYYMMDD-HHMMSS.db
+docker compose up -d plombir-git
 ```
 
-If you deploy with a config file, pass `--config /app/forgekeep.toml` instead of
+If you deploy with a config file, pass `--config /app/plombir-git.toml` instead of
 `--db-url`: every DB-touching subcommand (`migrate`, `rebuild-fts`, `backup-db`,
 `restore-db`, `rotate-instance-key`, `rotate-encryption-key`, `import`,
 `index-repo`, `package list`) reads `[database].url` from it, so the admin
 command and the server cannot end up pointed at two different databases.
-Passing **neither** falls back to `sqlite://./forgekeep.db?mode=rwc` relative to
+Passing **neither** falls back to `sqlite://./plombir-git.db?mode=rwc` relative to
 the current directory — the container's `WORKDIR /app` unless `docker exec -w`
 says otherwise — where no database lives. `backup-db` refuses that address and
 creates nothing, but `migrate` is allowed to create a database, so there it
@@ -352,12 +352,12 @@ enforce it through a process lease, so stop the service before running any of
 them. For example:
 
 ```bash
-docker compose stop forgekeep
-docker compose run --rm forgekeep migrate --config /app/forgekeep.toml
-docker compose up -d forgekeep
+docker compose stop plombir-git
+docker compose run --rm plombir-git migrate --config /app/plombir-git.toml
+docker compose up -d plombir-git
 ```
 
-The `.forgekeep.lock` sidecar next to the database is persistent by design; do
+The `.plombir-git.lock` sidecar next to the database is persistent by design; do
 not delete it as a stale PID file. The lock itself is owned by the OS and is
 released automatically when the server or migration process exits.
 
@@ -382,7 +382,7 @@ the type changes; MySQL may rebuild the tables and its DDL is not transactional.
 Use an offline application window even though the migration lock itself is
 online-capable:
 
-1. Stop ForgeKeep servers and runners that write pipelines. Confirm there are
+1. Stop Plombir Git servers and runners that write pipelines. Confirm there are
    no remaining application sessions or long transactions holding the five CI
    tables.
 2. Record row counts for `pipelines`, `pipeline_stages`, `pipeline_jobs`,
@@ -390,7 +390,7 @@ online-capable:
    logical backup (`pg_dump --format=custom` or `mysqldump
    --single-transaction`) and restore it into a throwaway database before
    proceeding. A successful dump command alone is not verification.
-3. Run the new binary's `forgekeep migrate --config /app/forgekeep.toml`. Do not
+3. Run the new binary's `plombir-git migrate --config /app/plombir-git.toml`. Do not
    start the new server until it exits successfully.
 4. Verify that every CI id/FK is `BIGINT`; `pipeline_jobs.updated_at` is
    `timestamp without time zone` on PostgreSQL or `datetime` on MySQL; and the
@@ -401,7 +401,7 @@ online-capable:
 The migration is deliberately forward-only: narrowing a newly accepted id
 above `i32::MAX` is not a safe rollback. If the database migration itself is
 only partly applied on MySQL or post-migration verification fails, keep
-ForgeKeep stopped and restore the verified backup; do not hand-edit columns back
+Plombir Git stopped and restore the verified backup; do not hand-edit columns back
 to `INT`.
 
 #### Rolling back across a migration
@@ -433,7 +433,7 @@ proved itself.
 
 ## Overview
 
-This is a production-grade observability stack for ForgeKeep, providing:
+This is a production-grade observability stack for Plombir Git, providing:
 
 - **Metrics**: Prometheus scrapes `/metrics` every 15s
 - **Alerting**: Alertmanager routes alerts by severity (critical/warning/info)
@@ -459,8 +459,8 @@ docker compose -f docker-compose.observability.yml ps
 docker compose -f docker-compose.observability.yml logs -f
 ```
 
-Prometheus scrapes the app at `forgekeep:8080` through the shared Docker
-network `forgekeep-net`; start the main ForgeKeep compose service first.
+Prometheus scrapes the app at `plombir-git:8080` through the shared Docker
+network `plombir-git-net`; start the main Plombir Git compose service first.
 
 ## 📈 Available Metrics
 
@@ -503,19 +503,19 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 ### Business Metrics (Phase 22-C)
 | Metric | Type | Description |
 |--------|------|-------------|
-| `forgekeep_users_registered_total` | Counter | User accounts created — self-service registration **and** LDAP/SSO first-login auto-provision (provenance split via `forgekeep_auth_events_total{event="provision",outcome="ldap"\|"sso"}`; refusals are a separate series, `event="provision_refused",outcome=<rule>`, and never count as an account) |
-| `forgekeep_repos_created_total` | Counter | Repos created |
-| `forgekeep_repos_deleted_total` | Counter | Repos deleted — the REST endpoint **and** the cascades that retire repositories without one of their own (deleting an organization or an account), so this counter and the `forgekeep_repositories` gauge describe the same event |
-| `forgekeep_repos_forked_total` | Counter | Repos forked |
-| `forgekeep_issues_opened_total` | Counter | Issues opened — filed over the REST API **and** replayed by a repository import, which files through the same repository-local number allocator and owns no handler of its own |
-| `forgekeep_issues_closed_total` | Counter | Issues closed — the transition the REST endpoint performs **and** an imported issue that arrives already closed, so `opened - closed` is not permanently wrong by the imported history |
-| `forgekeep_prs_opened_total` | Counter | PRs opened — the REST endpoint **and** a repository import, for the same reason as issues |
-| `forgekeep_prs_merged_total` | Counter | PRs merged — the REST endpoint, auto-merge and the merge queue (all through `merge_pr`) **and** an imported pull request that arrives already merged, which is written in one insert and never reaches `merge_pr` |
-| `forgekeep_stars_total` | Counter | Stars given |
-| `forgekeep_webhook_deliveries_total` | Counter (labels: status) | Webhook deliveries |
-| `forgekeep_ws_connections` | Gauge | Active WS connections |
-| `forgekeep_users` | Gauge | Total registered users |
-| `forgekeep_repositories` | Gauge | Total non-deleted repos |
+| `plombir_git_users_registered_total` | Counter | User accounts created — self-service registration **and** LDAP/SSO first-login auto-provision (provenance split via `plombir_git_auth_events_total{event="provision",outcome="ldap"\|"sso"}`; refusals are a separate series, `event="provision_refused",outcome=<rule>`, and never count as an account) |
+| `plombir_git_repos_created_total` | Counter | Repos created |
+| `plombir_git_repos_deleted_total` | Counter | Repos deleted — the REST endpoint **and** the cascades that retire repositories without one of their own (deleting an organization or an account), so this counter and the `plombir_git_repositories` gauge describe the same event |
+| `plombir_git_repos_forked_total` | Counter | Repos forked |
+| `plombir_git_issues_opened_total` | Counter | Issues opened — filed over the REST API **and** replayed by a repository import, which files through the same repository-local number allocator and owns no handler of its own |
+| `plombir_git_issues_closed_total` | Counter | Issues closed — the transition the REST endpoint performs **and** an imported issue that arrives already closed, so `opened - closed` is not permanently wrong by the imported history |
+| `plombir_git_prs_opened_total` | Counter | PRs opened — the REST endpoint **and** a repository import, for the same reason as issues |
+| `plombir_git_prs_merged_total` | Counter | PRs merged — the REST endpoint, auto-merge and the merge queue (all through `merge_pr`) **and** an imported pull request that arrives already merged, which is written in one insert and never reaches `merge_pr` |
+| `plombir_git_stars_total` | Counter | Stars given |
+| `plombir_git_webhook_deliveries_total` | Counter (labels: status) | Webhook deliveries |
+| `plombir_git_ws_connections` | Gauge | Active WS connections |
+| `plombir_git_users` | Gauge | Total registered users |
+| `plombir_git_repositories` | Gauge | Total non-deleted repos |
 
 ## 🔔 Alert Rules
 
@@ -537,7 +537,7 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 - **CIJobQueueBuildup**: > 50 jobs running for 15+ minutes (warning)
 
 ### Health Alerts
-- **ForgeKeepDown**: Target down for 2+ minutes (critical, pages on-call)
+- **PlombirGitDown**: Target down for 2+ minutes (critical, pages on-call)
 - **HighMemoryUsage**: Memory > 90% for 10+ minutes (warning)
 - **LowDiskSpace**: Disk > 85% for 10+ minutes (warning)
 
@@ -547,23 +547,23 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 
 ## 🔭 Distributed Tracing (OpenTelemetry)
 
-Beyond Prometheus metrics, ForgeKeep can export **distributed traces** over
+Beyond Prometheus metrics, Plombir Git can export **distributed traces** over
 OTLP/HTTP (protobuf) to any OpenTelemetry collector (Tempo, Jaeger, the OTel
 Collector, Honeycomb, …). Tracing is **opt-in** and independent of `/metrics`.
 
-Enable it via `[observability]` in `forgekeep.toml` or the standard env vars:
+Enable it via `[observability]` in `plombir-git.toml` or the standard env vars:
 
 ```toml
 [observability]
 otlp_endpoint = "http://localhost:4318"   # /v1/traces is appended automatically
-# service_name = "forgekeep"
+# service_name = "plombir-git"
 # sample_ratio = 1.0                       # 0.0..=1.0 head sampling
 ```
 
 ```bash
 # Equivalent via the standard OpenTelemetry environment variables:
 export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318"
-export OTEL_SERVICE_NAME="forgekeep"
+export OTEL_SERVICE_NAME="plombir-git"
 ```
 
 With no endpoint configured, none of the tracing machinery runs. When enabled,
@@ -574,7 +574,7 @@ thread and flushed on graceful shutdown.
 
 ## 📋 Dashboard Panels
 
-The main dashboard (`forgekeep-main`) includes:
+The main dashboard (`plombir-git-main`) includes:
 
 - Grafana panel `1`: **📊 Request Rate (QPS)** — per-route traffic
 - Grafana panel `2`: **⏱️ P95 Request Latency** — p95/p99 latency distribution per route
@@ -636,7 +636,7 @@ metrics::recorder::my_event();
 
 ```
 ┌──────────────────┐  scrape   ┌─────────────────┐
-│  ForgeKeep       │ ────────▶ │  Prometheus     │
+│  Plombir Git       │ ────────▶ │  Prometheus     │
 │  :8080/metrics   │  15s      │  :9090          │
 └──────────────────┘           └────────┬────────┘
                                         │

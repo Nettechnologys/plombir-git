@@ -1,4 +1,4 @@
-# ForgeKeep — UI Inventory (generated)
+# Plombir Git — UI Inventory (generated)
 
 > **Сгенерировано.** Не править руками — перегенерировать:
 > `node scripts/ui-inventory.mjs`

@@ -1,4 +1,4 @@
-//! Process-level checks for `forgekeep serve` startup failures.
+//! Process-level checks for `plombir-git serve` startup failures.
 //!
 //! A transport task returning `Err` is not the same thing as its Tokio task
 //! panicking. The former used to be logged inside the spawned future and then
@@ -24,9 +24,9 @@ fn an_occupied_http_port_makes_serve_exit_unsuccessfully() {
     let http_addr = occupied.local_addr().expect("reserved HTTP address");
     let database_url = format!(
         "sqlite://{}?mode=rwc",
-        dir.path().join("forgekeep.db").display()
+        dir.path().join("plombir-git.db").display()
     );
-    let config = dir.path().join("forgekeep.toml");
+    let config = dir.path().join("plombir-git.toml");
     std::fs::write(&config, "[server]\nshutdown_grace_secs = 1\n").expect("write the test config");
     #[cfg(unix)]
     {
@@ -35,7 +35,7 @@ fn an_occupied_http_port_makes_serve_exit_unsuccessfully() {
             .expect("make the test config owner-only");
     }
 
-    let output = Command::new(env!("CARGO_BIN_EXE_forgekeep"))
+    let output = Command::new(env!("CARGO_BIN_EXE_plombir-git"))
         .args([
             "serve",
             "--repo-root",
@@ -60,7 +60,7 @@ fn an_occupied_http_port_makes_serve_exit_unsuccessfully() {
         ])
         .current_dir(dir.path())
         .output()
-        .expect("run forgekeep serve with its HTTP port occupied");
+        .expect("run plombir-git serve with its HTTP port occupied");
     let text = diagnostic(&output);
 
     assert!(
@@ -76,7 +76,7 @@ fn an_occupied_http_port_makes_serve_exit_unsuccessfully() {
         "the bind failure must name the requested address:\n{text}"
     );
     assert!(
-        !text.contains("ForgeKeep server started"),
+        !text.contains("Plombir Git server started"),
         "startup must not be announced before the listener owns its address:\n{text}"
     );
 }

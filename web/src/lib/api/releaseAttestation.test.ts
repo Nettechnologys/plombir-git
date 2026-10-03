@@ -28,7 +28,7 @@ let rendered: RenderedComponent | undefined;
 const asset = {
 	id: 11,
 	release_id: 7,
-	filename: 'forgekeep.zip',
+	filename: 'plombir-git.zip',
 	size: 7,
 	content_type: 'application/zip',
 	download_count: 0,

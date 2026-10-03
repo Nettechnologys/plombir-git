@@ -1,8 +1,8 @@
-//! The configuration under which ForgeKeep runs the `git` binary.
+//! The configuration under which Plombir Git runs the `git` binary.
 //!
 //! The subprocess twin of [`crate::repository::open`]. That one states the
-//! permissions ForgeKeep opens a repository under in-process; this one states
-//! the configuration ForgeKeep runs `git` under, so the two halves of the same
+//! permissions Plombir Git opens a repository under in-process; this one states
+//! the configuration Plombir Git runs `git` under, so the two halves of the same
 //! server answer the same way.
 //!
 //! Without it, `git` answers to the machine. `/etc/gitconfig` and the
@@ -13,7 +13,7 @@
 //! `core.hooksPath` is running their own scripts inside every server-side
 //! replay; one who set `commit.gpgsign` is turning every rebase merge into a
 //! `500`. None of that is a setting the instance offered anybody — it is the
-//! host steering what ForgeKeep does with somebody else's repository, and two
+//! host steering what Plombir Git does with somebody else's repository, and two
 //! instances configured differently answer the same request differently
 //! without either of them saying so. Measured on git 2.43.0, all three.
 //!
@@ -25,7 +25,7 @@
 //!   child the gateway spawns, on both the synchronous and the streaming path,
 //!   so a call site cannot arrive without it and this module cannot be the
 //!   reason one did.
-//! * the settings ForgeKeep decides are stated on the command line, where they
+//! * the settings Plombir Git decides are stated on the command line, where they
 //!   outrank every configuration file. `OWNED_SETTINGS` below is that list, and
 //!   every entry there is git's own default — an unconfigured host therefore
 //!   behaves exactly as it did before.
@@ -34,9 +34,9 @@
 //! says only that the *host* did not decide; it leaves the decision to whatever
 //! git's built-in default happens to be in the version installed, and it says
 //! nothing about configuration written inside the repository the command runs
-//! in. Stating the values is what makes the answer ForgeKeep's own.
+//! in. Stating the values is what makes the answer Plombir Git's own.
 //!
-//! This is the policy for repository-local operations ForgeKeep performs on its
+//! This is the policy for repository-local operations Plombir Git performs on its
 //! own repositories. Talking to a remote the *user* named is a different
 //! contract with a different threat model, and lives in
 //! [`crate::credentials::credential_invocation`].
@@ -47,13 +47,13 @@ use anyhow::Result;
 
 use crate::cli_gateway::{GitCommandGateway, GitOutput};
 
-/// The git settings ForgeKeep states rather than inherits.
+/// The git settings Plombir Git states rather than inherits.
 ///
 /// Every value here is git's own default, so this list changes nothing on a
 /// host that configured nothing — it only takes the decision away from
 /// `/etc/gitconfig`, `~/.gitconfig` and injected `GIT_CONFIG_*` environment. A
 /// setting that genuinely ought to be operator-tunable belongs in
-/// `forgekeep.toml`, where it is the instance's decision and is written down.
+/// `plombir-git.toml`, where it is the instance's decision and is written down.
 const OWNED_SETTINGS: &[&str] = &[
     // The bytes a replay writes. `apply.whitespace` is the one measured to
     // silently rewrite a pull request's content: with the `apply` backend and
@@ -70,7 +70,7 @@ const OWNED_SETTINGS: &[&str] = &[
     // The *global* attributes file, which is the host's; `.gitattributes` inside
     // the repository is the user's own content and is left alone.
     "core.attributesFile=/dev/null",
-    // How content is reconciled. The same knobs `forgekeep_merge_options` states
+    // How content is reconciled. The same knobs `plombir_git_merge_options` states
     // for the in-process half, so the CLI and `gix` paths cannot disagree.
     "diff.algorithm=myers",
     "diff.renames=true",
@@ -89,7 +89,7 @@ const OWNED_SETTINGS: &[&str] = &[
     "clone.defaultRemoteName=origin",
 ];
 
-/// One complete invocation policy for `git` run against ForgeKeep's own
+/// One complete invocation policy for `git` run against Plombir Git's own
 /// repositories.
 ///
 /// Built around a gateway rather than beside one so that a call site reads the

@@ -2192,8 +2192,8 @@ mod tests {
 
         std::fs::create_dir_all(&worktree).unwrap();
         git(&["init", "-q", "-b", "master"]);
-        git(&["config", "user.name", "ForgeKeep Test"]);
-        git(&["config", "user.email", "forgekeep@example.test"]);
+        git(&["config", "user.name", "Plombir Git Test"]);
+        git(&["config", "user.email", "plombir-git@example.test"]);
         std::fs::write(worktree.join("file.txt"), "content\n").unwrap();
         git(&["add", "file.txt"]);
         git(&["commit", "-q", "-m", "history that HEAD cannot name"]);
@@ -2277,8 +2277,8 @@ mod tests {
 
         std::fs::create_dir_all(worktree.join("requested-dir")).unwrap();
         git(&["init", "-q"]);
-        git(&["config", "user.name", "ForgeKeep Test"]);
-        git(&["config", "user.email", "forgekeep@example.test"]);
+        git(&["config", "user.name", "Plombir Git Test"]);
+        git(&["config", "user.email", "plombir-git@example.test"]);
         std::fs::write(worktree.join("requested-dir/file.txt"), "content\n").unwrap();
         git(&["add", "requested-dir/file.txt"]);
         git(&["commit", "-q", "-m", "tree fixture"]);
@@ -2379,8 +2379,8 @@ mod tests {
 
         std::fs::create_dir_all(&worktree).unwrap();
         git(&["init", "-q"]);
-        git(&["config", "user.name", "ForgeKeep Test"]);
-        git(&["config", "user.email", "forgekeep@example.test"]);
+        git(&["config", "user.name", "Plombir Git Test"]);
+        git(&["config", "user.email", "plombir-git@example.test"]);
         std::fs::write(worktree.join("history.txt"), "first\n").unwrap();
         git(&["add", "history.txt"]);
         git(&["commit", "-q", "-m", "first"]);

@@ -102,7 +102,7 @@ async fn a_blob_row_that_was_not_written_fails_the_push() {
     let (token, _user_id) = register_full(&base, "fault_push", "fault_push@example.com").await;
     create_repo(&base, &token, "lost-row").await;
 
-    let payload = b"forgekeep-fault-injected-blob";
+    let payload = b"plombir-git-fault-injected-blob";
     let digest = format!(
         "sha256:{}",
         hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))
@@ -160,7 +160,7 @@ async fn a_mount_row_failure_rolls_back_only_its_own_copy() {
     create_repo(&app.base, &token, "source-image").await;
     create_repo(&app.base, &token, "target-image").await;
 
-    let payload = b"forgekeep-mounted-layer";
+    let payload = b"plombir-git-mounted-layer";
     let digest = push_blob(&app.base, &token, "mount_rollback", "source-image", payload).await;
     let target = oci_blob_path(&app.repo_root, "mount_rollback", "target-image", &digest);
     let mount = || {
@@ -267,7 +267,7 @@ async fn a_second_push_of_the_same_blob_is_idempotent() {
     let (token, _user_id) = register_full(&app.base, "oci_retry", "oci_retry@example.com").await;
     create_repo(&app.base, &token, "same-layer").await;
 
-    let payload = b"forgekeep-idempotent-layer";
+    let payload = b"plombir-git-idempotent-layer";
     let digest = push_blob(&app.base, &token, "oci_retry", "same-layer", payload).await;
     let blob = oci_blob_path(&app.repo_root, "oci_retry", "same-layer", &digest);
     let original = std::fs::read(&blob).expect("the first push must store the layer");
@@ -325,7 +325,7 @@ async fn concurrent_pushes_of_the_same_blob_both_succeed() {
     let (token, _user_id) = register_full(&app.base, "oci_race", "oci_race@example.com").await;
     create_repo(&app.base, &token, "same-layer").await;
 
-    let payload = b"forgekeep-concurrent-layer";
+    let payload = b"plombir-git-concurrent-layer";
     let digest = format!(
         "sha256:{}",
         hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))
@@ -365,7 +365,7 @@ async fn concurrent_pushes_of_the_same_blob_both_succeed() {
     assert_eq!(fetched.bytes().await.unwrap().as_ref(), payload);
 }
 
-/// The first two uploads for a ForgeKeep repository can both observe that its
+/// The first two uploads for a Plombir Git repository can both observe that its
 /// OCI row is absent. The unique namespace index serializes creation, but the
 /// losing request must reuse the winner's row rather than surface the conflict.
 #[tokio::test]
@@ -506,12 +506,12 @@ async fn a_second_put_of_the_same_manifest_digest_is_idempotent() {
         );
     }
 
-    let forgekeep_repo =
+    let plombir_git_repo =
         rg_core::repo::service::find_repo_by_owner_name(&app.db, "manifest_retry", "same-manifest")
             .await
             .unwrap()
             .unwrap();
-    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&app.db, forgekeep_repo.id)
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&app.db, plombir_git_repo.id)
         .await
         .unwrap()
         .unwrap();
@@ -623,12 +623,12 @@ async fn concurrent_puts_of_the_same_manifest_digest_both_succeed() {
         );
     }
 
-    let forgekeep_repo =
+    let plombir_git_repo =
         rg_core::repo::service::find_repo_by_owner_name(&db, "manifest_race", "same-manifest")
             .await
             .unwrap()
             .unwrap();
-    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, forgekeep_repo.id)
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, plombir_git_repo.id)
         .await
         .unwrap()
         .unwrap();
@@ -888,12 +888,12 @@ async fn a_failed_manifest_tag_move_keeps_the_old_tag_live() {
     );
     fault.clear().await;
 
-    let forgekeep_repo =
+    let plombir_git_repo =
         rg_core::repo::service::find_repo_by_owner_name(&db, "tag_move", "atomic-move")
             .await
             .unwrap()
             .unwrap();
-    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, forgekeep_repo.id)
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, plombir_git_repo.id)
         .await
         .unwrap()
         .unwrap();
@@ -939,7 +939,7 @@ async fn a_push_whose_blob_row_was_never_written_leaves_no_blob() {
     let (token, _user_id) = register_full(&app.base, "oci_orphan", "oci_orphan@example.com").await;
     create_repo(&app.base, &token, "orphan-blob").await;
 
-    let payload = b"forgekeep-orphaned-layer";
+    let payload = b"plombir-git-orphaned-layer";
     let digest = format!(
         "sha256:{}",
         hex::encode(<sha2::Sha256 as sha2::Digest>::digest(payload))
@@ -993,7 +993,7 @@ async fn a_failed_repush_does_not_delete_the_layer_an_earlier_push_stored() {
     let (token, _user_id) = register_full(&app.base, "oci_dedup", "oci_dedup@example.com").await;
     create_repo(&app.base, &token, "shared-layer").await;
 
-    let payload = b"forgekeep-shared-layer";
+    let payload = b"plombir-git-shared-layer";
     let digest = push_blob(&app.base, &token, "oci_dedup", "shared-layer", payload).await;
     let blob = oci_blob_path(&app.repo_root, "oci_dedup", "shared-layer", &digest);
     assert!(blob.exists(), "the first push must store the layer");
@@ -1121,12 +1121,12 @@ async fn a_manifest_naming_an_absent_blob_fails_the_push() {
     // writer with a missing row — except by losing the race between that check
     // and the transaction, which is precisely the state the tagged half above
     // simulates and which this writer used to commit without noticing.
-    let forgekeep_repo =
+    let plombir_git_repo =
         rg_core::repo::service::find_repo_by_owner_name(&db, "fault_ref", "lost-ref")
             .await
             .unwrap()
             .unwrap();
-    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, forgekeep_repo.id)
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, plombir_git_repo.id)
         .await
         .unwrap()
         .unwrap();
@@ -2473,7 +2473,7 @@ async fn an_lfs_upload_whose_row_was_never_written_leaves_no_staging_file() {
         &token,
         "lfs_row",
         "lost-lfs-row",
-        b"forgekeep-lfs-payload",
+        b"plombir-git-lfs-payload",
     )
     .await;
     assert_eq!(
@@ -2502,7 +2502,7 @@ async fn an_lfs_object_the_blob_store_refused_leaves_no_staging_file() {
         &token,
         "lfs_put",
         "refused-lfs",
-        b"forgekeep-lfs-refused",
+        b"plombir-git-lfs-refused",
     )
     .await;
     assert_eq!(
@@ -2536,7 +2536,7 @@ async fn an_lfs_object_that_was_never_marked_uploaded_leaves_no_blob() {
         &token,
         "lfs_mark",
         "unmarked-lfs",
-        b"forgekeep-lfs-unmarked",
+        b"plombir-git-lfs-unmarked",
     )
     .await;
     assert_eq!(
@@ -2572,7 +2572,7 @@ async fn a_failed_lfs_retry_keeps_the_object_an_earlier_upload_published() {
         register_full(&app.base, "lfs_retry_owner", "lfs_retry_owner@example.com").await;
     create_repo(&app.base, &token, "retry-lfs").await;
 
-    let payload = b"forgekeep-lfs-retry-keeps-live-bytes";
+    let payload = b"plombir-git-lfs-retry-keeps-live-bytes";
     let (first_status, oid) =
         upload_lfs_object(&app.base, &token, "lfs_retry_owner", "retry-lfs", payload).await;
     assert_eq!(first_status, 200, "baseline upload must publish the object");
@@ -2655,7 +2655,7 @@ async fn a_release_asset_whose_bytes_were_refused_leaves_no_row_behind() {
         .post(&assets_url)
         .bearer_auth(&token)
         .header("x-asset-filename", "payload.bin")
-        .body(b"forgekeep-release-asset".to_vec())
+        .body(b"plombir-git-release-asset".to_vec())
         .send()
         .await
         .unwrap();
@@ -2682,7 +2682,7 @@ async fn a_release_asset_whose_bytes_were_refused_leaves_no_row_behind() {
         .post(&assets_url)
         .bearer_auth(&token)
         .header("x-asset-filename", "payload.bin")
-        .body(b"forgekeep-release-asset".to_vec())
+        .body(b"plombir-git-release-asset".to_vec())
         .send()
         .await
         .unwrap();
@@ -2793,7 +2793,7 @@ async fn a_ci_artifact_whose_row_was_never_written_leaves_no_blob() {
         job_id,
         &runner_token,
         "report.txt",
-        b"forgekeep-artifact-bytes",
+        b"plombir-git-artifact-bytes",
     )
     .await;
     assert_eq!(
@@ -2849,7 +2849,7 @@ async fn a_ci_artifact_whose_row_was_never_written_leaves_no_blob() {
         job_id,
         &runner_token,
         "report.txt",
-        b"forgekeep-artifact-bytes",
+        b"plombir-git-artifact-bytes",
     )
     .await;
     assert_eq!(
