@@ -71,6 +71,12 @@ const UNEXECUTED = new Map([
       'nothing a shared runner should point at a real backend.',
   ],
   [
+    'agent-review-demo.sh',
+    'the replay behind docs/demo/agent-review.cast, run by hand under ephemeral-stand.sh (README says ' +
+      'how). It narrates rather than asserts; the same flow is asserted by ' +
+      '`agent_accounts_tests::an_agents_pull_request_merges_only_after_a_code_owner_approves`.',
+  ],
+  [
     'install-git-hooks.sh',
     'a one-time developer setup step (CONTRIBUTING.md tells you to run it). It installs the hook that ' +
       'runs the gates; a gate cannot install itself.',

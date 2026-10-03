@@ -113,7 +113,7 @@ export const reviews = {
   /**
    * Withdraw a standing review.
    *
-   * `count_current_approvals` reads the `dismissed_at` stamp on the review row
+   * `current_approvers` reads the `dismissed_at` stamp on the review row
    * and nothing else, so this is the only thing that takes a stale approval
    * back off a protected branch's counter (card_dc0f5d58e5f4). Behind
    * `RepoWrite`; until this client existed the only way to reach it was `curl`

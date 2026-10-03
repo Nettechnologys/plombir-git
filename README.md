@@ -584,6 +584,19 @@ treat an agent as a participant of its own rather than as its owner:
   `/api/v1/mcp`), and kept off protected branches (no merge, push or
   server-side commit there; on by default for a bot's token). A bot's token
   carries the `repo` scope only, so it cannot manage credentials of its own.
+- **A person approves.** An agent can do the whole loop through MCP — start a
+  branch with `write_file`, `create_pr`, read inline review with
+  `list_review_comments`, push a fix, answer in the thread
+  (`create_review_comment` with `reply_to_id`), and read CI with
+  `list_pipelines` / `get_commit_status` — but a bot's approval never counts
+  toward a protected branch's required approvals, nor does its owner's on the
+  bot's own pull request, nor a read-only collaborator's. The approval that
+  opens the merge comes from another person with write access (CODEOWNERS can
+  request them), and the bot's token cannot merge into the protected branch
+  itself. [`docs/demo/agent-review.cast`](docs/demo/agent-review.cast) is a
+  recording of the whole loop (`asciinema play docs/demo/agent-review.cast`);
+  `STAND_USER=alice scripts/ephemeral-stand.sh -- scripts/agent-review-demo.sh`
+  runs it against a throwaway instance.
 - **Limits and audit.** Every token of one bot shares a request budget,
   `[rate_limit].agent_max` per `agent_window_secs` (600 a minute by default).
   Every tool call is written to the audit log as `agent.mcp_tool_call`; a

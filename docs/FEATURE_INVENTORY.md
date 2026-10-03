@@ -89,9 +89,9 @@ _Последняя сверка с кодом: 2026-07-23._
 | Фича | Статус | Где | Заметки |
 |------|--------|-----|---------|
 | MCP-сервер (JSON-RPC, stdio) | ✅ | `rg-mcp/` | |
-| Read tools (list_repos, read_file, read_dir, get_issue, get_pr, get_pr_diff) | ✅ | `rg-mcp/src/tools/mod.rs` | 6 read-обёрток |
-| Write-tools (create/update/comment/labels issues, PR create/merge, review + inline-comment + apply-suggestion, request-reviewers) | ✅ | `rg-mcp/src/tools/mod.rs` | тонкие обёртки над REST, тело строится из whitelist ключей |
-| CI-tools (list/get pipeline, retry/cancel, get job) | ✅ | `rg-mcp/src/tools/mod.rs` | `list_pipelines`/`get_pipeline`/`retry_pipeline`/`cancel_pipeline`/`get_ci_job` |
+| Read tools (list_repos, read_file, read_dir, get_issue, get_pr, get_pr_diff, list_reviews, list_review_comments) | ✅ | `rg-mcp/src/tools/mod.rs` | 8 read-обёрток; ревью и inline-комментарии PR видны агенту |
+| Write-tools (write_file, create/update/comment/labels issues, PR create/merge, review + inline-comment/ответ в треде + apply-suggestion, request-reviewers) | ✅ | `rg-mcp/src/tools/mod.rs` | тонкие обёртки над REST, тело строится из whitelist ключей; `write_file` коммитит в ветку и создаёт её от ветки по умолчанию |
+| CI-tools (list/get pipeline, retry/cancel, get job, commit status) | ✅ | `rg-mcp/src/tools/mod.rs` | `list_pipelines`/`get_pipeline`/`retry_pipeline`/`cancel_pipeline`/`get_ci_job`/`get_commit_status` (статусы внешнего CI) |
 | `search` через MCP | ✅ | `rg-mcp/src/tools/mod.rs` | обёртка `/search` (q/type/page/per_page) |
 | Обёртки `/ai/*` (summary / issues / prs / tree / search_code) | ✅ | `rg-mcp/src/tools/mod.rs` | оборачивает готовый AI-namespace `rg-http/src/api/ai.rs` |
 | MCP по HTTP (`POST /api/v1/mcp`) | ✅ 🔒 | `rg-http/src/api/mcp.rs` | те же инструменты, вызовы API идут in-process через роутер с учёткой вызывающего; локальный бинарник агенту не нужен |
@@ -99,6 +99,7 @@ _Последняя сверка с кодом: 2026-07-23._
 | Сужение токена: репозитории / MCP-инструменты / защищённые ветки | ✅ 🔒 | `rg-http/src/agent_scope.rs`, `rg-core/src/auth/credential_context.rs` | per-route слой по `Access` и `{owner}/{name}`, git и OCI отдельно; запрет merge/push/server-side commit в защищённые ветки |
 | Отдельный rate-limit агентов | ✅ 🔒 | `rg-http/src/pat_auth.rs` | бюджет на бот-аккаунт, общий для всех его токенов; `[rate_limit] agent_max`/`agent_window_secs` (600/60s) |
 | Аудит действий агента | ✅ 🔒 | `rg-core/src/audit/audit.rs` | `agent.mcp_tool_call`, `agent.scope_denied`; каждая запись через токен несёт `credential.token_id` и `credential.mcp_tool` |
+| Одобряет человек (агент открыл PR → CODEOWNERS → человек одобрил) | ✅ 🔒 | `rg-core/src/branch_protection/service.rs` | в `required_approvals` идёт одобрение только человека с правом записи, не автора и не владельца бота-автора; e2e: `agent_accounts_tests::an_agents_pull_request_merges_only_after_a_code_owner_approves` |
 
 ---
 

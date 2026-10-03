@@ -269,10 +269,73 @@ pub struct MergeVerdict {
     pub judged_head_sha: Option<String>,
 }
 
+/// The current approvals of a pull request, split into those a required
+/// approval count may rest on and those it may not.
+struct ApprovalTally {
+    counted: i64,
+    set_aside: usize,
+}
+
+/// Count the approvals branch protection accepts for the pull request's head.
+///
+/// "Requires N approvals" means N people other than the one asking to merge
+/// looked at the change and had the standing to say yes. Three kinds of
+/// approval are recorded but cannot carry that meaning (card_25220b69c295):
+///
+/// - **A bot's.** An agent's verdict is not a review by a person, and one
+///   owner's two bots could otherwise approve each other's pull requests and
+///   meet any requirement with nobody looking. A bot may still post an
+///   `approve` — it reads as advice — it just never counts.
+/// - **The author's side.** The author cannot approve their own pull request
+///   (`submit_review` refuses it), and a bot's pull request is its owner's: the
+///   bot acts for them, so the owner approving it is the author approving
+///   themselves. A different person has to.
+/// - **A non-writer's.** Reviewing takes only read access, which on a public
+///   repository is every account on the instance — a second account of the
+///   author's included. An approval counts only from someone who could have
+///   pushed the change themselves, and is checked now, not when it was given,
+///   so a collaborator removed since stops counting.
+async fn tally_approvals(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    pr: &pull_request::Model,
+) -> Result<ApprovalTally> {
+    let approvers = pr_review_ops::current_approvers(db, pr.id, pr.head_sha.as_deref()).await?;
+    if approvers.is_empty() {
+        return Ok(ApprovalTally {
+            counted: 0,
+            set_aside: 0,
+        });
+    }
+    let repo = rg_db::entities::repository::Entity::find_by_id(repo_id)
+        .one(db)
+        .await
+        .context("db: load repository for approval count")?
+        .ok_or_else(|| crate::error::not_found("repository"))?;
+    let author_bot_owner = rg_db::ops::user_ops::find_by_id(db, pr.author_id)
+        .await?
+        .and_then(|author| author.bot_owner_id);
+
+    let mut counted = 0;
+    let mut set_aside = 0;
+    for approver in approvers {
+        let authors_side = approver.id == pr.author_id || Some(approver.id) == author_bot_owner;
+        if approver.is_bot()
+            || authors_side
+            || !crate::repo::service::can_write_repo(db, &repo, Some(approver.id)).await?
+        {
+            set_aside += 1;
+        } else {
+            counted += 1;
+        }
+    }
+    Ok(ApprovalTally { counted, set_aside })
+}
+
 /// Check if a PR merge is allowed under branch protection rules.
 ///
 /// The `Ok` half carries [`MergeVerdict::judged_head_sha`]: approvals are
-/// counted for one commit (`pr_review_ops::count_current_approvals`) and status
+/// counted for one commit (`pr_review_ops::current_approvers`) and status
 /// checks are looked up for one commit
 /// (`pipeline_ops::find_latest_by_repo_and_commit`), so the answer "this merge
 /// is allowed" is only ever true *of that commit*. Merging anything else —
@@ -323,17 +386,27 @@ async fn check_matching_merge_rule(
             .one(db)
             .await?
             .ok_or_else(|| crate::error::not_found("pull request"))?;
-        let approval_count =
-            pr_review_ops::count_current_approvals(db, pr_id, pr.head_sha.as_deref()).await?;
+        let tally = tally_approvals(db, repo_id, &pr).await?;
         // The approvals just counted are the ones recorded against this head;
         // an approval given for another commit is not one of them. That makes
         // the head part of the verdict, not a detail of how it was reached.
         verdict.judged_head_sha = pr.head_sha.filter(|sha| !sha.is_empty());
-        if approval_count < required {
-            return Err(crate::error::forbidden(format!(
+        if tally.counted < required {
+            let mut message = format!(
                 "merging into protected branch '{}' requires at least {} approval(s), got {}",
-                target_branch, required, approval_count
-            )));
+                target_branch, required, tally.counted
+            );
+            // The reviewer sees an approval on the pull request and a merge
+            // refused for want of one; say why the two disagree.
+            if tally.set_aside > 0 {
+                message.push_str(&format!(
+                    " ({} more approval(s) do not count: an approval counts only from a \
+                     person with write access who is neither the author nor, for a bot's pull \
+                     request, the bot's owner)",
+                    tally.set_aside
+                ));
+            }
+            return Err(crate::error::forbidden(message));
         }
     }
 

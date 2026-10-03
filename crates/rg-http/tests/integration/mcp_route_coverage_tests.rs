@@ -31,7 +31,7 @@
 //!
 //! ## Why the target repository does not exist
 //!
-//! Thirteen of the twenty-seven tools write. They are driven against
+//! About half of the tools write. They are driven against
 //! `probe/probe`, which is nothing on this instance, so every one of them is
 //! turned away while resolving the repository and no request can leave a mark.
 //! Routing is decided before any of that, so nothing is lost by it.
@@ -137,6 +137,17 @@ fn tool_probes() -> Vec<(&'static str, serde_json::Value)> {
         ("get_issue", with(serde_json::json!({ "number": 1 }))),
         ("get_pr", with(serde_json::json!({ "number": 1 }))),
         ("get_pr_diff", with(serde_json::json!({ "number": 1 }))),
+        ("list_reviews", with(serde_json::json!({ "number": 1 }))),
+        (
+            "list_review_comments",
+            with(serde_json::json!({ "number": 1 })),
+        ),
+        (
+            "write_file",
+            with(
+                serde_json::json!({ "path": "README.md", "content": "probe", "message": "probe" }),
+            ),
+        ),
         (
             "create_issue",
             with(serde_json::json!({ "title": "probe" })),
@@ -181,6 +192,10 @@ fn tool_probes() -> Vec<(&'static str, serde_json::Value)> {
         (
             "get_ci_job",
             with(serde_json::json!({ "id": 1, "job_id": 1 })),
+        ),
+        (
+            "get_commit_status",
+            with(serde_json::json!({ "sha": "0123456789abcdef0123456789abcdef01234567" })),
         ),
         ("search", serde_json::json!({ "q": "probe" })),
         ("ai_repo_summary", with(serde_json::json!({}))),

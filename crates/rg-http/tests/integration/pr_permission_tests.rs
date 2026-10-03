@@ -634,6 +634,23 @@ async fn creating_pr_requests_matching_codeowner_user() {
     let (reviewer_token, reviewer_id) =
         register_full(&base, "rust-reviewer", "rust-reviewer@example.com").await;
     let repo_id = create_repo_with_visibility(&base, &owner_token, "owned-code", false).await;
+    // The code owner approves further down and that approval has to satisfy a
+    // required-approval rule, which only a writer's does (card_25220b69c295):
+    // on a public repository reading is open to every account.
+    let collaborator = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/repos/owners-owner/owned-code/collaborators"
+        ))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({ "username": "rust-reviewer", "permission": "write" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        collaborator.status().is_success(),
+        "{}",
+        collaborator.text().await.unwrap()
+    );
 
     let worktree = tempfile::tempdir().unwrap();
     let worktree_path = worktree.path();

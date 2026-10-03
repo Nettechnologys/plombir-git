@@ -11,6 +11,11 @@
 //!   [`ApiTransport`] — so an agent needs no local binary, and the server knows
 //!   which tool every API call serves.
 
+// `tools::list_tools` declares every tool's schema in one `serde_json::json!`
+// literal, and that macro recurses once per token tree: past ~30 tools it
+// outgrows the default limit of 128.
+#![recursion_limit = "256"]
+
 pub mod client;
 pub mod error;
 pub mod protocol;

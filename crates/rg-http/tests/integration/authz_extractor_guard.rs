@@ -330,12 +330,20 @@ const WORKSPACE_SIGNED_OFF: &[(&str, &str)] = &[
 /// exemption. `merge_pr` is different from the ordinary HTTP-handler case
 /// because auto-merge and merge-queue call it without an extractor; the core
 /// mutation boundary must therefore re-read current write access itself.
-const WORKSPACE_FUNCTION_SIGNED_OFF: &[(&str, &str, &str)] = &[(
-    "rg-core/src/pull_request/service.rs",
-    "merge_pr",
-    "public core mutation boundary shared by REST, auto-merge and merge-queue; it revalidates the \
-     durable actor before branch protection and Git writes",
-)];
+const WORKSPACE_FUNCTION_SIGNED_OFF: &[(&str, &str, &str)] = &[
+    (
+        "rg-core/src/pull_request/service.rs",
+        "merge_pr",
+        "public core mutation boundary shared by REST, auto-merge and merge-queue; it revalidates \
+         the durable actor before branch protection and Git writes",
+    ),
+    (
+        "rg-core/src/branch_protection/service.rs",
+        "tally_approvals",
+        "filters approvals before counting them — the subject is each approver, not the caller — \
+         and runs where no request exists, from auto-merge and the merge queue",
+    ),
+];
 
 /// The file that *defines* the repository gates, spelled workspace-relative.
 ///

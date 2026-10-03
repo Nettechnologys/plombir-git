@@ -2,7 +2,7 @@
 //!
 //! `dismiss_review` used to insert a *second* `pr_reviews` row with
 //! `action = "dismiss"` under the *dismissor's* `reviewer_id`, and nothing read
-//! it. `count_current_approvals` folds only `approve` / `request_changes` into
+//! it. `current_approvers` folds only `approve` / `request_changes` into
 //! its per-reviewer verdict map, so the dismissal displaced nobody — and had it
 //! been folded in, it carried the wrong reviewer's id and would have displaced
 //! the wrong verdict. The maintainer got a `200` and a timeline entry while the
@@ -109,6 +109,23 @@ async fn require_one_approval(base: &str, token: &str, owner: &str, repo: &str) 
     );
 }
 
+/// Only a writer's approval counts toward required approvals
+/// (card_25220b69c295), so the seeded reviewer is made one.
+async fn grant_write(base: &str, token: &str, owner: &str, repo: &str, username: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1/repos/{owner}/{repo}/collaborators"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "username": username, "permission": "write" }))
+        .send()
+        .await
+        .expect("add collaborator");
+    assert!(
+        resp.status().is_success(),
+        "collaborator setup failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+}
+
 async fn dismiss(base: &str, token: &str, owner: &str, repo: &str, review_id: i64) -> String {
     let resp = reqwest::Client::new()
         .post(format!(
@@ -141,13 +158,22 @@ async fn a_dismissed_approval_stops_satisfying_required_approvals() {
     let pr = seed_pr(&db, repo_id, host_id, reviewer_id).await;
     let review = seed_approval(&db, &pr, reviewer_id, chrono::Utc::now()).await;
     require_one_approval(&base, &host_token, "dismiss-host", "withdrawn-approval").await;
+    grant_write(
+        &base,
+        &host_token,
+        "dismiss-host",
+        "withdrawn-approval",
+        "dismiss-reviewer",
+    )
+    .await;
 
     // Baseline: the approval really does open the gate, so the assertions
     // after the dismissal cannot be satisfied by a gate that refuses always.
     assert_eq!(
-        rg_db::ops::pr_review_ops::count_current_approvals(&db, pr.id, Some(HEAD_SHA))
+        rg_db::ops::pr_review_ops::current_approvers(&db, pr.id, Some(HEAD_SHA))
             .await
-            .expect("count approvals"),
+            .expect("count approvals")
+            .len(),
         1,
         "a live reviewer's standing approval must count"
     );
@@ -165,9 +191,10 @@ async fn a_dismissed_approval_stops_satisfying_required_approvals() {
     .await;
 
     assert_eq!(
-        rg_db::ops::pr_review_ops::count_current_approvals(&db, pr.id, Some(HEAD_SHA))
+        rg_db::ops::pr_review_ops::current_approvers(&db, pr.id, Some(HEAD_SHA))
             .await
-            .expect("count approvals after dismissal"),
+            .expect("count approvals after dismissal")
+            .len(),
         0,
         "the dismissed approval is still being counted — the 200 meant nothing"
     );
@@ -239,9 +266,10 @@ async fn dismissing_the_latest_approval_does_not_resurrect_an_earlier_one() {
     require_one_approval(&base, &host_token, "revive-host", "no-resurrection").await;
 
     assert_eq!(
-        rg_db::ops::pr_review_ops::count_current_approvals(&db, pr.id, Some(HEAD_SHA))
+        rg_db::ops::pr_review_ops::current_approvers(&db, pr.id, Some(HEAD_SHA))
             .await
-            .expect("count approvals"),
+            .expect("count approvals")
+            .len(),
         1,
         "two approvals from one reviewer must still count once"
     );
@@ -256,9 +284,10 @@ async fn dismissing_the_latest_approval_does_not_resurrect_an_earlier_one() {
     .await;
 
     assert_eq!(
-        rg_db::ops::pr_review_ops::count_current_approvals(&db, pr.id, Some(HEAD_SHA))
+        rg_db::ops::pr_review_ops::current_approvers(&db, pr.id, Some(HEAD_SHA))
             .await
-            .expect("count approvals after dismissal"),
+            .expect("count approvals after dismissal")
+            .len(),
         0,
         "the reviewer's earlier approval came back to life when their latest was withdrawn"
     );

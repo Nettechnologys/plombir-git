@@ -3599,10 +3599,22 @@ pub async fn create_or_update_file(
             bail!("repository path not found: {:?}", repo_path);
         }
         let previous_head_sha = try_get_branch_sha(&repo_path, &branch)?;
+        // A branch this edit creates starts as a copy of the default branch,
+        // so that is the tree the file is checked against, too: creating a
+        // file the new branch would already carry is an overwrite, and the
+        // `sha` of a file being updated is the one it has there.
+        let base = match previous_head_sha {
+            Some(_) => None,
+            None => Some(new_branch_base(&repo_path, &branch)?),
+        };
+        let start_point = match &base {
+            Some(NewBranchBase::Branch(base_branch)) => base_branch.as_str(),
+            None | Some(NewBranchBase::EmptyRepository) => branch.as_str(),
+        };
 
         // Verify the file SHA if this is an update (not a create).
         if let Some(expected_sha) = expected_sha.as_deref() {
-            match read_path_entry(&repo_path, &branch, &file_path)? {
+            match read_path_entry(&repo_path, start_point, &file_path)? {
                 None => return Err(crate::error::not_found("file")),
                 Some(PathEntry::NotAFile(what)) => return Err(not_a_file(what)),
                 Some(PathEntry::File(current)) if current != expected_sha => {
@@ -3613,7 +3625,7 @@ pub async fn create_or_update_file(
                 Some(PathEntry::File(_)) => {}
             }
         } else {
-            match read_path_entry(&repo_path, &branch, &file_path)? {
+            match read_path_entry(&repo_path, start_point, &file_path)? {
                 None => {}
                 Some(PathEntry::NotAFile(what)) => return Err(not_a_file(what)),
                 Some(PathEntry::File(_)) => {
@@ -3639,23 +3651,49 @@ pub async fn create_or_update_file(
             .as_ref()
             .map_err(|e| anyhow::anyhow!("git CLI not available: {e}"))?;
 
-        // Try cloning with the target branch; fall back to --no-checkout for new repos
-        // where the branch does not exist yet, then create the branch via checkout -b.
-        let clone_out = gateway
-            .run(&["clone", "-b", &branch, &clone_url, &tmp_str], None)
-            .context("git clone failed")?;
-        if !clone_out.success() {
-            let nc_out = gateway
-                .run(&["clone", "--no-checkout", &clone_url, &tmp_str], None)
-                .context("git clone (no-checkout) failed")?;
-            if !nc_out.success() {
-                bail!("git clone failed: {}", nc_out.stderr_str());
+        // Check out the tree the commit is made on top of. The commit records
+        // the index, so whatever the index lacks the commit deletes.
+        //
+        // A branch that does not exist yet used to be reached through
+        // `clone --no-checkout` + `checkout -b`, whatever the repository held.
+        // That clone writes no index; the new branch started from the default
+        // branch's commit with an empty index, so the edit's commit carried the
+        // one file it wrote and deleted every other file of the repository —
+        // a pull request from such a branch removes the whole tree
+        // (card_25220b69c295). Only a repository with no commits at all has
+        // nothing to check out.
+        let clone_branch = |name: &str| -> Result<()> {
+            let out = gateway
+                .run(&["clone", "-b", name, &clone_url, &tmp_str], None)
+                .context("git clone failed")?;
+            if !out.success() {
+                bail!("git clone failed: {}", out.stderr_str());
             }
-            let co_out = gateway
+            Ok(())
+        };
+        let create_branch = || -> Result<()> {
+            let out = gateway
                 .run(&["checkout", "-b", &branch], Some(tmp_path))
                 .context("git checkout failed")?;
-            if !co_out.success() {
-                bail!("git checkout failed: {}", co_out.stderr_str());
+            if !out.success() {
+                bail!("git checkout failed: {}", out.stderr_str());
+            }
+            Ok(())
+        };
+        match &base {
+            None => clone_branch(&branch)?,
+            Some(NewBranchBase::Branch(base_branch)) => {
+                clone_branch(base_branch)?;
+                create_branch()?;
+            }
+            Some(NewBranchBase::EmptyRepository) => {
+                let out = gateway
+                    .run(&["clone", "--no-checkout", &clone_url, &tmp_str], None)
+                    .context("git clone (no-checkout) failed")?;
+                if !out.success() {
+                    bail!("git clone failed: {}", out.stderr_str());
+                }
+                create_branch()?;
             }
         }
 
@@ -3725,6 +3763,53 @@ pub struct FileUpdate {
     pub path: String,
     pub content: String,
     pub expected_blob_sha: String,
+}
+
+/// What a branch a file edit creates starts from.
+#[derive(Debug, PartialEq, Eq)]
+enum NewBranchBase {
+    /// The default branch — the one the bare repository's `HEAD` names.
+    Branch(String),
+    /// A repository with no branch at all: the edit makes its first commit.
+    EmptyRepository,
+}
+
+/// Where a branch the contents API creates starts: from the default branch,
+/// or — in a repository with no commits — from nothing.
+///
+/// A repository that has branches but whose `HEAD` names none of them is
+/// refused rather than given a branch with no history, which would carry the
+/// one edited file and nothing else.
+fn new_branch_base(repo_path: &std::path::Path, branch: &str) -> Result<NewBranchBase> {
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+    let head = repo
+        .head_name()
+        .with_context(|| format!("failed to read HEAD in repository: {:?}", repo_path))?;
+    if let Some(default_branch) = head
+        .as_ref()
+        .and_then(|name| name.as_bstr().strip_prefix(b"refs/heads/"))
+        .and_then(|name| std::str::from_utf8(name).ok())
+    {
+        if try_get_branch_sha(repo_path, default_branch)?.is_some() {
+            return Ok(NewBranchBase::Branch(default_branch.to_string()));
+        }
+    }
+
+    let has_branches = repo
+        .references()
+        .with_context(|| format!("failed to open references in repository: {:?}", repo_path))?
+        .local_branches()
+        .with_context(|| format!("failed to list branches in repository: {:?}", repo_path))?
+        .next()
+        .is_some();
+    if has_branches {
+        return Err(crate::error::conflict(format!(
+            "branch '{branch}' does not exist, and the default branch it would start from does \
+             not exist either"
+        )));
+    }
+    Ok(NewBranchBase::EmptyRepository)
 }
 
 /// Look up a branch SHA without collapsing an absent ref into a repository

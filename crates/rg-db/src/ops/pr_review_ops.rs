@@ -26,7 +26,8 @@ pub async fn list_by_pr(db: &DatabaseConnection, pr_id: i64) -> Result<Vec<PrRev
         .context("db: list reviews by PR")
 }
 
-/// Count at most one latest approval per live reviewer for the current head commit.
+/// The live accounts whose latest verdict on the current head commit is an
+/// approval — at most one entry per reviewer, ordered by account id.
 /// A later `request_changes` from the same reviewer supersedes their approval.
 /// Historical reviews outlive their authors, but a missing, deactivated, or
 /// retiring account no longer contributes a current authorization verdict.
@@ -34,11 +35,16 @@ pub async fn list_by_pr(db: &DatabaseConnection, pr_id: i64) -> Result<Vec<PrRev
 /// A dismissed review is history too: it stays the reviewer's latest verdict —
 /// dismissing an approval does not resurrect an older one from the same person
 /// — but a withdrawn verdict authorizes nothing (card_dc0f5d58e5f4).
-pub async fn count_current_approvals(
+///
+/// This answers "who approved this head", not "how many approvals count": the
+/// accounts come back whole because branch protection still has to ask who each
+/// of them is — a bot, the author's side, a non-writer — before counting them
+/// (`rg_core::branch_protection::service`, card_25220b69c295).
+pub async fn current_approvers(
     db: &DatabaseConnection,
     pr_id: i64,
     head_sha: Option<&str>,
-) -> Result<i64> {
+) -> Result<Vec<user::Model>> {
     let reviews = list_by_pr(db, pr_id).await?;
     let mut latest = std::collections::HashMap::new();
     for review in reviews {
@@ -59,17 +65,17 @@ pub async fn count_current_approvals(
         .map(|review| review.reviewer_id)
         .collect::<Vec<_>>();
     if candidate_reviewers.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
-    let count = UserEntity::find()
+    UserEntity::find()
         .filter(user::Column::Id.is_in(candidate_reviewers))
         .filter(user::Column::IsActive.eq(true))
         .filter(user::Column::DeletedAt.is_null())
-        .count(db)
+        .order_by_asc(user::Column::Id)
+        .all(db)
         .await
-        .context("db: count live PR reviewers")?;
-    Ok(count as i64)
+        .context("db: load live PR approvers")
 }
 
 /// Create a new review.

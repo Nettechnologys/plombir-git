@@ -25,7 +25,7 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     /// When this review was withdrawn, if it was. A dismissal is a property of
     /// the review it dismisses, not a separate opinion by whoever dismissed it
-    /// — `count_current_approvals` reads this column and nothing else to decide
+    /// — `current_approvers` reads this column and nothing else to decide
     /// whether the verdict still stands (card_dc0f5d58e5f4).
     pub dismissed_at: Option<DateTimeUtc>,
     /// Who withdrew the review. Durable history: it survives the dismissor's

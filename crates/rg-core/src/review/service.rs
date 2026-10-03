@@ -186,7 +186,7 @@ pub async fn get_review(db: &DatabaseConnection, review_id: i64) -> Result<PrRev
 ///
 /// The dismissal is stamped on the review being dismissed, not written as a
 /// second `pr_reviews` row under the dismissor's name. That older shape was the
-/// whole bug (card_dc0f5d58e5f4): `count_current_approvals` folds only
+/// whole bug (card_dc0f5d58e5f4): `current_approvers` folds only
 /// `approve` / `request_changes` into its per-reviewer verdict map, so a
 /// `"dismiss"` row displaced nobody — and carrying the dismissor's
 /// `reviewer_id`, it would have displaced the wrong person had it been folded

@@ -162,6 +162,25 @@ async fn ghost_review_stays_in_history_but_stops_authorizing_merge() {
     .await
     .expect("seed approval");
 
+    // Only a writer's approval counts toward required approvals
+    // (card_25220b69c295): without this the baseline below would be refused
+    // for the reviewer's standing, not for the deactivation it is there to
+    // contrast with.
+    let collaborator = client
+        .post(format!(
+            "{base}/api/v1/repos/review-host/review-lifecycle/collaborators"
+        ))
+        .bearer_auth(&host_token)
+        .json(&serde_json::json!({ "username": "departing-reviewer", "permission": "write" }))
+        .send()
+        .await
+        .expect("add the reviewer as a writer");
+    assert!(
+        collaborator.status().is_success(),
+        "collaborator setup failed: {}",
+        collaborator.text().await.unwrap_or_default()
+    );
+
     let protection = client
         .post(format!(
             "{base}/api/v1/repos/review-host/review-lifecycle/branches/protection"

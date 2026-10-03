@@ -2708,7 +2708,7 @@ async fn import_github_pr(
         // GitHub reports a withdrawn review as `DISMISSED` and does not say
         // which verdict it used to be, so the imported row keeps `"dismiss"`
         // as its action and carries the stamp as well. Both halves say the
-        // same thing to `count_current_approvals` — this authorizes nothing —
+        // same thing to `current_approvers` — this authorizes nothing —
         // which is the only safe reading of a verdict we cannot reconstruct
         // (card_dc0f5d58e5f4).
         let dismissed_at = (action == "dismiss").then_some(submitted_at);

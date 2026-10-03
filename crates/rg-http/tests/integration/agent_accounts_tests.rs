@@ -758,3 +758,383 @@ async fn every_token_of_a_bot_spends_one_budget() {
     assert_eq!(f.get(&second, "/repos/alice/app").await, 429);
     assert_eq!(f.get(&f.alice, "/repos/alice/app").await, 200);
 }
+
+impl Fixture {
+    /// `POST` as `token` and return the status with the JSON body.
+    async fn post(
+        &self,
+        token: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (reqwest::StatusCode, serde_json::Value) {
+        let response = self
+            .http
+            .post(format!("{}/api/v1{path}", self.base))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, response.json().await.unwrap_or_default())
+    }
+
+    async fn get_json(&self, token: &str, path: &str) -> serde_json::Value {
+        let response = self
+            .http
+            .get(format!("{}/api/v1{path}", self.base))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "GET {path}");
+        response.json().await.unwrap()
+    }
+
+    /// Wait until the pull request's head is `sha`. The row is moved by the
+    /// detached post-push hook, so it lags the commit that answered.
+    async fn await_pr_head(&self, number: i64, sha: &str) {
+        let path = format!("/repos/alice/app/pulls/{number}");
+        for _ in 0..300 {
+            if self.get_json(&self.alice, &path).await["head_sha"] == sha {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("pull request #{number} never moved its head to {sha}");
+    }
+
+    /// Approve `alice/app#number` as `token`.
+    async fn approve(&self, token: &str, number: i64) {
+        let (status, body) = self
+            .post(
+                token,
+                &format!("/repos/alice/app/pulls/{number}/reviews"),
+                serde_json::json!({ "action": "approve" }),
+            )
+            .await;
+        assert_eq!(status, 201, "{body}");
+    }
+
+    /// `tools/call` whose answer is JSON; panics with the text if it failed.
+    async fn tool_json(
+        &self,
+        token: &str,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let (failed, text) = self.tool(token, name, arguments).await;
+        assert!(!failed, "{name} failed: {text}");
+        serde_json::from_str(&text).unwrap_or_else(|error| panic!("{name}: {error}: {text}"))
+    }
+}
+
+/// The scenario the agent accounts exist for (card_25220b69c295): an agent
+/// starts a branch, commits and opens a pull request through MCP; CODEOWNERS
+/// puts a person on it; the agent reads that person's inline comment, fixes the
+/// code, answers in the thread and reads CI — and the change reaches the
+/// protected branch only once that person approves.
+///
+/// Three approvals are given on the way that must not open the gate, and each
+/// is the only thing standing between its own rule and a green merge: the
+/// owner's second bot (two agents of one person would otherwise approve each
+/// other), the bot's owner (the bot acts for them, so that is the author
+/// approving themselves), and a collaborator who may only read. Remove any one
+/// of the three exclusions in `tally_approvals` and the merge attempted before
+/// the code owner's approval goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agents_pull_request_merges_only_after_a_code_owner_approves() {
+    let f = fixture(StateOverrides::default()).await;
+    let (bob, _) = register_full(&f.base, "bob", "bob@example.test").await;
+    let (carol, _) = register_full(&f.base, "carol", "carol@example.test").await;
+    for (username, permission) in [("bob", "write"), ("carol", "read")] {
+        let (status, body) = f
+            .post(
+                &f.alice,
+                "/repos/alice/app/collaborators",
+                serde_json::json!({ "username": username, "permission": permission }),
+            )
+            .await;
+        assert!(status.is_success(), "add {username}: {status} {body}");
+    }
+    // A second agent of the same owner, a writer like the first.
+    let (status, body) = f
+        .post(
+            &f.alice,
+            "/users/bots",
+            serde_json::json!({ "username": "alice-reviewer" }),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = f
+        .post(
+            &f.alice,
+            "/repos/alice/app/collaborators",
+            serde_json::json!({ "username": "alice-reviewer", "permission": "write" }),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (status, body) = f
+        .post(
+            &f.alice,
+            "/users/bots/alice-reviewer/tokens",
+            serde_json::json!({ "name": "review" }),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let reviewer_bot = body["token"].as_str().unwrap().to_string();
+
+    let (status, body) = f
+        .post(
+            &f.alice,
+            "/repos/alice/app/contents/.github/CODEOWNERS",
+            serde_json::json!({ "branch": "main", "content": "* @bob\n", "message": "owners" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = f
+        .post(
+            &f.alice,
+            "/repos/alice/app/branches/protection",
+            serde_json::json!({
+                "branch_name": "main", "require_pr": true,
+                "require_approval": true, "required_approvals": 1,
+            }),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+
+    let agent = f
+        .bot_token(serde_json::json!({ "name": "agent", "repositories": ["alice/app"] }))
+        .await;
+
+    // ── The agent starts a branch with its first commit and opens a PR. ──
+    let written = f
+        .tool_json(
+            &agent,
+            "write_file",
+            serde_json::json!({
+                "owner": "alice", "repo": "app", "path": "src/agent.rs",
+                "branch": "agent/answer", "message": "Add the answer",
+                "content": "pub fn answer() -> i32 { 41 }\n",
+            }),
+        )
+        .await;
+    let first_commit = written["commit_sha"].as_str().unwrap().to_string();
+    let file = f
+        .tool_json(
+            &agent,
+            "read_file",
+            serde_json::json!({
+                "owner": "alice", "repo": "app", "path": "README.md", "ref": "agent/answer",
+            }),
+        )
+        .await;
+    assert_eq!(
+        file["content"], "seed\n",
+        "the new branch starts from the default branch, the rest of the tree intact"
+    );
+    let pr = f
+        .tool_json(
+            &agent,
+            "create_pr",
+            serde_json::json!({
+                "owner": "alice", "repo": "app", "title": "Add the answer",
+                "head": "agent/answer", "base": "main",
+            }),
+        )
+        .await;
+    let number = pr["number"].as_i64().unwrap();
+    assert_eq!(pr["author"], "alice-agent");
+    f.await_pr_head(number, &first_commit).await;
+
+    let reviewers = f
+        .get_json(
+            &f.alice,
+            &format!("/repos/alice/app/pulls/{number}/reviewers"),
+        )
+        .await;
+    let reviewers: Vec<&str> = reviewers
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|reviewer| reviewer["username"].as_str().unwrap())
+        .collect();
+    assert_eq!(reviewers, ["bob"], "CODEOWNERS put the person on the PR");
+
+    // ── The code owner comments inline; the agent reads it and fixes. ──
+    let (status, comment) = f
+        .post(
+            &bob,
+            &format!("/repos/alice/app/pulls/{number}/comments"),
+            serde_json::json!({
+                "path": "src/agent.rs", "line": 1, "side": "RIGHT",
+                "body": "The answer is 42.",
+            }),
+        )
+        .await;
+    assert_eq!(status, 201, "{comment}");
+    let comments = f
+        .tool_json(
+            &agent,
+            "list_review_comments",
+            serde_json::json!({ "owner": "alice", "repo": "app", "number": number }),
+        )
+        .await;
+    let seen = comments
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|seen| seen["body"] == "The answer is 42.")
+        .unwrap_or_else(|| panic!("the agent does not see the comment: {comments}"));
+    assert_eq!(seen["id"], comment["id"]);
+
+    let current = f
+        .tool_json(
+            &agent,
+            "read_file",
+            serde_json::json!({
+                "owner": "alice", "repo": "app", "path": "src/agent.rs", "ref": "agent/answer",
+            }),
+        )
+        .await;
+    let fixed = f
+        .tool_json(
+            &agent,
+            "write_file",
+            serde_json::json!({
+                "owner": "alice", "repo": "app", "path": "src/agent.rs",
+                "branch": "agent/answer", "message": "Make it 42",
+                "content": "pub fn answer() -> i32 { 42 }\n", "sha": current["sha"],
+            }),
+        )
+        .await;
+    let head = fixed["commit_sha"].as_str().unwrap().to_string();
+    assert_ne!(head, first_commit);
+    let reply = f
+        .tool_json(
+            &agent,
+            "create_review_comment",
+            serde_json::json!({
+                "owner": "alice", "repo": "app", "number": number, "path": "src/agent.rs",
+                "body": "Fixed.", "reply_to_id": comment["id"],
+            }),
+        )
+        .await;
+    assert_eq!(
+        reply["reply_to_id"], comment["id"],
+        "the answer is in the thread"
+    );
+    f.await_pr_head(number, &head).await;
+
+    // ── CI reports on the new head, and the agent sees it. ──
+    let (status, body) = f
+        .post(
+            &f.alice,
+            &format!("/repos/alice/app/statuses/{head}"),
+            serde_json::json!({ "state": "success", "context": "ci/build" }),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {body}");
+    let ci = f
+        .tool_json(
+            &agent,
+            "get_commit_status",
+            serde_json::json!({ "owner": "alice", "repo": "app", "sha": head }),
+        )
+        .await;
+    assert_eq!(ci["state"], "success", "{ci}");
+
+    // ── Approvals that must not count. ──
+    f.approve(&reviewer_bot, number).await;
+    f.approve(&f.alice, number).await;
+    f.approve(&carol, number).await;
+    let merge_path = format!("/repos/alice/app/pulls/{number}/merge");
+    let (status, refused) = f
+        .post(
+            &f.alice,
+            &merge_path,
+            serde_json::json!({ "strategy": "merge" }),
+        )
+        .await;
+    assert_eq!(status, 403, "a merge with no counted approval: {refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("requires at least 1 approval(s), got 0 (3 more approval(s) do not count"),
+        "{refused}"
+    );
+
+    // ── The code owner approves; the agent sees it and still cannot merge. ──
+    f.approve(&bob, number).await;
+    let reviews = f
+        .tool_json(
+            &agent,
+            "list_reviews",
+            serde_json::json!({ "owner": "alice", "repo": "app", "number": number }),
+        )
+        .await;
+    assert!(
+        reviews
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|review| review["action"] == "approve" && review["commit_id"] == head.as_str()),
+        "{reviews}"
+    );
+    let (failed, refused) = f
+        .tool(
+            &agent,
+            "merge_pr",
+            serde_json::json!({ "owner": "alice", "repo": "app", "number": number, "strategy": "merge" }),
+        )
+        .await;
+    assert!(
+        failed,
+        "the agent merged into a protected branch: {refused}"
+    );
+    assert!(refused.contains("403"), "{refused}");
+
+    let (status, merged) = f
+        .post(
+            &f.alice,
+            &merge_path,
+            serde_json::json!({ "strategy": "merge" }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "the person merges once a code owner approved: {merged}"
+    );
+    let landed = f
+        .get_json(&f.alice, "/repos/alice/app/blob/src/agent.rs?ref=main")
+        .await;
+    assert_eq!(landed["content"], "pub fn answer() -> i32 { 42 }\n");
+
+    let tools: Vec<String> = f
+        .audit("agent.mcp_tool_call")
+        .await
+        .iter()
+        .map(|row| {
+            let details: serde_json::Value =
+                serde_json::from_str(row.details.as_deref().unwrap()).unwrap();
+            details["tool"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(
+        tools,
+        [
+            "write_file",
+            "read_file",
+            "create_pr",
+            "list_review_comments",
+            "read_file",
+            "write_file",
+            "create_review_comment",
+            "get_commit_status",
+            "list_reviews",
+            "merge_pr",
+        ],
+        "every step the agent took is in the audit log under its tool"
+    );
+}

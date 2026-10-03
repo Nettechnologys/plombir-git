@@ -98,6 +98,50 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                 "required": ["owner", "repo", "number"]
             }
         },
+        {
+            "name": "list_reviews",
+            "description": "List the reviews submitted on a pull request — who approved, who requested changes, and on which commit.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string", "description": "Repository owner" },
+                    "repo":  { "type": "string", "description": "Repository name" },
+                    "number":{ "type": "number", "description": "Pull request number" }
+                },
+                "required": ["owner", "repo", "number"]
+            }
+        },
+        {
+            "name": "list_review_comments",
+            "description": "List the inline review comments on a pull request, replies included (`reply_to_id` names the comment a reply answers).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string", "description": "Repository owner" },
+                    "repo":  { "type": "string", "description": "Repository name" },
+                    "number":{ "type": "number", "description": "Pull request number" }
+                },
+                "required": ["owner", "repo", "number"]
+            }
+        },
+        // ── Write: content ─────────────────────────────────
+        {
+            "name": "write_file",
+            "description": "Create or update a file and commit it to a branch. A branch that does not exist yet is created from the repository's default branch, so this is also how a change starts its own branch. Updating an existing file needs its current blob `sha` (from read_file).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner":   { "type": "string", "description": "Repository owner" },
+                    "repo":    { "type": "string", "description": "Repository name" },
+                    "path":    { "type": "string", "description": "File path, e.g. 'src/main.rs'" },
+                    "content": { "type": "string", "description": "The whole new file content (UTF-8 text)" },
+                    "message": { "type": "string", "description": "Commit message" },
+                    "branch":  { "type": "string", "description": "Branch to commit to. Defaults to the default branch." },
+                    "sha":     { "type": "string", "description": "Blob SHA of the file being replaced; omit to create a new file" }
+                },
+                "required": ["owner", "repo", "path", "content", "message"]
+            }
+        },
         // ── Write: issues ──────────────────────────────────
         {
             "name": "create_issue",
@@ -227,7 +271,7 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
         },
         {
             "name": "create_review_comment",
-            "description": "Create an inline review comment on a pull request diff (optionally with a suggestion).",
+            "description": "Create an inline review comment on a pull request diff (optionally with a suggestion), or reply in an existing comment's thread with `reply_to_id`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -241,7 +285,9 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                     "side":       { "type": "string", "description": "'LEFT' or 'RIGHT'" },
                     "start_side": { "type": "string", "description": "Side of the start line" },
                     "review_id":  { "type": "number", "description": "Attach to an existing review (optional)" },
-                    "suggestion": { "type": "string", "description": "Suggested replacement text (optional)" }
+                    "suggestion": { "type": "string", "description": "Suggested replacement text (optional)" },
+                    "reply_to_id":{ "type": "number", "description": "Id of the comment this one replies to (optional); `path` repeats that comment's path" },
+                    "commit_id":  { "type": "string", "description": "Commit SHA the comment pins to (optional, defaults to the review's)" }
                 },
                 "required": ["owner", "repo", "number", "path", "body"]
             }
@@ -326,6 +372,19 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                     "job_id": { "type": "number", "description": "Job id" }
                 },
                 "required": ["owner", "repo", "id", "job_id"]
+            }
+        },
+        {
+            "name": "get_commit_status",
+            "description": "Get the combined status that external CI systems reported for a commit (success / pending / failure, with each reported status). The instance's own CI is read with list_pipelines.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string", "description": "Repository owner" },
+                    "repo":  { "type": "string", "description": "Repository name" },
+                    "sha":   { "type": "string", "description": "Commit SHA, e.g. a pull request's head_sha" }
+                },
+                "required": ["owner", "repo", "sha"]
             }
         },
         // ── Search ─────────────────────────────────────────
@@ -441,6 +500,10 @@ const TOOL_DISPATCH: &[(&str, ToolHandler)] = &[
     ("get_issue", tool_get_issue),
     ("get_pr", tool_get_pr),
     ("get_pr_diff", tool_get_pr_diff),
+    ("list_reviews", tool_list_reviews),
+    ("list_review_comments", tool_list_review_comments),
+    // content write
+    ("write_file", tool_write_file),
     // issues write
     ("create_issue", tool_create_issue),
     ("update_issue", tool_update_issue),
@@ -460,6 +523,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler)] = &[
     ("retry_pipeline", tool_retry_pipeline),
     ("cancel_pipeline", tool_cancel_pipeline),
     ("get_ci_job", tool_get_ci_job),
+    ("get_commit_status", tool_get_commit_status),
     // search
     ("search", tool_search),
     // AI
@@ -719,6 +783,51 @@ fn tool_get_pr_diff(state: &AppState, args: &Value) -> String {
     run(async move { client.get_raw(&api_path).await })
 }
 
+fn tool_list_reviews(state: &AppState, args: &Value) -> String {
+    let (owner, repo, number) = match owner_repo_i64(args, "number") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let api_path = format!("/repos/{}/{}/pulls/{}/reviews", owner, repo, number);
+    let client = crate::client::ApiClient::new(state);
+    run(async move { client.get_raw(&api_path).await })
+}
+
+fn tool_list_review_comments(state: &AppState, args: &Value) -> String {
+    let (owner, repo, number) = match owner_repo_i64(args, "number") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let api_path = format!("/repos/{}/{}/pulls/{}/comments", owner, repo, number);
+    let client = crate::client::ApiClient::new(state);
+    run(async move { client.get_raw(&api_path).await })
+}
+
+// ── content write ─────────────────────────────────────────
+
+/// The API path `write_file` commits a file through: `POST /contents/{path}`,
+/// the write half of the route `read_file` must not address.
+fn write_file_path(owner: &str, repo: &str, path: &str) -> String {
+    format!("/repos/{owner}/{repo}/contents/{}", encode_repo_path(path))
+}
+
+fn tool_write_file(state: &AppState, args: &Value) -> String {
+    let (owner, repo) = match owner_repo(args) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let path = arg_str(args, "path");
+    // Empty content is an empty file, not a missing argument.
+    let has_content = args.get("content").is_some_and(Value::is_string);
+    if path.is_empty() || !has_content || arg_str(args, "message").is_empty() {
+        return "Error: path, content and message are required".into();
+    }
+    let api_path = write_file_path(owner, repo, path);
+    let body = body_from(args, &["branch", "content", "message", "sha"]);
+    let client = crate::client::ApiClient::new(state);
+    run(async move { client.post_raw(&api_path, &body).await })
+}
+
 // ── issues write ──────────────────────────────────────────
 
 fn tool_create_issue(state: &AppState, args: &Value) -> String {
@@ -867,6 +976,8 @@ fn tool_create_review_comment(state: &AppState, args: &Value) -> String {
             "start_side",
             "body",
             "suggestion",
+            "reply_to_id",
+            "commit_id",
         ],
     );
     let client = crate::client::ApiClient::new(state);
@@ -954,6 +1065,25 @@ fn tool_get_ci_job(state: &AppState, args: &Value) -> String {
         return "Error: job_id is required".into();
     }
     let api_path = format!("/repos/{}/{}/pipelines/{}/jobs/{}", owner, repo, id, job_id);
+    let client = crate::client::ApiClient::new(state);
+    run(async move { client.get_raw(&api_path).await })
+}
+
+fn tool_get_commit_status(state: &AppState, args: &Value) -> String {
+    let (owner, repo) = match owner_repo(args) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let sha = arg_str(args, "sha");
+    if sha.is_empty() {
+        return "Error: sha is required".into();
+    }
+    let api_path = format!(
+        "/repos/{}/{}/commits/{}/status",
+        owner,
+        repo,
+        urlencoding::encode(sha)
+    );
     let client = crate::client::ApiClient::new(state);
     run(async move { client.get_raw(&api_path).await })
 }
@@ -1228,6 +1358,27 @@ mod tests {
             read_file_path("acme", "widgets", "docs/read me?.md", "feature/new"),
             "/repos/acme/widgets/blob/docs/read%20me%3F.md?ref=feature%2Fnew"
         );
+    }
+
+    /// `write_file` posts to the write half of `/contents/{path}` — the route
+    /// `read_file` must never address — with the same per-segment escaping.
+    #[test]
+    fn write_file_addresses_the_contents_write_route() {
+        assert_eq!(
+            write_file_path("acme", "widgets", "docs/read me?.md"),
+            "/repos/acme/widgets/contents/docs/read%20me%3F.md"
+        );
+    }
+
+    #[test]
+    fn write_file_validates_its_arguments_before_any_network_call() {
+        let no_content =
+            serde_json::json!({ "owner": "o", "repo": "r", "path": "a.txt", "message": "m" });
+        assert!(call_text("write_file", no_content).starts_with("Error: path, content"));
+        let no_message = serde_json::json!({
+            "owner": "o", "repo": "r", "path": "a.txt", "content": "x", "message": ""
+        });
+        assert!(call_text("write_file", no_message).starts_with("Error: path, content"));
     }
 
     #[test]

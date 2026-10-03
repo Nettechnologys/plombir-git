@@ -16,6 +16,14 @@ pull request's reviewer list. It does not block the merge: branch protection
 has no "require review from code owners" setting, so an owner who never
 reviews holds nothing up.
 
+**Whose approval counts.** When branch protection requires approvals, an
+approval counts toward that number only if it comes from a person with write
+access to the repository, checked at merge time, who is neither the author nor
+— for a pull request a bot opened — the bot's owner. Approvals from bots, and
+from collaborators who may only read, are shown on the pull request but do not
+count. So an owner named here needs write access for their approval to
+satisfy the rule.
+
 **When it is read.** Once, at the moment the pull request is **created**,
 from the tip of the pull request's **base branch** — out of the commit
 itself, not a checkout. Three consequences worth knowing:

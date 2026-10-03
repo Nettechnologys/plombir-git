@@ -188,6 +188,7 @@ mod repo_name_transport_tests;
 mod repo_read_gate_tests;
 mod repo_watch_authz_tests;
 mod repo_write_failure_status_tests;
+mod repo_write_new_branch_tests;
 mod repository_deletion_storage_tests;
 mod repository_open_ownership_guard;
 mod review_dismissal_tests;

@@ -306,6 +306,10 @@ which is what lets the server enforce what the CLI cannot:
   MCP tools (then it works only through `/api/v1/mcp`), and kept off protected
   branches (merge, push, server-side commit). A request outside that narrowing
   answers `403` and writes `agent.scope_denied` to the audit log.
+- **Human approval.** Branch protection counts an approval only from a person
+  with write access who is neither the pull request's author nor, for a bot's
+  pull request, the bot's owner (`branch_protection::service::tally_approvals`);
+  bots' approvals never count.
 - **Rate limit.** Bot accounts share a per-account budget,
   `[rate_limit].agent_max` per `agent_window_secs`.
 - **Audit.** Every tool call writes `agent.mcp_tool_call`, and every audit row

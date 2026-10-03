@@ -2,7 +2,7 @@
 //!
 //! `dismiss_review` used to insert a *second* `pr_reviews` row with
 //! `action = "dismiss"` under the dismissor's `reviewer_id`. Nothing read it:
-//! `count_current_approvals` folds only `approve` / `request_changes` into its
+//! `current_approvers` folds only `approve` / `request_changes` into its
 //! per-reviewer verdict map, so the dismissal displaced nobody's approval — and
 //! had it been folded in, it carried the wrong `reviewer_id` and would have
 //! displaced the wrong person's verdict. A maintainer dismissed a stale
@@ -11,7 +11,7 @@
 //!
 //! An approval that has been withdrawn is not a separate opinion by whoever
 //! withdrew it — it is the same opinion, no longer current. So the fact lives
-//! on the original row: `dismissed_at` is what `count_current_approvals`
+//! on the original row: `dismissed_at` is what `current_approvers`
 //! filters on, and `dismissed_by` records who withdrew it so the review itself
 //! can be rendered without joining the event log.
 //!

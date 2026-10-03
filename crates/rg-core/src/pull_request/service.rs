@@ -804,7 +804,7 @@ pub async fn compute_diff(
 /// Not `refs/heads/<head>`, and not the fork ref just fetched: both name the
 /// branch tip *now*, while everything the reviewer's verdict attaches to names
 /// `pr.head_sha` — approvals are counted for it
-/// (`pr_review_ops::count_current_approvals`), branch protection judges it, and
+/// (`pr_review_ops::current_approvers`), branch protection judges it, and
 /// the merge is pinned to it. The row is moved by the detached post-push hook,
 /// so it lags the branch by design; a diff taken from the branch shows content
 /// that the approval about to be recorded will not cover (card_9ff26bb95dc9).
