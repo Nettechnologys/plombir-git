@@ -11,7 +11,11 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::{api::auth::AuthUser, error::AppError, AppState};
+use crate::{
+    api::auth::{AuthUser, SessionUser},
+    error::AppError,
+    AppState,
+};
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSshKeyRequest {
@@ -79,12 +83,13 @@ pub async fn list_ssh_keys(
         (status = 201, description = "SSH key added", body = SshKeyResponse),
         (status = 400, description = "Invalid SSH key", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "A login session is required to create credentials", body = serde_json::Value),
         (status = 409, description = "SSH key already registered", body = serde_json::Value),
     )
 )]
 pub async fn create_ssh_key(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    SessionUser(user_id): SessionUser,
     headers: HeaderMap,
     Json(body): Json<CreateSshKeyRequest>,
 ) -> impl IntoResponse {

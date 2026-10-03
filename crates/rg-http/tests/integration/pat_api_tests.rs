@@ -180,6 +180,253 @@ async fn pat_scopes_are_enforced_by_api_family() {
     assert_eq!(allowed_repo.status(), 201);
 }
 
+const TEST_SSH_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAICAgICAgICAgICAgICAgICAgICAgICAgIC pat-scope-test";
+
+#[tokio::test]
+async fn pat_cannot_issue_a_broader_pat_or_ssh_key_but_a_browser_session_can() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (jwt, user_id) = register_full(&base, "patissuer", "patissuer@example.com").await;
+    let pat = create_pat_with_scopes(&base, &jwt, Some("user")).await;
+    let client = reqwest::Client::new();
+    let token_url = format!("{base}/api/v1/users/tokens");
+    let ssh_url = format!("{base}/api/v1/users/ssh-keys");
+    let token_body = serde_json::json!({ "name": "expanded", "scopes": "repo,admin" });
+    let ssh_body = serde_json::json!({ "title": "test", "public_key": TEST_SSH_KEY });
+
+    for response in [
+        client
+            .post(&token_url)
+            .bearer_auth(&pat)
+            .json(&token_body)
+            .send()
+            .await
+            .unwrap(),
+        client
+            .post(&ssh_url)
+            .bearer_auth(&pat)
+            .json(&ssh_body)
+            .send()
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(response.status(), 403);
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("credential creation requires a login session"));
+    }
+    assert_eq!(
+        rg_db::entities::access_token::Entity::find()
+            .filter(rg_db::entities::access_token::Column::UserId.eq(user_id))
+            .count(&db)
+            .await
+            .unwrap(),
+        1,
+        "the refused request must not insert a PAT"
+    );
+    assert_eq!(
+        rg_db::entities::ssh_key::Entity::find()
+            .filter(rg_db::entities::ssh_key::Column::UserId.eq(user_id))
+            .count(&db)
+            .await
+            .unwrap(),
+        0,
+        "the refused request must not insert an SSH key"
+    );
+
+    let cookie = format!("plombir_git_token={jwt}");
+    let created_pat = client
+        .post(&token_url)
+        .header("Cookie", &cookie)
+        .json(&token_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        created_pat.status(),
+        201,
+        "browser session can create a PAT"
+    );
+    let created_ssh = client
+        .post(&ssh_url)
+        .header("Cookie", &cookie)
+        .json(&ssh_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        created_ssh.status(),
+        201,
+        "browser session can create an SSH key"
+    );
+
+    // When both credentials are sent, the PAT still owns the request's grant.
+    let mixed = client
+        .post(&token_url)
+        .header("Cookie", &cookie)
+        .bearer_auth(&pat)
+        .json(&token_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mixed.status(), 403);
+    assert!(mixed
+        .text()
+        .await
+        .unwrap()
+        .contains("credential creation requires a login session"));
+}
+
+#[tokio::test]
+async fn pat_cannot_issue_bot_or_deploy_credentials_or_start_passkey_registration() {
+    let base = spawn_test_app().await;
+    let jwt = register_user(&base, "patlateral", "patlateral@example.com", "Qz7$wRtm").await;
+    let cookie = format!("plombir_git_token={jwt}");
+    let user_pat = create_pat_with_scopes(&base, &jwt, Some("user")).await;
+    let repo_pat = create_pat_with_scopes(&base, &jwt, Some("repo")).await;
+    let client = reqwest::Client::new();
+
+    let bot = client
+        .post(format!("{base}/api/v1/users/bots"))
+        .header("Cookie", &cookie)
+        .json(&serde_json::json!({ "username": "patlateralbot" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bot.status(), 201, "browser session creates the bot fixture");
+    let bot_url = format!("{base}/api/v1/users/bots/patlateralbot/tokens");
+    let bot_body = serde_json::json!({ "name": "bot-grant" });
+    let denied_bot = client
+        .post(&bot_url)
+        .bearer_auth(&user_pat)
+        .json(&bot_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_bot.status(), 403);
+    assert!(denied_bot
+        .text()
+        .await
+        .unwrap()
+        .contains("credential creation requires a login session"));
+    let created_bot = client
+        .post(&bot_url)
+        .header("Cookie", &cookie)
+        .json(&bot_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        created_bot.status(),
+        201,
+        "browser session creates a bot PAT"
+    );
+
+    let repo = client
+        .post(format!("{base}/api/v1/repos"))
+        .header("Cookie", &cookie)
+        .json(&serde_json::json!({ "name": "pat-grant" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.status(),
+        201,
+        "browser session creates the repository fixture"
+    );
+    let deploy_url = format!("{base}/api/v1/repos/patlateral/pat-grant/keys");
+    let deploy_body =
+        serde_json::json!({ "title": "deploy", "public_key": TEST_SSH_KEY, "read_only": false });
+    let denied_deploy = client
+        .post(&deploy_url)
+        .bearer_auth(&repo_pat)
+        .json(&deploy_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_deploy.status(), 403);
+    assert!(denied_deploy
+        .text()
+        .await
+        .unwrap()
+        .contains("credential creation requires a login session"));
+    let created_deploy = client
+        .post(&deploy_url)
+        .header("Cookie", &cookie)
+        .json(&deploy_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        created_deploy.status(),
+        201,
+        "browser session creates a deploy key"
+    );
+
+    let passkey_url = format!("{base}/api/v1/users/passkeys/register/start");
+    let denied_passkey = client
+        .post(&passkey_url)
+        .bearer_auth(&user_pat)
+        .header(reqwest::header::HOST, "localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_passkey.status(), 403);
+    assert!(denied_passkey
+        .text()
+        .await
+        .unwrap()
+        .contains("credential creation requires a login session"));
+    let started_passkey = client
+        .post(&passkey_url)
+        .header("Cookie", &cookie)
+        .header(reqwest::header::HOST, "localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        started_passkey.status(),
+        200,
+        "browser session starts passkey registration"
+    );
+    let finish_url = format!("{base}/api/v1/users/passkeys/register/finish");
+    let finish_body = serde_json::json!({
+        "name": "bogus",
+        "credential": {
+            "id": "AAAA",
+            "rawId": "AAAA",
+            "type": "public-key",
+            "response": {
+                "attestationObject": "AAAA",
+                "clientDataJSON": "AAAA"
+            }
+        }
+    });
+    let denied_finish = client
+        .post(&finish_url)
+        .bearer_auth(&user_pat)
+        .json(&finish_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_finish.status(), 403);
+    let session_finish = client
+        .post(&finish_url)
+        .header("Cookie", &cookie)
+        .json(&finish_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(session_finish.status(), 400);
+    assert!(session_finish
+        .text()
+        .await
+        .unwrap()
+        .contains("passkey registration challenge missing or expired"));
+}
+
 #[tokio::test]
 async fn unknown_pat_scope_is_rejected_at_creation() {
     let base = spawn_test_app().await;

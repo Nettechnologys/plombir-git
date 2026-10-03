@@ -13,7 +13,7 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::auth::{AuthUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{AuthUser, SessionUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -691,11 +691,12 @@ pub async fn list_tokens(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "A login session is required to create credentials", body = serde_json::Value),
     ),
 )]
 pub async fn create_token(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    SessionUser(user_id): SessionUser,
     headers: HeaderMap,
     Json(body): Json<CreateTokenRequest>,
 ) -> impl IntoResponse {

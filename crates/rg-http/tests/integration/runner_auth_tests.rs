@@ -215,7 +215,7 @@ async fn runner_register_requires_admin() {
 }
 
 #[tokio::test]
-async fn runner_register_accepts_admin_httponly_cookie() {
+async fn runner_register_requires_admin_session_not_pat() {
     let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
     let (admin_token, admin_id) =
@@ -227,16 +227,44 @@ async fn runner_register_accepts_admin_httponly_cookie() {
         .unwrap()
         .expect("registered user must exist");
 
+    let issued_pat = client
+        .post(format!("{base}/api/v1/users/tokens"))
+        .header(
+            reqwest::header::COOKIE,
+            format!("plombir_git_token={admin_token}"),
+        )
+        .json(&serde_json::json!({ "name": "runner-issuer", "scopes": "admin" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(issued_pat.status(), 201);
+    let pat: serde_json::Value = issued_pat.json().await.unwrap();
+    let pat = pat["token"].as_str().unwrap();
+    let request = serde_json::json!({
+        "repository": "runner_cookie/runner-cookie-scope",
+        "name": "cookie-runner"
+    });
+    let denied = client
+        .post(format!("{base}/api/v1/runners/register"))
+        .bearer_auth(pat)
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    assert!(denied
+        .text()
+        .await
+        .unwrap()
+        .contains("credential creation requires a login session"));
+
     let resp = client
         .post(format!("{}/api/v1/runners/register", base))
         .header(
             reqwest::header::COOKIE,
             format!("plombir_git_token={}", admin_token),
         )
-        .json(&serde_json::json!({
-            "repository": "runner_cookie/runner-cookie-scope",
-            "name": "cookie-runner"
-        }))
+        .json(&request)
         .send()
         .await
         .unwrap();

@@ -53,6 +53,43 @@ impl FromRequestParts<crate::AppState> for AuthUser {
     }
 }
 
+/// An account authenticated by a login session, not by a delegated PAT.
+///
+/// Use this for routes that issue credentials which can outlive the request.
+/// The PAT middleware attaches `TokenGrant` even when a request also carries
+/// a session cookie, so mixed credentials cannot launder a PAT into a session.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionUser(pub i64);
+
+impl FromRequestParts<crate::AppState> for SessionUser {
+    type Rejection = crate::error::AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &crate::AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let claims = extract_token_from_cookie(&parts.headers)
+            .and_then(|token| rg_core::auth::jwt::validate_token(&token, &state.jwt_secret))
+            .or_else(|| extract_bearer_claims(&parts.headers, &state.jwt_secret))
+            .ok_or_else(|| crate::error::AppError::unauthorized("authentication required"))?;
+        if claims.pat_id.is_some()
+            || parts
+                .extensions
+                .get::<crate::agent_scope::TokenGrant>()
+                .is_some()
+        {
+            return Err(crate::error::AppError::forbidden(
+                "credential creation requires a login session",
+            ));
+        }
+        let user_id = claims
+            .sub
+            .parse::<i64>()
+            .map_err(|_| crate::error::AppError::unauthorized("authentication required"))?;
+        Ok(SessionUser(user_id))
+    }
+}
+
 /// Cookie name used for HttpOnly JWT storage (M-4).
 pub(crate) const AUTH_COOKIE_NAME: &str = "plombir_git_token";
 

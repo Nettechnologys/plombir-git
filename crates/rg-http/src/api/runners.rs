@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::access_audit::{grant_actor, record_instance_credential, InstanceResource};
 use crate::api::admin::InstanceAdmin;
+use crate::api::auth::SessionUser;
 use crate::error::AppError;
 use crate::AppState;
 use utoipa::{IntoParams, ToSchema};
@@ -185,11 +186,13 @@ pub async fn get_runner_admin(
         (status = 201, description = "Created", body = RegisterRunnerResponse),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "A login session is required to create credentials", body = serde_json::Value),
     ),
 )]
 pub async fn register(
     State(state): State<AppState>,
     InstanceAdmin(actor_id): InstanceAdmin,
+    SessionUser(_session_user): SessionUser,
     headers: HeaderMap,
     Json(req): Json<RegisterRunnerRequest>,
 ) -> impl IntoResponse {

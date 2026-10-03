@@ -17,7 +17,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, SessionUser};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -473,12 +473,13 @@ pub async fn list_bot_tokens(
         (status = 201, description = "Created; `token` is shown only here", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "A login session is required to create credentials", body = serde_json::Value),
         (status = 404, description = "No such bot of the caller's", body = serde_json::Value),
     ),
 )]
 pub async fn create_bot_token(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    SessionUser(user_id): SessionUser,
     headers: HeaderMap,
     Path(bot): Path<String>,
     Json(body): Json<CreateBotTokenRequest>,
