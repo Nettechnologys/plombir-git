@@ -522,7 +522,7 @@ async fn protected_environment_requires_authorized_approval_before_release() {
 
     let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
-    let (owner_token, _owner_id) = register_full(&base, "env_owner", "env_owner@example.com").await;
+    let (owner_token, owner_id) = register_full(&base, "env_owner", "env_owner@example.com").await;
     let (other_token, _other_id) = register_full(&base, "env_other", "env_other@example.com").await;
     let repo_id = create_private_repo(&base, &owner_token, "protected-deploy").await;
     let environment_response = client
@@ -534,7 +534,7 @@ async fn protected_environment_requires_authorized_approval_before_release() {
             "name": "production",
             "protected": true,
             "required_approvals": 1,
-            "allowed_approver_ids": []
+            "allowed_approver_ids": [owner_id]
         }))
         .send()
         .await
@@ -605,6 +605,62 @@ async fn protected_environment_requires_authorized_approval_before_release() {
     let bot_id = bot.json::<serde_json::Value>().await.unwrap()["id"]
         .as_i64()
         .unwrap();
+    // The same list as the live release below becomes impossible when its
+    // second human is replaced by a bot: a bot's vote cannot satisfy the gate.
+    for (method, url, name) in [
+        (
+            "POST",
+            format!("{base}/api/v1/repos/env_owner/protected-deploy/actions/environments"),
+            "unreleasable",
+        ),
+        (
+            "PUT",
+            format!(
+                "{base}/api/v1/repos/env_owner/protected-deploy/actions/environments/{environment_id}"
+            ),
+            "production",
+        ),
+    ] {
+        let rejected = client
+            .request(method.parse().unwrap(), url)
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({
+                "name": name,
+                "protected": true,
+                "required_approvals": 2,
+                "allowed_approver_ids": [owner_id, bot_id]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = rejected.status();
+        let body: serde_json::Value = rejected.json().await.unwrap();
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            format!("CI environment approver {bot_id} must be a human account")
+        );
+    }
+    assert_eq!(
+        rg_db::ops::ci_environment_ops::list(&db, repo_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the invalid POST must not leave a second environment"
+    );
+    let unchanged = rg_db::ops::ci_environment_ops::find_by_id(&db, environment_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.required_approvals, 1);
+    assert_eq!(
+        rg_db::ops::ci_environment_ops::allowed_approver_ids(&db, &unchanged)
+            .await
+            .unwrap(),
+        vec![owner_id],
+        "the invalid PUT must leave the human approval path intact"
+    );
     let collaborator = client
         .post(format!(
             "{base}/api/v1/repos/env_owner/protected-deploy/collaborators"

@@ -236,3 +236,111 @@ async fn every_grant_endpoint_rejects_unusable_users_and_accepts_a_live_one() {
         vec![live_id]
     );
 }
+
+#[tokio::test]
+async fn environment_approvers_must_be_human_on_create_and_update() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (owner_token, owner_id) = register_full(
+        &base,
+        "human-approval-owner",
+        "human-approval-owner@example.com",
+    )
+    .await;
+    let (_, reviewer_id) = register_full(
+        &base,
+        "human-approval-reviewer",
+        "human-approval-reviewer@example.com",
+    )
+    .await;
+    let repo_id = create_repo(&base, &owner_token, "human-approval-repo").await;
+    let endpoint = format!(
+        "{base}/api/v1/repos/human-approval-owner/human-approval-repo/actions/environments"
+    );
+    let bot = client
+        .post(format!("{base}/api/v1/users/bots"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"username": "approval-bot"}))
+        .send()
+        .await
+        .expect("create bot");
+    assert_eq!(bot.status(), 201);
+    let bot_id = bot.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let rejected = bad_request_message(
+        client
+            .post(&endpoint)
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({
+                "name": "production",
+                "protected": true,
+                "required_approvals": 2,
+                "allowed_approvers": ["human-approval-owner", "approval-bot"]
+            }))
+            .send()
+            .await
+            .expect("create with an impossible approval threshold"),
+    )
+    .await;
+    assert_eq!(
+        rejected,
+        format!("CI environment approver {bot_id} must be a human account")
+    );
+    assert!(
+        rg_db::ops::ci_environment_ops::list(&db, repo_id)
+            .await
+            .expect("list environments after rejected create")
+            .is_empty(),
+        "the rejected create must not store an environment"
+    );
+
+    let created = client
+        .post(&endpoint)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "name": "production",
+            "protected": true,
+            "required_approvals": 2,
+            "allowed_approver_ids": [owner_id, reviewer_id]
+        }))
+        .send()
+        .await
+        .expect("create with two human approvers");
+    assert_eq!(created.status(), 201);
+    let environment_id = created.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let rejected = bad_request_message(
+        client
+            .put(format!("{endpoint}/{environment_id}"))
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({
+                "name": "production",
+                "protected": true,
+                "required_approvals": 2,
+                "allowed_approver_ids": [owner_id, bot_id]
+            }))
+            .send()
+            .await
+            .expect("update to an impossible approval threshold"),
+    )
+    .await;
+    assert_eq!(
+        rejected,
+        format!("CI environment approver {bot_id} must be a human account")
+    );
+    let environment = rg_db::ops::ci_environment_ops::find_by_id(&db, environment_id)
+        .await
+        .expect("load environment after rejected update")
+        .expect("environment still exists");
+    assert_eq!(environment.required_approvals, 2);
+    assert_eq!(
+        rg_db::ops::ci_environment_ops::allowed_approver_ids(&db, &environment)
+            .await
+            .expect("load original human approvers"),
+        vec![owner_id, reviewer_id]
+    );
+}

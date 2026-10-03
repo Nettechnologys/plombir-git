@@ -49,6 +49,8 @@ pub enum InvalidPrincipal {
     Inactive(i64),
     #[error("grant user {0} is being retired")]
     Retiring(i64),
+    #[error("CI environment approver {0} must be a human account")]
+    BotApprover(i64),
 }
 
 /// Turn a shared validation error inside an `anyhow` chain into its stable
@@ -114,7 +116,11 @@ async fn write_json_mirror(
     Ok(())
 }
 
-async fn validate_and_lock_users(transaction: &DatabaseTransaction, ids: &[i64]) -> Result<()> {
+async fn validate_and_lock_users(
+    transaction: &DatabaseTransaction,
+    target: Target,
+    ids: &[i64],
+) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
@@ -141,6 +147,9 @@ async fn validate_and_lock_users(transaction: &DatabaseTransaction, ids: &[i64])
         }
         if !principal.is_active {
             return Err(InvalidPrincipal::Inactive(*id).into());
+        }
+        if matches!(target, Target::CiEnvironment(_)) && principal.is_bot() {
+            return Err(InvalidPrincipal::BotApprover(*id).into());
         }
     }
     Ok(())
@@ -234,7 +243,7 @@ pub async fn replace(
     };
 
     write_json_mirror(transaction, target, serialized).await?;
-    validate_and_lock_users(transaction, &ids).await?;
+    validate_and_lock_users(transaction, target, &ids).await?;
     delete_relational(transaction, target).await?;
     insert_relational(transaction, target, &ids).await
 }
