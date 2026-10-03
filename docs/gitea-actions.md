@@ -631,9 +631,10 @@ jobs:
 environment — job and workflow `env:` override it, which is the precedence
 Actions uses. `options` is refused.
 
-Whether a job may run at all without an `image` depends on the instance: host
-execution is off by default, so on a default instance every job wants either a
-`container.image` or a runner that supplies one.
+Whether a job may run at all depends on the instance. Docker execution, host
+execution and external runners are all off by default, so a default instance
+runs no job until the operator enables one of them; with Docker on, every job
+wants either a `container.image` or a runner that supplies one.
 
 ## Matrix
 

@@ -163,7 +163,9 @@ runnable at all, and both refuse loudly rather than falling back:
   `ci.external_runners`, see [`tags`](#tags)), or have the operator enable host
   execution on a trusted instance.
 
-So on a default instance, every job wants an `image`.
+So a default instance — Docker execution off, host execution off, no external
+runners — runs no job at all. The operator turns one of the three on first; with
+Docker on, every job wants an `image`.
 
 ### `only`
 

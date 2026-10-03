@@ -1,22 +1,148 @@
 # ForgeKeep
 
-> A lightweight, self-hosted Git platform written in Rust.
+> A lightweight, self-hosted Git forge for teams where code is written by
+> people and AI agents alike.
 
 [![Rust](https://img.shields.io/badge/rust-1.95%2B-orange)](https://www.rust-lang.org/)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 
-ForgeKeep is a full-featured Git hosting platform — repositories, issues, pull
-requests, code review, wiki, CI/CD, and a package registry — built as a single
-Rust workspace. It targets a small memory footprint and single-binary
-deployment, in the same space as [Gitea](https://gitea.com/) and
-[Forgejo](https://forgejo.org/).
-
-The server speaks the Git Smart Protocol (V1 + V2) over both HTTPS and SSH, so
-`git clone` / `git push` work out of the box, and everything else is exposed
-through a REST API and an optional SvelteKit web UI.
+ForgeKeep hosts repositories, issues, pull requests, code review, CI, a wiki
+and package registries — and treats an AI agent as a participant of its own:
+its own account, its own narrowed token, its own audit trail, while a person
+keeps the approval that opens the merge. One server process speaks Git over
+HTTPS and SSH and serves the REST API, MCP and the CI scheduler; the web UI is
+a static SvelteKit bundle served next to it. It sits in the same space as
+[Gitea](https://gitea.com/) and [Forgejo](https://forgejo.org/).
 
 > **Origin.** ForgeKeep is a fork of [IronForge](https://github.com/lengyuqu/ironforge).
 > See [NOTICE](NOTICE) for provenance and licensing details.
+
+---
+
+## Why ForgeKeep
+
+Three things, each with something you can check.
+
+### 1. Agents work under their own name, and a person approves
+
+- **MCP is part of the server**, at `POST /api/v1/mcp`, with the caller's
+  credential and every access check of the REST API behind each tool call.
+  There is nothing extra to install. (Gitea's MCP server is a separate
+  program, [`gitea-mcp`](https://gitea.com/gitea/gitea-mcp).)
+- **Any user can create a bot account they own.** It has no password, it acts
+  only through tokens you mint, and it stops working when your account does.
+- **Tokens can be narrowed** to named repositories and named MCP tools, and
+  kept off protected branches — on by default for a bot's token.
+- **A person opens the merge.** A bot's approval never counts toward a
+  protected branch's required approvals, nor does its owner's approval on the
+  bot's own pull request. A bot cannot approve a protected deployment
+  environment, and CI for a pull request from a fork runs only after a person
+  approves its exact head commit.
+- **Every MCP tool call is in the audit log** (`agent.mcp_tool_call`), and so is
+  every request a token's narrowing refused (`agent.scope_denied`).
+
+Proof: the whole loop — an agent branches, commits, opens a pull request,
+answers review, a person approves — is an integration test and a recording,
+[`docs/demo/agent-review.cast`](docs/demo/agent-review.cast)
+(`asciinema play docs/demo/agent-review.cast`). Details are under
+[MCP over HTTP and agent accounts](#mcp-over-http-and-agent-accounts).
+
+Gitea 28 has bot accounts and an audit log too
+([release notes](https://blog.gitea.com/release-of-28.0.0/)), so "has bots" is
+no longer the difference. The difference is who may create one, what its token
+can be narrowed to, and whose approval counts.
+
+### 2. Release assets that can be verified outside the forge
+
+With `attestation_enabled = true` under `[releases]`, anyone with write access
+can have a release asset signed: `POST …/releases/assets/{id}/attestation` produces an
+[in-toto Statement v1](https://github.com/in-toto/attestation) in a
+[DSSE](https://github.com/secure-systems-lab/dsse) envelope, canonicalised with
+RFC 8785 and signed with the instance's Ed25519 key. The public key is the one
+already published at `/api/v1/ci/oidc/jwks`, and `…/attestation/verify` checks
+an envelope on the server.
+
+What it states, precisely: *this instance received exactly this SHA-256 for
+this release, from this uploader*. It is not SLSA build provenance — it says
+nothing about how the file was built. The signing key is stored, not derived
+from `jwt_secret`, so rotating that secret does not invalidate signatures
+already issued (see [Secrets and rotation](#secrets-and-rotation)).
+
+### 3. CI that runs what you wrote, or refuses by name
+
+ForgeKeep runs `.gitea/workflows/*.yml` as a **strict subset** of Actions. A key
+it accepts is executed; a key, trigger or action it does not implement fails the
+whole workflow with a message naming the file, the job and the key. It is never
+quietly dropped, so you never get a green run of a shortened workflow. A
+protected `environment:` holds the job until a person approves it.
+
+The table below is the honest trade. Gitea runs much more of the Actions
+ecosystem; ForgeKeep's promise is narrower and stricter.
+
+## Actions compatibility
+
+Compared with **Gitea 28.0.0** and **Gitea Runner 2.0.0**, as of 2026-10-03.
+Gitea documents its Actions as GitHub-compatible except for the differences on
+[its comparison page](https://docs.gitea.com/usage/actions/comparison/); a ✅ in
+the Gitea column means the key is not listed there, or that the release notes
+cited in the row added it. ForgeKeep's side is specified in full in
+[docs/gitea-actions.md](docs/gitea-actions.md).
+
+| Workflow syntax | ForgeKeep | Gitea 28 |
+|-----------------|-----------|----------|
+| `on:` `push`, `pull_request`, `workflow_dispatch`, `workflow_call` | ✅ | ✅ |
+| `on:` `schedule`, `pull_request_target`; `on.<event>.types` | ❌ refused by name | ✅ |
+| Branch, tag and path filters, `!` negation | ✅ GitHub globs; `+`, `?` and `[…]` refused rather than read differently | ✅ |
+| `concurrency` (workflow level) | ✅ `group`, `cancel-in-progress` | ✅ since 1.26 ([notes](https://blog.gitea.com/release-of-1.26.0/)) |
+| `jobs.<id>.timeout-minutes` | ✅ | ✅ with Runner 2.0 ([notes](https://blog.gitea.com/release-of-runner-2.0.0/)) |
+| `jobs.<id>.continue-on-error` | ✅ | ✅ with Runner 2.0 and Gitea ≥ 1.27 |
+| `jobs.<id>.environment` | ✅ an existing environment; a protected one waits for a person's approval | ⚠️ ignored |
+| `needs`, `if`, `env`, `defaults.run.working-directory` | ✅ | ✅ |
+| `strategy.matrix` | ✅ static | ✅ static and dynamic |
+| `strategy.fail-fast`, `strategy.max-parallel` | ❌ refused | ✅ |
+| Reusable workflows | ✅ same repository only | ✅ |
+| `container.image`, `container.env` | ✅ | ✅ |
+| `container.options` | ❌ refused — it could undo the job sandbox | ✅ |
+| `services:` | ❌ refused | ✅ |
+| `uses:` actions | ⚠️ `actions/checkout`, `actions/cache`, `actions/upload-artifact` only | ✅ any action |
+| Composite actions, step `id` and outputs | ❌ refused | ✅ |
+| Step `continue-on-error`, step `timeout-minutes`, step `shell` | ❌ refused — a job's steps run as one script | ✅ |
+| `permissions`, `vars.*` | ❌ refused | ✅ |
+
+If your workflows lean on marketplace actions, services or step outputs, Gitea
+will run them and ForgeKeep will not. ForgeKeep also has its own pipeline format,
+[`.forgekeep-ci.yml`](docs/ci.md), for what the subset cannot express.
+
+## Memory: measured, and not good yet
+
+We publish only numbers we measured, and this one is our weak spot:
+
+| Build | Load | `VmRSS` at idle | `VmHWM` (peak) |
+|-------|------|-----------------|----------------|
+| `1e3679f`, before the fix below | Production instance: 40 days up, 4 users, 35 MB database, 14 MB of repositories | 1.21 GB | 2.56 GB |
+
+1.14 GB of that idle figure was 31 glibc per-thread malloc arenas of about
+58 MB each, held fully resident by transparent huge pages. Since `1068860` the
+server caps glibc at two arenas before it starts its worker threads (an explicit
+`MALLOC_ARENA_MAX` still wins). The measurement after that fix has not been
+taken yet; it will replace this paragraph when it has. Until then, "lightweight"
+is a goal rather than a measured claim.
+
+## How it is built
+
+ForgeKeep is developed with AI coding agents. They write the code; the
+maintainer decides what to build and reviews it. The repository's pre-push hook
+(`.githooks/pre-push`) lets a push through only once
+`scripts/verify-push-gates.sh` has passed on that exact commit:
+
+- `cargo fmt --check`, workspace Clippy and `cargo doc`, where a warning is a
+  failure;
+- around eighty `scripts/*-contract-check.mjs` checks that pin documentation,
+  configuration, routes and access rules to the code;
+- Docker Compose, observability-config and frontend checks.
+
+The workspace test suite takes about half an hour and is not part of that push
+gate; it is run before a piece of work is closed.
 
 ---
 
@@ -38,11 +164,13 @@ through a REST API and an optional SvelteKit web UI.
 | Search | Full-text search (FTS) and per-repository code indexing |
 | Import | Pull repositories, issues, PRs, labels, milestones, releases and wiki from GitHub / GitLab |
 | Operations | TLS/HTTPS, TOML config, rate limiting, log rotation, unified pagination, GPG signature verification, audit log, health checks |
-| AI integration | `forgekeep-mcp` — a Model Context Protocol (stdio) server exposing repository tools/resources to agents |
-| Web UI | SvelteKit 5 SPA (login, repos, issues, PRs, wiki, CI, review, orgs, notifications), English + Chinese i18n |
+| AI agents | Model Context Protocol built into the server (`POST /api/v1/mcp`) and as a stdio binary (`forgekeep-mcp`); bot accounts, narrowed tokens, per-bot rate limits and audit ([details](#mcp-over-http-and-agent-accounts)) |
+| Releases | Release assets with optional in-toto / DSSE attestations signed by the instance key |
+| Web UI | SvelteKit (Svelte 5) SPA (login, repos, issues, PRs, wiki, CI, review, orgs, notifications), English + Chinese i18n |
 
 Databases: SQLite, PostgreSQL, and MySQL are all supported and selected at
-runtime from the `database_url` scheme — no feature rebuild required.
+runtime from the scheme of `--db-url` / `[database].url` — no feature rebuild
+required.
 
 ---
 
@@ -381,10 +509,16 @@ not relax the exact-origin redirect policy.
 
 ## CI runner (`forgekeep-runner`)
 
-CI jobs do not run inside the server. `forgekeep-runner` is a separate binary you
-install on the build machine: it registers once, then polls the server for jobs
-whose `tags:` its own labels satisfy and executes them — natively, or in a
-container when the job names an image (see [docs/ci.md](docs/ci.md)).
+Out of the box the server executes CI jobs itself: in Docker when `[ci].docker`
+is on, or as a shell on the host only when `[ci].allow_host_runner` explicitly
+allows it. `forgekeep-runner` moves that work to a build machine. It is a
+separate binary: it registers once, then polls the server for jobs whose `tags:`
+its own labels satisfy and executes them — natively, or in a container when the
+job names an image (see [docs/ci.md](docs/ci.md)).
+
+The server hands jobs to registered runners only with `external_runners = true`
+under `[ci]`. With the default `false` it keeps running every job in-process, and
+a registered runner polls without ever being given one.
 
 ### Register
 
@@ -612,14 +746,14 @@ treat an agent as a participant of its own rather than as its owner:
 |-------|--------|---------|
 | Async runtime | tokio | 1.x |
 | HTTP | axum + axum-server | 0.8 / 0.7 |
-| SSH server | russh | 0.51 |
+| SSH server | russh | 0.60 |
 | Git objects | gix (gitoxide) + `git` CLI gateway | 0.84 |
 | ORM | SeaORM (SQLite / PostgreSQL / MySQL) | 1.1 |
 | Auth | argon2 + JWT | — |
 | TLS | rustls + tokio-rustls | 0.23 / 0.26 |
-| Logging | tracing + tracing-appender | 0.1 |
+| Logging | tracing + tracing-appender | 0.1 / 0.2 |
 | CLI | clap | 4.x |
-| Frontend | SvelteKit 5 (adapter-static, SPA) | — |
+| Frontend | SvelteKit (adapter-static, SPA) + Svelte | 2 / 5 |
 | Coverage | cargo-llvm-cov | — |
 
 > Git object operations use a hybrid of `gix` and a `GitCommandGateway`: pack,

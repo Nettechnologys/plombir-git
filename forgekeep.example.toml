@@ -131,10 +131,13 @@ allow_host_runner = false
 # runner_labels = ["self-hosted", "ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-20.04"]
 
 [releases]
-# Sign release assets with this instance's Ed25519 provenance key and publish
-# the attestation next to the asset. Opt-in: the key itself is created on first
-# start regardless (see [auth] above), this only decides whether uploads get
-# signed. Also settable as FORGEKEEP_ATTESTATION_ENABLED=1, which wins.
+# Serve the release-asset attestation endpoints: a user with write access signs
+# one asset with this instance's Ed25519 provenance key through
+# POST .../releases/assets/{id}/attestation, and the envelope is published next
+# to the asset. Nothing is signed on upload by itself. Opt-in: the key is
+# created on first start regardless (see [auth] above), this only decides
+# whether the endpoints answer. Also settable as FORGEKEEP_ATTESTATION_ENABLED=1,
+# which wins.
 attestation_enabled = false
 
 [rate_limit]
