@@ -174,6 +174,23 @@ pub async fn trigger_pull_request_ci(
             );
             return Ok(None);
         }
+        // Old approvals remain on the PR row. Refusing bot accounts only at
+        // the HTTP endpoint would leave an already-stamped bot approval able
+        // to release this head on the next push/retry.
+        let human_approver = match pr.ci_approved_by {
+            Some(id) => rg_db::ops::user_ops::find_by_id(db, id)
+                .await?
+                .is_some_and(|user| user.is_usable() && !user.is_bot()),
+            None => false,
+        };
+        if !human_approver {
+            tracing::info!(
+                pr_id = pr.id,
+                head_repo_id,
+                "pull_request CI held for a fork PR: approval has no active human approver"
+            );
+            return Ok(None);
+        }
         tracing::info!(
             pr_id = pr.id,
             head_repo_id,

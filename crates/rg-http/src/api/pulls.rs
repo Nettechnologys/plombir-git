@@ -1,14 +1,15 @@
 //! REST API handlers for Pull Requests.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::Json;
+use axum::{Extension, Json};
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 
 use rg_core::pull_request::merge_queue::CancelOutcome;
 
+use crate::agent_scope::TokenGrant;
 use crate::api::repo_access::{self, RepoAuthRead, RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
@@ -667,6 +668,7 @@ pub async fn disable_auto_merge(
     responses(
         (status = 200, description = "CI approved for the PR's current head", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Write access or a human approver is required", body = serde_json::Value),
         (status = 409, description = "The pull request is not open, or its head moved while the approval was being recorded", body = serde_json::Value),
     ),
 )]
@@ -677,14 +679,34 @@ pub async fn disable_auto_merge(
 /// head must not start one on its own — and until this endpoint existed the
 /// answer to that was that a fork PR got no CI at all (card_94834ecee708).
 ///
-/// `RepoWrite` and not the PR author: the whole point is that somebody who
-/// already has write access has looked at the diff. The approval is recorded
+/// A human with `RepoWrite`, not the PR author: the whole point is that somebody
+/// already trusted to write here has looked at the diff. The approval is recorded
 /// against the head commit, so it does not survive the next push.
 pub async fn approve_pr_ci(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    RepoWrite { actor_id, .. }: RepoWrite,
+    RepoWrite {
+        repo: repository,
+        actor_id,
+    }: RepoWrite,
+    headers: HeaderMap,
+    grant: Option<Extension<TokenGrant>>,
 ) -> impl IntoResponse {
+    if let Some(Extension(grant)) = grant.filter(|Extension(grant)| grant.owner().is_bot()) {
+        return grant
+            .deny(
+                &headers,
+                "a person must approve fork pull request CI",
+                serde_json::json!({
+                    "reason": "human_approval_required",
+                    "action": "fork_pr_ci",
+                    "repo_id": repository.id,
+                    "pr_number": number,
+                }),
+            )
+            .await
+            .into_response();
+    }
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(error) => return AppError::from(error).into_response(),

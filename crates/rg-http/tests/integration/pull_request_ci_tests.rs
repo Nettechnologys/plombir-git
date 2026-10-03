@@ -978,7 +978,7 @@ impl Fixture {
 /// code it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fork_pr_runs_ci_only_for_a_head_a_maintainer_approved() {
-    use sea_orm::Set;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 
     let fixture = fixture("forkci", "fork-ci-repo", true).await;
     open_pr(&fixture, "forkci", "fork-ci-repo").await;
@@ -1027,6 +1027,82 @@ async fn a_fork_pr_runs_ci_only_for_a_head_a_maintainer_approved() {
         None,
         "a refused approval must leave the fork head held"
     );
+
+    // A bot has real write access to the base repository, but its own verdict
+    // is not the human review that permits fork code to see base CI secrets.
+    let bot = client
+        .post(format!("{}/api/v1/users/bots", fixture.base))
+        .bearer_auth(&fixture.jwt)
+        .json(&serde_json::json!({ "username": "fork-ci-bot" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bot.status(), 201, "{}", bot.text().await.unwrap());
+    let bot_id = bot.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let collaborator = client
+        .post(format!(
+            "{}/api/v1/repos/forkci/fork-ci-repo/collaborators",
+            fixture.base
+        ))
+        .bearer_auth(&fixture.jwt)
+        .json(&serde_json::json!({ "username": "fork-ci-bot", "permission": "write" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        collaborator.status().is_success(),
+        "{}",
+        collaborator.text().await.unwrap()
+    );
+    let token = client
+        .post(format!(
+            "{}/api/v1/users/bots/fork-ci-bot/tokens",
+            fixture.base
+        ))
+        .bearer_auth(&fixture.jwt)
+        .json(&serde_json::json!({ "name": "ci-review" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(token.status(), 201, "{}", token.text().await.unwrap());
+    let token = token.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let denied = client
+        .post(&approval_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let denied_status = denied.status();
+    let denied_body: serde_json::Value = denied.json().await.unwrap();
+    assert_eq!(denied_status, 403, "{denied_body}");
+    assert_eq!(denied_body["error"]["code"], "FORBIDDEN");
+    let denials = rg_db::entities::audit_log::Entity::find()
+        .filter(rg_db::entities::audit_log::Column::Action.eq("agent.scope_denied"))
+        .all(&fixture.db)
+        .await
+        .unwrap();
+    assert!(denials.iter().any(|row| {
+        row.user_id == Some(bot_id)
+            && row.details.as_deref().is_some_and(|details| {
+                let details: serde_json::Value = serde_json::from_str(details).unwrap();
+                details["reason"] == "human_approval_required"
+                    && details["action"] == "fork_pr_ci"
+                    && details["token_id"].is_number()
+            })
+    }));
+    // A previously stamped approval cannot release the fork after this fix.
+    let mut historical: rg_db::entities::pull_request::ActiveModel = fixture.pr().await.into();
+    historical.ci_approved_by = Set(Some(bot_id));
+    historical.ci_approved_sha = Set(Some(fixture.head_sha.clone()));
+    let historical = rg_db::ops::pull_request_ops::update(&fixture.db, historical)
+        .await
+        .unwrap();
+    assert_eq!(fixture.trigger_pr_ci(&historical).await, None);
 
     let approved = client
         .post(&approval_url)

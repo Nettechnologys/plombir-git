@@ -1,3 +1,4 @@
+use crate::agent_scope::TokenGrant;
 use crate::api::access_audit::{grant_actor, named_grant_list, record_grant};
 use crate::api::repo_access::{self, RepoAdmin, RepoAuthRead, RepoRead};
 use crate::api::user_ref::{name_allow_list, resolve_allow_list, AllowedUser};
@@ -6,7 +7,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use sea_orm::{NotSet, Set};
 use serde::{Deserialize, Serialize};
@@ -442,12 +443,30 @@ pub struct ApprovalResponse {
     pub released: bool,
 }
 
-#[utoipa::path(post, path = "/repos/{owner}/{name}/pipelines/{pipeline_id}/jobs/{job_id}/approve", tag = "CI/CD", responses((status = 200, body = ApprovalResponse)))]
+#[utoipa::path(post, path = "/repos/{owner}/{name}/pipelines/{pipeline_id}/jobs/{job_id}/approve", tag = "CI/CD", responses((status = 200, body = ApprovalResponse), (status = 403, description = "A human approver with access is required", body = serde_json::Value)))]
 pub async fn approve(
     State(state): State<AppState>,
     Path((owner, _, pipeline_id, job_id)): Path<(String, String, i64, i64)>,
     RepoAuthRead { repo, actor_id }: RepoAuthRead,
+    headers: HeaderMap,
+    grant: Option<Extension<TokenGrant>>,
 ) -> impl IntoResponse {
+    if let Some(Extension(grant)) = grant.filter(|Extension(grant)| grant.owner().is_bot()) {
+        return grant
+            .deny(
+                &headers,
+                "a person must approve a protected environment",
+                serde_json::json!({
+                    "reason": "human_approval_required",
+                    "action": "environment_deploy",
+                    "repo_id": repo.id,
+                    "pipeline_id": pipeline_id,
+                    "job_id": job_id,
+                }),
+            )
+            .await
+            .into_response();
+    }
     let ctx = match authorize_approval(&state, repo, actor_id, pipeline_id, job_id).await {
         Ok(ctx) => ctx,
         Err(response) => return response,

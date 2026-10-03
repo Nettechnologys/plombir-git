@@ -518,7 +518,7 @@ async fn manual_job_play_requires_write_access_and_is_atomic() {
 
 #[tokio::test]
 async fn protected_environment_requires_authorized_approval_before_release() {
-    use sea_orm::ConnectionTrait;
+    use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 
     let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
@@ -593,6 +593,84 @@ async fn protected_environment_requires_authorized_approval_before_release() {
         "{base}/api/v1/repos/env_owner/protected-deploy/pipelines/{}/jobs/{}/approve",
         pipeline.id, job.id
     );
+
+    let bot = client
+        .post(format!("{base}/api/v1/users/bots"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({ "username": "deploy-bot" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bot.status(), 201, "{}", bot.text().await.unwrap());
+    let bot_id = bot.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let collaborator = client
+        .post(format!(
+            "{base}/api/v1/repos/env_owner/protected-deploy/collaborators"
+        ))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({ "username": "deploy-bot", "permission": "admin" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        collaborator.status().is_success(),
+        "{}",
+        collaborator.text().await.unwrap()
+    );
+    let bot_token = client
+        .post(format!("{base}/api/v1/users/bots/deploy-bot/tokens"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({ "name": "deploy" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bot_token.status(),
+        201,
+        "{}",
+        bot_token.text().await.unwrap()
+    );
+    let bot_token = bot_token.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let denied = client
+        .post(&approve_url)
+        .bearer_auth(&bot_token)
+        .send()
+        .await
+        .unwrap();
+    let denied_status = denied.status();
+    let denied_body: serde_json::Value = denied.json().await.unwrap();
+    assert_eq!(denied_status, 403, "{denied_body}");
+    assert_eq!(denied_body["error"]["code"], "FORBIDDEN");
+    let denials = rg_db::entities::audit_log::Entity::find()
+        .filter(rg_db::entities::audit_log::Column::Action.eq("agent.scope_denied"))
+        .all(&db)
+        .await
+        .unwrap();
+    assert!(denials.iter().any(|row| {
+        row.user_id == Some(bot_id)
+            && row.details.as_deref().is_some_and(|details| {
+                let details: serde_json::Value = serde_json::from_str(details).unwrap();
+                details["reason"] == "human_approval_required"
+                    && details["action"] == "environment_deploy"
+                    && details["token_id"].is_number()
+            })
+    }));
+    // An approval left by an older server remains history, not a release vote.
+    rg_db::ops::ci_environment_ops::add_approval(&db, job.id, environment_id, bot_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        rg_db::ops::ci_environment_ops::count_approvals(&db, job.id)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_ci_graph_status(&db, job.id, stage.id, pipeline.id, "waiting_approval").await;
 
     assert_eq!(
         client
