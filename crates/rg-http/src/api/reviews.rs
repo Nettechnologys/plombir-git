@@ -184,21 +184,9 @@ async fn require_suggestion_source(
     if pr.state != "open" {
         return Err(AppError::conflict("pull request is not open"));
     }
+    crate::agent_scope::confine_pull_request_head(grant, headers, &pr, "apply_review_suggestion")
+        .await?;
     let source_repo_id = pr.head_repo_id.unwrap_or(pr.repo_id);
-    if let Some(grant) = grant.filter(|grant| !grant.admits_repository(source_repo_id)) {
-        return Err(grant
-            .deny(
-                headers,
-                "this token may not access the pull request head repository",
-                serde_json::json!({
-                    "reason": "repository_not_allowed",
-                    "action": "apply_review_suggestion",
-                    "base_repo_id": pr.repo_id,
-                    "head_repo_id": source_repo_id,
-                }),
-            )
-            .await);
-    }
     let source_repo = rg_db::entities::repository::Entity::find_by_id(source_repo_id)
         .one(&state.db)
         .await

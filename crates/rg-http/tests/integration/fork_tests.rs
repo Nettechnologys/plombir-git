@@ -19,6 +19,8 @@
 
 use std::path::Path;
 
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+
 use crate::common::{register_full, spawn_test_app_with_repo_root};
 
 /// Create a repository with `auto_init`, so the fork has an actual commit to
@@ -470,5 +472,153 @@ async fn outsider_cannot_fork_a_private_repository() {
     assert!(
         repo_root.join("privoutsider/publicme.git").is_dir(),
         "baseline fork is missing on disk"
+    );
+}
+
+/// Mint a Personal Access Token confined to `repositories` for the account
+/// behind `session`.
+async fn confined_token(base: &str, session: &str, repositories: &[&str]) -> String {
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/tokens"))
+        .bearer_auth(session)
+        .json(&serde_json::json!({
+            "name": "confined", "scopes": "repo", "repositories": repositories,
+        }))
+        .send()
+        .await
+        .expect("mint confined token");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("token body");
+    assert_eq!(
+        status, 201,
+        "baseline: confined token minting failed: {body}"
+    );
+    body["token"].as_str().expect("raw token").to_string()
+}
+
+/// card_06b1b53d1df0: a token confined to the *source* repository must not add
+/// a repository anywhere. Its allow-list names repositories that exist, so the
+/// destination of a fork — personal or organizational — or of a transfer can
+/// never be on it. The route layer judges these routes by the source in the
+/// path and let them through.
+///
+/// Every refusal is checked against the same account's unconfined credential
+/// doing the same thing, so a `403` here is the token boundary and not a
+/// broken fixture.
+#[tokio::test]
+async fn a_source_confined_token_adds_no_repository_to_any_namespace() {
+    let (base, db, repo_root) = crate::common::spawn_test_app_with_db_and_repo_root().await;
+    let (owner_token, _) = register_full(&base, "cfsource", "cfsource@example.com").await;
+    create_seeded_repo(&base, &owner_token, "upstream", false).await;
+    let (forker_token, forker_id) = register_full(&base, "cfforker", "cfforker@example.com").await;
+    create_org(&base, &forker_token, "cf-forker-org").await;
+    let source_only = confined_token(&base, &forker_token, &["cfsource/upstream"]).await;
+    let client = reqwest::Client::new();
+    let fork_url = format!("{base}/api/v1/repos/cfsource/upstream/fork");
+
+    // The confined token does reach the source it was given.
+    let readable = client
+        .get(format!("{base}/api/v1/repos/cfsource/upstream"))
+        .bearer_auth(&source_only)
+        .send()
+        .await
+        .expect("read source");
+    assert_eq!(
+        readable.status(),
+        200,
+        "baseline: the token reaches its source"
+    );
+
+    let mut messages = Vec::new();
+    for body in [None, Some(serde_json::json!({ "org": "cf-forker-org" }))] {
+        let request = client.post(&fork_url).bearer_auth(&source_only);
+        let request = match &body {
+            Some(body) => request.json(body),
+            None => request,
+        };
+        let response = request.send().await.expect("confined fork");
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.expect("refusal body");
+        assert_eq!(status, 403, "fork into {body:?}: {payload}");
+        assert_eq!(payload["error"]["code"], "FORBIDDEN", "{payload}");
+        messages.push(payload["error"]["message"].clone());
+    }
+    assert_eq!(
+        messages[0], messages[1],
+        "personal and organization destinations refuse alike"
+    );
+    assert!(!repo_root.join("cfforker/upstream.git").exists());
+    assert!(!repo_root.join("cf-forker-org/upstream.git").exists());
+    let created = rg_db::entities::repository::Entity::find()
+        .filter(rg_db::entities::repository::Column::Name.eq("upstream"))
+        .count(&db)
+        .await
+        .expect("count repositories");
+    assert_eq!(created, 1, "only the source may exist after the refusals");
+
+    // A transfer adds the moved repository to its destination namespace — the
+    // same half the allow-list cannot name.
+    let movable_id = create_seeded_repo(&base, &forker_token, "movable", false).await;
+    let movable_only = confined_token(&base, &forker_token, &["cfforker/movable"]).await;
+    let transfer_url = format!("{base}/api/v1/repos/cfforker/movable/transfer");
+    let refused = client
+        .post(&transfer_url)
+        .bearer_auth(&movable_only)
+        .json(&serde_json::json!({ "new_owner": "cf-forker-org" }))
+        .send()
+        .await
+        .expect("confined transfer");
+    assert_eq!(refused.status(), 403);
+    let still_here = rg_db::entities::repository::Entity::find_by_id(movable_id)
+        .one(&db)
+        .await
+        .expect("read movable")
+        .expect("movable exists");
+    assert_eq!(still_here.org_id, None, "a refused transfer moved nothing");
+
+    let denials: Vec<serde_json::Value> = rg_db::entities::audit_log::Entity::find()
+        .filter(rg_db::entities::audit_log::Column::Action.eq("agent.scope_denied"))
+        .all(&db)
+        .await
+        .expect("read audit")
+        .into_iter()
+        .filter_map(|row| row.details)
+        .map(|details| serde_json::from_str(&details).expect("audit details are JSON"))
+        .filter(|details: &serde_json::Value| {
+            details["reason"] == "repository_creation_not_allowed"
+        })
+        .collect();
+    assert_eq!(denials.len(), 3, "every refusal is audited: {denials:?}");
+    assert!(denials
+        .iter()
+        .any(|details| details["namespace"] == "cf-forker-org"
+            && details["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("/fork"))));
+
+    // The same account, unconfined, forks and transfers exactly as asked.
+    let forked = client
+        .post(&fork_url)
+        .bearer_auth(&forker_token)
+        .send()
+        .await
+        .expect("unconfined fork");
+    let status = forked.status();
+    let forked: serde_json::Value = forked.json().await.expect("fork body");
+    assert_eq!(status, 201, "{forked}");
+    assert_eq!(forked["owner_id"].as_i64(), Some(forker_id));
+    assert!(repo_root.join("cfforker/upstream.git").is_dir());
+    let moved = client
+        .post(&transfer_url)
+        .bearer_auth(&forker_token)
+        .json(&serde_json::json!({ "new_owner": "cf-forker-org" }))
+        .send()
+        .await
+        .expect("unconfined transfer");
+    let status = moved.status();
+    assert!(
+        status.is_success(),
+        "baseline transfer failed: {status} {}",
+        moved.text().await.unwrap_or_default()
     );
 }

@@ -721,9 +721,10 @@ async fn protected_environment_requires_authorized_approval_before_release() {
         .await
         .unwrap();
     assert_eq!(
-        rg_db::ops::ci_environment_ops::count_approvals(&db, job.id)
+        rg_db::ops::ci_environment_ops::live_approver_ids(&db, job.id)
             .await
-            .unwrap(),
+            .unwrap()
+            .len(),
         0
     );
     assert_ci_graph_status(&db, job.id, stage.id, pipeline.id, "waiting_approval").await;
@@ -803,4 +804,214 @@ async fn protected_environment_requires_authorized_approval_before_release() {
             .status(),
         409
     );
+}
+
+/// A pipeline paused on one job bound for `environment`, ready to be approved.
+async fn waiting_protected_job(
+    db: &rg_db::DatabaseConnection,
+    repo_id: i64,
+    environment: &rg_db::entities::ci_environment::Model,
+    commit: char,
+) -> (i64, i64, i64) {
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo_id,
+        &commit.to_string().repeat(40),
+        "refs/heads/main",
+        "push",
+        None,
+    )
+    .await
+    .unwrap();
+    let stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "deploy", 0)
+        .await
+        .unwrap();
+    let job = rg_db::ops::pipeline_ops::create_job(
+        db,
+        stage.id,
+        &environment.name,
+        "echo deploy",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    rg_db::ops::ci_environment_ops::attach_job(db, job.id, Some(environment), &environment.name)
+        .await
+        .unwrap();
+    assert!(
+        rg_db::ops::pipeline_ops::try_pause_stage_at_manual(db, stage.id)
+            .await
+            .unwrap()
+    );
+    (pipeline.id, stage.id, job.id)
+}
+
+/// card_aa1d374901e3: an approval row records that somebody *was* allowed to
+/// approve. Taking the right away — off the allow-list, or out of the
+/// administration that approves without one — must take away the vote still
+/// waiting for the threshold, or the revoked approver and one newcomer release
+/// a deployment neither could alone. The rows stay as history.
+#[tokio::test]
+async fn a_revoked_approver_no_longer_counts_toward_a_protected_release() {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (owner_token, _) = register_full(&base, "rv_owner", "rv_owner@example.com").await;
+    let repo_id = create_private_repo(&base, &owner_token, "rv-deploy").await;
+    let repo_url = format!("{base}/api/v1/repos/rv_owner/rv-deploy");
+    let mut people = Vec::new();
+    for (name, permission) in [
+        ("rv_first", "read"),
+        ("rv_second", "read"),
+        ("rv_third", "read"),
+        ("rv_admin", "admin"),
+    ] {
+        let (token, id) = register_full(&base, name, &format!("{name}@example.com")).await;
+        let added = client
+            .post(format!("{repo_url}/collaborators"))
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({ "username": name, "permission": permission }))
+            .send()
+            .await
+            .unwrap();
+        let status = added.status();
+        let row: serde_json::Value = added.json().await.unwrap();
+        assert!(status.is_success(), "{row}");
+        // The permission route takes the collaborator row's id, not the user's.
+        people.push((token, id, row["id"].as_i64().unwrap()));
+    }
+    let [(first, first_id, _), (second, second_id, _), (third, third_id, _), (admin, _, admin_row)] =
+        <[_; 4]>::try_from(people).unwrap();
+    let environment_url = format!("{repo_url}/actions/environments");
+    let created = client
+        .post(&environment_url)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "name": "production",
+            "protected": true,
+            "required_approvals": 2,
+            "allowed_approver_ids": [first_id, second_id, third_id],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let environment_id = created.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let environment = rg_db::ops::ci_environment_ops::find_by_id(&db, environment_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let approve = |token: &str, pipeline_id: i64, job_id: i64| {
+        client
+            .post(format!(
+                "{repo_url}/pipelines/{pipeline_id}/jobs/{job_id}/approve"
+            ))
+            .bearer_auth(token.to_string())
+            .send()
+    };
+    let verdict = |response: reqwest::Response| async move {
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        (
+            body["approvals"].as_u64().unwrap(),
+            body["released"].as_bool().unwrap(),
+        )
+    };
+
+    // Baseline: before any revocation, the first approver's vote and the
+    // admin's each count, and two of them release.
+    let (pipeline, stage, job) = waiting_protected_job(&db, repo_id, &environment, 'a').await;
+    assert_eq!(
+        verdict(approve(&first, pipeline, job).await.unwrap()).await,
+        (1, false)
+    );
+    assert_eq!(
+        verdict(approve(&admin, pipeline, job).await.unwrap()).await,
+        (2, true)
+    );
+    assert_ci_graph_status(&db, job, stage, pipeline, "pending").await;
+
+    // Off the allow-list after voting: the vote stays in history and stops
+    // counting, so the second approver alone does not release.
+    let (pipeline, stage, job) = waiting_protected_job(&db, repo_id, &environment, 'b').await;
+    assert_eq!(
+        verdict(approve(&first, pipeline, job).await.unwrap()).await,
+        (1, false)
+    );
+    let narrowed = client
+        .put(format!("{environment_url}/{environment_id}"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "name": "production",
+            "protected": true,
+            "required_approvals": 2,
+            "allowed_approver_ids": [second_id, third_id],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(narrowed.status(), 200, "{}", narrowed.text().await.unwrap());
+    assert_eq!(
+        verdict(approve(&second, pipeline, job).await.unwrap()).await,
+        (1, false)
+    );
+    assert_ci_graph_status(&db, job, stage, pipeline, "waiting_approval").await;
+    let history = rg_db::entities::ci_environment_approval::Entity::find()
+        .filter(rg_db::entities::ci_environment_approval::Column::JobId.eq(job))
+        .all(&db)
+        .await
+        .unwrap();
+    assert!(
+        history.iter().any(|row| row.approved_by == Some(first_id)),
+        "the revoked vote stays as history"
+    );
+    // The people still authorized meet the threshold themselves.
+    assert_eq!(
+        verdict(approve(&third, pipeline, job).await.unwrap()).await,
+        (2, true)
+    );
+    assert_ci_graph_status(&db, job, stage, pipeline, "pending").await;
+
+    // An administrator approves without the allow-list; losing administration
+    // after voting drops the vote the same way.
+    let (pipeline, stage, job) = waiting_protected_job(&db, repo_id, &environment, 'c').await;
+    assert_eq!(
+        verdict(approve(&admin, pipeline, job).await.unwrap()).await,
+        (1, false)
+    );
+    let demoted = client
+        .patch(format!("{repo_url}/collaborators/{admin_row}"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({ "permission": "read" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        demoted.status().is_success(),
+        "{}",
+        demoted.text().await.unwrap()
+    );
+    assert_eq!(
+        verdict(approve(&second, pipeline, job).await.unwrap()).await,
+        (1, false)
+    );
+    assert_ci_graph_status(&db, job, stage, pipeline, "waiting_approval").await;
+    assert_eq!(
+        verdict(approve(&third, pipeline, job).await.unwrap()).await,
+        (2, true)
+    );
+    assert_ci_graph_status(&db, job, stage, pipeline, "pending").await;
 }

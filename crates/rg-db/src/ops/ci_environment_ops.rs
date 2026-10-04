@@ -284,14 +284,20 @@ pub async fn add_approval(
         Err(error) => Err(error).context("db: add environment approval"),
     }
 }
-/// Count approvals that still carry a current authorization verdict.
+/// The approvers of a job who are still people able to approve anything.
 ///
 /// Approval rows are durable history and survive account deletion with a null
 /// actor. A missing, deactivated, or retiring approver must not keep a waiting
 /// deployment authorized. A bot's old approval is also history, never a human
 /// authorization, even though its row is still there.
-pub async fn count_approvals(db: &DatabaseConnection, job_id: i64) -> Result<u64> {
+///
+/// Whether each of them may still approve *this* environment — the allow-list
+/// and repository administration, both of which can be revoked after the vote
+/// — is the caller's half: administration is decided in `rg-http`.
+pub async fn live_approver_ids(db: &DatabaseConnection, job_id: i64) -> Result<Vec<i64>> {
     UserEntity::find()
+        .select_only()
+        .column(user::Column::Id)
         .filter(
             user::Column::Id.in_subquery(
                 Query::select()
@@ -304,9 +310,11 @@ pub async fn count_approvals(db: &DatabaseConnection, job_id: i64) -> Result<u64
         .filter(user::Column::IsActive.eq(true))
         .filter(user::Column::DeletedAt.is_null())
         .filter(user::Column::BotOwnerId.is_null())
-        .count(db)
+        .order_by_asc(user::Column::Id)
+        .into_tuple()
+        .all(db)
         .await
-        .context("db: count live environment approvers")
+        .context("db: list live environment approvers")
 }
 pub async fn release_approved_job(db: &impl ConnectionTrait, job_id: i64) -> Result<bool> {
     let result = pipeline_job::Entity::update_many()

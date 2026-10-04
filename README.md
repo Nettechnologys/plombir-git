@@ -716,8 +716,11 @@ treat an agent as a participant of its own rather than as its owner:
 - **Token narrowing.** Any token — a bot's or your own — can be confined to
   named repositories, to named MCP tools (it then works only through
   `/api/v1/mcp`), and kept off protected branches (no merge, push or
-  server-side commit there; on by default for a bot's token). A bot's token
-  carries the `repo` scope only, so it cannot manage credentials of its own.
+  server-side commit there; on by default for a bot's token). A token confined
+  to repositories reaches a fork pull request's diff, merge, CI approval and
+  suggestions only when the fork is on its list too, and it never adds a
+  repository anywhere — no fork, no transfer. A bot's token carries the `repo`
+  scope only, so it cannot manage credentials of its own.
 - **A person approves.** An agent can do the whole loop through MCP — start a
   branch with `write_file`, `create_pr`, read inline review with
   `list_review_comments`, push a fix, answer in the thread

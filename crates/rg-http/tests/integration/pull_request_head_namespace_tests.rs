@@ -449,3 +449,182 @@ async fn a_base_only_pat_cannot_apply_suggestions_to_a_fork_head() {
     assert_ne!(head_after, head_before);
     assert_eq!(body["commit_sha"].as_str(), Some(head_after.as_str()));
 }
+
+/// card_a1ec90176840: an *existing* fork PR reaches its head repository through
+/// every route that reads or imports the head — the diff, the merge and the two
+/// deferred merges, the CI approval that runs the head's code here. The route
+/// layer admits all of them by the base in the path, so a token confined to the
+/// base read a repository outside its list through them.
+///
+/// Baselines in the same test: the account's session and a token listing both
+/// repositories read the identical diff, and the second one merges — so the
+/// refusals are the confinement, not a broken fork fixture.
+#[tokio::test]
+async fn a_base_only_pat_cannot_reach_an_existing_fork_prs_head() {
+    let (base, db, repo_root) = crate::common::spawn_test_app_with_db_and_repo_root().await;
+    let (base_token, _) = register_full(&base, "fd-base", "fd-base@example.test").await;
+    let base_id = create_repo_in(&base, &base_token, "shared", None).await;
+    let (fork_token, _) = register_full(&base, "fd-owner", "fd-owner@example.test").await;
+    create_org(&base, &fork_token, "fd-org").await;
+    let fork_id = create_repo_in(&base, &fork_token, "shared", Some("fd-org")).await;
+    mark_as_fork(&db, fork_id, base_id).await;
+    let base_path = repo_root.join("fd-base/shared.git");
+    seed_shared_history(&base_path, &repo_root.join("fd-org/shared.git"));
+
+    let client = reqwest::Client::new();
+    let pr_url = format!("{base}/api/v1/repos/fd-base/shared/pulls");
+    let created = client
+        .post(&pr_url)
+        .bearer_auth(&fork_token)
+        .json(&serde_json::json!({
+            "title": "fork diff", "head": "fd-org:feature", "base": "main"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = created.status();
+    let pr: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(status, 201, "{pr}");
+    assert_eq!(pr["head_repo_id"].as_i64(), Some(fork_id));
+    let number = pr["number"].as_i64().unwrap();
+    let mint = |repositories: serde_json::Value| {
+        let client = client.clone();
+        let url = format!("{base}/api/v1/users/tokens");
+        let session = base_token.clone();
+        async move {
+            let minted = client
+                .post(url)
+                .bearer_auth(session)
+                .json(&serde_json::json!({
+                    "name": format!("fork-diff-{}", repositories.as_array().unwrap().len()),
+                    "scopes": "repo",
+                    "repositories": repositories,
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = minted.status();
+            let token: serde_json::Value = minted.json().await.unwrap();
+            assert_eq!(status, 201, "{token}");
+            token["token"].as_str().unwrap().to_string()
+        }
+    };
+    let base_only = mint(serde_json::json!(["fd-base/shared"])).await;
+    let both = mint(serde_json::json!(["fd-base/shared", "fd-org/shared"])).await;
+    let main_before = git_stdout(&["rev-parse", "refs/heads/main"], &base_path);
+
+    let pr_route = format!("{pr_url}/{number}");
+    let refused_routes = [
+        ("get", format!("{pr_route}/diff"), None),
+        (
+            "post",
+            format!("{pr_route}/merge"),
+            Some(serde_json::json!({ "strategy": "merge" })),
+        ),
+        (
+            "put",
+            format!("{pr_route}/auto-merge"),
+            Some(serde_json::json!({ "strategy": "merge" })),
+        ),
+        (
+            "put",
+            format!("{pr_route}/merge-queue"),
+            Some(serde_json::json!({ "strategy": "merge" })),
+        ),
+        ("post", format!("{pr_route}/ci-approval"), None),
+    ];
+    for (method, url, body) in &refused_routes {
+        let request = match *method {
+            "get" => client.get(url),
+            "put" => client.put(url),
+            _ => client.post(url),
+        }
+        .bearer_auth(&base_only);
+        let request = match body {
+            Some(body) => request.json(body),
+            None => request,
+        };
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, 403, "{method} {url}: {payload}");
+        assert_eq!(payload["error"]["code"], "FORBIDDEN", "{payload}");
+    }
+    assert_eq!(
+        git_stdout(&["rev-parse", "refs/heads/main"], &base_path),
+        main_before,
+        "a refused merge must not move the base"
+    );
+    let unchanged = rg_db::entities::pull_request::Entity::find_by_id(pr["id"].as_i64().unwrap())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.state, "open");
+    assert!(!unchanged.auto_merge_enabled);
+    assert!(unchanged.ci_approved_sha.is_none());
+
+    let denials: Vec<serde_json::Value> = rg_db::entities::audit_log::Entity::find()
+        .filter(rg_db::entities::audit_log::Column::Action.eq("agent.scope_denied"))
+        .all(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| row.details)
+        .map(|details| serde_json::from_str(&details).unwrap())
+        .collect();
+    let mut actions: Vec<&str> = denials
+        .iter()
+        .filter(|details: &&serde_json::Value| details["head_repo_id"].as_i64() == Some(fork_id))
+        .filter_map(|details| details["action"].as_str())
+        .collect();
+    actions.sort_unstable();
+    assert_eq!(
+        actions,
+        [
+            "enable_auto_merge",
+            "enqueue_merge_queue",
+            "fork_pr_ci",
+            "merge_pr",
+            "pull_request_diff",
+        ],
+        "every refusal is audited: {denials:?}"
+    );
+
+    let read_diff = |token: String| {
+        let request = client.get(format!("{pr_route}/diff")).bearer_auth(token);
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let diff: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(status, 200, "{diff}");
+            diff
+        }
+    };
+    let unconfined = read_diff(base_token.clone()).await;
+    assert!(
+        unconfined["files_changed"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|file| file["path"] == "feature.txt")),
+        "{unconfined}"
+    );
+    assert_eq!(read_diff(both.clone()).await, unconfined);
+
+    let merged = client
+        .post(format!("{pr_route}/merge"))
+        .bearer_auth(&both)
+        .json(&serde_json::json!({ "strategy": "merge" }))
+        .send()
+        .await
+        .unwrap();
+    let status = merged.status();
+    assert!(
+        status.is_success(),
+        "a token listing both repositories merges: {status} {}",
+        merged.text().await.unwrap_or_default()
+    );
+    assert_ne!(
+        git_stdout(&["rev-parse", "refs/heads/main"], &base_path),
+        main_before
+    );
+}

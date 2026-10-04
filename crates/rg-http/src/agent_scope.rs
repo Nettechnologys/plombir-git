@@ -14,6 +14,10 @@
 //!   organization) is refused outright: its answer is drawn from everything the
 //!   account can see, which is exactly what the confinement is meant to cut.
 //!   Public routes, whose answer does not depend on who asks, stay open.
+//!   The layer sees only the repository in the path, so a handler that reaches
+//!   a second one — a fork pull request's head — confines that one itself
+//!   ([`confine_pull_request_head`]), and a route that would mint a new
+//!   repository refuses a confined token in `NamespaceCreate`.
 //! - **MCP tools.** A token confined to named tools works only through this
 //!   instance's MCP endpoint ([`MCP_ENDPOINT_PATH`]), which dispatches each tool
 //!   call to the API in-process and marks those inner requests with
@@ -171,6 +175,38 @@ impl TokenGrant {
         details: serde_json::Value,
     ) {
         record_scope_denial(&self.0.db, &self.0.owner, self.0.token.id, headers, details).await;
+    }
+}
+
+/// Refuse `action` on a fork pull request whose head repository the token may
+/// not reach.
+///
+/// The route layer admits a pull-request route by the base repository in its
+/// path. Diffing, merging, approving CI for or committing to a fork PR reads or
+/// writes the head repository as well, and a token confined to the base must
+/// not reach a repository outside its list through it. A same-repository PR has
+/// its head in the base and always passes.
+pub(crate) async fn confine_pull_request_head(
+    grant: Option<&TokenGrant>,
+    headers: &axum::http::HeaderMap,
+    pr: &rg_db::entities::pull_request::Model,
+    action: &str,
+) -> Result<(), AppError> {
+    let head_repo_id = pr.head_repo_id.unwrap_or(pr.repo_id);
+    match grant {
+        Some(grant) if !grant.admits_repository(head_repo_id) => Err(grant
+            .deny(
+                headers,
+                "this token may not access the pull request head repository",
+                serde_json::json!({
+                    "reason": "repository_not_allowed",
+                    "action": action,
+                    "base_repo_id": pr.repo_id,
+                    "head_repo_id": head_repo_id,
+                }),
+            )
+            .await),
+        _ => Ok(()),
     }
 }
 

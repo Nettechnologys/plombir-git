@@ -805,6 +805,13 @@ where
 /// `POST /repos` takes this extractor too rather than keeping the second copy
 /// of the membership rule it used to carry in its body (card_1e1ed1ee06f1).
 ///
+/// A token confined to repositories is refused here outright, whatever the
+/// namespace. Its allow-list names repositories that already exist, so it can
+/// never list the destination a fork or a transfer adds a repository to. The
+/// route layer cannot see that half: `POST /repos` is not about a repository
+/// and is refused there, but `POST /repos/{owner}/{name}/fork` and `/transfer`
+/// name their *source*, and the layer admits them by it (card_06b1b53d1df0).
+///
 /// Being a body extractor, it must be the *last* argument of the handler.
 pub struct NamespaceCreate<B> {
     pub actor_id: i64,
@@ -831,6 +838,15 @@ where
         // it was never going to act on.
         let actor_id = super::auth::extract_user_id(req.headers(), &state.jwt_secret)
             .ok_or_else(|| AppError::unauthorized("authentication required"))?;
+        let confined = req
+            .extensions()
+            .get::<crate::agent_scope::TokenGrant>()
+            .filter(|grant| grant.is_repo_restricted())
+            .cloned()
+            .map(|grant| {
+                let refused = (req.method().to_string(), req.uri().path().to_string());
+                (grant, refused, req.headers().clone())
+            });
 
         let body = if let Some(empty_body) = B::from_empty_body() {
             // `POST /fork` predates its optional destination payload. Buffering
@@ -859,6 +875,24 @@ where
                 .map_err(|rejection| AppError::bad_request(rejection.body_text()))?;
             body
         };
+
+        // After the body, so the refusal can record where the repository was
+        // headed; before the namespace lookup, so it answers the same for a
+        // namespace that exists and one that does not.
+        if let Some((grant, (method, path), headers)) = confined {
+            return Err(grant
+                .deny(
+                    &headers,
+                    "this token is confined to specific repositories and may not add a repository to a namespace",
+                    serde_json::json!({
+                        "reason": "repository_creation_not_allowed",
+                        "method": method,
+                        "path": path,
+                        "namespace": body.target_owner_or_self(),
+                    }),
+                )
+                .await);
+        }
 
         let NamespaceCreateGrant {
             org_id,

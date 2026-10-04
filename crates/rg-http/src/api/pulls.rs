@@ -474,7 +474,27 @@ pub async fn get_diff(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
     RepoRead { .. }: RepoRead,
+    headers: HeaderMap,
+    grant: Option<Extension<TokenGrant>>,
 ) -> impl IntoResponse {
+    // The diff reads the head repository's objects, which for a fork PR is a
+    // repository the route layer never judged.
+    if let Some(Extension(grant)) = grant.filter(|Extension(grant)| grant.is_repo_restricted()) {
+        let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
+            Ok(pr) => pr,
+            Err(error) => return AppError::from(error).into_response(),
+        };
+        if let Err(error) = crate::agent_scope::confine_pull_request_head(
+            Some(&grant),
+            &headers,
+            &pr,
+            "pull_request_diff",
+        )
+        .await
+        {
+            return error.into_response();
+        }
+    }
     match rg_core::pull_request::compute_diff(&state.db, &state.repo_root, &owner, &repo, number)
         .await
     {
@@ -506,6 +526,8 @@ pub async fn merge_pr(
         repo: repo_model,
         actor_id,
     }: RepoWrite,
+    headers: HeaderMap,
+    grant: Option<Extension<TokenGrant>>,
     Json(req): Json<MergePrRequest>,
 ) -> impl IntoResponse {
     let strategy = match rg_core::pull_request::MergeStrategy::parse(&req.strategy) {
@@ -526,6 +548,18 @@ pub async fn merge_pr(
     };
     if pr.is_draft {
         return AppError::conflict("draft pull requests cannot be merged").into_response();
+    }
+    // Merging a fork PR fetches the head repository's commits into the base:
+    // a token confined to the base would otherwise read the head through it.
+    if let Err(e) = crate::agent_scope::confine_pull_request_head(
+        grant.as_ref().map(|Extension(grant)| grant),
+        &headers,
+        &pr,
+        "merge_pr",
+    )
+    .await
+    {
+        return e.into_response();
     }
     // A token kept off protected branches may not merge into one, whatever the
     // rule below would say about its account (card_60a80311d512). Decided here,
@@ -611,6 +645,8 @@ pub async fn enable_auto_merge(
         repo: repo_model,
         actor_id,
     }: RepoWrite,
+    headers: HeaderMap,
+    grant: Option<Extension<TokenGrant>>,
     Json(req): Json<EnableAutoMergeRequest>,
 ) -> impl IntoResponse {
     let strategy = match rg_core::pull_request::MergeStrategy::parse(&req.strategy) {
@@ -625,6 +661,16 @@ pub async fn enable_auto_merge(
         Ok(pr) => pr,
         Err(error) => return AppError::from(error).into_response(),
     };
+    if let Err(error) = crate::agent_scope::confine_pull_request_head(
+        grant.as_ref().map(|Extension(grant)| grant),
+        &headers,
+        &pr,
+        "enable_auto_merge",
+    )
+    .await
+    {
+        return error.into_response();
+    }
     if let Err(error) = rg_core::auth::credential_context::refuse_protected_write(
         &state.db,
         repo_model.id,
@@ -732,7 +778,10 @@ pub async fn approve_pr_ci(
     headers: HeaderMap,
     grant: Option<Extension<TokenGrant>>,
 ) -> impl IntoResponse {
-    if let Some(Extension(grant)) = grant.filter(|Extension(grant)| grant.owner().is_bot()) {
+    if let Some(Extension(grant)) = grant
+        .as_ref()
+        .filter(|Extension(grant)| grant.owner().is_bot())
+    {
         return grant
             .deny(
                 &headers,
@@ -751,6 +800,18 @@ pub async fn approve_pr_ci(
         Ok(pr) => pr,
         Err(error) => return AppError::from(error).into_response(),
     };
+    // Approving releases the head repository's code into this repository's
+    // pipeline, whose logs and artifacts the token can then read.
+    if let Err(error) = crate::agent_scope::confine_pull_request_head(
+        grant.as_ref().map(|Extension(grant)| grant),
+        &headers,
+        &pr,
+        "fork_pr_ci",
+    )
+    .await
+    {
+        return error.into_response();
+    }
     match rg_core::pull_request::approve_pull_request_ci(&state.db, &pr, actor_id).await {
         Ok(approved) => {
             // Same shape as reopening a PR: the approval is what makes this head
@@ -828,12 +889,24 @@ pub async fn enqueue_merge_queue(
         repo: repository,
         actor_id,
     }: RepoWrite,
+    headers: HeaderMap,
+    grant: Option<Extension<TokenGrant>>,
     Json(req): Json<EnableAutoMergeRequest>,
 ) -> impl IntoResponse {
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(error) => return AppError::from(error).into_response(),
     };
+    if let Err(error) = crate::agent_scope::confine_pull_request_head(
+        grant.as_ref().map(|Extension(grant)| grant),
+        &headers,
+        &pr,
+        "enqueue_merge_queue",
+    )
+    .await
+    {
+        return error.into_response();
+    }
     let strategy = match rg_core::pull_request::MergeStrategy::parse(&req.strategy) {
         Ok(strategy) => strategy,
         Err(error) => return AppError::bad_request(error).into_response(),

@@ -406,9 +406,10 @@ async fn ghost_environment_approval_stays_in_history_but_stops_authorizing_relea
         .expect("deactivate approver");
     assert_eq!(deactivated.status(), 200);
     assert_eq!(
-        rg_db::ops::ci_environment_ops::count_approvals(&db, job_id)
+        rg_db::ops::ci_environment_ops::live_approver_ids(&db, job_id)
             .await
-            .expect("count after deactivation"),
+            .expect("count after deactivation")
+            .len(),
         0,
         "a deactivated approver still contributes a current approval"
     );
@@ -422,9 +423,10 @@ async fn ghost_environment_approval_stays_in_history_but_stops_authorizing_relea
         .expect("reactivate approver");
     assert_eq!(reactivated.status(), 200);
     assert_eq!(
-        rg_db::ops::ci_environment_ops::count_approvals(&db, job_id)
+        rg_db::ops::ci_environment_ops::live_approver_ids(&db, job_id)
             .await
-            .expect("count after reactivation"),
+            .expect("count after reactivation")
+            .len(),
         1,
         "reactivating the approver did not restore the approval"
     );
@@ -435,9 +437,10 @@ async fn ghost_environment_approval_stays_in_history_but_stops_authorizing_relea
             .expect("mark approver for retirement")
     );
     assert_eq!(
-        rg_db::ops::ci_environment_ops::count_approvals(&db, job_id)
+        rg_db::ops::ci_environment_ops::live_approver_ids(&db, job_id)
             .await
-            .expect("count during retirement"),
+            .expect("count during retirement")
+            .len(),
         0,
         "an approver claimed for deletion still contributes a current approval"
     );
@@ -445,9 +448,10 @@ async fn ghost_environment_approval_stays_in_history_but_stops_authorizing_relea
         .await
         .expect("release approver retirement marker");
     assert_eq!(
-        rg_db::ops::ci_environment_ops::count_approvals(&db, job_id)
+        rg_db::ops::ci_environment_ops::live_approver_ids(&db, job_id)
             .await
-            .expect("count after retirement abort"),
+            .expect("count after retirement abort")
+            .len(),
         1,
         "releasing the retirement marker did not restore the approval"
     );
@@ -465,9 +469,10 @@ async fn ghost_environment_approval_stays_in_history_but_stops_authorizing_relea
         deleted.text().await.unwrap_or_default()
     );
     assert_eq!(
-        rg_db::ops::ci_environment_ops::count_approvals(&db, job_id)
+        rg_db::ops::ci_environment_ops::live_approver_ids(&db, job_id)
             .await
-            .expect("count after deletion"),
+            .expect("count after deletion")
+            .len(),
         0,
         "a deleted approver still contributes a current approval"
     );

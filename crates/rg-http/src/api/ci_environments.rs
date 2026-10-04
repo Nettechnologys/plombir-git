@@ -482,9 +482,9 @@ pub async fn approve(
         Ok(newly_approved) => newly_approved,
         Err(error) => return AppError::from(error).into_response(),
     };
-    let approvals = match rg_db::ops::ci_environment_ops::count_approvals(&state.db, job_id).await {
+    let approvals = match authorized_approvals(&state, &ctx, job_id).await {
         Ok(count) => count,
-        Err(error) => return AppError::from(error).into_response(),
+        Err(error) => return error.into_response(),
     };
     let release_ready = approvals >= ctx.environment.required_approvals as u64;
     if !newly_approved && !release_ready {
@@ -599,6 +599,49 @@ async fn authorize_approval(
         stage,
         environment,
     })
+}
+
+/// Count the approvals on `job_id` whose approvers may approve this
+/// environment *now*.
+///
+/// An approval row records that somebody was allowed to say yes when they said
+/// it. Removing them from the allow-list, or taking away the administration
+/// that let them approve without one, revokes the right — and must revoke the
+/// vote still waiting for the threshold with it, or a revoked approver plus one
+/// newcomer would release a deployment neither alone could (card_aa1d374901e3).
+/// So each vote is judged by `authorize_approval`'s rule as it stands, the way
+/// branch protection re-checks write access for a review approval at merge
+/// time. The rows themselves stay, as history.
+async fn authorized_approvals(
+    state: &AppState,
+    ctx: &ApprovalContext,
+    job_id: i64,
+) -> Result<u64, AppError> {
+    let approvers = rg_db::ops::ci_environment_ops::live_approver_ids(&state.db, job_id).await?;
+    // Read only once a non-administrator's vote needs it, as in
+    // `authorize_approval`: an unreadable list must not fail a release that
+    // administrators alone carry.
+    let mut allowed = None;
+    let mut counted = 0;
+    for approver in approvers {
+        if repo_access::may_admin(state, &ctx.repo, Some(approver)).await? {
+            counted += 1;
+            continue;
+        }
+        if allowed.is_none() {
+            allowed = Some(
+                rg_db::ops::ci_environment_ops::allowed_approver_ids(&state.db, &ctx.environment)
+                    .await?,
+            );
+        }
+        if allowed
+            .as_ref()
+            .is_some_and(|allowed| allowed.contains(&approver))
+        {
+            counted += 1;
+        }
+    }
+    Ok(counted)
 }
 
 /// Once enough approvals exist, release the job and — if the whole stage is now
