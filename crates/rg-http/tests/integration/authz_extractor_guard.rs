@@ -343,6 +343,12 @@ const WORKSPACE_FUNCTION_SIGNED_OFF: &[(&str, &str, &str)] = &[
         "filters approvals before counting them — the subject is each approver, not the caller — \
          and runs where no request exists, from auto-merge and the merge queue",
     ),
+    (
+        "rg-core/src/pull_request/ci.rs",
+        "trigger_pull_request_ci",
+        "checks whether the recorded human approver still has write access before a fork head \
+         receives base-repository CI secrets; detached producers have no request extractor",
+    ),
 ];
 
 /// The file that *defines* the repository gates, spelled workspace-relative.

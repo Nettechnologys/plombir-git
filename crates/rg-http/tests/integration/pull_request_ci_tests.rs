@@ -1156,6 +1156,111 @@ async fn a_fork_pr_runs_ci_only_for_a_head_a_maintainer_approved() {
     fixture.server.abort();
 }
 
+/// A recorded approval is only valid while its human approver can still write
+/// to the base repository. Reopening the same head exercises the normal HTTP
+/// producer again, without changing the SHA that the old approval names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_writer_cannot_release_the_same_fork_head_again() {
+    let fixture = fixture("revokeci", "revoked-ci", true).await;
+    open_pr(&fixture, "revokeci", "revoked-ci").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the initial PR trigger").await;
+
+    let client = reqwest::Client::new();
+    let (contributor, _) =
+        register_full(&fixture.base, "revokefork", "revokefork@example.com").await;
+    let fork_repo_id = create_repo(&fixture.base, &contributor, "revoked-fork").await;
+    fixture.make_fork_pr(fork_repo_id).await;
+    fixture.ci_engine.triggered.lock().unwrap().clear();
+    fixture.ci_engine.created.lock().unwrap().clear();
+
+    let (writer_token, writer_id) =
+        register_full(&fixture.base, "ciwriter", "ciwriter@example.com").await;
+    let collaborators_url = format!(
+        "{}/api/v1/repos/revokeci/revoked-ci/collaborators",
+        fixture.base
+    );
+    let added = client
+        .post(&collaborators_url)
+        .bearer_auth(&fixture.jwt)
+        .json(&serde_json::json!({ "username": "ciwriter", "permission": "write" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 201, "{}", added.text().await.unwrap());
+    let row_id = added.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let approval_url = format!(
+        "{}/api/v1/repos/revokeci/revoked-ci/pulls/1/ci-approval",
+        fixture.base
+    );
+    let approved = client
+        .post(&approval_url)
+        .bearer_auth(&writer_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), 200, "{}", approved.text().await.unwrap());
+    drain_delivery_tracker(&fixture.delivery_tracker, "the writer's CI approval").await;
+    assert_eq!(fixture.ci_engine.created.lock().unwrap().len(), 1);
+    assert_eq!(fixture.pr().await.ci_approved_by, Some(writer_id));
+
+    let downgraded = client
+        .patch(format!("{collaborators_url}/{row_id}"))
+        .bearer_auth(&fixture.jwt)
+        .json(&serde_json::json!({ "permission": "read" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        downgraded.status(),
+        200,
+        "{}",
+        downgraded.text().await.unwrap()
+    );
+
+    fixture
+        .set_pr_state("revokeci", "revoked-ci", "closed")
+        .await;
+    fixture.set_pr_state("revokeci", "revoked-ci", "open").await;
+    drain_delivery_tracker(
+        &fixture.delivery_tracker,
+        "the reopened fork PR's CI trigger",
+    )
+    .await;
+    let historical = fixture.pr().await;
+    assert_eq!(
+        historical.head_sha.as_deref(),
+        Some(fixture.head_sha.as_str())
+    );
+    assert_eq!(
+        historical.ci_approved_sha.as_deref(),
+        Some(fixture.head_sha.as_str())
+    );
+    assert_eq!(historical.ci_approved_by, Some(writer_id));
+    assert_eq!(
+        fixture.ci_engine.created.lock().unwrap().len(),
+        1,
+        "reopening the PR started CI from a revoked writer's historical approval"
+    );
+    assert_eq!(fixture.trigger_pr_ci(&historical).await, None);
+    assert_eq!(fixture.ci_engine.created.lock().unwrap().len(), 1);
+
+    let approved = client
+        .post(&approval_url)
+        .bearer_auth(&fixture.jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), 200, "{}", approved.text().await.unwrap());
+    drain_delivery_tracker(&fixture.delivery_tracker, "the owner's new CI approval").await;
+    assert_eq!(fixture.pr().await.ci_approved_by, Some(fixture.user_id));
+    assert_eq!(fixture.ci_engine.created.lock().unwrap().len(), 2);
+
+    fixture.server.abort();
+}
+
 /// The gate is for fork PRs only. A branch inside the repository is code its
 /// writers already own, so making everyone approve their own pushes would be a
 /// ceremony that protects nothing — and a check that never runs is what this

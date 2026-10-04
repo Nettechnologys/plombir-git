@@ -148,6 +148,10 @@ pub async fn trigger_pull_request_ci(
         tracing::debug!(pr_id = pr.id, "pull_request CI skipped: PR has no head SHA");
         return Ok(None);
     };
+    let repository = repository::Entity::find_by_id(pr.repo_id)
+        .one(db)
+        .await?
+        .context("pull request repository not found")?;
     // A fork PR's head is code the base repository's owner has not accepted, and
     // a pipeline carries that repository's CI secrets (`ci_secret_ops` are keyed
     // by `repo_id` and injected into every job). Running it automatically would
@@ -191,6 +195,15 @@ pub async fn trigger_pull_request_ci(
             );
             return Ok(None);
         }
+        if !crate::repo::service::can_write_repo(db, &repository, pr.ci_approved_by).await? {
+            tracing::info!(
+                pr_id = pr.id,
+                head_repo_id,
+                approved_by = pr.ci_approved_by,
+                "pull_request CI held for a fork PR: approver no longer has write access to the base repository"
+            );
+            return Ok(None);
+        }
         tracing::info!(
             pr_id = pr.id,
             head_repo_id,
@@ -200,10 +213,6 @@ pub async fn trigger_pull_request_ci(
         );
     }
 
-    let repository = repository::Entity::find_by_id(pr.repo_id)
-        .one(db)
-        .await?
-        .context("pull request repository not found")?;
     let namespace = super::service::repository_namespace(db, &repository).await?;
     let repo_path = repo_root.join(format!("{namespace}/{}.git", repository.name));
 
