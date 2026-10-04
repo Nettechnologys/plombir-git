@@ -18,7 +18,7 @@
 //! a Git ref walk between the assertion and what it is about.
 
 use rg_db::entities::repository;
-use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 
 use crate::common::{register_full, spawn_test_app_with_db};
 
@@ -200,6 +200,13 @@ fn git(args: &[&str], cwd: Option<&std::path::Path>) {
     output.ensure_success().unwrap();
 }
 
+fn git_stdout(args: &[&str], cwd: &std::path::Path) -> String {
+    let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+    let output = gateway.run(args, Some(cwd)).unwrap();
+    output.ensure_success().unwrap();
+    output.stdout_str().trim().to_string()
+}
+
 /// Give `upstream` a `main` and `fork` the same `main` plus a `feature` branch.
 ///
 /// One worktree pushed to both bare repositories, so the two share history and
@@ -338,4 +345,107 @@ async fn an_org_fork_pr_is_created_and_its_diff_is_readable() {
             .is_some_and(|files| files.iter().any(|file| file["path"] == "feature.txt")),
         "the diff must contain the fork's feature commit: {diff}"
     );
+}
+
+#[tokio::test]
+async fn a_base_only_pat_cannot_apply_suggestions_to_a_fork_head() {
+    let (base, db, repo_root) = crate::common::spawn_test_app_with_db_and_repo_root().await;
+    let (base_token, _) = register_full(&base, "sg-base", "sg-base@example.test").await;
+    let base_id = create_repo_in(&base, &base_token, "shared", None).await;
+    let (fork_token, _) = register_full(&base, "sg-owner", "sg-owner@example.test").await;
+    create_org(&base, &fork_token, "sg-org").await;
+    let fork_id = create_repo_in(&base, &fork_token, "shared", Some("sg-org")).await;
+    mark_as_fork(&db, fork_id, base_id).await;
+    let fork_path = repo_root.join("sg-org/shared.git");
+    seed_shared_history(&repo_root.join("sg-base/shared.git"), &fork_path);
+
+    let client = reqwest::Client::new();
+    let pr_url = format!("{base}/api/v1/repos/sg-base/shared/pulls");
+    let created = client
+        .post(&pr_url)
+        .bearer_auth(&fork_token)
+        .json(&serde_json::json!({
+            "title": "fork suggestion", "head": "sg-org:feature", "base": "main"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = created.status();
+    let pr: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(status, 201, "{pr}");
+    assert_eq!(pr["head_repo_id"].as_i64(), Some(fork_id));
+    let number = pr["number"].as_i64().unwrap();
+    let head_before = git_stdout(&["rev-parse", "refs/heads/feature"], &fork_path);
+    assert_eq!(pr["head_sha"].as_str(), Some(head_before.as_str()));
+    let comment = client
+        .post(format!("{pr_url}/{number}/comments"))
+        .bearer_auth(&base_token)
+        .json(&serde_json::json!({
+            "path": "feature.txt", "line": 1, "side": "RIGHT",
+            "body": "improve the feature", "suggestion": "reviewed feature",
+            "commit_id": head_before,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = comment.status();
+    let comment: serde_json::Value = comment.json().await.unwrap();
+    assert_eq!(status, 201, "{comment}");
+    let comment_id = comment["id"].as_i64().unwrap();
+
+    let minted = client
+        .post(format!("{base}/api/v1/users/tokens"))
+        .bearer_auth(&fork_token)
+        .json(&serde_json::json!({
+            "name": "suggestion-base-only", "scopes": "repo",
+            "repositories": ["sg-base/shared"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = minted.status();
+    let token: serde_json::Value = minted.json().await.unwrap();
+    assert_eq!(status, 201, "{token}");
+    let base_only = token["token"].as_str().unwrap();
+    let single_url = format!("{pr_url}/{number}/comments/{comment_id}/suggestion/apply");
+    let batch_url = format!("{pr_url}/{number}/suggestions/apply");
+    for (url, batch) in [(&single_url, false), (&batch_url, true)] {
+        let request = client.post(url).bearer_auth(base_only);
+        let request = if batch {
+            request.json(&serde_json::json!({"comment_ids": [comment_id]}))
+        } else {
+            request
+        };
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, 403, "{url}: {body}");
+        assert_eq!(body["error"]["code"], "FORBIDDEN", "{body}");
+        assert_eq!(
+            git_stdout(&["rev-parse", "refs/heads/feature"], &fork_path),
+            head_before
+        );
+    }
+
+    let denials = rg_db::entities::audit_log::Entity::find()
+        .filter(rg_db::entities::audit_log::Column::Action.eq("agent.scope_denied"))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(denials.len(), 2, "each refused route must be audited");
+
+    // The same account can apply the same suggestion when its credential is
+    // not confined to the base repository.
+    let applied = client
+        .post(&single_url)
+        .bearer_auth(&fork_token)
+        .send()
+        .await
+        .unwrap();
+    let status = applied.status();
+    let body: serde_json::Value = applied.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let head_after = git_stdout(&["rev-parse", "refs/heads/feature"], &fork_path);
+    assert_ne!(head_after, head_before);
+    assert_eq!(body["commit_sha"].as_str(), Some(head_after.as_str()));
 }

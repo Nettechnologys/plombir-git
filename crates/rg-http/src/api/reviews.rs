@@ -1,14 +1,15 @@
 //! REST API handlers for PR code reviews.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::Json;
+use axum::{Extension, Json};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use utoipa::ToSchema;
 
+use crate::agent_scope::TokenGrant;
 use crate::api::repo_access::{self, RepoAuthRead, RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::AppState;
@@ -165,6 +166,8 @@ async fn require_suggestion_source(
     owner: &str,
     repo: &str,
     number: i64,
+    headers: &HeaderMap,
+    grant: Option<&TokenGrant>,
 ) -> Result<
     (
         i64,
@@ -182,6 +185,20 @@ async fn require_suggestion_source(
         return Err(AppError::conflict("pull request is not open"));
     }
     let source_repo_id = pr.head_repo_id.unwrap_or(pr.repo_id);
+    if let Some(grant) = grant.filter(|grant| !grant.admits_repository(source_repo_id)) {
+        return Err(grant
+            .deny(
+                headers,
+                "this token may not access the pull request head repository",
+                serde_json::json!({
+                    "reason": "repository_not_allowed",
+                    "action": "apply_review_suggestion",
+                    "base_repo_id": pr.repo_id,
+                    "head_repo_id": source_repo_id,
+                }),
+            )
+            .await);
+    }
     let source_repo = rg_db::entities::repository::Entity::find_by_id(source_repo_id)
         .one(&state.db)
         .await
@@ -1001,12 +1018,23 @@ pub async fn apply_review_suggestion(
         actor_id: actor_gate,
         ..
     }: RepoAuthRead,
+    headers: HeaderMap,
+    grant: Option<Extension<TokenGrant>>,
 ) -> impl IntoResponse {
-    let (actor_id, actor, pr, source_repo, source_namespace) =
-        match require_suggestion_source(&state, actor_gate, &owner, &repo, number).await {
-            Ok(access) => access,
-            Err(error) => return error.into_response(),
-        };
+    let (actor_id, actor, pr, source_repo, source_namespace) = match require_suggestion_source(
+        &state,
+        actor_gate,
+        &owner,
+        &repo,
+        number,
+        &headers,
+        grant.as_ref().map(|Extension(grant)| grant),
+    )
+    .await
+    {
+        Ok(access) => access,
+        Err(error) => return error.into_response(),
+    };
 
     match rg_core::review::service::apply_suggestion(
         &state.db,
@@ -1058,13 +1086,24 @@ pub async fn apply_review_suggestions(
         actor_id: actor_gate,
         ..
     }: RepoAuthRead,
+    headers: HeaderMap,
+    grant: Option<Extension<TokenGrant>>,
     Json(request): Json<ApplySuggestionsRequest>,
 ) -> impl IntoResponse {
-    let (actor_id, actor, pr, source_repo, source_namespace) =
-        match require_suggestion_source(&state, actor_gate, &owner, &repo, number).await {
-            Ok(access) => access,
-            Err(error) => return error.into_response(),
-        };
+    let (actor_id, actor, pr, source_repo, source_namespace) = match require_suggestion_source(
+        &state,
+        actor_gate,
+        &owner,
+        &repo,
+        number,
+        &headers,
+        grant.as_ref().map(|Extension(grant)| grant),
+    )
+    .await
+    {
+        Ok(access) => access,
+        Err(error) => return error.into_response(),
+    };
     match rg_core::review::service::apply_suggestions(
         &state.db,
         &state.repo_root,
