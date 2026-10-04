@@ -97,8 +97,8 @@ async fn sign_get_verify_round_trip() {
     let report: serde_json::Value = verified.json().await.unwrap();
     assert_eq!(report["status"], "verified", "report: {report}");
     assert_eq!(
-        report["predicate_type"],
-        "https://forgekeep.dev/provenance/v1"
+        report["predicate_type"], "https://plombir.com/git/provenance/v1",
+        "new attestations are issued under the Plombir type, not the pre-rename one: {report}"
     );
     // "release asset" → known SHA-256 (matches the digest step's vector).
     assert_eq!(
@@ -386,6 +386,75 @@ async fn an_uncheckable_envelope_is_undeterminable_and_a_wrong_digest_is_a_misma
         report["status"], "mismatch",
         "a subject digest that is not the asset's is exactly what this feature exists to \
          shout about: {report}"
+    );
+    drop(dir);
+}
+
+/// An attestation issued before the rename sits in `release_assets.attestation`
+/// under the former predicate type, and the verify endpoint must still call it
+/// verified (card_f835b97ca951). Stored straight to the row, as a pre-rename
+/// build left it: the signing endpoint only issues the current type now.
+#[tokio::test]
+async fn an_attestation_stored_under_the_former_type_still_verifies() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    let key =
+        rg_core::auth::instance_key::load_or_adopt(&db, "attestation-secret", TEST_ENCRYPTION_KEY)
+            .await
+            .expect("adopt instance key");
+    let base = spawn_test_app_over_db_with(
+        db.clone(),
+        repo_root,
+        StateOverrides {
+            instance_key: Some(std::sync::Arc::new(key.clone())),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let owner = "legacyatt".to_string();
+    let token = register_user(&base, &owner, "legacyatt@example.com", PW).await;
+    let repo = "legacyattrepo".to_string();
+    create_repo(&base, &token, &repo).await;
+    let release_id = create_release(&base, &token, &owner, &repo).await;
+    let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
+
+    let envelope = rg_core::attestation::sign_statement(
+        &key,
+        &rg_core::attestation::Statement::new(
+            "notes.txt",
+            "e6abe9df7db8513616674b02b5edb26c37bf3b2f81daeec1e3c6fc8c9a802850",
+            "https://forgekeep.dev/provenance/v1".to_string(),
+            serde_json::json!({ "builder": { "id": "https://forge.example" } }),
+        ),
+    )
+    .expect("sign the pre-rename envelope");
+    db.execute(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "UPDATE release_assets SET attestation = ? WHERE id = ?",
+        [
+            serde_json::to_string(&envelope).unwrap().into(),
+            asset_id.into(),
+        ],
+    ))
+    .await
+    .expect("store the pre-rename attestation");
+
+    let report: serde_json::Value = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}/attestation/verify"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(report["status"], "verified", "report: {report}");
+    assert_eq!(
+        report["predicate_type"], "https://forgekeep.dev/provenance/v1",
+        "report: {report}"
     );
     drop(dir);
 }

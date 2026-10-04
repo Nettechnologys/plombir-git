@@ -340,18 +340,57 @@ mod tests {
     fn canonical_payload_is_a_frozen_cross_language_vector() {
         // This exact byte string is the cross-language contract: any JCS
         // implementation must produce it, and the signature is over its DSSE
-        // PAE. If this literal changes, existing attestations stop verifying.
+        // PAE. If this literal changes, new attestations change shape for every
+        // external verifier. Envelopes already issued carry their own payload
+        // bytes; the frozen one below pins that they keep verifying.
         let value = serde_json::to_value(sample_statement()).unwrap();
         let bytes = jcs::to_canonical_bytes(&value).unwrap();
         let expected = concat!(
             r#"{"_type":"https://in-toto.io/Statement/v1","#,
             r#""predicate":{"builder":{"id":"https://forge.example/instance"}},"#,
-            r#""predicateType":"https://forgekeep.dev/provenance/v1","#,
+            r#""predicateType":"https://plombir.com/git/provenance/v1","#,
             r#""subject":[{"digest":{"sha256":""#,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             r#""},"name":"app-1.0.tar.gz"}]}"#,
         );
         assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+    }
+
+    /// An attestation issued before the rename, frozen byte for byte: it
+    /// carries the former predicate type `https://forgekeep.dev/provenance/v1`.
+    /// It was produced outside this crate (Python `cryptography`, Ed25519 over
+    /// the DSSE PAE) with the key `instance_key()` derives, so it pins the
+    /// stored bytes rather than whatever `sign_statement` produces today
+    /// (card_f835b97ca951).
+    #[test]
+    fn an_attestation_issued_under_the_former_type_still_verifies() {
+        let envelope = Envelope {
+            payload_type: DSSE_PAYLOAD_TYPE.to_string(),
+            payload: concat!(
+                "eyJfdHlwZSI6Imh0dHBzOi8vaW4tdG90by5pby9TdGF0ZW1lbnQvdjEiLCJwcmVkaWNhdGUiOnsiYnVp",
+                "bGRlciI6eyJpZCI6Imh0dHBzOi8vZm9yZ2UuZXhhbXBsZS9pbnN0YW5jZSJ9fSwicHJlZGljYXRlVHlw",
+                "ZSI6Imh0dHBzOi8vZm9yZ2VrZWVwLmRldi9wcm92ZW5hbmNlL3YxIiwic3ViamVjdCI6W3siZGlnZXN0",
+                "Ijp7InNoYTI1NiI6ImUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0",
+                "Y2E0OTU5OTFiNzg1MmI4NTUifSwibmFtZSI6ImFwcC0xLjAudGFyLmd6In1dfQ==",
+            )
+            .to_string(),
+            signatures: vec![EnvelopeSignature {
+                keyid: "51f275ae431217d7".to_string(),
+                sig: concat!(
+                    "gmJqHJFRkYnUPxryI7g7zBnM1BipgAhCkQt6Vs4rMoXlpM3479cE3UEoCgaSC8A4627C3Djg6ku1",
+                    "03ifcifDCg==",
+                )
+                .to_string(),
+            }],
+        };
+        let reg = VerifierRegistry::with_defaults();
+        let verified = verify_envelope(&instance_key(), &envelope, EMPTY_SHA256, &reg)
+            .unwrap_or_else(|e| panic!("a pre-rename attestation must still verify: {e:#}"));
+        assert_eq!(
+            verified.statement.predicate_type,
+            "https://forgekeep.dev/provenance/v1"
+        );
+        assert_eq!(verified.keyid, instance_key().kid());
     }
 
     #[test]
@@ -519,6 +558,12 @@ mod tests {
         .unwrap();
         let reg = VerifierRegistry::with_defaults();
         let v = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg).unwrap();
+        // New attestations are issued under the Plombir type, never the
+        // pre-rename one (card_f835b97ca951).
+        assert_eq!(
+            v.statement.predicate_type,
+            "https://plombir.com/git/provenance/v1"
+        );
         assert_eq!(v.statement.predicate["release_id"], json!(7));
         assert_eq!(
             v.statement.predicate["builder"]["id"],

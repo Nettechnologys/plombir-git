@@ -36,10 +36,13 @@ impl VerifierRegistry {
         Self::default()
     }
 
-    /// Registry pre-loaded with the built-in Plombir Git provenance verifier.
+    /// Registry pre-loaded with the built-in Plombir Git provenance verifiers:
+    /// the type issued today and the one issued before the rename.
     pub fn with_defaults() -> Self {
         let mut reg = Self::new();
-        reg.register(Box::new(SlsaProvenanceVerifier));
+        for predicate_type in [PLOMBIR_GIT_PROVENANCE_TYPE, FORGEKEEP_PROVENANCE_TYPE] {
+            reg.register(Box::new(SlsaProvenanceVerifier { predicate_type }));
+        }
         reg
     }
 
@@ -66,21 +69,32 @@ impl VerifierRegistry {
     }
 }
 
-/// The Plombir Git provenance predicate type (SLSA-provenance shaped).
+/// The Plombir Git provenance predicate type (SLSA-provenance shaped) that
+/// every new attestation is issued under.
 ///
-/// The URI keeps the project's former name on purpose: it sits inside every
-/// signed DSSE envelope already issued, and the verifier is looked up by it.
-/// A new type can be registered beside this one; replacing it would leave
-/// those attestations without a verifier.
-pub const PLOMBIR_GIT_PROVENANCE_TYPE: &str = "https://forgekeep.dev/provenance/v1";
+/// It names the predicate's format, not its issuer: every instance stamps the
+/// same string, and who signed is told by `builder.id` and the key's `kid`.
+/// The URI sits under a domain the project controls so that nobody else can
+/// define what it means.
+pub const PLOMBIR_GIT_PROVENANCE_TYPE: &str = "https://plombir.com/git/provenance/v1";
 
-/// Verifier for [`PLOMBIR_GIT_PROVENANCE_TYPE`]: requires a `builder.id` string so
-/// a consumer can attribute the build to an issuing instance.
-pub struct SlsaProvenanceVerifier;
+/// The same predicate format under the project's former name, issued until
+/// card_f835b97ca951. Verify-only: it sits inside every DSSE envelope signed
+/// before then, and the verifier is looked up by it, so dropping it would
+/// leave those attestations unverifiable. Nothing signs under it any more:
+/// the project does not hold `forgekeep.dev`.
+const FORGEKEEP_PROVENANCE_TYPE: &str = "https://forgekeep.dev/provenance/v1";
+
+/// Verifier for the Plombir Git provenance predicate, under either of its
+/// types: requires a `builder.id` string so a consumer can attribute the build
+/// to an issuing instance.
+pub struct SlsaProvenanceVerifier {
+    predicate_type: &'static str,
+}
 
 impl PredicateVerifier for SlsaProvenanceVerifier {
     fn predicate_type(&self) -> &str {
-        PLOMBIR_GIT_PROVENANCE_TYPE
+        self.predicate_type
     }
 
     fn verify(&self, statement: &Statement) -> Result<()> {
@@ -124,6 +138,21 @@ mod tests {
     fn rejects_provenance_without_builder_id() {
         let reg = VerifierRegistry::with_defaults();
         let st = statement(PLOMBIR_GIT_PROVENANCE_TYPE, json!({ "builder": {} }));
+        assert!(reg.verify_predicate(&st).is_err());
+    }
+
+    /// Attestations issued before the rename carry the former type and must
+    /// keep verifying, under the same predicate checks as the current one.
+    #[test]
+    fn the_former_type_is_still_verified_with_the_same_checks() {
+        let reg = VerifierRegistry::with_defaults();
+        assert!(reg.handles("https://forgekeep.dev/provenance/v1"));
+        let st = statement(
+            FORGEKEEP_PROVENANCE_TYPE,
+            json!({ "builder": { "id": "https://forge.example/instance" } }),
+        );
+        assert!(reg.verify_predicate(&st).is_ok());
+        let st = statement(FORGEKEEP_PROVENANCE_TYPE, json!({ "builder": {} }));
         assert!(reg.verify_predicate(&st).is_err());
     }
 

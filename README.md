@@ -64,7 +64,11 @@ can have a release asset signed: `POST …/releases/assets/{id}/attestation` pro
 [DSSE](https://github.com/secure-systems-lab/dsse) envelope, canonicalised with
 RFC 8785 and signed with the instance's Ed25519 key. The public key is the one
 already published at `/api/v1/ci/oidc/jwks`, and `…/attestation/verify` checks
-an envelope on the server.
+an envelope on the server. The statement's `predicateType` is
+`https://plombir.com/git/provenance/v1`. It names the format, not the signer:
+`predicate.builder.id` is the issuing instance's URL. Envelopes issued before
+the rename carry `https://forgekeep.dev/provenance/v1`, the same format under
+the former name, and still verify.
 
 What it states, precisely: *this instance received exactly this SHA-256 for
 this release, from this uploader*. It is not SLSA build provenance — it says
