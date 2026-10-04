@@ -329,7 +329,7 @@ runs:
 
 ```bash
 cargo install cargo-nextest --locked      # one-off
-cargo nextest run --workspace             # 2045 tests
+cargo nextest run --workspace
 cargo test --workspace --doc              # nextest does not run doc-tests
 ```
 
@@ -339,8 +339,9 @@ its own it silently stops checking them.
 `cargo test --workspace` still works and runs the same tests, it is just far
 slower: it runs the workspace's test binaries one after another and only
 parallelises inside one of them, so on a 24-core machine most of the machine
-sits idle. Measured on a warm `target` and a quiet machine: **496s for
-`cargo test --workspace` against 60s for `cargo nextest run --workspace`.**
+sits idle. Measured on 2026-08-08, when the workspace had 2045 tests, on a
+warm `target` and a quiet machine: **496s for `cargo test --workspace`
+against 60s for `cargo nextest run --workspace`.**
 
 **`-j` does not mean the same thing to the two commands, and getting it wrong
 costs half the run.** For `cargo test` it caps *build* jobs. For `cargo nextest`
