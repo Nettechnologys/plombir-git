@@ -317,7 +317,9 @@ pub struct LfsObjectResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LfsActions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub download: Option<LfsAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub upload: Option<LfsAction>,
 }
 
@@ -384,6 +386,32 @@ fn lfs_request_error(operation: &str, oid: &str, size: i64) -> Option<LfsError> 
     })
 }
 
+/// The only transfer adapter this server implements: plain HTTP `PUT`/`GET`
+/// against the action `href`.
+const BASIC_TRANSFER: &str = "basic";
+
+/// Pick the transfer adapter the batch response names.
+///
+/// The client lists the adapters *it* can run, most preferred first, and the
+/// server must answer with one of them that it can serve too — the response's
+/// `transfer` is what the client hands every action to. This used to echo the
+/// client's first choice. git-lfs 3.x lists `lfs-standalone-file` first, an
+/// adapter for local file remotes that an HTTP server never serves, so the
+/// response named it and `git lfs push` died on a nil adapter before
+/// uploading a byte. An absent list means `basic` (the batch API spec); a list
+/// without it has nothing this server can serve, and saying so is better than
+/// naming an adapter the client then cannot drive.
+fn negotiate_transfer(offered: Option<&[String]>) -> Result<&'static str> {
+    match offered {
+        None => Ok(BASIC_TRANSFER),
+        Some(offered) if offered.iter().any(|name| name == BASIC_TRANSFER) => Ok(BASIC_TRANSFER),
+        Some(offered) => Err(crate::error::invalid_request(format!(
+            "no supported LFS transfer adapter offered (server supports `{BASIC_TRANSFER}`, \
+             client offered {offered:?})"
+        ))),
+    }
+}
+
 /// Handle a batch upload/download request.
 /// Processes all objects concurrently using `join_all` to avoid serial DB round-trips.
 #[allow(clippy::too_many_arguments)]
@@ -399,11 +427,7 @@ pub async fn batch(
     signing_secret: &[u8],
     actor: Option<LfsActor>,
 ) -> Result<LfsBatchResponse> {
-    let transfer = req
-        .transfers
-        .as_ref()
-        .and_then(|t| t.first().cloned())
-        .unwrap_or_else(|| "basic".to_string());
+    let transfer = negotiate_transfer(req.transfers.as_deref())?.to_string();
 
     let operation = req.operation.as_str();
     let futures: Vec<_> = req
@@ -2119,6 +2143,45 @@ mod blob_publication_tests {
             payload,
             "the rollback deleted bytes a live row points at"
         );
+    }
+}
+
+#[cfg(test)]
+mod transfer_negotiation_tests {
+    use super::negotiate_transfer;
+
+    fn offered(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// What git-lfs 3.x sends: its local-file adapter first, `basic` after it.
+    #[test]
+    fn basic_is_chosen_wherever_the_client_lists_it() {
+        for list in [
+            offered(&["lfs-standalone-file", "basic", "ssh"]),
+            offered(&["basic"]),
+            offered(&["tus", "basic"]),
+        ] {
+            assert_eq!(
+                negotiate_transfer(Some(&list)).unwrap(),
+                "basic",
+                "{list:?}"
+            );
+        }
+        assert_eq!(negotiate_transfer(None).unwrap(), "basic");
+    }
+
+    #[test]
+    fn an_offer_without_basic_is_refused_as_the_clients_request() {
+        let error = negotiate_transfer(Some(&offered(&["lfs-standalone-file", "ssh"])))
+            .expect_err("nothing offered is served here");
+        assert!(error
+            .downcast_ref::<crate::error::InvalidRequest>()
+            .is_some());
+        let error = negotiate_transfer(Some(&[])).expect_err("an empty offer has no adapter");
+        assert!(error
+            .downcast_ref::<crate::error::InvalidRequest>()
+            .is_some());
     }
 }
 

@@ -325,7 +325,7 @@ fn build_router(
     )
     .with_state(state);
     slot.publish(&router);
-    router
+    with_lfs_endpoint_discovery(router)
 }
 
 /// The server's middleware stack — the one and only copy of it.
@@ -454,6 +454,77 @@ fn with_spa_fallback(router: Router<AppState>, state: &AppState) -> Router<AppSt
         )
         .layer(axum::middleware::from_fn(protocol_subtrees_are_not_pages)),
     )
+}
+
+/// Serve the Git LFS API at the URL `git lfs` derives from a remote.
+///
+/// The LFS routes are mounted under `/api/v1/repos/{owner}/{name}/lfs`, but a
+/// stock client never asks there: it takes the remote URL, appends `.git` when
+/// the URL lacks it, and posts to `<remote>.git/info/lfs/objects/batch` — for
+/// the clone URL the UI shows, `/git/{owner}/{repo}.git/info/lfs/...`, and for
+/// an SSH remote, `/{owner}/{repo}.git/info/lfs/...`. No route claimed either
+/// path, so the POST fell through to the GET-only SPA fallback and every
+/// `git lfs push` and `git lfs pull` answered `405` unless the user had found
+/// `lfs.url` and spelled the API path out by hand.
+///
+/// Mounting those paths as routes of their own would have handed the protocol
+/// a second, weaker door. The git transport's tables sit outside the REST
+/// stack: no PAT bridge, so a Basic-auth PAT reaches `batch` as anonymous, and
+/// no repository confinement, so a token restricted to one repository reaches
+/// every other one. Rewriting the URI in front of the router instead sends the
+/// request through the one REST route and everything in front of it — PAT
+/// bridge, confinement, maintenance gate, rate limit, JSON envelope — and makes
+/// the alias exactly as strong as the canonical path, by construction.
+///
+/// It has to be a service around the finished router: a `Router::layer` runs
+/// after routing, when changing the URI no longer changes which route answers.
+fn with_lfs_endpoint_discovery(router: Router) -> Router {
+    Router::new().fallback_service(tower::util::MapRequest::new(
+        router,
+        rewrite_lfs_discovery_request,
+    ))
+}
+
+fn rewrite_lfs_discovery_request(mut request: axum::extract::Request) -> axum::extract::Request {
+    let target = lfs_discovery_api_path(request.uri().path()).and_then(|path| {
+        let path_and_query = match request.uri().query() {
+            Some(query) => format!("{path}?{query}"),
+            None => path,
+        };
+        path_and_query.parse::<axum::http::Uri>().ok()
+    });
+    if let Some(uri) = target {
+        *request.uri_mut() = uri;
+    }
+    request
+}
+
+/// The REST path an LFS client's derived endpoint stands for, if `path` is one.
+///
+/// Only the `.git`-suffixed spelling is taken: that is the only one `git lfs`
+/// produces, and it keeps the rewrite off the SPA's own `/{owner}/{repo}/…`
+/// pages. Empty and dot segments are refused rather than forwarded, so nothing
+/// here can name a path outside the repository's `lfs` subtree.
+pub(crate) fn lfs_discovery_api_path(path: &str) -> Option<String> {
+    let segments = path.strip_prefix('/')?.split('/').collect::<Vec<_>>();
+    let endpoint = |segments: &[&str]| -> Option<String> {
+        let [owner, repo, "info", "lfs", rest @ ..] = segments else {
+            return None;
+        };
+        let repo = repo.strip_suffix(".git")?;
+        let mut addressed = [*owner, repo].into_iter().chain(rest.iter().copied());
+        if rest.is_empty() || addressed.any(|s| matches!(s, "" | "." | "..")) {
+            return None;
+        }
+        Some(format!(
+            "/api/v1/repos/{owner}/{repo}/lfs/{}",
+            rest.join("/")
+        ))
+    };
+    endpoint(&segments).or_else(|| match segments.as_slice() {
+        ["git", under_git @ ..] => endpoint(under_git),
+        _ => None,
+    })
 }
 
 /// Whether `path` lies strictly inside the subtree `prefix` names.
@@ -2640,7 +2711,56 @@ pub(crate) fn build_test_router_with_facts(mut state: AppState) -> (Router, Vec<
         .with_state(state);
     slot.publish(&router);
 
-    (router, facts)
+    (with_lfs_endpoint_discovery(router), facts)
+}
+
+#[cfg(test)]
+mod lfs_discovery_tests {
+    use super::lfs_discovery_api_path;
+
+    #[test]
+    fn the_endpoints_git_lfs_derives_reach_the_rest_routes() {
+        for (derived, api) in [
+            (
+                "/alice/app.git/info/lfs/objects/batch",
+                "/api/v1/repos/alice/app/lfs/objects/batch",
+            ),
+            (
+                "/git/alice/app.git/info/lfs/objects/batch",
+                "/api/v1/repos/alice/app/lfs/objects/batch",
+            ),
+            (
+                "/alice/app.git/info/lfs/locks/verify",
+                "/api/v1/repos/alice/app/lfs/locks/verify",
+            ),
+            // An account named `git` keeps its root-level spelling.
+            (
+                "/git/app.git/info/lfs/objects/batch",
+                "/api/v1/repos/git/app/lfs/objects/batch",
+            ),
+        ] {
+            assert_eq!(lfs_discovery_api_path(derived).as_deref(), Some(api));
+        }
+    }
+
+    #[test]
+    fn paths_that_are_not_an_lfs_endpoint_are_left_alone() {
+        for path in [
+            // No `.git`: `git lfs` never sends it, and it is the SPA's namespace.
+            "/alice/app/info/lfs/objects/batch",
+            "/git/alice/app/info/lfs/objects/batch",
+            "/alice/.git/info/lfs/objects/batch",
+            "/alice/app.git/info/lfs",
+            "/alice/app.git/info/lfs/",
+            "/alice/app.git/info/refs",
+            "/alice/app.git/info/lfs/../../../admin/settings",
+            "/../app.git/info/lfs/objects/batch",
+            "/alice/app.git/info/lfs/objects//batch",
+            "/api/v1/repos/alice/app/lfs/objects/batch",
+        ] {
+            assert_eq!(lfs_discovery_api_path(path), None, "{path}");
+        }
+    }
 }
 
 #[cfg(test)]
