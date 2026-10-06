@@ -168,6 +168,8 @@ agent_max = 600
 agent_window_secs = 60
 
 [smtp]
+# Mail is on when host, user, pass and from are all set, off when none are;
+# anything in between refuses to start and names the missing keys.
 # Password-reset mail needs [server].external_url as well: the link may only
 # name the configured address, never one taken from the request, so without it
 # reset requests are refused.
@@ -178,6 +180,8 @@ agent_window_secs = 60
 # from = "Plombir Git <noreply@example.com>"
 
 [tls]
+# Set both to serve HTTPS, or neither for plain HTTP; one without the other
+# refuses to start instead of quietly falling back to plain HTTP.
 # cert = "/path/to/cert.pem"
 # key = "/path/to/key.pem"
 # The certificate is public; the key is the whole of this server's TLS

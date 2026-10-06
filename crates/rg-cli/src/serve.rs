@@ -273,6 +273,98 @@ fn validate_config(
     Ok(())
 }
 
+/// `[tls]` names both halves or neither. Half of it used to downgrade the
+/// listener to plain HTTP behind one WARN line, so a typo in `[tls].key` gave
+/// an instance that takes passwords and tokens in the clear while its
+/// operator believes it serves HTTPS. Running without TLS is a choice made by
+/// leaving both unset, never the fallback for a broken pair. Each half is
+/// resolved CLI > config on its own, so `--tls-key` may complete a file's cert.
+fn resolve_tls_config(
+    cfg: Option<&crate::config::ConfigFile>,
+    cli_cert: Option<String>,
+    cli_key: Option<String>,
+) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    let cert = cli_cert.or_else(|| cfg.and_then(|c| c.tls.cert.clone()));
+    let key = cli_key.or_else(|| cfg.and_then(|c| c.tls.key.clone()));
+    match (cert, key) {
+        (Some(cert), Some(key)) => {
+            tracing::info!("TLS enabled: cert={}, key={}", cert, key);
+            Ok(Some((PathBuf::from(cert), PathBuf::from(key))))
+        }
+        (Some(_), None) => anyhow::bail!(
+            "TLS is half-configured: a certificate is set (`--tls-cert` / `[tls].cert`) but no \
+             private key (`--tls-key` / `[tls].key`). Refusing to start rather than serve plain \
+             HTTP; set the key that pairs with the certificate, or remove the certificate to run \
+             without TLS"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "TLS is half-configured: a private key is set (`--tls-key` / `[tls].key`) but no \
+             certificate (`--tls-cert` / `[tls].cert`). Refusing to start rather than serve plain \
+             HTTP; set the certificate that pairs with the key, or remove the key to run without \
+             TLS"
+        ),
+        (None, None) => Ok(None),
+    }
+}
+
+/// `[smtp]` (with its `--smtp-*` flags) enables mail only when `host`, `user`,
+/// `pass` and `from` are all set; none of them set means mail is off. Anything
+/// in between used to switch mail off without a word, so notifications and
+/// password reset died on a forgotten `pass`. It now refuses the start and
+/// names what is missing. A blank value counts as unset: the transport always
+/// authenticates, and an empty password is a placeholder, not a credential.
+/// Each field is resolved CLI > config on its own; `port` arrives resolved.
+fn resolve_smtp_config(
+    cfg: Option<&crate::config::ConfigFile>,
+    cli_host: Option<String>,
+    port: u16,
+    cli_user: Option<String>,
+    cli_pass: Option<String>,
+    cli_from: Option<String>,
+) -> anyhow::Result<Option<rg_core::email::SmtpConfig>> {
+    let smtp = cfg.map(|c| &c.smtp);
+    let given = |cli: Option<String>, file: Option<&Option<String>>| {
+        cli.or_else(|| file.cloned().flatten())
+            .filter(|v| !v.trim().is_empty())
+    };
+    let fields = [
+        ("host", given(cli_host, smtp.map(|s| &s.host))),
+        ("user", given(cli_user, smtp.map(|s| &s.user))),
+        ("pass", given(cli_pass, smtp.map(|s| &s.pass))),
+        ("from", given(cli_from, smtp.map(|s| &s.from))),
+    ];
+    let missing: Vec<&str> = fields
+        .iter()
+        .filter(|(_, value)| value.is_none())
+        .map(|(name, _)| *name)
+        .collect();
+    if missing.len() == fields.len() {
+        return Ok(None);
+    }
+    if !missing.is_empty() {
+        let flags: Vec<String> = missing
+            .iter()
+            .map(|name| format!("`--smtp-{name}` / `[smtp].{name}`"))
+            .collect();
+        anyhow::bail!(
+            "SMTP is half-configured: missing {}. Mail (notifications, password reset) needs \
+             host, user, pass and from together; set the missing ones, or remove the others to \
+             run without mail",
+            flags.join(", ")
+        );
+    }
+    if port == 0 {
+        anyhow::bail!("config `smtp.port` must be 1-65535 (got 0) when SMTP is configured");
+    }
+    let [(_, Some(host)), (_, Some(user)), (_, Some(pass)), (_, Some(from))] = fields else {
+        unreachable!("every field was checked present above");
+    };
+    let smtp = rg_core::email::SmtpConfig::new(&host, port, &user, &pass, &from);
+    smtp.validate_from()
+        .context("`--smtp-from` / `[smtp].from` must be a mailbox such as `Name <addr@host>`")?;
+    Ok(Some(smtp))
+}
+
 /// Reject a numeric config knob left at `0` when every downstream consumer
 /// treats `0` as broken rather than as a meaningful "disabled" sentinel:
 /// a zero DB acquire/idle timeout makes the SQLite/MySQL pool churn or become
@@ -767,20 +859,6 @@ pub(crate) async fn run_serve(
         );
     }
 
-    // SMTP: CLI takes precedence, fallback to config (the port is resolved
-    // alongside the other dual-source knobs above).
-    let (resolved_smtp_host, resolved_smtp_user, resolved_smtp_pass, resolved_smtp_from) = {
-        let h = smtp_host.or_else(|| cfg.as_ref().and_then(|c| c.smtp.host.clone()));
-        let u = smtp_user.or_else(|| cfg.as_ref().and_then(|c| c.smtp.user.clone()));
-        let pw = smtp_pass.or_else(|| cfg.as_ref().and_then(|c| c.smtp.pass.clone()));
-        let f = smtp_from.or_else(|| cfg.as_ref().and_then(|c| c.smtp.from.clone()));
-        (h, u, pw, f)
-    };
-
-    // TLS: CLI takes precedence, fallback to config
-    let resolved_tls_cert = tls_cert.or_else(|| cfg.as_ref().and_then(|c| c.tls.cert.clone()));
-    let resolved_tls_key = tls_key.or_else(|| cfg.as_ref().and_then(|c| c.tls.key.clone()));
-
     // Logging: CLI takes precedence, fallback to config (rotation sizes are
     // resolved alongside the other dual-source knobs above).
     let resolved_log_file = log_file.or_else(|| cfg.as_ref().and_then(|c| c.logging.file.clone()));
@@ -920,6 +998,19 @@ pub(crate) async fn run_serve(
             );
         }
     }
+
+    // A half-written `[smtp]` or `[tls]` stops the start here, before the
+    // first directory or database is created, rather than quietly disabling
+    // mail or downgrading the listener to plain HTTP.
+    let smtp_config = resolve_smtp_config(
+        cfg.as_ref(),
+        smtp_host,
+        resolved_smtp_port,
+        smtp_user,
+        smtp_pass,
+        smtp_from,
+    )?;
+    let tls_config = resolve_tls_config(cfg.as_ref(), tls_cert, tls_key)?;
 
     let repo_root = PathBuf::from(&resolved_repo_root);
     // What lives below this root is the *content* of every private repository
@@ -1237,26 +1328,6 @@ pub(crate) async fn run_serve(
     };
 
     // ── HTTP server ───────────────────────────────────────────────
-    let smtp_config = match (
-        resolved_smtp_host,
-        resolved_smtp_user,
-        resolved_smtp_pass,
-        resolved_smtp_from,
-    ) {
-        (Some(host), Some(user), Some(pass), Some(from)) => {
-            if resolved_smtp_port == 0 {
-                anyhow::bail!("config `smtp.port` must be 1-65535 (got 0) when SMTP is configured");
-            }
-            Some(rg_core::email::SmtpConfig::new(
-                &host,
-                resolved_smtp_port,
-                &user,
-                &pass,
-                &from,
-            ))
-        }
-        _ => None,
-    };
     // A reset link may only name the configured public address — one taken
     // from the request `Host` would let an anonymous requester choose where a
     // victim's token is sent — so `forgot-password` refuses mail without it
@@ -1266,22 +1337,6 @@ pub(crate) async fn run_serve(
             "SMTP is configured but [server].external_url is not: password reset emails will be refused until external_url names this instance's public URL"
         );
     }
-
-    let tls_config = match (resolved_tls_cert, resolved_tls_key) {
-        (Some(cert), Some(key)) => {
-            tracing::info!("TLS enabled: cert={}, key={}", cert, key);
-            Some((PathBuf::from(cert), PathBuf::from(key)))
-        }
-        (Some(_), None) => {
-            tracing::warn!("TLS cert specified but no key — running HTTP only");
-            None
-        }
-        (None, Some(_)) => {
-            tracing::warn!("TLS key specified but no cert — running HTTP only");
-            None
-        }
-        _ => None,
-    };
 
     validate_config(&resolved_auth_secrets.jwt_secret, &repo_root, &tls_config)?;
 
@@ -2025,6 +2080,166 @@ mod serve_tests {
             .to_string();
         assert!(err.contains("TLS private key"), "unexpected: {err}");
         assert!(err.contains("does not exist"), "unexpected: {err}");
+    }
+
+    /// Half a `[tls]` used to boot a plain-HTTP listener behind one WARN line:
+    /// a typo in the key path gave an instance taking passwords in the clear.
+    #[test]
+    fn a_half_configured_tls_section_refuses_the_start() {
+        let cert_only: ConfigFile =
+            toml::from_str("[tls]\ncert = \"/etc/tls/fullchain.pem\"\n").unwrap();
+        let err = super::resolve_tls_config(Some(&cert_only), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[tls].key"), "unexpected: {err}");
+        assert!(err.contains("--tls-key"), "unexpected: {err}");
+        assert!(err.contains("plain HTTP"), "unexpected: {err}");
+
+        let key_only: ConfigFile =
+            toml::from_str("[tls]\nkey = \"/etc/tls/privkey.pem\"\n").unwrap();
+        let err = super::resolve_tls_config(Some(&key_only), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[tls].cert"), "unexpected: {err}");
+        assert!(err.contains("--tls-cert"), "unexpected: {err}");
+
+        // The flag pair alone is just as half-configured as the file.
+        let err = super::resolve_tls_config(None, Some("/c.pem".into()), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[tls].key"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn an_absent_or_complete_tls_section_starts() {
+        let empty: ConfigFile = toml::from_str("[tls]\n").unwrap();
+        assert_eq!(
+            super::resolve_tls_config(Some(&empty), None, None).unwrap(),
+            None
+        );
+        assert_eq!(super::resolve_tls_config(None, None, None).unwrap(), None);
+
+        let both: ConfigFile =
+            toml::from_str("[tls]\ncert = \"/c.pem\"\nkey = \"/k.pem\"\n").unwrap();
+        assert_eq!(
+            super::resolve_tls_config(Some(&both), None, None).unwrap(),
+            Some((PathBuf::from("/c.pem"), PathBuf::from("/k.pem")))
+        );
+
+        // Each half resolves on its own: a flag completes the file's half and
+        // overrides the file's value for its own half.
+        let cert_only: ConfigFile = toml::from_str("[tls]\ncert = \"/c.pem\"\n").unwrap();
+        assert_eq!(
+            super::resolve_tls_config(Some(&cert_only), None, Some("/flag-k.pem".into())).unwrap(),
+            Some((PathBuf::from("/c.pem"), PathBuf::from("/flag-k.pem")))
+        );
+        assert_eq!(
+            super::resolve_tls_config(Some(&both), Some("/flag-c.pem".into()), None).unwrap(),
+            Some((PathBuf::from("/flag-c.pem"), PathBuf::from("/k.pem")))
+        );
+    }
+
+    fn smtp_from_file(toml_text: &str) -> anyhow::Result<Option<rg_core::email::SmtpConfig>> {
+        let cfg: ConfigFile = toml::from_str(toml_text).unwrap();
+        super::resolve_smtp_config(Some(&cfg), None, 587, None, None, None)
+    }
+
+    /// A forgotten `pass` used to switch mail off without a single log line:
+    /// notifications and password reset silently stopped.
+    #[test]
+    fn a_half_configured_smtp_section_names_what_is_missing() {
+        let err = smtp_from_file(
+            "[smtp]\nhost = \"smtp.example.com\"\nuser = \"bot\"\nfrom = \"bot@example.com\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`[smtp].pass`"), "unexpected: {err}");
+        assert!(err.contains("`--smtp-pass`"), "unexpected: {err}");
+        for present in ["[smtp].host", "[smtp].user", "[smtp].from"] {
+            assert!(!err.contains(present), "{present} is set: {err}");
+        }
+
+        // Every missing field is named, not just the first.
+        let err = smtp_from_file("[smtp]\nhost = \"smtp.example.com\"\n")
+            .unwrap_err()
+            .to_string();
+        for missing in ["[smtp].user", "[smtp].pass", "[smtp].from"] {
+            assert!(err.contains(missing), "{missing} not named: {err}");
+        }
+
+        // A blank value is a placeholder, not a credential.
+        let err = smtp_from_file(
+            "[smtp]\nhost = \"smtp.example.com\"\nuser = \"bot\"\npass = \"  \"\n\
+             from = \"bot@example.com\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`[smtp].pass`"), "unexpected: {err}");
+
+        // A flag counts like the file: `--smtp-host` alone is half a setup.
+        let err = super::resolve_smtp_config(
+            None,
+            Some("smtp.example.com".into()),
+            587,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`--smtp-pass`"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn an_empty_or_complete_smtp_section_starts() {
+        assert!(smtp_from_file("[smtp]\n").unwrap().is_none());
+        assert!(smtp_from_file("[smtp]\nport = 2525\n").unwrap().is_none());
+        assert!(
+            super::resolve_smtp_config(None, None, 587, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let full = "[smtp]\nhost = \"smtp.example.com\"\nuser = \"bot\"\npass = \"s3cret\"\n\
+                    from = \"Plombir Git <bot@example.com>\"\n";
+        let smtp = smtp_from_file(full)
+            .unwrap()
+            .expect("complete [smtp] enables mail");
+        assert_eq!(smtp.host, "smtp.example.com");
+        assert_eq!(smtp.port, 587);
+        assert_eq!(smtp.pass, "s3cret");
+
+        // The flag overrides the file field by field.
+        let cfg: ConfigFile = toml::from_str(full).unwrap();
+        let smtp =
+            super::resolve_smtp_config(Some(&cfg), None, 587, None, Some("flag".into()), None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(smtp.pass, "flag");
+        assert_eq!(smtp.user, "bot");
+    }
+
+    #[test]
+    fn a_complete_smtp_section_with_an_unusable_port_or_sender_refuses_the_start() {
+        let cfg: ConfigFile = toml::from_str(
+            "[smtp]\nhost = \"smtp.example.com\"\nuser = \"bot\"\npass = \"s3cret\"\n\
+             from = \"bot@example.com\"\n",
+        )
+        .unwrap();
+        let err = super::resolve_smtp_config(Some(&cfg), None, 0, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("smtp.port"), "unexpected: {err}");
+
+        // Parsed only at send time before, so a typo failed every mail.
+        let err = smtp_from_file(
+            "[smtp]\nhost = \"smtp.example.com\"\nuser = \"bot\"\npass = \"s3cret\"\n\
+             from = \"bot at example.com\"\n",
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("[smtp].from"), "unexpected: {err}");
+        assert!(err.contains("bot at example.com"), "unexpected: {err}");
     }
 
     /// The certificate is published to every client that connects; the key is

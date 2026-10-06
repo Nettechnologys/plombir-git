@@ -1,13 +1,14 @@
 //! Email notification service — send notification emails via SMTP.
 //!
-//! Configuration is provided via CLI flags:
+//! Configuration is provided via CLI flags or the `[smtp]` config section:
 //! - `--smtp-host` — SMTP server hostname
 //! - `--smtp-port` — SMTP server port (default 587)
 //! - `--smtp-user` — SMTP username
 //! - `--smtp-pass` — SMTP password
 //! - `--smtp-from` — From email address
 //!
-//! If SMTP is not configured, email sending is silently skipped.
+//! With none of host/user/pass/from set, mail is off and sending is skipped.
+//! `serve` refuses to start on a partial set rather than turning mail off.
 
 use anyhow::Result;
 use lettre::{
@@ -35,6 +36,16 @@ impl SmtpConfig {
             pass: pass.to_string(),
             from: from.to_string(),
         }
+    }
+
+    /// Refuse a `from` no message could carry. It is otherwise parsed only at
+    /// send time, so a typo there passes the start and then fails every
+    /// notification and password-reset mail.
+    pub fn validate_from(&self) -> Result<()> {
+        self.from
+            .parse::<lettre::message::Mailbox>()
+            .map_err(|e| anyhow::anyhow!("invalid sender address {:?}: {e}", self.from))?;
+        Ok(())
     }
 }
 
