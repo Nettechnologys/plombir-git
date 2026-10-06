@@ -933,11 +933,13 @@ enum BlobPublication {
     Reused,
 }
 
-/// Where the compressed bytes of a publication come from.
+/// Where the bytes of a publication come from.
 enum PublicationSource<'a> {
-    #[cfg(test)]
     Buffered(&'a [u8]),
     File(&'a std::path::Path),
+    /// Another repository's stored object, published by sharing its bytes
+    /// ([`BlobStorage::put_file_shared`]) rather than copying them.
+    Shared(&'a std::path::Path),
 }
 
 /// Everything one publication of one LFS object needs to know about itself.
@@ -1092,9 +1094,9 @@ async fn publish_under_lease(
         BlobPublication::Reused
     } else {
         match request.source {
-            #[cfg(test)]
             PublicationSource::Buffered(bytes) => storage.put(request.key, bytes).await?,
             PublicationSource::File(path) => storage.put_file(request.key, path).await?,
+            PublicationSource::Shared(path) => storage.put_file_shared(request.key, path).await?,
         };
         BlobPublication::Published
     };
@@ -1576,10 +1578,9 @@ pub async fn copy_repository_objects(
     })
 }
 
-/// Put one object's bytes under `destination`'s key, wherever the source has
-/// them — blob storage first, the legacy on-disk layout second, the same order
-/// [`read_object_source`] reads in. `Ok(None)` is the one outcome that proves
-/// the source has no bytes for `oid`; every other failure is an error.
+/// Put one object's bytes under `destination`'s key. `Ok(None)` is the one
+/// outcome that proves the source has no bytes for `oid`; every other failure
+/// is an error.
 async fn copy_object_bytes(
     storage: &dyn BlobStorage,
     legacy_root: &std::path::Path,
@@ -1587,31 +1588,148 @@ async fn copy_object_bytes(
     destination: LfsRepository<'_>,
     oid: &str,
 ) -> Result<Option<BlobKey>> {
+    let Some(bytes) = locate_object_bytes(storage, legacy_root, source, oid).await? else {
+        return Ok(None);
+    };
+    let to = lfs_object_key(destination.owner, destination.name, oid, bytes.compressed)?;
+    match &bytes.location {
+        StoredObjectLocation::Local(path) => storage.put_file_shared(&to, path).await?,
+        StoredObjectLocation::Remote(from) => storage.put(&to, &storage.get(from).await?).await?,
+    };
+    Ok(Some(to))
+}
+
+/// Where one repository keeps the bytes of one object.
+struct StoredObject {
+    location: StoredObjectLocation,
+    /// Whether the bytes are zstd-compressed, which decides the key suffix
+    /// whoever shares them has to publish them under.
+    compressed: bool,
+}
+
+enum StoredObjectLocation {
+    /// A file that can be shared by link.
+    Local(std::path::PathBuf),
+    /// A key on a backend with no local files: the bytes have to be read
+    /// whole, as [`read_object_source`] does for the same backend.
+    Remote(BlobKey),
+}
+
+/// Find `oid`'s bytes in `source` — blob storage first, the legacy on-disk
+/// layout second, the same order [`read_object_source`] reads in. `Ok(None)`
+/// means the source has no bytes for it.
+async fn locate_object_bytes(
+    storage: &dyn BlobStorage,
+    legacy_root: &std::path::Path,
+    source: LfsRepository<'_>,
+    oid: &str,
+) -> Result<Option<StoredObject>> {
     for compressed in [true, false] {
-        let from = lfs_object_key(source.owner, source.name, oid, compressed)?;
-        if !storage.exists(&from).await? {
+        let key = lfs_object_key(source.owner, source.name, oid, compressed)?;
+        if !storage.exists(&key).await? {
             continue;
         }
-        let to = lfs_object_key(destination.owner, destination.name, oid, compressed)?;
-        match storage.local_path(&from) {
-            Some(path) => storage.put_file_shared(&to, &path).await?,
-            // A backend with no local files has nothing to share; this reads
-            // the object whole, as `read_object_source` does for the same
-            // backend.
-            None => storage.put(&to, &storage.get(&from).await?).await?,
+        let location = match storage.local_path(&key) {
+            Some(path) => StoredObjectLocation::Local(path),
+            None => StoredObjectLocation::Remote(key),
         };
-        return Ok(Some(to));
+        return Ok(Some(StoredObject {
+            location,
+            compressed,
+        }));
     }
 
     match read_object_path(legacy_root, oid) {
-        Ok((path, compressed)) => {
-            let to = lfs_object_key(destination.owner, destination.name, oid, compressed)?;
-            storage.put_file_shared(&to, &path).await?;
-            Ok(Some(to))
-        }
+        Ok((path, compressed)) => Ok(Some(StoredObject {
+            location: StoredObjectLocation::Local(path),
+            compressed,
+        })),
         Err(error) if error.downcast_ref::<crate::error::NotFound>().is_some() => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// What [`adopt_objects`] found for the oids it was handed.
+#[derive(Debug, Default)]
+pub struct LfsObjectsAdopted {
+    /// Objects the destination did not have and now serves as its own.
+    pub adopted: usize,
+    /// Objects neither repository stores. The destination would answer `404`
+    /// for them, and nothing here can change that.
+    pub missing: Vec<String>,
+}
+
+/// Make sure `destination` serves each of `oids`, taking from `source` the
+/// ones it does not have yet.
+///
+/// This is how LFS content follows history from one repository into another
+/// that already exists — a pull request from a fork being merged. Unlike
+/// [`copy_repository_objects`], which fills a repository nobody else can see
+/// yet, the destination here is live: its users may be uploading the very same
+/// object right now. So every object goes through the same per-object
+/// publication lease an upload takes, registered and marked uploaded the way an
+/// upload would be, and an object that arrives is never taken away again. A
+/// failure halfway leaves the destination with some extra objects nothing
+/// points at yet — exactly what an upload whose push never came leaves.
+///
+/// An object the destination already records as uploaded is left alone, which
+/// is the same test its batch API answers downloads by.
+pub async fn adopt_objects(
+    db: &DatabaseConnection,
+    storage: &dyn BlobStorage,
+    repo_root: &std::path::Path,
+    source: LfsRepository<'_>,
+    destination: LfsRepository<'_>,
+    oids: &[String],
+) -> Result<LfsObjectsAdopted> {
+    let legacy_root = lfs_root(repo_root, source.owner, source.name);
+    let mut outcome = LfsObjectsAdopted::default();
+    for oid in oids {
+        if object_claims_upload(db, destination.id, oid).await? {
+            continue;
+        }
+        let stored = match lfs_object_ops::find_by_repo_and_oid(db, source.id, oid).await? {
+            Some(row) if row.uploaded => locate_object_bytes(storage, &legacy_root, source, oid)
+                .await?
+                .map(|bytes| (row.size, bytes)),
+            _ => None,
+        };
+        let Some((size, bytes)) = stored else {
+            outcome.missing.push(oid.clone());
+            continue;
+        };
+
+        let key = lfs_object_key(destination.owner, destination.name, oid, bytes.compressed)?;
+        let object = find_or_register_object(db, destination.id, oid, size).await?;
+        let buffered;
+        let publication_source = match &bytes.location {
+            StoredObjectLocation::Local(path) => PublicationSource::Shared(path),
+            StoredObjectLocation::Remote(from) => {
+                buffered = storage.get(from).await?;
+                PublicationSource::Buffered(&buffered)
+            }
+        };
+        publish_object(
+            db,
+            storage,
+            PublicationRequest {
+                object_id: object.id,
+                repo_id: destination.id,
+                oid,
+                key: &key,
+                source: publication_source,
+            },
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to give {}/{} the LFS object {oid} of {}/{}",
+                destination.owner, destination.name, source.owner, source.name
+            )
+        })?;
+        outcome.adopted += 1;
+    }
+    Ok(outcome)
 }
 
 // ── Compression helpers ───────────────────────────────────────────────────────

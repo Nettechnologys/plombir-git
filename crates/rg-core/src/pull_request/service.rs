@@ -8,6 +8,7 @@ use sea_orm::{
 use std::collections::HashMap;
 
 use crate::error::NotFound;
+use crate::lfs::service::LfsRepository;
 use rg_git::protocol::receive_pack::RefUpdate;
 
 use rg_db::entities::pull_request::{self, Model as PullRequest};
@@ -4035,9 +4036,10 @@ async fn merge_claimed_pr(
         let expected_head_sha = expected_head_sha.map(str::to_owned);
         let repo_path_for_git = repo_path.clone();
         let pr_for_git = pr.clone();
-        let merge_commit_sha = crate::blocking::run_blocking_git(
-            "fetching and merging a fork pull request",
-            move || -> Result<String> {
+        let merge_ref_for_git = merge_ref.clone();
+        let (head_sha, lfs_oids) = crate::blocking::run_blocking_git(
+            "fetching a fork pull request",
+            move || -> Result<(String, Vec<String>)> {
                 // A deleted head is stale PR state, while an unreadable fork
                 // repository is a server failure. Checking before fetch also
                 // prevents reuse of an old local fork ref.
@@ -4061,19 +4063,69 @@ async fn merge_claimed_pr(
                 }
 
                 // The fetch brought whatever the fork branch points at now.
-                // Pin and merge that same object inside this blocking phase.
-                let merged = (|| {
-                    let head_sha = resolve_ref_sha(&repo_path_for_git, &merge_ref)?;
+                // Everything below — the pin, the LFS objects, the merge —
+                // is about that one commit, never the branch again.
+                let pinned = (|| {
+                    let head_sha = resolve_ref_sha(&repo_path_for_git, &merge_ref_for_git)?;
                     require_pinned_head(&pr_for_git, expected_head_sha.as_deref(), &head_sha)?;
-                    merge_head_rev(&repo_path_for_git, &pr_for_git, &head_sha, strategy)
+                    let lfs_oids = crate::lfs::pointer::objects_introduced(
+                        &repo_path_for_git,
+                        &head_sha,
+                        &format!("refs/heads/{}", pr_for_git.base_branch),
+                    )?;
+                    Ok((head_sha, lfs_oids))
                 })();
-                // On every outcome, not only success: a conflict or a moved
-                // pin is exactly when the author goes on to rewrite the branch.
-                discard_fork_ref(&repo_path_for_git, &merge_ref);
-                merged
+                // On every failure, not only after a merge: a moved pin is
+                // exactly when the author goes on to rewrite the branch.
+                if pinned.is_err() {
+                    discard_fork_ref(&repo_path_for_git, &merge_ref_for_git);
+                }
+                pinned
             },
         )
         .await?;
+
+        // Before the merge, not after it: once the base branch moves, its
+        // pointers are public, and an object still missing then is a `404` for
+        // the next `git lfs pull` rather than a refusal the author can act on.
+        if let Err(error) = adopt_fork_lfs_objects(
+            db,
+            repo_root,
+            &pr,
+            LfsRepository {
+                id: head_repo.id,
+                owner: &head_namespace,
+                name: &head_repo.name,
+            },
+            LfsRepository {
+                id: pr.repo_id,
+                owner,
+                name: repo_name,
+            },
+            &lfs_oids,
+        )
+        .await
+        {
+            // Local Git from here on: the fetch above is this function's one
+            // network boundary, and these phases block the same way the
+            // same-repository merge below does.
+            let repo_path = repo_path.clone();
+            if let Err(cleanup) =
+                tokio::task::spawn_blocking(move || discard_fork_ref(&repo_path, &merge_ref)).await
+            {
+                tracing::warn!(error = %cleanup, "failed to discard a scratch fork ref");
+            }
+            return Err(error);
+        }
+
+        let repo_path_for_git = repo_path.clone();
+        let pr_for_git = pr.clone();
+        let merge_commit_sha = tokio::task::spawn_blocking(move || -> Result<String> {
+            let merged = merge_head_rev(&repo_path_for_git, &pr_for_git, &head_sha, strategy);
+            discard_fork_ref(&repo_path_for_git, &merge_ref);
+            merged
+        })
+        .await??;
 
         return update_pr_merged(
             db,
@@ -4875,6 +4927,64 @@ fn discard_fork_ref(repo_path: &std::path::Path, ref_name: &str) {
             "failed to clean up a pull request's scratch fork ref"
         );
     }
+}
+
+/// Give the base repository of a fork pull request every LFS object in
+/// `oids` it does not store yet, taking them from the fork.
+///
+/// Refused as a `Conflict` when an object is in neither repository: the author
+/// committed a pointer and never ran `git lfs push`, so merging would publish a
+/// pointer to nothing. That is the author's to fix and retry, not a server
+/// failure, and the message names the objects so they can.
+async fn adopt_fork_lfs_objects(
+    db: &DatabaseConnection,
+    repo_root: &std::path::Path,
+    pr: &PullRequest,
+    fork: LfsRepository<'_>,
+    base: LfsRepository<'_>,
+    oids: &[String],
+) -> Result<()> {
+    if oids.is_empty() {
+        return Ok(());
+    }
+    let adopted = crate::lfs::service::adopt_objects(
+        db,
+        &crate::blob_storage::instance_blob_storage(repo_root),
+        repo_root,
+        fork,
+        base,
+        oids,
+    )
+    .await?;
+    if adopted.adopted > 0 {
+        tracing::info!(
+            pr_id = pr.id,
+            repo_id = base.id,
+            fork_repo_id = fork.id,
+            adopted = adopted.adopted,
+            "gave the base repository the LFS objects a fork pull request brings"
+        );
+    }
+    if adopted.missing.is_empty() {
+        return Ok(());
+    }
+
+    const LISTED: usize = 20;
+    let mut listed = adopted.missing[..adopted.missing.len().min(LISTED)].join(", ");
+    if adopted.missing.len() > LISTED {
+        listed.push_str(&format!(" and {} more", adopted.missing.len() - LISTED));
+    }
+    Err(crate::error::conflict(format!(
+        "this pull request points at {} Git LFS object(s) that neither {}/{} nor the fork \
+         {}/{} stores: {listed}. Upload them to the fork (`git lfs push --all <fork remote> \
+         {}`) and merge again.",
+        adopted.missing.len(),
+        base.owner,
+        base.name,
+        fork.owner,
+        fork.name,
+        pr.head_branch,
+    )))
 }
 
 fn gix_delete_ref(repo_path: &std::path::Path, ref_name: &str) -> Result<()> {

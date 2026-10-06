@@ -213,6 +213,17 @@ pub trait BlobStorage: Send + Sync {
     }
 }
 
+/// The blob store of the instance whose storage root is `repo_root`.
+///
+/// The server builds its request-path handle (`AppState::blob_storage`) from
+/// this, and so does work that runs where no such handle reaches — a merge
+/// started by the merge queue or by auto-merge after CI, which has to give the
+/// base repository the LFS objects of a fork. One function says which backend
+/// that is, so the two can never be pointed at different stores.
+pub fn instance_blob_storage(repo_root: &Path) -> LocalBlobStorage {
+    LocalBlobStorage::new(repo_root.to_path_buf())
+}
+
 /// Atomic filesystem implementation used by the current single-node runtime.
 #[derive(Clone, Debug)]
 pub struct LocalBlobStorage {

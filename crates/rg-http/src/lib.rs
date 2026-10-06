@@ -540,7 +540,7 @@ async fn run_with_listener(
     );
 
     let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> = Arc::new(
-        rg_core::blob_storage::LocalBlobStorage::new(config.repo_root.clone()),
+        rg_core::blob_storage::instance_blob_storage(&config.repo_root),
     );
     // One registry shape, not two. The branch that used to stand here was
     // selected by a `[server]` key inherited from upstream that reached
