@@ -230,7 +230,7 @@ Three finds from the history:
 | Issues | CRUD, labels, milestones, comments, Gitea-compatible issue templates and chooser ([template reference](docs/issue-templates.md)) |
 | Pull requests | Diff, three merge strategies (merge / squash / rebase), cross-repo (fork) PRs, code review (approve / request changes / inline comments), branch protection, repository pull-request template ([reference](docs/issue-templates.md#pull-request-templates)), CODEOWNERS auto-review ([reference](docs/codeowners.md)) |
 | Wiki | Page CRUD backed by Git |
-| Git LFS | Batch API, object upload/download, zstd compression |
+| Git LFS | Batch API, object upload/download, zstd compression; works from both the HTTPS and the SSH clone URL ([details](#git-lfs)) |
 | CI/CD | Native `.plombir-git-ci.yml` pipelines ([schema reference](docs/ci.md)) and Gitea Actions (`.gitea/workflows/*.yml`, [supported subset](docs/gitea-actions.md)); embedded or external runners, optional Docker execution, artifacts, live job logs over WebSocket |
 | Webhooks | Registration, delivery, HMAC-SHA256 signatures, delivery history |
 | Notifications | In-app, email (SMTP), and real-time WebSocket delivery |
@@ -452,6 +452,22 @@ cd /tmp/myrepo-http
 # ... edit files ...
 git push origin main
 ```
+
+### Git LFS
+
+`git lfs` needs no `lfs.url` with either clone URL. From the HTTPS URL the
+client finds the endpoint itself. From the SSH URL it asks the server over SSH
+(`git-lfs-authenticate`), which checks the same repository permission as a
+clone or push and sends the client to the instance's public URL with a
+short-lived credential for that one repository.
+
+That answer can only name the public URL if the server knows it: set
+`[server].external_url`. Without it, `git-lfs-authenticate` refuses with a
+message saying so, and an SSH clone needs
+`git config lfs.url <external URL>/api/v1/repos/<owner>/<repo>/lfs`.
+Deploy keys work too, read-only ones for downloads only. The pure-SSH transfer
+protocol (`git-lfs-transfer`) is not implemented; git-lfs falls back to
+`git-lfs-authenticate` by itself.
 
 ---
 

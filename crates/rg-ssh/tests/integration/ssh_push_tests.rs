@@ -81,6 +81,7 @@ async fn registered_key_can_push_and_clone_over_live_ssh() {
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
         post_push: None,
+        lfs: None,
         shutdown: None,
         shutdown_grace_secs: 5,
     };
@@ -232,6 +233,7 @@ async fn an_unregistered_key_is_refused_while_the_registered_one_still_works() {
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
         post_push: None,
+        lfs: None,
         shutdown: None,
         shutdown_grace_secs: 5,
     };
@@ -395,6 +397,7 @@ async fn maintenance_mode_rejects_push_but_allows_clone_and_fetch_over_ssh() {
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
         post_push: None,
+        lfs: None,
         shutdown: None,
         shutdown_grace_secs: 5,
     };

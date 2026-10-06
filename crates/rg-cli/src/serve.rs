@@ -1371,6 +1371,16 @@ pub(crate) async fn run_serve(
     // webhooks, open-PR head-SHA refresh, auto-merge / merge-queue. These hooks
     // used to be private to `rg-http`, so SSH (the default once a key is
     // registered) ran none of them (card_b4fefeee8abf).
+    // LFS for clones made from the SSH address: `git-lfs-authenticate` sends the
+    // client to the HTTP side, and the only address it can honestly name is the
+    // configured public one (card_d8d274ed134d).
+    let ssh_lfs = resolved_external_url
+        .clone()
+        .map(|external_url| rg_ssh::SshLfsConfig {
+            external_url,
+            signing_secret: resolved_auth_secrets.jwt_secret.clone(),
+        });
+
     let post_push_context = rg_core::push_hooks::PostPushContext {
         repo_root: repo_root.clone(),
         docker_enabled: resolved_docker,
@@ -1393,6 +1403,7 @@ pub(crate) async fn run_serve(
         git_stream_timeout_secs: resolved_git_stream_timeout,
         git_idle_timeout_secs: resolved_git_idle_timeout,
         post_push: Some(std::sync::Arc::new(post_push_context)),
+        lfs: ssh_lfs,
         instance_settings,
         // The second consumer of the fan-out above. It used to be the one the
         // channel never reached, so a `SIGTERM` cut an SSH push mid-objects

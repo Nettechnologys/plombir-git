@@ -50,6 +50,7 @@ async fn server_with_shutdown() -> (
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
         post_push: None,
+        lfs: None,
         shutdown: Some(shutdown_rx),
         shutdown_grace_secs: 5,
     })
@@ -108,6 +109,7 @@ async fn a_server_with_no_shutdown_channel_keeps_serving() {
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
         post_push: None,
+        lfs: None,
         shutdown: None,
         shutdown_grace_secs: 5,
     })

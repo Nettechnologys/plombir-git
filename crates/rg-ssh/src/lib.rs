@@ -118,6 +118,11 @@ enum GitServiceError {
     AuthenticationRequired,
     RepositoryNotFound,
     AccessDenied(&'static str),
+    /// The request is well-formed but asks for something this port does not
+    /// serve: a command it does not implement, or LFS on an instance that has
+    /// no public URL to send the client to. The text is the whole answer the
+    /// client gets, so it says what to do instead.
+    NotOffered(&'static str),
     ServerUnavailable(anyhow::Error),
 }
 
@@ -127,6 +132,7 @@ impl GitServiceError {
             Self::AuthenticationRequired => "authentication required",
             Self::RepositoryNotFound => "repository not found",
             Self::AccessDenied(_) => "repository access denied",
+            Self::NotOffered(reason) => reason,
             Self::ServerUnavailable(_) => "server temporarily unavailable; try again later",
         }
     }
@@ -136,6 +142,7 @@ impl GitServiceError {
             Self::AuthenticationRequired => "authentication_required",
             Self::RepositoryNotFound => "repository_not_found",
             Self::AccessDenied(_) => "access_denied",
+            Self::NotOffered(_) => "not_offered",
             Self::ServerUnavailable(_) => "server_unavailable",
         }
     }
@@ -144,7 +151,7 @@ impl GitServiceError {
         match self {
             Self::AuthenticationRequired => "no authenticated SSH identity".to_string(),
             Self::RepositoryNotFound => "repository not found".to_string(),
-            Self::AccessDenied(reason) => (*reason).to_string(),
+            Self::AccessDenied(reason) | Self::NotOffered(reason) => (*reason).to_string(),
             Self::ServerUnavailable(error) => format!("{error:#}"),
         }
     }
@@ -213,6 +220,27 @@ pub struct SshServerConfig {
     /// of them. `None` disables the hooks (no automation configured); the push
     /// itself still succeeds.
     pub post_push: Option<Arc<rg_core::push_hooks::PostPushContext>>,
+    /// What `git-lfs-authenticate` needs to send an SSH remote's LFS traffic to
+    /// the HTTP side. `None` turns the command into a refusal that says how to
+    /// configure the instance; git itself is unaffected.
+    pub lfs: Option<SshLfsConfig>,
+}
+
+/// Git LFS for clones made from the SSH address.
+///
+/// LFS objects travel over HTTP whatever the remote is. git-lfs asks the SSH
+/// remote, with `git-lfs-authenticate <path> <operation>`, where that HTTP
+/// endpoint is and which header to present to it. Without an answer it guesses
+/// `https://<ssh host>/<path>/info/lfs` — no port, always HTTPS — which on most
+/// instances is nowhere (card_d8d274ed134d).
+pub struct SshLfsConfig {
+    /// The instance's public HTTP(S) URL (`[server].external_url`): the SSH
+    /// port has no request `Host` to fall back on, so this is the only honest
+    /// source for the endpoint the client is sent to.
+    pub external_url: String,
+    /// The secret LFS action URLs are signed with (the instance JWT secret).
+    /// The HTTP side verifies the credential minted here with the same key.
+    pub signing_secret: String,
 }
 
 /// Shared state passed to every SshHandler.
@@ -230,6 +258,8 @@ struct SharedState {
     /// Post-push hooks shared with the HTTP transport. See
     /// [`SshServerConfig::post_push`].
     post_push: Option<Arc<rg_core::push_hooks::PostPushContext>>,
+    /// See [`SshServerConfig::lfs`].
+    lfs: Option<SshLfsConfig>,
     /// Every git session this server is currently streaming.
     ///
     /// The session runs detached — `exec_request` returns as soon as it is
@@ -436,6 +466,7 @@ impl SshServer {
             git_stream_timeout_secs: ssh_config.git_stream_timeout_secs,
             git_idle_timeout_secs: ssh_config.git_idle_timeout_secs,
             post_push: ssh_config.post_push,
+            lfs: ssh_config.lfs,
             git_sessions: rg_core::task_tracker::TaskTracker::new(),
         });
 
@@ -940,11 +971,47 @@ impl Handler for SshHandler {
         let command = String::from_utf8_lossy(data).to_string();
         tracing::info!(%command, id = self.id, "SSH exec request");
 
-        let (service, repo_path) = parse_git_command(&command)?;
+        // A command this port does not serve is answered like a failed command
+        // — stderr plus a non-zero exit — rather than with an error out of the
+        // handler, which russh turns into a dropped connection. git-lfs probes
+        // `git-lfs-transfer` first and falls back only on a clean failure; a
+        // torn-down connection read to it as `Broken pipe`.
+        let (service, repo_path) = match parse_exec_command(&command) {
+            Ok(ExecCommand::Git { service, repo_path }) => (service, repo_path),
+            Ok(ExecCommand::LfsAuthenticate {
+                repo_path,
+                operation,
+            }) => {
+                return self
+                    .lfs_authenticate(channel_id, &repo_path, operation, session)
+                    .await
+            }
+            Err(error) => {
+                reject_git_exec(
+                    session,
+                    channel_id,
+                    &error,
+                    self.authenticated_identity.as_ref(),
+                    &command,
+                    "",
+                )?;
+                return Ok(());
+            }
+        };
 
         // H-02: Validate repo_path before joining with repo_root
-        rg_core::platform::validate_repo_path(&repo_path)
-            .with_context(|| format!("invalid repository path: {}", repo_path))?;
+        if let Err(error) = rg_core::platform::validate_repo_path(&repo_path) {
+            tracing::warn!(error = %format!("{error:#}"), %repo_path, "invalid SSH repository path");
+            reject_git_exec(
+                session,
+                channel_id,
+                &GitServiceError::RepositoryNotFound,
+                self.authenticated_identity.as_ref(),
+                &service,
+                &repo_path,
+            )?;
+            return Ok(());
+        }
 
         let db = &*self.shared.db;
 
@@ -1246,30 +1313,195 @@ impl Handler for SshHandler {
     }
 }
 
-/// Parse a git SSH command string like:
+impl SshHandler {
+    /// Answer `git-lfs-authenticate <path> <operation>`.
+    ///
+    /// The decision is the one `git-upload-pack` (download) or
+    /// `git-receive-pack` (upload) would get on the same connection — same
+    /// gate, same refusals — so an SSH key that cannot clone a repository
+    /// cannot fetch its LFS objects either. A granted request is answered with
+    /// the JSON git-lfs expects on stdout: the HTTP endpoint built from the
+    /// instance's public URL, and a short-lived credential for it.
+    async fn lfs_authenticate(
+        &mut self,
+        channel_id: ChannelId,
+        repo_path: &str,
+        operation: rg_core::lfs::service::LfsActionKind,
+        session: &mut Session,
+    ) -> Result<(), HandlerError> {
+        match self.lfs_grant(repo_path, operation).await {
+            Ok(answer) => {
+                tracing::info!(
+                    identity = ?self.authenticated_identity,
+                    %repo_path,
+                    ?operation,
+                    "SSH git-lfs-authenticate granted"
+                );
+                session.channel_success(channel_id)?;
+                session.data(channel_id, format!("{answer}\n"))?;
+                session.exit_status_request(channel_id, 0)?;
+                session.close(channel_id)?;
+                Ok(())
+            }
+            Err(error) => reject_git_exec(
+                session,
+                channel_id,
+                &error,
+                self.authenticated_identity.as_ref(),
+                "git-lfs-authenticate",
+                repo_path,
+            ),
+        }
+    }
+
+    async fn lfs_grant(
+        &self,
+        repo_path: &str,
+        operation: rg_core::lfs::service::LfsActionKind,
+    ) -> std::result::Result<String, GitServiceError> {
+        use rg_core::lfs::service::{
+            sign_ssh_grant, LfsActionKind, LfsActor, LfsCredential, SSH_GRANT_AUTH_SCHEME,
+            SSH_GRANT_TTL_SECONDS,
+        };
+
+        let lfs = self.shared.lfs.as_ref().ok_or(GitServiceError::NotOffered(
+            "Git LFS over SSH needs the server's public URL, and this server has none: set \
+             [server].external_url, or point `git config lfs.url` at its HTTP address",
+        ))?;
+        rg_core::platform::validate_repo_path(repo_path)
+            .map_err(|_| GitServiceError::RepositoryNotFound)?;
+        let service = match operation {
+            LfsActionKind::Download => "git-upload-pack",
+            LfsActionKind::Upload => "git-receive-pack",
+        };
+        let identity = self.authenticated_identity.as_ref();
+        let repo = authorize_git_service(&self.shared.db, service, repo_path, identity).await?;
+        let actor = match identity.ok_or(GitServiceError::AuthenticationRequired)? {
+            AuthenticatedIdentity::User {
+                user_id,
+                credential: UserCredential::SshKey { key_id },
+            } => LfsActor::User {
+                user_id: *user_id,
+                credential: LfsCredential::SshKey { id: *key_id },
+            },
+            AuthenticatedIdentity::User {
+                user_id,
+                credential: UserCredential::Password { session_version },
+            } => LfsActor::User {
+                user_id: *user_id,
+                credential: LfsCredential::Session {
+                    version: *session_version,
+                },
+            },
+            AuthenticatedIdentity::DeployKey { key_id } => LfsActor::DeployKey { key_id: *key_id },
+        };
+        let (owner, repo_name) =
+            parse_repo_owner_name(repo_path).map_err(|_| GitServiceError::RepositoryNotFound)?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| GitServiceError::ServerUnavailable(error.into()))?
+            .as_secs() as i64;
+        let token = sign_ssh_grant(
+            lfs.signing_secret.as_bytes(),
+            operation,
+            repo.id,
+            now + SSH_GRANT_TTL_SECONDS,
+            actor,
+        )
+        .map_err(GitServiceError::ServerUnavailable)?;
+
+        // The REST route itself rather than `<repo>.git/info/lfs`: the alias is
+        // only a rewrite onto it, and the client uses whatever `href` it is
+        // given verbatim.
+        Ok(serde_json::json!({
+            "href": format!(
+                "{}/api/v1/repos/{owner}/{repo_name}/lfs",
+                lfs.external_url.trim_end_matches('/')
+            ),
+            "header": { "Authorization": format!("{SSH_GRANT_AUTH_SCHEME} {token}") },
+            "expires_in": SSH_GRANT_TTL_SECONDS,
+        })
+        .to_string())
+    }
+}
+
+/// What an SSH `exec` asked this server to do.
+#[derive(Debug, PartialEq, Eq)]
+enum ExecCommand {
+    /// `git-upload-pack` / `git-receive-pack` on a repository.
+    Git { service: String, repo_path: String },
+    /// `git-lfs-authenticate <path> <operation>`: where to send this
+    /// repository's LFS traffic, and with which credential.
+    LfsAuthenticate {
+        repo_path: String,
+        operation: rg_core::lfs::service::LfsActionKind,
+    },
+}
+
+/// Parse an SSH exec command string like:
 ///   `git-upload-pack '/owner/repo'`
 ///   `git-receive-pack '/owner/repo.git'`
-fn parse_git_command(command: &str) -> Result<(String, String)> {
-    let parts: Vec<&str> = command.splitn(2, ' ').collect();
-    if parts.len() < 2 {
-        anyhow::bail!("invalid git command: {}", command);
+///   `git-lfs-authenticate /owner/repo.git download`
+///
+/// Anything else is [`GitServiceError::NotOffered`] — including
+/// `git-lfs-transfer`, the pure-SSH LFS protocol, which git-lfs tries first and
+/// abandons for `git-lfs-authenticate` when it fails cleanly.
+fn parse_exec_command(command: &str) -> std::result::Result<ExecCommand, GitServiceError> {
+    let (program, arguments) = command
+        .trim()
+        .split_once(' ')
+        .unwrap_or((command.trim(), ""));
+    match program {
+        "git-upload-pack" | "git-receive-pack" => {
+            let repo_path = unquote_repo_path(arguments.trim());
+            if repo_path.is_empty() {
+                return Err(GitServiceError::NotOffered(
+                    "usage: <git command> '<owner>/<repo>'",
+                ));
+            }
+            Ok(ExecCommand::Git {
+                service: program.to_string(),
+                repo_path,
+            })
+        }
+        "git-lfs-authenticate" => {
+            const USAGE: &str = "usage: git-lfs-authenticate <owner>/<repo> <download|upload>";
+            // The path comes first and the operation last; git-lfs sends the
+            // path bare, a hand-typed command may quote it.
+            let (path, operation) = arguments
+                .trim()
+                .rsplit_once(' ')
+                .ok_or(GitServiceError::NotOffered(USAGE))?;
+            let operation = rg_core::lfs::service::LfsActionKind::from_operation(operation)
+                .ok_or(GitServiceError::NotOffered(USAGE))?;
+            let repo_path = unquote_repo_path(path.trim());
+            if repo_path.is_empty() {
+                return Err(GitServiceError::NotOffered(USAGE));
+            }
+            Ok(ExecCommand::LfsAuthenticate {
+                repo_path,
+                operation,
+            })
+        }
+        "git-lfs-transfer" => Err(GitServiceError::NotOffered(
+            "git-lfs-transfer is not supported; Git LFS on this server is served over HTTP \
+             through git-lfs-authenticate",
+        )),
+        _ => Err(GitServiceError::NotOffered(
+            "this port serves only git-upload-pack, git-receive-pack and git-lfs-authenticate",
+        )),
     }
+}
 
-    let service = parts[0].trim().to_string();
-    if service != "git-upload-pack" && service != "git-receive-pack" {
-        anyhow::bail!("unsupported git command: {}", service);
-    }
-
-    let raw_path = parts[1].trim();
-    let repo_path = raw_path
+fn unquote_repo_path(raw_path: &str) -> String {
+    raw_path
         .trim_start_matches('\'')
         .trim_end_matches('\'')
         .trim_start_matches('"')
         .trim_end_matches('"')
         .trim_start_matches('/')
-        .to_string();
-
-    Ok((service, repo_path))
+        .to_string()
 }
 
 fn parse_repo_owner_name(repo_path: &str) -> Result<(String, String)> {
@@ -1295,7 +1527,7 @@ async fn authorize_git_service(
     service: &str,
     repo_path: &str,
     identity: Option<&AuthenticatedIdentity>,
-) -> std::result::Result<(), GitServiceError> {
+) -> std::result::Result<rg_db::entities::repository::Model, GitServiceError> {
     let identity = identity.ok_or(GitServiceError::AuthenticationRequired)?;
     let (owner, repo_name) =
         parse_repo_owner_name(repo_path).map_err(|_| GitServiceError::RepositoryNotFound)?;
@@ -1390,7 +1622,7 @@ async fn authorize_git_service(
                 .ok_or(GitServiceError::AccessDenied(
                     "the deploy key this session authenticated with is gone",
                 ))?;
-            deploy_key_allows(key.repo_id, key.read_only, repo.id, service)
+            deploy_key_allows(&key, repo.id, service)
         }
     };
 
@@ -1400,7 +1632,7 @@ async fn authorize_git_service(
         ));
     }
 
-    Ok(())
+    Ok(repo)
 }
 
 /// Build the extra receive-pack policy context without letting a failed lookup
@@ -1433,13 +1665,19 @@ async fn load_receive_pack_context(
 }
 
 fn deploy_key_allows(
-    key_repo_id: i64,
-    read_only: bool,
+    key: &rg_db::entities::deploy_key::Model,
     requested_repo_id: i64,
     service: &str,
 ) -> bool {
-    key_repo_id == requested_repo_id
-        && (service == "git-upload-pack" || (service == "git-receive-pack" && !read_only))
+    match service {
+        "git-upload-pack" => {
+            rg_core::repo::service::deploy_key_permits(key, requested_repo_id, false)
+        }
+        "git-receive-pack" => {
+            rg_core::repo::service::deploy_key_permits(key, requested_repo_id, true)
+        }
+        _ => false,
+    }
 }
 
 /// Public entry point to start the SSH server.
@@ -1466,8 +1704,9 @@ pub async fn start_ssh_server_on_listener(
 mod tests {
     use super::{
         check_host_key_readable, deploy_key_allows, drain_git_sessions, ensure_host_key,
-        parse_git_command, parse_repo_owner_name, split_git_session, with_git_timeout,
-        write_new_host_key, AppliedRefUpdates, ReceivePackOutcome, RefUpdate,
+        parse_exec_command, parse_repo_owner_name, split_git_session, with_git_timeout,
+        write_new_host_key, AppliedRefUpdates, ExecCommand, GitServiceError, ReceivePackOutcome,
+        RefUpdate,
     };
     use std::time::Duration;
 
@@ -1800,10 +2039,71 @@ mod tests {
 
     #[test]
     fn parses_git_command_with_quoted_repo_path() {
-        let (service, path) = parse_git_command("git-upload-pack '/alice/project.git'").unwrap();
+        assert_eq!(
+            parse_exec_command("git-upload-pack '/alice/project.git'").unwrap(),
+            ExecCommand::Git {
+                service: "git-upload-pack".to_string(),
+                repo_path: "alice/project.git".to_string(),
+            }
+        );
+    }
 
-        assert_eq!(service, "git-upload-pack");
-        assert_eq!(path, "alice/project.git");
+    /// The shapes git-lfs actually sends: `ssh://` remotes pass `/owner/repo.git`,
+    /// scp-style ones `owner/repo.git`, both bare; a hand-typed command may quote.
+    #[test]
+    fn parses_git_lfs_authenticate_in_every_shape_the_client_sends() {
+        use rg_core::lfs::service::LfsActionKind;
+        for (command, repo_path, operation) in [
+            (
+                "git-lfs-authenticate /alice/project.git download",
+                "alice/project.git",
+                LfsActionKind::Download,
+            ),
+            (
+                "git-lfs-authenticate alice/project upload",
+                "alice/project",
+                LfsActionKind::Upload,
+            ),
+            (
+                "git-lfs-authenticate '/alice/project.git' download",
+                "alice/project.git",
+                LfsActionKind::Download,
+            ),
+        ] {
+            assert_eq!(
+                parse_exec_command(command).unwrap(),
+                ExecCommand::LfsAuthenticate {
+                    repo_path: repo_path.to_string(),
+                    operation,
+                },
+                "{command}"
+            );
+        }
+    }
+
+    /// Everything this port does not serve is a clean refusal with a message,
+    /// never a handler error — russh turns that into a dropped connection.
+    #[test]
+    fn unsupported_and_malformed_commands_are_refusals_not_errors() {
+        for command in [
+            "git-lfs-transfer /alice/project.git download",
+            "git-upload-archive '/alice/project.git'",
+            "git-lfs-authenticate /alice/project.git verify",
+            "git-lfs-authenticate /alice/project.git",
+            "git-lfs-authenticate",
+            "git-upload-pack",
+            "git-upload-pack ''",
+            "",
+            "ls -la",
+        ] {
+            assert!(
+                matches!(
+                    parse_exec_command(command),
+                    Err(GitServiceError::NotOffered(_))
+                ),
+                "{command:?} must be refused as not offered"
+            );
+        }
     }
 
     #[test]
@@ -1829,11 +2129,23 @@ mod tests {
 
     #[test]
     fn deploy_keys_are_repository_scoped_and_respect_read_only() {
-        assert!(deploy_key_allows(7, true, 7, "git-upload-pack"));
-        assert!(!deploy_key_allows(7, true, 7, "git-receive-pack"));
-        assert!(deploy_key_allows(7, false, 7, "git-receive-pack"));
-        assert!(!deploy_key_allows(7, false, 8, "git-upload-pack"));
-        assert!(!deploy_key_allows(7, false, 8, "git-receive-pack"));
+        let key = |read_only| rg_db::entities::deploy_key::Model {
+            id: 1,
+            repo_id: 7,
+            created_by_id: None,
+            title: "deploy".to_string(),
+            public_key: String::new(),
+            fingerprint: String::new(),
+            read_only,
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+        };
+        assert!(deploy_key_allows(&key(true), 7, "git-upload-pack"));
+        assert!(!deploy_key_allows(&key(true), 7, "git-receive-pack"));
+        assert!(deploy_key_allows(&key(false), 7, "git-receive-pack"));
+        assert!(!deploy_key_allows(&key(false), 8, "git-upload-pack"));
+        assert!(!deploy_key_allows(&key(false), 8, "git-receive-pack"));
+        assert!(!deploy_key_allows(&key(false), 7, "git-lfs-authenticate"));
     }
 
     #[tokio::test]
@@ -2119,6 +2431,7 @@ mod tests {
                 shutdown: Some(shutdown_rx),
                 shutdown_grace_secs: 1,
                 post_push: None,
+                lfs: None,
             }),
         )
         .await

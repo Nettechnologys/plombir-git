@@ -89,6 +89,7 @@ async fn harness(username: &str) -> Harness {
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
         post_push: None,
+        lfs: None,
         shutdown: None,
         shutdown_grace_secs: 5,
     };

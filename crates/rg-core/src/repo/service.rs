@@ -537,6 +537,20 @@ pub async fn can_read(
     can_read_repo(db, &repo, actor_id).await
 }
 
+/// May a deploy key with this row open `repo_id` for reading, or for writing?
+///
+/// A deploy key belongs to exactly one repository and writes only when it was
+/// not added read-only. Both SSH doors ask it — `git-upload-pack` /
+/// `git-receive-pack` and `git-lfs-authenticate` — and the LFS HTTP side asks it
+/// again when the URL a deploy key was issued is redeemed, so it is written once.
+pub fn deploy_key_permits(
+    key: &rg_db::entities::deploy_key::Model,
+    repo_id: i64,
+    write: bool,
+) -> bool {
+    key.repo_id == repo_id && (!write || !key.read_only)
+}
+
 /// Check whether `actor_id` can write to the given repo.
 /// Use this when you already have the repo model to avoid duplicate queries.
 /// Owner always has write. Collaborators with "write" or "admin" can write.

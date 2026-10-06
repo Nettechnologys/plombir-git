@@ -100,20 +100,38 @@ async fn handler_inputs_reach_the_published_openapi_document() {
             &["label", "labels", "page", "per_page", "state"][..],
         ),
         ("get", "/repos/{owner}/{name}/milestones", &["state"][..]),
-        // `session` and `pat` are the two spellings of the credential half of a
-        // signed URL — a session generation or an `access_tokens.id` — and
-        // exactly one of them is ever present on a minted URL (card_e4e177acd095).
-        // Both are published, because a client redeeming a URL sends whichever
-        // one it was handed.
+        // `session`, `pat` and `ssh_key` are the spellings of the credential half
+        // of a signed URL — a session generation, an `access_tokens.id`, or the
+        // SSH key behind `git-lfs-authenticate` — and exactly one of them is ever
+        // present on a minted URL (card_e4e177acd095, card_d8d274ed134d).
+        // `deploy_key` replaces `actor` + credential for a deploy key. All are
+        // published, because a client redeeming a URL sends whichever it was
+        // handed.
         (
             "put",
             "/repos/{owner}/{name}/lfs/objects/{oid}",
-            &["actor", "expires", "pat", "session", "signature"][..],
+            &[
+                "actor",
+                "deploy_key",
+                "expires",
+                "pat",
+                "session",
+                "signature",
+                "ssh_key",
+            ][..],
         ),
         (
             "get",
             "/repos/{owner}/{name}/lfs/objects/{oid}",
-            &["actor", "expires", "pat", "session", "signature"][..],
+            &[
+                "actor",
+                "deploy_key",
+                "expires",
+                "pat",
+                "session",
+                "signature",
+                "ssh_key",
+            ][..],
         ),
         (
             "post",

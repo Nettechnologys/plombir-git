@@ -150,6 +150,42 @@ pub(crate) async fn check_write_for(
     }
 }
 
+/// The deploy-key half of [`check_read_for`] / [`check_write_for`].
+///
+/// A deploy key is not an account, so the account gates cannot answer for it:
+/// the key opens the one repository it was added to, and writes only when it was
+/// not added read-only. It reaches this crate solely through Git LFS — a URL
+/// issued against `git-lfs-authenticate` on the SSH port — and the row is
+/// re-read here so that deleting the key, or narrowing it to read-only, takes
+/// effect on the next request rather than when the URL runs out.
+pub(crate) async fn check_deploy_key_for(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    key_id: i64,
+    write: bool,
+) -> Result<(), AppError> {
+    match rg_db::ops::deploy_key_ops::find_by_id(&state.db, key_id).await {
+        Ok(Some(key)) if rg_core::repo::service::deploy_key_permits(&key, repo.id, write) => Ok(()),
+        Ok(Some(_)) => Err(AppError::forbidden(if write {
+            "write access denied"
+        } else {
+            "access denied"
+        })),
+        Ok(None) => Err(AppError::unauthorized("the deploy key has been removed")),
+        Err(error) => {
+            tracing::error!(
+                key_id,
+                repo_id = repo.id,
+                error = %format!("{error:#}"),
+                "could not read the deploy key behind an LFS request"
+            );
+            Err(AppError::service_unavailable(
+                "could not verify the deploy key",
+            ))
+        }
+    }
+}
+
 /// [`check_read_for`] for administrative access.
 pub(crate) async fn check_admin_for(
     state: &AppState,

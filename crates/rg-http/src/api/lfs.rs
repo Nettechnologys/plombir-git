@@ -43,6 +43,13 @@ pub struct LfsActionQuery {
     /// checked against the PAT still existing, which is what revoking a PAT
     /// actually does (card_e4e177acd095).
     pat: Option<i64>,
+    /// `ssh_keys.id`, when the URL was issued through `git-lfs-authenticate` to
+    /// an account that signed in on the SSH port with that key. Mutually
+    /// exclusive with `session` / `pat`; deleting the key revokes the URL.
+    ssh_key: Option<i64>,
+    /// `deploy_keys.id`, when the URL was issued through `git-lfs-authenticate`
+    /// to a deploy key. Carried without `actor`: a deploy key is not an account.
+    deploy_key: Option<i64>,
 }
 
 /// One actionable error for a filesystem failure on an LFS object path.
@@ -87,17 +94,34 @@ fn lfs_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) ->
 /// fresh row from that ordering before this capability may publish success.
 async fn signer_still_stands(
     state: &AppState,
-    actor: rg_core::lfs::service::LfsActor,
+    user_id: i64,
+    credential: rg_core::lfs::service::LfsCredential,
 ) -> Result<(), AppError> {
     use rg_core::lfs::service::LfsCredential;
 
     // The credential's own question, and only that one. Asking a PAT-issued URL
     // about the owner's session generation revokes it on an event the token is
     // explicitly meant to survive, and leaves it standing through the one event
-    // that means the token *was* revoked.
-    let user_id = actor.user_id;
-    let token_stands = match actor.credential {
+    // that means the token *was* revoked. An SSH key is the same kind of
+    // standing credential as a PAT: deleting it is what revokes it.
+    let token_stands = match credential {
         LfsCredential::Session { .. } => true,
+        LfsCredential::SshKey { id } => {
+            match rg_db::ops::ssh_key_ops::find_by_id(&state.db, id).await {
+                Ok(key) => key.is_some_and(|key| key.user_id == user_id),
+                Err(error) => {
+                    tracing::error!(
+                        user_id,
+                        ssh_key_id = id,
+                        error = %format!("{error:#}"),
+                        "could not verify SSH key standing for an LFS credential"
+                    );
+                    return Err(AppError::service_unavailable(
+                        "could not verify account standing",
+                    ));
+                }
+            }
+        }
         LfsCredential::Token { id } => {
             match rg_db::ops::token_ops::find_by_id(&state.db, id).await {
                 Ok(Some(token)) => {
@@ -154,9 +178,9 @@ async fn signer_still_stands(
             }
         };
 
-    let credential_stands = match actor.credential {
+    let credential_stands = match credential {
         LfsCredential::Session { version } => account_stands.session_version == version,
-        LfsCredential::Token { .. } => true,
+        LfsCredential::Token { .. } | LfsCredential::SshKey { .. } => true,
     };
 
     if account_stands.is_usable() && credential_stands {
@@ -227,18 +251,7 @@ async fn authorize_signed_action(
                 chrono::Utc::now().timestamp(),
             ) {
                 Ok(()) => {
-                    if let Some(actor) = signed_actor {
-                        signer_still_stands(state, actor).await?;
-                    }
-                    let actor_id = signed_actor.map(|actor| actor.user_id);
-                    match action {
-                        rg_core::lfs::service::LfsActionKind::Download => {
-                            repo_access::check_read_for(state, repo_model, actor_id).await?
-                        }
-                        rg_core::lfs::service::LfsActionKind::Upload => {
-                            repo_access::check_write_for(state, repo_model, actor_id).await?
-                        }
-                    }
+                    actor_still_may(state, repo_model, action, signed_actor).await?;
                     Ok(true)
                 }
                 Err(rg_core::lfs::service::LfsActionSignatureError::Expired) => {
@@ -251,6 +264,102 @@ async fn authorize_signed_action(
         }
         _ => Err(AppError::forbidden("incomplete LFS action URL signature")),
     }
+}
+
+/// May the actor an LFS capability was issued to still do what it asks, on this
+/// repository, right now?
+///
+/// One answer for every capability this file honours — a signed action URL and
+/// the credential `git-lfs-authenticate` hands out on the SSH port — so the two
+/// cannot drift: the account and the credential behind it must still stand
+/// ([`signer_still_stands`]), and the repository gate must still admit the
+/// account. A deploy key has no account; its row is re-read instead
+/// ([`repo_access::check_deploy_key_for`]).
+async fn actor_still_may(
+    state: &AppState,
+    repo_model: &rg_db::entities::repository::Model,
+    action: rg_core::lfs::service::LfsActionKind,
+    actor: Option<rg_core::lfs::service::LfsActor>,
+) -> Result<(), AppError> {
+    use rg_core::lfs::service::{LfsActionKind, LfsActor};
+
+    let actor_id = match actor {
+        Some(LfsActor::DeployKey { key_id }) => {
+            return repo_access::check_deploy_key_for(
+                state,
+                repo_model,
+                key_id,
+                action == LfsActionKind::Upload,
+            )
+            .await;
+        }
+        Some(LfsActor::User {
+            user_id,
+            credential,
+        }) => {
+            signer_still_stands(state, user_id, credential).await?;
+            Some(user_id)
+        }
+        None => None,
+    };
+    match action {
+        LfsActionKind::Download => repo_access::check_read_for(state, repo_model, actor_id).await,
+        LfsActionKind::Upload => repo_access::check_write_for(state, repo_model, actor_id).await,
+    }
+}
+
+/// The credential `git-lfs-authenticate` minted on the SSH port, when this
+/// request presents one.
+///
+/// `None` when the `Authorization` header is anything else, so every other
+/// caller keeps the path it always had. A grant is honoured only for the
+/// repository and the operation it was minted for — and, like a signed URL,
+/// only while the actor behind it still may ([`actor_still_may`]): the SSH
+/// gate's answer is minutes old by now, and a key deleted in between must not
+/// keep working for the rest of the grant.
+async fn ssh_grant_actor(
+    state: &AppState,
+    headers: &HeaderMap,
+    repo_model: &rg_db::entities::repository::Model,
+    operation: &str,
+) -> Option<Result<rg_core::lfs::service::LfsActor, AppError>> {
+    use rg_core::lfs::service::{
+        verify_ssh_grant, LfsActionKind, LfsActionSignatureError, SSH_GRANT_AUTH_SCHEME,
+    };
+
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix(SSH_GRANT_AUTH_SCHEME)?
+        .strip_prefix(' ')?;
+    let grant = match verify_ssh_grant(
+        state.jwt_secret.as_bytes(),
+        token,
+        chrono::Utc::now().timestamp(),
+    ) {
+        Ok(grant) => grant,
+        Err(LfsActionSignatureError::Expired) => {
+            return Some(Err(AppError::unauthorized(
+                "the SSH LFS credential has expired; git-lfs fetches a new one over SSH",
+            )))
+        }
+        Err(LfsActionSignatureError::Invalid) => {
+            return Some(Err(AppError::unauthorized("invalid SSH LFS credential")))
+        }
+    };
+    if grant.repo_id != repo_model.id
+        || LfsActionKind::from_operation(operation) != Some(grant.action)
+    {
+        return Some(Err(AppError::forbidden(
+            "the SSH LFS credential was issued for another repository or operation",
+        )));
+    }
+    Some(
+        actor_still_may(state, repo_model, grant.action, Some(grant.actor))
+            .await
+            .map(|()| grant.actor),
+    )
 }
 
 /// The user behind this request's credentials, if any.
@@ -274,7 +383,7 @@ fn actor_id(headers: &HeaderMap, state: &AppState) -> Option<i64> {
 /// through `session_standing_middleware` on this very request.
 fn issuing_actor(headers: &HeaderMap, state: &AppState) -> Option<rg_core::lfs::service::LfsActor> {
     crate::api::auth::extract_user_credential(headers, &state.jwt_secret).map(
-        |(user_id, credential)| rg_core::lfs::service::LfsActor {
+        |(user_id, credential)| rg_core::lfs::service::LfsActor::User {
             user_id,
             credential,
         },
@@ -293,17 +402,27 @@ fn signed_actor(
 ) -> Result<Option<rg_core::lfs::service::LfsActor>, AppError> {
     use rg_core::lfs::service::{LfsActor, LfsCredential};
 
-    match (query.actor, query.session, query.pat) {
-        (None, None, None) => Ok(None),
-        (Some(user_id), Some(version), None) => Ok(Some(LfsActor {
+    let user = |user_id, credential| {
+        Ok(Some(LfsActor::User {
             user_id,
-            credential: LfsCredential::Session { version },
-        })),
-        (Some(user_id), None, Some(id)) => Ok(Some(LfsActor {
-            user_id,
-            credential: LfsCredential::Token { id },
-        })),
-        // Both credentials at once is not a shape this server mints either, and
+            credential,
+        }))
+    };
+    match (
+        query.actor,
+        query.session,
+        query.pat,
+        query.ssh_key,
+        query.deploy_key,
+    ) {
+        (None, None, None, None, None) => Ok(None),
+        (Some(user_id), Some(version), None, None, None) => {
+            user(user_id, LfsCredential::Session { version })
+        }
+        (Some(user_id), None, Some(id), None, None) => user(user_id, LfsCredential::Token { id }),
+        (Some(user_id), None, None, Some(id), None) => user(user_id, LfsCredential::SshKey { id }),
+        (None, None, None, None, Some(key_id)) => Ok(Some(LfsActor::DeployKey { key_id })),
+        // Two credentials at once is not a shape this server mints either, and
         // it is the one a caller would try in order to pick which question gets
         // asked about their URL.
         _ => Err(AppError::forbidden("incomplete LFS action URL signature")),
@@ -361,16 +480,27 @@ pub async fn batch(
     // a private repository used to be turned away by the *credential* helper
     // rather than by the gate, which happened to produce the same 401 without
     // anything guaranteeing it would.
-    let actor = issuing_actor(&headers, &state);
-    let actor_id = actor.map(|actor| actor.user_id);
-    let decision = if req.operation == "upload" {
-        repo_access::check_write_for(&state, &repo_model, actor_id).await
-    } else {
-        repo_access::check_read_for(&state, &repo_model, actor_id).await
+    //
+    // A clone made from the SSH address arrives with the credential
+    // `git-lfs-authenticate` minted instead of a session or a token; it is
+    // asked the same questions, and the URLs below are issued to it.
+    let actor = match ssh_grant_actor(&state, &headers, &repo_model, &req.operation).await {
+        Some(Ok(actor)) => Some(actor),
+        Some(Err(error)) => return error.into_response(),
+        None => {
+            let actor = issuing_actor(&headers, &state);
+            let actor_id = actor.and_then(rg_core::lfs::service::LfsActor::user_id);
+            let decision = if req.operation == "upload" {
+                repo_access::check_write_for(&state, &repo_model, actor_id).await
+            } else {
+                repo_access::check_read_for(&state, &repo_model, actor_id).await
+            };
+            if let Err(error) = decision {
+                return error.into_response();
+            }
+            actor
+        }
     };
-    if let Err(error) = decision {
-        return error.into_response();
-    }
 
     let repo_id = repo_model.id;
     let lfs_root = rg_core::lfs::service::lfs_root(&state.repo_root, &owner, &repo);

@@ -101,6 +101,7 @@ mod ldap_outage_status_tests;
 mod lfs_download_failure_status_tests;
 mod lfs_endpoint_discovery_tests;
 mod lfs_signed_url_tests;
+mod lfs_ssh_grant_tests;
 mod login_completion_race_tests;
 mod login_enumeration_tests;
 mod login_failure_semantics_tests;

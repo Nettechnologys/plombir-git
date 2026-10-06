@@ -65,6 +65,10 @@ use crate::common::source_scan::{
 /// name list, so the first handler to call it would have been the guard's blind
 /// spot rather than its failure.
 ///
+/// `check_deploy_key_for` is the same family for the one caller that is not an
+/// account: it takes the deploy key as an argument, and only the LFS transport
+/// — which resolved that key from a signed capability — may hand it one.
+///
 /// `require_namespace_write` / `require_namespace_create` guard the routes whose
 /// target is named by the request *body* (`POST /imports`, `POST /repos`, the
 /// destination of a transfer). Their extractors — `NamespaceWrite` /
@@ -99,6 +103,7 @@ const GATES: &[&str] = &[
     "check_read_for",
     "check_write_for",
     "check_admin_for",
+    "check_deploy_key_for",
 ];
 
 /// Files that legitimately hold their own gate, with the reason.
@@ -162,12 +167,17 @@ const TRANSPORTS: &[&str] = &["oci.rs", "api/lfs.rs", "ws.rs"];
 /// uid)` with its own `Ok(false) => forbidden(…)` arm and stay green on every
 /// guard in this file at once — no `require_*` to find, no `check_read` to find,
 /// and no `can_*_repo` either. The rule is the rule whichever argument it takes.
+///
+/// `deploy_key_permits` is the rule for a deploy key, which no `can_*` answers
+/// for: asked by the SSH gate and by `repo_access::check_deploy_key_for`, and by
+/// nothing that would write its own `Ok(false) => forbidden(…)` arm around it.
 const PREDICATES: &[&str] = &[
     "can_read_repo",
     "can_write_repo",
     "can_admin_repo",
     "can_read",
     "can_write",
+    "deploy_key_permits",
 ];
 
 /// The files that may ask a predicate directly, with the reason.

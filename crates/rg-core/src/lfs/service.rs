@@ -82,6 +82,15 @@ pub enum LfsActionKind {
 }
 
 impl LfsActionKind {
+    /// The batch API's `operation` / `git-lfs-authenticate`'s last argument.
+    pub fn from_operation(operation: &str) -> Option<Self> {
+        match operation {
+            "download" => Some(Self::Download),
+            "upload" => Some(Self::Upload),
+            _ => None,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Download => "download",
@@ -138,23 +147,52 @@ pub enum LfsCredential {
         /// `access_tokens.id` of the token the request presented.
         id: i64,
     },
+    /// The SSH key an account authenticated with on the SSH port, revoked by
+    /// deleting the key. Like a PAT it is a standing credential and survives a
+    /// password change; it is what `git-lfs-authenticate` speaks for when the
+    /// clone came from the SSH address.
+    SshKey {
+        /// `ssh_keys.id` of the key the SSH session authenticated with.
+        id: i64,
+    },
 }
 
-/// The account a signed URL is issued to, and the credential it was issued
-/// against.
+/// Who a signed URL is issued to, and the credential it was issued against.
 ///
-/// The two travel as one value because an id on its own can only ask half of the
-/// revocation question at redemption time. Re-reading the account catches a
-/// deactivation, but a password reset and a `POST /users/logout` leave
-/// `is_usable()` true — so a capability carrying only the id had nothing to
-/// compare against, and an upload URL minted by a stolen session stayed write
-/// access to a private repository for the rest of its six hours
-/// (card_c742da1794e4). Same shape, same fix as the WebSocket half of this
+/// An account travels together with its credential because an id on its own can
+/// only ask half of the revocation question at redemption time. Re-reading the
+/// account catches a deactivation, but a password reset and a
+/// `POST /users/logout` leave `is_usable()` true — so a capability carrying only
+/// the id had nothing to compare against, and an upload URL minted by a stolen
+/// session stayed write access to a private repository for the rest of its six
+/// hours (card_c742da1794e4). Same shape, same fix as the WebSocket half of this
 /// class (`rg_http::api::auth::WsSessionUser`).
+///
+/// A deploy key is the one caller that is not an account: it opens exactly one
+/// repository, read-only or not, and that is what has to still hold when its URL
+/// is redeemed. It reaches LFS only through `git-lfs-authenticate` on the SSH
+/// port, the one door a deploy key has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LfsActor {
-    pub user_id: i64,
-    pub credential: LfsCredential,
+pub enum LfsActor {
+    User {
+        user_id: i64,
+        credential: LfsCredential,
+    },
+    DeployKey {
+        /// `deploy_keys.id`.
+        key_id: i64,
+    },
+}
+
+impl LfsActor {
+    /// The account behind this actor; `None` for a deploy key, which speaks for
+    /// a repository rather than for a person.
+    pub fn user_id(self) -> Option<i64> {
+        match self {
+            Self::User { user_id, .. } => Some(user_id),
+            Self::DeployKey { .. } => None,
+        }
+    }
 }
 
 /// How the actor a signed URL was issued to is rendered into the signed
@@ -162,21 +200,62 @@ pub struct LfsActor {
 ///
 /// An anonymous issue is a distinct value rather than an empty one, so
 /// dropping `actor=` from an authenticated URL changes the payload instead of
-/// reproducing it. The `s`/`t` tag is inside the signature for the same reason:
-/// the two credentials are checked differently at redemption, so which one this
-/// is must not be something a caller can swap.
+/// reproducing it. The `s`/`t`/`k` tag is inside the signature for the same
+/// reason: the credentials are checked differently at redemption, so which one
+/// this is must not be something a caller can swap. A deploy key renders with a
+/// non-numeric prefix, so it can never read as an account id.
 fn actor_token(actor: Option<LfsActor>) -> String {
     match actor {
-        Some(LfsActor {
+        Some(LfsActor::User {
             user_id,
             credential: LfsCredential::Session { version },
         }) => format!("{user_id}@s{version}"),
-        Some(LfsActor {
+        Some(LfsActor::User {
             user_id,
             credential: LfsCredential::Token { id },
         }) => format!("{user_id}@t{id}"),
+        Some(LfsActor::User {
+            user_id,
+            credential: LfsCredential::SshKey { id },
+        }) => format!("{user_id}@k{id}"),
+        Some(LfsActor::DeployKey { key_id }) => format!("deploy@{key_id}"),
         None => "anon".to_string(),
     }
+}
+
+/// The inverse of [`actor_token`] for an authenticated actor. `anon` and
+/// anything this server never renders are `None`.
+fn parse_actor_token(token: &str) -> Option<LfsActor> {
+    if let Some(key_id) = token.strip_prefix("deploy@") {
+        return Some(LfsActor::DeployKey {
+            key_id: parse_canonical_id(key_id)?,
+        });
+    }
+    let (user_id, credential) = token.split_once('@')?;
+    let user_id = parse_canonical_id(user_id)?;
+    let credential = match credential.split_at_checked(1)? {
+        ("s", version) => LfsCredential::Session {
+            version: parse_canonical_id(version)?,
+        },
+        ("t", id) => LfsCredential::Token {
+            id: parse_canonical_id(id)?,
+        },
+        ("k", id) => LfsCredential::SshKey {
+            id: parse_canonical_id(id)?,
+        },
+        _ => return None,
+    };
+    Some(LfsActor::User {
+        user_id,
+        credential,
+    })
+}
+
+/// A decimal id exactly as `format!("{}")` renders an `i64` — no sign, no
+/// padding — so a parsed token re-renders to the bytes that were signed.
+fn parse_canonical_id(text: &str) -> Option<i64> {
+    let value = text.parse::<i64>().ok()?;
+    (value.to_string() == text).then_some(value)
 }
 
 /// The signed payload.
@@ -209,21 +288,27 @@ fn action_signature_payload(
 /// Both halves are echoed, because both are covered by the HMAC and the
 /// redeeming side needs them to recompute it — and needs the credential on its
 /// own to answer "is the thing that asked for this still allowed to act?". The
-/// second parameter is named for the credential (`session=` or `pat=`), so a
-/// URL says which question it expects to be asked.
+/// second parameter is named for the credential (`session=`, `pat=` or
+/// `ssh_key=`), so a URL says which question it expects to be asked. A deploy
+/// key has no account, so it is echoed alone as `deploy_key=`.
 ///
 /// Anonymous issues carry nothing: there is no account behind them to re-check,
 /// and `anon` is already what the signature covers.
 pub fn action_url_actor_param(actor: Option<LfsActor>) -> String {
     match actor {
-        Some(LfsActor {
+        Some(LfsActor::User {
             user_id,
             credential: LfsCredential::Session { version },
         }) => format!("&actor={user_id}&session={version}"),
-        Some(LfsActor {
+        Some(LfsActor::User {
             user_id,
             credential: LfsCredential::Token { id },
         }) => format!("&actor={user_id}&pat={id}"),
+        Some(LfsActor::User {
+            user_id,
+            credential: LfsCredential::SshKey { id },
+        }) => format!("&actor={user_id}&ssh_key={id}"),
+        Some(LfsActor::DeployKey { key_id }) => format!("&deploy_key={key_id}"),
         None => String::new(),
     }
 }
@@ -273,6 +358,106 @@ pub fn verify_action_url(
     mac.update(action_signature_payload(action, repo_id, oid, expires_at, actor).as_bytes());
     mac.verify_slice(&signature)
         .map_err(|_| LfsActionSignatureError::Invalid)
+}
+
+// ── LFS over an SSH remote ────────────────────────────────────────────────
+
+/// The `Authorization` scheme of the credential `git-lfs-authenticate` hands
+/// out.
+///
+/// A scheme of its own rather than `Bearer`, so every other reader of the
+/// header — the PAT bridge, the session-standing gate, the JWT extractors —
+/// passes it by without trying it as one of theirs, and the only code that
+/// honours it is the LFS batch handler it is minted for.
+pub const SSH_GRANT_AUTH_SCHEME: &str = "SSH-LFS";
+
+/// How long the credential from `git-lfs-authenticate` lasts. git-lfs caches it
+/// by the `expires_in` it is told and runs the command again when it runs out,
+/// so this bounds a leaked header, not a long transfer.
+pub const SSH_GRANT_TTL_SECONDS: i64 = 10 * 60;
+
+/// What the SSH port vouched for: one LFS operation, on one repository, for one
+/// SSH-authenticated actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshLfsGrant {
+    pub action: LfsActionKind,
+    pub repo_id: i64,
+    pub actor: LfsActor,
+}
+
+fn ssh_grant_payload(action: &str, repo_id: &str, expires_at: &str, actor: &str) -> String {
+    format!("plombir-git-lfs-ssh-grant-v1:{action}:{repo_id}:{expires_at}:{actor}")
+}
+
+/// Mint the credential `git-lfs-authenticate` returns in its `header`.
+///
+/// The SSH port has already asked its own gate — the one `git-upload-pack` /
+/// `git-receive-pack` ask — before it calls this. The grant carries the answer
+/// to the HTTP side, bound to the operation, the repository and the actor, and
+/// signed under a payload prefix no action URL uses, so neither can be replayed
+/// as the other.
+pub fn sign_ssh_grant(
+    secret: &[u8],
+    action: LfsActionKind,
+    repo_id: i64,
+    expires_at: i64,
+    actor: LfsActor,
+) -> Result<String> {
+    let (action, repo_id, expires_at, actor) = (
+        action.as_str(),
+        repo_id.to_string(),
+        expires_at.to_string(),
+        actor_token(Some(actor)),
+    );
+    let mut mac = HmacSha256::new_from_slice(secret)?;
+    mac.update(ssh_grant_payload(action, &repo_id, &expires_at, &actor).as_bytes());
+    let signature = hex::encode(mac.finalize().into_bytes());
+    Ok(format!(
+        "{action}.{repo_id}.{expires_at}.{actor}.{signature}"
+    ))
+}
+
+/// Check a credential minted by [`sign_ssh_grant`] at a caller-provided time.
+///
+/// Like [`verify_action_url`] this proves only that the server issued the grant
+/// and that it has not run out. Whether the actor still stands and still has
+/// access is the redeeming side's question, asked again on every batch.
+pub fn verify_ssh_grant(
+    secret: &[u8],
+    token: &str,
+    now: i64,
+) -> std::result::Result<SshLfsGrant, LfsActionSignatureError> {
+    let invalid = LfsActionSignatureError::Invalid;
+    let mut parts = token.split('.');
+    let (Some(action), Some(repo_id), Some(expires_at), Some(actor), Some(signature), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(invalid);
+    };
+    let signature = hex::decode(signature).map_err(|_| invalid)?;
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| invalid)?;
+    mac.update(ssh_grant_payload(action, repo_id, expires_at, actor).as_bytes());
+    mac.verify_slice(&signature).map_err(|_| invalid)?;
+
+    // Signed, so every field below is one this server wrote; a field that does
+    // not parse is still refused rather than trusted.
+    let action = LfsActionKind::from_operation(action).ok_or(invalid)?;
+    let repo_id = parse_canonical_id(repo_id).ok_or(invalid)?;
+    let expires_at = parse_canonical_id(expires_at).ok_or(invalid)?;
+    let actor = parse_actor_token(actor).ok_or(invalid)?;
+    if expires_at <= now {
+        return Err(LfsActionSignatureError::Expired);
+    }
+    Ok(SshLfsGrant {
+        action,
+        repo_id,
+        actor,
+    })
 }
 
 /// Git LFS SHA-256 object identifiers are exactly 64 lowercase hex bytes.
@@ -2251,5 +2436,134 @@ mod oid_validation_tests {
             lfs_request_error("download", &oid, LFS_OBJECT_MAX_BYTES as i64 + 1).is_none(),
             "the upload ceiling must not hide a legacy object from downloads"
         );
+    }
+}
+
+#[cfg(test)]
+mod ssh_grant_tests {
+    use super::{
+        parse_actor_token, sign_ssh_grant, verify_ssh_grant, LfsActionKind,
+        LfsActionSignatureError, LfsActor, LfsCredential, SshLfsGrant,
+    };
+
+    const SECRET: &[u8] = b"grant-secret";
+    const EXPIRES: i64 = 2_000_000_000;
+
+    fn key_user() -> LfsActor {
+        LfsActor::User {
+            user_id: 42,
+            credential: LfsCredential::SshKey { id: 9 },
+        }
+    }
+
+    #[test]
+    fn a_grant_round_trips_for_every_actor_the_ssh_port_can_name() {
+        for actor in [
+            key_user(),
+            LfsActor::User {
+                user_id: 42,
+                credential: LfsCredential::Session { version: 3 },
+            },
+            LfsActor::DeployKey { key_id: 5 },
+        ] {
+            for action in [LfsActionKind::Download, LfsActionKind::Upload] {
+                let token = sign_ssh_grant(SECRET, action, 7, EXPIRES, actor).unwrap();
+                assert_eq!(
+                    verify_ssh_grant(SECRET, &token, EXPIRES - 1),
+                    Ok(SshLfsGrant {
+                        action,
+                        repo_id: 7,
+                        actor
+                    }),
+                    "{token}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_grant_is_bound_to_its_operation_repository_actor_and_expiry() {
+        let token =
+            sign_ssh_grant(SECRET, LfsActionKind::Download, 7, EXPIRES, key_user()).unwrap();
+        let fields: Vec<&str> = token.split('.').collect();
+        assert_eq!(fields.len(), 5, "{token}");
+
+        // Every signed field, edited alone, must stop the grant verifying.
+        for (index, replacement) in [
+            (0, "upload"),
+            (1, "8"),
+            (2, "2000000001"),
+            (3, "43@k9"),
+            (3, "42@s9"),
+            (3, "deploy@9"),
+        ] {
+            let mut edited = fields.clone();
+            edited[index] = replacement;
+            assert_eq!(
+                verify_ssh_grant(SECRET, &edited.join("."), EXPIRES - 1),
+                Err(LfsActionSignatureError::Invalid),
+                "editing field {index} to {replacement} must invalidate the grant"
+            );
+        }
+
+        assert_eq!(
+            verify_ssh_grant(b"another-secret", &token, EXPIRES - 1),
+            Err(LfsActionSignatureError::Invalid)
+        );
+        assert_eq!(
+            verify_ssh_grant(SECRET, &token, EXPIRES),
+            Err(LfsActionSignatureError::Expired)
+        );
+        for malformed in ["", "a.b.c.d", &format!("{token}.extra"), "download.7"] {
+            assert_eq!(
+                verify_ssh_grant(SECRET, malformed, EXPIRES - 1),
+                Err(LfsActionSignatureError::Invalid),
+                "{malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_action_url_signature_is_not_a_grant() {
+        // Same secret, same fields — but the action-URL payload carries a
+        // different prefix, so one capability cannot be replayed as the other.
+        let oid = "a".repeat(64);
+        let url_signature = super::sign_action_url(
+            SECRET,
+            LfsActionKind::Download,
+            7,
+            &oid,
+            EXPIRES,
+            Some(key_user()),
+        )
+        .unwrap();
+        let forged = format!("download.7.{EXPIRES}.42@k9.{url_signature}");
+        assert_eq!(
+            verify_ssh_grant(SECRET, &forged, EXPIRES - 1),
+            Err(LfsActionSignatureError::Invalid)
+        );
+    }
+
+    #[test]
+    fn only_canonical_actor_tokens_parse() {
+        assert_eq!(parse_actor_token("42@k9"), Some(key_user()));
+        assert_eq!(
+            parse_actor_token("deploy@5"),
+            Some(LfsActor::DeployKey { key_id: 5 })
+        );
+        for rejected in [
+            "anon",
+            "42",
+            "42@",
+            "42@x9",
+            "042@k9",
+            "+42@k9",
+            "42@k09",
+            "deploy@",
+            "deploy@-1x",
+            "@k9",
+        ] {
+            assert_eq!(parse_actor_token(rejected), None, "{rejected}");
+        }
     }
 }

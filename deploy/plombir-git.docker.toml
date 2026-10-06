@@ -22,8 +22,9 @@ ssh_addr = "0.0.0.0:2222"
 # separate bind-mount: mounting a file that does not exist yet gets you a
 # directory here, which is not a key.
 host_key = "/data/ssh_host_key"
-# Public URL of this instance, used in emails and webhook payloads. Set it to
-# whatever your reverse proxy serves.
+# Public URL of this instance, used in emails and webhook payloads, and as the
+# Git LFS endpoint for clones made from the SSH URL. Set it to whatever your
+# reverse proxy serves.
 # external_url = "https://git.example.com"
 
 [database]

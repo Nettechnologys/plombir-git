@@ -1018,7 +1018,7 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
     };
 
     let actor = |user_id, session_version| {
-        Some(LfsActor {
+        Some(LfsActor::User {
             user_id,
             credential: LfsCredential::Session {
                 version: session_version,

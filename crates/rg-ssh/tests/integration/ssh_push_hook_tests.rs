@@ -229,6 +229,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
             notifier: Some(notifier),
             delivery_tracker: delivery_tracker.clone(),
         })),
+        lfs: None,
     };
     let server = common::spawn_ssh_server(server_config).await;
     let listen_addr = server.addr().to_string();
