@@ -502,11 +502,7 @@ pub async fn verify_mfa(
     .map_err(AppError::from)?;
 
     // M-4: Set HttpOnly cookie for browser-based auth
-    let is_https = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "https")
-        .unwrap_or(false);
+    let is_https = crate::public_url::request_is_https(&state, &headers);
     let cookie_value = format!(
         "{}={}; HttpOnly; Path=/; SameSite=Strict; Max-Age=604800{}",
         AUTH_COOKIE_NAME,

@@ -8,7 +8,7 @@
 //! The nonce is generated here and stored in request extensions for the SPA
 //! handler to inject into `<script>` tags.
 
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -43,14 +43,18 @@ pub(crate) fn inject_csp_nonce(html: &str, nonce: &str) -> String {
 /// - `Permissions-Policy` — disable unused browser features
 /// - `Cross-Origin-Opener-Policy: same-origin`
 /// - `Cross-Origin-Resource-Policy: same-origin`
-pub async fn security_headers_middleware(request: Request, next: Next) -> Response {
+///
+/// `tls_enabled` is the listener's own `[tls]` flag. Over HTTP/1.1 the request
+/// URI is origin-form and carries no scheme, so without it an instance serving
+/// TLS itself — no proxy, no `X-Forwarded-Proto` — never sent HSTS
+/// (card_c94e2be7c148).
+pub async fn security_headers_middleware(
+    State(tls_enabled): State<bool>,
+    request: Request,
+    next: Next,
+) -> Response {
     let is_https = is_https_uri(request.uri())
-        || request
-            .headers()
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v == "https")
-            .unwrap_or(false);
+        || crate::public_url::transport_is_https(tls_enabled, request.headers());
 
     // H-2: Generate a per-request nonce for CSP.
     // 128 bits of entropy (16 bytes → 32 hex chars) — sufficient for CSP nonce.
@@ -214,7 +218,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use axum::middleware::from_fn;
+    use axum::middleware::from_fn_with_state;
     use axum::routing::get;
     use axum::Router;
     use tower::ServiceExt;
@@ -240,7 +244,7 @@ mod tests {
     async fn test_security_headers_added() {
         let app = Router::new()
             .route("/", get(dummy_handler))
-            .layer(from_fn(security_headers_middleware));
+            .layer(from_fn_with_state(false, security_headers_middleware));
 
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -264,7 +268,7 @@ mod tests {
     async fn test_hsts_only_on_https() {
         let app = Router::new()
             .route("/", get(dummy_handler))
-            .layer(from_fn(security_headers_middleware));
+            .layer(from_fn_with_state(false, security_headers_middleware));
 
         // HTTP request — no HSTS
         let response = app
@@ -285,6 +289,25 @@ mod tests {
                     .body(Body::empty())
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert!(response
+            .headers()
+            .get("strict-transport-security")
+            .is_some());
+    }
+
+    /// A listener serving `[tls]` itself sees HTTP/1.1 requests in origin-form —
+    /// no scheme in the URI, no proxy to add `X-Forwarded-Proto` — and must
+    /// still send HSTS (card_c94e2be7c148).
+    #[tokio::test]
+    async fn a_tls_listener_sends_hsts_for_an_origin_form_request() {
+        let app = Router::new()
+            .route("/", get(dummy_handler))
+            .layer(from_fn_with_state(true, security_headers_middleware));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert!(response

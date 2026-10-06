@@ -41,15 +41,6 @@ fn build_clear_cookie(is_https: bool) -> String {
     cookie
 }
 
-/// Check if the request was made over HTTPS (for Secure cookie flag).
-fn is_https_request(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "https")
-        .unwrap_or(false)
-}
-
 /// Helper to record audit log (fire-and-forget, does not fail the main operation).
 /// POST /api/v1/users/register
 #[derive(Deserialize, ToSchema)]
@@ -343,7 +334,7 @@ pub async fn login(
                     Ok(challenge) => challenge,
                     Err(error) => return AppError::from(error).into_response(),
                 };
-                let is_https = is_https_request(&headers);
+                let is_https = crate::public_url::request_is_https(&state, &headers);
                 let challenge_cookie =
                     crate::api::mfa::build_mfa_challenge_cookie(&challenge, is_https);
                 let mfa_resp = serde_json::json!({
@@ -367,7 +358,7 @@ pub async fn login(
                 response
             } else {
                 // M-4: Set HttpOnly cookie with JWT for browser-based auth
-                let is_https = is_https_request(&headers);
+                let is_https = crate::public_url::request_is_https(&state, &headers);
                 let cookie = build_auth_cookie(&resp.token, is_https);
                 (
                     StatusCode::OK,
@@ -532,7 +523,7 @@ pub async fn logout(
     if let Err(error) = rg_db::ops::user_ops::invalidate_sessions(&state.db, user_id).await {
         return AppError::from(error).into_response();
     }
-    let is_https = is_https_request(&headers);
+    let is_https = crate::public_url::request_is_https(&state, &headers);
     let cookie = build_clear_cookie(is_https);
     (
         StatusCode::OK,
@@ -1041,7 +1032,7 @@ pub async fn reset_password(
             tracing::info!(user_id = resp.user_id, "password reset successful");
             journal_password_reset(&state, &headers, resp.user_id, &resp.username, false).await;
             // M-4: Set HttpOnly cookie so the user stays logged in after reset
-            let is_https = is_https_request(&headers);
+            let is_https = crate::public_url::request_is_https(&state, &headers);
             let cookie = build_auth_cookie(&resp.token, is_https);
             (
                 StatusCode::OK,
@@ -1070,7 +1061,7 @@ pub async fn reset_password(
                 Ok(challenge) => challenge,
                 Err(error) => return AppError::from(error).into_response(),
             };
-            let is_https = is_https_request(&headers);
+            let is_https = crate::public_url::request_is_https(&state, &headers);
             let mut response = (
                 StatusCode::OK,
                 [(

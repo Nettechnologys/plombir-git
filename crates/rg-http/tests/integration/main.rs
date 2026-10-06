@@ -230,6 +230,7 @@ mod tail_lookup_failure_status_tests;
 mod team_delete_failure_status_tests;
 mod time_tracking_authz_tests;
 mod time_tracking_tests;
+mod tls_listener_transport_tests;
 mod transfer_namespace_tests;
 mod transfer_recovery_tests;
 mod undecodable_allow_list_tests;

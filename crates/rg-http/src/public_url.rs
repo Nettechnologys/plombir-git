@@ -33,7 +33,13 @@ use crate::AppState;
 /// boundary here: it only decides the scheme of URLs handed back to the same
 /// caller, who controls `Host` just as fully.
 pub(crate) fn request_is_https(state: &AppState, headers: &HeaderMap) -> bool {
-    state.tls_enabled || forwarded_https(headers)
+    transport_is_https(state.tls_enabled, headers)
+}
+
+/// [`request_is_https`] for a layer that is handed only the listener's TLS
+/// flag rather than the whole state — the security-headers middleware.
+pub(crate) fn transport_is_https(tls_enabled: bool, headers: &HeaderMap) -> bool {
+    tls_enabled || forwarded_https(headers)
 }
 
 /// This instance's public base URL for this request, without a trailing slash.

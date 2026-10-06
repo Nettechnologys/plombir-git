@@ -84,14 +84,6 @@ fn build_clear_auth_cookie(is_https: bool) -> String {
     )
 }
 
-fn is_https_request(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "https")
-        .unwrap_or(false)
-}
-
 fn encode_query_component(value: &str) -> String {
     let mut out = String::new();
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -617,11 +609,14 @@ pub async fn callback(
         let mut redirect = Redirect::temporary(&target).into_response();
         append_set_cookie(
             &mut redirect,
-            crate::api::mfa::build_mfa_challenge_cookie(&challenge, is_https_request(&headers)),
+            crate::api::mfa::build_mfa_challenge_cookie(
+                &challenge,
+                crate::public_url::request_is_https(&state, &headers),
+            ),
         );
         append_set_cookie(
             &mut redirect,
-            build_clear_auth_cookie(is_https_request(&headers)),
+            build_clear_auth_cookie(crate::public_url::request_is_https(&state, &headers)),
         );
         clear_state_cookie(&mut redirect, SSO_STATE_COOKIE);
         clear_state_cookie(&mut redirect, SSO_VERIFIER_COOKIE);
@@ -641,7 +636,10 @@ pub async fn callback(
     let mut redirect = Redirect::temporary("/dashboard").into_response();
     append_set_cookie(
         &mut redirect,
-        build_auth_cookie(&token, is_https_request(&headers)),
+        build_auth_cookie(
+            &token,
+            crate::public_url::request_is_https(&state, &headers),
+        ),
     );
     clear_state_cookie(&mut redirect, SSO_STATE_COOKIE);
     clear_state_cookie(&mut redirect, SSO_VERIFIER_COOKIE);

@@ -406,7 +406,8 @@ fn apply_middleware(
     // 503 or 429 produced by the gates above. It also inserts the CSP nonce into
     // request extensions before forwarding, so the deeper SPA fallback still
     // receives exactly the nonce later written into the response header.
-    router.layer(axum::middleware::from_fn(
+    router.layer(axum::middleware::from_fn_with_state(
+        state.tls_enabled,
         security::security_headers_middleware,
     ))
 }

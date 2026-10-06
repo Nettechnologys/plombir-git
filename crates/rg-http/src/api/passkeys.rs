@@ -53,14 +53,6 @@ const CEREMONY_SPEND_RETENTION_SECS: i64 = CEREMONY_TTL_SECS + 180;
 
 // ── Cookie helpers ────────────────────────────────────────────────────────
 
-fn is_https_request(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "https")
-        .unwrap_or(false)
-}
-
 fn build_state_cookie(name: &str, token: &str, is_https: bool) -> String {
     format!(
         "{}={}; HttpOnly; Path=/; SameSite=Strict; Max-Age={}{}",
@@ -532,7 +524,7 @@ pub async fn register_start(
     )
     .map_err(AppError::from)?;
 
-    let is_https = is_https_request(&headers);
+    let is_https = crate::public_url::request_is_https(&state, &headers);
     Ok((
         StatusCode::OK,
         [(
@@ -649,7 +641,7 @@ pub async fn register_finish(
     )
     .await;
 
-    let is_https = is_https_request(&headers);
+    let is_https = crate::public_url::request_is_https(&state, &headers);
     let passkeys: Vec<PasskeyInfo> =
         rg_db::ops::passkey_credential_ops::list_by_user(&state.db, user_id)
             .await?
@@ -873,7 +865,7 @@ pub async fn login_start(
     )
     .map_err(AppError::from)?;
 
-    let is_https = is_https_request(&headers);
+    let is_https = crate::public_url::request_is_https(&state, &headers);
     Ok((
         StatusCode::OK,
         [(
@@ -1071,7 +1063,7 @@ pub async fn login_finish(
     )
     .map_err(AppError::from)?;
 
-    let is_https = is_https_request(&headers);
+    let is_https = crate::public_url::request_is_https(&state, &headers);
     let mut response = (
         StatusCode::OK,
         [(
