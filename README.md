@@ -469,6 +469,15 @@ Deploy keys work too, read-only ones for downloads only. The pure-SSH transfer
 protocol (`git-lfs-transfer`) is not implemented; git-lfs falls back to
 `git-lfs-authenticate` by itself.
 
+An import brings the LFS objects along with the history. After the
+clone the server asks the source's own batch endpoint
+(`<repo>.git/info/lfs/objects/batch`, with the import's token) for every
+object the pointers name, checks each against its oid and stores it. An object
+the source does not give does not fail the import: the finished task says how
+many are missing, and its `stats` list each one by oid and path. A committed
+`.lfsconfig` is not followed, and download addresses the source hands back go
+through the same private-address guard as the import itself.
+
 ---
 
 ## REST API

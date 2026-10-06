@@ -77,8 +77,13 @@ pub async fn mark_failed(db: &DatabaseConnection, id: i64, error: &str) -> Resul
     update(db, model).await
 }
 
-/// Mark import as completed with final stats.
-pub async fn mark_completed(db: &DatabaseConnection, id: i64, stats_json: &str) -> Result<Model> {
+/// Mark import as completed with final stats and the `stage` line it ends on.
+pub async fn mark_completed(
+    db: &DatabaseConnection,
+    id: i64,
+    stats_json: &str,
+    stage: &str,
+) -> Result<Model> {
     let task = find_by_id(db, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("import task not found: {id}"))?;
@@ -86,7 +91,7 @@ pub async fn mark_completed(db: &DatabaseConnection, id: i64, stats_json: &str) 
     let mut model: ActiveModel = task.into();
     model.status = Set("completed".to_string());
     model.progress = Set(100);
-    model.stage = Set(Some("Import completed".to_string()));
+    model.stage = Set(Some(stage.to_string()));
     model.stats = Set(Some(stats_json.to_string()));
     model.updated_at = Set(Utc::now());
 

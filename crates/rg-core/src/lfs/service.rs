@@ -1207,7 +1207,11 @@ async fn discard_stored_blob(
 }
 
 /// Whether a row currently points at the object's blob as a live upload.
-async fn object_claims_upload(db: &DatabaseConnection, repo_id: i64, oid: &str) -> Result<bool> {
+pub(crate) async fn object_claims_upload(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    oid: &str,
+) -> Result<bool> {
     Ok(lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid)
         .await?
         .is_some_and(|obj| obj.uploaded))

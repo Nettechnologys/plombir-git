@@ -603,9 +603,28 @@ if (guards < MIN_CLASSIFIER_GUARDS) {
 // is a fact about the tree, not a law: the day a second crate takes an Axum
 // `Body`, this gate would go on reporting a clean tree while a whole new set of
 // streaming paths sits outside its subject. So the boundary is asserted.
+//
+// A crate can only take an Axum `Body` or `Multipart` if it depends on Axum, so
+// that is what decides whether its reads are in question. Matching the calls
+// alone also caught `reqwest::Response::chunk` — an *outbound* download, such
+// as the LFS objects an import fetches from its source — which no request-body
+// ceiling governs. A crate whose manifest cannot be read is scanned anyway:
+// not knowing its dependencies is not knowing it is safe.
+
+/** Whether `crate` declares an Axum dependency, or cannot say. */
+function mayTakeAxumBodies(crate) {
+  let manifest;
+  try {
+    manifest = readFileSync(path.join(CRATES, crate, 'Cargo.toml'), 'utf8');
+  } catch {
+    return true;
+  }
+  return /^\s*axum\s*(=|\.)/m.test(manifest);
+}
 
 for (const crate of readdirSync(CRATES).sort()) {
   if (crate === 'rg-http') continue;
+  if (!mayTakeAxumBodies(crate)) continue;
   const src = path.join(CRATES, crate, 'src');
   let entries;
   try {
@@ -620,7 +639,7 @@ for (const crate of readdirSync(CRATES).sort()) {
       const match = site.re.exec(code);
       if (match === null) continue;
       failures.push(
-        `${relative(file)}:${lineOf(code, match.index)}: \`${site.kind}\` is called outside ` +
+        `${relative(file)}:${lineOf(code, match.index)}: \`${site.name}\` is called outside ` +
           '`rg-http`, which is the only crate this check reads. Either move the streaming read ' +
           'back behind the HTTP boundary, or widen this check\'s subject — leaving it here means ' +
           'a request-body ceiling with nothing asserting what it answers',

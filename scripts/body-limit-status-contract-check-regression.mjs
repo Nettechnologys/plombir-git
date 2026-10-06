@@ -366,6 +366,46 @@ expect(
   },
 );
 
+// What decides the subject is the dependency on Axum, not the spelling of the
+// call: a crate that declares Axum is read even when its manifest says so as a
+// workspace dependency, and its read is named by kind, not as `undefined`.
+expect(
+  'a streaming read in a crate that depends on axum is caught',
+  ({ fixture }) => {
+    const crate = join(fixture, 'crates', 'rg-core');
+    mkdirSync(join(crate, 'src'), { recursive: true });
+    writeFileSync(join(crate, 'Cargo.toml'), '[dependencies]\naxum.workspace = true\n');
+    writeFileSync(
+      join(crate, 'src', 'upload.rs'),
+      'async fn upload(mut field: axum::extract::multipart::Field<\'_>) {\n'
+        + '    let _ = field.chunk().await;\n'
+        + '}\n',
+    );
+  },
+  {
+    red: true,
+    mentions: ['crates/rg-core/src/upload.rs:2', '`Field::chunk` is called outside `rg-http`'],
+  },
+);
+
+// And the other half: an outbound response read in a crate with no Axum in its
+// manifest is no request body, and must not hold a push.
+expect(
+  'an outbound response read in a crate without axum is not a request body',
+  ({ fixture }) => {
+    const crate = join(fixture, 'crates', 'rg-core');
+    mkdirSync(join(crate, 'src'), { recursive: true });
+    writeFileSync(join(crate, 'Cargo.toml'), '[dependencies]\nreqwest = { workspace = true }\n');
+    writeFileSync(
+      join(crate, 'src', 'fetch.rs'),
+      'async fn fetch(mut response: reqwest::Response) {\n'
+        + '    while let Ok(Some(_)) = response.chunk().await {}\n'
+        + '}\n',
+    );
+  },
+  { red: false },
+);
+
 if (failures.length > 0) {
   console.error('❌ body limit status mutation stand failed:');
   for (const failure of failures) console.error(`  - ${failure}`);

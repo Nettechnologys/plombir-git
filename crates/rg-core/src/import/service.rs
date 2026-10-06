@@ -101,6 +101,27 @@ pub struct ImportStats {
     pub pr_reviews_imported: usize,
     pub releases_imported: usize,
     pub wiki_pages_imported: usize,
+    /// LFS objects downloaded from the source and stored for the target.
+    pub lfs_objects_imported: usize,
+    /// LFS objects the cloned history points at and the source did not give,
+    /// each with a path it is committed under and the reason. The clone holds
+    /// their pointers, so these are the files `git lfs pull` will fail on.
+    pub lfs_objects_failed: Vec<crate::lfs::fetch::LfsFetchFailure>,
+}
+
+impl ImportStats {
+    /// The `stage` a finished import leaves on its task — the line the import
+    /// page shows. The detail lives in `stats`; this line only has to make
+    /// sure nobody reads an import with missing LFS content as a clean one.
+    pub fn completion_stage(&self) -> String {
+        match self.lfs_objects_failed.len() {
+            0 => "Import completed".to_string(),
+            missing => format!(
+                "Import completed, but {missing} LFS object(s) could not be fetched from the \
+                 source; the task's stats name each one"
+            ),
+        }
+    }
 }
 
 /// Live import workers owned by one server instance.
@@ -286,7 +307,7 @@ async fn clone_into_target(
     progress_when_done: i32,
     stats: &mut ImportStats,
 ) -> Result<()> {
-    clone_into_target_with_destination(
+    let outcome = clone_into_target_with_destination(
         db,
         task,
         repo_id,
@@ -296,7 +317,108 @@ async fn clone_into_target(
         progress_when_done,
         stats,
     )
+    .await?;
+
+    // Only a clone that ran brought the source's pointers. A skipped one left
+    // the target's own history in place, and its objects are not the
+    // source's to give.
+    if outcome == CloneOutcome::Cloned {
+        fetch_lfs_objects(
+            db,
+            task,
+            repo_id,
+            clone_url,
+            trusted_origins,
+            repo_root,
+            token,
+            progress_when_done,
+            stats,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Give the freshly cloned repository the LFS objects its history points at.
+///
+/// `git clone --bare` brought the pointer files and none of the content: an
+/// imported repository with LFS used to look complete while every tracked
+/// file in it answered `404` to `git lfs pull`, and nothing said so
+/// (card_bc7c8ddbf9b7). An object the source does not give is recorded in
+/// `stats` by oid and path, and the rest of the import carries on — the
+/// history, issues and pull requests are no less worth having for one missing
+/// binary.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_lfs_objects(
+    db: &DatabaseConnection,
+    task: &ImportTask,
+    repo_id: i64,
+    clone_url: &str,
+    trusted_origins: &crate::import::trust::TrustedImportOrigins,
+    repo_root: &Path,
+    token: &str,
+    progress: i32,
+    stats: &mut ImportStats,
+) -> Result<()> {
+    let repo_path = repo_root.join(format!("{}/{}.git", task.target_owner, task.target_name));
+    let pointers = crate::blocking::run_blocking_git("import LFS pointer scan", move || {
+        crate::lfs::pointer::objects_in_history(&repo_path)
+    })
     .await
+    .context("failed to read the LFS pointers of the imported repository")?;
+    if pointers.is_empty() {
+        return Ok(());
+    }
+
+    let total = pointers.len();
+    update_stage(
+        db,
+        task.id,
+        "importing",
+        progress,
+        &format!("Fetching LFS objects (0/{total})"),
+    )
+    .await?;
+
+    let storage = crate::blob_storage::instance_blob_storage(repo_root);
+    let mut fetcher = crate::lfs::fetch::LfsFetcher::new(
+        db,
+        &storage,
+        repo_root,
+        crate::lfs::service::LfsRepository {
+            id: repo_id,
+            owner: &task.target_owner,
+            name: &task.target_name,
+        },
+        clone_url,
+        source_credentials(&task.platform, &task.source_url, token),
+        trusted_origins,
+    )?;
+    let mut outcome = crate::lfs::fetch::LfsFetchOutcome::default();
+    let mut done = 0;
+    for chunk in pointers.chunks(crate::lfs::fetch::BATCH_SIZE) {
+        outcome.absorb(fetcher.fetch(chunk).await?);
+        done += chunk.len();
+        update_stage(
+            db,
+            task.id,
+            "importing",
+            progress,
+            &format!("Fetching LFS objects ({done}/{total})"),
+        )
+        .await?;
+    }
+
+    stats.lfs_objects_imported = outcome.fetched;
+    stats.lfs_objects_failed = outcome.failed;
+    let summary = match stats.lfs_objects_failed.len() {
+        0 => format!("Fetched {} LFS objects", stats.lfs_objects_imported),
+        missing => format!(
+            "Fetched {} LFS objects; {missing} could not be fetched from the source",
+            stats.lfs_objects_imported
+        ),
+    };
+    update_stage(db, task.id, "importing", progress, &summary).await
 }
 
 #[cfg(test)]
@@ -324,6 +446,7 @@ async fn clone_into_target_for_test(
         stats,
     )
     .await
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -336,7 +459,7 @@ async fn clone_into_target_with_destination(
     token: &str,
     progress_when_done: i32,
     stats: &mut ImportStats,
-) -> Result<()> {
+) -> Result<CloneOutcome> {
     update_stage(db, task.id, "cloning", 0, "Cloning repository...").await?;
 
     let Some(target_row) = rg_db::ops::repo_ops::find_by_id(db, repo_id)
@@ -393,7 +516,7 @@ async fn clone_into_target_with_destination(
     )
     .await?;
 
-    Ok(())
+    Ok(outcome)
 }
 
 /// How many branch names the unborn-HEAD warning is willing to spell out. The
@@ -3351,8 +3474,13 @@ pub async fn start_import(
         {
             Ok(stats) => {
                 let stats_json = serde_json::to_string(&stats).unwrap_or_default();
-                if let Err(error) =
-                    import_task_ops::mark_completed(&db_clone, task_clone.id, &stats_json).await
+                if let Err(error) = import_task_ops::mark_completed(
+                    &db_clone,
+                    task_clone.id,
+                    &stats_json,
+                    &stats.completion_stage(),
+                )
+                .await
                 {
                     tracing::error!(
                         task_id = task_clone.id,

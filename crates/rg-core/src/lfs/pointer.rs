@@ -13,7 +13,8 @@
 //! size 12345
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -130,6 +131,178 @@ pub fn objects_introduced(repo_path: &Path, head: &str, exclude: &str) -> Result
     Ok(oids.into_iter().collect())
 }
 
+/// A pointer found in a repository, with one path its blob is committed
+/// under — what a person needs to recognise the file when its object is
+/// missing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PointerInHistory {
+    pub pointer: LfsPointer,
+    /// Empty when no commit reachable from a ref holds the blob.
+    pub path: String,
+}
+
+/// Every LFS object a repository that arrived whole — a fresh import clone —
+/// points at, one entry per oid, sorted by oid.
+///
+/// Read from the object store rather than from a `git rev-list --objects`
+/// listing. That listing names every small blob of the whole history, and the
+/// git gateway caps what it captures at 16 MiB: a large upstream would fail
+/// the import after its clone had succeeded. Here only the blob headers are
+/// read, only blobs small enough to be a pointer are opened, and memory grows
+/// with the number of pointers, not with the size of the history. A fresh
+/// clone holds exactly what its refs reach, so the store *is* the history; a
+/// repository with unreachable objects would list pointers no ref names,
+/// which costs a fetch, never a missed object.
+///
+/// Paths come from a walk of the trees of every ref's history, newest first,
+/// that stops as soon as every pointer blob has one. An oid behind several
+/// blobs keeps the first path in path order.
+pub fn objects_in_history(repo_path: &Path) -> Result<Vec<PointerInHistory>> {
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+
+    let mut pointers: BTreeMap<gix::ObjectId, LfsPointer> = BTreeMap::new();
+    let objects = repo
+        .objects
+        .iter()
+        .with_context(|| format!("failed to list the objects of {repo_path:?}"))?;
+    for id in objects {
+        let id = id.with_context(|| format!("failed to list the objects of {repo_path:?}"))?;
+        // The listing may repeat an object that is in two packs.
+        if pointers.contains_key(&id) {
+            continue;
+        }
+        let header = repo
+            .find_header(id)
+            .with_context(|| format!("failed to read the header of object {id}"))?;
+        if header.kind() != gix::object::Kind::Blob || header.size() >= POINTER_SIZE_LIMIT {
+            continue;
+        }
+        let blob = repo
+            .find_object(id)
+            .with_context(|| format!("failed to read blob {id}"))?;
+        if let Some(pointer) = parse(&blob.data) {
+            pointers.insert(id, pointer);
+        }
+    }
+    if pointers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = blob_paths(&repo, repo_path, &pointers)?;
+    let mut found: BTreeMap<String, PointerInHistory> = BTreeMap::new();
+    for (blob, pointer) in pointers {
+        let path = paths.remove(&blob).unwrap_or_default();
+        match found.entry(pointer.oid.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(PointerInHistory { pointer, path });
+            }
+            Entry::Occupied(mut entry) => {
+                let kept = &mut entry.get_mut().path;
+                if kept.is_empty() || (!path.is_empty() && path < *kept) {
+                    *kept = path;
+                }
+            }
+        }
+    }
+    Ok(found.into_values().collect())
+}
+
+/// One path for each of `wanted`, from the trees of every ref's history.
+///
+/// Each tree is read once however many commits share it, and the walk ends
+/// when every blob has a path — for the usual repository, whose pointers are
+/// all in its branch tips, after the first few commits.
+fn blob_paths(
+    repo: &gix::Repository,
+    repo_path: &Path,
+    wanted: &BTreeMap<gix::ObjectId, LfsPointer>,
+) -> Result<HashMap<gix::ObjectId, String>> {
+    let mut tips = Vec::new();
+    let references = repo
+        .references()
+        .with_context(|| format!("failed to open references in {repo_path:?}"))?;
+    for reference in references
+        .all()
+        .with_context(|| format!("failed to list references in {repo_path:?}"))?
+    {
+        let mut reference = reference
+            .map_err(anyhow::Error::from_boxed)
+            .with_context(|| format!("failed to read a reference in {repo_path:?}"))?;
+        let id = reference
+            .peel_to_id()
+            .with_context(|| format!("failed to resolve `{}`", reference.name().as_bstr()))?
+            .detach();
+        let kind = repo
+            .find_header(id)
+            .with_context(|| format!("failed to read the header of object {id}"))?
+            .kind();
+        // A tag of a tree or a blob names no history to walk.
+        if kind == gix::object::Kind::Commit {
+            tips.push(id);
+        }
+    }
+
+    let mut paths = HashMap::new();
+    let mut visited = HashSet::new();
+    let walk = repo
+        .rev_walk(tips)
+        .all()
+        .with_context(|| format!("failed to walk the history of {repo_path:?}"))?;
+    for commit in walk {
+        let commit =
+            commit.with_context(|| format!("failed to walk the history of {repo_path:?}"))?;
+        let tree = repo
+            .find_commit(commit.id)
+            .with_context(|| format!("failed to read commit {}", commit.id))?
+            .tree_id()
+            .with_context(|| format!("failed to read the tree of commit {}", commit.id))?
+            .detach();
+        collect_blob_paths(repo, tree, wanted, &mut paths, &mut visited)?;
+        if paths.len() == wanted.len() {
+            break;
+        }
+    }
+    Ok(paths)
+}
+
+fn collect_blob_paths(
+    repo: &gix::Repository,
+    root: gix::ObjectId,
+    wanted: &BTreeMap<gix::ObjectId, LfsPointer>,
+    paths: &mut HashMap<gix::ObjectId, String>,
+    visited: &mut HashSet<gix::ObjectId>,
+) -> Result<()> {
+    if !visited.insert(root) {
+        return Ok(());
+    }
+    let mut stack = vec![(root, String::new())];
+    while let Some((tree_id, prefix)) = stack.pop() {
+        let tree = repo
+            .find_tree(tree_id)
+            .with_context(|| format!("failed to read tree {tree_id}"))?;
+        for entry in tree.iter() {
+            let entry =
+                entry.with_context(|| format!("failed to read an entry of tree {tree_id}"))?;
+            let name = String::from_utf8_lossy(entry.filename());
+            let path = if prefix.is_empty() {
+                name.into_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let id = entry.oid().to_owned();
+            if entry.mode().is_tree() {
+                if visited.insert(id) {
+                    stack.push((id, path));
+                }
+            } else if wanted.contains_key(&id) {
+                paths.entry(id).or_insert(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +408,69 @@ mod tests {
 
         // Nothing is new relative to the head itself.
         assert!(objects_introduced(path, &head, &head).unwrap().is_empty());
+    }
+
+    /// What an import asks the source for: every pointer the store holds —
+    /// in the tip, only in older history, under two names — each once, with a
+    /// path a person can recognise.
+    #[test]
+    fn every_pointer_in_the_store_is_listed_once_with_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        git(path, &["init", "-q", "-b", "main"]);
+        git(path, &["config", "user.name", "pointer test"]);
+        git(path, &["config", "user.email", "pointer@example.invalid"]);
+
+        // Replaced by a later commit: only older history holds this pointer.
+        let replaced = "5".repeat(64);
+        std::fs::create_dir(path.join("art")).unwrap();
+        std::fs::write(path.join("art/hero.png"), pointer_text(&replaced, 9)).unwrap();
+        std::fs::write(path.join("notes.txt"), "not a pointer\n").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-qm", "first"]);
+
+        let current = "6".repeat(64);
+        let shared = "7".repeat(64);
+        std::fs::write(path.join("art/hero.png"), pointer_text(&current, 9)).unwrap();
+        std::fs::write(path.join("z-copy.bin"), pointer_text(&shared, 4)).unwrap();
+        std::fs::write(path.join("a-original.bin"), pointer_text(&shared, 4)).unwrap();
+        let mut padded = pointer_text(&"8".repeat(64), 3);
+        padded.push_str(&"x".repeat(2 * POINTER_SIZE_LIMIT as usize));
+        std::fs::write(path.join("big.bin"), padded).unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-qm", "second"]);
+
+        // A side branch holds a pointer no `main` commit has.
+        git(path, &["checkout", "-qb", "side"]);
+        let side = "9".repeat(64);
+        std::fs::write(path.join("side.bin"), pointer_text(&side, 2)).unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-qm", "side"]);
+        git(path, &["checkout", "-q", "main"]);
+
+        // A tag naming a blob directly, and a pointer no commit holds.
+        let notes = git(path, &["rev-parse", "HEAD:notes.txt"]);
+        git(path, &["tag", "blob-tag", &notes]);
+        let loose = "a".repeat(64);
+        let loose_file = path.join("loose-pointer");
+        std::fs::write(&loose_file, pointer_text(&loose, 1)).unwrap();
+        git(path, &["hash-object", "-w", loose_file.to_str().unwrap()]);
+        std::fs::remove_file(&loose_file).unwrap();
+
+        let listed = objects_in_history(path)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.pointer.oid, entry.path))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            vec![
+                (replaced, "art/hero.png".to_string()),
+                (current, "art/hero.png".to_string()),
+                (shared, "a-original.bin".to_string()),
+                (side, "side.bin".to_string()),
+                (loose, String::new()),
+            ]
+        );
     }
 }

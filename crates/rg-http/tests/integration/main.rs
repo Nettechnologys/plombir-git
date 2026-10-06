@@ -86,6 +86,7 @@ mod git_auth_tests;
 mod git_http_clone_tests;
 mod git_http_failure_status_tests;
 mod global_id_anchor_guard;
+mod import_lfs_tests;
 mod import_target_namespace_tests;
 mod import_token_tests;
 mod import_trusted_origin_tests;

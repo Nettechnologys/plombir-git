@@ -784,7 +784,7 @@ async fn delete_repository_refuses_while_an_import_is_in_flight() {
 
     // The worker has not reached `set_repo_id` yet: the row points at no
     // repository, and only the pair it was accepted for names the target.
-    rg_db::ops::import_task_ops::mark_completed(&db, linked.id, "{}")
+    rg_db::ops::import_task_ops::mark_completed(&db, linked.id, "{}", "Import completed")
         .await
         .expect("settle the linked import");
     let unlinked = seed_running_import(&db, user_id, None, "delete-import", "incoming").await;
@@ -805,7 +805,7 @@ async fn delete_repository_refuses_while_an_import_is_in_flight() {
     );
 
     // Nothing in flight any more — the gate has to let go.
-    rg_db::ops::import_task_ops::mark_completed(&db, unlinked.id, "{}")
+    rg_db::ops::import_task_ops::mark_completed(&db, unlinked.id, "{}", "Import completed")
         .await
         .expect("settle the unresolved import");
     let response = client

@@ -24,9 +24,9 @@
 //! area from being spelled past it.
 //!
 //! Not every spool can live under `.tmp/`. Five more producers write theirs
-//! *beside* the destination — an LFS object, a CI cache archive, any blob a
-//! local backend writes, an audit archive, the rollback copy of an attachment
-//! being deleted. For the first four the reason is that publishing is a rename,
+//! *beside* the destination — an LFS object (uploaded, or fetched by an
+//! import), a CI cache archive, any blob a local backend writes, an audit
+//! archive, the rollback copy of an attachment being deleted. For the first four the reason is that publishing is a rename,
 //! and a rename that stays inside one directory cannot fail across a device
 //! boundary the way a move out of `<repo_root>/.tmp/` onto a bind-mounted
 //! volume can. That is a deliberate and correct choice, so [`StagingArea`] must
@@ -161,6 +161,16 @@ pub fn lfs_object_spool_name(oid: &str) -> String {
     format!(".tmp_{oid}")
 }
 
+/// The spool an LFS object fetched from another server — the source of an
+/// import — is streamed into before its digest is checked.
+///
+/// Per fetch rather than per oid: the repository may be live, and a client
+/// uploading the same object at the same moment writes `.tmp_<oid>`, which a
+/// shared name would let the two writers truncate under each other.
+pub fn lfs_object_fetch_spool_name(oid: &str, fetch_id: uuid::Uuid) -> String {
+    format!(".fetch_{oid}.{}", fetch_id.simple())
+}
+
 /// The spool a local blob write publishes with a same-directory rename.
 pub fn blob_write_spool_name(destination: &str, write_id: uuid::Uuid) -> String {
     format!(".{destination}.{write_id}.tmp")
@@ -200,6 +210,9 @@ pub enum SiblingSpool {
     /// `.tmp_<oid>` beside one repository's LFS objects, up to
     /// `LFS_OBJECT_MAX_BYTES` — by a wide margin the most expensive of the four.
     LfsObject,
+    /// `.fetch_<oid>.<uuid>` beside one repository's LFS objects: an object an
+    /// import downloads from its source, up to `LFS_OBJECT_MAX_BYTES`.
+    LfsObjectFetch,
     /// `cache-<random>.upload` in `_ci_cache/<repo_id>/`. Retention walks cache
     /// *rows*, and a spool is named by no row, so nothing else can find one.
     CiCacheArchive,
@@ -218,6 +231,7 @@ impl SiblingSpool {
     /// Every spool family written beside its destination.
     pub const ALL: &'static [SiblingSpool] = &[
         SiblingSpool::LfsObject,
+        SiblingSpool::LfsObjectFetch,
         SiblingSpool::CiCacheArchive,
         SiblingSpool::BlobWrite,
         SiblingSpool::AuditArchive,
@@ -236,6 +250,14 @@ impl SiblingSpool {
             SiblingSpool::LfsObject => name
                 .strip_prefix(".tmp_")
                 .is_some_and(crate::lfs::service::is_valid_oid),
+            SiblingSpool::LfsObjectFetch => name
+                .strip_prefix(".fetch_")
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(oid, fetch_id)| {
+                    crate::lfs::service::is_valid_oid(oid)
+                        && fetch_id.len() == 32
+                        && uuid::Uuid::try_parse(fetch_id).is_ok()
+                }),
             SiblingSpool::CiCacheArchive => name
                 .strip_prefix(CI_CACHE_SPOOL_PREFIX)
                 .and_then(|rest| rest.strip_suffix(CI_CACHE_SPOOL_SUFFIX))
@@ -848,9 +870,10 @@ mod tests {
     use super::{
         attachment_backup_spool_name, audit_archive_spool_name, blob_write_spool_name,
         import_clone_staging_name, import_wiki_clone_staging_name, is_sibling_spool,
-        is_sibling_spool_tree, lfs_object_spool_name, sweep_stale_spools, worktree_staging_name,
-        worktree_staging_path, SiblingSpool, SiblingSpoolTree, StagingArea, SweepReport,
-        WorktreePurpose, CI_CACHE_SPOOL_PREFIX, CI_CACHE_SPOOL_SUFFIX, STALE_SPOOL_AGE,
+        is_sibling_spool_tree, lfs_object_fetch_spool_name, lfs_object_spool_name,
+        sweep_stale_spools, worktree_staging_name, worktree_staging_path, SiblingSpool,
+        SiblingSpoolTree, StagingArea, SweepReport, WorktreePurpose, CI_CACHE_SPOOL_PREFIX,
+        CI_CACHE_SPOOL_SUFFIX, STALE_SPOOL_AGE,
     };
     use std::time::{Duration, SystemTime};
 
@@ -1136,6 +1159,10 @@ mod tests {
 
         let named = [
             (SiblingSpool::LfsObject, lfs_object_spool_name(&oid)),
+            (
+                SiblingSpool::LfsObjectFetch,
+                lfs_object_fetch_spool_name(&oid, write_id),
+            ),
             (SiblingSpool::CiCacheArchive, cache),
             (
                 SiblingSpool::BlobWrite,
@@ -1190,6 +1217,10 @@ mod tests {
             &format!(".tmp_{}", "c".repeat(63)),
             // Uppercase is not LFS oid alphabet.
             &format!(".tmp_{}", "A".repeat(64)),
+            // The fetch spool's shape without a real oid or a real fetch id.
+            &format!(".fetch_{}", "b".repeat(64)),
+            &format!(".fetch_{}.not-a-uuid", "b".repeat(64)),
+            &format!(".fetch_not-an-oid.{}", uuid::Uuid::nil().simple()),
             // A published cache archive, and the spool shape without its parts.
             "e3b0c44298fc1c14.9.tar",
             "cache-.upload",
