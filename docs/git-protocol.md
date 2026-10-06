@@ -337,13 +337,35 @@ report-status report-status-v2 side-band-64k agent=plombir-git/0.1
 
 ```
 russh::server::Server::new_client()  -> create SshHandler
-SshHandler::channel_open_session()   -> store the Channel
-SshHandler::exec_request()           -> parse the git command, tokio::spawn to handle it
+SshHandler::channel_open_session()   -> store the Channel under its ChannelId
+SshHandler::exec_request()           -> parse the git command, take THAT channel, tokio::spawn
   |-- handle_upload_pack_stream() or handle_receive_pack_stream()
     |-- exit_status_request()        -> send exit code
     |-- stream.shutdown()            -> send SSH EOF
     |-- stream drop                  -> channel close
+SshHandler::channel_close()          -> forget a channel that never ran a command
 ```
+
+One connection can carry several session channels (`ssh` multiplexing opens them side by side),
+so channels are kept per id: an exec streams over the channel it arrived on, never over the one
+opened last.
+
+### Refusals never leave the handler as an error
+
+russh answers an `Err` from any handler method by dropping the whole connection. The client then
+sees `Broken pipe` / exit 255, which git and git-lfs read as a network failure and retry. So every
+refusal is answered on its own channel, the way a failed command would be: `channel_success`,
+the reason on stderr, `exit_status_request(1)`, `close` (`reject_git_exec`). That covers an
+unknown command, a bad path, a denied or missing repository, a repository whose directory is gone,
+and a shell or subsystem request (`ssh -T`, `sftp`).
+
+A terminal or display request (`pty-req`, `x11-req`) gets a plain `channel_failure`, and so does a
+second exec on a channel whose git process is already running, since writing stderr there would
+corrupt that session's stream.
+
+russh does not reply to `shell`, `subsystem`, `pty-req` or `x11-req` by itself: a handler that
+leaves them at the default leaves the client waiting for an answer that never comes, and OpenSSH,
+which matches replies to requests in order, hands the next reply to the wrong request.
 
 ### Ordering of exit_status and stream.shutdown()
 

@@ -3,6 +3,7 @@
 //! Phase 2: auth_publickey queries the database for matching SSH keys.
 //! auth_password queries the database and verifies via Argon2.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -558,7 +559,7 @@ impl russh::server::Server for SshServer {
             shared: self.shared.clone(),
             id: self.id,
             peer,
-            channel: None,
+            channels: HashMap::new(),
             authenticated_identity: None,
             git_protocol_version: "1".to_string(),
         };
@@ -579,8 +580,12 @@ struct SshHandler {
     /// Client address, recorded against rejected password attempts so a run of
     /// failures in `login_log` names where it came from.
     peer: Option<std::net::SocketAddr>,
-    /// The channel opened by the client for this session.
-    channel: Option<Channel<Msg>>,
+    /// Session channels the client has opened and not yet handed to a git
+    /// process, keyed by id. One connection may carry several (`ssh`
+    /// multiplexing does exactly that), and the exec on a channel has to stream
+    /// over THAT channel — a single slot would hand an exec the channel opened
+    /// last, and the next exec none at all.
+    channels: HashMap<ChannelId, Channel<Msg>>,
     /// Repository-scoped identity resolved during authentication.
     authenticated_identity: Option<AuthenticatedIdentity>,
     /// Git protocol version requested by the client (default: "1").
@@ -958,8 +963,70 @@ impl Handler for SshHandler {
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
         tracing::debug!(id = self.id, channel_id = ?channel.id(), "channel_open_session");
-        self.channel = Some(channel);
+        self.channels.insert(channel.id(), channel);
         Ok(true)
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel_id: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.channels.remove(&channel_id);
+        Ok(())
+    }
+
+    // russh answers none of the requests below on its own: a handler that
+    // leaves them at the default never replies, and a client that asked for a
+    // reply waits on it forever. `ssh -T git@host` — the usual way to check
+    // that a key works — sits on exactly that.
+
+    /// No terminal is offered; the client says so and carries on without one.
+    async fn pty_request(
+        &mut self,
+        channel_id: ChannelId,
+        _term: &str,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(russh::Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel_id)?;
+        Ok(())
+    }
+
+    /// `ssh -X`: no display is forwarded. OpenSSH matches replies to its
+    /// requests in order, so an unanswered one would take the next reply.
+    async fn x11_request(
+        &mut self,
+        channel_id: ChannelId,
+        _single_connection: bool,
+        _x11_auth_protocol: &str,
+        _x11_auth_cookie: &str,
+        _x11_screen_number: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel_id)?;
+        Ok(())
+    }
+
+    async fn shell_request(
+        &mut self,
+        channel_id: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.refuse_unserved(channel_id, "shell", session)
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel_id: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.refuse_unserved(channel_id, &format!("subsystem {name}"), session)
     }
 
     async fn exec_request(
@@ -970,6 +1037,10 @@ impl Handler for SshHandler {
     ) -> Result<(), Self::Error> {
         let command = String::from_utf8_lossy(data).to_string();
         tracing::info!(%command, id = self.id, "SSH exec request");
+
+        if self.refuse_if_busy(channel_id, &command, session)? {
+            return Ok(());
+        }
 
         // A command this port does not serve is answered like a failed command
         // — stderr plus a non-zero exit — rather than with an error out of the
@@ -1088,23 +1159,29 @@ impl Handler for SshHandler {
                 if with_git.exists() {
                     with_git
                 } else {
-                    let err_msg = format!("repository not found: {}", repo_path);
-                    tracing::error!(%err_msg);
-                    session.channel_failure(channel_id)?;
-                    return Err(HandlerError(err_msg));
+                    // The gate above found the row, so this is the server's
+                    // storage out of step with its database — not the client's
+                    // mistake, and no reason to drop the connection.
+                    reject_git_exec(
+                        session,
+                        channel_id,
+                        &GitServiceError::ServerUnavailable(anyhow::anyhow!(
+                            "repository {repo_path} is registered but has no directory under {}",
+                            self.shared.repo_root.display()
+                        )),
+                        self.authenticated_identity.as_ref(),
+                        &service,
+                        &repo_path,
+                    )?;
+                    return Ok(());
                 }
             }
         };
 
-        let ch = match self.channel.take() {
-            Some(ch) => ch,
-            None => {
-                let msg = "no channel available for exec_request";
-                tracing::error!(msg);
-                session.channel_failure(channel_id)?;
-                return Err(HandlerError(msg.into()));
-            }
-        };
+        let ch = self
+            .channels
+            .remove(&channel_id)
+            .context("exec channel vanished between its check and its use")?;
 
         session.channel_success(channel_id)?;
 
@@ -1314,6 +1391,45 @@ impl Handler for SshHandler {
 }
 
 impl SshHandler {
+    /// Refuse a request on a channel whose git process is already running —
+    /// a second exec, a shell, a subsystem. Declining the request is all it
+    /// takes; answering it with stderr and an exit status would write into that
+    /// git session's stream. `true` when the request was refused here.
+    fn refuse_if_busy(
+        &self,
+        channel_id: ChannelId,
+        request: &str,
+        session: &mut Session,
+    ) -> Result<bool, HandlerError> {
+        if self.channels.contains_key(&channel_id) {
+            return Ok(false);
+        }
+        tracing::warn!(?channel_id, %request, "SSH request on a channel that already runs a command");
+        session.channel_failure(channel_id)?;
+        Ok(true)
+    }
+
+    /// A shell or a subsystem: answered like a command that failed, with the
+    /// reason on stderr, so the connection stays up for the git that follows.
+    fn refuse_unserved(
+        &self,
+        channel_id: ChannelId,
+        request: &str,
+        session: &mut Session,
+    ) -> Result<(), HandlerError> {
+        if self.refuse_if_busy(channel_id, request, session)? {
+            return Ok(());
+        }
+        reject_git_exec(
+            session,
+            channel_id,
+            &GitServiceError::NotOffered(NO_SHELL),
+            self.authenticated_identity.as_ref(),
+            request,
+            "",
+        )
+    }
+
     /// Answer `git-lfs-authenticate <path> <operation>`.
     ///
     /// The decision is the one `git-upload-pack` (download) or
@@ -1425,6 +1541,12 @@ impl SshHandler {
         .to_string())
     }
 }
+
+/// The answer to a shell or a subsystem (`sftp`, `scp`): this port runs Git
+/// commands and nothing else. A client that got this far has authenticated, so
+/// `ssh -T` also learns that its key works.
+const NO_SHELL: &str = "authenticated, but this port serves only Git (git-upload-pack, \
+                        git-receive-pack, git-lfs-authenticate); there is no shell";
 
 /// What an SSH `exec` asked this server to do.
 #[derive(Debug, PartialEq, Eq)]
