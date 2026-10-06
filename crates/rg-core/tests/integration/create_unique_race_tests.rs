@@ -415,7 +415,14 @@ async fn a_fork_that_loses_the_namespace_race_is_the_caller_s_conflict() {
     .await;
 
     let error = match rg_core::repo::service::fork_repo(
-        &db, forker_id, None, None, "upstream", &source, &repo_root,
+        &db,
+        forker_id,
+        None,
+        None,
+        "upstream",
+        &source,
+        &rg_core::blob_storage::LocalBlobStorage::new(&repo_root),
+        &repo_root,
     )
     .await
     {

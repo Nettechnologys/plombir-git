@@ -2701,6 +2701,7 @@ pub struct ForkedRepo {
 /// This function used to re-decide that itself, off `can_read_repo` — a second
 /// copy of the rule, living one crate away from the gate it was supposed to
 /// mirror (card_b38bfb0f2b40).
+#[allow(clippy::too_many_arguments)]
 pub async fn fork_repo(
     db: &DatabaseConnection,
     user_id: i64,
@@ -2708,6 +2709,7 @@ pub async fn fork_repo(
     destination_namespace: Option<&str>,
     source_owner: &str,
     source_repo: &rg_db::entities::repository::Model,
+    blob_storage: &dyn BlobStorage,
     repo_root: &std::path::Path,
 ) -> Result<ForkedRepo> {
     // Name already taken → 400. Each outcome carries its own type so the clone,
@@ -2911,24 +2913,68 @@ pub async fn fork_repo(
     )
     .await
     {
-        // Row first, so the directory it named is unreferenced before it goes.
-        if let Err(rollback_error) = repo_ops::delete_by_id(db, forked.id).await {
-            tracing::error!(
-                repo_id = forked.id,
-                owner_id = user_id,
-                reason = %format!("{error:#}"),
-                error = %format!("{rollback_error:#}"),
-                "a repository was forked into a namespace that is being deleted, and removing the \
-                 row failed — it now names a destination that is gone"
-            );
-            return Err(rollback_error);
+        return Err(undo_committed_fork(
+            db,
+            &forked,
+            &target_path,
+            &creation_journal,
+            &creation_id,
+            error,
+            "a repository was forked into a namespace that is being deleted, and removing the \
+             row failed — it now names a destination that is gone",
+        )
+        .await);
+    }
+
+    // LFS content lives outside Git: the clone above carried the pointer files
+    // and nothing they point at (card_44bf421f18f2). Copied only now, once the
+    // row is ours and the namespace has stopped moving, because the
+    // destination keys are spelled from that namespace and nothing else may
+    // own them. A fork that cannot serve its source's LFS files is not the
+    // fork that was asked for, so a failure undoes it rather than standing as
+    // a repository whose every `git lfs pull` answers `404`.
+    match crate::lfs::service::copy_repository_objects(
+        db,
+        blob_storage,
+        repo_root,
+        crate::lfs::service::LfsRepository {
+            id: source_repo.id,
+            owner: source_owner,
+            name: repo_name,
+        },
+        crate::lfs::service::LfsRepository {
+            id: forked.id,
+            owner: &destination_namespace,
+            name: repo_name,
+        },
+    )
+    .await
+    {
+        Ok(copied) => {
+            if !copied.missing.is_empty() {
+                tracing::warn!(
+                    source_repo_id = source_repo.id,
+                    fork_repo_id = forked.id,
+                    copied = copied.copied,
+                    missing = ?copied.missing,
+                    "the fork source records LFS objects as uploaded that are not in storage; \
+                     the fork, like its source, answers 404 for them"
+                );
+            }
         }
-        if discard_unreferenced_repo_dir_blocking(&target_path, &recreate_blocked_by(repo_name))
-            .await
-        {
-            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
+        Err(error) => {
+            return Err(undo_committed_fork(
+                db,
+                &forked,
+                &target_path,
+                &creation_journal,
+                &creation_id,
+                error,
+                "a fork could not receive its source's LFS objects, and removing its row failed \
+                 — the repository stands without them",
+            )
+            .await);
         }
-        return Err(error);
     }
 
     crate::deletion_recovery::close(&creation_journal, &creation_id).await;
@@ -2949,6 +2995,39 @@ pub async fn fork_repo(
         repo: forked,
         owner_name: destination_namespace,
     })
+}
+
+/// Take back a fork whose row has already committed, and return the error that
+/// is the reason.
+///
+/// Row first, so the directory it named is unreferenced before it goes. A row
+/// that will not delete is the worse failure of the two — it names a
+/// destination the caller is about to be told does not exist — so that error
+/// is the one returned, with `stranded` naming what it left behind.
+async fn undo_committed_fork(
+    db: &DatabaseConnection,
+    forked: &rg_db::entities::repository::Model,
+    target_path: &std::path::Path,
+    creation_journal: &dyn BlobStorage,
+    creation_id: &str,
+    reason: anyhow::Error,
+    stranded: &'static str,
+) -> anyhow::Error {
+    if let Err(rollback_error) = repo_ops::delete_by_id(db, forked.id).await {
+        tracing::error!(
+            repo_id = forked.id,
+            owner_id = forked.owner_id,
+            reason = %format!("{reason:#}"),
+            error = %format!("{rollback_error:#}"),
+            "{stranded}"
+        );
+        return rollback_error;
+    }
+    if discard_unreferenced_repo_dir_blocking(target_path, &recreate_blocked_by(&forked.name)).await
+    {
+        crate::deletion_recovery::close(creation_journal, creation_id).await;
+    }
+    reason
 }
 
 /// One fork together with the namespace needed to address it over HTTP.
@@ -5945,6 +6024,7 @@ mod repository_deletion_tests {
                 None,
                 &format!("{prefix}-source"),
                 &source,
+                &crate::blob_storage::LocalBlobStorage::new(repo_root),
                 repo_root,
             )
             .await
@@ -6505,6 +6585,7 @@ mod repository_deletion_tests {
             None,
             "fork-claim-source",
             &upstream,
+            &crate::blob_storage::LocalBlobStorage::new(&repo_root),
             &repo_root,
         )
         .await
@@ -6585,6 +6666,7 @@ mod repository_deletion_tests {
             Some(&destination.name),
             "fork-org-claim-source",
             &upstream,
+            &crate::blob_storage::LocalBlobStorage::new(&repo_root),
             &repo_root,
         )
         .await

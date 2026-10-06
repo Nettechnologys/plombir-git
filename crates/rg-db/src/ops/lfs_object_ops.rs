@@ -26,6 +26,42 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<LfsOb
     model.insert(db).await.context("db: create LFS object")
 }
 
+/// Every object of `repo_id` whose bytes have been stored, oldest first.
+pub async fn list_uploaded_by_repo(
+    db: &DatabaseConnection,
+    repo_id: i64,
+) -> Result<Vec<LfsObject>> {
+    LfsEntity::find()
+        .filter(lfs_object::Column::RepoId.eq(repo_id))
+        .filter(lfs_object::Column::Uploaded.eq(true))
+        .order_by_asc(lfs_object::Column::Id)
+        .all(db)
+        .await
+        .context("db: list uploaded LFS objects of a repository")
+}
+
+/// Rows per `INSERT` in [`create_many`]: seven bound columns each stays well
+/// under SQLite's and PostgreSQL's limits on parameters per statement.
+const CREATE_MANY_CHUNK: usize = 500;
+
+/// Record `models` in one transaction, so a repository ends up with all of
+/// them or none.
+pub async fn create_many(db: &DatabaseConnection, models: Vec<ActiveModel>) -> Result<()> {
+    if models.is_empty() {
+        return Ok(());
+    }
+    let txn = db.begin().await.context("db: begin LFS object batch")?;
+    let mut models = models.into_iter().peekable();
+    while models.peek().is_some() {
+        let chunk: Vec<ActiveModel> = models.by_ref().take(CREATE_MANY_CHUNK).collect();
+        LfsEntity::insert_many(chunk)
+            .exec(&txn)
+            .await
+            .context("db: insert LFS object batch")?;
+    }
+    txn.commit().await.context("db: commit LFS object batch")
+}
+
 /// Outcome of a bid for an object's publication lease.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationLeaseBid {

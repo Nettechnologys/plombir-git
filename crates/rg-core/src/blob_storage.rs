@@ -148,6 +148,22 @@ pub trait BlobStorage: Send + Sync {
         source: &'a Path,
     ) -> BoxFuture<'a, Result<BlobMetadata>>;
 
+    /// Store the file at `source` under `key`, sharing its bytes rather than
+    /// copying them when the backend can.
+    ///
+    /// Only for content that is never rewritten in place — content-addressed
+    /// objects such as LFS, whose key already names their hash — because a
+    /// shared copy is the same bytes under two names. Readers see the same
+    /// atomicity as [`BlobStorage::put_file`], and a backend with no way to
+    /// share simply copies.
+    fn put_file_shared<'a>(
+        &'a self,
+        key: &'a BlobKey,
+        source: &'a Path,
+    ) -> BoxFuture<'a, Result<BlobMetadata>> {
+        self.put_file(key, source)
+    }
+
     fn get<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, Result<Vec<u8>>>;
 
     fn metadata<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, Result<BlobMetadata>>;
@@ -278,6 +294,60 @@ impl LocalBlobStorage {
             discard_temporary(&temporary).await;
         }
         result
+    }
+
+    /// Publish `source` under `key` as a second hard link to the same inode.
+    ///
+    /// The link is made under a temporary sibling and renamed into place, so a
+    /// reader sees the previous object or the whole new one, as with
+    /// [`Self::atomic_copy`]. Sharing the inode is safe because nothing in this
+    /// backend writes into an existing file: `put` and `put_file` stage a fresh
+    /// file and rename it over the name, which detaches the name and leaves
+    /// every other link to the old bytes untouched, and `delete` unlinks one
+    /// name only.
+    ///
+    /// Anything that cannot be linked falls back to a real copy: a symlink
+    /// (linking would publish the symlink itself, which the canonical-root
+    /// check then refuses), another filesystem, a filesystem without hard
+    /// links, or an inode at its link-count ceiling.
+    async fn atomic_link(&self, key: &BlobKey, source: &Path) -> Result<BlobMetadata> {
+        let source_kind = tokio::fs::symlink_metadata(source)
+            .await
+            .map_err(io_at("blob source file", source))?;
+        if !source_kind.is_file() {
+            return self.atomic_copy(key, source).await;
+        }
+
+        let destination = self.lexical_path(key);
+        self.prepare_parent(&destination).await?;
+        let temporary = temporary_sibling(&destination);
+        if let Err(error) = tokio::fs::hard_link(source, &temporary).await {
+            tracing::debug!(
+                source = %source.display(),
+                destination = %destination.display(),
+                error = %error,
+                "blob could not be hard-linked; copying it instead"
+            );
+            discard_temporary(&temporary).await;
+            return self.atomic_copy(key, source).await;
+        }
+
+        // The linked sibling carries the *source's* mtime, so to the stale-spool
+        // sweep (`staging::sweep_stale_sibling_spools`) it can look abandoned the
+        // moment it exists. That sweep runs at startup, but a second process
+        // starting beside this one is enough — and losing the sibling costs
+        // only the link, never the bytes, so a failed rename takes the copy
+        // path instead of failing the write.
+        if let Err(error) = tokio::fs::rename(&temporary, &destination).await {
+            tracing::debug!(
+                path = %temporary.display(),
+                error = %error,
+                "hard-linked blob could not be renamed into place; copying it instead"
+            );
+            discard_temporary(&temporary).await;
+            return self.atomic_copy(key, source).await;
+        }
+        self.metadata_checked(key).await
     }
 
     async fn read_checked(&self, key: &BlobKey) -> Result<Vec<u8>> {
@@ -455,6 +525,14 @@ impl BlobStorage for LocalBlobStorage {
         source: &'a Path,
     ) -> BoxFuture<'a, Result<BlobMetadata>> {
         Box::pin(self.atomic_copy(key, source))
+    }
+
+    fn put_file_shared<'a>(
+        &'a self,
+        key: &'a BlobKey,
+        source: &'a Path,
+    ) -> BoxFuture<'a, Result<BlobMetadata>> {
+        Box::pin(self.atomic_link(key, source))
     }
 
     fn get<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, Result<Vec<u8>>> {
@@ -697,6 +775,68 @@ mod tests {
         assert!(storage.delete_prefix(&artifacts).await.unwrap());
         assert!(storage.list(None).await.unwrap().is_empty());
         assert!(!storage.delete_prefix(&artifacts).await.unwrap());
+    }
+
+    /// A shared copy is the same inode under a second name — and stays the
+    /// bytes it was when either name is later replaced or removed, because
+    /// nothing in the backend writes into an existing file.
+    #[tokio::test]
+    async fn a_shared_copy_shares_the_inode_and_outlives_changes_to_its_source() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalBlobStorage::new(dir.path());
+        let source = BlobKey::new("lfs/alice/assets/ab/source.zst").unwrap();
+        let copy = BlobKey::new("lfs/bob/assets/ab/source.zst").unwrap();
+        storage.put(&source, b"original bytes").await.unwrap();
+
+        let source_path = storage.local_path(&source).unwrap();
+        let stored = storage.put_file_shared(&copy, &source_path).await.unwrap();
+        assert_eq!(stored.size, 14);
+        let copy_path = storage.local_path(&copy).unwrap();
+        assert_eq!(
+            std::fs::metadata(&source_path).unwrap().ino(),
+            std::fs::metadata(&copy_path).unwrap().ino(),
+            "the shared copy must be a hard link, not a second set of bytes"
+        );
+
+        storage.put(&source, b"replacement").await.unwrap();
+        assert_eq!(storage.get(&copy).await.unwrap(), b"original bytes");
+        assert!(storage.delete(&source).await.unwrap());
+        assert_eq!(storage.get(&copy).await.unwrap(), b"original bytes");
+        let leftovers: Vec<_> = std::fs::read_dir(copy_path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            leftovers.len(),
+            1,
+            "a temporary link was left beside the copy: {leftovers:?}"
+        );
+    }
+
+    /// A symlinked source is never linked as a symlink — that would publish a
+    /// name the canonical-root check refuses to read — but copied by content.
+    #[tokio::test]
+    async fn a_shared_copy_of_a_symlink_copies_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalBlobStorage::new(dir.path().join("blobs"));
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"behind a symlink").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let copy = BlobKey::new("lfs/bob/assets/ab/linked").unwrap();
+        storage.put_file_shared(&copy, &link).await.unwrap();
+        let copy_path = storage.local_path(&copy).unwrap();
+        assert!(
+            !std::fs::symlink_metadata(&copy_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the stored object must be a regular file"
+        );
+        assert_eq!(storage.get(&copy).await.unwrap(), b"behind a symlink");
     }
 
     /// The failing directory is derived from the storage root and the key, so

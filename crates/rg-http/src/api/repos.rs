@@ -790,6 +790,7 @@ pub async fn fork_repo_handler(
         namespace_name.as_deref(),
         &owner,
         &source,
+        state.blob_storage.as_ref(),
         &state.repo_root,
     )
     .await

@@ -1479,6 +1479,141 @@ pub async fn read_object_source(
     Ok(LfsObjectSource::Local { path, compressed })
 }
 
+/// A repository as the LFS store addresses it: rows by id, bytes by the
+/// `<owner>/<name>` pair the storage keys are built from.
+#[derive(Clone, Copy, Debug)]
+pub struct LfsRepository<'a> {
+    pub id: i64,
+    pub owner: &'a str,
+    pub name: &'a str,
+}
+
+/// What [`copy_repository_objects`] carried over.
+#[derive(Debug, Default)]
+pub struct LfsObjectsCopied {
+    /// Objects the destination now serves as its own.
+    pub copied: usize,
+    /// Objects the source has an uploaded row for but no bytes. The source
+    /// answers `404` to them already, so the destination does too: copying
+    /// the row would promise an object nobody can serve.
+    pub missing: Vec<String>,
+}
+
+/// Give `destination` every stored LFS object of `source`, as its own.
+///
+/// Both halves of an object are per repository — the `(repo_id, oid)` row the
+/// batch API looks up and the bytes under a key built from `<owner>/<name>` —
+/// so a repository that merely shares history with another (a fork) has
+/// neither until they are made for it. They are made as copies rather than as
+/// a pointer back to the source, because every lifecycle operation on the
+/// source moves or retires its whole prefix: a fork that read through to the
+/// source would lose its objects to the source's deletion, rename or transfer,
+/// and would keep serving them to people the source has since locked out.
+///
+/// The bytes are shared where the backend can share them
+/// ([`BlobStorage::put_file_shared`]), so on local storage a copy is one hard
+/// link per object rather than a second set of gigabytes. The rows go in one
+/// transaction after every object is in place, and a failure removes the keys
+/// this call published: the destination ends with all of the source's objects
+/// or none of them, never a partial set that answers `404` at random.
+pub async fn copy_repository_objects(
+    db: &DatabaseConnection,
+    storage: &dyn BlobStorage,
+    repo_root: &std::path::Path,
+    source: LfsRepository<'_>,
+    destination: LfsRepository<'_>,
+) -> Result<LfsObjectsCopied> {
+    let objects = lfs_object_ops::list_uploaded_by_repo(db, source.id).await?;
+    let legacy_root = lfs_root(repo_root, source.owner, source.name);
+
+    let mut published: Vec<BlobKey> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let result = async {
+        let mut rows = Vec::with_capacity(objects.len());
+        for object in &objects {
+            let Some(key) =
+                copy_object_bytes(storage, &legacy_root, source, destination, &object.oid).await?
+            else {
+                missing.push(object.oid.clone());
+                continue;
+            };
+            published.push(key);
+            rows.push(lfs_object::ActiveModel {
+                id: sea_orm::NotSet,
+                repo_id: sea_orm::Set(destination.id),
+                oid: sea_orm::Set(object.oid.clone()),
+                size: sea_orm::Set(object.size),
+                uploaded: sea_orm::Set(true),
+                created_at: sea_orm::Set(Utc::now()),
+                publisher_token: sea_orm::Set(None),
+                publisher_since: sea_orm::Set(None),
+            });
+        }
+        lfs_object_ops::create_many(db, rows).await
+    }
+    .await;
+
+    if let Err(error) = result {
+        for key in &published {
+            if let Err(cleanup) = storage.delete(key).await {
+                tracing::warn!(
+                    key = %key,
+                    error = %cleanup,
+                    "an LFS object copied for a repository that did not get its objects could \
+                     not be removed; it is unreferenced and safe to delete"
+                );
+            }
+        }
+        return Err(error.context(format!(
+            "failed to copy the LFS objects of {}/{} to {}/{}",
+            source.owner, source.name, destination.owner, destination.name
+        )));
+    }
+
+    Ok(LfsObjectsCopied {
+        copied: published.len(),
+        missing,
+    })
+}
+
+/// Put one object's bytes under `destination`'s key, wherever the source has
+/// them — blob storage first, the legacy on-disk layout second, the same order
+/// [`read_object_source`] reads in. `Ok(None)` is the one outcome that proves
+/// the source has no bytes for `oid`; every other failure is an error.
+async fn copy_object_bytes(
+    storage: &dyn BlobStorage,
+    legacy_root: &std::path::Path,
+    source: LfsRepository<'_>,
+    destination: LfsRepository<'_>,
+    oid: &str,
+) -> Result<Option<BlobKey>> {
+    for compressed in [true, false] {
+        let from = lfs_object_key(source.owner, source.name, oid, compressed)?;
+        if !storage.exists(&from).await? {
+            continue;
+        }
+        let to = lfs_object_key(destination.owner, destination.name, oid, compressed)?;
+        match storage.local_path(&from) {
+            Some(path) => storage.put_file_shared(&to, &path).await?,
+            // A backend with no local files has nothing to share; this reads
+            // the object whole, as `read_object_source` does for the same
+            // backend.
+            None => storage.put(&to, &storage.get(&from).await?).await?,
+        };
+        return Ok(Some(to));
+    }
+
+    match read_object_path(legacy_root, oid) {
+        Ok((path, compressed)) => {
+            let to = lfs_object_key(destination.owner, destination.name, oid, compressed)?;
+            storage.put_file_shared(&to, &path).await?;
+            Ok(Some(to))
+        }
+        Err(error) if error.downcast_ref::<crate::error::NotFound>().is_some() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 // ── Compression helpers ───────────────────────────────────────────────────────
 
 /// Compress data using zstd.
