@@ -683,6 +683,143 @@ async fn pr_merge_names_a_deleted_fork_head_branch_as_a_conflict() {
     );
 }
 
+/// Replace the tip of `branch` in a bare fork with a commit that does not
+/// descend from it, the way `git commit --amend` + `git push --force` does, and
+/// return the new tip.
+fn rewrite_fork_branch(bare_path: &std::path::Path, branch: &str, content: &str) -> String {
+    let worktree = tempfile::tempdir().expect("create fork rewrite worktree");
+    let path = worktree.path();
+    let path_arg = path.to_str().expect("UTF-8 worktree path");
+    let bare_arg = bare_path.to_str().expect("UTF-8 bare repository path");
+
+    git(&["clone", "-q", "-b", branch, bare_arg, path_arg], None);
+    git(&["config", "user.name", "Fork PR rewrite test"], Some(path));
+    git(
+        &["config", "user.email", "fork-pr-rewrite@example.invalid"],
+        Some(path),
+    );
+    std::fs::write(path.join("fork-feature.txt"), content).expect("rewrite fork feature file");
+    git(&["add", "."], Some(path));
+    git(
+        &["commit", "-q", "--amend", "-m", content.trim()],
+        Some(path),
+    );
+    git(&["push", "-q", "--force", "origin", branch], Some(path));
+    git_stdout(&["rev-parse", "HEAD"], Some(path))
+}
+
+/// Record `head_sha` as the pull request's head, which is what the post-push
+/// hook does when the push reaches the fork through the server. The fixture
+/// writes the bare repository directly, so nothing else would.
+async fn record_pr_head(db: &sea_orm::DatabaseConnection, pr_id: i64, head_sha: &str) {
+    use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
+    rg_db::entities::pull_request::Entity::update_many()
+        .col_expr(
+            rg_db::entities::pull_request::Column::HeadSha,
+            Expr::value(head_sha),
+        )
+        .filter(rg_db::entities::pull_request::Column::Id.eq(pr_id))
+        .exec(db)
+        .await
+        .expect("record the rewritten PR head");
+}
+
+/// Opening a fork PR computes its diff, and the diff copies the fork branch
+/// into the base repository's `refs/forks/<namespace>/<branch>` and leaves it
+/// there. Both that diff and the merge fetched into the ref with an unforced
+/// refspec, so once the author rewrote the branch — an amend, a rebase — git
+/// refused the non-fast-forward update and the pull request could neither be
+/// diffed nor merged again: `500` for good.
+///
+/// The steps are ordered so each fetch site meets a stale ref on its own: the
+/// diff after the first rewrite, the merge after the second.
+#[tokio::test]
+async fn a_fork_pull_request_diffs_and_merges_after_its_branch_is_rewritten() {
+    let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (owner_token, _) =
+        register_full(&base, "pr-rewrite-owner", "pr-rewrite-owner@example.com").await;
+    let (fork_token, _) =
+        register_full(&base, "pr-rewrite-head", "pr-rewrite-head@example.com").await;
+    create_repo(&base, &owner_token, "pr-rewrite-repo").await;
+    seed_pr_branches(&repo_root.join("pr-rewrite-owner/pr-rewrite-repo.git"));
+
+    let client = reqwest::Client::new();
+    let fork = client
+        .post(format!(
+            "{base}/api/v1/repos/pr-rewrite-owner/pr-rewrite-repo/fork"
+        ))
+        .bearer_auth(&fork_token)
+        .send()
+        .await
+        .expect("fork request");
+    assert_eq!(fork.status(), 201, "fixture fork must be created");
+
+    let fork_path = repo_root.join("pr-rewrite-head/pr-rewrite-repo.git");
+    let fork_branch = "rewritten-feature";
+    seed_fork_feature_branch(&fork_path, fork_branch);
+
+    let pulls_url = format!("{base}/api/v1/repos/pr-rewrite-owner/pr-rewrite-repo/pulls");
+    let created = client
+        .post(&pulls_url)
+        .bearer_auth(&fork_token)
+        .json(&serde_json::json!({
+            "title": "fork head that will be rewritten",
+            "head": format!("pr-rewrite-head:{fork_branch}"),
+            "base": "main",
+        }))
+        .send()
+        .await
+        .expect("create fork PR request");
+    assert_eq!(created.status(), 201, "fixture fork PR must be valid");
+    let created = created.json::<serde_json::Value>().await.unwrap();
+    let number = created["number"].as_i64().expect("created PR number");
+    let pr_id = created["id"].as_i64().expect("created PR id");
+
+    let first = rewrite_fork_branch(&fork_path, fork_branch, "first rewrite\n");
+    record_pr_head(&db, pr_id, &first).await;
+    let diff = client
+        .get(format!("{pulls_url}/{number}/diff"))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .expect("diff request");
+    let diff_status = diff.status();
+    let diff_body = diff.text().await.unwrap_or_default();
+    assert_eq!(
+        diff_status, 200,
+        "the diff of a rewritten fork branch failed: {diff_body}"
+    );
+    assert!(
+        diff_body.contains("first rewrite"),
+        "the diff must show the rewritten branch, not the cached one: {diff_body}"
+    );
+
+    let second = rewrite_fork_branch(&fork_path, fork_branch, "second rewrite\n");
+    record_pr_head(&db, pr_id, &second).await;
+    let merge = client
+        .post(format!("{pulls_url}/{number}/merge"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"strategy": "merge"}))
+        .send()
+        .await
+        .expect("merge request");
+    let merge_status = merge.status();
+    let merge_body = merge.text().await.unwrap_or_default();
+    assert_eq!(
+        merge_status, 200,
+        "the merge of a rewritten fork branch failed: {merge_body}"
+    );
+
+    let merged = git_stdout(
+        &["show", "main:fork-feature.txt"],
+        Some(&repo_root.join("pr-rewrite-owner/pr-rewrite-repo.git")),
+    );
+    assert_eq!(
+        merged, "second rewrite",
+        "the merge must carry the branch as it was rewritten last"
+    );
+}
+
 /// `POST .../collaborators` — an unknown permission and an already-listed user
 /// are the caller's, the `repo_collaborators` insert is ours. The handler had
 /// *two* blanket `bad_request`s: one on the service, one on the helper that

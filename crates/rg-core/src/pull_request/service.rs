@@ -778,7 +778,7 @@ pub async fn compute_diff(
                     &[
                         "fetch",
                         &head_repo_path.to_string_lossy(),
-                        &format!("{}:{}", fetch_ref, local_ref),
+                        &fork_fetch_refspec(&fetch_ref, &local_ref),
                     ],
                     Some(&base_path),
                 )?;
@@ -4049,7 +4049,7 @@ async fn merge_claimed_pr(
                     &[
                         "fetch",
                         &head_repo_path.to_string_lossy(),
-                        &format!("{}:{}", fetch_ref, local_ref),
+                        &fork_fetch_refspec(&fetch_ref, &local_ref),
                     ],
                     Some(&repo_path_for_git),
                 )?;
@@ -4062,13 +4062,15 @@ async fn merge_claimed_pr(
 
                 // The fetch brought whatever the fork branch points at now.
                 // Pin and merge that same object inside this blocking phase.
-                let head_sha = resolve_ref_sha(&repo_path_for_git, &merge_ref)?;
-                require_pinned_head(&pr_for_git, expected_head_sha.as_deref(), &head_sha)?;
-                let sha = merge_head_rev(&repo_path_for_git, &pr_for_git, &head_sha, strategy)?;
-                if let Err(e) = gix_delete_ref(&repo_path_for_git, &merge_ref) {
-                    tracing::warn!("failed to clean up fork ref '{}': {}", merge_ref, e);
-                }
-                Ok(sha)
+                let merged = (|| {
+                    let head_sha = resolve_ref_sha(&repo_path_for_git, &merge_ref)?;
+                    require_pinned_head(&pr_for_git, expected_head_sha.as_deref(), &head_sha)?;
+                    merge_head_rev(&repo_path_for_git, &pr_for_git, &head_sha, strategy)
+                })();
+                // On every outcome, not only success: a conflict or a moved
+                // pin is exactly when the author goes on to rewrite the branch.
+                discard_fork_ref(&repo_path_for_git, &merge_ref);
+                merged
             },
         )
         .await?;
@@ -4849,6 +4851,32 @@ fn merge_signature_time() -> String {
 }
 
 /// Delete a reference using gix (replaces `git update-ref -d <ref>`).
+/// The refspec that copies a fork's head branch into the base repository's
+/// scratch ref `refs/forks/<namespace>/<branch>`.
+///
+/// Forced, because that ref is a cache of the fork branch and not history the
+/// base repository owns. Both the diff and the merge write it, and the diff
+/// never removes it, so a plain `<src>:<dst>` refspec made the first rewrite of
+/// the fork branch — a rebase, an amended commit — a non-fast-forward update
+/// git refuses. From then on every diff and every merge of that pull request
+/// answered `500` until someone deleted the ref by hand.
+fn fork_fetch_refspec(fetch_ref: &str, local_ref: &str) -> String {
+    format!("+{fetch_ref}:{local_ref}")
+}
+
+/// Remove a merge's scratch fork ref, logging rather than failing: the merge
+/// has already been decided by the time this runs, and a leftover ref is
+/// overwritten by the next forced fetch anyway.
+fn discard_fork_ref(repo_path: &std::path::Path, ref_name: &str) {
+    if let Err(error) = gix_delete_ref(repo_path, ref_name) {
+        tracing::warn!(
+            ref_name,
+            error = %format!("{error:#}"),
+            "failed to clean up a pull request's scratch fork ref"
+        );
+    }
+}
+
 fn gix_delete_ref(repo_path: &std::path::Path, ref_name: &str) -> Result<()> {
     let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
