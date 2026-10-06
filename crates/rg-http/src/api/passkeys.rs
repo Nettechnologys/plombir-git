@@ -115,7 +115,9 @@ struct RelyingParty {
 /// Resolve the WebAuthn relying-party id and origin for this request.
 ///
 /// Prefers the configured `external_url`; otherwise derives them from the
-/// request `Host` header + forwarded scheme. `rp_id` is the host without a port;
+/// request `Host` header and the scheme the request arrived over — the
+/// server's own `[tls]` listener or a proxy's `X-Forwarded-Proto`, see
+/// [`crate::public_url::request_is_https`]. `rp_id` is the host without a port;
 /// `origin` is the exact `scheme://host[:port]` the browser will report.
 fn resolve_rp(state: &AppState, headers: &HeaderMap) -> Result<RelyingParty, AppError> {
     if let Some(ext) = state.external_url.as_deref() {
@@ -134,7 +136,10 @@ fn resolve_rp(state: &AppState, headers: &HeaderMap) -> Result<RelyingParty, App
         .and_then(|v| v.to_str().ok())
         .filter(|h| !h.is_empty())
         .ok_or_else(|| AppError::bad_request("missing Host header"))?;
-    let scheme = if is_https_request(headers) {
+    // Not the cookie helper's forwarded-header check alone: on a `[tls]`
+    // listener with no proxy the browser reports `https://`, and an `http://`
+    // origin here refused every ceremony (card_f78054e9e98f).
+    let scheme = if crate::public_url::request_is_https(state, headers) {
         "https"
     } else {
         "http"

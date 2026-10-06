@@ -505,19 +505,13 @@ pub async fn batch(
     let repo_id = repo_model.id;
     let lfs_root = rg_core::lfs::service::lfs_root(&state.repo_root, &owner, &repo);
 
-    // Prefer the configured public URL so signed actions retain HTTPS and the
-    // externally visible host when Plombir Git runs behind a reverse proxy.
-    let base_url = state
-        .external_url
-        .as_deref()
-        .map(|url| url.trim_end_matches('/').to_string())
-        .or_else(|| {
-            headers
-                .get("host")
-                .and_then(|value| value.to_str().ok())
-                .map(|host| format!("http://{host}"))
-        })
-        .unwrap_or_else(|| "http://localhost:8080".to_string());
+    // The client follows these hrefs as given, so they must name the address
+    // it can reach: `external_url` behind a proxy, `https` on a `[tls]`
+    // listener (card_f78054e9e98f).
+    let base_url = match crate::public_url::require_public_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
 
     match rg_core::lfs::service::batch(
         &state.db,

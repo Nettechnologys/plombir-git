@@ -3829,11 +3829,15 @@ fn matches_index_prefix(prefix: &[String], name: &str) -> bool {
 /// URL a user configures is
 /// `sparse+{base}/api/v1/repos/{owner}/{name}/packages/cargo/index/`.
 pub async fn cargo_index_config(
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
-    let base_url = build_base_url(&headers);
+    let base_url = match package_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
     let json = rg_core::package_registry::build_cargo_index_config(&base_url, &owner, &name);
 
     (
@@ -3940,19 +3944,10 @@ pub async fn npm_registry_metadata(
         Err(e) => return package_error_response(e),
     };
 
-    // Determine base URL from request host header
-    let base_url = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(|host| {
-            let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
-                "http"
-            } else {
-                "https"
-            };
-            format!("{}://{}", scheme, host)
-        })
-        .unwrap_or_else(|| "http://localhost".into());
+    let base_url = match package_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
 
     let npm_versions: Vec<rg_core::package_registry::NpmVersionInfo> = versions
         .iter()
@@ -4332,7 +4327,10 @@ pub async fn pypi_simple_index(
         Err(e) => return AppError::from(e).into_response(),
     };
 
-    let base_url = build_base_url(&headers);
+    let base_url = match package_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
 
     // The download route matches on the *stored* package name, so the link has
     // to carry that one and not the normalized spelling the client asked with.
@@ -4457,7 +4455,11 @@ pub async fn pypi_simple_root_index(
             Err(error) => return package_error_response(error),
         };
 
-    let base = pypi_simple_base(&build_base_url(&headers), &owner, &name);
+    let base_url = match package_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
+    let base = pypi_simple_base(&base_url, &owner, &name);
 
     let projects: Vec<rg_core::package_registry::PyPIProjectEntry> = packages
         .iter()
@@ -5209,11 +5211,15 @@ pub async fn maven_upload(
 ///
 /// NuGet Service Index (v3) — returns the list of available API resources.
 pub async fn nuget_service_index(
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
-    let base_url = build_base_url(&headers);
+    let base_url = match package_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
     let json = rg_core::package_registry::build_service_index(&base_url, &owner, &name);
 
     (
@@ -5247,7 +5253,10 @@ pub async fn nuget_registration_index(
         Err(e) => return package_error_response(e),
     };
 
-    let base_url = build_base_url(&headers);
+    let base_url = match package_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
     let registration_url = nuget_registration_url(&base_url, &owner, &name, &pkg_name);
     let entries = versions
         .iter()
@@ -5303,7 +5312,10 @@ pub async fn nuget_registration_leaf(
         );
     };
 
-    let base_url = build_base_url(&headers);
+    let base_url = match package_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
     let registration_url = nuget_registration_url(&base_url, &owner, &name, &pkg_name);
     let entry = match nuget_registration_entry(&base_url, &owner, &name, &pkg_name, found) {
         Ok(entry) => entry,
@@ -5381,7 +5393,10 @@ pub async fn nuget_search(
     Query(params): Query<NuGetSearchParams>,
 ) -> axum::response::Response {
     let query = params.q.as_deref().unwrap_or("");
-    let base_url = build_base_url(&headers);
+    let base_url = match package_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
 
     // List all nuget packages in the repo. A repository that never enabled the
     // registry answers an empty result set rather than a 404: the service index
@@ -5821,7 +5836,10 @@ pub async fn rubygems_gem_info(
         Err(e) => return package_error_response(e),
     };
 
-    let base_url = build_base_url(&headers);
+    let base_url = match package_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
     let root = rubygems_root(&base_url, &owner, &name);
 
     let version_info = versions
@@ -6348,7 +6366,10 @@ pub async fn helm_index(
     Path((owner, name)): Path<(String, String)>,
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
-    let base_url = build_base_url(&headers);
+    let base_url = match package_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
 
     // List all helm packages in the repo
     let packages =
@@ -6447,7 +6468,10 @@ pub async fn composer_packages_json(
     Path((owner, name)): Path<(String, String)>,
     CiRead::<Packages> { .. }: CiRead<Packages>,
 ) -> axum::response::Response {
-    let base_url = build_base_url(&headers);
+    let base_url = match package_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
 
     let packages = match rg_core::package_registry::service::list_packages(
         &state.db, &owner, &name, "composer",
@@ -6640,19 +6664,12 @@ fn parse_helm_metadata(
 
 // ── helpers ───────────────────────────────────────────────
 
-fn build_base_url(headers: &axum::http::HeaderMap) -> String {
-    headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(|host| {
-            let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
-                "http"
-            } else {
-                "https"
-            };
-            format!("{}://{}", scheme, host)
-        })
-        .unwrap_or_else(|| "http://localhost".into())
+/// The base of every link a package index hands its client. The client
+/// downloads from these links as given, so they come from the one rule in
+/// [`crate::public_url`] — never from a scheme guessed off the host name
+/// (card_f78054e9e98f).
+fn package_base_url(state: &AppState, headers: &axum::http::HeaderMap) -> Result<String, AppError> {
+    crate::public_url::require_public_base_url(state, headers)
 }
 
 /// What a NuGet version's stored `protocol_metadata` says, in the shape the

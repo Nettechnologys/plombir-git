@@ -173,6 +173,7 @@ mod pr_state_gate_status_tests;
 mod private_repo_issue_metadata_tests;
 mod private_repo_visibility_tests;
 mod protection_allow_list_naming_tests;
+mod public_base_url_tests;
 mod pull_request_ci_tests;
 mod pull_request_head_namespace_tests;
 mod push_hook_drain_tests;

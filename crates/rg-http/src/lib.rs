@@ -34,6 +34,7 @@ mod content_disposition;
 mod git_http;
 mod handlers;
 mod http_stream;
+mod public_url;
 mod refusal;
 // Public for the same reason `route_table` is: `required_pat_scope` states
 // which token family a route belongs to, and the only way to check that
@@ -137,8 +138,16 @@ pub struct AppState {
     pub log_write_queue: rg_core::ci::log_write_queue::LogWriteQueue,
     /// Tracker for detached delivery/post-push work owned by this app state.
     pub delivery_tracker: rg_core::task_tracker::TaskTracker,
-    /// External-facing base URL for SSO callbacks (None = detect from request).
+    /// Configured public base URL — `[server].external_url`. Read it through
+    /// `public_url`, which owns the fallback to the request `Host` when this
+    /// is `None`; a handler that formats its own fallback is how three features
+    /// came to name three different addresses (card_f78054e9e98f).
     pub external_url: Option<String>,
+    /// Whether this process terminates TLS on its own listener (`[tls]`).
+    /// Without `external_url` it decides the scheme of every URL the server
+    /// hands back, so it has to be the listener's truth, not a guess from the
+    /// host name.
+    pub tls_enabled: bool,
     /// CI job timeout in seconds.
     pub job_timeout_secs: u64,
     /// Wall-clock timeout (seconds) for streaming git operations
@@ -378,7 +387,10 @@ pub struct HttpServerConfig {
     /// TLS configuration: (cert_path, key_path). None = HTTP only.
     pub tls_config: Option<(PathBuf, PathBuf)>,
     /// External-facing base URL (e.g., "<https://git.example.com>").
-    /// Used for SSO callbacks and as the stable WebAuthn relying party.
+    /// The base of every URL the server hands a client to follow (LFS actions,
+    /// OCI realm, OIDC issuer, package indexes, SSO callbacks, reset links) and
+    /// the stable WebAuthn relying party. Unset, those fall back to the request
+    /// `Host` with the scheme of the listener — see `tls_config`.
     pub external_url: Option<String>,
     /// CI job timeout in seconds (default: 3600).
     pub job_timeout_secs: u64,
@@ -581,6 +593,7 @@ async fn run_with_listener(
         log_write_queue,
         delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
         external_url: config.external_url,
+        tls_enabled: config.tls_config.is_some(),
         job_timeout_secs: config.job_timeout_secs,
         git_stream_timeout_secs: config.git_stream_timeout_secs,
         git_idle_timeout_secs: config.git_idle_timeout_secs,

@@ -164,26 +164,15 @@ fn sign_cookie_value(value: &str, secret: &str) -> String {
 
 // ── Extract base URL ─────────────────────────────────────────────
 
-fn get_base_url(headers: &HeaderMap) -> String {
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost:8080");
-    let scheme = if host.contains(":443") || host.contains(":8443") {
-        "https"
-    } else {
-        "http"
-    };
-    format!("{}://{}", scheme, host)
-}
-
-fn get_api_base_url(state: &AppState, headers: &HeaderMap) -> String {
-    let base = state
-        .external_url
-        .as_ref()
-        .map(|url| url.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| get_base_url(headers));
-    format!("{}/api/v1", base.trim_end_matches('/'))
+/// The API base the provider redirects the browser back to. It has to be the
+/// address the browser can reach and the IdP has registered, so it comes from
+/// [`crate::public_url`]: the old port-sniffing (`:443` → https) never fired,
+/// because a browser does not write the default port into `Host`, and every
+/// SSO round trip on a `[tls]` listener came back to `http://`
+/// (card_f78054e9e98f).
+fn get_api_base_url(state: &AppState, headers: &HeaderMap) -> Result<String, AppError> {
+    let base = crate::public_url::require_public_base_url(state, headers)?;
+    Ok(format!("{base}/api/v1"))
 }
 
 // ── Provider resolution ──────────────────────────────────────────
@@ -430,7 +419,7 @@ pub async fn authorize(
 ) -> Result<impl IntoResponse, AppError> {
     let provider = resolve_usable_provider(&state, &slug).await?;
 
-    let base_url = get_api_base_url(&state, &headers);
+    let base_url = get_api_base_url(&state, &headers)?;
     let redirect_url = format!("{}/auth/sso/{}/callback", base_url, slug);
 
     let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
@@ -526,7 +515,7 @@ pub async fn callback(
     // ── Get provider config ──────────────────────────────────────
     let provider = resolve_usable_provider(&state, &slug).await?;
 
-    let base_url = get_api_base_url(&state, &headers);
+    let base_url = get_api_base_url(&state, &headers)?;
     let redirect_url = format!("{}/auth/sso/{}/callback", base_url, slug);
 
     let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);

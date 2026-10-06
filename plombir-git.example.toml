@@ -25,11 +25,13 @@ ssh_addr = "0.0.0.0:2222"
 # envelopes get bounded protocol headroom, so this remains the real artifact
 # ceiling for every package manager rather than a smaller npm-only limit.
 package_upload_max_mb = 512
-# Public URL of this instance, used in SSO callbacks, emails and webhook
-# payloads, and as the Git LFS endpoint for clones made from the SSH URL. Set it
-# to whatever your reverse proxy serves — left unset, links built by the server
-# point at the address it bound to, and `git lfs` over SSH needs a manual
-# `lfs.url`.
+# Public URL of this instance: the base of every link the server hands a
+# client to follow — SSO callbacks, emails, webhook payloads, Git LFS actions,
+# the OCI token realm, the CI OIDC issuer, package indexes — and the Git LFS
+# endpoint for clones made from the SSH URL. Set it to whatever your reverse
+# proxy serves. Left unset, links name the request's `Host`, over `https` when
+# `[tls]` is configured or a proxy sends `X-Forwarded-Proto: https`, and
+# `git lfs` over SSH needs a manual `lfs.url`.
 # external_url = "https://git.example.com"
 # Seconds allowed for draining in-flight requests and the CI-log queue after
 # SIGTERM / ctrl-c before the process is forced down. Raise it if a slow clone

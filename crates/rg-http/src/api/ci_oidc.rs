@@ -15,16 +15,8 @@ pub struct TokenQuery {
 }
 
 fn issuer(state: &AppState, headers: &HeaderMap) -> Result<String, AppError> {
-    if let Some(url) = state.external_url.as_deref() {
-        return Ok(format!("{}/api/v1/ci/oidc", url.trim_end_matches('/')));
-    }
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| {
-            AppError::bad_request("Host header is required when external_url is not configured")
-        })?;
-    Ok(format!("http://{host}/api/v1/ci/oidc"))
+    let base = crate::public_url::require_public_base_url(state, headers)?;
+    Ok(format!("{base}/api/v1/ci/oidc"))
 }
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers

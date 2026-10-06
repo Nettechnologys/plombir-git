@@ -897,17 +897,13 @@ pub async fn forgot_password(
     headers: HeaderMap,
     Json(body): Json<ForgotPasswordRequest>,
 ) -> impl IntoResponse {
-    // Determine base URL from Host header (fallback to localhost)
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost:3000");
-    let scheme = if host.contains("localhost") || host.contains("127.0.0.1") {
-        "http"
-    } else {
-        "https"
+    // The link in the mail names the instance's public address: the configured
+    // `external_url` first, which the old Host-only derivation never read
+    // (card_f78054e9e98f).
+    let base_url = match crate::public_url::require_public_base_url(&state, &headers) {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
     };
-    let base_url = format!("{}://{}", scheme, host);
 
     match rg_core::user::service::forgot_password(
         &state.db,

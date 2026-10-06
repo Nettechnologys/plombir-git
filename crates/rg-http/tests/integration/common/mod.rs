@@ -328,6 +328,13 @@ pub struct StateOverrides {
     /// must load it through `rg_core::auth::instance_key::load_or_adopt` and
     /// inject it here, which is the production path.
     pub instance_key: Option<Arc<rg_core::auth::instance_key::InstanceKey>>,
+    /// `[server].external_url` for this state. The default leaves it unset,
+    /// so client-facing URLs come from the request `Host`.
+    pub external_url: Option<String>,
+    /// Reports this state as terminating TLS itself, as `[tls]` does in
+    /// production. The harness still serves plain HTTP; what changes is the
+    /// scheme the server writes into the URLs it hands back.
+    pub tls_enabled: bool,
 }
 
 /// The at-rest encryption key every test AppState carries.
@@ -427,7 +434,8 @@ pub fn build_test_app_state_with(
         )),
         log_write_queue: rg_core::ci::log_write_queue::LogWriteQueue::spawn(db_for_queue),
         delivery_tracker: overrides.delivery_tracker.unwrap_or_default(),
-        external_url: None,
+        external_url: overrides.external_url,
+        tls_enabled: overrides.tls_enabled,
         job_timeout_secs: rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,

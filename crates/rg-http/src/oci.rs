@@ -355,12 +355,11 @@ fn oci_status_for<E: OciDbStatus>(e: &E) -> StatusCode {
 /// version check advertises: a client takes the scope out of the challenge and
 /// asks the token endpoint for exactly that, so a wrong scope here buys a token
 /// that is refused again.
-fn oci_unauthorized(headers: &HeaderMap, scope: &str, message: &str) -> Response {
-    let challenge = www_authenticate(
-        &format!("{}/v2/auth/token", get_base_url(headers)),
-        REGISTRY_SERVICE,
-        scope,
-    );
+fn oci_unauthorized(state: &AppState, headers: &HeaderMap, scope: &str, message: &str) -> Response {
+    let Some(realm) = token_realm(state, headers) else {
+        return missing_host_refusal();
+    };
+    let challenge = www_authenticate(&realm, REGISTRY_SERVICE, scope);
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, challenge.as_str())],
@@ -589,6 +588,7 @@ async fn require_access(
     match check_access(state, headers, owner, repo, required_action).await {
         Ok((true, user_id)) => Ok(user_id),
         Ok((false, _)) => Err(oci_unauthorized(
+            state,
             headers,
             &format!("repository:{owner}/{repo}:{required_action}"),
             "authentication required",
@@ -641,7 +641,9 @@ pub async fn api_version_check(State(state): State<AppState>, headers: HeaderMap
     // The realm is not decoration: a client does not guess where to get its
     // token, it reads this path out of the challenge and goes there. It has to
     // be the path `build_v2_routes` registers for `oci::get_token`.
-    let realm = format!("{}/v2/auth/token", get_base_url(&headers));
+    let Some(realm) = token_realm(&state, &headers) else {
+        return missing_host_refusal();
+    };
 
     (
         StatusCode::UNAUTHORIZED,
@@ -2953,19 +2955,22 @@ async fn find_or_create_oci_repo(
     .map_err(Into::into)
 }
 
-fn get_base_url(headers: &HeaderMap) -> String {
-    headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(|host| {
-            let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
-                "http"
-            } else {
-                "https"
-            };
-            format!("{}://{}", scheme, host)
-        })
-        .unwrap_or_else(|| "http://localhost".into())
+/// The token endpoint a challenge sends the client to, on this instance's
+/// public address — `external_url` behind a proxy, the listener's own scheme
+/// otherwise, never a scheme guessed from the host name (card_f78054e9e98f).
+///
+fn token_realm(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    crate::public_url::public_base_url(state, headers).map(|base| format!("{base}/v2/auth/token"))
+}
+
+/// What a challenge answers when [`token_realm`] has no address to name.
+fn missing_host_refusal() -> Response {
+    let refusal = crate::public_url::missing_host();
+    oci_err(
+        refusal.status(),
+        error_codes::UNSUPPORTED,
+        &refusal.to_string(),
+    )
 }
 
 #[cfg(test)]
