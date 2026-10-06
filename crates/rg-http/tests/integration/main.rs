@@ -158,6 +158,7 @@ mod pagination_page_size_tests;
 mod passkey_ceremony_single_use_tests;
 mod passkey_counter_persistence_tests;
 mod password_hash_failure_status_tests;
+mod password_reset_link_origin_tests;
 mod password_reset_mfa_tests;
 mod password_reset_single_use_tests;
 mod pat_api_tests;

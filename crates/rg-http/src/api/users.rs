@@ -888,9 +888,19 @@ pub async fn forgot_password(
     headers: HeaderMap,
     Json(body): Json<ForgotPasswordRequest>,
 ) -> impl IntoResponse {
-    // The link in the mail names the instance's public address: the configured
-    // `external_url` first, which the old Host-only derivation never read
-    // (card_f78054e9e98f).
+    // The link goes into a mailbox the requester does not control, and this
+    // endpoint is anonymous: a base taken from the request `Host` lets anyone
+    // ask for a victim's reset and have the real token mailed to them as a link
+    // to their own host. Only the configured address may be named in it, so
+    // with mail configured and no `external_url` the reset is refused before
+    // any token is issued (card_e67aeb8c09ca). Without mail no link leaves the
+    // process, and the request-derived base below is never seen by anyone.
+    if state.smtp_config.is_some() && state.external_url.is_none() {
+        return AppError::internal(
+            "password reset mail is refused: [server].external_url is not configured, and a reset link built from the request Host would let the requester choose where the token is sent",
+        )
+        .into_response();
+    }
     let base_url = match crate::public_url::require_public_base_url(&state, &headers) {
         Ok(url) => url,
         Err(e) => return e.into_response(),

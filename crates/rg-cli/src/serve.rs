@@ -1257,6 +1257,15 @@ pub(crate) async fn run_serve(
         }
         _ => None,
     };
+    // A reset link may only name the configured public address — one taken
+    // from the request `Host` would let an anonymous requester choose where a
+    // victim's token is sent — so `forgot-password` refuses mail without it
+    // (card_e67aeb8c09ca). Say so now rather than at the first locked-out user.
+    if smtp_config.is_some() && resolved_external_url.is_none() {
+        tracing::warn!(
+            "SMTP is configured but [server].external_url is not: password reset emails will be refused until external_url names this instance's public URL"
+        );
+    }
 
     let tls_config = match (resolved_tls_cert, resolved_tls_key) {
         (Some(cert), Some(key)) => {

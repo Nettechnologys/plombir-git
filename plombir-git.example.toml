@@ -168,6 +168,9 @@ agent_max = 600
 agent_window_secs = 60
 
 [smtp]
+# Password-reset mail needs [server].external_url as well: the link may only
+# name the configured address, never one taken from the request, so without it
+# reset requests are refused.
 # host = "smtp.example.com"
 # port = 587
 # user = "noreply@example.com"

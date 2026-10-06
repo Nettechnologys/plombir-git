@@ -335,6 +335,9 @@ pub struct StateOverrides {
     /// production. The harness still serves plain HTTP; what changes is the
     /// scheme the server writes into the URLs it hands back.
     pub tls_enabled: bool,
+    /// Outbound mail for this state. The default is none, so no test sends
+    /// mail it did not ask for.
+    pub smtp_config: Option<rg_core::email::SmtpConfig>,
 }
 
 /// The at-rest encryption key every test AppState carries.
@@ -426,7 +429,7 @@ pub fn build_test_app_state_with(
             .package_upload_max_bytes
             .unwrap_or(rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES),
         notification_hub: rg_http::ws::NotificationHub::new(),
-        smtp_config: None,
+        smtp_config: overrides.smtp_config,
         oci_storage: Arc::new(OciStorage::from_backend(
             blob_storage,
             oci_upload_root,
