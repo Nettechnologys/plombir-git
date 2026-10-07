@@ -1842,6 +1842,11 @@ pub(crate) fn build_all_routes(
         )
         .get(
             RepoRead,
+            "/repos/{owner}/{name}/raw/{*path}",
+            api::repo_content::get_raw,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/log",
             api::repo_content::get_log,
         )

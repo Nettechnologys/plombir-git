@@ -1207,7 +1207,7 @@ async fn discard_stored_blob(
 }
 
 /// Whether a row currently points at the object's blob as a live upload.
-pub(crate) async fn object_claims_upload(
+pub async fn object_claims_upload(
     db: &DatabaseConnection,
     repo_id: i64,
     oid: &str,

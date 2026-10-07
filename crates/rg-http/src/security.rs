@@ -104,11 +104,20 @@ pub async fn security_headers_middleware(
     // SvelteKit hydration works without weakening CSP.
     // `style-src 'unsafe-inline'` is retained because SvelteKit inlines styles
     // and there is no runtime mechanism to nonce them in static-build mode.
-    let csp = build_content_security_policy(&nonce);
-    headers.insert(
-        header::HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_str(&csp).expect("CSP header is valid ASCII"),
-    );
+    //
+    // A handler that serves repository content sets a policy of its own — the
+    // raw file route sandboxes everything it serves. Both are kept: a browser
+    // enforces every policy it is given, so the second one can only narrow
+    // what the first allows, and overwriting it would have handed committed
+    // HTML this origin's script rights again.
+    let csp = HeaderValue::from_str(&build_content_security_policy(&nonce))
+        .expect("CSP header is valid ASCII");
+    let csp_name = header::HeaderName::from_static("content-security-policy");
+    if headers.contains_key(&csp_name) {
+        headers.append(csp_name, csp);
+    } else {
+        headers.insert(csp_name, csp);
+    }
 
     // Permissions Policy — disable unused browser features
     headers.insert(
@@ -262,6 +271,40 @@ mod tests {
         assert!(headers.get("content-security-policy").is_some());
         assert!(headers.get("permissions-policy").is_some());
         assert!(headers.get("cross-origin-opener-policy").is_some());
+    }
+
+    /// The raw file route sandboxes what it serves; the global policy must be
+    /// added beside that, never put in its place.
+    #[tokio::test]
+    async fn a_handler_s_own_policy_is_kept_beside_the_global_one() {
+        async fn sandboxed() -> impl axum::response::IntoResponse {
+            (
+                [(
+                    header::CONTENT_SECURITY_POLICY,
+                    "default-src 'none'; sandbox",
+                )],
+                "committed content",
+            )
+        }
+        let app = Router::new()
+            .route("/", get(sandboxed))
+            .layer(from_fn_with_state(false, security_headers_middleware));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let policies = response
+            .headers()
+            .get_all("content-security-policy")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(policies.len(), 2, "{policies:?}");
+        assert_eq!(policies[0], "default-src 'none'; sandbox");
+        assert!(
+            policies[1].contains("frame-ancestors 'none'"),
+            "{policies:?}"
+        );
     }
 
     #[tokio::test]

@@ -161,6 +161,24 @@ pub struct BlobContent {
     /// against a memory-amplification DoS where a huge committed file would be
     /// base64-inflated (×4/3) and JSON-escaped into a single in-memory frame.
     pub too_large: bool,
+    /// Present when the committed file is a Git LFS pointer: `content` is then
+    /// the pointer's three lines, and the file itself is the object it names,
+    /// served by `GET /repos/{owner}/{name}/raw/{path}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lfs: Option<BlobLfs>,
+}
+
+/// The LFS object a pointer file names.
+#[derive(Serialize)]
+pub struct BlobLfs {
+    /// SHA-256 of the object, lowercase hex.
+    pub oid: String,
+    /// Size of the object in bytes, as the pointer declares it.
+    pub size: u64,
+    /// Whether this repository has the object. `false` is the honest answer
+    /// for a pointer pushed without `git lfs push`, or imported from a source
+    /// that did not give its objects: the raw route then answers `404`.
+    pub available: bool,
 }
 
 /// Upper bound (bytes) on a blob the JSON blob API will inline. A file larger
@@ -458,7 +476,7 @@ fn branch_names(repo: &gix::Repository) -> anyhow::Result<Vec<String>> {
         BlobQuery,
     ),
     responses(
-        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 200, description = "The committed blob. A Git LFS pointer file also carries `lfs: {oid, size, available}`; its content is served by `/repos/{owner}/{name}/raw/{path}`", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 404, description = "Repository or ref not found", body = serde_json::Value),
         (status = 500, description = "Repository storage or commit history could not be read", body = serde_json::Value),
@@ -466,7 +484,9 @@ fn branch_names(repo: &gix::Repository) -> anyhow::Result<Vec<String>> {
 )]
 pub async fn get_blob(
     State(state): State<AppState>,
-    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
+    CiRead::<RepoContents> {
+        repo: repo_model, ..
+    }: CiRead<RepoContents>,
     Path((owner, repo, path)): Path<(String, String, String)>,
     Query(params): Query<BlobQuery>,
 ) -> impl IntoResponse {
@@ -488,12 +508,264 @@ pub async fn get_blob(
     let git_ref = params.r#ref.unwrap_or_else(|| "HEAD".to_string());
 
     match get_blob_content(&repo_path, &git_ref, &path) {
-        Ok(blob) => (StatusCode::OK, Json(blob)).into_response(),
+        Ok(mut blob) => {
+            if let Some(lfs) = blob.lfs.as_mut() {
+                lfs.available = match rg_core::lfs::service::object_claims_upload(
+                    &state.db,
+                    repo_model.id,
+                    &lfs.oid,
+                )
+                .await
+                {
+                    Ok(available) => available,
+                    Err(e) => return AppError::from(e).into_response(),
+                };
+            }
+            (StatusCode::OK, Json(blob)).into_response()
+        }
         // Only the two typed outcomes of `get_blob_content` become 4xx; a git
         // layer that failed is a 5xx, and `From<anyhow::Error>` logs the full
         // context chain for operators before sanitizing the body.
         Err(e) => AppError::from(e).into_response(),
     }
+}
+
+/// Get a file's bytes — for an LFS pointer, the object it names.
+/// GET /api/v1/repos/:owner/:name/raw/:path
+///
+/// What the file view shows an image with and downloads anything else from.
+/// The JSON blob API answers with the committed blob, which for an LFS file is
+/// three lines of pointer text; this answers with the file the person
+/// committed. A pointer whose object this repository does not store is a
+/// `404`, never the pointer text dressed up as the file.
+///
+/// The content is the repository's, served from the same origin as the web
+/// application and readable with its session cookie, so only raster images are
+/// served `inline` under their own type; everything else is an
+/// `application/octet-stream` attachment. Both carry `nosniff` and a sandboxing
+/// CSP, so nothing committed can run as this origin.
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/raw/{*path}",
+    tag = "Repository Content",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        BlobQuery,
+    ),
+    responses(
+        (status = 200, description = "The file's bytes; an LFS object for a pointer file", content_type = "application/octet-stream"),
+        (status = 400, description = "The path is not a file", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "Repository, ref, file, or the LFS object a pointer names not found", body = serde_json::Value),
+        (status = 500, description = "Repository or LFS storage could not be read", body = serde_json::Value),
+    ),
+)]
+pub async fn get_raw(
+    State(state): State<AppState>,
+    CiRead::<RepoContents> {
+        repo: repo_model, ..
+    }: CiRead<RepoContents>,
+    Path((owner, repo, path)): Path<(String, String, String)>,
+    Query(params): Query<BlobQuery>,
+) -> axum::response::Response {
+    if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
+        return AppError::bad_request(e.to_string()).into_response();
+    }
+    if let Err(e) = rg_core::platform::validate_repo_path(&repo) {
+        return AppError::bad_request(e.to_string()).into_response();
+    }
+    let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
+    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(e).into_response();
+    }
+    let git_ref = params.r#ref.unwrap_or_else(|| "HEAD".to_string());
+
+    let raw = match read_raw_blob(&repo_path, &git_ref, &path) {
+        Ok(raw) => raw,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    let response = match raw {
+        RawBlob::Loaded(data) => match rg_core::lfs::pointer::parse(&data) {
+            Some(pointer) => {
+                match rg_core::lfs::service::object_claims_upload(
+                    &state.db,
+                    repo_model.id,
+                    &pointer.oid,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return AppError::not_found(
+                            "this file is stored in Git LFS and its object has not been \
+                             uploaded to this server",
+                        )
+                        .into_response()
+                    }
+                    Err(e) => return AppError::from(e).into_response(),
+                }
+                let mut response =
+                    crate::api::lfs::lfs_object_response(&state, &owner, &repo, &pointer.oid).await;
+                if response.status() == StatusCode::OK
+                    && !response
+                        .headers()
+                        .contains_key(axum::http::header::CONTENT_LENGTH)
+                {
+                    // A compressed object streams without a length; the
+                    // pointer's size is what it decompresses to.
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&pointer.size.to_string())
+                    {
+                        response
+                            .headers_mut()
+                            .insert(axum::http::header::CONTENT_LENGTH, value);
+                    }
+                }
+                response
+            }
+            None => {
+                let length = data.len();
+                let mut response = (
+                    StatusCode::OK,
+                    crate::http_stream::buffered_body_with_idle(data, state.git_idle_timeout_secs),
+                )
+                    .into_response();
+                if let Ok(value) = axum::http::HeaderValue::from_str(&length.to_string()) {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::CONTENT_LENGTH, value);
+                }
+                response
+            }
+        },
+        // Larger than any pointer and than the inline cap: stream it from git
+        // rather than hold it, the way an archive is streamed.
+        RawBlob::Large { id, size } => {
+            match stream_large_blob(&state, repo_path, &id.to_string(), size).await {
+                Ok(response) => response,
+                Err(e) => return AppError::from(e).into_response(),
+            }
+        }
+    };
+    raw_file_headers(response, &path)
+}
+
+/// A blob read for the raw route.
+enum RawBlob {
+    /// Small enough to hold — every pointer is.
+    Loaded(Vec<u8>),
+    /// Too large to hold; streamed by id.
+    Large { id: gix::ObjectId, size: u64 },
+}
+
+fn read_raw_blob(
+    repo_path: &std::path::Path,
+    git_ref: &str,
+    path: &str,
+) -> anyhow::Result<RawBlob> {
+    let repo = rg_git::repository::open(repo_path)
+        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
+    let (id, size) = resolve_blob(&repo, repo_path, git_ref, path)?;
+    if size > MAX_BLOB_API_BYTES {
+        return Ok(RawBlob::Large { id, size });
+    }
+    let object = repo
+        .find_object(id)
+        .with_context(|| format!("failed to read blob {id} in {}", repo_path.display()))?;
+    Ok(RawBlob::Loaded(object.detach().data))
+}
+
+/// Stream a blob too large to hold through `git cat-file`, idle-guarded like
+/// an archive. The id was read from the tree a moment ago, so a git that fails
+/// here is a repository failure, never the caller's.
+async fn stream_large_blob(
+    state: &AppState,
+    repo_path: std::path::PathBuf,
+    id: &str,
+    size: u64,
+) -> anyhow::Result<axum::response::Response> {
+    let git = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let child = git
+        .spawn_async(&["cat-file", "blob", id], Some(&repo_path))
+        .await
+        .context("git cat-file failed to start")?;
+    let stream =
+        crate::http_stream::split_git_child(child).context("git cat-file has no output")?;
+    let body = crate::http_stream::git_child_body_with_idle(
+        stream,
+        state.git_idle_timeout_secs,
+        crate::http_stream::GitStreamSource {
+            job_id: None,
+            repo_path,
+            what: "raw file",
+        },
+    );
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_LENGTH, size.to_string())],
+        body,
+    )
+        .into_response())
+}
+
+/// The raster image types the raw route shows inline, by extension. SVG is
+/// deliberately absent: it is a document that can carry script.
+fn inline_image_type(path: &str) -> Option<&'static str> {
+    let extension = path.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        _ => return None,
+    })
+}
+
+/// Type, disposition and the headers that keep committed content from running
+/// as this origin. Applied to a `200` only: a refusal keeps its JSON envelope.
+fn raw_file_headers(
+    mut response: axum::response::Response,
+    path: &str,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let headers = response.headers_mut();
+    match inline_image_type(path) {
+        Some(content_type) => {
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("inline"),
+            );
+        }
+        None => {
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                crate::content_disposition::attachment(filename),
+            );
+        }
+    }
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    response
 }
 
 /// Get commit log for a repo or a specific file.
@@ -796,14 +1068,14 @@ fn list_tree_entries(
     Ok(entries)
 }
 
-fn get_blob_content(
+/// Resolve `ref:path` to a blob: its id and size, read from the object header
+/// without loading the blob.
+fn resolve_blob(
+    repo: &gix::Repository,
     repo_path: &std::path::Path,
     git_ref: &str,
     path: &str,
-) -> anyhow::Result<BlobContent> {
-    let repo = rg_git::repository::open(repo_path)
-        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
-
+) -> anyhow::Result<(gix::ObjectId, u64)> {
     // Exactly two outcomes below belong to the client: the `ref:path` pair does
     // not resolve, and it resolves to something that is not a file. They carry
     // `rg_core::error::NotFound` / `InvalidRequest` so the HTTP layer can name
@@ -820,7 +1092,7 @@ fn get_blob_content(
     // repository losing objects kept answering `404 file not found`
     // (card_7cb31c61cee2). Ref and path are resolved separately below, each
     // through an API whose `None` means absence and nothing else.
-    let commit_id = resolve_content_ref(&repo, git_ref, repo_path)?;
+    let commit_id = resolve_content_ref(repo, git_ref, repo_path)?;
 
     let tree = commit_id
         .object()
@@ -840,7 +1112,7 @@ fn get_blob_content(
             )
         })?;
 
-    let Some(entry) = lookup_tree_path(&repo, tree, path, repo_path, git_ref)? else {
+    let Some(entry) = lookup_tree_path(repo, tree, path, repo_path, git_ref)? else {
         return Err(
             anyhow::Error::new(rg_core::error::NotFound::new("file")).context(format!(
                 "path '{}' is not in {:?} at '{}'",
@@ -868,7 +1140,17 @@ fn get_blob_content(
         // and the fixed text carries no request data (H-05).
         return Err(rg_core::error::invalid_request("path is not a file"));
     }
-    let blob_size = header.size();
+    Ok((object_id, header.size()))
+}
+
+fn get_blob_content(
+    repo_path: &std::path::Path,
+    git_ref: &str,
+    path: &str,
+) -> anyhow::Result<BlobContent> {
+    let repo = rg_git::repository::open(repo_path)
+        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
+    let (object_id, blob_size) = resolve_blob(&repo, repo_path, git_ref, path)?;
     if blob_size > MAX_BLOB_API_BYTES {
         // Memory-amplification guard: return metadata only, never load/encode.
         return Ok(BlobContent {
@@ -879,6 +1161,7 @@ fn get_blob_content(
             encoding: "none".to_string(),
             is_binary: false,
             too_large: true,
+            lfs: None,
         });
     }
 
@@ -898,6 +1181,12 @@ fn get_blob_content(
 
     let data = blob.data.as_slice();
     let size = data.len() as i64;
+    // `available` is the database's answer, filled in by the handler.
+    let lfs = rg_core::lfs::pointer::parse(data).map(|pointer| BlobLfs {
+        oid: pointer.oid,
+        size: pointer.size,
+        available: false,
+    });
 
     // Check if binary by looking for null bytes
     let is_binary = data.contains(&0);
@@ -941,6 +1230,7 @@ fn get_blob_content(
         encoding,
         is_binary,
         too_large: false,
+        lfs,
     })
 }
 

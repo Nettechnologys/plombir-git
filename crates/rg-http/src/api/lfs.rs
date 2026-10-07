@@ -705,14 +705,29 @@ pub async fn download_object(
         return response;
     }
 
-    let lfs_root = rg_core::lfs::service::lfs_root(&state.repo_root, &owner, &repo);
+    lfs_object_response(&state, &owner, &repo, &oid).await
+}
+
+/// The stored bytes of one LFS object as a `200`, or the honest refusal.
+///
+/// Shared by the batch API's download action and by the raw file route, so a
+/// file viewed in the browser and the same file fetched by `git lfs pull` are
+/// one read of one object — decompressed the same way, refused the same way.
+/// Authorization is the caller's: both decide it before they get here.
+pub(crate) async fn lfs_object_response(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    oid: &str,
+) -> axum::response::Response {
+    let lfs_root = rg_core::lfs::service::lfs_root(&state.repo_root, owner, repo);
 
     match rg_core::lfs::service::read_object_source(
         state.blob_storage.as_ref(),
         &lfs_root,
-        &owner,
-        &repo,
-        &oid,
+        owner,
+        repo,
+        oid,
     )
     .await
     {
