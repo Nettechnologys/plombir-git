@@ -94,11 +94,32 @@ use crate::platform::fs::{path_error, REPO_ROOT_HINT};
 pub struct ImportStats {
     pub repo_cloned: bool,
     pub labels_imported: usize,
+    /// Labels the source listed, the target did not already have, and the
+    /// target could not create.
+    pub labels_failed: Vec<ImportedObjectFailure>,
     pub milestones_imported: usize,
+    /// Milestones the target could not create. Issues and pull requests that
+    /// point at one of these are imported without their milestone.
+    pub milestones_failed: Vec<ImportedObjectFailure>,
     pub issues_imported: usize,
+    /// Issue comments (GitHub) and issue notes (GitLab) actually written.
     pub issue_comments_imported: usize,
+    /// Pull-request conversation comments (GitHub) and merge-request notes
+    /// (GitLab) actually written. ForgeKeep keeps a pull request's
+    /// conversation as comment-only reviews, so that is where they land.
+    pub pr_comments_imported: usize,
+    /// Comments and notes of either kind the target could not write.
+    pub comments_failed: Vec<ImportedObjectFailure>,
+    /// GitLab system notes ("added label", "mentioned in"), left out on
+    /// purpose: they describe GitLab's own events, not something a person
+    /// wrote. Counted so the source's note total still adds up.
+    pub system_notes_skipped: usize,
     pub prs_imported: usize,
     pub pr_reviews_imported: usize,
+    /// Reviews the target could not write, or that carry no time they were
+    /// submitted at. Unsubmitted (`PENDING`) GitHub drafts are not reviews
+    /// yet and appear in neither list.
+    pub pr_reviews_failed: Vec<ImportedObjectFailure>,
     pub releases_imported: usize,
     /// Releases the source listed but the target could not create.
     pub releases_failed: Vec<ReleaseImportFailure>,
@@ -117,6 +138,54 @@ pub struct ImportStats {
 pub struct ReleaseImportFailure {
     pub tag_name: String,
     pub reason: &'static str,
+}
+
+/// One source object the import did not write, named the way the source names
+/// it (a label's name, a milestone's title, `issue #12 comment 3456`) with a
+/// reason the task owner can act on. Like [`ReleaseImportFailure`], the raw
+/// database error stays in the server log.
+#[derive(Debug, serde::Serialize)]
+pub struct ImportedObjectFailure {
+    pub source: String,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ImportedObject {
+    Label,
+    Milestone,
+    Comment,
+    Review,
+}
+
+impl ImportedObjectFailure {
+    /// The insert of `source` was refused. Logs the full error and keeps only
+    /// its class.
+    fn insert_failed(source: String, object: ImportedObject, error: &anyhow::Error) -> Self {
+        tracing::warn!(
+            object = ?object,
+            source = %source,
+            error = %format!("{error:#}"),
+            "failed to import object"
+        );
+        let reason = match (object, rg_db::is_unique_violation_anyhow(error)) {
+            (ImportedObject::Label, true) => "a label with this name already exists",
+            (ImportedObject::Milestone, true) => "a milestone with this title already exists",
+            (ImportedObject::Label, false) => {
+                "label creation failed; ask the instance operator to check the server log"
+            }
+            (ImportedObject::Milestone, false) => {
+                "milestone creation failed; ask the instance operator to check the server log"
+            }
+            (ImportedObject::Comment, _) => {
+                "comment creation failed; ask the instance operator to check the server log"
+            }
+            (ImportedObject::Review, _) => {
+                "review creation failed; ask the instance operator to check the server log"
+            }
+        };
+        Self { source, reason }
+    }
 }
 
 fn release_failure_reason(error: &anyhow::Error) -> &'static str {
@@ -268,21 +337,34 @@ impl ImportStats {
     /// page shows. The detail lives in `stats`; this line only has to make
     /// sure nobody reads an import with missing content as a clean one.
     pub fn completion_stage(&self) -> String {
-        match (self.lfs_objects_failed.len(), self.releases_failed.len()) {
-            (0, 0) => "Import completed".to_string(),
-            (missing, 0) => format!(
-                "Import completed, but {missing} LFS object(s) could not be fetched from the \
-                 source; the task's stats name each one"
-            ),
-            (0, missing) => format!(
-                "Import completed, but {missing} release(s) could not be imported; \
-                 the task's stats name each one"
-            ),
-            (lfs, releases) => format!(
-                "Import completed, but {lfs} LFS object(s) could not be fetched and \
-                 {releases} release(s) could not be imported; the task's stats name each one"
-            ),
+        let mut missing = Vec::new();
+        if !self.lfs_objects_failed.is_empty() {
+            missing.push(format!(
+                "{} LFS object(s) could not be fetched from the source",
+                self.lfs_objects_failed.len()
+            ));
         }
+        let not_imported: Vec<String> = [
+            (self.labels_failed.len(), "label"),
+            (self.milestones_failed.len(), "milestone"),
+            (self.comments_failed.len(), "comment"),
+            (self.pr_reviews_failed.len(), "review"),
+            (self.releases_failed.len(), "release"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, object)| format!("{count} {object}(s)"))
+        .collect();
+        if !not_imported.is_empty() {
+            missing.push(format!("{} could not be imported", not_imported.join(", ")));
+        }
+        if missing.is_empty() {
+            return "Import completed".to_string();
+        }
+        format!(
+            "Import completed, but {}; the task's stats name each one",
+            missing.join(" and ")
+        )
     }
 }
 
@@ -970,7 +1052,7 @@ async fn run_github_import(
     if task.import_labels {
         update_stage(db, task.id, "importing", 15, "Importing labels...").await?;
         let labels = client.list_labels(&gh_owner, &gh_repo).await?;
-        stats.labels_imported = import_github_labels(db, repo_id, &labels).await?;
+        stats.labels_imported = import_github_labels(db, repo_id, &labels, stats).await?;
         update_stage(
             db,
             task.id,
@@ -992,7 +1074,7 @@ async fn run_github_import(
         update_stage(db, task.id, "importing", 25, "Importing milestones...").await?;
         let milestones = client.list_milestones(&gh_owner, &gh_repo).await?;
         stats.milestones_imported =
-            import_github_milestones(db, repo_id, &milestones, &mut milestone_map).await?;
+            import_github_milestones(db, repo_id, &milestones, &mut milestone_map, stats).await?;
         update_stage(
             db,
             task.id,
@@ -1023,10 +1105,10 @@ async fn run_github_import(
                 task.user_id,
                 &milestone_map,
                 label_map.as_ref(),
+                stats,
             )
             .await?;
             stats.issues_imported += 1;
-            stats.issue_comments_imported += comments.len();
 
             let pct = 35 + (i as f64 / total.max(1) as f64 * 20.0) as i32;
             update_stage(
@@ -1053,7 +1135,7 @@ async fn run_github_import(
             let reviews = client
                 .list_pr_reviews(&gh_owner, &gh_repo, pr.number)
                 .await?;
-            let imported_reviews = import_github_pr(
+            import_github_pr(
                 db,
                 repo_id,
                 pr,
@@ -1061,11 +1143,10 @@ async fn run_github_import(
                 &reviews,
                 task.user_id,
                 &milestone_map,
+                stats,
             )
             .await?;
             stats.prs_imported += 1;
-            stats.pr_reviews_imported += imported_reviews;
-            stats.issue_comments_imported += comments.len();
 
             let pct = 60 + (i as f64 / total.max(1) as f64 * 15.0) as i32;
             update_stage(
@@ -1190,7 +1271,7 @@ async fn run_gitlab_import(
     if task.import_labels {
         update_stage(db, task.id, "importing", 15, "Importing labels...").await?;
         let labels = client.list_labels(&project_path).await?;
-        stats.labels_imported = import_gitlab_labels(db, repo_id, &labels).await?;
+        stats.labels_imported = import_gitlab_labels(db, repo_id, &labels, stats).await?;
         update_stage(
             db,
             task.id,
@@ -1212,7 +1293,7 @@ async fn run_gitlab_import(
         update_stage(db, task.id, "importing", 25, "Importing milestones...").await?;
         let milestones = client.list_milestones(&project_path).await?;
         stats.milestones_imported =
-            import_gitlab_milestones(db, repo_id, &milestones, &mut milestone_map).await?;
+            import_gitlab_milestones(db, repo_id, &milestones, &mut milestone_map, stats).await?;
         update_stage(
             db,
             task.id,
@@ -1241,10 +1322,10 @@ async fn run_gitlab_import(
                 task.user_id,
                 &milestone_map,
                 label_map.as_ref(),
+                stats,
             )
             .await?;
             stats.issues_imported += 1;
-            stats.issue_comments_imported += notes.len();
 
             let pct = 35 + (i as f64 / total.max(1) as f64 * 20.0) as i32;
             update_stage(
@@ -1266,9 +1347,8 @@ async fn run_gitlab_import(
 
         for (i, mr) in mrs.iter().enumerate() {
             let notes = client.list_mr_notes(&project_path, mr.iid).await?;
-            import_gitlab_mr(db, repo_id, mr, &notes, task.user_id, &milestone_map).await?;
+            import_gitlab_mr(db, repo_id, mr, &notes, task.user_id, &milestone_map, stats).await?;
             stats.prs_imported += 1;
-            stats.issue_comments_imported += notes.len();
 
             let pct = 60 + (i as f64 / total.max(1) as f64 * 15.0) as i32;
             update_stage(
@@ -2607,6 +2687,7 @@ async fn import_github_labels(
     db: &DatabaseConnection,
     repo_id: i64,
     labels: &[GitHubLabel],
+    stats: &mut ImportStats,
 ) -> Result<usize> {
     let existing = label_ops::list_by_repo(db, repo_id).await?;
     let now = Utc::now();
@@ -2634,10 +2715,15 @@ async fn import_github_labels(
             updated_at: Set(now),
         };
 
-        if let Err(e) = label_ops::create(db, model).await {
-            tracing::warn!(label = %gl.name, error = %format!("{e:#}"), "failed to create label");
-        } else {
-            count += 1;
+        match label_ops::create(db, model).await {
+            Ok(_) => count += 1,
+            Err(e) => stats
+                .labels_failed
+                .push(ImportedObjectFailure::insert_failed(
+                    gl.name.clone(),
+                    ImportedObject::Label,
+                    &e,
+                )),
         }
     }
 
@@ -2649,6 +2735,7 @@ async fn import_github_milestones(
     repo_id: i64,
     milestones: &[GitHubMilestone],
     milestone_map: &mut HashMap<String, i64>,
+    stats: &mut ImportStats,
 ) -> Result<usize> {
     let existing = milestone_ops::list_by_repo(db, repo_id, None).await?;
     let mut count = 0;
@@ -2705,9 +2792,13 @@ async fn import_github_milestones(
                 milestone_map.insert(gm.title.clone(), ms.id);
                 count += 1;
             }
-            Err(e) => {
-                tracing::warn!(milestone = %gm.title, error = %format!("{e:#}"), "failed to create milestone");
-            }
+            Err(e) => stats
+                .milestones_failed
+                .push(ImportedObjectFailure::insert_failed(
+                    gm.title.clone(),
+                    ImportedObject::Milestone,
+                    &e,
+                )),
         }
     }
 
@@ -2725,6 +2816,7 @@ async fn import_github_issue(
     author_id: i64,
     milestone_map: &HashMap<String, i64>,
     label_map: Option<&HashMap<String, i64>>,
+    stats: &mut ImportStats,
 ) -> Result<()> {
     // Collect label names
     let label_names: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
@@ -2815,8 +2907,15 @@ async fn import_github_issue(
             updated_at: Set(updated_at),
         };
 
-        if let Err(e) = issue_comment_ops::create(db, cm).await {
-            tracing::warn!(issue_number = %issue.number, error = %format!("{e:#}"), "failed to import issue comment");
+        match issue_comment_ops::create(db, cm).await {
+            Ok(_) => stats.issue_comments_imported += 1,
+            Err(e) => stats
+                .comments_failed
+                .push(ImportedObjectFailure::insert_failed(
+                    format!("issue #{} comment {}", issue.number, comment.id),
+                    ImportedObject::Comment,
+                    &e,
+                )),
         }
     }
 
@@ -2831,7 +2930,8 @@ async fn import_github_pr(
     reviews: &[GitHubReview],
     author_id: i64,
     milestone_map: &HashMap<String, i64>,
-) -> Result<usize> {
+    stats: &mut ImportStats,
+) -> Result<()> {
     let label_names: Vec<String> = pr.labels.iter().map(|l| l.name.clone()).collect();
     let labels_json = if label_names.is_empty() {
         None
@@ -2905,6 +3005,11 @@ async fn import_github_pr(
     let review_timestamps: Vec<Option<chrono::DateTime<Utc>>> = reviews
         .iter()
         .map(|review| {
+            // An unsubmitted draft belongs to whoever is writing it and is not
+            // a review yet; GitHub only shows it to the token's own account.
+            if review.state == "PENDING" {
+                return None;
+            }
             match parse_required_import_datetime(
                 "GitHub",
                 "pull request review",
@@ -2922,6 +3027,10 @@ async fn import_github_pr(
                         error = %format!("{error:#}"),
                         "skipping imported object with invalid required timestamp"
                     );
+                    stats.pr_reviews_failed.push(ImportedObjectFailure {
+                        source: format!("pull request #{} review {}", pr.number, review.id),
+                        reason: "the review has no valid submission time",
+                    });
                     None
                 }
             }
@@ -2962,24 +3071,26 @@ async fn import_github_pr(
 
     let saved = crate::pull_request::service::insert_with_repo_number(db, repo_id, model).await?;
 
-    // Import PR comments (general discussion)
-    for (comment, (created_at, updated_at)) in comments.iter().zip(comment_timestamps) {
-        let cm = rg_db::entities::issue_comment::ActiveModel {
-            id: sea_orm::NotSet,
-            issue_id: Set(saved.id), // issue_id is PR id in this context
-            author_id: Set(author_id),
-            body: Set(comment.body.clone().unwrap_or_default()),
-            created_at: Set(created_at),
-            updated_at: Set(updated_at),
-        };
-
-        if let Err(e) = issue_comment_ops::create(db, cm).await {
-            tracing::warn!(pr_number = %pr.number, error = %format!("{e:#}"), "failed to import PR comment");
-        }
+    // The pull request's conversation. ForgeKeep has no comment table for
+    // pull requests; a comment-only review is how its own UI and API record
+    // one. These used to go into `issue_comments` with the pull request's id
+    // as `issue_id`, which is an id from a different table: they showed up
+    // under whichever issue, in whichever repository, happened to share it.
+    for (comment, (created_at, _updated_at)) in comments.iter().zip(comment_timestamps) {
+        import_pr_conversation_comment(
+            db,
+            repo_id,
+            saved.id,
+            author_id,
+            comment.body.clone().unwrap_or_default(),
+            created_at,
+            format!("pull request #{} comment {}", pr.number, comment.id),
+            stats,
+        )
+        .await;
     }
 
     // Import reviews
-    let mut imported_reviews = 0;
     for (review, submitted_at) in reviews.iter().zip(review_timestamps) {
         let Some(submitted_at) = submitted_at else {
             continue;
@@ -3013,14 +3124,56 @@ async fn import_github_pr(
             dismissed_by: Set(None),
         };
 
-        if let Err(e) = pr_review_ops::create(db, rv).await {
-            tracing::warn!(pr_number = %pr.number, error = %format!("{e:#}"), "failed to import PR review");
-        } else {
-            imported_reviews += 1;
+        match pr_review_ops::create(db, rv).await {
+            Ok(_) => stats.pr_reviews_imported += 1,
+            Err(e) => stats
+                .pr_reviews_failed
+                .push(ImportedObjectFailure::insert_failed(
+                    format!("pull request #{} review {}", pr.number, review.id),
+                    ImportedObject::Review,
+                    &e,
+                )),
         }
     }
 
-    Ok(imported_reviews)
+    Ok(())
+}
+
+/// Write one comment of a pull request's conversation as a comment-only review
+/// — no verdict, no commit — and account for it in `stats`.
+#[allow(clippy::too_many_arguments)]
+async fn import_pr_conversation_comment(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    pr_id: i64,
+    author_id: i64,
+    body: String,
+    created_at: chrono::DateTime<Utc>,
+    source: String,
+    stats: &mut ImportStats,
+) {
+    let row = rg_db::entities::pr_review::ActiveModel {
+        id: sea_orm::NotSet,
+        pr_id: Set(pr_id),
+        repo_id: Set(repo_id),
+        reviewer_id: Set(author_id),
+        action: Set("comment".to_string()),
+        body: Set(Some(body)),
+        commit_id: Set(None),
+        created_at: Set(created_at),
+        dismissed_at: Set(None),
+        dismissed_by: Set(None),
+    };
+    match pr_review_ops::create(db, row).await {
+        Ok(_) => stats.pr_comments_imported += 1,
+        Err(e) => stats
+            .comments_failed
+            .push(ImportedObjectFailure::insert_failed(
+                source,
+                ImportedObject::Comment,
+                &e,
+            )),
+    }
 }
 
 async fn import_github_releases(
@@ -3077,6 +3230,7 @@ async fn import_gitlab_labels(
     db: &DatabaseConnection,
     repo_id: i64,
     labels: &[GitLabLabel],
+    stats: &mut ImportStats,
 ) -> Result<usize> {
     let existing = label_ops::list_by_repo(db, repo_id).await?;
     let now = Utc::now();
@@ -3103,10 +3257,15 @@ async fn import_gitlab_labels(
             updated_at: Set(now),
         };
 
-        if let Err(e) = label_ops::create(db, model).await {
-            tracing::warn!(label = %gl.name, error = %format!("{e:#}"), "failed to create label");
-        } else {
-            count += 1;
+        match label_ops::create(db, model).await {
+            Ok(_) => count += 1,
+            Err(e) => stats
+                .labels_failed
+                .push(ImportedObjectFailure::insert_failed(
+                    gl.name.clone(),
+                    ImportedObject::Label,
+                    &e,
+                )),
         }
     }
 
@@ -3118,6 +3277,7 @@ async fn import_gitlab_milestones(
     repo_id: i64,
     milestones: &[GitLabMilestone],
     milestone_map: &mut HashMap<String, i64>,
+    stats: &mut ImportStats,
 ) -> Result<usize> {
     let existing = milestone_ops::list_by_repo(db, repo_id, None).await?;
     let mut count = 0;
@@ -3162,9 +3322,13 @@ async fn import_gitlab_milestones(
                 milestone_map.insert(gm.title.clone(), ms.id);
                 count += 1;
             }
-            Err(e) => {
-                tracing::warn!(milestone = %gm.title, error = %format!("{e:#}"), "failed to create milestone");
-            }
+            Err(e) => stats
+                .milestones_failed
+                .push(ImportedObjectFailure::insert_failed(
+                    gm.title.clone(),
+                    ImportedObject::Milestone,
+                    &e,
+                )),
         }
     }
 
@@ -3182,6 +3346,7 @@ async fn import_gitlab_issue(
     author_id: i64,
     milestone_map: &HashMap<String, i64>,
     label_map: Option<&HashMap<String, i64>>,
+    stats: &mut ImportStats,
 ) -> Result<()> {
     // GitLab labels are plain strings.
     let label_ids = resolve_imported_label_ids(label_map, &issue.labels)?;
@@ -3266,10 +3431,18 @@ async fn import_gitlab_issue(
             updated_at: Set(updated_at),
         };
 
-        if let Err(e) = issue_comment_ops::create(db, cm).await {
-            tracing::warn!(issue_iid = %issue.iid, error = %format!("{e:#}"), "failed to import issue note");
+        match issue_comment_ops::create(db, cm).await {
+            Ok(_) => stats.issue_comments_imported += 1,
+            Err(e) => stats
+                .comments_failed
+                .push(ImportedObjectFailure::insert_failed(
+                    format!("issue #{} note {}", issue.iid, note.id),
+                    ImportedObject::Comment,
+                    &e,
+                )),
         }
     }
+    stats.system_notes_skipped += notes.iter().filter(|note| note.system).count();
 
     Ok(())
 }
@@ -3281,6 +3454,7 @@ async fn import_gitlab_mr(
     notes: &[GitLabNote],
     author_id: i64,
     milestone_map: &HashMap<String, i64>,
+    stats: &mut ImportStats,
 ) -> Result<()> {
     let labels_json = if mr.labels.is_empty() {
         None
@@ -3387,25 +3561,26 @@ async fn import_gitlab_mr(
 
     let saved = crate::pull_request::service::insert_with_repo_number(db, repo_id, model).await?;
 
-    // Import MR notes (skip system notes)
-    for (note, (created_at, updated_at)) in notes
+    // Import MR notes (skip system notes) into the merge request's
+    // conversation — see `import_github_pr` for why not `issue_comments`.
+    for (note, (created_at, _updated_at)) in notes
         .iter()
         .filter(|note| !note.system)
         .zip(note_timestamps)
     {
-        let cm = rg_db::entities::issue_comment::ActiveModel {
-            id: sea_orm::NotSet,
-            issue_id: Set(saved.id),
-            author_id: Set(author_id),
-            body: Set(note.body.clone().unwrap_or_default()),
-            created_at: Set(created_at),
-            updated_at: Set(updated_at),
-        };
-
-        if let Err(e) = issue_comment_ops::create(db, cm).await {
-            tracing::warn!(mr_iid = %mr.iid, error = %format!("{e:#}"), "failed to import MR note");
-        }
+        import_pr_conversation_comment(
+            db,
+            repo_id,
+            saved.id,
+            author_id,
+            note.body.clone().unwrap_or_default(),
+            created_at,
+            format!("merge request !{} note {}", mr.iid, note.id),
+            stats,
+        )
+        .await;
     }
+    stats.system_notes_skipped += notes.iter().filter(|note| note.system).count();
 
     Ok(())
 }
@@ -3954,6 +4129,7 @@ mod imported_issue_label_tests {
             IMPORTER_ID,
             &HashMap::new(),
             None,
+            &mut ImportStats::default(),
         )
         .await
         .expect_err("a GitHub issue with a malformed created_at must fail");
@@ -3981,6 +4157,7 @@ mod imported_issue_label_tests {
             IMPORTER_ID,
             &HashMap::new(),
             None,
+            &mut ImportStats::default(),
         )
         .await
         .expect_err("a GitHub comment with a malformed updated_at must fail its issue item");
@@ -4002,9 +4179,18 @@ mod imported_issue_label_tests {
         let mut pr = github_pr();
         pr.updated_at = "not-a-timestamp".to_string();
 
-        let error = import_github_pr(&db, 1, &pr, &[], &[], IMPORTER_ID, &HashMap::new())
-            .await
-            .expect_err("a GitHub PR with a malformed updated_at must fail");
+        let error = import_github_pr(
+            &db,
+            1,
+            &pr,
+            &[],
+            &[],
+            IMPORTER_ID,
+            &HashMap::new(),
+            &mut ImportStats::default(),
+        )
+        .await
+        .expect_err("a GitHub PR with a malformed updated_at must fail");
         let rendered = format!("{error:#}");
         assert!(rendered.contains("GitHub pull request 61"), "{rendered}");
         assert!(rendered.contains("`updated_at`"), "{rendered}");
@@ -4039,7 +4225,8 @@ mod imported_issue_label_tests {
             },
         ];
 
-        let imported = import_github_pr(
+        let mut stats = ImportStats::default();
+        import_github_pr(
             &db,
             1,
             &github_pr(),
@@ -4047,11 +4234,25 @@ mod imported_issue_label_tests {
             &reviews,
             IMPORTER_ID,
             &HashMap::new(),
+            &mut stats,
         )
         .await
         .unwrap();
 
-        assert_eq!(imported, 0, "skipped reviews must not inflate import stats");
+        assert_eq!(
+            stats.pr_reviews_imported, 0,
+            "skipped reviews must not inflate import stats"
+        );
+        let named: Vec<&str> = stats
+            .pr_reviews_failed
+            .iter()
+            .map(|failure| failure.source.as_str())
+            .collect();
+        assert_eq!(
+            named,
+            ["pull request #61 review 801", "pull request #61 review 802"],
+            "a review the import left out is named in the task's stats"
+        );
         assert!(
             rg_db::entities::pr_review::Entity::find()
                 .all(&db)
@@ -4091,6 +4292,7 @@ mod imported_issue_label_tests {
             IMPORTER_ID,
             &HashMap::new(),
             None,
+            &mut ImportStats::default(),
         )
         .await
         .expect_err("a GitLab issue with a malformed updated_at must fail");
@@ -4115,6 +4317,7 @@ mod imported_issue_label_tests {
             IMPORTER_ID,
             &HashMap::new(),
             None,
+            &mut ImportStats::default(),
         )
         .await
         .expect_err("a GitLab note with a malformed created_at must fail its issue item");
@@ -4136,9 +4339,17 @@ mod imported_issue_label_tests {
         let mut mr = gitlab_mr();
         mr.created_at = "not-a-timestamp".to_string();
 
-        let error = import_gitlab_mr(&db, 1, &mr, &[], IMPORTER_ID, &HashMap::new())
-            .await
-            .expect_err("a GitLab MR with a malformed created_at must fail");
+        let error = import_gitlab_mr(
+            &db,
+            1,
+            &mr,
+            &[],
+            IMPORTER_ID,
+            &HashMap::new(),
+            &mut ImportStats::default(),
+        )
+        .await
+        .expect_err("a GitLab MR with a malformed created_at must fail");
         let rendered = format!("{error:#}");
         assert!(rendered.contains("GitLab merge request 71"), "{rendered}");
         assert!(rendered.contains("`created_at`"), "{rendered}");
@@ -4179,15 +4390,27 @@ mod imported_issue_label_tests {
         };
 
         assert_eq!(
-            import_github_milestones(&db, 1, &[github], &mut milestone_map)
-                .await
-                .unwrap(),
+            import_github_milestones(
+                &db,
+                1,
+                &[github],
+                &mut milestone_map,
+                &mut ImportStats::default()
+            )
+            .await
+            .unwrap(),
             1
         );
         assert_eq!(
-            import_gitlab_milestones(&db, 1, &[gitlab], &mut milestone_map)
-                .await
-                .unwrap(),
+            import_gitlab_milestones(
+                &db,
+                1,
+                &[gitlab],
+                &mut milestone_map,
+                &mut ImportStats::default()
+            )
+            .await
+            .unwrap(),
             1
         );
 
@@ -4260,6 +4483,7 @@ mod imported_issue_label_tests {
             7,
             &HashMap::new(),
             None,
+            &mut ImportStats::default(),
         )
         .await
         .unwrap();
@@ -4398,6 +4622,7 @@ mod tests {
             IMPORTER_ID,
             &empty_milestones,
             Some(&label_map),
+            &mut ImportStats::default(),
         )
         .await
         .unwrap();
@@ -4411,6 +4636,7 @@ mod tests {
             IMPORTER_ID,
             &empty_milestones,
             Some(&label_map),
+            &mut ImportStats::default(),
         )
         .await
         .unwrap();
@@ -4435,6 +4661,345 @@ mod tests {
         }
     }
 
+    /// Make the target refuse one insert, the way a constraint or a full disk
+    /// would: a trigger that aborts on exactly the row a test names.
+    async fn refuse_insert(db: &DatabaseConnection, table: &str, condition: &str) {
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            format!(
+                "CREATE TRIGGER refuse_{table} BEFORE INSERT ON {table} WHEN {condition} \
+                 BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END"
+            ),
+        ))
+        .await
+        .unwrap();
+    }
+
+    fn named(failures: &[ImportedObjectFailure]) -> Vec<&str> {
+        failures
+            .iter()
+            .map(|failure| failure.source.as_str())
+            .collect()
+    }
+
+    /// card_29b766cae56b: a label or milestone the target refused used to be a
+    /// `warn!` and a smaller count under a plain "Import completed".
+    #[tokio::test]
+    async fn refused_labels_and_milestones_are_named_in_stats_and_stage() {
+        let db = test_db().await;
+        create_label(&db, 10, "already-here").await;
+        refuse_insert(&db, "labels", "NEW.name LIKE 'refused%'").await;
+        refuse_insert(&db, "milestones", "NEW.title LIKE 'Refused%'").await;
+        let mut stats = ImportStats::default();
+
+        let github_label = |name: &str| GitHubLabel {
+            id: 1,
+            name: name.to_string(),
+            color: "ee0701".to_string(),
+            description: None,
+        };
+        let gitlab_label = |name: &str| GitLabLabel {
+            id: 2,
+            name: name.to_string(),
+            color: "#ee0701".to_string(),
+            description: None,
+            text_color: None,
+        };
+        let github_count = import_github_labels(
+            &db,
+            1,
+            &[
+                github_label("already-here"),
+                github_label("bug"),
+                github_label("refused-gh"),
+            ],
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        let gitlab_count = import_gitlab_labels(
+            &db,
+            1,
+            &[gitlab_label("triage"), gitlab_label("refused-gl")],
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!((github_count, gitlab_count), (1, 1));
+        assert_eq!(
+            named(&stats.labels_failed),
+            ["refused-gh", "refused-gl"],
+            "an existing label is skipped on purpose and is not a failure"
+        );
+        assert_eq!(
+            stats.labels_failed[0].reason,
+            "label creation failed; ask the instance operator to check the server log"
+        );
+
+        let github_milestone = |title: &str| GitHubMilestone {
+            number: 31,
+            title: title.to_string(),
+            description: None,
+            state: "open".to_string(),
+            due_on: None,
+            created_at: "2024-02-01T02:03:04Z".to_string(),
+            updated_at: "2024-02-02T03:04:05Z".to_string(),
+            closed_at: None,
+        };
+        let gitlab_milestone = |title: &str| GitLabMilestone {
+            id: 32,
+            iid: 32,
+            title: title.to_string(),
+            description: None,
+            state: "active".to_string(),
+            due_date: None,
+            start_date: None,
+            created_at: "2024-03-01T02:03:04Z".to_string(),
+            updated_at: "2024-03-02T03:04:05Z".to_string(),
+        };
+        let mut milestone_map = HashMap::new();
+        let github_count = import_github_milestones(
+            &db,
+            1,
+            &[github_milestone("v1"), github_milestone("Refused GH")],
+            &mut milestone_map,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        let gitlab_count = import_gitlab_milestones(
+            &db,
+            1,
+            &[gitlab_milestone("Refused GL"), gitlab_milestone("v2")],
+            &mut milestone_map,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!((github_count, gitlab_count), (1, 1));
+        assert_eq!(
+            named(&stats.milestones_failed),
+            ["Refused GH", "Refused GL"]
+        );
+        assert!(milestone_map.contains_key("v1") && milestone_map.contains_key("v2"));
+        assert!(!milestone_map.contains_key("Refused GH"));
+
+        let stage = stats.completion_stage();
+        assert!(
+            stage.contains("2 label(s), 2 milestone(s) could not be imported"),
+            "{stage}"
+        );
+        assert_ne!(stage, "Import completed");
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["labels_failed"][0]["source"], "refused-gh");
+        assert_eq!(json["milestones_failed"][1]["source"], "Refused GL");
+        assert!(
+            !json.to_string().contains("injected insert failure"),
+            "the raw database error stays in the server log"
+        );
+    }
+
+    /// card_2332150aada0: the totals used to add the length of the source list,
+    /// refused rows and GitLab system notes included.
+    #[tokio::test]
+    async fn issue_comment_totals_count_written_rows_and_name_refused_ones() {
+        let db = test_db().await;
+        refuse_insert(&db, "issue_comments", "NEW.body = 'refused'").await;
+        let mut stats = ImportStats::default();
+
+        let mut refused = github_comment(502);
+        refused.body = Some("refused".to_string());
+        import_github_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &github_issue(GitHubLabel {
+                id: 10,
+                name: "bug".to_string(),
+                color: "ee0701".to_string(),
+                description: None,
+            }),
+            &[github_comment(501), refused],
+            IMPORTER_ID,
+            &HashMap::new(),
+            None,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.issue_comments_imported, 1);
+        assert_eq!(named(&stats.comments_failed), ["issue #41 comment 502"]);
+
+        let mut system = gitlab_note(902);
+        system.system = true;
+        let mut refused = gitlab_note(903);
+        refused.body = Some("refused".to_string());
+        import_gitlab_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &gitlab_issue("bug"),
+            &[gitlab_note(901), system, refused],
+            IMPORTER_ID,
+            &HashMap::new(),
+            None,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stats.issue_comments_imported, 2,
+            "one GitHub comment and one GitLab note were written; the system note \
+             and the refused rows were not"
+        );
+        assert_eq!(stats.system_notes_skipped, 1);
+        assert_eq!(
+            named(&stats.comments_failed),
+            ["issue #41 comment 502", "issue #52 note 903"]
+        );
+        assert_eq!(
+            rg_db::entities::issue_comment::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .len(),
+            stats.issue_comments_imported
+        );
+        let stage = stats.completion_stage();
+        assert!(
+            stage.contains("2 comment(s) could not be imported"),
+            "{stage}"
+        );
+    }
+
+    /// A pull request's conversation lands on the pull request. It used to be
+    /// written to `issue_comments` under the pull request's id — an id from a
+    /// different table — and so showed up under an unrelated issue.
+    #[tokio::test]
+    async fn pull_request_conversation_lands_on_the_pull_request_not_on_an_issue() {
+        let db = test_db().await;
+        // An issue in another repository holding the id the pull request will
+        // get. Before the fix the comments surfaced under it.
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO repositories(id, owner_id, name, is_private, default_branch, stars_count, forks_count, created_at, updated_at) \
+             VALUES(2, 1, 'elsewhere', 0, 'main', 0, 0, '2024-01-01', '2024-01-01')"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO issues(id, repo_id, number, title, state, author_id, created_at, updated_at) \
+             VALUES(1, 2, 1, 'unrelated', 'open', 1, '2024-01-01', '2024-01-01')"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+        refuse_insert(
+            &db,
+            "pr_reviews",
+            "NEW.body = 'refused' OR NEW.action = 'request_changes'",
+        )
+        .await;
+        let mut stats = ImportStats::default();
+
+        let mut refused = github_comment(602);
+        refused.body = Some("refused".to_string());
+        let review = |id: i64, state: &str, submitted_at: Option<&str>| GitHubReview {
+            id,
+            user: None,
+            state: state.to_string(),
+            body: Some(format!("review {id}")),
+            submitted_at: submitted_at.map(str::to_string),
+        };
+        import_github_pr(
+            &db,
+            1,
+            &github_pr(),
+            &[github_comment(601), refused],
+            &[
+                review(701, "APPROVED", Some("2024-01-05T00:00:00Z")),
+                review(702, "CHANGES_REQUESTED", Some("2024-01-05T00:00:00Z")),
+                review(703, "PENDING", None),
+            ],
+            IMPORTER_ID,
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        let mut system = gitlab_note(912);
+        system.system = true;
+        let mut refused = gitlab_note(913);
+        refused.body = Some("refused".to_string());
+        import_gitlab_mr(
+            &db,
+            1,
+            &gitlab_mr(),
+            &[gitlab_note(911), system, refused],
+            IMPORTER_ID,
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            rg_db::ops::issue_comment_ops::list_by_issue(&db, 1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no pull-request comment may surface under an issue"
+        );
+        let prs = rg_db::entities::pull_request::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(prs.len(), 2);
+        let reviews = rg_db::entities::pr_review::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        let conversation: Vec<(i64, &str, Option<&str>)> = reviews
+            .iter()
+            .filter(|review| review.action == "comment")
+            .map(|review| (review.pr_id, review.action.as_str(), review.body.as_deref()))
+            .collect();
+        assert_eq!(
+            conversation,
+            [
+                (prs[0].id, "comment", Some("comment")),
+                (prs[1].id, "comment", Some("note")),
+            ]
+        );
+        assert_eq!(stats.pr_comments_imported, 2);
+        assert_eq!(stats.issue_comments_imported, 0);
+        assert_eq!(stats.pr_reviews_imported, 1);
+        assert_eq!(stats.system_notes_skipped, 1);
+        assert_eq!(
+            named(&stats.comments_failed),
+            ["pull request #61 comment 602", "merge request !17 note 913"]
+        );
+        assert_eq!(
+            named(&stats.pr_reviews_failed),
+            ["pull request #61 review 702"],
+            "an unsubmitted PENDING draft is not a lost review"
+        );
+        assert_eq!(
+            stats.pr_reviews_failed[0].reason,
+            "review creation failed; ask the instance operator to check the server log"
+        );
+        let stage = stats.completion_stage();
+        assert!(
+            stage.contains("2 comment(s), 1 review(s) could not be imported"),
+            "{stage}"
+        );
+    }
+
     #[tokio::test]
     async fn disabling_label_import_does_not_smuggle_labels_in_through_issues() {
         let db = test_db().await;
@@ -4455,6 +5020,7 @@ mod tests {
             IMPORTER_ID,
             &HashMap::new(),
             None,
+            &mut ImportStats::default(),
         )
         .await
         .unwrap();
