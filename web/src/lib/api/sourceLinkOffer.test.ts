@@ -16,7 +16,7 @@ import { renderComponent, type RenderedComponent } from '../test/render';
 const COMMIT = '87bd02a3c1f0e9d8b7a6c5d4e3f2a1b0c9d8e7f6';
 const FORK = 'https://codeberg.org/someone/forge-fork';
 const FORK_AT_COMMIT = `${FORK}/tree/${COMMIT}`;
-const UPSTREAM = 'github.com/Yahook';
+const UPSTREAM = 'github.com/Nettechnologys';
 
 let rendered: RenderedComponent | undefined;
 

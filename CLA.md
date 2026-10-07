@@ -3,9 +3,9 @@
 Thank you for contributing to Plombir Git. This agreement explains the rights
 you give the project when you send a contribution. It is modelled on the
 Apache Software Foundation Individual CLA. You keep the copyright in your
-work. You give Yahook (the "Maintainer"), the copyright holder of Plombir Git, a
-license broad enough to ship your work both under the AGPL and under the
-commercial license described in [NOTICE](NOTICE).
+work. You give NetTechnologys s.r.o. (the "Maintainer"), the copyright holder
+of Plombir Git, a license broad enough to ship your work both under the AGPL
+and under the commercial license described in [NOTICE](NOTICE).
 
 > **Why a CLA?** Plombir Git is AGPL-3.0-or-later and is also offered under a
 > commercial license. Without this agreement, code from outside contributors

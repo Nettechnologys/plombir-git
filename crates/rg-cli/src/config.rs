@@ -554,7 +554,7 @@ pub(crate) const DEFAULT_PACKAGE_UPLOAD_MAX_MB: u64 =
 /// The repository the UI offers as this instance's source when
 /// `[server].source_url` is unset: upstream's. Right for an unmodified build;
 /// a modified one owes its users its own URL, which is what the setting is for.
-pub(crate) const DEFAULT_SOURCE_URL: &str = "https://github.com/Yahook/ForgeKeep";
+pub(crate) const DEFAULT_SOURCE_URL: &str = "https://github.com/Nettechnologys/plombir-git";
 
 /// Resolve and validate `[server].source_url`.
 ///

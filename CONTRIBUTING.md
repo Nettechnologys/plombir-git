@@ -45,8 +45,8 @@ cargo tree                  # inspect the dependency graph
 ### First-time setup
 
 ```bash
-git clone https://github.com/Yahook/ForgeKeep.git
-cd ForgeKeep
+git clone https://github.com/Nettechnologys/plombir-git.git
+cd plombir-git
 
 # Use the repository-owned pre-push fallback for this clone. GitHub Actions is
 # blocked on account billing and has never executed a step, so local checks are

@@ -3,7 +3,7 @@ name = "rg-mcp"
 version = "0.1.0"
 edition = "2021"
 description = "Plombir Git MCP server (stdio) exposing repository tools to AI agents"
-repository = "https://github.com/Yahook/ForgeKeep"
+repository = "https://github.com/Nettechnologys/plombir-git"
 license.workspace = true
 rust-version.workspace = true
 

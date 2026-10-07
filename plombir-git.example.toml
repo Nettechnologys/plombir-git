@@ -42,7 +42,7 @@ package_upload_max_mb = 512
 # Docker build takes it as PLOMBIR_GIT_SOURCE_COMMIT) — the source offer AGPL §13
 # asks of anyone who modifies the code and serves it over a network. Point it at
 # your fork if you run a modified build.
-# source_url = "https://github.com/Yahook/ForgeKeep"
+# source_url = "https://github.com/Nettechnologys/plombir-git"
 
 [database]
 url = "sqlite://./plombir-git.db?mode=rwc"

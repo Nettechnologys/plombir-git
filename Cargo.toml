@@ -14,7 +14,7 @@ members = [
 resolver = "2"
 
 # Shared package metadata inherited by every crate via `license.workspace = true`.
-# The whole workspace is AGPL-3.0-or-later (see LICENSE / NOTICE, © Yahook), so
+# The whole workspace is AGPL-3.0-or-later (see LICENSE / NOTICE, © NetTechnologys s.r.o.), so
 # the license lives in one place instead of being repeated (or, worse,
 # drifting) per crate.
 [workspace.package]

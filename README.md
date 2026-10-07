@@ -259,8 +259,8 @@ required.
 ### Build
 
 ```bash
-git clone https://github.com/Yahook/ForgeKeep.git
-cd ForgeKeep
+git clone https://github.com/Nettechnologys/plombir-git.git
+cd plombir-git
 cargo build --release
 ```
 
@@ -983,7 +983,7 @@ environment toggles.
 ## License
 
 Plombir Git is free software under the
-[GNU Affero General Public License v3.0 or later](LICENSE), © [Yahook](https://github.com/Yahook).
+[GNU Affero General Public License v3.0 or later](LICENSE), © [NetTechnologys s.r.o.](https://github.com/Nettechnologys).
 You may use, study, modify and share it. If you run a modified version for
 other people over a network, the AGPL asks you to offer them its source.
 
