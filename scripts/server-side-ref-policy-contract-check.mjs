@@ -4,6 +4,17 @@
 // through another Plombir Git function.  A new mover must declare which policy
 // owns it; the three user-facing server-side commit producers additionally
 // have to carry `ServerSideCommitPolicy` to the created commit.
+//
+// "Can move a ref" is wider than `push` and `update-ref` (card_4f51d61a783f).
+// The census used to see only those two and gix `reference` /
+// `edit_reference`, and stayed green while missing the path nearly every merge
+// takes — gix `commit_as`, which writes the commit *and* moves the branch —
+// as well as the `fetch` that publishes a pull mirror's branches (pruning the
+// rest), the fork fetch into `refs/forks/*`, `clone` (a fork and an import
+// create a repository with every branch and tag at once) and `symbolic-ref
+// HEAD`. A mover outside the census is a mover outside every policy: the
+// read-only mirror and the server-side LFS lock checks both rest on knowing
+// each one.
 
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
@@ -17,20 +28,66 @@ const root = process.env.PLOMBIR_GIT_SERVER_SIDE_REF_POLICY_ROOT
   : path.resolve(scriptsDir, '..');
 const cratesDir = path.join(root, 'crates');
 
+// git subcommands that write refs in the repository they run in, or — `clone`
+// — create one with refs. Worktree-only commands (`commit`, `checkout`,
+// `rebase`, `merge`) are left out: they cannot run in a bare served repository,
+// and the scratch clones they run in are published only through `push`.
+const GIT_REF_COMMANDS = [
+  'push',
+  'update-ref',
+  'fetch',
+  'clone',
+  'symbolic-ref',
+  'remote',
+  'branch',
+  'tag',
+  'replace',
+  'reset',
+  'notes',
+  'pull',
+];
+
+// gix methods that move a ref. `commit` / `commit_as` / `tag` write an object
+// and then update the named reference; the arity floor keeps sea-orm's
+// zero-argument `transaction.commit()` out.
+const GIX_REF_METHODS = new Map([
+  ['reference', 1],
+  ['edit_reference', 1],
+  ['edit_references', 1],
+  ['tag_reference', 1],
+  ['commit', 4],
+  ['commit_as', 6],
+  ['tag', 5],
+]);
+
 const CLASSIFIED_MOVERS = new Map(
   [
     ['crates/rg-git/src/protocol/receive_pack.rs', 'update_ref', 'gix:reference', 'canonical_receive_pack'],
     ['crates/rg-core/src/repo/service.rs', 'auto_init_repo', 'git:push', 'repository_initialization'],
     ['crates/rg-core/src/repo/service.rs', 'push_branch_with_lease', 'git:push', 'leased_server_side_publish'],
     ['crates/rg-core/src/repo/service.rs', 'set_bare_repo_head_to_branch', 'gix:edit_reference', 'head_metadata'],
+    ['crates/rg-core/src/repo/service.rs', 'fork_repo', 'git:clone', 'repository_creation'],
+    ['crates/rg-core/src/repo/service.rs', 'create_or_update_file', 'git:clone', 'scratch_clone'],
+    ['crates/rg-core/src/repo/service.rs', 'update_files_in_commit', 'git:clone', 'scratch_clone'],
+    ['crates/rg-core/src/repo/service.rs', 'delete_file', 'git:clone', 'scratch_clone'],
     ['crates/rg-core/src/pull_request/service.rs', 'git_rebase_merge', 'git:push', 'pull_request_merge_policy'],
-    ['crates/rg-core/src/pull_request/service.rs', 'gix_set_head_to_branch_with_repo', 'gix:edit_reference', 'head_metadata'],
-    ['crates/rg-core/src/pull_request/service.rs', 'gix_fast_forward_with_repo', 'gix:reference', 'pull_request_merge_policy'],
+    ['crates/rg-core/src/pull_request/service.rs', 'gix_merge_no_ff', 'gix:commit_as', 'pull_request_merge_policy'],
+    ['crates/rg-core/src/pull_request/service.rs', 'gix_squash_merge', 'gix:commit_as', 'pull_request_merge_policy'],
     ['crates/rg-core/src/pull_request/service.rs', 'gix_delete_ref', 'gix:edit_reference', 'pull_request_merge_policy'],
+    ['crates/rg-core/src/pull_request/service.rs', 'run_fork_fetch', 'git:fetch', 'server_scratch_ref'],
+    ['crates/rg-core/src/pull_request/service.rs', 'rebase_group_tree', 'git:fetch', 'object_transfer_only'],
+    ['crates/rg-core/src/pull_request/service.rs', 'replay_rebase', 'git:clone', 'scratch_clone'],
+    ['crates/rg-core/src/pull_request/merge_queue.rs', 'ensure_merge_group_ci', 'git:fetch', 'object_transfer_only'],
     ['crates/rg-core/src/pull_request/merge_queue.rs', 'cleanup_merge_group_ref', 'git:update-ref', 'internal_merge_queue_ref'],
     ['crates/rg-core/src/pull_request/merge_queue.rs', 'retire_losing_merge_group_pipeline', 'git:update-ref', 'internal_merge_queue_ref'],
     ['crates/rg-core/src/pull_request/merge_queue.rs', 'publish', 'git:update-ref', 'internal_merge_queue_ref'],
     ['crates/rg-core/src/pull_request/merge_queue.rs', 'drop', 'git:update-ref', 'internal_merge_queue_ref'],
+    ['crates/rg-core/src/mirror/service.rs', 'publish_mirrored_refs', 'git:fetch', 'pull_mirror_publication'],
+    ['crates/rg-core/src/mirror/service.rs', 'adoptable_head', 'git:symbolic-ref', 'head_metadata'],
+    ['crates/rg-core/src/mirror/service.rs', 'run_git_clone_mirror', 'git:clone', 'mirror_private_clone'],
+    ['crates/rg-core/src/mirror/service.rs', 'run_git_remote_update', 'git:remote', 'mirror_private_clone'],
+    ['crates/rg-core/src/import/service.rs', 'clone_repo', 'git:clone', 'repository_creation'],
+    ['crates/rg-core/src/import/service.rs', 'import_wiki_pages_from_destination', 'git:clone', 'scratch_clone'],
   ].map(([file, symbol, primitive, policy]) => [
     `${file}:${symbol}:${primitive}`,
     { file, symbol, primitive, policy },
@@ -123,7 +180,7 @@ function discoverMovers(file) {
   const ranges = functionRanges(code);
   const movers = [];
 
-  const record = (index, primitive) => {
+  const record = (index, primitive, call) => {
     const owner = ownerAt(ranges, index);
     movers.push({
       file: relative(file),
@@ -131,20 +188,30 @@ function discoverMovers(file) {
       primitive,
       line: code.slice(0, index).split('\n').length,
       body: owner ? source.slice(owner.start, owner.end) : '',
+      call,
     });
   };
 
-  const runCall = /\.(?:run|run_with_env|run_with_env_removed|run_or_bail|spawn_async)\s*\(/g;
+  // The argument list is the first `&[...]` / `&vec![...]` argument: a plain
+  // gateway call takes it first, an `Invocation` takes the gateway first.
+  const runCall = /\.(?:run\w*|spawn_async)\s*\(/g;
   for (const match of code.matchAll(runCall)) {
     const open = code.indexOf('(', match.index);
     const args = callArguments(source, code, open);
-    const command = args?.[0]?.match(/^&\s*\[\s*"(push|update-ref)"/s)?.[1];
-    if (command) record(match.index, `git:${command}`);
+    const list = args?.find((arg) => /^&\s*(?:vec!\s*)?\[/s.test(arg));
+    const command = list?.match(/^&\s*(?:vec!\s*)?\[\s*"([a-z-]+)"/s)?.[1];
+    if (command && GIT_REF_COMMANDS.includes(command)) {
+      record(match.index, `git:${command}`, list);
+    }
   }
 
-  const gixCall = /\.(edit_reference|reference)\s*\(/g;
+  const gixCall = /\.([a-z_]+)\s*\(/g;
   for (const match of code.matchAll(gixCall)) {
-    record(match.index, `gix:${match[1]}`);
+    const minimumArity = GIX_REF_METHODS.get(match[1]);
+    if (minimumArity === undefined) continue;
+    const args = callArguments(source, code, code.indexOf('(', match.index));
+    const arity = args === null || (args.length === 1 && args[0] === '') ? 0 : args.length;
+    if (arity >= minimumArity) record(match.index, `gix:${match[1]}`, args.join(', '));
   }
 
   return movers;
@@ -174,6 +241,42 @@ for (const mover of movers) {
     continue;
   }
   seen.add(key);
+
+  const where = `${mover.file}:${mover.symbol}`;
+  const literals = [...mover.call.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((literal) => literal[1]);
+  const refspecs = literals.filter((literal) => literal.includes(':'));
+
+  if (classification.policy === 'repository_creation') {
+    // `--bare` copies branches and tags; `--mirror` copies every ref the source
+    // has, `refs/replace/*` and `refs/pull/*` included, into a repository the
+    // server then reads and serves (card_03ed757463d4).
+    if (!literals.includes('--bare') || literals.includes('--mirror')) {
+      failures.push(`${where} must create the repository with \`clone --bare\`, never \`--mirror\`.`);
+    }
+  }
+
+  if (classification.policy === 'pull_mirror_publication') {
+    const outside = refspecs.filter(
+      (refspec) => !/^\+?refs\/(heads|tags)\/\*:refs\/\1\/\*$/.test(refspec),
+    );
+    if (refspecs.length === 0 || outside.length > 0) {
+      failures.push(
+        `${where} publishes ${JSON.stringify(outside)} — a pull mirror may write only refs/heads/* and refs/tags/* of the served repository.`,
+      );
+    }
+  }
+
+  if (classification.policy === 'server_scratch_ref' && !literals.includes('--no-tags')) {
+    // A fetch with a destination follows tags into refs/tags/* — past tag
+    // protection and the post-push hooks.
+    failures.push(`${where} fetches into a scratch ref without \`--no-tags\`.`);
+  }
+
+  if (classification.policy === 'object_transfer_only') {
+    if (refspecs.length > 0 || literals.includes('--tags')) {
+      failures.push(`${where} is classified object-transfer-only but stores refs (${JSON.stringify([...refspecs, ...literals.filter((literal) => literal === '--tags')])}).`);
+    }
+  }
 
   if (classification.policy === 'leased_server_side_publish') {
     if (!mover.body.includes('--force-with-lease=')) {

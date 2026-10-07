@@ -8,7 +8,8 @@
 //!   (card_97a2c0209056).
 //! * A path someone else has locked with `git lfs lock` cannot be changed by a
 //!   push, whether or not the client checks locks itself; the lock holder's
-//!   own push goes through (card_4a40b70a6796).
+//!   own push goes through (card_4a40b70a6796). The same lock holds a web
+//!   edit and the merge of a fork pull request (card_e486e8e09406).
 //!
 //! The SSH twin of each lives in `rg-ssh`'s `ssh_push_policy_tests`.
 
@@ -373,5 +374,158 @@ async fn a_path_someone_else_has_locked_cannot_be_changed_by_a_push() {
         "the lock holder's push was refused:\n{}",
         pushed.output
     );
+    drop(root);
+}
+
+/// The lock holds every way into a branch, not only `git push`: a web edit
+/// and the merge of a fork pull request are refused with the path and its
+/// holder, and the lock holder does both (card_e486e8e09406).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_path_someone_else_has_locked_cannot_be_changed_by_a_web_edit_or_a_fork_merge() {
+    const ALICE: &str = "lock_edit_alice";
+    const BOB: &str = "lock_edit_bob";
+    const REPO: &str = "levels";
+    let (base, _db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (alice_session, _) = register_full(&base, ALICE, "lock_edit_alice@example.com").await;
+    let (bob_session, _) = register_full(&base, BOB, "lock_edit_bob@example.com").await;
+    let alice_pat = pat_for(&base, &alice_session).await;
+    let bob_pat = pat_for(&base, &bob_session).await;
+    create_initialised_repo(&base, &alice_session, REPO).await;
+    let client = reqwest::Client::new();
+    let added = client
+        .post(format!("{base}/api/v1/repos/{ALICE}/{REPO}/collaborators"))
+        .bearer_auth(&alice_session)
+        .json(&serde_json::json!({"username": BOB, "permission": "write"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 201);
+    let root = tempfile::tempdir().unwrap();
+
+    {
+        let (root_path, base, pat) = (root.path().to_path_buf(), base.clone(), alice_pat.clone());
+        on_machine(move || {
+            let work = checkout(&root_path, &base, ALICE, &pat, ALICE, REPO);
+            commit(&work, ALICE, "castle.level", "castle v1\n");
+            git_ok(&work, ALICE, &["push", "-q", "origin", "HEAD"]);
+        })
+        .await;
+    }
+    let locked = client
+        .post(format!("{base}/git/{ALICE}/{REPO}.git/info/lfs/locks"))
+        .header("Accept", "application/vnd.git-lfs+json")
+        .header("Content-Type", "application/vnd.git-lfs+json")
+        .basic_auth(ALICE, Some(&alice_pat))
+        .body(serde_json::json!({ "path": "castle.level" }).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(locked.status(), 201, "{}", locked.text().await.unwrap());
+
+    let bare = repo_root.join(format!("{ALICE}/{REPO}.git"));
+    let main = |bare: &Path| git_ok(bare, "server", &["rev-parse", "refs/heads/main"]);
+    let refusal = format!("path 'castle.level' is locked by {ALICE}");
+    let edit = |session: &str, content: &str| {
+        let blob = git_ok(&bare, "server", &["rev-parse", "main:castle.level"]);
+        client
+            .post(format!(
+                "{base}/api/v1/repos/{ALICE}/{REPO}/contents/castle.level"
+            ))
+            .bearer_auth(session)
+            .json(&serde_json::json!({
+                "content": content,
+                "message": "edit in the browser",
+                "sha": blob,
+            }))
+            .send()
+    };
+
+    // A web edit by someone else: refused, naming the path and the holder.
+    let main_before = main(&bare);
+    let refused = edit(&bob_session, "castle v2 by bob in the browser\n")
+        .await
+        .unwrap();
+    let status = refused.status();
+    let body = refused.text().await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains(&refusal), "{body}");
+    assert_eq!(main(&bare), main_before);
+
+    // The holder edits her own locked file.
+    let accepted = edit(&alice_session, "castle v2 by alice in the browser\n")
+        .await
+        .unwrap();
+    let status = accepted.status();
+    assert!(
+        status.is_success(),
+        "the lock holder's web edit was refused: {status} {}",
+        accepted.text().await.unwrap()
+    );
+
+    // Bob's fork has no locks of its own, so the push into it lands; the merge
+    // into Alice's repository is where her lock applies.
+    let fork = client
+        .post(format!("{base}/api/v1/repos/{ALICE}/{REPO}/fork"))
+        .bearer_auth(&bob_session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fork.status(), 201, "{}", fork.text().await.unwrap());
+    {
+        let (root_path, base) = (root.path().to_path_buf(), base.clone());
+        on_machine(move || {
+            let work = checkout(&root_path, &base, BOB, &bob_pat, BOB, REPO);
+            git_ok(&work, BOB, &["checkout", "-q", "-b", "bob-castle"]);
+            commit(&work, BOB, "castle.level", "castle v3 by bob\n");
+            git_ok(&work, BOB, &["push", "-q", "origin", "bob-castle"]);
+        })
+        .await;
+    }
+    let pr = client
+        .post(format!("{base}/api/v1/repos/{ALICE}/{REPO}/pulls"))
+        .bearer_auth(&bob_session)
+        .json(&serde_json::json!({
+            "title": "bob's castle",
+            "head": format!("{BOB}:bob-castle"),
+            "base": "main",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pr.status(), 201, "{}", pr.text().await.unwrap());
+    let number = pr.json::<serde_json::Value>().await.unwrap()["number"]
+        .as_i64()
+        .unwrap();
+    let merge = |session: &str| {
+        client
+            .post(format!(
+                "{base}/api/v1/repos/{ALICE}/{REPO}/pulls/{number}/merge"
+            ))
+            .bearer_auth(session)
+            .json(&serde_json::json!({ "strategy": "squash" }))
+            .send()
+    };
+
+    let main_before = main(&bare);
+    let refused = merge(&bob_session).await.unwrap();
+    let status = refused.status();
+    let body = refused.text().await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains(&refusal), "{body}");
+    assert_eq!(main(&bare), main_before);
+    assert_eq!(
+        refs_in(&bare, &["refs/forks/"]),
+        "",
+        "the refused merge left its scratch fork ref behind"
+    );
+
+    let merged = merge(&alice_session).await.unwrap();
+    let status = merged.status();
+    assert!(
+        status.is_success(),
+        "the lock holder's merge was refused: {status} {}",
+        merged.text().await.unwrap()
+    );
+    assert_ne!(main(&bare), main_before);
     drop(root);
 }

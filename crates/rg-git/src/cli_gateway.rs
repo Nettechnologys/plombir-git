@@ -165,6 +165,13 @@ const DISARMED_ENV: &[(&str, &str)] = &[
     // Nothing the server runs has a terminal behind it, so a prompt is a hang
     // until the timeout rather than a question.
     ("GIT_TERMINAL_PROMPT", "0"),
+    // A `refs/replace/<X>` makes every read of `X` return another object. The
+    // server reads a commit to decide whether it may land — its signature, the
+    // paths it changes against LFS locks — and the branch receives `X` itself,
+    // so a replacement in the repository would answer those checks for a
+    // commit that is not the one being admitted (card_03ed757463d4). The
+    // in-process half is `crate::repository::open`.
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
 ];
 
 /// Whether an inherited variable can steer git's configuration or redirect the
@@ -783,6 +790,11 @@ mod tests {
             );
         }
         assert_eq!(disarmed.get("GIT_TERMINAL_PROMPT"), Some(&"0"));
+        assert_eq!(
+            disarmed.get("GIT_NO_REPLACE_OBJECTS"),
+            Some(&"1"),
+            "every read would follow the repository's refs/replace/ again"
+        );
         assert_eq!(
             disarmed.len(),
             DISARMED_ENV.len(),

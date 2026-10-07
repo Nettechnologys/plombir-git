@@ -23,6 +23,8 @@ const sources = [
   'crates/rg-core/src/repo/service.rs',
   'crates/rg-core/src/pull_request/service.rs',
   'crates/rg-core/src/pull_request/merge_queue.rs',
+  'crates/rg-core/src/mirror/service.rs',
+  'crates/rg-core/src/import/service.rs',
 ];
 
 for (const relative of sources) {
@@ -97,10 +99,74 @@ try {
     'no longer publishes through push_branch_with_lease',
   );
 
+  writeFileSync(
+    repoService,
+    cleanRepoService.replace(
+      'git.run(&["clone", "--bare", &source_url, &target_arg], None)',
+      'git.run(&["clone", "--mirror", &source_url, &target_arg], None)',
+    ),
+  );
+  expectRed('fork created with clone --mirror mutation', 'never `--mirror`');
+
+  const pullService = path.join(fixture, 'crates/rg-core/src/pull_request/service.rs');
+  const cleanPullService = readFileSync(pullService, 'utf8');
+  // The path nearly every merge takes, and the one the census used to miss
+  // (card_4f51d61a783f): a new `commit_as` outside every classified merge.
+  appendFileSync(
+    pullService,
+    '\nfn unclassified_commit_writer(repo: &gix::Repository, tree: gix::ObjectId, parent: gix::ObjectId) {\n' +
+      '    let signature = merge_signature("0 +0000");\n' +
+      '    let _ = repo.commit_as(signature, signature, "refs/heads/main", "m", tree, [parent]);\n' +
+      '}\n',
+  );
+  expectRed('new commit_as mutation', 'Unclassified production ref mover');
+
+  writeFileSync(pullService, cleanPullService);
+  appendFileSync(
+    pullService,
+    '\nfn unclassified_fetch(git: &rg_git::cli_gateway::GitCommandGateway, from: &str) {\n' +
+      '    let _ = git.run(\n        &[\n            "fetch",\n            from,\n' +
+      '            "+refs/heads/*:refs/heads/*",\n        ],\n        None,\n    );\n}\n',
+  );
+  expectRed('new fetch-into-branches mutation', 'Unclassified production ref mover');
+
+  writeFileSync(
+    pullService,
+    cleanPullService.replace(
+      '            "fetch",\n            "--no-tags",\n            &head_repo_path',
+      '            "fetch",\n            &head_repo_path',
+    ),
+  );
+  expectRed('fork fetch follows tags mutation', 'without `--no-tags`');
+  writeFileSync(pullService, cleanPullService);
+
+  const mirrorService = path.join(fixture, 'crates/rg-core/src/mirror/service.rs');
+  const cleanMirrorService = readFileSync(mirrorService, 'utf8');
+  writeFileSync(
+    mirrorService,
+    cleanMirrorService.replace('"+refs/tags/*:refs/tags/*",', '"+refs/*:refs/*",'),
+  );
+  expectRed('mirror publishes every ref mutation', 'a pull mirror may write only');
+  writeFileSync(mirrorService, cleanMirrorService);
+
+  const mergeQueue = path.join(fixture, 'crates/rg-core/src/pull_request/merge_queue.rs');
+  const cleanMergeQueue = readFileSync(mergeQueue, 'utf8');
+  writeFileSync(
+    mergeQueue,
+    cleanMergeQueue.replace(
+      '"fetch",\n                    &head_repo_path',
+      '"fetch",\n                    "--tags",\n                    &head_repo_path',
+    ),
+  );
+  expectRed('object transfer stores tags mutation', 'is classified object-transfer-only but stores refs');
+  writeFileSync(mergeQueue, cleanMergeQueue);
+
   writeFileSync(repoService, cleanRepoService);
   appendFileSync(
     repoService,
-    '\n// decoy.run(&["push", "origin", "main"], None);\n' +
+    '\nasync fn database_commit_decoy(txn: sea_orm::DatabaseTransaction) {\n' +
+      '    let _ = txn.commit().await;\n}\n' +
+      '\n// decoy.run(&["push", "origin", "main"], None);\n' +
       'const REF_MOVER_DECOY: &str = r#"git.run(&["update-ref", "refs/heads/main", "x"], None)"#;\n' +
       '#[cfg(test)]\nfn test_only_ref_writer(git: &rg_git::cli_gateway::GitCommandGateway) {\n' +
       '    let _ = git.run(&["push", "origin", "main"], None);\n}\n',

@@ -8,7 +8,11 @@
 //! `lfs.locksverify = true`. Without that setting it warns and pushes anyway,
 //! so the server enforces the lock too: receive-pack refuses a ref whose new
 //! commits change a path someone else holds ([`held_by_others`] feeds that
-//! check, card_4a40b70a6796), over HTTP and SSH alike.
+//! check, card_4a40b70a6796), over HTTP and SSH alike. The commits the server
+//! makes itself answer to the same locks: a web edit or applied suggestion
+//! through `branch_protection::server_side::ServerSideCommitPolicy`, and the
+//! merge of a fork's pull request in `pull_request::service`
+//! (card_e486e8e09406).
 //!
 //! A lock covers a path on every branch. The client sends the ref it is on,
 //! and it is kept for display, but a lock scoped to one branch would let the

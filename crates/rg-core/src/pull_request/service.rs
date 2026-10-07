@@ -3975,6 +3975,7 @@ pub async fn merge_pr(
         owner,
         repo_name,
         pr.clone(),
+        actor_id,
         strategy,
         pinned_head.as_deref(),
         delivery_tracker,
@@ -3999,6 +4000,7 @@ async fn merge_claimed_pr(
     owner: &str,
     repo_name: &str,
     pr: PullRequest,
+    actor_id: i64,
     strategy: MergeStrategy,
     expected_head_sha: Option<&str>,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
@@ -4008,6 +4010,9 @@ async fn merge_claimed_pr(
         bail!("repository path does not exist: {:?}", repo_path);
     }
     require_pull_request_branch(&repo_path, "base", &pr.base_branch)?;
+    let foreign_locks = crate::lfs::locks::held_by_others(db, pr.repo_id, Some(actor_id))
+        .await
+        .context("load the LFS locks other people hold")?;
 
     // Read the base tip *before* the merge: afterwards the old commit is only
     // reachable through the reflog, and the post-push hooks need the `before`
@@ -4091,6 +4096,20 @@ async fn merge_claimed_pr(
         )
         .await?;
 
+        // The fork's commits were held to the fork's locks when they were
+        // pushed, if to any; landing in the base they are new there, and the
+        // base's locks are what they answer to now — the same check
+        // receive-pack makes of a push carrying them (card_e486e8e09406).
+        if let Err(error) = refuse_locked_paths(&repo_path, &head_sha, &foreign_locks).await {
+            let repo_path = repo_path.clone();
+            if let Err(cleanup) =
+                tokio::task::spawn_blocking(move || discard_fork_ref(&repo_path, &merge_ref)).await
+            {
+                tracing::warn!(error = %cleanup, "failed to discard a scratch fork ref");
+            }
+            return Err(error);
+        }
+
         // Before the merge, not after it: once the base branch moves, its
         // pointers are public, and an object still missing then is a `404` for
         // the next `git lfs pull` rather than a refusal the author can act on.
@@ -4150,6 +4169,10 @@ async fn merge_claimed_pr(
     require_pull_request_branch(&repo_path, "head", &pr.head_branch)?;
     let head_sha = get_ref_sha(&repo_path, &pr.head_branch)?;
     require_pinned_head(&pr, expected_head_sha, &head_sha)?;
+    // A same-repository head is a branch: every commit it brings was held to
+    // this repository's locks by receive-pack when it was pushed, and none of
+    // them is new to the branches, so there is nothing for
+    // `refuse_locked_paths` to read here.
 
     // Same-repo merge — offload gix merge operations to spawn_blocking
     let merge_commit_sha = {
@@ -4172,6 +4195,30 @@ async fn merge_claimed_pr(
         delivery_tracker,
     )
     .await
+}
+
+/// Refuse a merge whose head brings the base repository a change to a path
+/// someone other than the merger has locked (card_e486e8e09406).
+///
+/// "Brings" is what receive-pack means by it: commits reachable from
+/// `head_sha` that no branch or tag of the base holds yet. `409`, as for a web
+/// edit: the merger may write, and the lock is what refuses.
+async fn refuse_locked_paths(
+    repo_path: &std::path::Path,
+    head_sha: &str,
+    foreign_locks: &[rg_git::protocol::receive_pack::ForeignLock],
+) -> Result<()> {
+    match rg_git::protocol::receive_pack::first_foreign_lock_changed(
+        repo_path,
+        head_sha,
+        foreign_locks,
+    )
+    .await
+    .context("failed to check the pull request against LFS locks")?
+    {
+        Some(lock) => Err(crate::error::conflict(lock.refusal())),
+        None => Ok(()),
+    }
 }
 
 /// Merge one named revision of the head into the base branch.
@@ -4739,99 +4786,6 @@ fn remote_branch_sha(
         .split_whitespace()
         .next()
         .map(str::to_string))
-}
-
-/// Set HEAD to point to a branch (equivalent to `git checkout <branch>` in a bare repo).
-/// Uses gix to update the HEAD symbolic reference.
-#[allow(dead_code)]
-fn gix_set_head_to_branch(repo_path: &std::path::Path, branch: &str) -> Result<()> {
-    let repo = rg_git::repository::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
-    gix_set_head_to_branch_with_repo(&repo, branch)
-}
-
-/// Same as `gix_set_head_to_branch` but takes an already-open `Repository`.
-fn gix_set_head_to_branch_with_repo(repo: &gix::Repository, branch: &str) -> Result<()> {
-    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
-    use gix::refs::{FullName, Target};
-
-    let branch_ref: FullName = format!("refs/heads/{}", branch)
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("invalid branch reference: {}", e))?;
-    let head_name: FullName = "HEAD"
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("invalid HEAD reference: {}", e))?;
-
-    repo.edit_reference(RefEdit {
-        change: Change::Update {
-            log: LogChange {
-                mode: RefLog::AndReference,
-                force_create_reflog: false,
-                message: "checkout".into(),
-            },
-            expected: PreviousValue::Any,
-            new: Target::Symbolic(branch_ref),
-        },
-        name: head_name,
-        deref: false,
-    })
-    .map_err(|e| anyhow::anyhow!("failed to set HEAD to refs/heads/{}: {}", branch, e))?;
-
-    Ok(())
-}
-
-/// Fast-forward a branch to point to another branch's commit (equivalent to `git merge --ff-only`).
-/// Uses gix to update the base branch reference.
-#[allow(dead_code)]
-fn gix_fast_forward(
-    repo_path: &std::path::Path,
-    base_branch: &str,
-    head_branch: &str,
-) -> Result<()> {
-    let repo = rg_git::repository::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
-    gix_fast_forward_with_repo(&repo, base_branch, head_branch)
-}
-
-/// Same as `gix_fast_forward` but takes an already-open `Repository`.
-fn gix_fast_forward_with_repo(
-    repo: &gix::Repository,
-    base_branch: &str,
-    head_branch: &str,
-) -> Result<()> {
-    let head_ref_str = format!("refs/heads/{}", head_branch);
-    let base_ref_str = format!("refs/heads/{}", base_branch);
-
-    // Resolve head branch commit
-    let head_id = repo
-        .rev_parse_single(head_ref_str.as_str())
-        .map_err(|e| anyhow::anyhow!("failed to resolve {}: {}", head_ref_str, e))?;
-
-    // Update base branch to point to head's commit
-    repo.reference(
-        base_ref_str.as_str(),
-        head_id.detach(),
-        gix::refs::transaction::PreviousValue::Any,
-        "fast-forward merge",
-    )
-    .map_err(|e| anyhow::anyhow!("fast-forward failed: {}", e))?;
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn get_head_sha(repo_path: &std::path::Path) -> Result<String> {
-    let repo = rg_git::repository::open(repo_path)
-        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
-    get_head_sha_with_repo(&repo)
-}
-
-/// Same as `get_head_sha` but takes an already-open `Repository`.
-fn get_head_sha_with_repo(repo: &gix::Repository) -> Result<String> {
-    let head_id = repo
-        .rev_parse_single("HEAD")
-        .map_err(|e| anyhow::anyhow!("failed to parse HEAD: {}", e))?;
-    Ok(head_id.to_string())
 }
 
 /// Require the branch recorded on a pull request to still exist.

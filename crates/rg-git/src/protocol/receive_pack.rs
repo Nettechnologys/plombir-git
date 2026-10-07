@@ -71,6 +71,14 @@ pub struct ForeignLock {
     pub owner: String,
 }
 
+impl ForeignLock {
+    /// What a writer refused by this lock reads — the same words over
+    /// receive-pack, the web editor and a merge.
+    pub fn refusal(&self) -> String {
+        format!("path '{}' is locked by {}", self.path, self.owner)
+    }
+}
+
 /// Ref updates a push has already applied, kept somewhere a cancelled future
 /// cannot take them with it.
 ///
@@ -853,16 +861,13 @@ async fn enforce_foreign_lfs_locks(
     if locks.is_empty() {
         return;
     }
-    let locked: std::collections::HashMap<&str, &str> = locks
-        .iter()
-        .map(|lock| (lock.path.as_str(), lock.owner.as_str()))
-        .collect();
+    let locked = locked_paths(locks);
     for update in updates.iter_mut().filter(|update| update.status == "ok") {
         match first_locked_path_changed(repo_path, &update.new_sha, &locked).await {
             Ok(None) => {}
-            Ok(Some((path, owner))) => {
+            Ok(Some(lock)) => {
                 update.status = "error".into();
-                update.message = format!("path '{path}' is locked by {owner}");
+                update.message = lock.refusal();
             }
             Err(error) => {
                 tracing::warn!(
@@ -877,17 +882,92 @@ async fn enforce_foreign_lfs_locks(
     }
 }
 
+/// `locks` by path, the shape both lock checks match a changed path against.
+fn locked_paths(locks: &[ForeignLock]) -> std::collections::HashMap<&str, &ForeignLock> {
+    locks
+        .iter()
+        .map(|lock| (lock.path.as_str(), lock))
+        .collect()
+}
+
+/// The first of `locks` whose path a commit new to `repo_path` changes: one
+/// reachable from `new_sha` that no branch or tag holds yet — the same "new"
+/// receive-pack enforces (see `enforce_foreign_lfs_locks`).
+///
+/// For a merge the server makes: the head of a fork pull request lives under a
+/// scratch ref, so its commits count, while a same-repository head is already
+/// on a branch and was checked when it was pushed.
+pub async fn first_foreign_lock_changed(
+    repo_path: &Path,
+    new_sha: &str,
+    locks: &[ForeignLock],
+) -> Result<Option<ForeignLock>> {
+    if locks.is_empty() {
+        return Ok(None);
+    }
+    first_locked_path_changed(repo_path, new_sha, &locked_paths(locks)).await
+}
+
+/// The first of `locks` whose path `commit` changes against its parent — or,
+/// for a root commit, adds.
+///
+/// For a commit the server has just made on top of a branch (a web edit, an
+/// applied suggestion), where that one commit is everything the ref move
+/// brings. Not for a merge commit: `diff-tree` lists nothing for one.
+pub fn foreign_lock_changed_by_commit(
+    repo_path: &Path,
+    commit: &str,
+    locks: &[ForeignLock],
+) -> Result<Option<ForeignLock>> {
+    if locks.is_empty() {
+        return Ok(None);
+    }
+    let output = crate::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{}", e))?
+        .run(
+            &[
+                "diff-tree",
+                "-r",
+                "-z",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                commit,
+                "--",
+            ],
+            Some(repo_path),
+        )
+        .context("failed to run git diff-tree for the LFS lock check")?;
+    output
+        .ensure_success()
+        .context("git diff-tree for the LFS lock check failed")?;
+    let locked = locked_paths(locks);
+    Ok(output
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .filter_map(|name| std::str::from_utf8(name).ok())
+        .find_map(|name| locked.get(name).map(|lock| (*lock).clone())))
+}
+
 /// The first locked path a commit new to the repository changes, with its
 /// lock holder.
 ///
 /// `git log --name-only` is streamed rather than collected: a first push of a
 /// large history lists every path of every commit, and only one hit is needed.
 /// Leaving early drops the child, which `spawn_async` kills.
+///
+/// `-c`, because `git log` lists no paths at all for a merge commit by default:
+/// a merge whose result changes a locked path that neither parent changed —
+/// an edit made in the merge itself — went through. The combined form names
+/// exactly the paths the merge result differs from every parent in, so a clean
+/// merge of work already checked still lists nothing.
 async fn first_locked_path_changed(
     repo_path: &Path,
     new_sha: &str,
-    locked: &std::collections::HashMap<&str, &str>,
-) -> Result<Option<(String, String)>> {
+    locked: &std::collections::HashMap<&str, &ForeignLock>,
+) -> Result<Option<ForeignLock>> {
     use tokio::io::AsyncBufReadExt;
 
     let mut child = crate::cli_gateway::global_gateway()
@@ -898,6 +978,7 @@ async fn first_locked_path_changed(
                 "log",
                 "--format=",
                 "--name-only",
+                "-c",
                 "-z",
                 "--no-renames",
                 new_sha,
@@ -925,11 +1006,11 @@ async fn first_locked_path_changed(
             break;
         }
         let name = path.strip_suffix(b"\0").unwrap_or(&path);
-        if let Some((locked_path, owner)) = std::str::from_utf8(name)
+        if let Some(lock) = std::str::from_utf8(name)
             .ok()
-            .and_then(|name| locked.get_key_value(name))
+            .and_then(|name| locked.get(name))
         {
-            return Ok(Some((locked_path.to_string(), owner.to_string())));
+            return Ok(Some((*lock).clone()));
         }
     }
 
@@ -2571,6 +2652,92 @@ mod push_policy_tests {
             "ok",
             "moving main onto commits a branch already holds was blamed on the pusher"
         );
+    }
+
+    /// The lock holds an edit made inside a merge commit — one neither parent
+    /// carries — and lets a clean merge of already-pushed work through.
+    #[tokio::test]
+    async fn a_merge_commit_s_own_edit_of_a_locked_path_is_refused() {
+        let served = Served::new();
+        let side = commit(&served.work, "free.txt", "side\n");
+        served.publish(&side, "side");
+        git(&served.work, &["reset", "-q", "--hard", &served.base]);
+        let other = commit(&served.work, "other.txt", "other\n");
+        served.publish(&other, "other");
+
+        git(
+            &served.work,
+            &["merge", "-q", "--no-ff", "-m", "clean", &side],
+        );
+        let clean = git(&served.work, &["rev-parse", "HEAD"]);
+        git(&served.work, &["reset", "-q", "--hard", &other]);
+        git(
+            &served.work,
+            &["merge", "-q", "--no-ff", "--no-commit", &side],
+        );
+        std::fs::write(served.work.join("castle.level"), "edited in the merge\n").unwrap();
+        git(&served.work, &["add", "castle.level"]);
+        git(&served.work, &["commit", "-q", "-m", "evil"]);
+        let evil = git(&served.work, &["rev-parse", "HEAD"]);
+        served.deliver_objects(&clean);
+        served.deliver_objects(&evil);
+
+        let updates = push(
+            &served.bare,
+            &[
+                (&other, &evil, "refs/heads/other"),
+                (NULL_SHA1, &clean, "refs/heads/clean"),
+            ],
+            &alice_holds("castle.level"),
+        )
+        .await;
+
+        let refused = outcome(&updates, "refs/heads/other");
+        assert_eq!(refused.status, "error", "the merge's own edit went through");
+        assert_eq!(refused.message, "path 'castle.level' is locked by alice");
+        assert_eq!(branch(&served.bare, "other"), Some(other));
+        assert_eq!(
+            outcome(&updates, "refs/heads/clean").status,
+            "ok",
+            "a clean merge of work the repository already holds was refused"
+        );
+    }
+
+    /// A `refs/replace/<E>` already in the repository — from before such
+    /// pushes were refused — must not answer the lock check for `E`: the
+    /// branch receives `E`, so `E` is what is read (card_03ed757463d4).
+    #[tokio::test]
+    async fn a_replacement_in_the_repository_does_not_hide_a_locked_path() {
+        let served = Served::new();
+        let locked = commit(&served.work, "castle.level", "bob's castle\n");
+        git(&served.work, &["reset", "-q", "--hard", &served.base]);
+        let decoy = commit(&served.work, "free.txt", "nothing to see\n");
+        served.deliver_objects(&locked);
+        served.deliver_objects(&decoy);
+        git(
+            &served.bare,
+            &["update-ref", &format!("refs/replace/{locked}"), &decoy],
+        );
+
+        // The fixture holds a well-formed replacement; that the check reads
+        // past it is what dropping `GIT_NO_REPLACE_OBJECTS` from the gateway
+        // turns red.
+        assert_eq!(
+            git(&served.bare, &["replace", "--list", "--format=long"]),
+            format!("{locked} (commit) -> {decoy} (commit)")
+        );
+
+        let updates = push(
+            &served.bare,
+            &[(&served.base, &locked, "refs/heads/main")],
+            &alice_holds("castle.level"),
+        )
+        .await;
+
+        let main = outcome(&updates, "refs/heads/main");
+        assert_eq!(main.status, "error", "the replacement hid the locked path");
+        assert_eq!(main.message, "path 'castle.level' is locked by alice");
+        assert_eq!(branch(&served.bare, "main"), Some(served.base.clone()));
     }
 
     #[tokio::test]

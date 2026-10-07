@@ -514,7 +514,10 @@ File locking works with the stock client from either clone URL:
 `git lfs lock <path>`, `git lfs locks`, `git lfs unlock <path>`. The server
 enforces a lock itself: a push whose new commits change a path someone else
 has locked is refused for that branch (`path '<path>' is locked by <owner>`),
-over HTTPS and SSH alike. Setting `git config lfs.locksverify true` (or
+over HTTPS and SSH alike, and so is an edit made inside a merge commit. The
+same lock answers `409` to a web edit or applied suggestion that changes the
+path, and to merging a fork's pull request whose commits change it; the lock
+holder does all of these as usual. Setting `git config lfs.locksverify true` (or
 `--global`) still helps — git-lfs then stops the push before uploading
 anything instead of the server refusing it afterwards. Unlocking someone
 else's lock takes `--force` from a repository administrator. Repository

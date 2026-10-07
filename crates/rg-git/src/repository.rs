@@ -30,5 +30,13 @@ use std::path::Path;
 // call site pay for a lint about gix's error type.
 #[allow(clippy::result_large_err)]
 pub fn open(path: impl AsRef<Path>) -> Result<gix::Repository, gix::open::Error> {
-    gix::open_opts(path.as_ref(), gix::open::Options::isolated())
+    let mut repo = gix::open_opts(path.as_ref(), gix::open::Options::isolated())?;
+    // Objects are read as stored, never through `refs/replace/`: what the
+    // server checks and merges has to be the object the branch will hold
+    // (card_03ed757463d4). Said here rather than left to gix's default, which
+    // hangs on `core.useReplaceRefs` — a key gix 0.84 reads with the opposite
+    // sense git gives it — and the CLI half is `GIT_NO_REPLACE_OBJECTS` in the
+    // gateway's disarmed environment.
+    repo.objects.ignore_replacements = true;
+    Ok(repo)
 }
