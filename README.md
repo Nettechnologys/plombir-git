@@ -453,6 +453,21 @@ cd /tmp/myrepo-http
 git push origin main
 ```
 
+### Pull mirrors
+
+A repository with a pull mirror (**Settings → Mirror**, or
+`POST /api/v1/repos/<owner>/<repo>/mirror`) fetches its upstream on the
+interval it is given, or on **Sync now**, and every pass that succeeds
+publishes the upstream's branches and tags to the repository clients clone.
+The first pass also points the repository's default branch at the upstream's
+when the repository has no branch of that name yet.
+
+The upstream owns `refs/heads/*` and `refs/tags/*`: each pass force-updates
+every branch and tag to the upstream's and removes the ones the upstream does
+not have. Pushes to a mirrored repository are not refused, but whatever they
+write to a branch or a tag lasts only until the next pass. Pull request heads
+and the server's other refs are left alone.
+
 ### Git LFS
 
 `git lfs` needs no `lfs.url` with either clone URL. From the HTTPS URL the

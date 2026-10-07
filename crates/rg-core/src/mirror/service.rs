@@ -29,6 +29,24 @@
 //! are converted at startup by
 //! [`crate::mirror::service::lift_legacy_url_credentials`], and
 //! `mask_credential` is the last net in front of anything persisted or logged.
+//!
+//! ## What clients see
+//!
+//! A pass fetches into a private clone (`<repo_root>/<repo_id>.mirror`), and
+//! nothing serves that directory. The repository clients clone, browse and
+//! pull is `<owner>/<name>.git`, so a pass ends by publishing the clone's
+//! branches and tags into it ([`publish_mirrored_refs`]). Until that existed a
+//! mirror reported `status=active` with a fresh `last_sync_at` while every
+//! clone of it got whatever the repository held before the mirror was set up
+//! — usually nothing (card_df2f1f187e5a).
+//!
+//! The upstream is authoritative for `refs/heads/*` and `refs/tags/*`. Like a
+//! pull mirror on GitHub or Gitea, the repository is not a place to push to:
+//! the next pass force-updates every branch and tag to the upstream's, and
+//! removes the ones the upstream does not have. Pushes are not refused yet,
+//! but whatever they write to those two namespaces lasts only until that
+//! pass. The server's own refs (pull request heads, fork refs) are outside
+//! both and are left alone.
 
 use super::transport::MirrorTransportPolicy;
 use anyhow::{Context, Result};
@@ -690,6 +708,33 @@ async fn run_sync_pass(
         ),
     };
 
+    finish_pass(
+        db,
+        mirror,
+        repo_root,
+        &clone_path,
+        credentials,
+        result,
+        transport_policy,
+    )
+    .await
+}
+
+/// Everything a pass does once the upstream has been dialled: bring the LFS
+/// objects, publish the refs, and record on the row how it went.
+///
+/// Apart from [`run_sync_pass`] because the dialling half is the one a test
+/// cannot reach — the transport policy refuses every loopback upstream — and
+/// everything that decides what clients see is here.
+async fn finish_pass(
+    db: &DatabaseConnection,
+    mirror: &Mirror,
+    repo_root: &Path,
+    clone_path: &Path,
+    credentials: Option<GitCredentials>,
+    result: Result<()>,
+    transport_policy: MirrorTransportPolicy,
+) -> Result<()> {
     // `{e}` printed the outermost `.context(...)` only, both in the persisted
     // field the UI shows and in the log — under it sits the `git clone
     // --mirror` failure that actually explains the outage (card_a997f30c142c).
@@ -701,38 +746,57 @@ async fn run_sync_pass(
         // missing binary — but the pass is not reported as a clean one either:
         // the row says which objects are missing, and the sweep retries a
         // mirror in `error` on its next tick.
-        Ok(()) => match super::lfs::fetch_new_objects(
-            db,
-            repo_root,
-            mirror.repo_id,
-            &clone_path,
-            &mirror.url,
-            credentials.as_ref().map(|credentials| {
-                GitCredentials::new(
-                    credentials.username().map(str::to_string),
-                    credentials.password().to_string(),
-                )
-            }),
-            &transport_policy,
-        )
-        .await
-        {
-            Ok(pass) if pass.failed.is_empty() => {
-                if pass.fetched > 0 {
-                    tracing::info!(
-                        repo_id = mirror.repo_id,
-                        fetched = pass.fetched,
-                        "fetched the LFS objects a mirror pass brought pointers for"
-                    );
+        Ok(()) => {
+            let lfs = match super::lfs::fetch_new_objects(
+                db,
+                repo_root,
+                mirror.repo_id,
+                clone_path,
+                &mirror.url,
+                credentials.as_ref().map(|credentials| {
+                    GitCredentials::new(
+                        credentials.username().map(str::to_string),
+                        credentials.password().to_string(),
+                    )
+                }),
+                &transport_policy,
+            )
+            .await
+            {
+                Ok(pass) if pass.failed.is_empty() => {
+                    if pass.fetched > 0 {
+                        tracing::info!(
+                            repo_id = mirror.repo_id,
+                            fetched = pass.fetched,
+                            "fetched the LFS objects a mirror pass brought pointers for"
+                        );
+                    }
+                    None
                 }
-                None
-            }
-            Ok(pass) => Some(super::lfs::describe_shortfall(&pass.failed)),
-            Err(e) => Some(format!(
+                Ok(pass) => Some(super::lfs::describe_shortfall(&pass.failed)),
+                Err(e) => Some(format!(
                 "the refs are up to date, but the LFS objects their history points at could not \
                  be fetched: {e:#}"
             )),
-        },
+            };
+            // After the LFS objects, so that a client which sees the new refs
+            // finds the objects they point at already here. A shortfall still
+            // publishes: the history is no less the upstream's for one missing
+            // binary, and the row names what is missing.
+            match publish_mirrored_refs(db, repo_root, mirror.repo_id, clone_path).await {
+                Ok(()) => lfs,
+                Err(e) => Some(match lfs {
+                    None => format!(
+                        "the upstream was fetched, but its branches and tags could not be \
+                         published to the repository: {e:#}"
+                    ),
+                    Some(lfs) => format!(
+                        "the upstream was fetched, but its branches and tags could not be \
+                         published to the repository: {e:#}; and {lfs}"
+                    ),
+                }),
+            }
+        }
     };
 
     let now = Utc::now();
@@ -763,6 +827,92 @@ async fn run_sync_pass(
 
     rg_db::ops::mirror_ops::update(db, model).await?;
     Ok(())
+}
+
+/// Make the repository clients read carry the branches and tags the mirror's
+/// clone just fetched.
+///
+/// Runs under the pass's sync lease, so a repository deletion — which backs off
+/// while the lease is held — cannot retire the directory underneath it. The
+/// identity is read now rather than when the mirror was selected, because a
+/// rename during the pass moves the directory.
+///
+/// `--prune` with explicit `refs/heads/*` and `refs/tags/*` destinations
+/// removes only branches and tags; the server's own refs live elsewhere.
+async fn publish_mirrored_refs(
+    db: &DatabaseConnection,
+    repo_root: &Path,
+    repo_id: i64,
+    clone: &Path,
+) -> Result<()> {
+    let (owner, name) = crate::repo::service::repository_identity(db, repo_id).await?;
+    let served = repo_root.join(&owner).join(format!("{name}.git"));
+    let clone = clone.to_path_buf();
+    let adopt = crate::blocking::run_blocking_git("mirror ref publication", move || {
+        let git = global_gateway()
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        git.run(
+            &[
+                "fetch",
+                "--prune",
+                "--no-write-fetch-head",
+                &clone.to_string_lossy(),
+                "+refs/heads/*:refs/heads/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+            Some(&served),
+        )?
+        .ensure_success()
+        .with_context(|| format!("git fetch from the mirror clone into {}", served.display()))?;
+        adoptable_head(&served, &clone)
+    })
+    .await?;
+
+    if let Some(branch) = adopt {
+        if rg_db::ops::repo_ops::set_default_branch(db, repo_id, &branch).await? {
+            tracing::info!(
+                repo_id,
+                branch = %branch,
+                "a mirror pass pointed the repository's default branch at the upstream's"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The upstream's default branch, when the repository's own `HEAD` names a
+/// branch that does not exist and the upstream's does — the state of every
+/// repository right after its first pass, which was created with a default
+/// branch of its own choosing. `HEAD` is moved here; the column is the
+/// caller's.
+///
+/// A `HEAD` that resolves is left alone: someone chose that branch, and it is
+/// one the upstream has.
+fn adoptable_head(served: &Path, clone: &Path) -> Result<Option<String>> {
+    let served_refs = rg_git::ref_advertisement::collect(served)
+        .with_context(|| format!("read the refs of {}", served.display()))?;
+    if served_refs.head_oid.is_some() {
+        return Ok(None);
+    }
+    let upstream = rg_git::ref_advertisement::collect(clone)
+        .with_context(|| format!("read the refs of {}", clone.display()))?;
+    let Some(target) = upstream
+        .head_target
+        .filter(|target| target.starts_with("refs/heads/"))
+    else {
+        return Ok(None);
+    };
+    if !served_refs.refs.iter().any(|(_, name)| *name == target) {
+        return Ok(None);
+    }
+    let git = global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    git.run(&["symbolic-ref", "HEAD", &target], Some(served))?
+        .ensure_success()
+        .context("git symbolic-ref HEAD")?;
+    Ok(target.strip_prefix("refs/heads/").map(str::to_string))
 }
 
 /// Sync all due mirrors (called by background task / cron).
@@ -1144,6 +1294,150 @@ mod tests {
         .expect("create mirror");
 
         (db, repo.id, mirror.id)
+    }
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let output = global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run(args, Some(dir))
+            .expect("run git");
+        output
+            .ensure_success()
+            .unwrap_or_else(|error| panic!("git {args:?} failed: {error:#}"));
+        output.stdout_str().trim().to_string()
+    }
+
+    fn commit(work: &Path, file: &str, message: &str) -> String {
+        std::fs::write(work.join(file), message).expect("write upstream file");
+        git_out(work, &["add", "."]);
+        git_out(work, &["commit", "-qm", message]);
+        git_out(work, &["rev-parse", "HEAD"])
+    }
+
+    /// card_df2f1f187e5a: a pass used to update only the private clone, so a
+    /// mirror said `active` while clients of the repository got nothing.
+    #[tokio::test]
+    async fn a_finished_pass_publishes_the_upstream_refs_to_the_served_repository() {
+        let (db, repo_id, _) = update_fixture().await;
+        let mirror = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repo_root = directory.path().join("repos");
+        let served = repo_root.join("mirror-race-owner/mirror-race-repo.git");
+        std::fs::create_dir_all(&served).expect("served directory");
+        // As repository creation leaves it: bare, empty, HEAD on the column's
+        // `main` — which this upstream does not have.
+        git_out(&served, &["init", "-q", "--bare", "-b", "main"]);
+
+        let upstream = directory.path().join("upstream");
+        std::fs::create_dir_all(&upstream).expect("upstream directory");
+        git_out(&upstream, &["init", "-q", "-b", "trunk"]);
+        git_out(&upstream, &["config", "user.name", "mirror test"]);
+        git_out(
+            &upstream,
+            &["config", "user.email", "mirror@example.invalid"],
+        );
+        let first = commit(&upstream, "a.txt", "first");
+        git_out(&upstream, &["tag", "v1"]);
+        git_out(&upstream, &["branch", "feature"]);
+
+        // What `git clone --mirror` gives the pass.
+        let clone = mirror_clone_path(&repo_root, repo_id);
+        git_out(
+            &repo_root,
+            &[
+                "clone",
+                "--mirror",
+                "-q",
+                upstream.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        let finish = |db: &DatabaseConnection, mirror: Mirror| {
+            let (repo_root, clone) = (repo_root.clone(), clone.clone());
+            let db = db.clone();
+            async move {
+                finish_pass(
+                    &db,
+                    &mirror,
+                    &repo_root,
+                    &clone,
+                    None,
+                    Ok(()),
+                    MirrorTransportPolicy::default(),
+                )
+                .await
+                .expect("finish the pass");
+            }
+        };
+        finish(&db, mirror.clone()).await;
+
+        let row = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_ACTIVE, "{:?}", row.last_sync_error);
+        assert_eq!(git_out(&served, &["rev-parse", "refs/heads/trunk"]), first);
+        assert_eq!(
+            git_out(&served, &["rev-parse", "refs/tags/v1^{commit}"]),
+            first
+        );
+        assert_eq!(
+            git_out(&served, &["rev-parse", "refs/heads/feature"]),
+            first
+        );
+        assert_eq!(
+            git_out(&served, &["symbolic-ref", "HEAD"]),
+            "refs/heads/trunk",
+            "an empty repository takes the upstream's default branch"
+        );
+        let repository = rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repository.default_branch, "trunk");
+
+        // What a client cloning the repository gets.
+        let checkout = directory.path().join("checkout");
+        git_out(
+            directory.path(),
+            &[
+                "clone",
+                "-q",
+                served.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(git_out(&checkout, &["rev-parse", "HEAD"]), first);
+
+        // The upstream moves on and drops a branch; someone pushed a branch of
+        // their own into the mirror, and the server keeps a ref of its own.
+        let second = commit(&upstream, "b.txt", "second");
+        git_out(&upstream, &["branch", "-D", "feature"]);
+        git_out(&served, &["update-ref", "refs/heads/local-only", &first]);
+        git_out(&served, &["update-ref", "refs/pull/1/head", &first]);
+        git_out(&clone, &["remote", "update", "--prune"]);
+        finish(&db, row).await;
+
+        assert_eq!(git_out(&served, &["rev-parse", "refs/heads/trunk"]), second);
+        let branches = git_out(
+            &served,
+            &["for-each-ref", "--format=%(refname)", "refs/heads"],
+        );
+        assert_eq!(
+            branches, "refs/heads/trunk",
+            "branches the upstream does not have are not kept"
+        );
+        assert_eq!(
+            git_out(&served, &["rev-parse", "refs/pull/1/head"]),
+            first,
+            "the server's own refs are not the upstream's to prune"
+        );
+        git_out(&checkout, &["pull", "-q"]);
+        assert_eq!(git_out(&checkout, &["rev-parse", "HEAD"]), second);
     }
 
     #[tokio::test]
