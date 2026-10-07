@@ -15,7 +15,7 @@
 //!
 //! ## Imported content belongs to the account that imported it
 //!
-//! Every issue, comment, review and merge request this module writes is
+//! Every issue, comment, review, merge request and release this module writes is
 //! attributed to `task.user_id`. There is no mapping from a source-platform
 //! login to a local account, and the code no longer pretends otherwise: it used
 //! to walk the source's issues and PRs to collect logins, hand them to a
@@ -100,6 +100,8 @@ pub struct ImportStats {
     pub prs_imported: usize,
     pub pr_reviews_imported: usize,
     pub releases_imported: usize,
+    /// Releases the source listed but the target could not create.
+    pub releases_failed: Vec<ReleaseImportFailure>,
     pub wiki_pages_imported: usize,
     /// LFS objects downloaded from the source and stored for the target.
     pub lfs_objects_imported: usize,
@@ -109,16 +111,176 @@ pub struct ImportStats {
     pub lfs_objects_failed: Vec<crate::lfs::fetch::LfsFetchFailure>,
 }
 
+/// A safe, actionable summary for the task owner. Raw database errors and
+/// source-supplied response text stay in the server log.
+#[derive(Debug, serde::Serialize)]
+pub struct ReleaseImportFailure {
+    pub tag_name: String,
+    pub reason: &'static str,
+}
+
+fn release_failure_reason(error: &anyhow::Error) -> &'static str {
+    if error.downcast_ref::<crate::error::Conflict>().is_some() {
+        "a release with this tag already exists"
+    } else if error
+        .downcast_ref::<crate::error::InvalidRequest>()
+        .is_some()
+    {
+        "the release has an empty tag or title"
+    } else {
+        "release creation failed; ask the instance operator to check the server log"
+    }
+}
+
+#[cfg(test)]
+mod release_import_tests {
+    use super::*;
+    use crate::import::gitlab_client::GitLabReleaseAssets;
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    async fn test_db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        for (id, username) in [(1, "someone_else"), (2, "importer")] {
+            db.execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                format!(
+                    "INSERT INTO users(id, username, email, password_hash, is_admin, is_active, created_at, updated_at) \
+                     VALUES({id}, '{username}', '{username}@example.invalid', 'x', 0, 1, '2024-01-01', '2024-01-01')"
+                ),
+            ))
+            .await
+            .unwrap();
+        }
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO repositories(id, owner_id, name, is_private, default_branch, stars_count, forks_count, created_at, updated_at) \
+             VALUES(1, 2, 'imported', 0, 'main', 0, 0, '2024-01-01', '2024-01-01')"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+        db
+    }
+
+    fn github_release(tag: &str) -> GitHubRelease {
+        GitHubRelease {
+            id: 10,
+            tag_name: tag.to_string(),
+            name: None,
+            body: None,
+            prerelease: false,
+            draft: false,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            published_at: None,
+            assets: Vec::new(),
+        }
+    }
+
+    fn gitlab_release(tag: &str) -> GitLabRelease {
+        GitLabRelease {
+            tag_name: tag.to_string(),
+            name: None,
+            description: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            released_at: None,
+            assets: GitLabReleaseAssets {
+                count: 0,
+                sources: Vec::new(),
+                links: Vec::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn github_releases_belong_to_importer_and_name_failed_tags() {
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let count = import_github_releases(
+            &db,
+            1,
+            2,
+            &[
+                github_release("v1"),
+                github_release("v1"),
+                github_release(""),
+            ],
+            Path::new("unused"),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, 1);
+        let saved = rg_db::ops::release_ops::find_by_repo_and_tag(&db, 1, "v1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.author_id, Some(2));
+        assert_eq!(stats.releases_failed.len(), 2);
+        assert_eq!(stats.releases_failed[0].tag_name, "v1");
+        assert_eq!(
+            stats.releases_failed[0].reason,
+            "a release with this tag already exists"
+        );
+        assert_eq!(stats.releases_failed[1].tag_name, "");
+        assert_eq!(
+            stats.releases_failed[1].reason,
+            "the release has an empty tag or title"
+        );
+        assert!(stats.completion_stage().contains("2 release(s)"));
+        assert!(serde_json::to_value(&stats).unwrap()["releases_failed"].is_array());
+    }
+
+    #[tokio::test]
+    async fn gitlab_releases_belong_to_importer_and_name_failed_tags() {
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let count = import_gitlab_releases(
+            &db,
+            1,
+            2,
+            &[gitlab_release("v2"), gitlab_release("v2")],
+            Path::new("unused"),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, 1);
+        let saved = rg_db::ops::release_ops::find_by_repo_and_tag(&db, 1, "v2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.author_id, Some(2));
+        assert_eq!(stats.releases_failed.len(), 1);
+        assert_eq!(stats.releases_failed[0].tag_name, "v2");
+        assert_eq!(
+            stats.releases_failed[0].reason,
+            "a release with this tag already exists"
+        );
+        assert!(stats.completion_stage().contains("1 release(s)"));
+    }
+}
+
 impl ImportStats {
     /// The `stage` a finished import leaves on its task — the line the import
     /// page shows. The detail lives in `stats`; this line only has to make
-    /// sure nobody reads an import with missing LFS content as a clean one.
+    /// sure nobody reads an import with missing content as a clean one.
     pub fn completion_stage(&self) -> String {
-        match self.lfs_objects_failed.len() {
-            0 => "Import completed".to_string(),
-            missing => format!(
+        match (self.lfs_objects_failed.len(), self.releases_failed.len()) {
+            (0, 0) => "Import completed".to_string(),
+            (missing, 0) => format!(
                 "Import completed, but {missing} LFS object(s) could not be fetched from the \
                  source; the task's stats name each one"
+            ),
+            (0, missing) => format!(
+                "Import completed, but {missing} release(s) could not be imported; \
+                 the task's stats name each one"
+            ),
+            (lfs, releases) => format!(
+                "Import completed, but {lfs} LFS object(s) could not be fetched and \
+                 {releases} release(s) could not be imported; the task's stats name each one"
             ),
         }
     }
@@ -921,7 +1083,8 @@ async fn run_github_import(
     if task.import_releases {
         update_stage(db, task.id, "importing", 80, "Importing releases...").await?;
         let releases = client.list_releases(&gh_owner, &gh_repo).await?;
-        stats.releases_imported = import_github_releases(db, repo_id, &releases, repo_root).await?;
+        stats.releases_imported =
+            import_github_releases(db, repo_id, task.user_id, &releases, repo_root, stats).await?;
         update_stage(
             db,
             task.id,
@@ -1123,7 +1286,8 @@ async fn run_gitlab_import(
     if task.import_releases {
         update_stage(db, task.id, "importing", 80, "Importing releases...").await?;
         let releases = client.list_releases(&project_path).await?;
-        stats.releases_imported = import_gitlab_releases(db, repo_id, &releases, repo_root).await?;
+        stats.releases_imported =
+            import_gitlab_releases(db, repo_id, task.user_id, &releases, repo_root, stats).await?;
         update_stage(
             db,
             task.id,
@@ -2862,15 +3026,14 @@ async fn import_github_pr(
 async fn import_github_releases(
     db: &DatabaseConnection,
     repo_id: i64,
+    importer_id: i64,
     releases: &[GitHubRelease],
     repo_root: &Path,
+    stats: &mut ImportStats,
 ) -> Result<usize> {
     let mut count = 0;
 
     for release in releases {
-        let author_id = 1; // GitHub releases API doesn't expose author in the list endpoint
-                           // In a full implementation, we'd fetch release details
-
         let title = release
             .name
             .clone()
@@ -2881,7 +3044,7 @@ async fn import_github_releases(
         match crate::release::service::create_release(
             db,
             repo_id,
-            author_id,
+            importer_id,
             &release.tag_name,
             &title,
             release.body.as_deref(),
@@ -2895,6 +3058,10 @@ async fn import_github_releases(
             Ok(_) => count += 1,
             Err(e) => {
                 tracing::warn!(tag = %release.tag_name, error = %format!("{e:#}"), "failed to import release");
+                stats.releases_failed.push(ReleaseImportFailure {
+                    tag_name: release.tag_name.clone(),
+                    reason: release_failure_reason(&e),
+                });
             }
         }
     }
@@ -3246,8 +3413,10 @@ async fn import_gitlab_mr(
 async fn import_gitlab_releases(
     db: &DatabaseConnection,
     repo_id: i64,
+    importer_id: i64,
     releases: &[GitLabRelease],
     repo_root: &Path,
+    stats: &mut ImportStats,
 ) -> Result<usize> {
     let mut count = 0;
 
@@ -3260,7 +3429,7 @@ async fn import_gitlab_releases(
         match crate::release::service::create_release(
             db,
             repo_id,
-            1, // GitLab releases don't expose author in list; default to admin
+            importer_id,
             &release.tag_name,
             &title,
             release.description.as_deref(),
@@ -3274,6 +3443,10 @@ async fn import_gitlab_releases(
             Ok(_) => count += 1,
             Err(e) => {
                 tracing::warn!(tag = %release.tag_name, error = %format!("{e:#}"), "failed to import release");
+                stats.releases_failed.push(ReleaseImportFailure {
+                    tag_name: release.tag_name.clone(),
+                    reason: release_failure_reason(&e),
+                });
             }
         }
     }
