@@ -306,6 +306,52 @@ function routePattern(url) {
   return new RegExp(`${patternSource(url)}(?=$|[?"'\\x60\\s),;\\]}])`, 'g');
 }
 
+/**
+ * Characters that end a literal route segment inside any match of
+ * `routePattern`: the `/` between segments, and everything its closing
+ * lookahead accepts after the last one. Split on these, a file yields every
+ * literal segment it could match as a whole token.
+ */
+const SEGMENT_BOUNDARY = /[/?"'\x60\s),;\]}{]+/;
+
+/**
+ * A route's pattern, compiled once, plus the literal segments any match of it
+ * has to contain.
+ *
+ * The coverage question is asked for every route against every corpus file,
+ * and most files name neither the route nor anything like it. `patternSource`
+ * copies a literal segment into the pattern verbatim, between a `/` and either
+ * another `/` or the closing boundary, so a file whose tokens lack one of them
+ * cannot match: checking that first skips the regex there without changing a
+ * single answer. A segment that itself holds a boundary character could be
+ * split across tokens, so it falls back to a substring test.
+ */
+const routeMatchers = new Map();
+function routeMatcher(url) {
+  let matcher = routeMatchers.get(url);
+  if (matcher === undefined) {
+    const literals = url.split('/').filter((segment) => segment !== '' && !segment.startsWith('{'));
+    matcher = {
+      re: routePattern(url),
+      tokens: literals.filter((segment) => !SEGMENT_BOUNDARY.test(segment)),
+      substrings: literals.filter((segment) => SEGMENT_BOUNDARY.test(segment)),
+    };
+    routeMatchers.set(url, matcher);
+  }
+  return matcher;
+}
+
+/** Every boundary-delimited token of a corpus file, built once per file. */
+const sourceTokens = new Map();
+function tokensOf(source) {
+  let tokens = sourceTokens.get(source);
+  if (tokens === undefined) {
+    tokens = new Set(source.split(SEGMENT_BOUNDARY));
+    sourceTokens.set(source, tokens);
+  }
+  return tokens;
+}
+
 /** Whether a whole literal — not a prefix of one — is the path this route answers. */
 const wholePathPatterns = new Map();
 function matchesWholePath(url, literal) {
@@ -365,7 +411,11 @@ function explicitMethods(window) {
 
 export function sourceTouchesRoute(source, method, url, { requireTransport = false, rivals = [] } = {}) {
   if (!url) return false;
-  const re = routePattern(url);
+  const { re, tokens, substrings } = routeMatcher(url);
+  const present = tokensOf(source);
+  if (!tokens.every((token) => present.has(token))) return false;
+  if (!substrings.every((literal) => source.includes(literal))) return false;
+  re.lastIndex = 0;
   let match;
   while ((match = re.exec(source)) !== null) {
     // The router would deliver this exact spelling to a more specific
@@ -683,6 +733,28 @@ export function buildInventory() {
     return rivals;
   };
 
+  // Which suites prove a route. Every control that reaches a route asks again,
+  // and the answer depends on the route alone — symbols and rivals are both
+  // functions of it — so it is computed once per route, not once per control.
+  // That repeat was most of the oracle's run, and the oracle runs once per
+  // fixture in its mutation stand.
+  const testedInByRoute = new Map();
+  const testedInOf = (route) => {
+    const key = `${route.method} ${route.url}`;
+    let suites = testedInByRoute.get(key);
+    if (suites === undefined) {
+      suites = touchedBy(
+        coverage,
+        route.method,
+        route.url,
+        symbolsOf(route.method, route.url),
+        rivalsOf(route.url),
+      );
+      testedInByRoute.set(key, suites);
+    }
+    return [...suites];
+  };
+
   const resolveSurfaceRow = (row, symbol = row.symbol) => {
     const url = urlOf(row);
     const opaque = row.path.includes(OPAQUE_SEGMENT);
@@ -708,15 +780,7 @@ export function buildInventory() {
       access: route ? route.access : null,
       handler: route ? route.handler : null,
       matched: Boolean(route),
-      testedIn: route
-        ? touchedBy(
-          coverage,
-          route.method,
-          route.url,
-          symbolsOf(route.method, route.url),
-          rivalsOf(route.url),
-        )
-        : [],
+      testedIn: route ? testedInOf(route) : [],
     };
   };
 

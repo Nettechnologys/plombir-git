@@ -45,8 +45,14 @@ function charLiteralEnd(source, start) {
   return source[i] === "'" ? i + 1 : null;
 }
 
+// Sticky, so it reads at `lastIndex` without copying the rest of the file
+// first: every scanner below asks this at every character it walks.
+const RAW_STRING_OPEN = /(?:br|r)(#+)?"/y;
+
 function rawStringEnd(source, start) {
-  const match = /^(?:br|r)(#+)?"/.exec(source.slice(start));
+  if (source[start] !== 'r' && source[start] !== 'b') return null;
+  RAW_STRING_OPEN.lastIndex = start;
+  const match = RAW_STRING_OPEN.exec(source);
   if (!match) return null;
   const hashes = match[1] ?? '';
   const close = `"${hashes}`;
@@ -67,37 +73,44 @@ function rawStringEnd(source, start) {
  * text that still has the strings in it.
  */
 function blankRustNonCode(source, { blankStrings }) {
-  let out = '';
+  // Verbatim stretches are copied as slices, not a character at a time: this
+  // pass runs over every Rust file most checks read, and appending per
+  // character made it the most expensive thing in several of them.
+  const parts = [];
+  let copied = 0;
   let i = 0;
-  const literal = (end) => {
-    const span = source.slice(i, end);
-    out += blankStrings ? blankExceptNewlines(span) : span;
+  const blank = (end) => {
+    if (i > copied) parts.push(source.slice(copied, i));
+    parts.push(blankExceptNewlines(source.slice(i, end)));
+    copied = end;
     i = end;
   };
+  const literal = (end) => {
+    if (blankStrings) blank(end);
+    else i = end;
+  };
   while (i < source.length) {
-    if (source.slice(i, i + 2) === '//') {
+    const ch = source[i];
+    if (ch === '/' && source[i + 1] === '/') {
       const end = source.indexOf('\n', i + 2);
-      const stop = end < 0 ? source.length : end;
-      out += blankExceptNewlines(source.slice(i, stop));
-      i = stop;
+      blank(end < 0 ? source.length : end);
       continue;
     }
-    if (source.slice(i, i + 2) === '/*') {
+    if (ch === '/' && source[i + 1] === '*') {
       let depth = 1;
       let end = i + 2;
       while (end < source.length && depth > 0) {
-        if (source.slice(end, end + 2) === '/*') {
+        if (source[end] === '/' && source[end + 1] === '*') {
           depth += 1;
           end += 2;
-        } else if (source.slice(end, end + 2) === '*/') {
+        } else if (source[end] === '*' && source[end + 1] === '/') {
           depth -= 1;
           end += 2;
         } else {
           end += 1;
         }
       }
-      out += blankExceptNewlines(source.slice(i, end));
-      i = end;
+      blank(end);
       continue;
     }
     const rawEnd = rawStringEnd(source, i);
@@ -110,19 +123,52 @@ function blankRustNonCode(source, { blankStrings }) {
       literal(charEnd);
       continue;
     }
-    if (source.slice(i, i + 2) === 'b"') {
+    if (ch === 'b' && source[i + 1] === '"') {
       literal(quotedEnd(source, i + 1));
       continue;
     }
-    if (source[i] === '"') {
+    if (ch === '"') {
       literal(quotedEnd(source, i));
       continue;
     }
-    out += source[i];
     i += 1;
   }
-  return out;
+  if (i > copied) parts.push(source.slice(copied, i));
+  return parts.join('');
 }
+
+/**
+ * A cache for a view that is a pure function of the source text.
+ *
+ * The finders take a whole file and rebuild its view on every call, and checks
+ * ask one file for dozens of functions in a row: `body-limit-declaration`
+ * lexed `routes.rs` and every handler module once per route, which was 95% of
+ * its run and, through its mutation stand, minutes of every push gate.
+ *
+ * Keyed by the text itself, not by a path or an object, so a caller that edits
+ * a copy of the source — every mutation fixture does — gets a view of the
+ * edit. Bounded and least-recently-used, so a sweep over the whole corpus does
+ * not pin every file's views in memory: what it buys is the repeat ask, and
+ * repeats come in runs. Views are strings, which nobody can mutate in place.
+ */
+export function viewCache(capacity = 16) {
+  const views = new Map();
+  return (source, build) => {
+    if (views.has(source)) {
+      const view = views.get(source);
+      views.delete(source);
+      views.set(source, view);
+      return view;
+    }
+    const view = build();
+    views.set(source, view);
+    if (views.size > capacity) views.delete(views.keys().next().value);
+    return view;
+  };
+}
+
+const codeOnlyViews = viewCache();
+const commentFreeViews = viewCache();
 
 /**
  * Replace Rust comments and string literals with spaces while preserving line
@@ -130,7 +176,7 @@ function blankRustNonCode(source, { blankStrings }) {
  * inside `r#"…"#` is data, not the beginning of a comment.
  */
 export function stripRustNonCode(source) {
-  return blankRustNonCode(source, { blankStrings: true });
+  return codeOnlyViews(source, () => blankRustNonCode(source, { blankStrings: true }));
 }
 
 /**
@@ -142,7 +188,7 @@ export function stripRustNonCode(source) {
  * come from executable code only.
  */
 export function blankRustComments(source) {
-  return blankRustNonCode(source, { blankStrings: false });
+  return commentFreeViews(source, () => blankRustNonCode(source, { blankStrings: false }));
 }
 
 function attributeEnd(source, start) {

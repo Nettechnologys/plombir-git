@@ -1655,10 +1655,26 @@ for (const subject of subjects) {
   // answer for a read whose path is assembled out of a table three hundred
   // lines away — and it is silent about a helper nobody feeds to a view, which
   // is what keeps every TOML and YAML reader in this workspace out.
-  const feedsAView = (name) =>
-    [...normalizers, ...stringViews].some((view) =>
-      new RegExp(`\\b${view}\\s*\\(\\s*&?\\s*(?:${IDENT}\\s*::\\s*)*${name}\\s*\\(`).test(subject.code),
-    );
+  //
+  // Asked once per function in the file, so the file is read once for every
+  // name a view is fed and the answer is a lookup. The tail is a lookahead so
+  // that a view nested in another's argument — `view(other_view(helper(…)))` —
+  // is still a match of its own rather than text the outer one consumed.
+  let fedToAView = null;
+  const feedsAView = (name) => {
+    if (fedToAView === null) {
+      const views = [...normalizers, ...stringViews];
+      fedToAView = new Set();
+      if (views.length > 0) {
+        const call = new RegExp(
+          `\\b(?:${views.join('|')})(?=\\s*\\(\\s*&?\\s*(?:${IDENT}\\s*::\\s*)*(${IDENT})\\s*\\()`,
+          'g',
+        );
+        for (const match of subject.code.matchAll(call)) fedToAView.add(match[1]);
+      }
+    }
+    return fedToAView.has(name);
+  };
   const producers = discoverProducers(
     [
       { functions: own, feedsAView },

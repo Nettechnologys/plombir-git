@@ -11,10 +11,11 @@
 // method/path contract.
 
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+
+import { runFixtures, runNode } from './lib/fixture-pool.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const copied = [
@@ -66,13 +67,13 @@ function mutateMethod(fixture, mutation) {
 }
 
 function run(fixture) {
-  const result = spawnSync(
-    process.execPath,
+  return runNode(
     [join(fixture, 'scripts/ui-inventory-oracle-contract-check.mjs')],
-    { cwd: fixture, encoding: 'utf8', timeout: 60_000 },
+    { cwd: fixture, timeout: 120_000 },
   );
-  return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
 }
+
+const newFixture = () => mkdtempSync(join(tmpdir(), 'plombir-git-ui-inventory-oracle.'));
 
 const mutations = [
   {
@@ -499,31 +500,49 @@ const mutations = [
   },
 ];
 
-let fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-inventory-oracle.'));
+// The clean copy goes first and alone: if it is red, every mutation below
+// would go red for the copy's sake and prove nothing.
+const clean = newFixture();
+let cleanRun;
 try {
-  baseline(fixture);
-  const clean = run(fixture);
-  if (clean.status !== 0) {
-    console.error(`❌ UI inventory oracle baseline fixture is red, so mutations prove nothing:\n${clean.output}`);
-    process.exit(1);
-  }
+  baseline(clean);
+  cleanRun = await run(clean);
+} finally {
+  rmSync(clean, { recursive: true, force: true });
+}
+if (cleanRun.status !== 0) {
+  console.error(`❌ UI inventory oracle baseline fixture is red, so mutations prove nothing:\n${cleanRun.output}`);
+  process.exit(1);
+}
 
-  for (const mutation of mutations) {
-    rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-inventory-oracle.'));
+// Each mutation gets a fresh copy of its own, so they are independent and run
+// side by side; see `lib/fixture-pool.mjs`.
+const results = await runFixtures(mutations, async (mutation) => {
+  const fixture = newFixture();
+  try {
     baseline(fixture);
     if (mutation.apply) mutation.apply(fixture);
     else mutateMethod(fixture, mutation);
-    const result = run(fixture);
-    if (result.status === 0 || !result.output.includes(mutation.expected)) {
-      console.error(
-        `❌ mutation did not go red by route: ${mutation.expected}\n`
-          + `status=${result.status}\n${result.output}`,
-      );
-      process.exit(1);
-    }
+    return await run(fixture);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+let failed = 0;
+for (const [index, { value: result, error }] of results.entries()) {
+  const mutation = mutations[index];
+  if (error) {
+    failed += 1;
+    console.error(`❌ mutation could not be applied: ${mutation.expected}\n${error.stack ?? error}`);
+  } else if (result.status === 0 || !result.output.includes(mutation.expected)) {
+    failed += 1;
+    console.error(
+      `❌ mutation did not go red by route: ${mutation.expected}\n`
+        + `status=${result.status}${result.signal ? ` signal=${result.signal}` : ''}\n${result.output}`,
+    );
+  } else {
     console.log(`✅ mutation rejected: ${mutation.expected}`);
   }
-} finally {
-  rmSync(fixture, { recursive: true, force: true });
 }
+if (failed > 0) process.exit(1);

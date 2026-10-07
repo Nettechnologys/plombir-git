@@ -8,6 +8,7 @@ import {
   blankRustComments,
   cfgTestItemRanges,
   stripRustNonCode,
+  viewCache,
 } from './rust-consumer-contract.mjs';
 
 /**
@@ -59,6 +60,11 @@ export function stripRustComments(source) {
   return blankRustComments(source);
 }
 
+// Every finder below rebuilds its views from the whole file, and checks call
+// the finders in loops over one file — see `viewCache`.
+const productionCodeViews = viewCache();
+const productionTextViews = viewCache();
+
 /**
  * The code-only view of `source` with every `#[cfg(test)]` item blanked.
  *
@@ -77,8 +83,10 @@ export function stripRustComments(source) {
  * Byte-aligned with `source`, so an offset found here addresses the original.
  */
 export function productionRustCode(source) {
-  const code = stripRustNonCode(source);
-  return blankRanges(code, cfgTestItemRanges(code));
+  return productionCodeViews(source, () => {
+    const code = stripRustNonCode(source);
+    return blankRanges(code, cfgTestItemRanges(code));
+  });
 }
 
 /**
@@ -91,8 +99,10 @@ export function productionRustCode(source) {
  * so a fixture cannot contribute a value either.
  */
 export function productionRustSource(source) {
-  const code = stripRustNonCode(source);
-  return blankRanges(blankRustComments(source), cfgTestItemRanges(code));
+  return productionTextViews(source, () => {
+    const code = stripRustNonCode(source);
+    return blankRanges(blankRustComments(source), cfgTestItemRanges(code));
+  });
 }
 
 /**
