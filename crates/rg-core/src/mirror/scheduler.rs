@@ -90,11 +90,16 @@ impl MirrorSyncConfig {
 /// The numeric knobs are range-checked here, so a `poll_interval_secs = 0` in
 /// the config file fails the server start rather than becoming a hot loop that
 /// nobody notices until the CPU graph does.
+///
+/// `hooks` is the process's post-push wiring: the branches a pass moves owe
+/// the open pull requests on them their new head (card_dbc5a1debb0a). `None`
+/// in a process that has none.
 pub fn spawn_mirror_sync_with_shutdown(
     db: DatabaseConnection,
     repo_root: PathBuf,
     encryption_key: String,
     config: MirrorSyncConfig,
+    hooks: Option<crate::push_hooks::PostPushContext>,
     shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     config.validate()?;
@@ -132,6 +137,7 @@ pub fn spawn_mirror_sync_with_shutdown(
                 let db = db.clone();
                 let repo_root = repo_root.clone();
                 let encryption_key = encryption_key.clone();
+                let hooks = hooks.clone();
                 async move {
                     crate::mirror::service::sync_due_mirrors(
                         &db,
@@ -139,6 +145,7 @@ pub fn spawn_mirror_sync_with_shutdown(
                         batch_size,
                         transport_policy,
                         &encryption_key,
+                        hooks.as_ref(),
                     )
                     .await
                 }

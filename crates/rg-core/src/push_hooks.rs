@@ -163,6 +163,48 @@ impl PostPushContext {
         .await;
     }
 
+    /// Run the hooks a pull mirror's pass owes for the branches and tags it
+    /// re-published, detached through the delivery tracker — see
+    /// [`mirror_pass_hooks`] for which ones (card_dbc5a1debb0a).
+    pub fn spawn_for_mirror_pass(
+        &self,
+        db: &DatabaseConnection,
+        owner: String,
+        repo_name: String,
+        ref_updates: Vec<RefUpdate>,
+    ) {
+        if ref_updates.is_empty() {
+            return;
+        }
+        let context = self.clone();
+        let db = db.clone();
+        self.delivery_tracker.spawn(async move {
+            let repo_path = context.repo_root.join(format!("{owner}/{repo_name}.git"));
+            mirror_pass_hooks(
+                &PostPushParams {
+                    db: &db,
+                    repo_path: &repo_path,
+                    repo_root: &context.repo_root,
+                    owner: &owner,
+                    repo_name: &repo_name,
+                    pusher_id: None,
+                    docker_enabled: context.docker_enabled,
+                    external_runners: context.external_runners,
+                    allow_host_runner: context.allow_host_runner,
+                    jwt_secret: context.jwt_secret.as_deref(),
+                    encryption_key: context.encryption_key.as_deref(),
+                    notifier: context.notifier.as_deref(),
+                    smtp_config: &context.smtp_config,
+                    ci_engine: &*context.ci_engine,
+                    external_url: context.external_url.as_deref(),
+                    delivery_tracker: &context.delivery_tracker,
+                },
+                &ref_updates,
+            )
+            .await;
+        });
+    }
+
     /// This process's CI wiring, in the borrowed form a pipeline-triggering
     /// path takes (the merge queue, the pull-request trigger).
     pub fn pipeline_ci(&self) -> crate::pull_request::ci::PipelineCi<'_> {
@@ -477,8 +519,43 @@ async fn resolve_hook_target(
     }
 }
 
+/// Who moved the refs a hook run starts from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefMoveOrigin {
+    /// A client's push, or a server-side commit or merge made on someone's
+    /// behalf: every hook runs.
+    Push,
+    /// A pull mirror's pass re-published its upstream's branches
+    /// (card_dbc5a1debb0a). What the database derives from the branches still
+    /// has to follow them — the head SHA of an open pull request, the
+    /// auto-merge and merge-queue evaluation of the new head, the code-search
+    /// snapshot. What a *push* announces does not: no `push` pipeline and no
+    /// `pull_request` pipeline (running an upstream's workflows on this
+    /// instance's runners is a decision nobody took), no `push` webhook and no
+    /// watch notification for a person who pushed nothing.
+    ///
+    /// Only the moves the pass made are treated this way. A merge the
+    /// evaluation performs is this server's own ref move, in a repository that
+    /// is not the mirror, and owes the full set.
+    MirrorPass,
+}
+
 /// Post-push hook: trigger CI pipeline and webhook for push events.
 pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpdate]) {
+    run_ref_move_hooks(params, ref_updates, RefMoveOrigin::Push).await;
+}
+
+/// The hooks owed after a pull mirror's pass moved its repository's branches
+/// and tags — see [`RefMoveOrigin::MirrorPass`] for which ones.
+pub async fn mirror_pass_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpdate]) {
+    run_ref_move_hooks(params, ref_updates, RefMoveOrigin::MirrorPass).await;
+}
+
+async fn run_ref_move_hooks(
+    params: &PostPushParams<'_>,
+    ref_updates: &[RefUpdate],
+    origin: RefMoveOrigin,
+) {
     // Find repo_id from DB. The pushed repository keeps the path the transport
     // handed us; only repositories the cascade discovers get one derived from
     // the repo root.
@@ -529,8 +606,13 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
     // that is not empty. Adopting the pushed branch must happen ahead of the
     // cascade, because the hooks below compare each ref against
     // `default_branch`.
-    if let Some(adopted) = adopt_unborn_head(params, &seed, ref_updates).await {
-        seed.default_branch = adopted;
+    //
+    // A mirror pass adopts the upstream's default branch itself, from the
+    // upstream's own `HEAD` rather than from whichever branch moved.
+    if origin == RefMoveOrigin::Push {
+        if let Some(adopted) = adopt_unborn_head(params, &seed, ref_updates).await {
+            seed.default_branch = adopted;
+        }
     }
 
     // Resolved once, not per ref: the watch fan-out below needs the pusher's
@@ -562,9 +644,15 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
             "Post-push: triggering hooks"
         );
 
+        // The moves the mirror pass itself made; everything the cascade adds
+        // below is a merge of this server's.
+        let announced = !(origin == RefMoveOrigin::MirrorPass && depth == 0);
+
         // 0. PR head-SHA refresh + auto-merge/merge-queue + protected-branch audit
         if let Some(branch_name) = update.refname.strip_prefix("refs/heads/") {
-            let merged = post_push_branch_maintenance(params, &target, branch_name, &update).await;
+            let merged =
+                post_push_branch_maintenance(params, &target, branch_name, &update, announced)
+                    .await;
             // A merge the maintenance above performed advanced *another* branch,
             // and that move owes these same hooks. Back into the work list it
             // goes rather than into a recursive call (card_87c4912c51ed) — under
@@ -587,6 +675,11 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
                     cascade.extend(next, [merged_ref.update], depth + 1);
                 }
             }
+        }
+
+        if !announced {
+            refresh_code_index_for_push(params, &target, &update);
+            continue;
         }
 
         // 1. Trigger CI pipeline if .plombir-git-ci.yml exists
@@ -927,11 +1020,16 @@ async fn synchronize_open_pr_heads(
 ///
 /// Returns the base-branch moves the merges it performed produced, so the caller
 /// can run this same hook run over them (card_87c4912c51ed).
+///
+/// `trigger_pull_request_ci` is `false` for a move a mirror pass made: the pull
+/// requests are still synchronised and evaluated, but the upstream's workflows
+/// are not run on this instance (see [`RefMoveOrigin::MirrorPass`]).
 async fn post_push_branch_maintenance(
     params: &PostPushParams<'_>,
     target: &HookTarget,
     branch_name: &str,
     update: &RefUpdate,
+    trigger_pull_request_ci: bool,
 ) -> Vec<crate::pull_request::MergedRef> {
     let mut merged_refs = Vec::new();
     match synchronize_open_pr_heads(params, target, branch_name).await {
@@ -963,7 +1061,7 @@ async fn post_push_branch_maintenance(
                 // keying on the row would silently skip exactly those. Repeats
                 // are bounded by the cascade's own `seen` set, which drops a
                 // `(repo, refname, new_sha)` it has already handled.
-                if update.old_sha != update.new_sha {
+                if trigger_pull_request_ci && update.old_sha != update.new_sha {
                     for pr in &synchronized.open_prs {
                         crate::pull_request::trigger_pull_request_ci_best_effort(
                             params.db,
@@ -2208,7 +2306,8 @@ mod tests {
         };
         let (logs, _guard) = CapturedLogs::capture();
 
-        let merged = post_push_branch_maintenance(&params, &target, "feature", &stale_update).await;
+        let merged =
+            post_push_branch_maintenance(&params, &target, "feature", &stale_update, true).await;
         assert!(merged.is_empty());
 
         let stored = rg_db::ops::pull_request_ops::find_by_id(&db, pr.id)

@@ -866,6 +866,7 @@ async fn store_object(
             object_id: object.id,
             repo_id,
             oid,
+            size: data.len() as i64,
             key: &key,
             source: PublicationSource::Buffered(&compressed),
         },
@@ -949,6 +950,9 @@ struct PublicationRequest<'a> {
     object_id: i64,
     repo_id: i64,
     oid: &'a str,
+    /// The object's declared size, for registering it again when its row was
+    /// removed as unused while this publication waited for it.
+    size: i64,
     key: &'a BlobKey,
     source: PublicationSource<'a>,
 }
@@ -1002,15 +1006,43 @@ struct PublicationLease {
 
 /// Publish the compressed bytes and commit the metadata under an exclusive
 /// lease on the object's key.
+///
+/// The row this publication was registered under can be removed while it waits
+/// for the lease: an unused-object removal holds the same lease while it
+/// deletes the stored bytes, and drops the row afterwards (card_10864c45e31e).
+/// The object is then registered afresh and the wait starts over — once; a row
+/// that vanishes twice in a row is reported, not chased.
 async fn publish_object(
     db: &DatabaseConnection,
     storage: &dyn BlobStorage,
-    request: PublicationRequest<'_>,
+    mut request: PublicationRequest<'_>,
 ) -> Result<()> {
-    let lease = acquire_publication_lease(db, request.object_id, request.oid).await?;
+    let lease = match acquire_publication_lease(db, request.object_id, request.oid).await? {
+        LeaseOutcome::Held(lease) => lease,
+        LeaseOutcome::RowGone => {
+            request.object_id =
+                find_or_register_object(db, request.repo_id, request.oid, request.size)
+                    .await?
+                    .id;
+            match acquire_publication_lease(db, request.object_id, request.oid).await? {
+                LeaseOutcome::Held(lease) => lease,
+                LeaseOutcome::RowGone => anyhow::bail!(
+                    "LFS object {} was removed twice while this upload waited to publish it",
+                    request.oid
+                ),
+            }
+        }
+    };
     let published = publish_under_lease(db, storage, &request, &lease).await;
     release_publication_lease(db, &lease, request.oid).await;
     published
+}
+
+/// What waiting for a publication lease ended with.
+enum LeaseOutcome {
+    Held(PublicationLease),
+    /// The row was removed while the wait went on — see [`publish_object`].
+    RowGone,
 }
 
 /// Wait for, then take, the object's publication lease.
@@ -1023,7 +1055,7 @@ async fn acquire_publication_lease(
     db: &DatabaseConnection,
     object_id: i64,
     oid: &str,
-) -> Result<PublicationLease> {
+) -> Result<LeaseOutcome> {
     let token = uuid::Uuid::new_v4().to_string();
     let deadline = std::time::Instant::now() + PUBLICATION_LEASE_WAIT;
     let mut backoff = PUBLICATION_LEASE_POLL_MIN;
@@ -1033,11 +1065,11 @@ async fn acquire_publication_lease(
         match lfs_object_ops::bid_for_publication_lease(db, object_id, &token, stale_before).await?
         {
             lfs_object_ops::PublicationLeaseBid::Granted => {
-                return Ok(PublicationLease {
+                return Ok(LeaseOutcome::Held(PublicationLease {
                     object_id,
                     token,
                     exclusive: true,
-                })
+                }))
             }
             lfs_object_ops::PublicationLeaseBid::TakenOver => {
                 tracing::warn!(
@@ -1045,12 +1077,13 @@ async fn acquire_publication_lease(
                     object_id,
                     "took over an expired LFS publication lease — the previous publisher never released it, so this request will keep any blob it cannot prove is its own"
                 );
-                return Ok(PublicationLease {
+                return Ok(LeaseOutcome::Held(PublicationLease {
                     object_id,
                     token,
                     exclusive: false,
-                });
+                }));
             }
+            lfs_object_ops::PublicationLeaseBid::Gone => return Ok(LeaseOutcome::RowGone),
             lfs_object_ops::PublicationLeaseBid::Busy => {}
         }
 
@@ -1348,6 +1381,7 @@ async fn stream_compress_and_store(
             object_id: object.id,
             repo_id,
             oid,
+            size: original_size,
             key: &key,
             source: PublicationSource::File(&staged.compressed),
         },
@@ -1744,6 +1778,7 @@ pub async fn adopt_objects(
                 object_id: object.id,
                 repo_id: destination.id,
                 oid,
+                size,
                 key: &key,
                 source: publication_source,
             },
@@ -2223,6 +2258,195 @@ mod blob_publication_tests {
         .unwrap();
     }
 
+    /// Deletes like a local store — except that the first delete starts an
+    /// upload of the same object first and gives it time to finish, which is
+    /// the window card_10864c45e31e is about: an unused-object removal between
+    /// deciding to remove the object and its bytes being gone.
+    struct UploadDuringRemoval {
+        inner: LocalBlobStorage,
+        db: DatabaseConnection,
+        payload: &'static [u8],
+        upload: std::sync::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<()>>>>,
+    }
+
+    impl BlobStorage for UploadDuringRemoval {
+        fn backend_name(&self) -> &'static str {
+            "upload-during-removal"
+        }
+
+        fn put<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            data: &'a [u8],
+        ) -> BoxFuture<'a, BlobResult<BlobMetadata>> {
+            self.inner.put(key, data)
+        }
+
+        fn put_file<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            source: &'a std::path::Path,
+        ) -> BoxFuture<'a, BlobResult<BlobMetadata>> {
+            self.inner.put_file(key, source)
+        }
+
+        fn get<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<Vec<u8>>> {
+            self.inner.get(key)
+        }
+
+        fn metadata<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<BlobMetadata>> {
+            self.inner.metadata(key)
+        }
+
+        fn exists<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<bool>> {
+            self.inner.exists(key)
+        }
+
+        fn delete<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, BlobResult<bool>> {
+            Box::pin(async move {
+                let first = {
+                    let mut upload = self.upload.lock().unwrap();
+                    if upload.is_none() {
+                        let (db, payload) = (self.db.clone(), self.payload);
+                        let root = self.inner.root().to_path_buf();
+                        *upload = Some(tokio::spawn(async move {
+                            store_object(
+                                &db,
+                                1,
+                                &LocalBlobStorage::new(root),
+                                "owner",
+                                "repo",
+                                &oid(payload),
+                                payload,
+                            )
+                            .await
+                        }));
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if first {
+                    // Long enough for an upload that reuses the old bytes to
+                    // finish; one that waits for the removal stays parked.
+                    for _ in 0..30 {
+                        let finished = self
+                            .upload
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|upload| upload.is_finished());
+                        if finished {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+                self.inner.delete(key).await
+            })
+        }
+
+        fn list<'a>(
+            &'a self,
+            prefix: Option<&'a BlobKey>,
+        ) -> BoxFuture<'a, BlobResult<Vec<BlobMetadata>>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    /// card_10864c45e31e: removing an unused object deleted its row, then its
+    /// bytes. An upload of the same object in between registered a new row,
+    /// found the old bytes under the content-addressed key, reused them — and
+    /// the removal then deleted them: a row that says "uploaded" and a `404`
+    /// for every `git lfs pull`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_during_an_unused_object_removal_keeps_its_bytes() {
+        const PAYLOAD: &[u8] = b"re-uploaded while it was being removed";
+        let dir = tempfile::tempdir().unwrap();
+        let db = setup_db().await;
+        let repo_root = dir.path().join("repos");
+        let repo_path = repo_root.join("owner/repo.git");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(&["init", "-q", "--bare"], Some(&repo_path))
+            .unwrap()
+            .ensure_success()
+            .unwrap();
+        let storage = UploadDuringRemoval {
+            inner: LocalBlobStorage::new(dir.path().join("blobs")),
+            db: db.clone(),
+            payload: PAYLOAD,
+            upload: std::sync::Mutex::new(None),
+        };
+        let oid = oid(PAYLOAD);
+        let key = lfs_object_key("owner", "repo", &oid, true).unwrap();
+        storage
+            .inner
+            .put(&key, &compress_data(PAYLOAD).unwrap())
+            .await
+            .unwrap();
+        // Old enough, and referenced by nothing: an orphan.
+        rg_db::ops::lfs_object_ops::create(
+            &db,
+            lfs_object::ActiveModel {
+                id: NotSet,
+                repo_id: Set(1),
+                oid: Set(oid.clone()),
+                size: Set(PAYLOAD.len() as i64),
+                uploaded: Set(true),
+                created_at: Set(chrono::Utc::now() - chrono::Duration::days(2)),
+                publisher_token: Set(None),
+                publisher_since: Set(None),
+                last_claimed_at: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+
+        let pruned = crate::lfs::gc::prune(
+            &db,
+            &storage,
+            &repo_root,
+            super::LfsRepository {
+                id: 1,
+                owner: "owner",
+                name: "repo",
+            },
+            &repo_path,
+            std::slice::from_ref(&oid),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pruned.deleted, vec![oid.clone()], "{pruned:?}");
+        let upload = storage
+            .upload
+            .lock()
+            .unwrap()
+            .take()
+            .expect("an upload ran");
+        upload
+            .await
+            .unwrap()
+            .expect("the concurrent upload succeeds");
+
+        let row = rg_db::ops::lfs_object_ops::find_by_repo_and_oid(&db, 1, &oid)
+            .await
+            .unwrap()
+            .expect("the upload registered the object");
+        assert!(row.uploaded);
+        assert!(
+            storage.exists(&key).await.unwrap(),
+            "the object reads as uploaded, but its bytes were removed after the upload"
+        );
+        assert_eq!(
+            decompress_data(&storage.get(&key).await.unwrap()).unwrap(),
+            PAYLOAD
+        );
+    }
+
     /// Both publication sources must carry the publication outcome to
     /// `mark_uploaded`: the buffered source exercises the same rollback branch
     /// without pretending to be a second production upload API.
@@ -2316,6 +2540,7 @@ mod blob_publication_tests {
                 object_id: object.id,
                 repo_id: 1,
                 oid: &oid,
+                size: payload.len() as i64,
                 key: &key,
                 source: PublicationSource::File(&staged),
             },

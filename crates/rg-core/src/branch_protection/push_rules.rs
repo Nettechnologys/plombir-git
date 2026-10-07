@@ -9,10 +9,77 @@
 //! Every decision here receives an allow-list already verified against its
 //! normalized FK rows. Loading that pair is fallible; the pure decision below
 //! therefore cannot accidentally treat a broken JSON mirror as an empty list.
+//!
+//! [`load_receive_pack_policy`] is the one loader both transports call: it
+//! adds to the protection rules the repository's pull mirror and the LFS locks
+//! other people hold, so a new rule reaches HTTP and SSH in the same change.
 
 use anyhow::{Context, Result};
 use rg_db::ops::{protected_branch_ops, protected_tag_ops};
-use rg_git::protocol::receive_pack::validate_tag_protection_pattern;
+use rg_git::protocol::receive_pack::{validate_tag_protection_pattern, PushPolicy};
+use sea_orm::DatabaseConnection;
+
+/// Everything `receive-pack` must hold one push to in `repo_id`, for the
+/// account `actor_id` (`None` for a deploy key).
+///
+/// `token_kept_off_protected` is the credential's own narrowing — a personal
+/// access token kept off protected branches is refused every one of them
+/// first, whatever the rules would let its account do (card_60a80311d512).
+///
+/// In order, first match wins:
+/// 1. an enabled pull mirror refuses every ref (card_97a2c0209056);
+/// 2. the token narrowing;
+/// 3. branch protection, then tag protection.
+///
+/// A rule whose stored allow-list does not decode fails the whole load — the
+/// caller answers with a server error, because refusing the ref instead would
+/// blame the pusher for a broken row.
+pub async fn load_receive_pack_policy(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    actor_id: Option<i64>,
+    token_kept_off_protected: bool,
+) -> Result<PushPolicy> {
+    let mut rejected_refs = Vec::new();
+    if let Some(reason) = crate::mirror::write_guard::read_only_reason(db, repo_id).await? {
+        rejected_refs.push(("*".to_string(), reason));
+    }
+
+    let protection_rules = protected_branch_ops::list_rules_by_repo(db, repo_id)
+        .await
+        .context("load branch protections")?;
+    if token_kept_off_protected {
+        rejected_refs.extend(protection_rules.iter().map(|rule| {
+            (
+                format!("refs/heads/{}", rule.protection.branch_name),
+                format!(
+                    "this token may not write to protected branch '{}'",
+                    rule.protection.branch_name
+                ),
+            )
+        }));
+    }
+    let require_signed_refs = signed_commit_required_refs(&protection_rules);
+    rejected_refs.extend(branch_protection_rejected_refs(protection_rules, actor_id)?);
+
+    let tag_protection_rules = protected_tag_ops::list_rules_by_repo(db, repo_id)
+        .await
+        .context("load tag protections")?;
+    rejected_refs.extend(tag_protection_rejected_refs(
+        tag_protection_rules,
+        actor_id,
+    )?);
+
+    let foreign_locks = crate::lfs::locks::held_by_others(db, repo_id, actor_id)
+        .await
+        .context("load the LFS locks other people hold")?;
+
+    Ok(PushPolicy {
+        rejected_refs,
+        require_signed_refs,
+        foreign_locks,
+    })
+}
 
 /// Refs that must be rejected because a protected-branch rule forbids this push.
 ///

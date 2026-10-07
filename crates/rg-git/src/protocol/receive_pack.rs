@@ -15,6 +15,10 @@ use crate::sideband;
 
 const NULL_SHA1: &str = "0000000000000000000000000000000000000000";
 
+/// The `ng` reason for a push into one of the server's own namespaces — see
+/// [`crate::ref_advertisement::is_server_owned`].
+pub const SERVER_OWNED_NAMESPACE: &str = "server-owned namespace";
+
 /// Hard ceiling for one incoming pack (1 GiB), shared by HTTP, SSH and direct
 /// library callers. The CLI indexer streams under this bound; the native gix
 /// path spools to disk under the same bound instead of retaining the pack in a
@@ -35,6 +39,36 @@ pub struct RefUpdate {
     pub refname: String,
     pub status: String,
     pub message: String,
+}
+
+/// Everything the transport decided about one pusher before the push is read.
+///
+/// Loaded once per push by the caller — branch and tag protection, the
+/// repository's pull mirror, the LFS locks other people hold — and enforced
+/// here, so HTTP and SSH cannot drift apart. `Default` is "no policy applies",
+/// which a caller may legitimately know; it is not the same as a caller that
+/// never asked (card_6cb7471a52b2).
+#[derive(Clone, Debug, Default)]
+pub struct PushPolicy {
+    /// `(pattern, message)` pairs: an update whose ref matches a pattern (see
+    /// [`ref_matches_rejection_pattern`]) is refused with that message, before
+    /// any object is read. The first match wins.
+    pub rejected_refs: Vec<(String, String)>,
+    /// Ref patterns every new commit of which must carry a valid signature.
+    pub require_signed_refs: Vec<String>,
+    /// LFS locks held by someone other than the pusher. A new commit that
+    /// changes one of these paths refuses its ref.
+    pub foreign_locks: Vec<ForeignLock>,
+}
+
+/// One path locked by another person, as [`PushPolicy::foreign_locks`] carries
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignLock {
+    /// The locked path, repository-relative, exactly as the lock spells it.
+    pub path: String,
+    /// The lock holder's username, for the refusal the pusher reads.
+    pub owner: String,
 }
 
 /// Ref updates a push has already applied, kept somewhere a cancelled future
@@ -134,26 +168,18 @@ pub struct ReceivePackOutcome {
 /// There is deliberately no validator-free twin. There used to be, and the SSH
 /// transport reached for it whenever it had no protection context — which is to
 /// say it ran the push with no branch and no tag protection at all. Passing
-/// empty lists says the same thing at the call site, where it is visible
-/// (card_6cb7471a52b2).
+/// `PushPolicy::default()` says the same thing at the call site, where it is
+/// visible (card_6cb7471a52b2).
 pub async fn handle_receive_pack_stream_with_rejections<S>(
     repo_path: &Path,
     stream: &mut S,
-    rejected_refs: Vec<(String, String)>,
-    require_signed_refs: Vec<String>,
+    policy: PushPolicy,
     applied: &AppliedRefUpdates,
 ) -> Result<ReceivePackOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    do_receive_pack_stream_with_rejections(
-        repo_path,
-        stream,
-        rejected_refs,
-        require_signed_refs,
-        applied,
-    )
-    .await
+    do_receive_pack_stream_with_rejections(repo_path, stream, policy, applied).await
 }
 
 /// Handle receive-pack for HTTP mode with a caller-provided pre-receive validator.
@@ -161,8 +187,7 @@ pub async fn handle_receive_pack_http_with_rejections<R, W>(
     repo_path: &Path,
     reader: R,
     mut writer: W,
-    rejected_refs: Vec<(String, String)>,
-    require_signed_refs: Vec<String>,
+    policy: PushPolicy,
     applied: &AppliedRefUpdates,
 ) -> Result<ReceivePackOutcome>
 where
@@ -171,14 +196,8 @@ where
 {
     let mut reader = BufReader::new(reader);
 
-    let ref_updates = process_push_with_rejections(
-        repo_path,
-        &mut reader,
-        &rejected_refs,
-        &require_signed_refs,
-        applied,
-    )
-    .await?;
+    let ref_updates =
+        process_push_with_rejections(repo_path, &mut reader, &policy, applied).await?;
     // Point of no return: the line above indexed the pack and wrote every
     // accepted ref. `send_response` is an ordinary network write and may fail
     // for reasons that have nothing to do with the push, so its error travels
@@ -195,8 +214,7 @@ where
 async fn do_receive_pack_stream_with_rejections<S>(
     repo_path: &Path,
     stream: &mut S,
-    rejected_refs: Vec<(String, String)>,
-    require_signed_refs: Vec<String>,
+    policy: PushPolicy,
     applied: &AppliedRefUpdates,
 ) -> Result<ReceivePackOutcome>
 where
@@ -211,14 +229,7 @@ where
 
     let ref_updates = {
         let mut reader = BufReader::new(&mut *stream);
-        process_push_with_rejections(
-            repo_path,
-            &mut reader,
-            &rejected_refs,
-            &require_signed_refs,
-            applied,
-        )
-        .await?
+        process_push_with_rejections(repo_path, &mut reader, &policy, applied).await?
     };
 
     // Point of no return crossed above, exactly as on the HTTP twin: the
@@ -279,15 +290,14 @@ fn build_ref_advertisement(ref_list: &[(String, String)], _service: &str) -> Vec
 
 /// Process the push: read update commands, packfile, and update refs.
 ///
-/// Empty `rejected_refs` / `require_signed_refs` mean "no policy applies to
-/// this push", which is a thing a caller may legitimately know — it is not the
-/// same as a caller that never asked. The convenience wrapper that used to hide
-/// the distinction is gone (card_6cb7471a52b2).
+/// An empty [`PushPolicy`] means "no policy applies to this push", which is a
+/// thing a caller may legitimately know — it is not the same as a caller that
+/// never asked. The convenience wrapper that used to hide the distinction is
+/// gone (card_6cb7471a52b2).
 async fn process_push_with_rejections<R>(
     repo_path: &Path,
     reader: &mut BufReader<R>,
-    rejected_refs: &[(String, String)],
-    require_signed_refs: &[String],
+    policy: &PushPolicy,
     applied: &AppliedRefUpdates,
 ) -> Result<Vec<RefUpdate>>
 where
@@ -363,6 +373,19 @@ where
                         validate_refname(&refname)
                             .err()
                             .map(|error| error.to_string())
+                    })
+                    // The server writes some of these for its own work and
+                    // compares what it wrote on the way out (`update-ref <ref>
+                    // <new> <old>`), and gives the others a meaning of its own
+                    // (a pull request's pipeline ref, git's object
+                    // replacement), so a client's write there is never wanted:
+                    // git's own `receive.hideRefs` makes a hidden ref
+                    // unwritable too (card_e62ac71c4768). Decided per ref,
+                    // before any object is read, so the rest of the push is
+                    // unaffected.
+                    .or_else(|| {
+                        crate::ref_advertisement::is_server_owned(&refname)
+                            .then(|| SERVER_OWNED_NAMESPACE.to_string())
                     });
                 if let Some(message) = invalid {
                     updates.push(RefUpdate {
@@ -407,7 +430,8 @@ where
             continue;
         }
 
-        if let Some((_, message)) = rejected_refs
+        if let Some((_, message)) = policy
+            .rejected_refs
             .iter()
             .find(|(pattern, _)| ref_matches_rejection_pattern(&update.refname, pattern))
         {
@@ -439,7 +463,8 @@ where
         index_pack_via_git(repo_path, reader).await?;
     }
 
-    enforce_signed_commit_policies(repo_path, &mut updates, require_signed_refs);
+    enforce_signed_commit_policies(repo_path, &mut updates, &policy.require_signed_refs);
+    enforce_foreign_lfs_locks(repo_path, &mut updates, &policy.foreign_locks).await;
 
     // Update the refs
     for update in &mut updates {
@@ -794,6 +819,132 @@ fn enforce_signed_commit_policies(
             }
         }
     }
+}
+
+/// The `ng` reason for a ref refused because the LFS lock check itself could
+/// not run. Fixed text for the reason [`RequiredSignatureError`] gives: the
+/// failure chain names server paths, and goes to the log instead.
+const LFS_LOCK_CHECK_UNAVAILABLE: &str = "LFS lock check could not run on the server";
+
+/// Refuse every ref whose new commits change a path another person has locked
+/// (card_4a40b70a6796).
+///
+/// The stock `git lfs` client checks this itself only when it is configured
+/// with `lfs.locksverify = true`; without it, it prints "would have halted this
+/// push" and pushes anyway. The server is the one place that sees every push,
+/// so the lock is enforced here as well, the same way for HTTP and SSH.
+///
+/// "New" means what the client's own check means: commits this push brings
+/// that no branch or tag already holds. Fast-forwarding `main` onto the lock
+/// holder's already-pushed work is therefore not a violation by whoever moves
+/// it, while a commit that reached the repository some other way — a fork pull
+/// request's head, a merge-queue group — still counts as new to the branches.
+/// The refs being updated have not moved yet, so `--branches --tags` is the
+/// state before this push.
+///
+/// A repository nobody else holds a lock in costs nothing: no git process is
+/// started. A check that cannot run refuses the ref rather than waving it
+/// through, exactly as the required-signature check does.
+async fn enforce_foreign_lfs_locks(
+    repo_path: &Path,
+    updates: &mut [RefUpdate],
+    locks: &[ForeignLock],
+) {
+    if locks.is_empty() {
+        return;
+    }
+    let locked: std::collections::HashMap<&str, &str> = locks
+        .iter()
+        .map(|lock| (lock.path.as_str(), lock.owner.as_str()))
+        .collect();
+    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+        match first_locked_path_changed(repo_path, &update.new_sha, &locked).await {
+            Ok(None) => {}
+            Ok(Some((path, owner))) => {
+                update.status = "error".into();
+                update.message = format!("path '{path}' is locked by {owner}");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    refname = %update.refname,
+                    error = %format!("{error:#}"),
+                    "server-side LFS lock check failed"
+                );
+                update.status = "error".into();
+                update.message = LFS_LOCK_CHECK_UNAVAILABLE.into();
+            }
+        }
+    }
+}
+
+/// The first locked path a commit new to the repository changes, with its
+/// lock holder.
+///
+/// `git log --name-only` is streamed rather than collected: a first push of a
+/// large history lists every path of every commit, and only one hit is needed.
+/// Leaving early drops the child, which `spawn_async` kills.
+async fn first_locked_path_changed(
+    repo_path: &Path,
+    new_sha: &str,
+    locked: &std::collections::HashMap<&str, &str>,
+) -> Result<Option<(String, String)>> {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut child = crate::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{}", e))?
+        .spawn_async(
+            &[
+                "log",
+                "--format=",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                new_sha,
+                "--not",
+                "--branches",
+                "--tags",
+                "--",
+            ],
+            Some(repo_path),
+        )
+        .await
+        .context("failed to spawn git log for the LFS lock check")?;
+    drop(child.stdin.take());
+    let stdout = child.stdout.take().context("git log has no stdout")?;
+    let mut paths = BufReader::new(stdout);
+    let mut path = Vec::new();
+    loop {
+        path.clear();
+        if paths
+            .read_until(b'\0', &mut path)
+            .await
+            .context("failed to read git log output for the LFS lock check")?
+            == 0
+        {
+            break;
+        }
+        let name = path.strip_suffix(b"\0").unwrap_or(&path);
+        if let Some((locked_path, owner)) = std::str::from_utf8(name)
+            .ok()
+            .and_then(|name| locked.get_key_value(name))
+        {
+            return Ok(Some((locked_path.to_string(), owner.to_string())));
+        }
+    }
+
+    let status = child.wait().await.context("failed to wait for git log")?;
+    if !status.success() {
+        let mut stderr = Vec::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            pipe.read_to_end(&mut stderr).await?;
+        }
+        bail!(
+            "git log for the LFS lock check failed ({status}): {}",
+            String::from_utf8_lossy(&stderr).trim()
+        );
+    }
+    Ok(None)
 }
 
 /// Interpret `git log --format=%G?` without turning an unavailable verifier
@@ -1238,8 +1389,7 @@ mod landed_push_tests {
             &repo_path,
             Cursor::new(push_request()),
             BrokenWriter,
-            vec![],
-            vec![],
+            super::PushPolicy::default(),
             &AppliedRefUpdates::new(),
         )
         .await
@@ -1258,8 +1408,7 @@ mod landed_push_tests {
         let outcome = handle_receive_pack_stream_with_rejections(
             &repo_path,
             &mut client,
-            vec![],
-            vec![],
+            super::PushPolicy::default(),
             &AppliedRefUpdates::new(),
         )
         .await
@@ -1308,8 +1457,7 @@ mod landed_push_tests {
             HangingWriter {
                 reached_response: reached_response.clone(),
             },
-            vec![],
-            vec![],
+            super::PushPolicy::default(),
             &applied,
         ));
 
@@ -1341,8 +1489,7 @@ mod landed_push_tests {
         let mut push = Box::pin(handle_receive_pack_stream_with_rejections(
             &repo_path,
             &mut client,
-            vec![],
-            vec![],
+            super::PushPolicy::default(),
             &applied,
         ));
 
@@ -1403,8 +1550,7 @@ mod ref_advertisement_tests {
         let error = super::handle_receive_pack_stream_with_rejections(
             &repo_path,
             &mut server,
-            vec![],
-            vec![],
+            super::PushPolicy::default(),
             &super::AppliedRefUpdates::new(),
         )
         .await
@@ -1827,8 +1973,7 @@ mod wire_tests {
         let updates = process_push_with_rejections(
             repo.path(),
             &mut reader,
-            &[],
-            &[],
+            &PushPolicy::default(),
             &AppliedRefUpdates::new(),
         )
         .await
@@ -1854,8 +1999,7 @@ mod wire_tests {
         let updates = process_push_with_rejections(
             repo.path(),
             &mut reader,
-            &[],
-            &[],
+            &PushPolicy::default(),
             &AppliedRefUpdates::new(),
         )
         .await
@@ -1886,8 +2030,7 @@ mod wire_tests {
         let error = process_push_with_rejections(
             repo.path(),
             &mut reader,
-            &[],
-            &[],
+            &PushPolicy::default(),
             &AppliedRefUpdates::new(),
         )
         .await
@@ -1907,8 +2050,7 @@ mod wire_tests {
         let result = process_push_with_rejections(
             repo.path(),
             &mut reader,
-            &[],
-            &[],
+            &PushPolicy::default(),
             &AppliedRefUpdates::new(),
         )
         .await;
@@ -2153,5 +2295,301 @@ mod native_index_pack_tests {
         .await
         .unwrap();
         assert!(res.is_err(), "a pre-set interrupt must abort the unpack");
+    }
+}
+
+/// Per-ref policy a push is held to before any ref moves: the server's own
+/// namespaces (card_e62ac71c4768) and the LFS locks other people hold
+/// (card_4a40b70a6796). Real repositories and a real `git`, because both
+/// checks are about what a client can make the server write.
+#[cfg(test)]
+mod push_policy_tests {
+    use std::io::Cursor;
+    use std::path::Path;
+
+    use tokio::io::BufReader;
+
+    use super::{
+        process_push_with_rejections, AppliedRefUpdates, ForeignLock, PushPolicy, RefUpdate,
+        LFS_LOCK_CHECK_UNAVAILABLE, NULL_SHA1, SERVER_OWNED_NAMESPACE,
+    };
+
+    /// See `landed_push_tests::EMPTY_PACK_CHECKSUM`: the objects every fixture
+    /// below names are already in the repository, so the pack carries none.
+    const EMPTY_PACK_CHECKSUM: &str = "029d08823bd8a8eab510ad6ac75c823cfd3ed31e";
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = crate::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run_with_env(
+                args,
+                Some(dir),
+                &[
+                    ("GIT_AUTHOR_NAME", "fixture"),
+                    ("GIT_AUTHOR_EMAIL", "fixture@example.invalid"),
+                    ("GIT_COMMITTER_NAME", "fixture"),
+                    ("GIT_COMMITTER_EMAIL", "fixture@example.invalid"),
+                ],
+            )
+            .expect("run git");
+        assert!(
+            output.success(),
+            "git {args:?} failed: {}",
+            output.stderr_str()
+        );
+        output.stdout_str().trim().to_string()
+    }
+
+    fn commit(work: &Path, file: &str, contents: &str) -> String {
+        std::fs::write(work.join(file), contents).unwrap();
+        git(work, &["add", file]);
+        git(work, &["commit", "-q", "-m", file]);
+        git(work, &["rev-parse", "HEAD"])
+    }
+
+    /// The served repository the way a push finds it: `main` at `base`, and
+    /// whatever else the test hands over present as objects under no branch —
+    /// exactly what `index-pack` leaves behind before the refs move.
+    struct Served {
+        _dir: tempfile::TempDir,
+        bare: std::path::PathBuf,
+        work: std::path::PathBuf,
+        base: String,
+    }
+
+    impl Served {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let bare = dir.path().join("served.git");
+            let work = dir.path().join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            git(dir.path(), &["init", "-q", "--bare", "served.git"]);
+            git(&work, &["init", "-q", "-b", "main"]);
+            let base = commit(&work, "readme.txt", "base\n");
+            git(&work, &["push", "-q", &bare.to_string_lossy(), "main"]);
+            Self {
+                _dir: dir,
+                bare,
+                work,
+                base,
+            }
+        }
+
+        /// Hand `sha`'s objects to the served repository without a branch or
+        /// tag reaching it.
+        fn deliver_objects(&self, sha: &str) {
+            let scratch = format!("{sha}:refs/fixture/delivered");
+            git(
+                &self.work,
+                &["push", "-q", &self.bare.to_string_lossy(), &scratch],
+            );
+            git(&self.bare, &["update-ref", "-d", "refs/fixture/delivered"]);
+        }
+
+        /// Publish `sha` as `branch` in the served repository.
+        fn publish(&self, sha: &str, branch: &str) {
+            let refspec = format!("{sha}:refs/heads/{branch}");
+            git(
+                &self.work,
+                &["push", "-q", &self.bare.to_string_lossy(), &refspec],
+            );
+        }
+    }
+
+    fn pkt(data: &[u8]) -> Vec<u8> {
+        let mut out = format!("{:04x}", data.len() + 4).into_bytes();
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// A wire push of `commands` (`old new refname`) followed by an empty pack.
+    fn push_stream(commands: &[(&str, &str, &str)]) -> Vec<u8> {
+        let mut stream = Vec::new();
+        for (index, (old, new, refname)) in commands.iter().enumerate() {
+            let capabilities = if index == 0 {
+                "\0report-status side-band-64k"
+            } else {
+                ""
+            };
+            stream.extend_from_slice(&pkt(
+                format!("{old} {new} {refname}{capabilities}\n").as_bytes()
+            ));
+        }
+        stream.extend_from_slice(b"0000");
+        stream.extend_from_slice(b"PACK");
+        stream.extend_from_slice(&2u32.to_be_bytes());
+        stream.extend_from_slice(&0u32.to_be_bytes());
+        stream.extend_from_slice(
+            gix::ObjectId::from_hex(EMPTY_PACK_CHECKSUM.as_bytes())
+                .unwrap()
+                .as_slice(),
+        );
+        stream
+    }
+
+    async fn push(
+        repo: &Path,
+        commands: &[(&str, &str, &str)],
+        policy: &PushPolicy,
+    ) -> Vec<RefUpdate> {
+        let mut reader = BufReader::new(Cursor::new(push_stream(commands)));
+        process_push_with_rejections(repo, &mut reader, policy, &AppliedRefUpdates::new())
+            .await
+            .expect("the push itself must run to the end")
+    }
+
+    fn outcome<'a>(updates: &'a [RefUpdate], refname: &str) -> &'a RefUpdate {
+        updates
+            .iter()
+            .find(|update| update.refname == refname)
+            .unwrap_or_else(|| panic!("no update for {refname} in {updates:?}"))
+    }
+
+    fn branch(repo: &Path, name: &str) -> Option<String> {
+        let output = crate::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(
+                &["rev-parse", "--verify", "-q", &format!("refs/heads/{name}")],
+                Some(repo),
+            )
+            .unwrap();
+        output
+            .success()
+            .then(|| output.stdout_str().trim().to_string())
+    }
+
+    fn alice_holds(path: &str) -> PushPolicy {
+        PushPolicy {
+            foreign_locks: vec![ForeignLock {
+                path: path.to_string(),
+                owner: "alice".to_string(),
+            }],
+            ..PushPolicy::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_into_a_server_namespace_is_refused_ref_by_ref() {
+        let served = Served::new();
+        let next = commit(&served.work, "next.txt", "next\n");
+        served.deliver_objects(&next);
+
+        let updates = push(
+            &served.bare,
+            &[
+                (NULL_SHA1, &next, "refs/merge-queue/1"),
+                (NULL_SHA1, &next, "refs/forks/x"),
+                (NULL_SHA1, &next, "refs/pull/7/head"),
+                (NULL_SHA1, &next, &format!("refs/replace/{}", served.base)),
+                (&served.base, &next, "refs/heads/main"),
+            ],
+            &PushPolicy::default(),
+        )
+        .await;
+
+        let replace = format!("refs/replace/{}", served.base);
+        for refname in [
+            "refs/merge-queue/1",
+            "refs/forks/x",
+            "refs/pull/7/head",
+            replace.as_str(),
+        ] {
+            let update = outcome(&updates, refname);
+            assert_eq!(update.status, "error", "{refname} was accepted");
+            assert_eq!(update.message, SERVER_OWNED_NAMESPACE);
+        }
+        assert_eq!(outcome(&updates, "refs/heads/main").status, "ok");
+        assert_eq!(branch(&served.bare, "main"), Some(next));
+        let written = crate::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(
+                &[
+                    "for-each-ref",
+                    "refs/merge-queue/",
+                    "refs/forks/",
+                    "refs/pull/",
+                    "refs/replace/",
+                ],
+                Some(&served.bare),
+            )
+            .unwrap();
+        assert_eq!(
+            written.stdout_str().trim(),
+            "",
+            "a refused server-namespace ref was written anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_changing_someone_else_s_locked_path_refuses_only_its_own_ref() {
+        let served = Served::new();
+        let free = commit(&served.work, "free.txt", "anyone may edit this\n");
+        let locked = commit(&served.work, "castle.level", "bob's castle\n");
+        served.deliver_objects(&locked);
+
+        let updates = push(
+            &served.bare,
+            &[
+                (&served.base, &locked, "refs/heads/main"),
+                (NULL_SHA1, &free, "refs/heads/free"),
+            ],
+            &alice_holds("castle.level"),
+        )
+        .await;
+
+        let main = outcome(&updates, "refs/heads/main");
+        assert_eq!(main.status, "error", "a locked path went through");
+        assert_eq!(main.message, "path 'castle.level' is locked by alice");
+        assert_eq!(branch(&served.bare, "main"), Some(served.base.clone()));
+        assert_eq!(
+            outcome(&updates, "refs/heads/free").status,
+            "ok",
+            "a ref whose commits leave the locked path alone was refused with it"
+        );
+        assert_eq!(branch(&served.bare, "free"), Some(free));
+    }
+
+    #[tokio::test]
+    async fn commits_a_branch_already_holds_are_not_the_pusher_s_change() {
+        let served = Served::new();
+        let locked = commit(&served.work, "castle.level", "alice's castle\n");
+        // The lock holder's own work, already on a branch of the repository.
+        served.publish(&locked, "alice-castle");
+
+        let updates = push(
+            &served.bare,
+            &[(&served.base, &locked, "refs/heads/main")],
+            &alice_holds("castle.level"),
+        )
+        .await;
+
+        assert_eq!(
+            outcome(&updates, "refs/heads/main").status,
+            "ok",
+            "moving main onto commits a branch already holds was blamed on the pusher"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lock_check_that_cannot_run_refuses_rather_than_admits() {
+        let served = Served::new();
+        // An object id the repository does not have: `git log` cannot walk
+        // from it, which is the check failing, not the pusher.
+        let missing = "b".repeat(40);
+
+        let updates = push(
+            &served.bare,
+            &[(NULL_SHA1, &missing, "refs/heads/ghost")],
+            &alice_holds("castle.level"),
+        )
+        .await;
+
+        let ghost = outcome(&updates, "refs/heads/ghost");
+        assert_eq!(ghost.status, "error");
+        assert_eq!(ghost.message, LFS_LOCK_CHECK_UNAVAILABLE);
+        assert_eq!(branch(&served.bare, "ghost"), None);
     }
 }

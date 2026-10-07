@@ -912,7 +912,7 @@
     },
     "lfs_locks": {
       "title": "LFS locks",
-      "desc": "Files locked with `git lfs lock`. A locked file can be pushed only by the person who holds the lock, when their client verifies locks (`git config lfs.locksverify true`).",
+      "desc": "Files locked with `git lfs lock`. A change to a locked file can be pushed only by the person who holds the lock; the server refuses anyone else's push.",
       "path": "Path",
       "owner": "Locked by",
       "locked_at": "Locked",

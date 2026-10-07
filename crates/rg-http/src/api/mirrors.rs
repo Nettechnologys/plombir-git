@@ -388,6 +388,7 @@ pub async fn trigger_mirror_sync(
         &state.repo_root,
         state.mirror_transport_policy,
         &state.encryption_key,
+        Some(&state.post_push_context()),
     )
     .await
     {

@@ -912,7 +912,7 @@
     },
     "lfs_locks": {
       "title": "LFS 锁",
-      "desc": "使用 `git lfs lock` 锁定的文件。只有持有锁的人才能推送被锁定的文件（需在客户端启用锁校验：`git config lfs.locksverify true`）。",
+      "desc": "使用 `git lfs lock` 锁定的文件。只有持有锁的人才能推送对被锁定文件的修改；其他人的推送会被服务器拒绝。",
       "path": "路径",
       "owner": "锁定者",
       "locked_at": "锁定时间",

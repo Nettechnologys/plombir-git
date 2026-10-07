@@ -187,6 +187,7 @@ mod public_base_url_tests;
 mod pull_request_ci_tests;
 mod pull_request_head_namespace_tests;
 mod push_hook_drain_tests;
+mod push_policy_tests;
 mod pypi_simple_index_tests;
 mod rate_limit_mounted_tests;
 mod registration_toggle_tests;

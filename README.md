@@ -464,9 +464,15 @@ when the repository has no branch of that name yet.
 
 The upstream owns `refs/heads/*` and `refs/tags/*`: each pass force-updates
 every branch and tag to the upstream's and removes the ones the upstream does
-not have. Pushes to a mirrored repository are not refused, but whatever they
-write to a branch or a tag lasts only until the next pass. Pull request heads
-and the server's other refs are left alone.
+not have. So while the mirror is enabled the repository is read-only: a push
+over HTTPS or SSH is refused, and so are web edits, applied suggestions and
+pull request merges (`409`). Switching the mirror off (`status: inactive`)
+makes it an ordinary repository again. The server's own refs are left alone.
+
+A pass that moves a branch updates the open pull requests on it — their head
+commit, auto-merge and the merge queue — but runs no CI pipeline and sends no
+`push` webhook: nobody pushed, and an upstream's workflows do not run on this
+instance's runners unasked.
 
 ### Git LFS
 
@@ -505,10 +511,12 @@ API marks a pointer file with `lfs: {oid, size, available}`; a pointer whose
 object was never uploaded is reported as such and the raw route answers `404`.
 
 File locking works with the stock client from either clone URL:
-`git lfs lock <path>`, `git lfs locks`, `git lfs unlock <path>`. A lock binds
-only clients that verify locks before pushing, so a team that locks files
-should run `git config lfs.locksverify true` (or `--global`); without it
-git-lfs warns about the locked file and pushes anyway. Unlocking someone
+`git lfs lock <path>`, `git lfs locks`, `git lfs unlock <path>`. The server
+enforces a lock itself: a push whose new commits change a path someone else
+has locked is refused for that branch (`path '<path>' is locked by <owner>`),
+over HTTPS and SSH alike. Setting `git config lfs.locksverify true` (or
+`--global`) still helps — git-lfs then stops the push before uploading
+anything instead of the server refusing it afterwards. Unlocking someone
 else's lock takes `--force` from a repository administrator. Repository
 settings list the locks (**LFS locks**) and show what the LFS store holds
 (**LFS storage**): its size, its objects, and the objects no branch, tag or

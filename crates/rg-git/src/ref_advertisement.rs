@@ -41,6 +41,28 @@ pub fn is_server_private(refname: &str) -> bool {
         .any(|namespace| refname.starts_with(namespace))
 }
 
+/// Ref namespaces the server stores nothing in but gives a meaning of its own,
+/// so a client may not create refs there either.
+///
+/// * `refs/pull/` — `refs/pull/<n>/head` is the ref name of a pull request's
+///   pipelines: their concurrency group, and what closing or merging the pull
+///   request cancels. A pushed `refs/pull/7/head` would run a `push` pipeline
+///   under that name, in that group.
+/// * `refs/replace/` — git substitutes the object a replace ref names for the
+///   one it replaces on every read. A pushed one would change what the
+///   server's own checks see: the signed-commit and LFS-lock checks would read
+///   the replacement, not the commit the branch actually gets.
+pub const SERVER_RESERVED_NAMESPACES: &[&str] = &["refs/pull/", "refs/replace/"];
+
+/// Whether a client's push may not write `refname`: one of the server's own
+/// namespaces, written or reserved.
+pub fn is_server_owned(refname: &str) -> bool {
+    is_server_private(refname)
+        || SERVER_RESERVED_NAMESPACES
+            .iter()
+            .any(|namespace| refname.starts_with(namespace))
+}
+
 /// The refs a protocol advertisement shows a client: [`collect`] without the
 /// server's private namespaces.
 pub fn collect_for_clients(repo_path: &Path) -> Result<RefAdvertisement> {

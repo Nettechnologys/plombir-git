@@ -3,12 +3,12 @@
 //! The protocol tests in `lfs_locks_tests` pin what the server answers; this
 //! one pins that a real client does with it what locking is for: once one
 //! person has locked a file, another person's push of a change to it is refused
-//! by their own `git lfs` before anything is sent, and goes through once the
-//! lock is released. Nothing is configured beyond the clone URL and
-//! `lfs.locksverify = true`: without that setting the stock client (3.4.1,
-//! measured) prints "Unable to push locked files … would have halted this
-//! push" and pushes anyway — the protocol makes locking advisory unless the
-//! client opts in, which is why the README tells a team to set it.
+//! — by the server when their client is left as it comes, by their own
+//! `git lfs` before anything is sent once `lfs.locksverify = true` is set — and
+//! goes through once the lock is released. Without that setting the stock
+//! client (3.4.1, measured) prints "Unable to push locked files … would have
+//! halted this push" and pushes anyway, which is why the server checks too
+//! (card_4a40b70a6796).
 //!
 //! Ignored by default: it needs the `git-lfs` binary on `PATH`, which not every
 //! machine that runs this suite has. Run it with
@@ -169,12 +169,13 @@ async fn a_locked_file_cannot_be_pushed_by_anyone_else_until_it_is_unlocked() {
     };
     assert!(lock_output.contains("Locked castle.level"), "{lock_output}");
 
-    // Bob's change to the locked file is refused by his own client.
-    let (bob_checkout, refused) = {
+    // Bob's change to the locked file is refused — first by the server, while
+    // his client is left as it comes (no `lfs.locksverify`: it only warns and
+    // pushes), then by his own client once he turns the check on.
+    let (bob_checkout, unverified, refused) = {
         let (bob, root_path) = (bob.clone(), root_path.clone());
         on_machine(move || {
             let work = bob.checkout(&root_path, &bob_url, "bob-work");
-            bob.ok(&work, &["config", "lfs.locksverify", "true"]);
             let listed = bob.ok(&work, &["lfs", "locks"]);
             assert!(
                 listed.contains("castle.level") && listed.contains(ALICE),
@@ -189,11 +190,25 @@ async fn a_locked_file_cannot_be_pushed_by_anyone_else_until_it_is_unlocked() {
             std::fs::set_permissions(&level, permissions).unwrap();
             std::fs::write(&level, b"\0castle v2 by bob\0").unwrap();
             bob.ok(&work, &["commit", "-qam", "bob edits the castle"]);
+            let unverified = bob.run(&work, &["push", "origin", "HEAD"]);
+            bob.ok(&work, &["config", "lfs.locksverify", "true"]);
             let pushed = bob.run(&work, &["push", "origin", "HEAD"]);
-            (work, pushed)
+            (work, unverified, pushed)
         })
         .await
     };
+    assert!(
+        !unverified.success,
+        "a client that does not check locks pushed a file alice has locked:\n{}",
+        unverified.output
+    );
+    assert!(
+        unverified
+            .output
+            .contains(&format!("path 'castle.level' is locked by {ALICE}")),
+        "the server did not refuse the locked path:\n{}",
+        unverified.output
+    );
     assert!(
         !refused.success,
         "bob's push of a file alice has locked went through:\n{}",

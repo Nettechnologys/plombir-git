@@ -12,9 +12,6 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::pat_auth::{extract_git_credential, GitCredential};
 use crate::{git_v2, AppState};
-use rg_core::branch_protection::push_rules::{
-    branch_protection_rejected_refs, signed_commit_required_refs, tag_protection_rejected_refs,
-};
 
 /// RAII timer that records a Git transport operation into the Prometheus
 /// metrics on drop — so every return path of the (branch-heavy) pack handlers
@@ -302,19 +299,6 @@ async fn check_git_access(
     }
 }
 
-/// The one sentence a git client is allowed to hear about a failure of ours,
-/// with the whole `anyhow` chain going to the log instead.
-///
-/// The git transport has no JSON envelope for `AppError` to sanitize — every
-/// return path writes its own body — so `{:#}` on an error puts the storage
-/// path, the gix internals and the `db: <operation>` context straight in front
-/// of whoever ran `git clone` (H-05). `operation` names the step for the log;
-/// the client gets a fixed string chosen by the status.
-/// Every ref a push must be refused, branch rules and tag rules together.
-///
-/// Both halves read an allow-list out of a stored JSON column and both are
-/// fallible for the same reason, so they are joined here and the call site has
-/// one error to answer rather than two identical arms.
 /// Apply a Personal Access Token's narrowing to a git request.
 ///
 /// Git is not behind the REST PAT middleware or the per-route layer, so the two
@@ -383,19 +367,14 @@ async fn git_grant_refusal(
     Err(refusal(format!("this token may not access {owner}/{repo}")))
 }
 
-fn receive_pack_rejected_refs(
-    protection_rules: Vec<rg_db::ops::protected_branch_ops::Rule>,
-    tag_protection_rules: Vec<rg_db::ops::protected_tag_ops::Rule>,
-    actor_id: Option<i64>,
-) -> anyhow::Result<Vec<(String, String)>> {
-    let mut rejected = branch_protection_rejected_refs(protection_rules, actor_id)?;
-    rejected.extend(tag_protection_rejected_refs(
-        tag_protection_rules,
-        actor_id,
-    )?);
-    Ok(rejected)
-}
-
+/// The one sentence a git client is allowed to hear about a failure of ours,
+/// with the whole `anyhow` chain going to the log instead.
+///
+/// The git transport has no JSON envelope for `AppError` to sanitize — every
+/// return path writes its own body — so `{:#}` on an error puts the storage
+/// path, the gix internals and the `db: <operation>` context straight in front
+/// of whoever ran `git clone` (H-05). `operation` names the step for the log;
+/// the client gets a fixed string chosen by the status.
 fn git_failure_body(operation: &'static str, e: &anyhow::Error) -> String {
     let status = git_db_status(e);
     tracing::error!(
@@ -1248,13 +1227,26 @@ pub(crate) async fn handle_git_receive_pack(
             );
         }
     };
-    let protection_rules = match rg_db::ops::protected_branch_ops::list_rules_by_repo(
+    // Decided before anything is spawned, in the one loader SSH calls too: the
+    // repository's pull mirror, branch and tag protection, the token's own
+    // narrowing and the LFS locks other people hold. A rule whose stored
+    // allow-list does not decode is a fault of ours, and the client has to
+    // hear that rather than "push to protected branch … is not allowed" —
+    // which would blame the pusher for a broken row and, for a pusher who *is*
+    // on the list, be a lie.
+    let token_kept_off_protected = credential
+        .as_ref()
+        .and_then(|credential| credential.grant.as_ref())
+        .is_some_and(|grant| grant.denies_protected_writes());
+    let push_policy = match rg_core::branch_protection::push_rules::load_receive_pack_policy(
         &state.db,
         repo_model.id,
+        actor_id,
+        token_kept_off_protected,
     )
     .await
     {
-        Ok(rules) => rules,
+        Ok(policy) => policy,
         Err(e) => {
             return (
                 git_db_status(&e),
@@ -1262,65 +1254,10 @@ pub(crate) async fn handle_git_receive_pack(
                     header::CONTENT_TYPE,
                     "application/x-git-receive-pack-result",
                 )],
-                Body::from(git_failure_body("load branch protections", &e)),
+                Body::from(git_failure_body("load push policy", &e)),
             );
         }
     };
-    let tag_protection_rules =
-        match rg_db::ops::protected_tag_ops::list_rules_by_repo(&state.db, repo_model.id).await {
-            Ok(rules) => rules,
-            Err(e) => {
-                return (
-                    git_db_status(&e),
-                    [(
-                        header::CONTENT_TYPE,
-                        "application/x-git-receive-pack-result",
-                    )],
-                    Body::from(git_failure_body("load tag protections", &e)),
-                );
-            }
-        };
-
-    // Decided before anything is spawned: a rule whose stored allow-list does
-    // not decode is a fault of ours, and the client has to hear that rather
-    // than "push to protected branch … is not allowed" — which would blame the
-    // pusher for a broken row and, for a pusher who *is* on the list, be a lie.
-    let require_signed_refs = signed_commit_required_refs(&protection_rules);
-    // A token kept off protected branches is refused every one of them, first,
-    // whatever the rules would let its account do (card_60a80311d512).
-    let token_rejections: Vec<(String, String)> = match credential
-        .as_ref()
-        .and_then(|credential| credential.grant.as_ref())
-        .filter(|grant| grant.denies_protected_writes())
-    {
-        Some(_) => protection_rules
-            .iter()
-            .map(|rule| {
-                (
-                    format!("refs/heads/{}", rule.protection.branch_name),
-                    format!(
-                        "this token may not write to protected branch '{}'",
-                        rule.protection.branch_name
-                    ),
-                )
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-    let rejected_refs =
-        match receive_pack_rejected_refs(protection_rules, tag_protection_rules, actor_id) {
-            Ok(refs) => token_rejections.into_iter().chain(refs).collect(),
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [(
-                        header::CONTENT_TYPE,
-                        "application/x-git-receive-pack-result",
-                    )],
-                    Body::from(git_failure_body("evaluate push protection rules", &e)),
-                );
-            }
-        };
 
     // All access and policy reads happen before the body is consumed. A valid
     // pusher's request is spooled to disk under the same ceiling rg-git applies
@@ -1363,8 +1300,7 @@ pub(crate) async fn handle_git_receive_pack(
             &repo_path,
             file,
             &mut buf_writer,
-            rejected_refs,
-            require_signed_refs,
+            push_policy,
             &applied,
         ),
     )

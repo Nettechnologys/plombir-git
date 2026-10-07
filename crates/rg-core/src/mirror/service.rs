@@ -43,12 +43,16 @@
 //! The upstream is authoritative for `refs/heads/*` and `refs/tags/*`. Like a
 //! pull mirror on GitHub or Gitea, the repository is not a place to push to:
 //! the next pass force-updates every branch and tag to the upstream's, and
-//! removes the ones the upstream does not have. Pushes are not refused yet,
-//! but whatever they write to those two namespaces lasts only until that
-//! pass. The server's own refs (pull request heads, fork refs) are outside
-//! both and are left alone.
+//! removes the ones the upstream does not have — so nothing else may write
+//! them while the mirror is on: pushes, web edits and merges are refused
+//! (`write_guard`, card_97a2c0209056). The server's own refs (fork scratch
+//! refs, merge-queue groups) are outside both and are left alone. The branches
+//! a pass moves get the hooks that keep derived data in step — open pull
+//! requests' head SHAs, auto-merge and the merge queue — but not the ones a
+//! push announces (`push_hooks::mirror_pass_hooks`, card_dbc5a1debb0a).
 
 use super::transport::MirrorTransportPolicy;
+use crate::push_hooks::PostPushContext;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rg_db::entities::mirror::{
@@ -57,6 +61,7 @@ use rg_db::entities::mirror::{
 use rg_db::entities::repository;
 use rg_git::cli_gateway::global_gateway;
 use rg_git::credentials::{credential_invocation, GitCredentials};
+use rg_git::protocol::receive_pack::RefUpdate;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use std::path::Path;
@@ -570,6 +575,7 @@ pub async fn sync_mirror(
     repo_root: &Path,
     transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
+    hooks: Option<&PostPushContext>,
 ) -> Result<SyncOutcome> {
     use rg_db::ops::mirror_ops::SyncLeaseBid;
 
@@ -615,7 +621,15 @@ pub async fn sync_mirror(
         }
     }
 
-    let pass = run_sync_pass(db, mirror, repo_root, transport_policy, encryption_key).await;
+    let pass = run_sync_pass(
+        db,
+        mirror,
+        repo_root,
+        transport_policy,
+        encryption_key,
+        hooks,
+    )
+    .await;
 
     // Released however the pass went, including on the error paths above it:
     // holding it any longer would keep the repository undeletable for the whole
@@ -652,6 +666,7 @@ async fn run_sync_pass(
     repo_root: &Path,
     transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
+    hooks: Option<&PostPushContext>,
 ) -> Result<()> {
     let repo_path = mirror_clone_path(repo_root, mirror.repo_id);
     let clone_path = repo_path.clone();
@@ -716,16 +731,19 @@ async fn run_sync_pass(
         credentials,
         result,
         transport_policy,
+        hooks,
     )
     .await
 }
 
 /// Everything a pass does once the upstream has been dialled: bring the LFS
-/// objects, publish the refs, and record on the row how it went.
+/// objects, publish the refs, record on the row how it went, and hand the
+/// branches it moved to the hooks that keep the database in step with them.
 ///
 /// Apart from [`run_sync_pass`] because the dialling half is the one a test
 /// cannot reach — the transport policy refuses every loopback upstream — and
 /// everything that decides what clients see is here.
+#[allow(clippy::too_many_arguments)]
 async fn finish_pass(
     db: &DatabaseConnection,
     mirror: &Mirror,
@@ -734,7 +752,9 @@ async fn finish_pass(
     credentials: Option<GitCredentials>,
     result: Result<()>,
     transport_policy: MirrorTransportPolicy,
+    hooks: Option<&PostPushContext>,
 ) -> Result<()> {
+    let mut published = None;
     // `{e}` printed the outermost `.context(...)` only, both in the persisted
     // field the UI shows and in the log — under it sits the `git clone
     // --mirror` failure that actually explains the outage (card_a997f30c142c).
@@ -784,7 +804,10 @@ async fn finish_pass(
             // publishes: the history is no less the upstream's for one missing
             // binary, and the row names what is missing.
             match publish_mirrored_refs(db, repo_root, mirror.repo_id, clone_path).await {
-                Ok(()) => lfs,
+                Ok(moved) => {
+                    published = Some(moved);
+                    lfs
+                }
                 Err(e) => Some(match lfs {
                     None => format!(
                         "the upstream was fetched, but its branches and tags could not be \
@@ -826,7 +849,26 @@ async fn finish_pass(
     }
 
     rg_db::ops::mirror_ops::update(db, model).await?;
+
+    // A branch the pass moved moves for the open pull requests on it too: a
+    // head SHA left on a commit the branch no longer has is what review, the
+    // merge gate and a pinned merge all compare against (card_dbc5a1debb0a).
+    // Detached through the tracker, like a push's hooks, so the lease is not
+    // held across them.
+    if let (Some(hooks), Some(moved)) = (hooks, published) {
+        hooks.spawn_for_mirror_pass(db, moved.owner, moved.name, moved.updates);
+    }
     Ok(())
+}
+
+/// What one publication changed in the served repository.
+struct PublishedRefs {
+    owner: String,
+    name: String,
+    /// Every branch and tag whose value differs from before the fetch — one
+    /// entry per ref, the old or new side all zeros for a ref created or
+    /// pruned, `status = "ok"` because each of them did happen.
+    updates: Vec<RefUpdate>,
 }
 
 /// Make the repository clients read carry the branches and tags the mirror's
@@ -839,19 +881,25 @@ async fn finish_pass(
 ///
 /// `--prune` with explicit `refs/heads/*` and `refs/tags/*` destinations
 /// removes only branches and tags; the server's own refs live elsewhere.
+///
+/// The two namespaces are read before and after the fetch, so the caller can
+/// tell the hooks which refs moved. Nothing else writes them meanwhile: the
+/// repository refuses pushes, web edits and merges while its mirror is on
+/// (`super::write_guard`).
 async fn publish_mirrored_refs(
     db: &DatabaseConnection,
     repo_root: &Path,
     repo_id: i64,
     clone: &Path,
-) -> Result<()> {
+) -> Result<PublishedRefs> {
     let (owner, name) = crate::repo::service::repository_identity(db, repo_id).await?;
     let served = repo_root.join(&owner).join(format!("{name}.git"));
     let clone = clone.to_path_buf();
-    let adopt = crate::blocking::run_blocking_git("mirror ref publication", move || {
+    let (adopt, updates) = crate::blocking::run_blocking_git("mirror ref publication", move || {
         let git = global_gateway()
             .as_ref()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let before = published_refs(git, &served)?;
         git.run(
             &[
                 "fetch",
@@ -865,7 +913,11 @@ async fn publish_mirrored_refs(
         )?
         .ensure_success()
         .with_context(|| format!("git fetch from the mirror clone into {}", served.display()))?;
-        adoptable_head(&served, &clone)
+        let after = published_refs(git, &served)?;
+        Ok((
+            adoptable_head(&served, &clone)?,
+            moved_refs(&before, &after),
+        ))
     })
     .await?;
 
@@ -878,7 +930,61 @@ async fn publish_mirrored_refs(
             );
         }
     }
-    Ok(())
+    Ok(PublishedRefs {
+        owner,
+        name,
+        updates,
+    })
+}
+
+/// The branches and tags of `repository`, by name.
+fn published_refs(
+    git: &rg_git::cli_gateway::GitCommandGateway,
+    repository: &Path,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let output = git.run(
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads/",
+            "refs/tags/",
+        ],
+        Some(repository),
+    )?;
+    output
+        .ensure_success()
+        .with_context(|| format!("read the branches and tags of {}", repository.display()))?;
+    Ok(output
+        .stdout_str()
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(sha, name)| (name.to_string(), sha.to_string()))
+        .collect())
+}
+
+/// One [`RefUpdate`] per ref whose value differs between the two snapshots.
+fn moved_refs(
+    before: &std::collections::BTreeMap<String, String>,
+    after: &std::collections::BTreeMap<String, String>,
+) -> Vec<RefUpdate> {
+    const ABSENT: &str = "0000000000000000000000000000000000000000";
+    before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|refname| {
+            let old_sha = before.get(refname).map_or(ABSENT, String::as_str);
+            let new_sha = after.get(refname).map_or(ABSENT, String::as_str);
+            (old_sha != new_sha).then(|| RefUpdate {
+                old_sha: old_sha.to_string(),
+                new_sha: new_sha.to_string(),
+                refname: refname.clone(),
+                status: "ok".to_string(),
+                message: String::new(),
+            })
+        })
+        .collect()
 }
 
 /// The upstream's default branch, when the repository's own `HEAD` names a
@@ -922,11 +1028,21 @@ pub async fn sync_due_mirrors(
     limit: u64,
     transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
+    hooks: Option<&PostPushContext>,
 ) -> Result<usize> {
     let mirrors = rg_db::ops::mirror_ops::list_due_sync(db, limit).await?;
     let mut count = 0;
     for mirror in &mirrors {
-        match sync_mirror(db, mirror, repo_root, transport_policy, encryption_key).await {
+        match sync_mirror(
+            db,
+            mirror,
+            repo_root,
+            transport_policy,
+            encryption_key,
+            hooks,
+        )
+        .await
+        {
             Ok(SyncOutcome::Ran) => count += 1,
             // Switched off, repository gone, or already being synced by someone
             // else — none of the three is this sweep's to report.
@@ -953,6 +1069,7 @@ pub async fn trigger_sync(
     repo_root: &Path,
     transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
+    hooks: Option<&PostPushContext>,
 ) -> Result<()> {
     let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
         .await?
@@ -963,7 +1080,16 @@ pub async fn trigger_sync(
     // (Reaching this with a deleted repository takes the row outliving its
     // repository *and* a caller that resolved it some other way — every HTTP
     // route here resolves the repository first.)
-    match sync_mirror(db, &mirror, repo_root, transport_policy, encryption_key).await? {
+    match sync_mirror(
+        db,
+        &mirror,
+        repo_root,
+        transport_policy,
+        encryption_key,
+        hooks,
+    )
+    .await?
+    {
         SyncOutcome::Ran => Ok(()),
         SyncOutcome::SwitchedOff => Err(crate::error::conflict(
             "this mirror is switched off — set its status to `active` before syncing it",
@@ -1368,6 +1494,7 @@ mod tests {
                     None,
                     Ok(()),
                     MirrorTransportPolicy::default(),
+                    None,
                 )
                 .await
                 .expect("finish the pass");
@@ -1438,6 +1565,186 @@ mod tests {
         );
         git_out(&checkout, &["pull", "-q"]);
         assert_eq!(git_out(&checkout, &["rev-parse", "HEAD"]), second);
+    }
+
+    /// Counts every question the hooks put to CI, so a mirror pass can be
+    /// held to asking none.
+    #[derive(Default)]
+    struct CountingCi {
+        questions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::ci::CiTrigger for CountingCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            self.questions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            self.questions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>>
+        {
+            unreachable!("a mirror pass starts no pipeline")
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+        {
+            unreachable!("a mirror pass resumes no pipeline")
+        }
+    }
+
+    /// card_dbc5a1debb0a: a pass moved the branches, and the pull requests on
+    /// them kept the head SHA of a commit the branch no longer had — review,
+    /// the merge gate and a pinned merge all compared against it.
+    #[tokio::test]
+    async fn a_pass_brings_the_head_of_an_open_pull_request_along_and_asks_ci_nothing() {
+        let (db, repo_id, _) = update_fixture().await;
+        let mirror = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repo_root = directory.path().join("repos");
+        let served = repo_root.join("mirror-race-owner/mirror-race-repo.git");
+        std::fs::create_dir_all(&served).expect("served directory");
+        git_out(&served, &["init", "-q", "--bare", "-b", "trunk"]);
+
+        let upstream = directory.path().join("upstream");
+        std::fs::create_dir_all(&upstream).expect("upstream directory");
+        git_out(&upstream, &["init", "-q", "-b", "trunk"]);
+        git_out(&upstream, &["config", "user.name", "mirror test"]);
+        git_out(
+            &upstream,
+            &["config", "user.email", "mirror@example.invalid"],
+        );
+        commit(&upstream, "a.txt", "first");
+        git_out(&upstream, &["checkout", "-q", "-b", "feature"]);
+        let reviewed = commit(&upstream, "b.txt", "reviewed");
+        let clone = mirror_clone_path(&repo_root, repo_id);
+        git_out(
+            &repo_root,
+            &[
+                "clone",
+                "--mirror",
+                "-q",
+                upstream.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+
+        let ci = std::sync::Arc::new(CountingCi::default());
+        let tracker = crate::task_tracker::TaskTracker::new();
+        let hooks = PostPushContext {
+            repo_root: repo_root.clone(),
+            docker_enabled: false,
+            external_runners: false,
+            allow_host_runner: false,
+            jwt_secret: None,
+            encryption_key: None,
+            smtp_config: None,
+            ci_engine: ci.clone(),
+            external_url: None,
+            notifier: None,
+            delivery_tracker: tracker.clone(),
+        };
+        let pass = |mirror: Mirror| {
+            let (db, repo_root, clone, hooks) =
+                (db.clone(), repo_root.clone(), clone.clone(), hooks.clone());
+            async move {
+                finish_pass(
+                    &db,
+                    &mirror,
+                    &repo_root,
+                    &clone,
+                    None,
+                    Ok(()),
+                    MirrorTransportPolicy::default(),
+                    Some(&hooks),
+                )
+                .await
+                .expect("finish the pass");
+            }
+        };
+        pass(mirror).await;
+
+        let owner = rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_id;
+        let now = Utc::now();
+        let pr = rg_db::ops::pull_request_ops::create(
+            &db,
+            rg_db::entities::pull_request::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repo_id),
+                number: Set(1),
+                title: Set("feature".to_string()),
+                body: Set(None),
+                state: Set("open".to_string()),
+                is_draft: Set(false),
+                auto_merge_enabled: Set(false),
+                auto_merge_strategy: Set(None),
+                auto_merge_enabled_by_id: Set(None),
+                auto_merge_enabled_at: Set(None),
+                author_id: Set(owner),
+                reviewer_id: Set(None),
+                head_branch: Set("feature".to_string()),
+                base_branch: Set("trunk".to_string()),
+                head_sha: Set(Some(reviewed.clone())),
+                merge_strategy: Set(None),
+                merge_commit_sha: Set(None),
+                head_repo_id: Set(None),
+                ci_approved_sha: Set(None),
+                ci_approved_by: Set(None),
+                ci_approved_at: Set(None),
+                milestone_id: Set(None),
+                labels: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                closed_at: Set(None),
+                merged_at: Set(None),
+            },
+        )
+        .await
+        .expect("open a pull request between two mirrored branches");
+
+        // The upstream moves the pull request's head branch on.
+        let moved = commit(&upstream, "c.txt", "moved on");
+        git_out(&clone, &["remote", "update", "--prune"]);
+        let row = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        pass(row).await;
+        tracker.close();
+        tracker.wait().await;
+
+        let pr = rg_db::ops::pull_request_ops::find_by_id(&db, pr.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pr.head_sha.as_deref(),
+            Some(moved.as_str()),
+            "the pull request still names the head the branch had before the pass"
+        );
+        assert_eq!(
+            ci.questions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a mirror pass asked CI about a push or pull_request pipeline"
+        );
     }
 
     #[tokio::test]

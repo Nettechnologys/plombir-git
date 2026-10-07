@@ -4,9 +4,11 @@
 //! A lock records that one person is editing a file nobody can merge, and the
 //! stock client enforces it: before a push it asks `locks/verify` which locks
 //! are its own and which are someone else's, and refuses to push a change to a
-//! path in the second list. The server records and answers; it does not
-//! inspect pushes. That is the protocol's division of labour, and what GitHub
-//! and Gitea do as well.
+//! path in the second list — but only when it is configured with
+//! `lfs.locksverify = true`. Without that setting it warns and pushes anyway,
+//! so the server enforces the lock too: receive-pack refuses a ref whose new
+//! commits change a path someone else holds ([`held_by_others`] feeds that
+//! check, card_4a40b70a6796), over HTTP and SSH alike.
 //!
 //! A lock covers a path on every branch. The client sends the ref it is on,
 //! and it is kept for display, but a lock scoped to one branch would let the
@@ -193,6 +195,28 @@ pub async fn verify_locks(
         theirs: view_all(db, theirs).await?,
         next_cursor,
     })
+}
+
+/// The locks in `repo_id` someone other than `pusher` holds, in the shape the
+/// receive-pack check enforces (card_4a40b70a6796). With no pusher — a deploy
+/// key, which cannot hold a lock — every lock is someone else's.
+pub async fn held_by_others(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    pusher: Option<i64>,
+) -> Result<Vec<rg_git::protocol::receive_pack::ForeignLock>> {
+    let locks = lfs_lock_ops::list_held_by_others(db, repo_id, pusher).await?;
+    if locks.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(view_all(db, locks)
+        .await?
+        .into_iter()
+        .map(|lock| rg_git::protocol::receive_pack::ForeignLock {
+            path: lock.path,
+            owner: lock.owner.name,
+        })
+        .collect())
 }
 
 /// What `POST /locks/{id}/unlock` found.

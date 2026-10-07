@@ -7,3 +7,5 @@ pub mod scheduler;
 pub mod service;
 /// Instance-level confidentiality policy for outbound mirror transport.
 pub mod transport;
+/// The refusal that keeps a pull mirror's branches and tags its upstream's.
+pub mod write_guard;

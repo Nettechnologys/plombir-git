@@ -21,8 +21,12 @@
 //!   afterwards, so until then the object looks exactly like an old orphan.
 //!
 //! Nothing is removed on the strength of an old answer: [`prune`] reads the
-//! refs again itself, after the administrator chose, and each row goes only
-//! under a conditional `DELETE` that repeats the age and lease checks.
+//! refs again itself, after the administrator chose, and each object goes only
+//! under its row's publication lease, taken by a conditional `UPDATE` that
+//! repeats the age and lease checks. The lease is held while the bytes are
+//! deleted and the row goes last, so an upload of the same object in that
+//! window waits and publishes fresh bytes rather than reusing ones about to
+//! disappear (card_10864c45e31e).
 //!
 //! ## Shared objects
 //!
@@ -206,15 +210,36 @@ pub async fn prune(
             ));
             continue;
         }
-        if !rg_db::ops::lfs_object_ops::delete_unused(db, repo.id, row.id, cutoff).await? {
+        let token = uuid::Uuid::new_v4().to_string();
+        if !rg_db::ops::lfs_object_ops::lease_unused_for_removal(
+            db, repo.id, row.id, &token, cutoff,
+        )
+        .await?
+        {
             outcome
                 .kept
                 .push(keep("an upload or a push of it is in progress"));
             continue;
         }
-        // The row is gone first, so a failure below leaves bytes nothing
-        // claims — never a row that promises bytes which are not there.
+        // Under the row's publication lease from here to the row's removal: a
+        // new upload of the same object waits for it instead of finding the
+        // old bytes still in place, reusing them and losing them a moment
+        // later (card_10864c45e31e), and no push is told the object is stored.
         remove_stored_bytes(storage, &legacy_root, repo, oid).await;
+        if !rg_db::ops::lfs_object_ops::delete_leased(db, repo.id, row.id, &token).await? {
+            // Only a takeover of a lease held past its expiry gets here. The
+            // bytes are gone and the row still promises them, so say so.
+            tracing::error!(
+                repo_id = repo.id,
+                oid,
+                "the lease of an LFS object being removed was taken over before its row went: \
+                 the stored bytes are already deleted"
+            );
+            outcome
+                .kept
+                .push(keep("its removal was interrupted; upload it again"));
+            continue;
+        }
         outcome.deleted.push(oid.to_string());
     }
     Ok(outcome)
@@ -245,7 +270,8 @@ async fn remove_stored_bytes(
                 oid,
                 blob_key = %key,
                 error = %format!("{error:#}"),
-                "an unused LFS object's row is gone but its stored bytes could not be removed"
+                "an unused LFS object's stored bytes could not be removed; they stay behind once \
+                 its row goes"
             );
         }
     }

@@ -111,6 +111,28 @@ pub async fn list(
     Ok((locks, more))
 }
 
+/// Every lock in `repo_id` held by anyone but `holder` — all of them when there
+/// is no holder (a deploy key cannot hold a lock).
+///
+/// Unpaged, for the push check: a lock it did not see would be a lock that
+/// does not hold. A repository's locks are files people are editing by hand,
+/// a set on the scale of a team's working copy rather than of its history.
+pub async fn list_held_by_others(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    holder: Option<i64>,
+) -> Result<Vec<LfsLock>> {
+    let mut select = LfsLockEntity::find().filter(lfs_lock::Column::RepoId.eq(repo_id));
+    if let Some(holder) = holder {
+        select = select.filter(lfs_lock::Column::OwnerId.ne(holder));
+    }
+    select
+        .order_by_asc(lfs_lock::Column::Id)
+        .all(db)
+        .await
+        .context("db: list the LFS locks other people hold")
+}
+
 /// Remove lock `id` of `repo_id` — when `owner_id` is given, only while that
 /// user still holds it. Returns whether a row went.
 ///

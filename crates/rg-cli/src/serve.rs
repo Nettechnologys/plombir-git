@@ -1280,53 +1280,6 @@ pub(crate) async fn run_serve(
         None
     };
 
-    // ── Scheduled mirror sync ─────────────────────────────────────
-    // The periodic half of the mirror feature. `POST .../mirror` has always
-    // taken a `sync_interval_seconds` and written a `next_sync_at` that the
-    // settings UI renders as "next sync at …", but nothing in the process ever
-    // called `sync_due_mirrors`: only the manual "Sync now" button refreshed a
-    // mirror, and it was also the only thing that ever moved `next_sync_at`
-    // (card_d2fd29942436).
-    let mirror_config = cfg.as_ref().map(|config| &config.mirror);
-    let _mirror_sync_handle = if mirror_config
-        .and_then(|config| config.enabled)
-        .unwrap_or(DEFAULT_MIRROR_ENABLED)
-    {
-        let sync_config = rg_core::mirror::scheduler::MirrorSyncConfig {
-            poll_interval_secs: mirror_config
-                .and_then(|config| config.poll_interval_secs)
-                .unwrap_or(rg_core::mirror::scheduler::DEFAULT_POLL_INTERVAL_SECS),
-            batch_size: mirror_config
-                .and_then(|config| config.batch_size)
-                .unwrap_or(rg_core::mirror::scheduler::DEFAULT_BATCH_SIZE),
-            transport_policy: resolved_mirror_transport_policy,
-        };
-        tracing::info!(
-            poll_interval_secs = sync_config.poll_interval_secs,
-            batch_size = sync_config.batch_size,
-            "Scheduled mirror sync enabled"
-        );
-        // The secret is `encryption_key`, never `jwt_secret`: the mirror's
-        // stored remote credential is encrypted at rest with the former, and
-        // the two stopped being the same value in card_d740512de0a8.
-        Some(rg_core::mirror::scheduler::spawn_mirror_sync_with_shutdown(
-            db.clone(),
-            repo_root.clone(),
-            resolved_auth_secrets.encryption_key.clone(),
-            sync_config,
-            Some(shutdown_rx.clone()),
-        )?)
-    } else {
-        // Said out loud for the same reason as the backup line below it: an
-        // operator whose mirror shows a next-sync time must be able to find out
-        // from the log that nothing is going to act on it.
-        tracing::info!(
-            "Scheduled mirror sync is OFF ([mirror].enabled): configured mirrors are only \
-             refreshed when someone triggers a sync from the repository's mirror settings."
-        );
-        None
-    };
-
     // ── HTTP server ───────────────────────────────────────────────
     // A reset link may only name the configured public address — one taken
     // from the request `Host` would let an anonymous requester choose where a
@@ -1445,6 +1398,7 @@ pub(crate) async fn run_serve(
             signing_secret: resolved_auth_secrets.jwt_secret.clone(),
         });
 
+    let mirror_encryption_key = resolved_auth_secrets.encryption_key.clone();
     let post_push_context = rg_core::push_hooks::PostPushContext {
         repo_root: repo_root.clone(),
         docker_enabled: resolved_docker,
@@ -1457,6 +1411,56 @@ pub(crate) async fn run_serve(
         external_url: resolved_external_url,
         notifier: Some(std::sync::Arc::new(notification_hub)),
         delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
+    };
+
+    // ── Scheduled mirror sync ─────────────────────────────────────
+    // The periodic half of the mirror feature. `POST .../mirror` has always
+    // taken a `sync_interval_seconds` and written a `next_sync_at` that the
+    // settings UI renders as "next sync at …", but nothing in the process ever
+    // called `sync_due_mirrors`: only the manual "Sync now" button refreshed a
+    // mirror, and it was also the only thing that ever moved `next_sync_at`
+    // (card_d2fd29942436).
+    let mirror_config = cfg.as_ref().map(|config| &config.mirror);
+    let _mirror_sync_handle = if mirror_config
+        .and_then(|config| config.enabled)
+        .unwrap_or(DEFAULT_MIRROR_ENABLED)
+    {
+        let sync_config = rg_core::mirror::scheduler::MirrorSyncConfig {
+            poll_interval_secs: mirror_config
+                .and_then(|config| config.poll_interval_secs)
+                .unwrap_or(rg_core::mirror::scheduler::DEFAULT_POLL_INTERVAL_SECS),
+            batch_size: mirror_config
+                .and_then(|config| config.batch_size)
+                .unwrap_or(rg_core::mirror::scheduler::DEFAULT_BATCH_SIZE),
+            transport_policy: resolved_mirror_transport_policy,
+        };
+        tracing::info!(
+            poll_interval_secs = sync_config.poll_interval_secs,
+            batch_size = sync_config.batch_size,
+            "Scheduled mirror sync enabled"
+        );
+        // The secret is `encryption_key`, never `jwt_secret`: the mirror's
+        // stored remote credential is encrypted at rest with the former, and
+        // the two stopped being the same value in card_d740512de0a8.
+        // With the post-push wiring: a pass that moves a branch owes the open
+        // pull requests on it their new head (card_dbc5a1debb0a).
+        Some(rg_core::mirror::scheduler::spawn_mirror_sync_with_shutdown(
+            db.clone(),
+            repo_root.clone(),
+            mirror_encryption_key,
+            sync_config,
+            Some(post_push_context.clone()),
+            Some(shutdown_rx.clone()),
+        )?)
+    } else {
+        // Said out loud for the same reason as the backup line below it: an
+        // operator whose mirror shows a next-sync time must be able to find out
+        // from the log that nothing is going to act on it.
+        tracing::info!(
+            "Scheduled mirror sync is OFF ([mirror].enabled): configured mirrors are only \
+             refreshed when someone triggers a sync from the repository's mirror settings."
+        );
+        None
     };
 
     let ssh_config = rg_ssh::SshServerConfig {

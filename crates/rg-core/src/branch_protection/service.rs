@@ -347,6 +347,10 @@ pub async fn check_merge_allowed(
     target_branch: &str,
     pr_id: i64,
 ) -> Result<MergeVerdict> {
+    // Every merge path asks this — the REST merge, auto-merge, the merge queue
+    // — and a merge into a pull mirror lasts only until its next pass
+    // (card_97a2c0209056). A `409`, and the queue shows it as what it waits on.
+    crate::mirror::write_guard::refuse_mirrored_write(db, repo_id).await?;
     let mut verdict = MergeVerdict::default();
     let target_ref = format!("refs/heads/{target_branch}");
     // Push checks every matching rule, including glob rules. Merge must do the

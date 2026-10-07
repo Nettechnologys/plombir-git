@@ -34,6 +34,9 @@ impl ServerSideCommitPolicy {
         branch: &str,
         actor_id: i64,
     ) -> Result<Self> {
+        // A pull mirror's next pass would overwrite this commit without a
+        // trace, so it is refused before anything is built (card_97a2c0209056).
+        crate::mirror::write_guard::refuse_mirrored_write(db, repo_id).await?;
         // The token behind the request may be narrower than its account: one
         // kept off protected branches is refused here, ahead of the rules that
         // would otherwise admit the account (card_60a80311d512).

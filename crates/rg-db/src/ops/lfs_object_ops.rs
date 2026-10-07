@@ -73,6 +73,10 @@ pub enum PublicationLeaseBid {
     TakenOver,
     /// Another request holds a live lease.
     Busy,
+    /// The row is gone — removed as unused while this bid waited. Waiting on
+    /// would wait for a lease nobody can release; the caller registers the
+    /// object again instead.
+    Gone,
 }
 
 /// Bid for the exclusive right to publish one LFS object's blob.
@@ -114,7 +118,16 @@ pub async fn bid_for_publication_lease(
         return Ok(PublicationLeaseBid::TakenOver);
     }
 
-    Ok(PublicationLeaseBid::Busy)
+    let exists = LfsEntity::find_by_id(id)
+        .one(db)
+        .await
+        .context("db: check an LFS object a publication lease was refused for")?
+        .is_some();
+    Ok(if exists {
+        PublicationLeaseBid::Busy
+    } else {
+        PublicationLeaseBid::Gone
+    })
 }
 
 /// Release a publication lease. Returns whether this token still held it —
@@ -197,12 +210,14 @@ pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<L
         .context("db: list the LFS objects of a repository")
 }
 
-/// Mark `repo_id`'s object `oid` claimed at `now`, if it is stored. Returns
-/// whether it is — `false` is the answer to give a client as "send the bytes".
+/// Mark `repo_id`'s object `oid` claimed at `now`, if it is stored and no
+/// lease holds it. Returns whether it is — `false` is the answer to give a
+/// client as "send the bytes".
 ///
 /// One conditional `UPDATE` rather than a read and a write, so it is ordered
-/// against [`delete_unused`]: either the claim lands first and the delete
-/// leaves the row alone, or the delete lands first and this finds no row.
+/// against [`lease_unused_for_removal`]: either the claim lands first and the
+/// removal leaves the row alone, or the removal's lease lands first and this
+/// claims nothing.
 pub async fn claim_uploaded(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -214,26 +229,43 @@ pub async fn claim_uploaded(
         .filter(lfs_object::Column::RepoId.eq(repo_id))
         .filter(lfs_object::Column::Oid.eq(oid))
         .filter(lfs_object::Column::Uploaded.eq(true))
+        // A leased row is being published or removed; either way its bytes
+        // are not settled, and "send the bytes" is the safe answer — the
+        // upload then waits for the lease (card_10864c45e31e).
+        .filter(lfs_object::Column::PublisherToken.is_null())
         .exec(db)
         .await
         .context("db: claim a stored LFS object")?;
     Ok(claimed.rows_affected > 0)
 }
 
-/// Remove object row `id` of `repo_id` — only while it was created and last
-/// claimed before `created_before` and no publication holds it. Returns
-/// whether it went.
+/// Take the publication lease of object row `id` of `repo_id` for its removal
+/// — only while it was created and last claimed before `created_before` and no
+/// publication holds it. Returns whether the lease is now `token`'s.
 ///
-/// Every condition sits in the `DELETE`, so an upload that took the row's
+/// Every condition sits in the `UPDATE`, so an upload that took the row's
 /// publication lease, or a push that was told the object is stored, after the
 /// caller decided the object was unused keeps it.
-pub async fn delete_unused(
+///
+/// The lease, not a `DELETE`, is what a removal starts with (card_10864c45e31e).
+/// Deleting the row first left a window before the bytes went in which a new
+/// upload of the same object registered a fresh row, found the old bytes still
+/// under the content-addressed key, reused them — and lost them a moment later.
+/// While the row is leased, a publication waits for it ([`bid_for_publication_lease`]
+/// answers `Busy`), and [`claim_uploaded`] does not answer "stored" for it.
+pub async fn lease_unused_for_removal(
     db: &DatabaseConnection,
     repo_id: i64,
     id: i64,
+    token: &str,
     created_before: DateTimeUtc,
 ) -> Result<bool> {
-    let deleted = LfsEntity::delete_many()
+    let leased = LfsEntity::update_many()
+        .col_expr(lfs_object::Column::PublisherToken, Expr::value(token))
+        .col_expr(
+            lfs_object::Column::PublisherSince,
+            Expr::value(chrono::Utc::now()),
+        )
         .filter(lfs_object::Column::Id.eq(id))
         .filter(lfs_object::Column::RepoId.eq(repo_id))
         .filter(lfs_object::Column::CreatedAt.lt(created_before))
@@ -245,7 +277,26 @@ pub async fn delete_unused(
         .filter(lfs_object::Column::PublisherToken.is_null())
         .exec(db)
         .await
-        .context("db: delete an unused LFS object")?;
+        .context("db: lease an unused LFS object for removal")?;
+    Ok(leased.rows_affected > 0)
+}
+
+/// Remove object row `id` of `repo_id` once its stored bytes are gone — only
+/// while `token`, from [`lease_unused_for_removal`], still holds its lease.
+/// Returns whether the row went.
+pub async fn delete_leased(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    id: i64,
+    token: &str,
+) -> Result<bool> {
+    let deleted = LfsEntity::delete_many()
+        .filter(lfs_object::Column::Id.eq(id))
+        .filter(lfs_object::Column::RepoId.eq(repo_id))
+        .filter(lfs_object::Column::PublisherToken.eq(token))
+        .exec(db)
+        .await
+        .context("db: delete a removed LFS object")?;
     Ok(deleted.rows_affected > 0)
 }
 
@@ -286,7 +337,7 @@ mod unused_object_tests {
         (db, row)
     }
 
-    /// The `DELETE` itself carries the claim, so a claim that lands after the
+    /// The lease itself carries the claim, so a claim that lands after the
     /// caller read the row as unused still keeps it.
     #[tokio::test]
     async fn a_claim_after_the_unused_read_keeps_the_object() {
@@ -295,7 +346,9 @@ mod unused_object_tests {
         let cutoff = now - chrono::Duration::hours(24);
 
         assert!(claim_uploaded(&db, 1, &row.oid, now).await.unwrap());
-        assert!(!delete_unused(&db, 1, row.id, cutoff).await.unwrap());
+        assert!(!lease_unused_for_removal(&db, 1, row.id, "prune", cutoff)
+            .await
+            .unwrap());
         assert!(find_by_repo_and_oid(&db, 1, &row.oid)
             .await
             .unwrap()
@@ -304,8 +357,45 @@ mod unused_object_tests {
         // An old claim protects nothing.
         let old = "2020-01-02T00:00:00Z".parse().unwrap();
         assert!(claim_uploaded(&db, 1, &row.oid, old).await.unwrap());
-        assert!(delete_unused(&db, 1, row.id, cutoff).await.unwrap());
+        assert!(lease_unused_for_removal(&db, 1, row.id, "prune", cutoff)
+            .await
+            .unwrap());
+        assert!(delete_leased(&db, 1, row.id, "prune").await.unwrap());
         // And once the row is gone, a claim says so.
         assert!(!claim_uploaded(&db, 1, &row.oid, now).await.unwrap());
+    }
+
+    /// card_10864c45e31e: between the lease and the row's removal the bytes
+    /// are being deleted, so nobody may be told the object is stored, nor
+    /// start publishing it — and only the lease holder removes the row.
+    #[tokio::test]
+    async fn a_row_leased_for_removal_is_neither_stored_nor_publishable() {
+        let (db, row) = object("2020-01-01T00:00:00Z").await;
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::hours(24);
+        assert!(lease_unused_for_removal(&db, 1, row.id, "prune", cutoff)
+            .await
+            .unwrap());
+
+        assert!(
+            !claim_uploaded(&db, 1, &row.oid, now).await.unwrap(),
+            "a push was told an object being removed is stored"
+        );
+        assert_eq!(
+            bid_for_publication_lease(&db, row.id, "upload", cutoff)
+                .await
+                .unwrap(),
+            PublicationLeaseBid::Busy,
+            "an upload started publishing an object being removed"
+        );
+        assert!(!delete_leased(&db, 1, row.id, "upload").await.unwrap());
+        assert!(delete_leased(&db, 1, row.id, "prune").await.unwrap());
+        assert_eq!(
+            bid_for_publication_lease(&db, row.id, "upload", cutoff)
+                .await
+                .unwrap(),
+            PublicationLeaseBid::Gone,
+            "a removed row must not read as a lease someone else holds"
+        );
     }
 }

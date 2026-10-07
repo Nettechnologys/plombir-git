@@ -642,6 +642,7 @@ async fn a_due_mirror_is_synced_by_the_scheduler_with_no_manual_trigger() {
             transport_policy: Default::default(),
         },
         None,
+        None,
     )
     .expect("the scheduler starts with valid knobs");
 
@@ -828,6 +829,7 @@ async fn a_mirror_whose_sync_failed_is_still_picked_up_by_the_next_sweep() {
         10,
         Default::default(),
         TEST_ENCRYPTION_KEY,
+        None,
     )
     .await
     .expect("the sweep itself must not fail");
@@ -855,6 +857,7 @@ async fn a_mirror_whose_sync_failed_is_still_picked_up_by_the_next_sweep() {
         10,
         Default::default(),
         TEST_ENCRYPTION_KEY,
+        None,
     )
     .await
     .expect("the sweep itself must not fail");

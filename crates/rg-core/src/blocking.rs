@@ -121,8 +121,10 @@ mod tests {
                 "run_sync_pass",
                 &["run_git_clone_mirror", "run_git_remote_update"],
             ),
-            (pulls, "compute_diff", &["run"]),
-            (pulls, "merge_claimed_pr", &["run"]),
+            // The fork fetch is one helper both share, so `--no-tags` cannot
+            // drift between them.
+            (pulls, "compute_diff", &["run_fork_fetch"]),
+            (pulls, "merge_claimed_pr", &["run_fork_fetch"]),
         ] {
             let boundary = rust_source::production_function_call_sites(
                 source,

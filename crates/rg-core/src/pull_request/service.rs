@@ -776,14 +776,8 @@ pub async fn compute_diff(
                     let git = rg_git::cli_gateway::global_gateway()
                         .as_ref()
                         .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    let fetch_output = git.run(
-                        &[
-                            "fetch",
-                            &head_repo_path.to_string_lossy(),
-                            &fork_fetch_refspec(&fetch_ref, &local_ref),
-                        ],
-                        Some(&base_path),
-                    )?;
+                    let fetch_output =
+                        run_fork_fetch(git, &head_repo_path, &fetch_ref, &local_ref, &base_path)?;
                     fetch_output
                         .ensure_success()
                         .context("failed to fetch pull request head branch")?;
@@ -4060,13 +4054,12 @@ async fn merge_claimed_pr(
                 let git = rg_git::cli_gateway::global_gateway()
                     .as_ref()
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let fetch_output = git.run(
-                    &[
-                        "fetch",
-                        &head_repo_path.to_string_lossy(),
-                        &fork_fetch_refspec(&fetch_ref, &local_ref),
-                    ],
-                    Some(&repo_path_for_git),
+                let fetch_output = run_fork_fetch(
+                    git,
+                    &head_repo_path,
+                    &fetch_ref,
+                    &local_ref,
+                    &repo_path_for_git,
                 )?;
                 if !fetch_output.success() {
                     bail!(
@@ -4926,6 +4919,32 @@ fn merge_signature_time() -> String {
 /// refused, and every diff and merge of that pull request answered `500`.
 fn fork_fetch_refspec(fetch_ref: &str, local_ref: &str) -> String {
     format!("+{fetch_ref}:{local_ref}")
+}
+
+/// The whole `git fetch` that copies a fork's head branch into the base
+/// repository's scratch ref, for the diff and the merge alike.
+///
+/// `--no-tags`, because a refspec with a destination makes git follow tags by
+/// default: every fork tag pointing into the fetched history used to land in
+/// the *base* repository's `refs/tags/*` — past tag protection, past the
+/// post-push hooks, and left behind by `discard_fork_ref`, which removes the
+/// scratch ref only. A diff of a fork pull request published its tags.
+fn run_fork_fetch(
+    git: &rg_git::cli_gateway::GitCommandGateway,
+    head_repo_path: &std::path::Path,
+    fetch_ref: &str,
+    local_ref: &str,
+    base_repo_path: &std::path::Path,
+) -> Result<rg_git::cli_gateway::GitOutput> {
+    git.run(
+        &[
+            "fetch",
+            "--no-tags",
+            &head_repo_path.to_string_lossy(),
+            &fork_fetch_refspec(fetch_ref, local_ref),
+        ],
+        Some(base_repo_path),
+    )
 }
 
 /// A scratch ref for one diff or merge of a fork pull request:
@@ -6724,5 +6743,53 @@ mod rebase_merge_status_tests {
             output.stderr_str()
         );
         output.stdout_str().trim().to_string()
+    }
+}
+
+/// A fork pull request's fetch brings its head branch and nothing else
+/// (card_e62ac71c4768's sideways sweep).
+#[cfg(test)]
+mod fork_fetch_tests {
+    use super::merge_configuration_ownership_tests::{git, init_fixture};
+    use super::{run_fork_fetch, scratch_fork_ref};
+
+    fn refs_in(repo: &std::path::Path) -> Vec<String> {
+        rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(&["for-each-ref", "--format=%(refname)"], Some(repo))
+            .unwrap()
+            .stdout_str()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_fork_fetch_leaves_the_fork_s_tags_in_the_fork() {
+        let root = tempfile::tempdir().unwrap();
+        let fork = init_fixture(root.path());
+        git(&fork, &["commit", "-q", "--allow-empty", "-m", "tagged"]);
+        git(&fork, &["tag", "v-from-the-fork"]);
+        git(&fork, &["commit", "-q", "--allow-empty", "-m", "head"]);
+        let base = root.path().join("base.git");
+        git(root.path(), &["init", "-q", "--bare", "base.git"]);
+
+        let scratch = scratch_fork_ref();
+        let output = run_fork_fetch(
+            rg_git::cli_gateway::global_gateway().as_ref().unwrap(),
+            &fork,
+            "refs/heads/main",
+            &scratch,
+            &base,
+        )
+        .unwrap();
+        assert!(output.success(), "{}", output.stderr_str());
+
+        assert_eq!(
+            refs_in(&base),
+            vec![scratch],
+            "the fetch wrote more than its scratch ref into the base repository"
+        );
     }
 }

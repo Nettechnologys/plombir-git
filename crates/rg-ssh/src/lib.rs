@@ -15,12 +15,10 @@ use russh::{Channel, ChannelId, ChannelStream};
 use sea_orm::DatabaseConnection;
 use tokio::io::AsyncWriteExt;
 
-use rg_core::branch_protection::push_rules::{
-    branch_protection_rejected_refs, signed_commit_required_refs, tag_protection_rejected_refs,
-};
 use rg_git::io_timeout::{is_idle_timeout, IdleTimeout};
 use rg_git::protocol::receive_pack::{
-    handle_receive_pack_stream_with_rejections, AppliedRefUpdates, ReceivePackOutcome, RefUpdate,
+    handle_receive_pack_stream_with_rejections, AppliedRefUpdates, PushPolicy, ReceivePackOutcome,
+    RefUpdate,
 };
 use rg_git::protocol::upload_pack::handle_upload_pack_stream;
 use rg_git::protocol::v2::handle_v2_stream;
@@ -594,11 +592,12 @@ struct SshHandler {
 }
 
 /// Per-push state the `git-receive-pack` branch needs beyond the byte stream:
-/// the protection rules enforced before the refs move, and the `owner`/`repo`
-/// the post-push hooks are keyed on.
+/// the policy enforced before the refs move, and the `owner`/`repo` the
+/// post-push hooks are keyed on.
 struct ReceivePackContext {
-    protection_rules: Vec<rg_db::ops::protected_branch_ops::Rule>,
-    tag_protection_rules: Vec<rg_db::ops::protected_tag_ops::Rule>,
+    /// Loaded by the same function the HTTP transport calls — mirror, branch
+    /// and tag protection, other people's LFS locks.
+    policy: PushPolicy,
     /// Pusher's user id, or `None` for a deploy key (protection rules treat an
     /// unidentified actor as "not on any allow-list").
     actor_id: Option<i64>,
@@ -1260,26 +1259,10 @@ impl Handler for SshHandler {
                         // arm either (card_6cb7471a52b2).
                         let context = receive_pack_context
                             .context("receive-pack accepted without its protection context")?;
-                        let require_signed_refs =
-                            signed_commit_required_refs(&context.protection_rules);
-                        // A rule whose stored allow-list does not decode
-                        // aborts the session with a server error: rejecting
-                        // the ref instead would blame the pusher for a
-                        // broken row, and would be flatly wrong for a
-                        // pusher who is on that list.
-                        let mut rejected_refs = branch_protection_rejected_refs(
-                            context.protection_rules,
-                            context.actor_id,
-                        )?;
-                        rejected_refs.extend(tag_protection_rejected_refs(
-                            context.tag_protection_rules,
-                            context.actor_id,
-                        )?);
                         let outcome = handle_receive_pack_stream_with_rejections(
                             &repo_full_path,
                             &mut stream,
-                            rejected_refs,
-                            require_signed_refs,
+                            context.policy,
                             &applied,
                         )
                         .await?;
@@ -1770,16 +1753,18 @@ async fn load_receive_pack_context(
         .await
         .map_err(GitServiceError::ServerUnavailable)?
         .ok_or(GitServiceError::RepositoryNotFound)?;
-    let protection_rules = rg_db::ops::protected_branch_ops::list_rules_by_repo(db, repo.id)
-        .await
-        .map_err(GitServiceError::ServerUnavailable)?;
-    let tag_protection_rules = rg_db::ops::protected_tag_ops::list_rules_by_repo(db, repo.id)
-        .await
-        .map_err(GitServiceError::ServerUnavailable)?;
+    // A rule whose stored allow-list does not decode refuses the exec as a
+    // server failure: rejecting the ref instead would blame the pusher for a
+    // broken row, and would be flatly wrong for a pusher who is on that list.
+    // No SSH credential carries a token's narrowing, hence `false`.
+    let policy = rg_core::branch_protection::push_rules::load_receive_pack_policy(
+        db, repo.id, actor_id, false,
+    )
+    .await
+    .map_err(GitServiceError::ServerUnavailable)?;
 
     Ok(ReceivePackContext {
-        protection_rules,
-        tag_protection_rules,
+        policy,
         actor_id,
         owner,
         repo_name,
