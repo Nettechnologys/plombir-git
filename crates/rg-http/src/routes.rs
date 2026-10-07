@@ -82,6 +82,14 @@ const LFS_PROTOCOL: Access = Foreign(Handler {
     ],
     note: "Git LFS batch protocol: per-operation gate, own envelope",
 });
+/// The LFS File Locking API gates in its handlers because the protocol
+/// spells its own refusals and the gate differs per operation: listing reads,
+/// locking, verifying and unlocking write, and a forced unlock administers.
+const LFS_LOCKS: Access = Foreign(Handler {
+    module: "api/lfs_locks.rs",
+    gates: &["check_read_for", "check_write_for", "check_admin_for"],
+    note: "Git LFS locking protocol: per-operation gate, own envelope",
+});
 const RUNNER_TOKEN: Access = Foreign(Middleware {
     layer: RUNNER_AUTH_LAYER,
     note: "CI runner: runner token via `authenticate_runner`",
@@ -1616,6 +1624,26 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/lfs/objects/{oid}",
             api::lfs::upload_object,
             &lfs_upload_limit,
+        )
+        .post(
+            LFS_LOCKS,
+            "/repos/{owner}/{name}/lfs/locks",
+            api::lfs_locks::create_lock,
+        )
+        .get(
+            LFS_LOCKS,
+            "/repos/{owner}/{name}/lfs/locks",
+            api::lfs_locks::list_locks,
+        )
+        .post(
+            LFS_LOCKS,
+            "/repos/{owner}/{name}/lfs/locks/verify",
+            api::lfs_locks::verify_locks,
+        )
+        .post(
+            LFS_LOCKS,
+            "/repos/{owner}/{name}/lfs/locks/{id}/unlock",
+            api::lfs_locks::unlock,
         )
         // ── Webhooks ───────────────────────────────────────────────────────
         .get(

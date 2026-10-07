@@ -134,6 +134,7 @@ pub mod m20260830_000001_align_ci_schema_types;
 pub mod m20260901_000001_scope_runners_to_repositories;
 pub mod m20260905_000001_add_user_pending_totp_secret;
 pub mod m20261003_000001_agent_accounts;
+pub mod m20261007_000001_create_lfs_locks;
 
 use sea_orm_migration::prelude::*;
 
@@ -358,6 +359,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260901_000001_scope_runners_to_repositories::Migration),
             Box::new(m20260905_000001_add_user_pending_totp_secret::Migration),
             Box::new(m20261003_000001_agent_accounts::Migration),
+            Box::new(m20261007_000001_create_lfs_locks::Migration),
         ]
     }
 }

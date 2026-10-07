@@ -15,6 +15,7 @@ pub mod issue_comment_ops;
 pub mod issue_label_ops;
 pub mod issue_ops;
 pub mod label_ops;
+pub mod lfs_lock_ops;
 pub mod lfs_object_ops;
 pub mod login_log_ops;
 pub mod merge_queue_ops;

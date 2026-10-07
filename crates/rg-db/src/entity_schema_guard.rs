@@ -90,6 +90,7 @@ probed_entities!(
     issue_comment,
     issue_label,
     label,
+    lfs_lock,
     lfs_object,
     login_log,
     merge_queue_entry,

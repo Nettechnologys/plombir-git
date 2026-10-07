@@ -189,11 +189,13 @@ async fn maintenance_mode_judges_the_derived_endpoint_by_operation() {
     }
 }
 
-/// `git lfs push` asks `locks/verify` before uploading. This server has no
-/// locking API, and the client reads `404` as "not supported" and carries on —
-/// the GET-only page fallback answered `405`, which reads as a failure.
+/// `git lfs push` asks `locks/verify` before uploading, at the endpoint it
+/// derives from the remote. That used to be a `404`, which the client reads as
+/// "this server has no locking"; the locking API exists now (card_e8afcaf3edf6)
+/// and has to answer at both derived endpoints, with a PAT over Basic auth, in
+/// the protocol's own media type.
 #[tokio::test]
-async fn an_lfs_endpoint_this_server_lacks_is_a_404_not_a_page() {
+async fn locks_verify_answers_at_the_endpoint_the_client_derives() {
     let (base, _) = spawn_test_app_with_db().await;
     let (session, _) = register_full(&base, "lfs_locks", "lfs_locks@example.com").await;
     create_repo(&base, &session, "media").await;
@@ -210,6 +212,46 @@ async fn an_lfs_endpoint_this_server_lacks_is_a_404_not_a_page() {
             .basic_auth("lfs_locks", Some(&pat))
             .header("Content-Type", "application/vnd.git-lfs+json")
             .body(r#"{"ref":{"name":"refs/heads/main"}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{endpoint}");
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("application/vnd.git-lfs+json"),
+            "{endpoint}: {content_type}"
+        );
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["ours"], serde_json::json!([]), "{endpoint}: {body}");
+        assert_eq!(body["theirs"], serde_json::json!([]), "{endpoint}: {body}");
+    }
+}
+
+/// An LFS path this server does not serve is still a JSON `404`, never the
+/// GET-only page fallback's `405`, which the client reads as a failure.
+#[tokio::test]
+async fn an_lfs_endpoint_this_server_lacks_is_a_404_not_a_page() {
+    let (base, _) = spawn_test_app_with_db().await;
+    let (session, _) = register_full(&base, "lfs_lacks", "lfs_lacks@example.com").await;
+    create_repo(&base, &session, "media").await;
+    let pat = create_pat(
+        &base,
+        &session,
+        serde_json::json!({ "name": "git-lfs", "scopes": "repo" }),
+    )
+    .await;
+
+    for endpoint in derived_endpoints(&base, "lfs_lacks", "media") {
+        let response = reqwest::Client::new()
+            .post(format!("{endpoint}/transfers/ssh"))
+            .basic_auth("lfs_lacks", Some(&pat))
+            .header("Content-Type", "application/vnd.git-lfs+json")
+            .body("{}")
             .send()
             .await
             .unwrap();

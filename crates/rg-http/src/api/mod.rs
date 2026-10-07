@@ -23,6 +23,7 @@ pub mod instance;
 pub mod issues;
 pub mod labels;
 pub mod lfs;
+pub mod lfs_locks;
 pub mod mcp;
 pub mod mfa;
 pub mod mirrors;

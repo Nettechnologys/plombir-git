@@ -24,6 +24,7 @@ pub mod issue;
 pub mod issue_comment;
 pub mod issue_label;
 pub mod label;
+pub mod lfs_lock;
 pub mod lfs_object;
 pub mod login_log;
 pub mod merge_queue_entry;

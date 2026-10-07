@@ -323,9 +323,22 @@ async fn ssh_grant_actor(
     repo_model: &rg_db::entities::repository::Model,
     operation: &str,
 ) -> Option<Result<rg_core::lfs::service::LfsActor, AppError>> {
-    use rg_core::lfs::service::{
-        verify_ssh_grant, LfsActionKind, LfsActionSignatureError, SSH_GRANT_AUTH_SCHEME,
-    };
+    let wanted = rg_core::lfs::service::LfsActionKind::from_operation(operation);
+    ssh_grant(state, headers, repo_model, |action| Some(action) == wanted).await
+}
+
+/// [`ssh_grant_actor`] for a caller whose operation is not a batch operation:
+/// `accepts` says which granted actions open it. The locking API takes an
+/// `upload` grant for anything that writes and either grant for a listing —
+/// git-lfs asks `git-lfs-authenticate` for `upload` before it locks, unlocks or
+/// verifies, and for `download` before it lists.
+pub(crate) async fn ssh_grant(
+    state: &AppState,
+    headers: &HeaderMap,
+    repo_model: &rg_db::entities::repository::Model,
+    accepts: impl Fn(rg_core::lfs::service::LfsActionKind) -> bool,
+) -> Option<Result<rg_core::lfs::service::LfsActor, AppError>> {
+    use rg_core::lfs::service::{verify_ssh_grant, LfsActionSignatureError, SSH_GRANT_AUTH_SCHEME};
 
     let token = headers
         .get(axum::http::header::AUTHORIZATION)?
@@ -348,9 +361,7 @@ async fn ssh_grant_actor(
             return Some(Err(AppError::unauthorized("invalid SSH LFS credential")))
         }
     };
-    if grant.repo_id != repo_model.id
-        || LfsActionKind::from_operation(operation) != Some(grant.action)
-    {
+    if grant.repo_id != repo_model.id || !accepts(grant.action) {
         return Some(Err(AppError::forbidden(
             "the SSH LFS credential was issued for another repository or operation",
         )));

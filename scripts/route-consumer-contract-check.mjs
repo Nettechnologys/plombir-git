@@ -160,6 +160,8 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
   ['POST /{owner}/{repo}/git-receive-pack', 'protocol'],
   ['POST /api/v1/repos/{owner}/{name}/lfs/objects/batch', 'protocol'],
   ['PUT /api/v1/repos/{owner}/{name}/lfs/objects/{oid}', 'protocol'],
+  ['POST /api/v1/repos/{owner}/{name}/lfs/locks', 'protocol'],
+  ['POST /api/v1/repos/{owner}/{name}/lfs/locks/verify', 'protocol'],
   ['PUT /api/v1/repos/{owner}/{name}/packages/npm/{pkg_name}', 'protocol'],
   ['PUT /api/v1/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}', 'protocol'],
   [
