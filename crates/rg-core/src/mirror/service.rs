@@ -35,7 +35,7 @@
 //! A pass fetches into a private clone (`<repo_root>/<repo_id>.mirror`), and
 //! nothing serves that directory. The repository clients clone, browse and
 //! pull is `<owner>/<name>.git`, so a pass ends by publishing the clone's
-//! branches and tags into it ([`publish_mirrored_refs`]). Until that existed a
+//! branches and tags into it (`publish_mirrored_refs`). Until that existed a
 //! mirror reported `status=active` with a fresh `last_sync_at` while every
 //! clone of it got whatever the repository held before the mirror was set up
 //! — usually nothing (card_df2f1f187e5a).
