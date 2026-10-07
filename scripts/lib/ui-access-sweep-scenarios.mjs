@@ -1027,6 +1027,27 @@ const repoDeployKeys = privileged(
   ]),
 );
 
+const repoLfsStorage = privileged(
+  async (context) => {
+    await context.navigate(settingsPage(context, 'lfs-storage'));
+    await context.waitForText('tbody tr', context.fixture.lfsObjectOid.slice(0, 12));
+    await context.clickWithin('section', 'Find unreferenced objects', 'button', 'Find unreferenced objects');
+    await context.waitForText('.empty-state', 'Every object is still referenced');
+    await context.setConfirm(true);
+    await context.clickWithin('tbody tr', context.fixture.lfsObjectOid.slice(0, 12), 'button', 'Remove');
+    await context.waitForText('.outcome', 'too recently');
+  },
+  (context) => requestSequence(context, [
+    [settingsApi(context, '/lfs/usage')],
+    [settingsApi(context, '/lfs/objects')],
+    [settingsApi(context, '/lfs/orphans')],
+    [settingsApi(context, '/lfs/orphans/prune'), {
+      method: 'POST',
+      json: { oids: [context.fixture.lfsObjectOid] },
+    }],
+  ]),
+);
+
 function environmentPayload(name) {
   return { name, protected: true, required_approvals: 2, allowed_approvers: [] };
 }
@@ -1255,6 +1276,7 @@ export const UI_ACCESS_SWEEP_SCENARIOS = new Map([
   ['repo-ci-secrets', repoCiSecrets],
   ['repo-collaborators', repoCollaborators],
   ['repo-deploy-keys', repoDeployKeys],
+  ['repo-lfs-storage', repoLfsStorage],
   ['repo-environments', repoEnvironments],
   ['repo-retention', repoRetention],
   ['repo-tag-protections', repoTagProtections],

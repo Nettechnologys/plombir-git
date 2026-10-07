@@ -1849,7 +1849,8 @@
       "handler": "api::lfs_locks::list_locks",
       "testedIn": [
         "rust",
-        "web"
+        "web",
+        "smoke"
       ],
       "reachedFromUi": true
     },
@@ -1870,6 +1871,62 @@
         "web"
       ],
       "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/lfs/usage",
+      "access": "RepoAdmin",
+      "handler": "api::lfs_storage::usage",
+      "testedIn": [
+        "web",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-lfs-storage"
+      ]
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/lfs/objects",
+      "access": "RepoAdmin",
+      "handler": "api::lfs_storage::list_objects",
+      "testedIn": [
+        "web",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-lfs-storage"
+      ]
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/lfs/orphans",
+      "access": "RepoAdmin",
+      "handler": "api::lfs_storage::list_orphans",
+      "testedIn": [
+        "web",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-lfs-storage"
+      ]
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/repos/{owner}/{name}/lfs/orphans/prune",
+      "access": "RepoAdmin",
+      "handler": "api::lfs_storage::prune",
+      "testedIn": [
+        "web",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-lfs-storage"
+      ]
     },
     {
       "method": "GET",
@@ -17483,6 +17540,202 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            }
+          ],
+          "unresolved": false
+        }
+      ],
+      "passive": []
+    },
+    {
+      "route": "/[owner]/[repo]/settings/lfs-storage",
+      "file": "web/src/routes/[owner]/[repo]/settings/lfs-storage/+page.svelte",
+      "admin": false,
+      "controls": [
+        {
+          "tag": "button",
+          "label": "i18n:settings.lfs_storage.scanning",
+          "line": 180,
+          "via": null,
+          "href": null,
+          "handler": "findOrphans",
+          "calls": [
+            {
+              "symbol": "lfsStorage.orphans",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/lfs/orphans",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/orphans",
+              "access": "RepoAdmin",
+              "handler": "api::lfs_storage::list_orphans",
+              "matched": true,
+              "testedIn": [
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-lfs-storage"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 194,
+          "via": null,
+          "href": null,
+          "handler": "(event) => toggle(object.oid, (event.currentTarget as HTMLInputElement).checked)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.lfs_storage.remove_selected",
+          "line": 206,
+          "via": null,
+          "href": null,
+          "handler": "removeSelected",
+          "calls": [
+            {
+              "symbol": "lfsStorage.prune",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/lfs/orphans/prune",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/orphans/prune",
+              "access": "RepoAdmin",
+              "handler": "api::lfs_storage::prune",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            },
+            {
+              "symbol": "lfsStorage.usage",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/lfs/usage",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/usage",
+              "access": "RepoAdmin",
+              "handler": "api::lfs_storage::usage",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            },
+            {
+              "symbol": "lfsStorage.objects",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/lfs/objects",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/objects",
+              "access": "RepoAdmin",
+              "handler": "api::lfs_storage::list_objects",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.lfs_storage.remove",
+          "line": 243,
+          "via": null,
+          "href": null,
+          "handler": "() => remove([object.oid])",
+          "calls": [
+            {
+              "symbol": "lfsStorage.prune",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/lfs/orphans/prune",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/orphans/prune",
+              "access": "RepoAdmin",
+              "handler": "api::lfs_storage::prune",
+              "matched": true,
+              "testedIn": [
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-lfs-storage"
+              ]
+            },
+            {
+              "symbol": "lfsStorage.usage",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/lfs/usage",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/usage",
+              "access": "RepoAdmin",
+              "handler": "api::lfs_storage::usage",
+              "matched": true,
+              "testedIn": [
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-lfs-storage"
+              ]
+            },
+            {
+              "symbol": "lfsStorage.objects",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/lfs/objects",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/objects",
+              "access": "RepoAdmin",
+              "handler": "api::lfs_storage::list_objects",
+              "matched": true,
+              "testedIn": [
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-lfs-storage"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.lfs_storage.more",
+          "line": 255,
+          "via": null,
+          "href": null,
+          "handler": "loadMore",
+          "calls": [
+            {
+              "symbol": "lfsStorage.usage",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/lfs/usage",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/usage",
+              "access": "RepoAdmin",
+              "handler": "api::lfs_storage::usage",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            },
+            {
+              "symbol": "lfsStorage.objects",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/lfs/objects",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/objects",
+              "access": "RepoAdmin",
+              "handler": "api::lfs_storage::list_objects",
+              "matched": true,
+              "testedIn": [
                 "web"
               ]
             }
@@ -23834,10 +24087,10 @@
       "owner",
       "outsider"
     ],
-    "scenarios": 40,
-    "inventoryEntries": 673,
-    "coveredEntries": 158,
-    "coveredRoutes": 150,
+    "scenarios": 41,
+    "inventoryEntries": 682,
+    "coveredEntries": 162,
+    "coveredRoutes": 154,
     "maxUiRoutesWithoutFrontendTest": 27
   }
 }

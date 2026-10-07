@@ -5,6 +5,7 @@
 // accounts, Chrome, the scenario registry and the persona matrix.
 
 import { dirname, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
@@ -44,6 +45,7 @@ const ADMIN_FIXTURE = Object.freeze({
   branchName: 'seeded-main',
   secretName: 'SWEEP_DELETE',
   deployKeyTitle: 'Seeded browser sweep key',
+  lfsPayload: 'seeded browser sweep LFS object',
   deployKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA seeded-sweep',
   browserDeployKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA browser-sweep',
   environmentName: 'seeded-environment',
@@ -367,6 +369,26 @@ async function seedFixtures(backendUrl, tokens) {
       read_only: true,
     },
   });
+  // One LFS object in the settings repository, uploaded the way `git lfs push`
+  // does, so the LFS storage page has a row whose Remove control the owner can
+  // drive. It is minutes old, so the server keeps it and says why.
+  const lfsOid = createHash('sha256').update(ADMIN_FIXTURE.lfsPayload).digest('hex');
+  const lfsBatch = await ownerJson(`${repoPath}/lfs/objects/batch`, {
+    method: 'POST',
+    json: {
+      operation: 'upload',
+      objects: [{ oid: lfsOid, size: Buffer.byteLength(ADMIN_FIXTURE.lfsPayload) }],
+      transfers: ['basic'],
+    },
+  });
+  const lfsUpload = lfsBatch?.objects?.[0]?.actions?.upload;
+  if (!lfsUpload?.href) throw new Error('LFS fixture batch returned no upload action');
+  const lfsStored = await fetch(lfsUpload.href, {
+    method: 'PUT',
+    headers: lfsUpload.header || {},
+    body: ADMIN_FIXTURE.lfsPayload,
+  });
+  if (!lfsStored.ok) throw new Error(`LFS fixture upload returned ${lfsStored.status}`);
   const environment = await ownerJson(`${repoPath}/actions/environments`, {
     method: 'POST',
     json: {
@@ -431,6 +453,7 @@ async function seedFixtures(backendUrl, tokens) {
     collaboratorId: collaborator.id,
     collaboratorUserId: collaborator.user_id,
     deployKeyId: deployKey.id,
+    lfsObjectOid: lfsOid,
     environmentId: environment.id,
     tagRuleId: tagRule.id,
     webhookId: webhook.id,

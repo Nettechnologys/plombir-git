@@ -1576,6 +1576,55 @@
       ]
     },
     {
+      "id": "repo-lfs-storage",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/lfs-storage",
+          "kind": "control",
+          "control": "findOrphans",
+          "line": 180,
+          "symbol": "lfsStorage.orphans",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/orphans",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/lfs-storage",
+          "kind": "control",
+          "control": "() => remove([object.oid])",
+          "line": 243,
+          "symbol": "lfsStorage.prune",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/orphans/prune",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/lfs-storage",
+          "kind": "control",
+          "control": "() => remove([object.oid])",
+          "line": 243,
+          "symbol": "lfsStorage.usage",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/usage",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/lfs-storage",
+          "kind": "control",
+          "control": "() => remove([object.oid])",
+          "line": 243,
+          "symbol": "lfsStorage.objects",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/objects",
+          "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
       "id": "repo-environments",
       "personaOrder": [
         "outsider",

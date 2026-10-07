@@ -23,14 +23,14 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 368 |
-| Из них достижимы из браузера | 249 (68%) |
+| Роутов в роутере (с объявленным `Access`) | 372 |
+| Из них достижимы из браузера | 253 (68%) |
 | Layout-модулей | 2 |
-| Страниц | 63 |
-| Интерактивных элементов | 829 |
-| — из них дёргают API | 311 |
+| Страниц | 64 |
+| Интерактивных элементов | 834 |
+| — из них дёргают API | 315 |
 | — приходят из общих компонентов | 303 |
-| Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
+| Browser sweep: сценариев / записей инвентаря / роутов | 41 / 162 / 154 |
 | **UI-роутов без единого web/smoke/browser-теста** | **27** |
 | UI-роутов без corpus-hit и browser-сценария | 0 |
 
@@ -41,7 +41,7 @@
 | `RepoRead` | 105 | 67 | 4 | 0 |
 | `RepoWrite` | 80 | 63 | 13 | 0 |
 | `User` | 42 | 30 | 6 | 0 |
-| `RepoAdmin` | 28 | 28 | 0 | 0 |
+| `RepoAdmin` | 32 | 32 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
 | `Public` | 20 | 9 | 2 | 0 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
@@ -107,6 +107,7 @@
 | `/[owner]/[repo]/settings/collaborators` | 6 | 3 | 0 |
 | `/[owner]/[repo]/settings/environments` | 6 | 2 | 0 |
 | `/[owner]/[repo]/settings/deploy-keys` | 5 | 2 | 0 |
+| `/[owner]/[repo]/settings/lfs-storage` | 5 | 4 | 0 |
 | `/[owner]/[repo]/settings/mirror` | 5 | 3 | 0 |
 | `/[owner]/[repo]/settings/tags` | 5 | 2 | 0 |
 | `/admin` 🔒 | 5 | 0 | 0 |
@@ -769,7 +770,21 @@
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
 | i18n:settings.lfs_locks.force_unlock | :122 | `POST /api/v1/repos/{owner}/{name}/lfs/locks/{id}/unlock` | `Foreign:api/lfs_locks.rs` | web |
-| i18n:settings.lfs_locks.more | :135 | `GET /api/v1/repos/{owner}/{name}/lfs/locks` | `Foreign:api/lfs_locks.rs` | rust+web |
+| i18n:settings.lfs_locks.more | :135 | `GET /api/v1/repos/{owner}/{name}/lfs/locks` | `Foreign:api/lfs_locks.rs` | rust+web+smoke |
+
+### `/[owner]/[repo]/settings/lfs-storage`
+
+| Элемент | Откуда | Вызов | `Access` | тест |
+|---|---|---|---|---|
+| i18n:settings.lfs_storage.scanning | :180 | `GET /api/v1/repos/{owner}/{name}/lfs/orphans` | `RepoAdmin` | web+browser |
+| i18n:settings.lfs_storage.remove_selected | :206 | `POST /api/v1/repos/{owner}/{name}/lfs/orphans/prune` | `RepoAdmin` | web |
+| i18n:settings.lfs_storage.remove_selected | :206 | `GET /api/v1/repos/{owner}/{name}/lfs/usage` | `RepoAdmin` | web |
+| i18n:settings.lfs_storage.remove_selected | :206 | `GET /api/v1/repos/{owner}/{name}/lfs/objects` | `RepoAdmin` | web |
+| i18n:settings.lfs_storage.remove | :243 | `POST /api/v1/repos/{owner}/{name}/lfs/orphans/prune` | `RepoAdmin` | web+browser |
+| i18n:settings.lfs_storage.remove | :243 | `GET /api/v1/repos/{owner}/{name}/lfs/usage` | `RepoAdmin` | web+browser |
+| i18n:settings.lfs_storage.remove | :243 | `GET /api/v1/repos/{owner}/{name}/lfs/objects` | `RepoAdmin` | web+browser |
+| i18n:settings.lfs_storage.more | :255 | `GET /api/v1/repos/{owner}/{name}/lfs/usage` | `RepoAdmin` | web |
+| i18n:settings.lfs_storage.more | :255 | `GET /api/v1/repos/{owner}/{name}/lfs/objects` | `RepoAdmin` | web |
 
 ### `/[owner]/[repo]/settings/mirror`
 
