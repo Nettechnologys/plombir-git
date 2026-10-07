@@ -75,6 +75,15 @@ function run(fixture) {
 
 const newFixture = () => mkdtempSync(join(tmpdir(), 'plombir-git-ui-inventory-oracle.'));
 
+// Every case below costs one full check run, and the stand is most of the time
+// the contract-check job spends on it. Do not buy that time back by putting
+// several `routes.rs` method mutations into one shared copy. A client call is
+// bound to the first registration with its method and a matching path, so a
+// mutated registration takes over the call its sibling on the same URL lost.
+// With the nuget `publish` POST and PUT mutations in one copy, or the npm
+// `dist-tags` PUT and DELETE pair, the check names only one route of the two,
+// though each goes red alone. card_e8f2c42882a4 measured this and kept the
+// independent fixtures at ~49 s on a hosted runner.
 const mutations = [
   {
     method: 'POST',
