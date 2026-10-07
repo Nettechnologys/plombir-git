@@ -394,7 +394,11 @@ jobs:
   contract-checks:
     name: Frontend/backend contract checks
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # A ceiling against a hang, not a budget. The first runs on hosted runners
+    # took 8m40s and then more than 10 minutes for the same tree — the old
+    # ceiling cancelled a job whose every check was green. Most of the time is
+    # the regression stands, not the checks.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -417,11 +421,12 @@ jobs:
           sudo apt-get install -y ripgrep python3-yaml
 
       # The contract checks are pure Node reading repository sources: no npm
-      # install, no build, no running backend. The whole set takes ~1s, so it is
-      # the cheapest gate in this workflow and deliberately has no dependencies
-      # on the other jobs. (Their count is deliberately not written here — the
-      # runner globs them and reports it, and a number in a comment is one more
-      # thing that silently stops being true.)
+      # install, no build, no running backend. The checks themselves take about
+      # a minute and a half; the regression stands that prove they still assert
+      # something take the rest (see the ceiling above). The job deliberately
+      # has no dependencies on the other jobs. (Their count is deliberately not
+      # written here — the runner globs them and reports it, and a number in a
+      # comment is one more thing that silently stops being true.)
       #
       # The runner globs scripts/*-contract-check.mjs rather than listing them,
       # so a check added in a PR gates that same PR. Checks that are red for a
