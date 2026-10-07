@@ -391,7 +391,14 @@
       "binary_file": "Binary file preview is not available in the browser.",
       "large_file": "Large files can be viewed but not edited in the browser.",
       "edit_unavailable": "Browser editing is unavailable for this file.",
-      "empty": "This file is empty."
+      "empty": "This file is empty.",
+      "download": "Download",
+      "download_failed": "Download failed: {message}",
+      "lfs_badge": "LFS",
+      "lfs_title": "Stored in Git LFS",
+      "lfs_stored": "This file is stored in Git LFS.",
+      "lfs_missing": "The object for this file has not been uploaded to the server. Run `git lfs push --all` from a clone that has it.",
+      "lfs_download_hint": "This file cannot be previewed in the browser."
     },
     "description": "Description",
     "description_hint": "(supports Markdown)",

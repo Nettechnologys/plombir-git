@@ -396,7 +396,14 @@
       "binary_file": "浏览器中无法预览二进制文件。",
       "large_file": "大文件可查看，但不能在浏览器中编辑。",
       "edit_unavailable": "此文件无法在浏览器中编辑。",
-      "empty": "此文件为空。"
+      "empty": "此文件为空。",
+      "download": "下载",
+      "download_failed": "下载失败：{message}",
+      "lfs_badge": "LFS",
+      "lfs_title": "存储在 Git LFS 中",
+      "lfs_stored": "此文件存储在 Git LFS 中。",
+      "lfs_missing": "此文件的对象尚未上传到服务器。请在拥有该对象的克隆中运行 `git lfs push --all`。",
+      "lfs_download_hint": "此文件无法在浏览器中预览。"
     },
     "description": "描述",
     "description_hint": "（支持 Markdown）",

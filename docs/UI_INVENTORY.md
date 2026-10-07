@@ -23,12 +23,12 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 363 |
-| Из них достижимы из браузера | 246 (68%) |
+| Роутов в роутере (с объявленным `Access`) | 364 |
+| Из них достижимы из браузера | 247 (68%) |
 | Layout-модулей | 2 |
 | Страниц | 62 |
-| Интерактивных элементов | 825 |
-| — из них дёргают API | 307 |
+| Интерактивных элементов | 827 |
+| — из них дёргают API | 309 |
 | — приходят из общих компонентов | 303 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
 | **UI-роутов без единого web/smoke/browser-теста** | **27** |
@@ -38,7 +38,7 @@
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 104 | 66 | 4 | 0 |
+| `RepoRead` | 105 | 67 | 4 | 0 |
 | `RepoWrite` | 80 | 63 | 13 | 0 |
 | `User` | 42 | 30 | 6 | 0 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
@@ -69,10 +69,10 @@
 | `/[owner]/[repo]/pulls` | 25 | 10 | 12 |
 | `/orgs/[name]` | 24 | 10 | 0 |
 | `/[owner]/[repo]/pipelines` | 23 | 11 | 11 |
+| `/[owner]/[repo]/blob/[...path]` | 22 | 7 | 11 |
 | `/[owner]/[repo]/wiki/[title]` | 22 | 9 | 11 |
 | `/[owner]/[repo]/releases/new` | 21 | 5 | 11 |
 | `/[owner]/[repo]` | 20 | 5 | 12 |
-| `/[owner]/[repo]/blob/[...path]` | 20 | 5 | 11 |
 | `/[owner]/[repo]/milestones` | 20 | 8 | 11 |
 | `/[owner]/[repo]/network` | 19 | 6 | 11 |
 | `/[owner]/[repo]/packages` | 18 | 9 | 11 |
@@ -170,7 +170,9 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:repo.blob.deleting | :432 | `DELETE /api/v1/repos/{owner}/{name}/contents/{*path}` | `RepoWrite` | rust+web+browser |
+| i18n:repo.blob.download | :493 | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
+| i18n:repo.blob.deleting | :546 | `DELETE /api/v1/repos/{owner}/{name}/contents/{*path}` | `RepoWrite` | rust+web+browser |
+| i18n:repo.blob.download | :580 | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -179,6 +181,7 @@
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | i18n:repo.download_zip | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/archive/{archive}` | `RepoRead` | rust+web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/boards`

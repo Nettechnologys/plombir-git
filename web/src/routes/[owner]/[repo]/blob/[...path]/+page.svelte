@@ -12,6 +12,10 @@
 
   const t = createT();
   const MAX_EDITABLE_SIZE = 1024 * 1024;
+  // An LFS object at most this large is read and shown as text when it is
+  // text; anything larger is offered as a download.
+  const MAX_LFS_TEXT_PREVIEW = 512 * 1024;
+  const INLINE_IMAGE = /\.(png|jpe?g|gif|webp|avif|bmp|ico)$/i;
 
   type BlobData = {
     path: string;
@@ -21,7 +25,16 @@
     encoding: string;
     is_binary: boolean;
     name?: string;
+    lfs?: { oid: string; size: number; available: boolean };
   };
+
+  // What an LFS file shows instead of its pointer text.
+  type LfsView =
+    | { kind: 'missing' }
+    | { kind: 'image'; src: string }
+    | { kind: 'loading' }
+    | { kind: 'text'; content: string }
+    | { kind: 'download' };
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
@@ -29,6 +42,8 @@
   let queryRef = $derived($page.url.searchParams.get('ref') || '');
 
   let blobData = $state<BlobData | null>(null);
+  let lfsView = $state<LfsView | null>(null);
+  let downloadError = $state('');
   let ref = $state('');
   let loading = $state(true);
   let error = $state('');
@@ -42,12 +57,22 @@
   let routeGeneration = 0;
 
   let isMarkdown = $derived(/\.(md|markdown)$/i.test(filePath));
-  let isText = $derived(Boolean(blobData && !blobData.is_binary && blobData.encoding === 'utf-8'));
+  let lfs = $derived(blobData?.lfs ?? null);
+  // An LFS file's committed text is its pointer: never shown or edited as the file.
+  let isText = $derived(
+    Boolean(blobData && !blobData.lfs && !blobData.is_binary && blobData.encoding === 'utf-8'),
+  );
   let canEdit = $derived(Boolean(isText && blobData && blobData.size <= MAX_EDITABLE_SIZE));
   let renderedMarkdown = $derived(
     isMarkdown && isText && blobData?.content ? renderMarkdown(blobData.content) : '',
   );
-  let contentLines = $derived(isText && blobData ? getLineNumbers(blobData.content) : []);
+  let contentLines = $derived(
+    lfsView?.kind === 'text'
+      ? getLineNumbers(lfsView.content)
+      : isText && blobData
+        ? getLineNumbers(blobData.content)
+        : [],
+  );
 
   function buildRepoQuery(nextRef: string, nextPath: string) {
     const params = new URLSearchParams();
@@ -107,6 +132,8 @@
 
     ref = expectedRef;
     blobData = null;
+    lfsView = null;
+    downloadError = '';
     loading = true;
     error = '';
     viewMode = 'rendered';
@@ -186,7 +213,20 @@
           expectedRef,
           expectedRoute,
         )
-      ) blobData = nextBlob;
+      ) {
+        blobData = nextBlob;
+        if (nextBlob.lfs) {
+          void loadLfsView(
+            nextBlob.lfs,
+            claim,
+            expectedOwner,
+            expectedRepo,
+            expectedPath,
+            expectedRef,
+            expectedRoute,
+          );
+        }
+      }
     } catch (e) {
       if (
         ownsBlobClaim(
@@ -209,6 +249,67 @@
           expectedRoute,
         )
       ) loading = false;
+    }
+  }
+
+  /** Decide what an LFS file shows, reading small objects to see if they are text. */
+  async function loadLfsView(
+    object: { oid: string; size: number; available: boolean },
+    claim: RepositoryResourceRequestClaim<string>,
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedPath: string,
+    expectedRef: string,
+    expectedRoute: number,
+  ) {
+    const owns = () =>
+      ownsBlobClaim(claim, expectedOwner, expectedRepo, expectedPath, expectedRef, expectedRoute);
+    if (!object.available) {
+      lfsView = { kind: 'missing' };
+      return;
+    }
+    if (INLINE_IMAGE.test(expectedPath)) {
+      lfsView = {
+        kind: 'image',
+        src: repos.rawUrl(expectedOwner, expectedRepo, expectedPath, expectedRef || undefined),
+      };
+      return;
+    }
+    if (object.size > MAX_LFS_TEXT_PREVIEW) {
+      lfsView = { kind: 'download' };
+      return;
+    }
+    lfsView = { kind: 'loading' };
+    try {
+      const bytes = new Uint8Array(
+        await repos.rawBytes(expectedOwner, expectedRepo, expectedPath, expectedRef || undefined),
+      );
+      if (!owns()) return;
+      const text = bytes.includes(0) ? null : decodeUtf8(bytes);
+      lfsView = text === null ? { kind: 'download' } : { kind: 'text', content: text };
+    } catch {
+      // The download button reports its own failure; a preview that could not
+      // be read is no reason to hide the file.
+      if (owns()) lfsView = { kind: 'download' };
+    }
+  }
+
+  function decodeUtf8(bytes: Uint8Array): string | null {
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch {
+      return null;
+    }
+  }
+
+  async function downloadFile() {
+    downloadError = '';
+    try {
+      await repos.downloadRaw(owner, repo, filePath, ref || undefined);
+    } catch (err) {
+      downloadError = t('repo.blob.download_failed', {
+        message: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -364,10 +465,13 @@
         <span class="file-path">{filePath.split('/').pop()}</span>
       </div>
       <div class="file-meta">
-        {#if isText}
+        {#if lfs}
+          <span class="lfs-badge" title={t('repo.blob.lfs_title')}>{t('repo.blob.lfs_badge')}</span>
+        {/if}
+        {#if isText || lfsView?.kind === 'text'}
           <span class="file-lines">{t('repo.lines_count', { count: contentLines.length })}</span>
         {/if}
-        <span class="file-size">({formatFileSize(blobData.size)})</span>
+        <span class="file-size">({formatFileSize(lfs ? lfs.size : blobData.size)})</span>
       </div>
       <div class="file-actions">
         {#if isMarkdown && isText}
@@ -385,6 +489,11 @@
         <button type="button" class="btn-outline btn-sm" onclick={copyLink}>
           {t('repo.blob.copy_link')}
         </button>
+        {#if !lfs || lfs.available}
+          <button type="button" class="btn-outline btn-sm" onclick={downloadFile}>
+            {t('repo.blob.download')}
+          </button>
+        {/if}
         {#if canEdit}
           <a href={buildEditHref()} class="btn-outline btn-sm">
             {t('repo.edit_file')}
@@ -403,8 +512,13 @@
     {#if copyStatus}
       <div class="copy-status">{copyStatus}</div>
     {/if}
+    {#if downloadError}
+      <div class="delete-error download-error">{downloadError}</div>
+    {/if}
 
-    {#if blobData.is_binary}
+    {#if lfs}
+      <div class="lfs-banner">{t('repo.blob.lfs_stored')}</div>
+    {:else if blobData.is_binary}
       <div class="warning-banner">{t('repo.blob.binary_file')}</div>
     {:else if blobData.size > MAX_EDITABLE_SIZE}
       <div class="warning-banner">{t('repo.blob.large_file')}</div>
@@ -437,7 +551,39 @@
     {/if}
 
     <div class="file-content">
-      {#if blobData.is_binary}
+      {#if lfsView?.kind === 'missing'}
+        <div class="empty-state lfs-missing">{t('repo.blob.lfs_missing')}</div>
+      {:else if lfsView?.kind === 'image'}
+        <div class="image-view">
+          <img src={lfsView.src} alt={filePath.split('/').pop()} />
+        </div>
+      {:else if lfsView?.kind === 'loading'}
+        <div class="empty-state">{t('common.loading')}</div>
+      {:else if lfsView?.kind === 'text'}
+        <div class="code-view">
+          <table class="code-table">
+            <tbody>
+              {#each contentLines as line}
+                <tr>
+                  <td class="line-number">{line.num}</td>
+                  <td class="line-content">
+                    <code class="hljs-code {langClass}">{line.text || ' '}</code>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {:else if lfsView?.kind === 'download'}
+        <div class="empty-state">
+          <p>{t('repo.blob.lfs_download_hint')}</p>
+          <button type="button" class="btn-outline btn-sm" onclick={downloadFile}>
+            {t('repo.blob.download')}
+          </button>
+        </div>
+      {:else if lfs}
+        <div class="empty-state">{t('common.loading')}</div>
+      {:else if blobData.is_binary}
         <div class="empty-state">{t('repo.blob.binary_file')}</div>
       {:else if isMarkdown && viewMode === 'rendered'}
         <div class="markdown-body">
@@ -713,6 +859,39 @@
   .empty-state {
     padding: 24px;
     color: var(--text-muted);
+  }
+
+  .lfs-badge {
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 8px;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .lfs-banner {
+    border: 1px solid var(--border);
+    border-bottom: none;
+    background: var(--bg-primary);
+    padding: 10px 16px;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+
+  .download-error {
+    border: 1px solid var(--border);
+    border-bottom: none;
+    padding: 10px 16px;
+  }
+
+  .image-view {
+    padding: 24px;
+    text-align: center;
+  }
+
+  .image-view img {
+    max-width: 100%;
+    height: auto;
   }
 
   @media (max-width: 820px) {

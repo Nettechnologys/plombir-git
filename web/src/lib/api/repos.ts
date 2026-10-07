@@ -1,7 +1,33 @@
-import { request, qs, type PaginatedResponse } from './_base.svelte';
+import {
+  downloadApiFile,
+  request,
+  requestBytes,
+  qs,
+  withApiBase,
+  type PaginatedResponse,
+} from './_base.svelte';
 
 function encodeRepoPath(path: string): string {
   return path.split('/').map(encodeURIComponent).join('/');
+}
+
+/** The LFS object a pointer file names, as the blob API reports it. */
+export interface BlobLfs {
+  oid: string;
+  size: number;
+  /** Whether the repository stores the object; `false` means the raw route answers 404. */
+  available: boolean;
+}
+
+export interface BlobResponse {
+  path: string;
+  content: string;
+  size: number;
+  name: string;
+  sha: string;
+  encoding: string;
+  is_binary: boolean;
+  lfs?: BlobLfs;
 }
 
 interface FileOperationResponse {
@@ -120,8 +146,18 @@ export const repos = {
     return request<{ entries: RepoTreeEntry[] }>(`/repos/${owner}/${repo}/tree${qs({ ref, path })}`);
   },
   blob: (owner: string, repo: string, path: string, ref?: string) => {
-    return request<{ path: string; content: string; size: number; name: string; sha: string; encoding: string; is_binary: boolean }>(`/repos/${owner}/${repo}/blob/${encodeRepoPath(path)}${qs({ ref })}`);
+    return request<BlobResponse>(`/repos/${owner}/${repo}/blob/${encodeRepoPath(path)}${qs({ ref })}`);
   },
+  /** The file's bytes — for an LFS pointer, the object — as an `<img src>`. */
+  rawUrl: (owner: string, repo: string, path: string, ref?: string) =>
+    withApiBase(`/repos/${owner}/${repo}/raw/${encodeRepoPath(path)}${qs({ ref })}`),
+  rawBytes: (owner: string, repo: string, path: string, ref?: string) =>
+    requestBytes(`/repos/${owner}/${repo}/raw/${encodeRepoPath(path)}${qs({ ref })}`),
+  downloadRaw: (owner: string, repo: string, path: string, ref?: string) =>
+    downloadApiFile(
+      `/repos/${owner}/${repo}/raw/${encodeRepoPath(path)}${qs({ ref })}`,
+      path.split('/').pop() || 'download',
+    ),
   saveContent: (
     owner: string,
     repo: string,

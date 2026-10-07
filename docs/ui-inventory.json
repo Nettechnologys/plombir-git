@@ -2464,6 +2464,16 @@
     },
     {
       "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/raw/{*path}",
+      "access": "RepoRead",
+      "handler": "api::repo_content::get_raw",
+      "testedIn": [
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
       "url": "/api/v1/repos/{owner}/{name}/log",
       "access": "RepoRead",
       "handler": "api::repo_content::get_log",
@@ -5154,7 +5164,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 355,
+          "line": 456,
           "via": null,
           "href": "buildRepoHref(ref, '')",
           "handler": null,
@@ -5164,7 +5174,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 358,
+          "line": 459,
           "via": null,
           "href": "crumb.href",
           "handler": null,
@@ -5174,7 +5184,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.raw",
-          "line": 374,
+          "line": 478,
           "via": null,
           "href": null,
           "handler": "() => viewMode = viewMode === 'rendered' ? 'source' : 'rendered'",
@@ -5184,7 +5194,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.copy_path",
-          "line": 382,
+          "line": 486,
           "via": null,
           "href": null,
           "handler": "copyPath",
@@ -5194,7 +5204,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.copy_link",
-          "line": 385,
+          "line": 489,
           "via": null,
           "href": null,
           "handler": "copyLink",
@@ -5202,9 +5212,33 @@
           "unresolved": true
         },
         {
+          "tag": "button",
+          "label": "i18n:repo.blob.download",
+          "line": 493,
+          "via": null,
+          "href": null,
+          "handler": "downloadFile",
+          "calls": [
+            {
+              "symbol": "repos.downloadRaw",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/raw/{path}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/raw/{*path}",
+              "access": "RepoRead",
+              "handler": "api::repo_content::get_raw",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
           "tag": "a",
           "label": "i18n:repo.edit_file",
-          "line": 389,
+          "line": 498,
           "via": null,
           "href": "buildEditHref()",
           "handler": null,
@@ -5214,7 +5248,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.delete_file",
-          "line": 397,
+          "line": 506,
           "via": null,
           "href": null,
           "handler": "() => deleteOpen = !deleteOpen",
@@ -5224,7 +5258,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 429,
+          "line": 543,
           "via": null,
           "href": null,
           "handler": "() => deleteOpen = false",
@@ -5234,7 +5268,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.deleting",
-          "line": 432,
+          "line": 546,
           "via": null,
           "href": null,
           "handler": "deleteFile",
@@ -5255,6 +5289,30 @@
               ],
               "browserScenarios": [
                 "repo-content-delete"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:repo.blob.download",
+          "line": 580,
+          "via": null,
+          "href": null,
+          "handler": "downloadFile",
+          "calls": [
+            {
+              "symbol": "repos.downloadRaw",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/raw/{path}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/raw/{*path}",
+              "access": "RepoRead",
+              "handler": "api::repo_content::get_raw",
+              "matched": true,
+              "testedIn": [
+                "web"
               ]
             }
           ],
@@ -5493,6 +5551,19 @@
           ],
           "browserScenarios": [
             "private-repository-blob"
+          ]
+        },
+        {
+          "symbol": "repos.rawUrl",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/raw/{path}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/raw/{*path}",
+          "access": "RepoRead",
+          "handler": "api::repo_content::get_raw",
+          "matched": true,
+          "testedIn": [
+            "web"
           ]
         },
         {
@@ -23670,7 +23741,7 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 668,
+    "inventoryEntries": 671,
     "coveredEntries": 158,
     "coveredRoutes": 150,
     "maxUiRoutesWithoutFrontendTest": 27

@@ -154,6 +154,29 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
   return JSON.parse(text) as T;
 }
 
+/**
+ * Fetch a response body as bytes, for content the browser shows itself — an
+ * LFS text file read through the raw route. Same cookie and timeout as
+ * `request`, no JSON parsing.
+ */
+export async function requestBytes(path: string, options: { timeoutMs?: number } = {}): Promise<ArrayBuffer> {
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const res = await fetch(withApiBase(path), {
+    headers,
+    signal: timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined,
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    throw await responseError(res);
+  }
+  return res.arrayBuffer();
+}
+
 function filenameFromContentDisposition(value: string | null): string | null {
   if (!value) return null;
 
