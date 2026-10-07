@@ -388,6 +388,73 @@ pub fn pointers_added_since(
     Ok(Some(found.into_values().collect()))
 }
 
+/// Every LFS object that the history reachable from a repository's refs
+/// points at — the objects the repository still needs.
+///
+/// Unlike [`objects_in_history`] this walks reachability rather than the
+/// object store: after a force-push the commits that held a pointer stay in
+/// the store until `git gc`, and an object only they name is exactly the one a
+/// clean-up is allowed to drop. Every tree of every commit is read once, so
+/// the cost grows with the size of the history; it runs when an administrator
+/// asks, not on a hot path.
+pub fn oids_reachable_from_refs(repo_path: &Path) -> Result<BTreeSet<String>> {
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+    let tips = ref_commit_tips(&repo, repo_path)?;
+    let mut oids = BTreeSet::new();
+    if tips.is_empty() {
+        return Ok(oids);
+    }
+    let mut trees = HashSet::new();
+    let mut blobs = HashSet::new();
+    let walk = repo
+        .rev_walk(tips)
+        .all()
+        .with_context(|| format!("failed to walk the history of {repo_path:?}"))?;
+    for info in walk {
+        let info = info.with_context(|| format!("failed to walk the history of {repo_path:?}"))?;
+        let root = repo
+            .find_commit(info.id)
+            .with_context(|| format!("failed to read commit {}", info.id))?
+            .tree_id()
+            .with_context(|| format!("failed to read the tree of commit {}", info.id))?
+            .detach();
+        if !trees.insert(root) {
+            continue;
+        }
+        let mut stack = vec![root];
+        while let Some(tree_id) = stack.pop() {
+            let tree = repo
+                .find_tree(tree_id)
+                .with_context(|| format!("failed to read tree {tree_id}"))?;
+            for entry in tree.iter() {
+                let entry =
+                    entry.with_context(|| format!("failed to read an entry of tree {tree_id}"))?;
+                let id = entry.oid().to_owned();
+                if entry.mode().is_tree() {
+                    if trees.insert(id) {
+                        stack.push(id);
+                    }
+                } else if entry.mode().is_blob() && blobs.insert(id) {
+                    let header = repo
+                        .find_header(id)
+                        .with_context(|| format!("failed to read the header of object {id}"))?;
+                    if header.size() >= POINTER_SIZE_LIMIT {
+                        continue;
+                    }
+                    let blob = repo
+                        .find_object(id)
+                        .with_context(|| format!("failed to read blob {id}"))?;
+                    if let Some(pointer) = parse(&blob.data) {
+                        oids.insert(pointer.oid);
+                    }
+                }
+            }
+        }
+    }
+    Ok(oids)
+}
+
 fn collect_blob_paths(
     repo: &gix::Repository,
     root: gix::ObjectId,

@@ -141,3 +141,80 @@ pub async fn release_publication_lease(
         .context("db: release LFS publication lease")?;
     Ok(released.rows_affected > 0)
 }
+
+/// How many objects of `repo_id` are stored, and how many bytes they declare.
+pub async fn usage(db: &DatabaseConnection, repo_id: i64) -> Result<(u64, i64)> {
+    #[derive(Debug, FromQueryResult)]
+    struct Usage {
+        count: i64,
+        bytes: Option<i64>,
+    }
+    let usage = LfsEntity::find()
+        .select_only()
+        .column_as(lfs_object::Column::Id.count(), "count")
+        .column_as(lfs_object::Column::Size.sum(), "bytes")
+        .filter(lfs_object::Column::RepoId.eq(repo_id))
+        .filter(lfs_object::Column::Uploaded.eq(true))
+        .into_model::<Usage>()
+        .one(db)
+        .await
+        .context("db: sum the LFS objects of a repository")?;
+    Ok(usage.map_or((0, 0), |usage| {
+        (usage.count.max(0) as u64, usage.bytes.unwrap_or(0))
+    }))
+}
+
+/// Up to `limit` objects of `repo_id` with an id above `after_id`, oldest
+/// first, and whether another page follows.
+pub async fn list_page(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    after_id: Option<i64>,
+    limit: u64,
+) -> Result<(Vec<LfsObject>, bool)> {
+    let mut select = LfsEntity::find().filter(lfs_object::Column::RepoId.eq(repo_id));
+    if let Some(after) = after_id {
+        select = select.filter(lfs_object::Column::Id.gt(after));
+    }
+    let mut rows = select
+        .order_by_asc(lfs_object::Column::Id)
+        .limit(limit + 1)
+        .all(db)
+        .await
+        .context("db: list a page of LFS objects")?;
+    let more = rows.len() as u64 > limit;
+    rows.truncate(limit as usize);
+    Ok((rows, more))
+}
+
+/// Every object row of `repo_id`, uploaded or only announced, oldest first.
+pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<LfsObject>> {
+    LfsEntity::find()
+        .filter(lfs_object::Column::RepoId.eq(repo_id))
+        .order_by_asc(lfs_object::Column::Id)
+        .all(db)
+        .await
+        .context("db: list the LFS objects of a repository")
+}
+
+/// Remove object row `id` of `repo_id` — only while it is older than
+/// `created_before` and no publication holds it. Returns whether it went.
+///
+/// Both conditions sit in the `DELETE`, so an upload that took the row's
+/// publication lease after the caller decided the object was unused keeps it.
+pub async fn delete_unused(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    id: i64,
+    created_before: DateTimeUtc,
+) -> Result<bool> {
+    let deleted = LfsEntity::delete_many()
+        .filter(lfs_object::Column::Id.eq(id))
+        .filter(lfs_object::Column::RepoId.eq(repo_id))
+        .filter(lfs_object::Column::CreatedAt.lt(created_before))
+        .filter(lfs_object::Column::PublisherToken.is_null())
+        .exec(db)
+        .await
+        .context("db: delete an unused LFS object")?;
+    Ok(deleted.rows_affected > 0)
+}

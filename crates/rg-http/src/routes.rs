@@ -1645,6 +1645,26 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/lfs/locks/{id}/unlock",
             api::lfs_locks::unlock,
         )
+        .get(
+            RepoAdmin,
+            "/repos/{owner}/{name}/lfs/usage",
+            api::lfs_storage::usage,
+        )
+        .get(
+            RepoAdmin,
+            "/repos/{owner}/{name}/lfs/objects",
+            api::lfs_storage::list_objects,
+        )
+        .get(
+            RepoAdmin,
+            "/repos/{owner}/{name}/lfs/orphans",
+            api::lfs_storage::list_orphans,
+        )
+        .post(
+            RepoAdmin,
+            "/repos/{owner}/{name}/lfs/orphans/prune",
+            api::lfs_storage::prune,
+        )
         // ── Webhooks ───────────────────────────────────────────────────────
         .get(
             RepoAdmin,

@@ -430,6 +430,10 @@ pub(crate) fn stamp_security(
         crate::api::lfs_locks::list_locks,
         crate::api::lfs_locks::verify_locks,
         crate::api::lfs_locks::unlock,
+        crate::api::lfs_storage::usage,
+        crate::api::lfs_storage::list_objects,
+        crate::api::lfs_storage::list_orphans,
+        crate::api::lfs_storage::prune,
         // Webhooks
         crate::api::webhooks::list_webhooks,
         crate::api::webhooks::create_webhook,

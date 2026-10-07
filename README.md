@@ -478,6 +478,29 @@ many are missing, and its `stats` list each one by oid and path. A committed
 `.lfsconfig` is not followed, and download addresses the source hands back go
 through the same private-address guard as the import itself.
 
+A pull mirror does the same after every sync that moves its refs, with the
+mirror's own credential, reading only the commits since the last complete
+pass. An object the upstream does not give leaves the mirror in `error`, with
+the missing objects named by oid and path, and is asked for again on the next
+sync.
+
+The file view shows an LFS file as the file: an image inline, other content
+as a download, from `GET /api/v1/repos/<owner>/<repo>/raw/<path>`. The blob
+API marks a pointer file with `lfs: {oid, size, available}`; a pointer whose
+object was never uploaded is reported as such and the raw route answers `404`.
+
+File locking works with the stock client from either clone URL:
+`git lfs lock <path>`, `git lfs locks`, `git lfs unlock <path>`. A lock binds
+only clients that verify locks before pushing, so a team that locks files
+should run `git config lfs.locksverify true` (or `--global`); without it
+git-lfs warns about the locked file and pushes anyway. Unlocking someone
+else's lock takes `--force` from a repository administrator. Repository
+settings list the locks (**LFS locks**) and show what the LFS store holds
+(**LFS storage**): its size, its objects, and the objects no branch, tag or
+pull request points at any more, which an administrator can remove. Objects
+uploaded in the last 24 hours are never offered, since a push uploads them
+before it moves its ref.
+
 ---
 
 ## REST API
