@@ -701,7 +701,9 @@ async fn handle_upload(
     let existing = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await?;
 
     if let Some(obj) = &existing {
-        if obj.uploaded {
+        // The claim, not the read above, decides: it is what an unused-object
+        // removal running right now is ordered against.
+        if obj.uploaded && claim_stored_object(db, repo_id, oid).await? {
             let compressed_key = lfs_object_key(owner, repo, oid, true)?;
             let raw_key = lfs_object_key(owner, repo, oid, false)?;
             let obj_path = lfs_object_path(lfs_root, oid)?;
@@ -911,6 +913,7 @@ async fn find_or_register_object(
         created_at: sea_orm::Set(Utc::now()),
         publisher_token: sea_orm::Set(None),
         publisher_since: sea_orm::Set(None),
+        last_claimed_at: sea_orm::Set(None),
     };
     match lfs_object_ops::create(db, model).await {
         Ok(obj) => Ok(obj),
@@ -1205,6 +1208,18 @@ async fn discard_stored_blob(
     }
 }
 
+/// Whether `repo_id` stores `oid`, recording — when it does — that the caller
+/// is about to rely on that and send no bytes.
+///
+/// For every "already have it, skip" answer that precedes a ref update: the
+/// batch API's upload reply, an import's fetch, a merge adopting a fork's
+/// objects. Removing unused objects ([`crate::lfs::gc::prune`]) keeps a
+/// claimed object for as long as a freshly uploaded one, so it cannot take it
+/// away in the window between this answer and the ref that will point at it.
+pub async fn claim_stored_object(db: &DatabaseConnection, repo_id: i64, oid: &str) -> Result<bool> {
+    lfs_object_ops::claim_uploaded(db, repo_id, oid, Utc::now()).await
+}
+
 /// Whether a row currently points at the object's blob as a live upload.
 pub async fn object_claims_upload(
     db: &DatabaseConnection,
@@ -1239,9 +1254,18 @@ pub async fn store_object_from_file(
     // Hence one cleanup tail over the whole body instead of a discard on the
     // one failure that happened to be noticed: a compression error in the
     // middle used to leave both files behind for good.
+    let Some(spool) = uncompressed_path.file_name().and_then(|name| name.to_str()) else {
+        discard_file("uncompressed LFS upload", uncompressed_path);
+        anyhow::bail!("LFS spool {uncompressed_path:?} has no file name");
+    };
+    // Through the namer, so the startup sweep recognises this file too.
+    let compressed = uncompressed_path.with_file_name(crate::staging::lfs_compressed_spool_name(
+        spool,
+        uuid::Uuid::new_v4(),
+    ));
     let staged = StagedLfsPublication {
         uncompressed: uncompressed_path.to_path_buf(),
-        compressed: uncompressed_path.with_extension(format!("{}.zst", uuid::Uuid::new_v4())),
+        compressed,
     };
     stream_compress_and_store(
         db,
@@ -1552,6 +1576,7 @@ pub async fn copy_repository_objects(
                 created_at: sea_orm::Set(Utc::now()),
                 publisher_token: sea_orm::Set(None),
                 publisher_since: sea_orm::Set(None),
+                last_claimed_at: sea_orm::Set(None),
             });
         }
         lfs_object_ops::create_many(db, rows).await
@@ -1688,7 +1713,7 @@ pub async fn adopt_objects(
     let legacy_root = lfs_root(repo_root, source.owner, source.name);
     let mut outcome = LfsObjectsAdopted::default();
     for oid in oids {
-        if object_claims_upload(db, destination.id, oid).await? {
+        if claim_stored_object(db, destination.id, oid).await? {
             continue;
         }
         let stored = match lfs_object_ops::find_by_repo_and_oid(db, source.id, oid).await? {
@@ -2191,6 +2216,7 @@ mod blob_publication_tests {
                 created_at: Set(chrono::Utc::now()),
                 publisher_token: Set(None),
                 publisher_since: Set(None),
+                last_claimed_at: Set(None),
             },
         )
         .await

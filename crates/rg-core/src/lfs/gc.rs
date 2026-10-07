@@ -16,6 +16,9 @@
 //!   objects first and moves the ref afterwards, so a fresh object nothing
 //!   points at yet is a push in flight, not garbage.
 //! * An object whose publication is in progress (its row holds the lease).
+//! * An object a push was told, within [`ORPHAN_GRACE`], is already stored
+//!   (`last_claimed_at`). That push sends no bytes and moves its ref
+//!   afterwards, so until then the object looks exactly like an old orphan.
 //!
 //! Nothing is removed on the strength of an old answer: [`prune`] reads the
 //! refs again itself, after the administrator chose, and each row goes only
@@ -122,7 +125,14 @@ pub async fn find_orphans(
 }
 
 fn is_orphan(row: &LfsObject, referenced: &BTreeSet<String>, cutoff: DateTime<Utc>) -> bool {
-    row.created_at < cutoff && row.publisher_token.is_none() && !referenced.contains(&row.oid)
+    row.created_at < cutoff
+        && !claimed_since(row, cutoff)
+        && row.publisher_token.is_none()
+        && !referenced.contains(&row.oid)
+}
+
+fn claimed_since(row: &LfsObject, cutoff: DateTime<Utc>) -> bool {
+    row.last_claimed_at.is_some_and(|claimed| claimed >= cutoff)
 }
 
 async fn referenced_oids(repo_path: &Path) -> Result<BTreeSet<String>> {
@@ -190,8 +200,16 @@ pub async fn prune(
             ));
             continue;
         }
+        if claimed_since(row, cutoff) {
+            outcome.kept.push(keep(
+                "a push was recently told it is stored and may still point a ref at it",
+            ));
+            continue;
+        }
         if !rg_db::ops::lfs_object_ops::delete_unused(db, repo.id, row.id, cutoff).await? {
-            outcome.kept.push(keep("an upload of it is in progress"));
+            outcome
+                .kept
+                .push(keep("an upload or a push of it is in progress"));
             continue;
         }
         // The row is gone first, so a failure below leaves bytes nothing
@@ -251,6 +269,7 @@ mod tests {
             created_at: now - Duration::hours(age_hours),
             publisher_token: publishing.then(|| "token".to_string()),
             publisher_since: publishing.then_some(now),
+            last_claimed_at: None,
         }
     }
 

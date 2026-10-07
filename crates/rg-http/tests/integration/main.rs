@@ -110,6 +110,7 @@ mod lfs_locks_tests;
 mod lfs_signed_url_tests;
 mod lfs_ssh_grant_tests;
 mod lfs_storage_gc_tests;
+mod lfs_upload_race_tests;
 mod login_completion_race_tests;
 mod login_enumeration_tests;
 mod login_failure_semantics_tests;

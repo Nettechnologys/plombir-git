@@ -217,7 +217,7 @@ impl<'a> LfsFetcher<'a> {
         let mut wanted = Vec::new();
         for entry in pointers {
             let oid = &entry.pointer.oid;
-            if crate::lfs::service::object_claims_upload(self.db, self.destination.id, oid).await? {
+            if crate::lfs::service::claim_stored_object(self.db, self.destination.id, oid).await? {
                 outcome.already_present += 1;
             } else if entry.pointer.size > LFS_OBJECT_MAX_BYTES as u64 {
                 outcome.failed.push(failure(

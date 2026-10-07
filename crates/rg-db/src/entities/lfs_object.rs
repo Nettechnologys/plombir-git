@@ -27,6 +27,11 @@ pub struct Model {
     /// When the current publisher took the lease — the basis for taking over
     /// a lease left behind by a process that died mid-publication.
     pub publisher_since: Option<DateTimeUtc>,
+    /// When a request last answered "already stored" for this object — a batch
+    /// upload the client then skips, or an import or merge that found it
+    /// present. Whoever got that answer is about to point a ref at the object,
+    /// so removing unused objects treats this like a fresh upload.
+    pub last_claimed_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

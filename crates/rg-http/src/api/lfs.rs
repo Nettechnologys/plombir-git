@@ -606,7 +606,14 @@ pub async fn upload_object(
     // with `let _ =`, so an unwritable LFS root surfaced later as a failure to
     // *open* the temp file — pointing the operator at the file instead of at
     // the directory that actually has to be fixed.
-    let temp_path = lfs_root.join(rg_core::staging::lfs_object_spool_name(&oid));
+    //
+    // One spool per request: concurrent uploads of the same object must not
+    // write — or delete — each other's file, because the digest checked below
+    // is of this request's stream and the file is what gets published.
+    let temp_path = lfs_root.join(rg_core::staging::lfs_object_spool_name(
+        &oid,
+        uuid::Uuid::new_v4(),
+    ));
     if let Some(parent) = temp_path.parent() {
         if let Err(error) = tokio::fs::create_dir_all(parent).await {
             return lfs_path_error("LFS object directory", parent, &error).into_response();
@@ -649,7 +656,10 @@ pub async fn upload_object(
                     .into_response();
                 }
                 Ok(_) => {}
-                Err(error) => return AppError::from(error).into_response(),
+                Err(error) => {
+                    discard_file_async("LFS staging file", &temp_path).await;
+                    return AppError::from(error).into_response();
+                }
             }
 
             match rg_core::lfs::service::store_object_from_file(
@@ -668,7 +678,7 @@ pub async fn upload_object(
                 Err(e) => AppError::from(e).into_response(),
             }
         }
-        // `write_body_to_file` retires a partial `.tmp_<oid>` before returning
+        // `write_body_to_file` retires a partial spool before returning
         // this error; keep the typed cause until this HTTP boundary classifies
         // a declared ceiling separately from an ordinary transport failure.
         Err(e) => lfs_body_error(e).into_response(),
@@ -1033,7 +1043,12 @@ async fn write_body_to_file(
         rg_core::platform::fs::path_error("LFS staging file", path, error, LFS_STORAGE_HINT)
     };
 
-    let mut file = tokio::fs::File::create(path)
+    // `create_new`: the name is this request's own, so finding a file there
+    // means something else wrote it, and truncating it is not ours to do.
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
         .await
         .map_err(|error| staged(&error))?;
 

@@ -197,11 +197,36 @@ pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<L
         .context("db: list the LFS objects of a repository")
 }
 
-/// Remove object row `id` of `repo_id` — only while it is older than
-/// `created_before` and no publication holds it. Returns whether it went.
+/// Mark `repo_id`'s object `oid` claimed at `now`, if it is stored. Returns
+/// whether it is — `false` is the answer to give a client as "send the bytes".
 ///
-/// Both conditions sit in the `DELETE`, so an upload that took the row's
-/// publication lease after the caller decided the object was unused keeps it.
+/// One conditional `UPDATE` rather than a read and a write, so it is ordered
+/// against [`delete_unused`]: either the claim lands first and the delete
+/// leaves the row alone, or the delete lands first and this finds no row.
+pub async fn claim_uploaded(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    oid: &str,
+    now: DateTimeUtc,
+) -> Result<bool> {
+    let claimed = LfsEntity::update_many()
+        .col_expr(lfs_object::Column::LastClaimedAt, Expr::value(now))
+        .filter(lfs_object::Column::RepoId.eq(repo_id))
+        .filter(lfs_object::Column::Oid.eq(oid))
+        .filter(lfs_object::Column::Uploaded.eq(true))
+        .exec(db)
+        .await
+        .context("db: claim a stored LFS object")?;
+    Ok(claimed.rows_affected > 0)
+}
+
+/// Remove object row `id` of `repo_id` — only while it was created and last
+/// claimed before `created_before` and no publication holds it. Returns
+/// whether it went.
+///
+/// Every condition sits in the `DELETE`, so an upload that took the row's
+/// publication lease, or a push that was told the object is stored, after the
+/// caller decided the object was unused keeps it.
 pub async fn delete_unused(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -212,9 +237,75 @@ pub async fn delete_unused(
         .filter(lfs_object::Column::Id.eq(id))
         .filter(lfs_object::Column::RepoId.eq(repo_id))
         .filter(lfs_object::Column::CreatedAt.lt(created_before))
+        .filter(
+            Condition::any()
+                .add(lfs_object::Column::LastClaimedAt.is_null())
+                .add(lfs_object::Column::LastClaimedAt.lt(created_before)),
+        )
         .filter(lfs_object::Column::PublisherToken.is_null())
         .exec(db)
         .await
         .context("db: delete an unused LFS object")?;
     Ok(deleted.rows_affected > 0)
+}
+
+#[cfg(test)]
+mod unused_object_tests {
+    use super::*;
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    async fn object(created_at: &str) -> (DatabaseConnection, LfsObject) {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::run_migrations(&db).await.unwrap();
+        for sql in [
+            "INSERT INTO users(id, username, email, password_hash, is_admin, is_active, created_at, updated_at) \
+             VALUES(1, 'owner', 'owner@example.invalid', 'x', 0, 1, '2024-01-01', '2024-01-01')",
+            "INSERT INTO repositories(id, owner_id, name, is_private, default_branch, stars_count, forks_count, created_at, updated_at) \
+             VALUES(1, 1, 'assets', 0, 'main', 0, 0, '2024-01-01', '2024-01-01')",
+        ] {
+            db.execute(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+                .await
+                .unwrap();
+        }
+        let row = create(
+            &db,
+            ActiveModel {
+                id: NotSet,
+                repo_id: Set(1),
+                oid: Set("a".repeat(64)),
+                size: Set(1),
+                uploaded: Set(true),
+                created_at: Set(created_at.parse().unwrap()),
+                publisher_token: Set(None),
+                publisher_since: Set(None),
+                last_claimed_at: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        (db, row)
+    }
+
+    /// The `DELETE` itself carries the claim, so a claim that lands after the
+    /// caller read the row as unused still keeps it.
+    #[tokio::test]
+    async fn a_claim_after_the_unused_read_keeps_the_object() {
+        let (db, row) = object("2020-01-01T00:00:00Z").await;
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::hours(24);
+
+        assert!(claim_uploaded(&db, 1, &row.oid, now).await.unwrap());
+        assert!(!delete_unused(&db, 1, row.id, cutoff).await.unwrap());
+        assert!(find_by_repo_and_oid(&db, 1, &row.oid)
+            .await
+            .unwrap()
+            .is_some());
+
+        // An old claim protects nothing.
+        let old = "2020-01-02T00:00:00Z".parse().unwrap();
+        assert!(claim_uploaded(&db, 1, &row.oid, old).await.unwrap());
+        assert!(delete_unused(&db, 1, row.id, cutoff).await.unwrap());
+        // And once the row is gone, a claim says so.
+        assert!(!claim_uploaded(&db, 1, &row.oid, now).await.unwrap());
+    }
 }

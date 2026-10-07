@@ -154,11 +154,16 @@ pub const CI_CACHE_SPOOL_SUFFIX: &str = ".upload";
 /// The spool `upload_object` streams an LFS object into before it has been
 /// verified against the oid the client claimed.
 ///
-/// Derived from the oid rather than random, so a repeat of the same upload
-/// reuses one file instead of adding a second — which is why this family leaks
-/// per *distinct* oid rather than per request.
-pub fn lfs_object_spool_name(oid: &str) -> String {
-    format!(".tmp_{oid}")
+/// One per request, not one per oid. It used to be `.tmp_<oid>` so that a
+/// repeat of an upload reused the file, and that is exactly what made two
+/// concurrent uploads of one object — two developers pushing the same asset, a
+/// client retrying while its first request is alive — truncate and delete the
+/// file under each other: the digest is computed over each request's own
+/// stream, but what gets compressed and published is whatever the shared file
+/// holds by then. The sweep still recognises the old shape, which spools left
+/// behind by an earlier version carry.
+pub fn lfs_object_spool_name(oid: &str, upload_id: uuid::Uuid) -> String {
+    format!(".tmp_{oid}.{}", upload_id.simple())
 }
 
 /// The spool an LFS object fetched from another server — the source of an
@@ -169,6 +174,18 @@ pub fn lfs_object_spool_name(oid: &str) -> String {
 /// shared name would let the two writers truncate under each other.
 pub fn lfs_object_fetch_spool_name(oid: &str, fetch_id: uuid::Uuid) -> String {
     format!(".fetch_{oid}.{}", fetch_id.simple())
+}
+
+/// The compressed copy `lfs::service::store_object_from_file` writes beside
+/// the spool it compresses — `spool` is that spool's file name, one of
+/// [`lfs_object_spool_name`] or [`lfs_object_fetch_spool_name`].
+///
+/// It is the publication's second file and just as large: `SIGKILL` during
+/// the zstd pass or the `put` leaves it beside the objects. It used to be
+/// built in place with `with_extension`, which no matcher here knew, so the
+/// sweep retired the uncompressed spool next to it and left this one forever.
+pub fn lfs_compressed_spool_name(spool: &str, publication_id: uuid::Uuid) -> String {
+    format!("{spool}.{}.zst", publication_id.simple())
 }
 
 /// The spool a local blob write publishes with a same-directory rename.
@@ -207,12 +224,17 @@ pub fn attachment_backup_spool_name(backup_id: uuid::Uuid) -> String {
 /// the matcher with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SiblingSpool {
-    /// `.tmp_<oid>` beside one repository's LFS objects, up to
+    /// `.tmp_<oid>.<uuid>` beside one repository's LFS objects, up to
     /// `LFS_OBJECT_MAX_BYTES` — by a wide margin the most expensive of the four.
+    /// An earlier version named it `.tmp_<oid>`, and that shape is still
+    /// recognised.
     LfsObject,
     /// `.fetch_<oid>.<uuid>` beside one repository's LFS objects: an object an
     /// import downloads from its source, up to `LFS_OBJECT_MAX_BYTES`.
     LfsObjectFetch,
+    /// `<lfs spool>.<uuid>.zst` — the compressed copy of either LFS spool,
+    /// written beside it while the object is published.
+    LfsCompressed,
     /// `cache-<random>.upload` in `_ci_cache/<repo_id>/`. Retention walks cache
     /// *rows*, and a spool is named by no row, so nothing else can find one.
     CiCacheArchive,
@@ -232,6 +254,7 @@ impl SiblingSpool {
     pub const ALL: &'static [SiblingSpool] = &[
         SiblingSpool::LfsObject,
         SiblingSpool::LfsObjectFetch,
+        SiblingSpool::LfsCompressed,
         SiblingSpool::CiCacheArchive,
         SiblingSpool::BlobWrite,
         SiblingSpool::AuditArchive,
@@ -247,16 +270,28 @@ impl SiblingSpool {
     /// loose predicate here does not waste space, it destroys data.
     pub fn matches(self, name: &str) -> bool {
         match self {
-            SiblingSpool::LfsObject => name
-                .strip_prefix(".tmp_")
-                .is_some_and(crate::lfs::service::is_valid_oid),
+            SiblingSpool::LfsObject => {
+                name.strip_prefix(".tmp_")
+                    .is_some_and(|rest| match rest.split_once('.') {
+                        Some((oid, upload_id)) => {
+                            crate::lfs::service::is_valid_oid(oid) && is_simple_uuid(upload_id)
+                        }
+                        None => crate::lfs::service::is_valid_oid(rest),
+                    })
+            }
             SiblingSpool::LfsObjectFetch => name
                 .strip_prefix(".fetch_")
                 .and_then(|rest| rest.split_once('.'))
                 .is_some_and(|(oid, fetch_id)| {
-                    crate::lfs::service::is_valid_oid(oid)
-                        && fetch_id.len() == 32
-                        && uuid::Uuid::try_parse(fetch_id).is_ok()
+                    crate::lfs::service::is_valid_oid(oid) && is_simple_uuid(fetch_id)
+                }),
+            SiblingSpool::LfsCompressed => name
+                .strip_suffix(".zst")
+                .and_then(|rest| rest.rsplit_once('.'))
+                .is_some_and(|(spool, publication_id)| {
+                    is_simple_uuid(publication_id)
+                        && (SiblingSpool::LfsObject.matches(spool)
+                            || SiblingSpool::LfsObjectFetch.matches(spool))
                 }),
             SiblingSpool::CiCacheArchive => name
                 .strip_prefix(CI_CACHE_SPOOL_PREFIX)
@@ -284,6 +319,11 @@ impl SiblingSpool {
                 .is_some_and(|backup_id| uuid::Uuid::parse_str(backup_id).is_ok()),
         }
     }
+}
+
+/// Whether `id` is a uuid in the 32-hex-digit form the LFS namers write.
+fn is_simple_uuid(id: &str) -> bool {
+    id.len() == 32 && uuid::Uuid::try_parse(id).is_ok()
 }
 
 /// Whether `name` is a spool of any family in [`SiblingSpool::ALL`].
@@ -870,10 +910,10 @@ mod tests {
     use super::{
         attachment_backup_spool_name, audit_archive_spool_name, blob_write_spool_name,
         import_clone_staging_name, import_wiki_clone_staging_name, is_sibling_spool,
-        is_sibling_spool_tree, lfs_object_fetch_spool_name, lfs_object_spool_name,
-        sweep_stale_spools, worktree_staging_name, worktree_staging_path, SiblingSpool,
-        SiblingSpoolTree, StagingArea, SweepReport, WorktreePurpose, CI_CACHE_SPOOL_PREFIX,
-        CI_CACHE_SPOOL_SUFFIX, STALE_SPOOL_AGE,
+        is_sibling_spool_tree, lfs_compressed_spool_name, lfs_object_fetch_spool_name,
+        lfs_object_spool_name, sweep_stale_spools, worktree_staging_name, worktree_staging_path,
+        SiblingSpool, SiblingSpoolTree, StagingArea, SweepReport, WorktreePurpose,
+        CI_CACHE_SPOOL_PREFIX, CI_CACHE_SPOOL_SUFFIX, STALE_SPOOL_AGE,
     };
     use std::time::{Duration, SystemTime};
 
@@ -1158,10 +1198,17 @@ mod tests {
             .to_owned();
 
         let named = [
-            (SiblingSpool::LfsObject, lfs_object_spool_name(&oid)),
+            (
+                SiblingSpool::LfsObject,
+                lfs_object_spool_name(&oid, write_id),
+            ),
             (
                 SiblingSpool::LfsObjectFetch,
                 lfs_object_fetch_spool_name(&oid, write_id),
+            ),
+            (
+                SiblingSpool::LfsCompressed,
+                lfs_compressed_spool_name(&lfs_object_spool_name(&oid, write_id), write_id),
             ),
             (SiblingSpool::CiCacheArchive, cache),
             (
@@ -1198,6 +1245,26 @@ mod tests {
             SiblingSpool::ALL.len(),
             "a spool family was registered without a namer to round-trip it"
         );
+
+        // The second base the compressed copy is built on, and the name an
+        // earlier version gave the upload spool, which can still be on disk.
+        for (family, name) in [
+            (
+                SiblingSpool::LfsCompressed,
+                lfs_compressed_spool_name(&lfs_object_fetch_spool_name(&oid, write_id), write_id),
+            ),
+            (SiblingSpool::LfsObject, format!(".tmp_{oid}")),
+        ] {
+            assert!(
+                family.matches(&name),
+                "{family:?} does not recognise {name}"
+            );
+            let claimed: Vec<_> = SiblingSpool::ALL
+                .iter()
+                .filter(|other| other.matches(&name))
+                .collect();
+            assert_eq!(claimed, [&family], "{name} is claimed by {claimed:?}");
+        }
     }
 
     /// The half that decides whether the sweep reclaims disk or destroys data:
@@ -1221,6 +1288,19 @@ mod tests {
             &format!(".fetch_{}", "b".repeat(64)),
             &format!(".fetch_{}.not-a-uuid", "b".repeat(64)),
             &format!(".fetch_not-an-oid.{}", uuid::Uuid::nil().simple()),
+            // The upload spool's shape with something that is not an id behind
+            // the oid.
+            &format!(".tmp_{}.not-a-uuid", "b".repeat(64)),
+            // The object the compressed copy is published as, and the copy's
+            // shape around something that is not one of the LFS spools.
+            &format!("{}.zst", "b".repeat(64)),
+            &format!(".tmp_{}.zst", "b".repeat(64)),
+            &format!("{}.{}.zst", "b".repeat(64), uuid::Uuid::nil().simple()),
+            &format!(
+                ".tmp_{}.{}.not-a-uuid.zst",
+                "b".repeat(64),
+                uuid::Uuid::nil().simple()
+            ),
             // A published cache archive, and the spool shape without its parts.
             "e3b0c44298fc1c14.9.tar",
             "cache-.upload",
@@ -1265,9 +1345,26 @@ mod tests {
         // LFS: `<repo_root>/<owner>.lfs/<repo>/`, beside the objects.
         let lfs = root.join("octocat.lfs").join("payloads");
         std::fs::create_dir_all(&lfs).expect("lfs root");
-        let stale_lfs = lfs.join(lfs_object_spool_name(&"a".repeat(64)));
-        let fresh_lfs = lfs.join(lfs_object_spool_name(&"b".repeat(64)));
+        let stale_lfs = lfs.join(lfs_object_spool_name(&"a".repeat(64), uuid::Uuid::new_v4()));
+        let fresh_lfs = lfs.join(lfs_object_spool_name(&"b".repeat(64), uuid::Uuid::new_v4()));
         let live_object = lfs.join("c".repeat(64));
+        // What an earlier version named the upload spool.
+        let stale_legacy_lfs = lfs.join(format!(".tmp_{}", "d".repeat(64)));
+        // The compressed copy publication writes beside either spool, and the
+        // compressed object it becomes.
+        let stale_compressed = lfs.join(lfs_compressed_spool_name(
+            &lfs_object_spool_name(&"e".repeat(64), uuid::Uuid::new_v4()),
+            uuid::Uuid::new_v4(),
+        ));
+        let stale_fetch_compressed = lfs.join(lfs_compressed_spool_name(
+            &lfs_object_fetch_spool_name(&"e".repeat(64), uuid::Uuid::new_v4()),
+            uuid::Uuid::new_v4(),
+        ));
+        let fresh_compressed = lfs.join(lfs_compressed_spool_name(
+            &lfs_object_spool_name(&"f".repeat(64), uuid::Uuid::new_v4()),
+            uuid::Uuid::new_v4(),
+        ));
+        let live_compressed = lfs.join(format!("{}.zst", "e".repeat(64)));
 
         // CI cache: `<repo_root>/_ci_cache/<repo_id>/`.
         let cache = root.join("_ci_cache").join("42");
@@ -1302,6 +1399,9 @@ mod tests {
 
         let stale = [
             &stale_lfs,
+            &stale_legacy_lfs,
+            &stale_compressed,
+            &stale_fetch_compressed,
             &stale_cache,
             &stale_blob,
             &stale_audit,
@@ -1309,6 +1409,7 @@ mod tests {
         ];
         let fresh = [
             &fresh_lfs,
+            &fresh_compressed,
             &fresh_cache,
             &fresh_blob,
             &fresh_audit,
@@ -1316,6 +1417,7 @@ mod tests {
         ];
         let live = [
             &live_object,
+            &live_compressed,
             &live_archive,
             &live_blob,
             &live_audit,
@@ -1339,7 +1441,7 @@ mod tests {
                 retained: fresh.len(),
                 failed: 0,
             },
-            "one stale spool per family had to go and one fresh spool per family had to stay"
+            "every stale spool had to go and every fresh spool had to stay"
         );
         for path in stale {
             assert!(
@@ -1955,6 +2057,62 @@ mod tests {
              `sweep_stale_sibling_spools` will never recognise what they leave behind: {}",
             elsewhere.join(", ")
         );
+
+        let mut computed = Vec::new();
+        for file in production_rust_files(&workspace.join("crates")) {
+            if file == home {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).expect("read a workspace source file");
+            for line in computed_extension_lines(&text) {
+                computed.push(format!("{}:{line}", file.display()));
+            }
+        }
+        assert!(
+            computed.is_empty(),
+            "these give a sibling file a computed extension — the shape the compressed LFS \
+             spool `<spool>.<uuid>.zst` was built in, past every namer here and so past the \
+             sweep. Build the name through `rg_core::staging`: {}",
+            computed.join(", ")
+        );
+    }
+
+    /// 1-based lines of production `with_extension(format!(…))` calls.
+    ///
+    /// A literal extension (`"zst"`, `"cache.tar"`) names a fixed, final file. A
+    /// formatted one carries a per-call part, which is what a spool is — and
+    /// that is how `store_object_from_file` named its compressed copy without
+    /// any fragment the literal census above looks for.
+    fn computed_extension_lines(text: &str) -> Vec<usize> {
+        let source = rust_source::production_rust_source(text);
+        rust_source::production_call_sites(text, &["with_extension"])
+            .into_iter()
+            .filter(|call| {
+                source[call.open_paren + 1..]
+                    .trim_start()
+                    .starts_with("format!")
+            })
+            .map(|call| call.line)
+            .collect()
+    }
+
+    #[test]
+    fn a_computed_extension_is_caught_and_a_literal_one_is_not() {
+        let producer = r#"
+fn stage(path: &std::path::Path) {
+    let fixed = path.with_extension("zst");
+    let spool = path.with_extension(format!("{}.zst", uuid::Uuid::new_v4()));
+    // path.with_extension(format!("{}.zst", id));
+}
+
+#[cfg(test)]
+mod tests {
+    fn decoy(path: &std::path::Path) {
+        path.with_extension(format!("{}.zst", 1));
+    }
+}
+"#;
+        assert_eq!(computed_extension_lines(producer), [4]);
     }
 
     /// 1-based lines of the production calls whose first argument literal names

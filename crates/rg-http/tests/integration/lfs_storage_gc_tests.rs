@@ -293,3 +293,91 @@ async fn only_old_objects_no_ref_points_at_are_removed_and_a_fork_keeps_its_copy
         "removing the source's object took the fork's copy with it"
     );
 }
+
+/// card_9907a20218b0: a push that the batch API told "already stored" sends no
+/// bytes and moves its ref afterwards. Until the ref moves, an old object looks
+/// exactly like an orphan, and removal used to take it — leaving the pushed
+/// history pointing at an object the server no longer has.
+#[tokio::test]
+async fn an_object_a_push_was_told_is_stored_survives_removal_until_the_push_lands() {
+    let (base, db, _repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (owner, _) = register_full(&base, OWNER, "lfs_gc_owner@example.com").await;
+    let created = reqwest::Client::new()
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({"name": REPO, "is_private": false, "auto_init": true, "readme": "default"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let repo_id = created.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // An object uploaded two days ago that no ref points at any more.
+    let reverted = b"an asset a revert is about to bring back".to_vec();
+    upload_object(&base, &owner, &reverted).await;
+    db.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        format!(
+            "UPDATE lfs_objects SET created_at = '2020-01-01T00:00:00Z' \
+             WHERE repo_id = {repo_id} AND oid = '{}'",
+            oid_of(&reverted)
+        ),
+    ))
+    .await
+    .unwrap();
+    let api = format!("{base}/api/v1/repos/{OWNER}/{REPO}/lfs");
+    let (_, orphans) = get_json(&format!("{api}/orphans"), &owner).await;
+    assert_eq!(oids(&orphans["objects"]), vec![oid_of(&reverted)]);
+
+    // The revert's `git lfs push`: the batch says the server has it.
+    let batch = reqwest::Client::new()
+        .post(format!("{api}/objects/batch"))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({
+            "operation": "upload",
+            "objects": [{"oid": oid_of(&reverted), "size": reverted.len()}],
+            "transfers": ["basic"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert!(
+        batch["objects"][0]["actions"].is_null(),
+        "the server already stores the object, so the client sends nothing: {batch}"
+    );
+
+    // An administrator removes unused objects before the ref update arrives.
+    let (_, orphans) = get_json(&format!("{api}/orphans"), &owner).await;
+    assert_eq!(
+        oids(&orphans["objects"]),
+        Vec::<String>::new(),
+        "a claimed object is not offered for removal"
+    );
+    let pruned = reqwest::Client::new()
+        .post(format!("{api}/orphans/prune"))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({"oids": [oid_of(&reverted)]}))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(pruned["deleted"], serde_json::json!([]));
+    assert_eq!(
+        pruned["kept"][0]["reason"],
+        "a push was recently told it is stored and may still point a ref at it"
+    );
+
+    // The push lands, and what it points at is still there.
+    commit_file(&base, &owner, "assets/back.bin", &pointer_text(&reverted)).await;
+    assert_eq!(
+        download(&base, &owner, OWNER, &reverted).await.as_deref(),
+        Some(reverted.as_slice())
+    );
+}
