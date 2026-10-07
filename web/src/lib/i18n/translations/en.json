@@ -910,6 +910,20 @@
       "private": "Private",
       "public": "Public"
     },
+    "lfs_locks": {
+      "title": "LFS locks",
+      "desc": "Files locked with `git lfs lock`. A locked file can be pushed only by the person who holds the lock, when their client verifies locks (`git config lfs.locksverify true`).",
+      "path": "Path",
+      "owner": "Locked by",
+      "locked_at": "Locked",
+      "empty": "No files are locked.",
+      "load_failed": "Failed to load LFS locks",
+      "force_unlock": "Force unlock",
+      "force_confirm": "Unlock {path}, locked by {owner}? Their unpushed work on it is no longer protected.",
+      "unlocked": "Unlocked {path}.",
+      "unlock_failed": "Failed to unlock: {message}",
+      "more": "Load more"
+    },
     "deploy_keys": {
       "title": "Deploy keys",
       "desc": "Grant an automation key access to this repository only.",

@@ -23,12 +23,12 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 364 |
-| Из них достижимы из браузера | 247 (68%) |
+| Роутов в роутере (с объявленным `Access`) | 368 |
+| Из них достижимы из браузера | 249 (68%) |
 | Layout-модулей | 2 |
-| Страниц | 62 |
-| Интерактивных элементов | 827 |
-| — из них дёргают API | 309 |
+| Страниц | 63 |
+| Интерактивных элементов | 829 |
+| — из них дёргают API | 311 |
 | — приходят из общих компонентов | 303 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
 | **UI-роутов без единого web/smoke/browser-теста** | **27** |
@@ -50,6 +50,7 @@
 | `OrgAdmin` | 8 | 8 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
 | `OrgRead` | 5 | 4 | 0 | 0 |
+| `Foreign:api/lfs_locks.rs` | 4 | 2 | 0 | 2 |
 | `PublicFiltered` | 3 | 3 | 0 | 0 |
 | `Foreign:api/lfs.rs` | 3 | 0 | 0 | 0 |
 | `RepoOwner` | 2 | 2 | 0 | 0 |
@@ -121,6 +122,7 @@
 | `/notifications` | 3 | 3 | 0 |
 | `/register` | 3 | 0 | 0 |
 | `/[owner]/[repo]/settings` | 2 | 2 | 0 |
+| `/[owner]/[repo]/settings/lfs-locks` | 2 | 2 | 0 |
 | `/[owner]/[repo]/settings/runners` | 1 | 0 | 0 |
 
 ## План тестов: элемент → роут → уровень доступа
@@ -762,6 +764,13 @@
 | handleDelete | :365 | `DELETE /api/v1/repos/{owner}/{name}/labels/{id}` | `RepoWrite` | rust+web+browser |
 | handleDelete | :365 | `GET /api/v1/repos/{owner}/{name}/labels` | `RepoRead` | rust+web |
 
+### `/[owner]/[repo]/settings/lfs-locks`
+
+| Элемент | Откуда | Вызов | `Access` | тест |
+|---|---|---|---|---|
+| i18n:settings.lfs_locks.force_unlock | :122 | `POST /api/v1/repos/{owner}/{name}/lfs/locks/{id}/unlock` | `Foreign:api/lfs_locks.rs` | web |
+| i18n:settings.lfs_locks.more | :135 | `GET /api/v1/repos/{owner}/{name}/lfs/locks` | `Foreign:api/lfs_locks.rs` | rust+web |
+
 ### `/[owner]/[repo]/settings/mirror`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
@@ -1155,6 +1164,8 @@
 | POST | `/api/v1/repos/{owner}/{name}/lfs/objects/batch` | `Foreign:api/lfs.rs` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/lfs/objects/{oid}` | `Foreign:api/lfs.rs` | rust+smoke |
 | PUT | `/api/v1/repos/{owner}/{name}/lfs/objects/{oid}` | `Foreign:api/lfs.rs` | rust |
+| POST | `/api/v1/repos/{owner}/{name}/lfs/locks` | `Foreign:api/lfs_locks.rs` | **—** |
+| POST | `/api/v1/repos/{owner}/{name}/lfs/locks/verify` | `Foreign:api/lfs_locks.rs` | **—** |
 | GET | `/api/v1/ci/oidc/.well-known/openid-configuration` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/jwks` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/token` | `Foreign:api/ci_oidc.rs` | rust |

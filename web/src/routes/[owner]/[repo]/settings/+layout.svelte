@@ -21,6 +21,7 @@
     { path: `/${owner}/${repo}/settings/retention`, label: t('settings.retention.title', 'CI retention'), icon: '🧹' },
     { path: `/${owner}/${repo}/settings/tags`, label: t('settings.tag_protection.title', 'Tag protection'), icon: '🏷️' },
     { path: `/${owner}/${repo}/settings/mirror`, label: t('settings.mirror.title'), icon: '🔁' },
+    { path: `/${owner}/${repo}/settings/lfs-locks`, label: t('settings.lfs_locks.title'), icon: '🔐' },
     { path: `/${owner}/${repo}/settings/webhooks`, label: t('settings.webhooks.title', 'Webhooks'), icon: '🔔' },
     { path: `/${owner}/${repo}/settings/collaborators`, label: t('settings.collaborators.title'), icon: '👥' },
     { path: `/${owner}/${repo}/settings/runners`, label: t('admin.runners.title'), icon: '🏃' }

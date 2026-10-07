@@ -98,6 +98,7 @@ export { tokens, splitList, type TokenNarrowing, type TokenNarrowingFields } fro
 export { bots, type Bot, type BotToken } from './bots';
 export { sshKeys, type SshKey } from './sshKeys';
 export { deployKeys, type DeployKey } from './deployKeys';
+export { lfsLocks, type LfsLock } from './lfsLocks';
 export { ciSecrets, type CiSecret } from './ciSecrets';
 export { tagProtections, type TagProtection, type TagProtectionPayload } from './tagProtections';
 export { buildTagProtectionPayload, type TagProtectionFormState } from './tagProtectionForm';

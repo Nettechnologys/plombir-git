@@ -1835,6 +1835,43 @@
       "reachedFromUi": false
     },
     {
+      "method": "POST",
+      "url": "/api/v1/repos/{owner}/{name}/lfs/locks",
+      "access": "Foreign:api/lfs_locks.rs",
+      "handler": "api::lfs_locks::create_lock",
+      "testedIn": [],
+      "reachedFromUi": false
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/lfs/locks",
+      "access": "Foreign:api/lfs_locks.rs",
+      "handler": "api::lfs_locks::list_locks",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/repos/{owner}/{name}/lfs/locks/verify",
+      "access": "Foreign:api/lfs_locks.rs",
+      "handler": "api::lfs_locks::verify_locks",
+      "testedIn": [],
+      "reachedFromUi": false
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/repos/{owner}/{name}/lfs/locks/{id}/unlock",
+      "access": "Foreign:api/lfs_locks.rs",
+      "handler": "api::lfs_locks::unlock",
+      "testedIn": [
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
       "method": "GET",
       "url": "/api/v1/repos/{owner}/{name}/hooks",
       "access": "RepoAdmin",
@@ -17399,6 +17436,63 @@
       "passive": []
     },
     {
+      "route": "/[owner]/[repo]/settings/lfs-locks",
+      "file": "web/src/routes/[owner]/[repo]/settings/lfs-locks/+page.svelte",
+      "admin": false,
+      "controls": [
+        {
+          "tag": "button",
+          "label": "i18n:settings.lfs_locks.force_unlock",
+          "line": 122,
+          "via": null,
+          "href": null,
+          "handler": "() => forceUnlock(lock)",
+          "calls": [
+            {
+              "symbol": "lfsLocks.forceUnlock",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/lfs/locks/{id}/unlock",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/locks/{id}/unlock",
+              "access": "Foreign:api/lfs_locks.rs",
+              "handler": "api::lfs_locks::unlock",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.lfs_locks.more",
+          "line": 135,
+          "via": null,
+          "href": null,
+          "handler": "loadMore",
+          "calls": [
+            {
+              "symbol": "lfsLocks.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/lfs/locks",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/lfs/locks",
+              "access": "Foreign:api/lfs_locks.rs",
+              "handler": "api::lfs_locks::list_locks",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        }
+      ],
+      "passive": []
+    },
+    {
       "route": "/[owner]/[repo]/settings/mirror",
       "file": "web/src/routes/[owner]/[repo]/settings/mirror/+page.svelte",
       "admin": false,
@@ -23741,7 +23835,7 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 671,
+    "inventoryEntries": 673,
     "coveredEntries": 158,
     "coveredRoutes": 150,
     "maxUiRoutesWithoutFrontendTest": 27
