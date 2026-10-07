@@ -301,9 +301,16 @@ mod tests {
             .expect("connect to disposable server database");
 
         exercise_live_backend(&db).await;
-        db.execute_unprepared("DROP TABLE IF EXISTS code_fts")
+        // The server database is shared with the rest of the job, and its
+        // migration ledger already records this migration as applied, so a
+        // dropped table is never recreated: every later step then fails with
+        // `relation "code_fts" does not exist`. `exercise_live_backend` ends on
+        // the complete schema `up` builds; leave that and remove only the rows
+        // this proof wrote.
+        db.execute_unprepared("DELETE FROM code_fts")
             .await
-            .expect("remove live code_fts fixture");
+            .expect("remove code_fts fixture rows");
+        assert_schema_complete(&SchemaManager::new(&db)).await;
     }
 
     async fn exercise_live_backend(db: &DatabaseConnection) {

@@ -33,7 +33,11 @@ RUN npm run build
 # Output: /build/web/build/ (static adapter with fallback: index.html)
 
 # ── Stage 2: Rust builder ───────────────────────────────────
-FROM rust:1.95.0-slim-bookworm AS builder
+# The compiler is whatever `rust-toolchain.toml` names — the same one CI and the
+# local push gates use. Keep this tag on the same version and the toolchain is
+# already in the image; let it fall behind and the install below downloads the
+# right one instead of building with the wrong one.
+FROM rust:1.96.1-slim-bookworm AS builder
 WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -46,6 +50,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Install the toolchain `rust-toolchain.toml` names before anything compiles,
+# in a layer of its own so a manifest change does not repeat it. Explicit rather
+# than left to rustup's implicit install on the first cargo call, which is a
+# setting rather than a guarantee.
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install --no-self-update \
+    && rustc --version
 
 # 2a. Copy workspace manifests for dependency caching.
 #

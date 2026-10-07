@@ -1,0 +1,17 @@
+# The one Rust toolchain every build of this repository uses: the CI jobs in
+# `.github/workflows/regression.yml`, the receipt-producing local verifier
+# (`scripts/verify-push-gates.sh`) and the Docker image.
+#
+# It used to be three. CI installed whatever `stable` was on the day of the run,
+# the local gates ran whatever the developer had, and the Dockerfile pinned its
+# own image tag. Strict Clippy (`-D warnings`) is a function of the toolchain,
+# so a push the local verifier proved warning-free went red in CI the day a new
+# stable shipped new lints, with no change in the code. A new toolchain now
+# arrives as a commit that bumps this line and triages what it brings.
+#
+# `rust-version` in Cargo.toml is a different thing: the oldest compiler the
+# crates promise to build with. This file is the compiler the gates run.
+[toolchain]
+channel = "1.96.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

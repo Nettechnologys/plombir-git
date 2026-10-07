@@ -37,6 +37,7 @@
 //! * **The record outlives the challenge, and no longer.** A live spend
 //!   survives the sweep the next spend performs; an expired one does not.
 
+use chrono::SubsecRound;
 use rg_db::ops::webauthn_ceremony_ops;
 use rg_db::sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 
@@ -286,6 +287,15 @@ async fn a_refusal_reports_when_the_challenge_was_first_answered() {
         "the first spend must land",
     );
     let after = chrono::Utc::now();
+
+    // MySQL's `TIMESTAMP` keeps whole seconds and rounds the fraction, so the
+    // stored instant may sit up to half a second either side of the spend, and
+    // a replay in the same second would be indistinguishable from it. Widen the
+    // window to whole seconds and replay well past its end: the assertion below
+    // then tells the original from the replay on every backend.
+    let before = before.trunc_subsecs(0);
+    let after = after.trunc_subsecs(0) + chrono::TimeDelta::seconds(1);
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
 
     // A later replay of the same ceremony, the shape an intercepted `finish`
     // arrives in.

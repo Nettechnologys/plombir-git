@@ -27,10 +27,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Every job installs the toolchain `rust-toolchain.toml` names, with the
+      # components it lists, rather than whatever `stable` is on the day of the
+      # run. That file is also what the local push-gate verifier and the Docker
+      # image build with, so a green receipt and a green job prove the same
+      # thing. rustup is preinstalled on the hosted runners.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+        run: rustup toolchain install --no-self-update
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -48,8 +51,10 @@ jobs:
   # the tests inside one job would mean no test feedback at all on that run.
   #
   # Warning-free is the delivery contract, so CI and the receipt-producing local
-  # verifier use the same strict command. A new stable-toolchain lint must be
-  # triaged explicitly instead of leaving a green job with warning diagnostics.
+  # verifier use the same strict command on the same toolchain
+  # (`rust-toolchain.toml`). Lints a newer toolchain brings are triaged in the
+  # commit that bumps it, instead of turning main red on the day a new stable
+  # ships.
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -63,12 +68,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev git
 
-      # dtolnay/rust-toolchain installs the minimal profile, which ships neither
-      # clippy nor rustfmt — the component has to be requested by name.
+      # The minimal profile ships neither clippy nor rustfmt;
+      # `rust-toolchain.toml` requests both by name.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+        run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -104,7 +107,7 @@ jobs:
           sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev git
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -126,7 +129,7 @@ jobs:
           sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev git
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -173,7 +176,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install --no-self-update
 
       # Prebuilt binaries — no from-source compile, keeps the gate fast.
       - name: Install cargo-audit and cargo-deny
@@ -228,7 +231,7 @@ jobs:
           sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev git openssh-client curl python3
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -266,7 +269,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -338,7 +341,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -652,8 +655,9 @@ jobs:
   #   * artifact paths hardcoded in stage 3 (`target/release/*`,
   #     `/build/web/build`). Moving adapter-static's output breaks the image and
   #     nothing else.
-  #   * a pinned toolchain (`rust:1.95.0-slim-bookworm`) drifting away from the
-  #     floating `dtolnay/rust-toolchain@stable` every other job installs.
+  #   * a toolchain drifting away from the one every other job installs. The
+  #     image now builds with `rust-toolchain.toml` like everything else; its
+  #     `rust:` tag only decides whether rustup has to download it first.
   # Each of those used to surface during a deploy, on the server.
   #
   # Nothing is pushed. The proof wanted here is that the image builds and its
@@ -704,7 +708,7 @@ jobs:
           changed="$(git diff --name-only "${BASE_SHA}" HEAD)"
           echo "Files changed against ${BASE_SHA}:"
           printf '%s\n' "${changed}"
-          if printf '%s\n' "${changed}" | grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|crates/|web/|scripts/openapi-interface-smoke\.mjs|\.github/workflows/regression\.yml)'; then
+          if printf '%s\n' "${changed}" | grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|rust-toolchain\.toml|crates/|web/|scripts/openapi-interface-smoke\.mjs|\.github/workflows/regression\.yml)'; then
             echo "build=true" >>"${GITHUB_OUTPUT}"
             echo "An input of the image build changed — building."
           else
@@ -743,7 +747,7 @@ jobs:
           cache-to: type=gha,scope=plombir-git-image,mode=max
 
       # A built image is not yet a working one. The runtime stage is a different
-      # base (debian:bookworm-slim) from the builder (rust:1.95.0-slim-bookworm),
+      # base (debian:bookworm-slim) from the builder (rust:1.96.1-slim-bookworm),
       # so a shared library the build linked against and the runtime does not
       # install produces a binary that compiles, copies, and then refuses to
       # start — on the server, in a restart loop, with the failure a line in
@@ -863,11 +867,13 @@ jobs:
           # the step ends, so a separate step would find nothing to talk to.
           #
           # This is also the only place the assertion is worth anything: the
-          # image is the one artefact where the SPA bundle exists, so an
-          # unrouted path answers `200 text/html` exactly as it would in
+          # image is the one artefact where the SPA bundle exists, so a path
+          # outside `/api/v1` answers `200 text/html` exactly as it would in
           # production. That is the failure the smoke was blind to for its whole
           # life — it requested every path without the `/api/v1` mount prefix,
-          # got the SPA, and printed 288 green ticks (card_b23fa617838f).
+          # got the SPA, and printed 288 green ticks (card_b23fa617838f). Inside
+          # `/api/v1` an unrouted path is a JSON 404 that differs from a
+          # handler's 404 only in its message, which is what the smoke compares.
           #
           # OPENAPI_SMOKE_ROUTING_ONLY keeps it to the anonymous, read-only pass:
           # one GET per advertised path, no registration, no bodies, no delete

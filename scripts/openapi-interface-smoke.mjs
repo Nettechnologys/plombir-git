@@ -20,12 +20,12 @@
 //     document now declares where its paths live, so this script no longer
 //     guesses (and a spec that stops declaring it fails loudly below);
 //   * a path that is not routed is detected rather than assumed. "404 fails"
-//     would be wrong in both directions: an unmounted path does not 404 in
-//     production, it returns the SPA, while `GET /repos/testuser/testrepo`
-//     legitimately 404s because that repository does not exist. So the fallback
-//     is CALIBRATED — one request to a path that certainly is not mounted, per
-//     method — and any advertised path answered the same way is reported as
-//     unrouted.
+//     would be wrong: an unmounted `/api/v1` path and `GET
+//     /repos/testuser/testrepo` both 404 — the second legitimately, because that
+//     repository does not exist. So the fallback is CALIBRATED — one request to
+//     a path that certainly is not mounted, per method — and any advertised path
+//     answered the same way is reported as unrouted. "The same way" includes the
+//     error message, since both 404s arrive in the same JSON envelope.
 //
 // Two passes, because they have different costs. The routing pass is anonymous,
 // read-only and deterministic: one GET per advertised path, asserting only that
@@ -51,6 +51,14 @@ const ABSENT_PATH = '/__plombir_git_openapi_smoke_absent__';
 // discriminates. If this endpoint ever moves, the control fails and says so
 // rather than letting the routing pass degrade into a no-op.
 const ROUTED_CONTROL_PATH = '/users/login';
+
+// A mounted route whose handler answers 404 because the repository it names
+// does not exist — the answer most advertised `/repos/{owner}/{name}/...` paths
+// give an anonymous probe on an empty instance. Since `/api/v1` stopped falling
+// through to the SPA (`protocol_subtrees_are_not_pages` in
+// crates/rg-http/src/routes.rs), the fallback is a `404 application/json` as
+// well, so this is the control that proves the two still read differently.
+const ROUTED_NOT_FOUND_CONTROL_PATH = '/repos/__plombir_git_smoke_owner__/__plombir_git_smoke_repo__';
 
 // Where requests are sent: the spec's own `servers[0].url`, resolved against
 // BACKEND_URL. Assigned once the document has been read.
@@ -466,16 +474,30 @@ function resolveRequestBase(doc) {
 }
 
 /**
- * What a response looks like to the router question: status plus media type.
+ * What a response looks like to the router question: status, media type and,
+ * for the API's JSON error envelope, its `error.code` and `error.message`.
  *
- * Enough to tell a routed answer from the fallback (`200 text/html` with a
- * bundle on disk, `404 text/plain` without one) and never enough to confuse two
- * routed answers with each other — every documented endpoint answers JSON,
- * including its errors (`AppError` in crates/rg-http/src/error.rs).
+ * Status and media type alone used to be enough, while the fallback was the SPA
+ * (`200 text/html`). Under `/api/v1` it now answers in the API's own envelope —
+ * `404 application/json`, "no endpoint is mounted at this path" — which is
+ * exactly what a mounted handler answers about a repository that does not
+ * exist. Read that way, 85 routed paths were reported as unrouted. The message
+ * is what tells the two apart. `error.request_id` is left out on purpose:
+ * `request_id_middleware` writes a fresh one into every error body, so a
+ * signature that included it would never equal the fallback's, and the routing
+ * pass would pass whatever the router did.
  */
-function responseSignature(res) {
+async function responseSignature(res) {
   const type = String(res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-  return `${res.status} ${type || '<no content-type>'}`;
+  let envelope = '';
+  if (type === 'application/json') {
+    const body = await res.clone().json().catch(() => null);
+    const error = body && typeof body === 'object' ? body.error : null;
+    if (error && typeof error === 'object') {
+      envelope = ` ${error.code ?? '<no code>'}: ${error.message ?? '<no message>'}`;
+    }
+  }
+  return `${res.status} ${type || '<no content-type>'}${envelope}`;
 }
 
 /**
@@ -496,7 +518,7 @@ async function fallbackSignatureFor(method) {
     console.log(`❌ Could not probe ${method.toUpperCase()} ${ABSENT_PATH}: ${probe.error?.message || 'network error'}`);
     process.exit(1);
   }
-  const signature = responseSignature(probe.response);
+  const signature = await responseSignature(probe.response);
   fallbackSignatures.set(method, signature);
   return signature;
 }
@@ -648,7 +670,7 @@ if (!controlResp.ok || !controlResp.response) {
   console.log(`❌ Could not probe the routing control GET ${ROUTED_CONTROL_PATH}: ${controlResp.error?.message || 'network error'}`);
   process.exit(1);
 }
-const controlSignature = responseSignature(controlResp.response);
+const controlSignature = await responseSignature(controlResp.response);
 if (controlSignature === fallbackGet) {
   console.log(
     `❌ The routing check cannot discriminate: a mounted path (GET ${ROUTED_CONTROL_PATH}) and an absent one\n` +
@@ -657,7 +679,28 @@ if (controlSignature === fallbackGet) {
   );
   process.exit(1);
 }
-checks.push(`✅ Routing probe calibrated: unrouted answers "${fallbackGet}", the control answers "${controlSignature}"`);
+const notFoundControlResp = await requestWithTimeout(`${REQUEST_BASE}${ROUTED_NOT_FOUND_CONTROL_PATH}`, { method: 'GET' });
+if (!notFoundControlResp.ok || !notFoundControlResp.response) {
+  console.log(
+    `❌ Could not probe the not-found control GET ${ROUTED_NOT_FOUND_CONTROL_PATH}: ` +
+      `${notFoundControlResp.error?.message || 'network error'}`,
+  );
+  process.exit(1);
+}
+const notFoundControlSignature = await responseSignature(notFoundControlResp.response);
+if (notFoundControlSignature === fallbackGet) {
+  console.log(
+    `❌ The routing check cannot discriminate: a mounted route refusing an absent repository\n` +
+      `   (GET ${ROUTED_NOT_FOUND_CONTROL_PATH}) and an absent path (GET ${ABSENT_PATH}) both answer\n` +
+      `   "${fallbackGet}". Every advertised path whose handler answers 404 would be reported as unrouted.\n` +
+      '   Make the fallback and a handler\'s 404 differ in what responseSignature reads.',
+  );
+  process.exit(1);
+}
+checks.push(
+  `✅ Routing probe calibrated: unrouted answers "${fallbackGet}", the controls answer ` +
+    `"${controlSignature}" and "${notFoundControlSignature}"`,
+);
 
 let unrouted = 0;
 for (const [rawPath, item] of Object.entries(paths)) {
@@ -673,7 +716,7 @@ for (const [rawPath, item] of Object.entries(paths)) {
     continue;
   }
 
-  if (responseSignature(probe.response) === fallbackGet) {
+  if ((await responseSignature(probe.response)) === fallbackGet) {
     checks.push(
       `❌ ${rawPath}: advertised by the spec but no route claims ${url} — the request fell through to the ` +
         `fallback (${fallbackGet}). A client generated from this spec goes to the same place.`,
@@ -775,7 +818,7 @@ for (const [rawPath, item] of entries) {
     }
 
     const fallbackForMethod = await fallbackSignatureFor(lower);
-    if (responseSignature(req.response) === fallbackForMethod) {
+    if ((await responseSignature(req.response)) === fallbackForMethod) {
       checks.push(
         `❌ ${lower.toUpperCase()} ${resolvedPath}: not routed — answered like an absent path ` +
           `(${fallbackForMethod}), so the spec advertises an operation the server does not serve.`,
