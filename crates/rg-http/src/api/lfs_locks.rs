@@ -27,6 +27,7 @@ use crate::api::repo_access;
 use crate::error::AppError;
 use crate::AppState;
 use rg_core::lfs::locks::{self, CreateOutcome, LockFilter, UnlockOutcome};
+use rg_core::lfs::service::LfsActor;
 
 const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
 
@@ -144,63 +145,41 @@ async fn repository(
     }
 }
 
-/// Who is asking, once the gate has let them in.
-enum LockActor {
-    /// An account, or nobody on a public repository's listing.
-    User(Option<i64>),
-    /// A deploy key, through a clone made from the SSH address. It is not an
-    /// account, so it may see locks but never hold one.
-    DeployKey,
-}
-
-/// Resolve and admit the caller: the write gate for `write`, the read gate
-/// otherwise. A clone made from the SSH address presents the credential
-/// `git-lfs-authenticate` minted; it opens a write only when it was minted for
-/// `upload`, and is re-checked against the account or deploy key behind it.
-async fn admit(
+/// The actor behind the credential `git-lfs-authenticate` minted on the SSH
+/// port, when the request presents one — already re-gated against the account
+/// or deploy key behind it (`api::lfs::ssh_grant`). It opens a write only when
+/// it was minted for `upload`; either grant opens a listing.
+///
+/// `Ok(None)` means the request carries a session, a PAT or nothing, and the
+/// handler asks the repository gate itself.
+async fn ssh_granted(
     state: &AppState,
     headers: &HeaderMap,
     repo: &rg_db::entities::repository::Model,
     write: bool,
-) -> Result<LockActor, Response> {
-    use rg_core::lfs::service::{LfsActionKind, LfsActor};
-
-    let granted = crate::api::lfs::ssh_grant(state, headers, repo, |action| {
+) -> Result<Option<rg_core::lfs::service::LfsActor>, Response> {
+    use rg_core::lfs::service::LfsActionKind;
+    match crate::api::lfs::ssh_grant(state, headers, repo, |action| {
         !write || action == LfsActionKind::Upload
     })
-    .await;
-    match granted {
-        Some(Ok(LfsActor::User { user_id, .. })) => return Ok(LockActor::User(Some(user_id))),
-        Some(Ok(LfsActor::DeployKey { .. })) => return Ok(LockActor::DeployKey),
-        Some(Err(error)) => return Err(lfs_refusal(error)),
-        None => {}
+    .await
+    {
+        Some(Ok(actor)) => Ok(Some(actor)),
+        Some(Err(error)) => Err(lfs_refusal(error)),
+        None => Ok(None),
     }
-    let actor = crate::api::auth::extract_user_id(headers, &state.jwt_secret);
-    let decision = if write {
-        repo_access::check_write_for(state, repo, actor).await
-    } else {
-        repo_access::check_read_for(state, repo, actor).await
-    };
-    decision.map_err(lfs_refusal)?;
-    Ok(LockActor::User(actor))
 }
 
-/// The account a write is made by. Every lock has an owner, so a deploy key —
-/// even one that may push — cannot take or release one.
-async fn writer(
-    state: &AppState,
-    headers: &HeaderMap,
-    repo: &rg_db::entities::repository::Model,
-) -> Result<i64, Response> {
-    match admit(state, headers, repo, true).await? {
-        LockActor::User(Some(user_id)) => Ok(user_id),
-        LockActor::User(None) => Err(lfs_refusal(AppError::unauthorized(
-            "authentication required",
-        ))),
-        LockActor::DeployKey => Err(lfs_refusal(AppError::forbidden(
-            "a deploy key cannot hold an LFS lock; lock files with a user account",
-        ))),
-    }
+/// Every lock has an owner, so a deploy key — even one that may push — can
+/// neither take nor release one.
+fn deploy_key_holds_no_lock() -> Response {
+    lfs_refusal(AppError::forbidden(
+        "a deploy key cannot hold an LFS lock; lock files with a user account",
+    ))
+}
+
+fn authentication_required() -> Response {
+    lfs_refusal(AppError::unauthorized("authentication required"))
 }
 
 /// Create a lock: POST /repos/:owner/:name/lfs/locks
@@ -231,9 +210,20 @@ pub async fn create_lock(
         Ok(repo) => repo,
         Err(response) => return response,
     };
-    let user_id = match writer(&state, &headers, &repo).await {
-        Ok(user_id) => user_id,
+    let user_id = match ssh_granted(&state, &headers, &repo, true).await {
         Err(response) => return response,
+        Ok(Some(LfsActor::User { user_id, .. })) => user_id,
+        Ok(Some(LfsActor::DeployKey { .. })) => return deploy_key_holds_no_lock(),
+        Ok(None) => {
+            let actor = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
+            if let Err(error) = repo_access::check_write_for(&state, &repo, actor).await {
+                return lfs_refusal(error);
+            }
+            match actor {
+                Some(user_id) => user_id,
+                None => return authentication_required(),
+            }
+        }
     };
     let ref_name = request.git_ref.as_ref().and_then(|r| r.name.as_deref());
     match locks::create_lock(&state.db, repo.id, user_id, &request.path, ref_name).await {
@@ -278,8 +268,15 @@ pub async fn list_locks(
         Ok(repo) => repo,
         Err(response) => return response,
     };
-    if let Err(response) = admit(&state, &headers, &repo, false).await {
-        return response;
+    match ssh_granted(&state, &headers, &repo, false).await {
+        Err(response) => return response,
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let actor = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
+            if let Err(error) = repo_access::check_read_for(&state, &repo, actor).await {
+                return lfs_refusal(error);
+            }
+        }
     }
     let filter = LockFilter {
         path: query.path.as_deref(),
@@ -328,13 +325,20 @@ pub async fn verify_locks(
     };
     // A deploy key that may push asks too; it holds no lock, so every lock is
     // someone else's.
-    let holder = match admit(&state, &headers, &repo, true).await {
-        Ok(LockActor::User(Some(user_id))) => Some(user_id),
-        Ok(LockActor::User(None)) => {
-            return lfs_refusal(AppError::unauthorized("authentication required"))
-        }
-        Ok(LockActor::DeployKey) => None,
+    let holder = match ssh_granted(&state, &headers, &repo, true).await {
         Err(response) => return response,
+        Ok(Some(LfsActor::User { user_id, .. })) => Some(user_id),
+        Ok(Some(LfsActor::DeployKey { .. })) => None,
+        Ok(None) => {
+            let actor = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
+            if let Err(error) = repo_access::check_write_for(&state, &repo, actor).await {
+                return lfs_refusal(error);
+            }
+            match actor {
+                Some(user_id) => Some(user_id),
+                None => return authentication_required(),
+            }
+        }
     };
     match locks::verify_locks(
         &state.db,
@@ -385,9 +389,20 @@ pub async fn unlock(
         Ok(repo) => repo,
         Err(response) => return response,
     };
-    let user_id = match writer(&state, &headers, &repo).await {
-        Ok(user_id) => user_id,
+    let user_id = match ssh_granted(&state, &headers, &repo, true).await {
         Err(response) => return response,
+        Ok(Some(LfsActor::User { user_id, .. })) => user_id,
+        Ok(Some(LfsActor::DeployKey { .. })) => return deploy_key_holds_no_lock(),
+        Ok(None) => {
+            let actor = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
+            if let Err(error) = repo_access::check_write_for(&state, &repo, actor).await {
+                return lfs_refusal(error);
+            }
+            match actor {
+                Some(user_id) => user_id,
+                None => return authentication_required(),
+            }
+        }
     };
     // `force` is an administrator's word whether or not the lock turns out to
     // be someone else's: a writer saying it is told no, not quietly obliged

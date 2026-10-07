@@ -38,11 +38,10 @@
 //! (card_9dc9cac96edc) — which read as "Plombir Git can delete an LFS object" when
 //! nothing ever did.
 //!
-//! What is genuinely missing is a *garbage collector*: an object whose last
-//! referencing commit is gone stays on disk forever. That needs a reachability
-//! walk over the repository's history, which is a feature to design, not a
-//! function to re-add — and it must go through `BlobStorage`, not the legacy
-//! filesystem path the deleted pair reached for.
+//! The one per-object removal is the garbage collector in [`crate::lfs::gc`]:
+//! an object no ref's history points at, older than its grace period, removed
+//! when an administrator asks — through `BlobStorage` and the legacy path both,
+//! after a reachability walk over the repository's history (card_9e4dd3f8330c).
 
 use anyhow::{Context, Result};
 use chrono::Utc;

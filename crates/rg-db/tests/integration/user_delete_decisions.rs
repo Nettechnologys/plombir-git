@@ -50,6 +50,14 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "the account's own import job, targeted at a repository it is creating",
     ),
     (
+        "lfs_locks",
+        "owner_id",
+        "CASCADE",
+        "card_e8afcaf3edf6: the account's own claim on a file — it sits in somebody else's \
+         repository, but a lock whose holder is gone could only ever block that repository's \
+         pushes until an administrator forced it off, so it goes with the account",
+    ),
+    (
         "mfa_backup_codes",
         "user_id",
         "CASCADE",

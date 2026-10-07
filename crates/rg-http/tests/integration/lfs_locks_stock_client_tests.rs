@@ -14,8 +14,7 @@
 //! machine that runs this suite has. Run it with
 //! `cargo nextest run -p rg-http --run-ignored only -E 'test(/lfs_locks_stock_client/)'`.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use crate::common::{register_full, spawn_test_app};
 
@@ -38,11 +37,12 @@ async fn pat_for(base: &str, session: &str) -> String {
         .to_string()
 }
 
-/// One person's machine: a home directory of their own, so neither the host's
-/// git configuration nor the other person's credentials leak in.
+/// One person's machine. git runs through the same gateway the server uses,
+/// which closes the host's own configuration — so the LFS filters and the
+/// pre-push hook are installed per repository (`git lfs install --local`), and
+/// a clone is told about the filters on its command line.
 #[derive(Clone)]
 struct Workstation {
-    home: PathBuf,
     name: &'static str,
 }
 
@@ -51,34 +51,42 @@ struct Outcome {
     output: String,
 }
 
+/// The LFS filters a fresh clone needs before it has a configuration of its own.
+const CLONE_FILTERS: &[&str] = &[
+    "-c",
+    "filter.lfs.smudge=git-lfs smudge -- %f",
+    "-c",
+    "filter.lfs.process=git-lfs filter-process",
+    "-c",
+    "filter.lfs.clean=git-lfs clean -- %f",
+    "-c",
+    "filter.lfs.required=true",
+];
+
 impl Workstation {
-    fn new(root: &Path, name: &'static str) -> Self {
-        let home = root.join(name);
-        std::fs::create_dir_all(&home).unwrap();
-        Self { home, name }
+    fn new(name: &'static str) -> Self {
+        Self { name }
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> Outcome {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.home.join(".config"))
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_AUTHOR_NAME", self.name)
-            .env("GIT_AUTHOR_EMAIL", format!("{}@example.com", self.name))
-            .env("GIT_COMMITTER_NAME", self.name)
-            .env("GIT_COMMITTER_EMAIL", format!("{}@example.com", self.name))
-            .output()
+        let email = format!("{}@example.com", self.name);
+        let output = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run_with_env(
+                args,
+                Some(cwd),
+                &[
+                    ("GIT_AUTHOR_NAME", self.name),
+                    ("GIT_AUTHOR_EMAIL", &email),
+                    ("GIT_COMMITTER_NAME", self.name),
+                    ("GIT_COMMITTER_EMAIL", &email),
+                ],
+            )
             .expect("run git");
         Outcome {
-            success: output.status.success(),
-            output: format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
+            success: output.success(),
+            output: format!("{}{}", output.stdout_str(), output.stderr_str()),
         }
     }
 
@@ -90,6 +98,16 @@ impl Workstation {
             self.name, outcome.output
         );
         outcome.output
+    }
+
+    /// Clone `url` into `cwd/dir` and make it an LFS checkout of its own.
+    fn checkout(&self, cwd: &Path, url: &str, dir: &str) -> std::path::PathBuf {
+        let mut args: Vec<&str> = CLONE_FILTERS.to_vec();
+        args.extend(["clone", "-q", url, dir]);
+        self.ok(cwd, &args);
+        let work = cwd.join(dir);
+        self.ok(&work, &["lfs", "install", "--local"]);
+        work
     }
 }
 
@@ -126,8 +144,8 @@ async fn a_locked_file_cannot_be_pushed_by_anyone_else_until_it_is_unlocked() {
 
     let root = tempfile::tempdir().unwrap();
     let root_path = root.path().to_path_buf();
-    let alice = Workstation::new(&root_path, ALICE);
-    let bob = Workstation::new(&root_path, BOB);
+    let alice = Workstation::new(ALICE);
+    let bob = Workstation::new(BOB);
     // The clone URL the UI shows, with the PAT where a credential helper
     // would put it.
     let address = base.trim_start_matches("http://").to_string();
@@ -138,9 +156,7 @@ async fn a_locked_file_cannot_be_pushed_by_anyone_else_until_it_is_unlocked() {
     let (alice_checkout, lock_output) = {
         let (alice, root_path) = (alice.clone(), root_path.clone());
         on_machine(move || {
-            alice.ok(&root_path, &["lfs", "install"]);
-            alice.ok(&root_path, &["clone", "-q", &alice_url, "alice-work"]);
-            let work = root_path.join("alice-work");
+            let work = alice.checkout(&root_path, &alice_url, "alice-work");
             alice.ok(&work, &["lfs", "track", "--lockable", "*.level"]);
             std::fs::write(work.join("castle.level"), b"\0castle v1\0").unwrap();
             alice.ok(&work, &["add", ".gitattributes", "castle.level"]);
@@ -157,9 +173,7 @@ async fn a_locked_file_cannot_be_pushed_by_anyone_else_until_it_is_unlocked() {
     let (bob_checkout, refused) = {
         let (bob, root_path) = (bob.clone(), root_path.clone());
         on_machine(move || {
-            bob.ok(&root_path, &["lfs", "install"]);
-            bob.ok(&root_path, &["clone", "-q", &bob_url, "bob-work"]);
-            let work = root_path.join("bob-work");
+            let work = bob.checkout(&root_path, &bob_url, "bob-work");
             bob.ok(&work, &["config", "lfs.locksverify", "true"]);
             let listed = bob.ok(&work, &["lfs", "locks"]);
             assert!(

@@ -420,6 +420,11 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
          resolves in them",
     ),
     (
+        "GET /api/v1/repos/{owner}/{name}/raw/{*path}",
+        "the same gate as the blob route over the same empty repositories, so no path resolves; \
+         `lfs_file_view_tests` drives it against committed files and a private repository",
+    ),
+    (
         "GET /api/v1/repos/{owner}/{name}/mirror",
         "the fixture's repositories are ordinary repositories, not mirrors",
     ),

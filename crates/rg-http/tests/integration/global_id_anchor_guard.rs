@@ -572,8 +572,11 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// deliberate act: the census fails until the new pair is classified *and* this
 /// count is updated. It is the denominator the plan for this guard was missing.
 /// 130 since card_60a80311d512: `api::bots::delete_bot_token` takes a token id,
-/// anchored by `token.user_id == bot.id` for a bot the caller owns.
-const CENSUS_TOTAL: usize = 130;
+/// anchored by `token.user_id == bot.id` for a bot the caller owns. 131 since
+/// card_e8afcaf3edf6: `api::lfs_locks::unlock` takes a lock id, a scoped call —
+/// `rg_core::lfs::locks::unlock` receives the gated repository's id beside it
+/// and finds the lock only by both.
+const CENSUS_TOTAL: usize = 131;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

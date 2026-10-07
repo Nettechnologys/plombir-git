@@ -69,6 +69,9 @@ const OUTSIDER: &str = "foreignoutsider";
 const VAULT: &str = "foreignvault";
 /// The cache key the seeded job declares, so the cache routes have one to name.
 const CACHE_KEY: &str = "foreign-scope-key";
+/// The outsider's own repository — where they may write, so the LFS locking
+/// API's gate admits them and the question about a lock id is actually asked.
+const OUTSIDER_REPO: &str = "foreignown";
 
 /// An id no row of any kind on this instance has ever carried.
 const ABSENT_ID: i64 = 999_999;
@@ -107,6 +110,8 @@ struct Fixture {
     owner_token: String,
     /// A perfectly valid session belonging to nobody in particular.
     outsider_token: String,
+    /// An LFS lock the owner holds in the private repository.
+    lock_id: i64,
 }
 
 async fn seed(
@@ -204,6 +209,36 @@ async fn seed(
     )
 }
 
+/// A lock the owner holds in the private repository, and a repository of the
+/// outsider's own to ask about it from.
+async fn seed_lock(fx_base: &str, client: &Client, owner_token: &str, outsider_token: &str) -> i64 {
+    let created = client
+        .post(format!("{fx_base}/api/v1/repos"))
+        .bearer_auth(outsider_token)
+        .json(&serde_json::json!({ "name": OUTSIDER_REPO, "is_private": true }))
+        .send()
+        .await
+        .expect("create the outsider's repository");
+    assert_eq!(
+        created.status(),
+        201,
+        "the outsider's repository was not created"
+    );
+    let locked = client
+        .post(format!("{fx_base}/api/v1/repos/{OWNER}/{VAULT}/lfs/locks"))
+        .bearer_auth(owner_token)
+        .json(&serde_json::json!({ "path": "secret/plan.psd" }))
+        .send()
+        .await
+        .expect("lock a file");
+    assert_eq!(locked.status(), 201, "the fixture lock was not taken");
+    locked.json::<serde_json::Value>().await.expect("lock json")["lock"]["id"]
+        .as_str()
+        .expect("lock id")
+        .parse()
+        .expect("numeric lock id")
+}
+
 // ── Reading the population ─────────────────────────────────────────────────
 
 /// The placeholders of `path` that carry an instance-wide id.
@@ -254,6 +289,9 @@ enum Driver {
     /// A user session offered as the `bearer.<jwt>` subprotocol of a WebSocket
     /// handshake — the only way a browser can authenticate an upgrade.
     WsSession,
+    /// A user session over plain HTTP, for a protocol route that resolves its
+    /// own caller (the LFS locking API).
+    Session,
 }
 
 impl Driver {
@@ -261,6 +299,7 @@ impl Driver {
         match self {
             Self::RunnerToken => "runner token",
             Self::WsSession => "ws session",
+            Self::Session => "session",
         }
     }
 }
@@ -293,6 +332,10 @@ fn plan<'a>(fact: &'a RouteFact, subject: &str, fx: &Fixture) -> Option<Probe<'a
         }
     } else if fact.path == "/api/v1/ws/job/{job_id}" && subject == "job_id" {
         (Driver::WsSession, fx.job_id)
+    } else if fact.path == "/api/v1/repos/{owner}/{name}/lfs/locks/{id}/unlock" && subject == "id" {
+        // The LFS locking protocol: the outsider's session, in a repository of
+        // their own, naming the owner's lock in a private repository.
+        (Driver::Session, fx.lock_id)
     } else {
         return None;
     };
@@ -305,6 +348,8 @@ fn plan<'a>(fact: &'a RouteFact, subject: &str, fx: &Fixture) -> Option<Probe<'a
         match name {
             "id" => Some(fx.stranger.id.to_string()),
             "job_id" => Some(fx.job_id.to_string()),
+            "owner" if driver == Driver::Session => Some(OUTSIDER.to_string()),
+            "name" if driver == Driver::Session => Some(OUTSIDER_REPO.to_string()),
             _ => None,
         }
     };
@@ -359,6 +404,9 @@ async fn drive_http(fx: &Fixture, fact: &RouteFact, url: &str, token: Option<&st
     if url.ends_with("/finish") {
         request = request.json(&serde_json::json!({"status": "success", "exit_code": 0}));
     }
+    if url.ends_with("/unlock") {
+        request = request.json(&serde_json::json!({"force": false}));
+    }
     if url.ends_with("/artifacts") {
         request = request.json(&serde_json::json!({
             "name": "a.txt",
@@ -377,6 +425,10 @@ async fn drive(fx: &Fixture, probe: &Probe<'_>, url: &str, credentialed: bool) -
         Driver::WsSession => {
             let token = credentialed.then_some(fx.outsider_token.as_str());
             crate::common::ws::refusal(&fx.base, url, token).await
+        }
+        Driver::Session => {
+            let token = credentialed.then_some(fx.outsider_token.as_str());
+            drive_http(fx, probe.fact, url, token).await
         }
     }
 }
@@ -402,6 +454,7 @@ async fn no_foreign_route_tells_a_real_id_from_an_absent_one() {
         register_full(&base, OUTSIDER, &format!("{OUTSIDER}@example.com")).await;
     let client = Client::builder().build().expect("http client");
     let (mine, stranger, job_id) = seed(&base, &client, &owner_token, &db).await;
+    let lock_id = seed_lock(&base, &client, &owner_token, &outsider_token).await;
     let fx = Fixture {
         base,
         client,
@@ -410,6 +463,7 @@ async fn no_foreign_route_tells_a_real_id_from_an_absent_one() {
         job_id,
         owner_token,
         outsider_token,
+        lock_id,
     };
 
     assert!(
@@ -612,6 +666,26 @@ async fn no_foreign_route_tells_a_real_id_from_an_absent_one() {
             "  the owner of the repository cannot open their own job's log socket ({error:?}), so \
              the refusals above describe a broken fixture rather than a gate"
         )),
+    }
+
+    // The lock is real: its holder, in its own repository, can release it.
+    let unlocked = fx
+        .client
+        .post(format!(
+            "{}/api/v1/repos/{OWNER}/{VAULT}/lfs/locks/{}/unlock",
+            fx.base, fx.lock_id
+        ))
+        .bearer_auth(&fx.owner_token)
+        .json(&serde_json::json!({"force": false}))
+        .send()
+        .await
+        .expect("the owner unlocks their own lock");
+    if unlocked.status() != StatusCode::OK {
+        dead.push(format!(
+            "  the holder of the fixture lock could not unlock it in its own repository ({}), so \
+             the refusals above describe a missing lock rather than a scoped one",
+            unlocked.status()
+        ));
     }
 
     assert!(

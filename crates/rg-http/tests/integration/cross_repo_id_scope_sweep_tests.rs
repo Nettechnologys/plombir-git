@@ -975,6 +975,13 @@ fn coverage(tail: &str, ids: &Ids) -> Coverage {
             probe(&[("asset_id", ids.asset)])
         }
 
+        "/lfs/locks/{id}/unlock" => Coverage::Skipped(
+            "the Git LFS locking protocol is `Foreign`: it also admits the credential \
+             `git-lfs-authenticate` mints, which this sweep cannot hold. \
+             `foreign_id_scope_sweep_tests` drives the same question — a lock id from a private \
+             repository, named from a repository of the caller's own — with a session, and \
+             `lfs_locks_tests` pins the `404`",
+        ),
         "/collaborators/{id}" => Coverage::Skipped(
             "`{id}` is a user id, and a collaboration is keyed `(repo_id, user_id)`: the id \
              names a person, not a row belonging to another repository, so a cross-repository \
@@ -1258,6 +1265,13 @@ async fn no_repository_scoped_route_reaches_another_repositorys_rows() {
             continue;
         }
         if !fact.access.is_repo_scoped() {
+            // A protocol route resolves its own caller, so this sweep cannot
+            // drive it; it is classified only by a signed reason naming where
+            // the same question is asked instead.
+            if let Coverage::Skipped(reason) = coverage(tail, &ids) {
+                skipped.push(format!("  {} — {reason}", fact.label()));
+                continue;
+            }
             unclassified.push(format!(
                 "  {} — carries a global id but declares {:?}, which this sweep cannot drive",
                 fact.label(),

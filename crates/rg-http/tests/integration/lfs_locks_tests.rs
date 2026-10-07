@@ -327,3 +327,68 @@ async fn locks_are_taken_listed_verified_and_released_by_the_right_people() {
         "the namesake inherited a lock"
     );
 }
+
+/// A lock id is instance-wide, and the unlock route takes it from the path. A
+/// writer of one repository naming a lock in another — a private one they
+/// cannot see — has to get exactly the answer an id nobody ever held gets, or
+/// walking the ids enumerates every lock on the instance.
+#[tokio::test]
+async fn a_lock_id_from_another_repository_is_answered_like_one_that_never_existed() {
+    let base = spawn_test_app().await;
+    let (owner_session, _) = register_full(&base, OWNER, "lock_admin@example.com").await;
+    let (outsider_session, _) =
+        register_full(&base, "lock_outsider", "lock_outsider@example.com").await;
+    let owner = Caller {
+        name: OWNER,
+        pat: pat_for(&base, &owner_session).await,
+    };
+    let outsider = Caller {
+        name: "lock_outsider",
+        pat: pat_for(&base, &outsider_session).await,
+    };
+    for (session, name) in [(&owner_session, REPO), (&outsider_session, "own")] {
+        let created = reqwest::Client::new()
+            .post(format!("{base}/api/v1/repos"))
+            .bearer_auth(session)
+            .json(&serde_json::json!({ "name": name, "is_private": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201);
+    }
+    let (status, body) = lock(&base, &owner, "secret/plan.psd").await;
+    assert_eq!(status, 201, "{body}");
+    let lock_id = body["lock"]["id"].as_str().unwrap().to_string();
+
+    let unlock_in_own = |id: String| {
+        let outsider = &outsider;
+        let base = &base;
+        async move {
+            call(
+                reqwest::Method::POST,
+                &format!("{base}/git/lock_outsider/own.git/info/lfs/locks/{id}/unlock"),
+                Some(outsider),
+                Some(serde_json::json!({"force": false})),
+            )
+            .await
+        }
+    };
+    // Each answer carries its own request id; everything else has to match.
+    let without_request_id = |(status, mut body): (reqwest::StatusCode, serde_json::Value)| {
+        if let Some(error) = body.get_mut("error").and_then(|e| e.as_object_mut()) {
+            error.remove("request_id");
+        }
+        (status, body)
+    };
+    let foreign = without_request_id(unlock_in_own(lock_id.clone()).await);
+    let absent = without_request_id(unlock_in_own("999999".to_string()).await);
+    assert_eq!(foreign.0, 404, "{}", foreign.1);
+    assert_eq!(
+        foreign, absent,
+        "a foreign lock id was answered differently from an absent one"
+    );
+
+    // And the lock is still there for its holder.
+    let (status, _) = unlock(&base, &owner, &lock_id, false).await;
+    assert_eq!(status, 200);
+}

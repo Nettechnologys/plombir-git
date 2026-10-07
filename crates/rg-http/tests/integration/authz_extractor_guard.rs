@@ -129,6 +129,11 @@ const SIGNED_OFF: &[(&str, &str)] = &[
         "Git LFS batch protocol: its own error envelope, gated per-operation",
     ),
     (
+        "api/lfs_locks.rs",
+        "Git LFS locking protocol: admits the credential `git-lfs-authenticate` mints as well as \
+         a session or PAT, answers in the protocol's own body, gated per-operation",
+    ),
+    (
         "ws.rs",
         "job-log WebSocket: the token arrives in `Sec-WebSocket-Protocol` or `?token=`, not in \
          `Authorization`, so a headers-based gate does not reach it",
@@ -144,7 +149,7 @@ const SIGNED_OFF: &[(&str, &str)] = &[
 /// no database, and the job-log socket had its own copy of the read check. The
 /// permission predicates below are therefore off-limits here — the decision has
 /// to come from `api::repo_access`, whatever the credential looked like.
-const TRANSPORTS: &[&str] = &["oci.rs", "api/lfs.rs", "ws.rs"];
+const TRANSPORTS: &[&str] = &["oci.rs", "api/lfs.rs", "api/lfs_locks.rs", "ws.rs"];
 
 /// The raw permission predicates. Calling one is deciding access.
 ///
