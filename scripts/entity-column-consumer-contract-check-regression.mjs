@@ -11,7 +11,6 @@
 // Each fixture below breaks exactly one thing and names the sentence the check
 // must produce. A green stand is the only reason to believe a green check.
 
-import { spawnSync } from 'node:child_process';
 import {
   appendFileSync,
   cpSync,
@@ -24,6 +23,8 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { runFixtures, runNode } from './lib/fixture-pool.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const check = join(root, 'scripts', 'entity-column-consumer-contract-check.mjs');
@@ -51,7 +52,12 @@ function edit(file, before, after) {
   writeFileSync(file, source.replace(before, after));
 }
 
-function runFixture(name, mutate, expectedStatus, expectedOutput) {
+// Fixtures are declared in order below and run together at the end of the
+// file, side by side; see `lib/fixture-pool.mjs`.
+const fixtures = [];
+
+/** Build one fixture, run the check over it, and resolve to the failure or `null`. */
+async function verdict({ name, mutate, expectedStatus, expectedOutput }) {
   const fixture = fixtureRoot();
   try {
     if (mutate) {
@@ -62,18 +68,19 @@ function runFixture(name, mutate, expectedStatus, expectedOutput) {
         board: join(fixture, 'crates', 'rg-db', 'src', 'entities', 'board.rs'),
       });
     }
-    const result = spawnSync(process.execPath, [check], { cwd: fixture, encoding: 'utf8' });
-    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
-    if (result.status !== expectedStatus || !output.includes(expectedOutput)) {
-      throw new Error(
-        `${name}: expected exit ${expectedStatus} and ${JSON.stringify(expectedOutput)}, got exit ` +
-          `${result.status}\n${output}`,
-      );
+    const { status, output } = await runNode([check], { cwd: fixture });
+    if (status !== expectedStatus || !output.includes(expectedOutput)) {
+      return `${name}: expected exit ${expectedStatus} and ${JSON.stringify(expectedOutput)}, got exit ` +
+        `${status}\n${output}`;
     }
-    console.log(`✅ ${name}`);
+    return null;
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
+}
+
+function runFixture(name, mutate, expectedStatus, expectedOutput) {
+  fixtures.push({ name, mutate, expectedStatus, expectedOutput });
 }
 
 /**
@@ -204,5 +211,20 @@ runFixture(
   1,
   'no production Rust outside the entity modules',
 );
+
+const results = await runFixtures(fixtures, verdict);
+let failed = 0;
+for (const [index, { value: failure, error }] of results.entries()) {
+  if (error) {
+    failed += 1;
+    console.error(`❌ ${fixtures[index].name}: the fixture could not be built:\n${error.stack ?? error}`);
+  } else if (failure) {
+    failed += 1;
+    console.error(`❌ ${failure}`);
+  } else {
+    console.log(`✅ ${fixtures[index].name}`);
+  }
+}
+if (failed > 0) process.exit(1);
 
 console.log('entity column consumer regression stand ok');

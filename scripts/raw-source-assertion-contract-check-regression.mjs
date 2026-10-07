@@ -9,17 +9,20 @@
 // `scripts/lib/` is a copy of the real one, so the normalizer set is discovered
 // the same way it is on `main`, and asserts which side the gate lands on.
 
-import { spawnSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { runFixtures, runNode } from './lib/fixture-pool.mjs';
+
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptsDir, '..');
 const check = join(scriptsDir, 'raw-source-assertion-contract-check.mjs');
 
-let failed = 0;
+// Cases are declared in order below and run together at the end of the file,
+// side by side; see `lib/fixture-pool.mjs`.
+const cases = [];
 
 /**
  * Run the real check against a fixture holding `files` under `scripts/`.
@@ -27,8 +30,10 @@ let failed = 0;
  * `expect.red` states which side the run must land on; `expect.mentions` and
  * `expect.silent` pin the diagnostic, because a check that goes red for the
  * wrong reason is not evidence about the reason it was written for.
+ *
+ * Resolves to the failure message, or `null` when the case held.
  */
-function runCase(name, { files, env = {}, withLib = true, expect }) {
+async function verdict(name, { files, env = {}, withLib = true, expect }) {
   const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-raw-rust-assert-'));
   try {
     mkdirSync(join(fixture, 'scripts'), { recursive: true });
@@ -37,39 +42,31 @@ function runCase(name, { files, env = {}, withLib = true, expect }) {
       writeFileSync(join(fixture, 'scripts', file), body);
     }
 
-    const result = spawnSync(process.execPath, [check], {
+    const { status, output } = await runNode([check], {
       cwd: fixture,
       env: { ...process.env, PLOMBIR_GIT_RAW_SOURCE_ASSERT_ROOT: fixture, ...env },
-      encoding: 'utf8',
     });
-    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
-    const red = result.status !== 0;
+    const red = status !== 0;
 
     if (red !== expect.red) {
-      console.error(
-        `❌ ${name}: expected the gate to go ${expect.red ? 'red' : 'green'}, it went ${red ? 'red' : 'green'}:\n${output}`,
-      );
-      failed += 1;
-      return;
+      return `${name}: expected the gate to go ${expect.red ? 'red' : 'green'}, it went ${red ? 'red' : 'green'}:\n${output}`;
     }
     for (const needle of expect.mentions ?? []) {
-      if (!output.includes(needle)) {
-        console.error(`❌ ${name}: the diagnostic never named ${needle}:\n${output}`);
-        failed += 1;
-        return;
-      }
+      if (!output.includes(needle)) return `${name}: the diagnostic never named ${needle}:\n${output}`;
     }
     for (const needle of expect.silent ?? []) {
       if (output.includes(needle)) {
-        console.error(`❌ ${name}: the diagnostic named ${needle}, which is not the defect:\n${output}`);
-        failed += 1;
-        return;
+        return `${name}: the diagnostic named ${needle}, which is not the defect:\n${output}`;
       }
     }
-    console.log(`✅ ${name}`);
+    return null;
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
+}
+
+function runCase(name, spec) {
+  cases.push({ name, spec });
 }
 
 const PATHS = `import { readFileSync } from 'node:fs';
@@ -1163,6 +1160,20 @@ runCase('a missing scripts/lib is rejected rather than passed over', {
   withLib: false,
   expect: { red: true, mentions: ['normalizer set'] },
 });
+
+let failed = 0;
+const results = await runFixtures(cases, ({ name, spec }) => verdict(name, spec));
+for (const [index, { value: failure, error }] of results.entries()) {
+  if (error) {
+    failed += 1;
+    console.error(`❌ ${cases[index].name}: the fixture could not be built:\n${error.stack ?? error}`);
+  } else if (failure) {
+    failed += 1;
+    console.error(`❌ ${failure}`);
+  } else {
+    console.log(`✅ ${cases[index].name}`);
+  }
+}
 
 if (failed > 0) {
   console.error(`❌ raw-source-assertion mutation stand: ${failed} case(s) failed`);

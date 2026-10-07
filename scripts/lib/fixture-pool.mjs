@@ -22,9 +22,9 @@ import { availableParallelism } from 'node:os';
  * used. A child still running at `timeout` milliseconds is killed and reported
  * by its signal — never as a pass.
  */
-export function runNode(args, { cwd, timeout = 120_000 } = {}) {
+export function runNode(args, { cwd, env, timeout = 120_000 } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
