@@ -734,10 +734,10 @@ export function buildInventory() {
   };
 
   // Which suites prove a route. Every control that reaches a route asks again,
-  // and the answer depends on the route alone — symbols and rivals are both
-  // functions of it — so it is computed once per route, not once per control.
-  // That repeat was most of the oracle's run, and the oracle runs once per
-  // fixture in its mutation stand.
+  // and so does the route's own row below; the answer depends on the route
+  // alone — symbols and rivals are both functions of it — so it is computed
+  // once per route. That repeat was most of the oracle's run, and the oracle
+  // runs once per fixture in its mutation stand.
   const testedInByRoute = new Map();
   const testedInOf = (route) => {
     const key = `${route.method} ${route.url}`;
@@ -863,7 +863,7 @@ export function buildInventory() {
       url: r.url,
       access: r.access,
       handler: r.handler,
-      testedIn: touchedBy(coverage, r.method, r.url, symbolsOf(r.method, r.url), rivalsOf(r.url)),
+      testedIn: testedInOf(r),
       reachedFromUi: r.url ? reachedUrls.has(`${r.method} ${r.url}`) : false,
     })),
     layouts,

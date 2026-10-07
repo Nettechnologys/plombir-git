@@ -27,8 +27,30 @@ const REGEX_KEYWORDS = new Set([
   'else', 'case', 'yield', 'await', 'throw',
 ]);
 
-const IDENT_START = /[A-Za-z_$]/;
-const IDENT_PART = /[A-Za-z0-9_$]/;
+// Character classes as code-unit comparisons: the scanner asks one of these at
+// nearly every character of every corpus file, and a regex test per character
+// was most of its time. Each is exactly the class its comment spells.
+
+/** `[A-Za-z_$]` */
+const isIdentStart = (code) =>
+  (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95 || code === 36;
+/** `[A-Za-z0-9_$]` */
+const isIdentPart = (code) => isIdentStart(code) || (code >= 48 && code <= 57);
+/** `[0-9]` */
+const isDigit = (code) => code >= 48 && code <= 57;
+/** `[0-9a-fA-FxXoObBn_.]` */
+const isNumberPart = (code) =>
+  isDigit(code)
+  || (code >= 97 && code <= 102)
+  || (code >= 65 && code <= 70)
+  || code === 120 || code === 88 || code === 111 || code === 79
+  || code === 98 || code === 66 || code === 110 || code === 95 || code === 46;
+/** `\s`: the ASCII spaces by code, anything else by the regex itself. */
+const isSpace = (ch) => {
+  const code = ch.charCodeAt(0);
+  if (code < 128) return code === 32 || (code >= 9 && code <= 13);
+  return /\s/.test(ch);
+};
 
 /** End index (exclusive) of the quoted literal opening at `start`. */
 function quotedEnd(source, start) {
@@ -66,7 +88,7 @@ function regexEnd(source, start) {
       inClass = true;
     } else if (ch === '/') {
       i += 1;
-      while (i < source.length && IDENT_PART.test(source[i])) i += 1;
+      while (i < source.length && isIdentPart(source.charCodeAt(i))) i += 1;
       return i;
     }
     i += 1;
@@ -84,7 +106,10 @@ function regexEnd(source, start) {
  * detector reading the code view.
  */
 function scanJs(source, { blankLiterals }) {
-  let out = '';
+  // The view is the source with some spans blanked, so code is never appended:
+  // a verbatim stretch is copied as one slice when a blank interrupts it.
+  const parts = [];
+  let copied = 0;
   let i = 0;
   // Whether the previous significant token can END an expression. `/` after
   // such a token is division; anywhere else it opens a regex.
@@ -94,18 +119,18 @@ function scanJs(source, { blankLiterals }) {
   // an object literal inside an interpolation cannot close it early.
   const templates = [];
 
-  const emitLiteral = (end) => {
-    const span = source.slice(i, end);
-    out += blankLiterals ? blankExceptNewlines(span) : span;
-    i = end;
-  };
   const emitBlank = (end) => {
-    out += blankExceptNewlines(source.slice(i, end));
+    if (i > copied) parts.push(source.slice(copied, i));
+    parts.push(blankExceptNewlines(source.slice(i, end)));
+    copied = end;
     i = end;
   };
   const emitCode = (end) => {
-    out += source.slice(i, end);
     i = end;
+  };
+  const emitLiteral = (end) => {
+    if (blankLiterals) emitBlank(end);
+    else emitCode(end);
   };
 
   // The literal chunk of a template, up to `${` or the closing backtick.
@@ -124,14 +149,12 @@ function scanJs(source, { blankLiterals }) {
   };
 
   while (i < source.length) {
-    const two = source.slice(i, i + 2);
-
-    if (two === '//') {
+    if (source[i] === '/' && source[i + 1] === '/') {
       const nl = source.indexOf('\n', i + 2);
       emitBlank(nl < 0 ? source.length : nl);
       continue;
     }
-    if (two === '/*') {
+    if (source[i] === '/' && source[i + 1] === '*') {
       const close = source.indexOf('*/', i + 2);
       emitBlank(close < 0 ? source.length : close + 2);
       continue;
@@ -197,28 +220,29 @@ function scanJs(source, { blankLiterals }) {
         continue;
       }
     }
-    if (IDENT_START.test(source[i])) {
+    if (isIdentStart(source.charCodeAt(i))) {
       let j = i + 1;
-      while (j < source.length && IDENT_PART.test(source[j])) j += 1;
+      while (j < source.length && isIdentPart(source.charCodeAt(j))) j += 1;
       const word = source.slice(i, j);
       emitCode(j);
       afterValue = !REGEX_KEYWORDS.has(word);
       continue;
     }
-    if (/[0-9]/.test(source[i])) {
+    if (isDigit(source.charCodeAt(i))) {
       let j = i;
-      while (j < source.length && /[0-9a-fA-FxXoObBn_.]/.test(source[j])) j += 1;
+      while (j < source.length && isNumberPart(source.charCodeAt(j))) j += 1;
       emitCode(j);
       afterValue = true;
       continue;
     }
     const ch = source[i];
     emitCode(i + 1);
-    if (!/\s/.test(ch)) afterValue = ch === ')' || ch === ']';
+    if (!isSpace(ch)) afterValue = ch === ')' || ch === ']';
     continue;
   }
 
-  return out;
+  if (i > copied) parts.push(source.slice(copied, i));
+  return parts.join('');
 }
 
 /** Comments and literal bodies blanked — the view structure is read in. */

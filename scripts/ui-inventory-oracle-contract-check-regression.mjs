@@ -476,8 +476,8 @@ const mutations = [
     apply: (fixture) => patch(
       fixture,
       'scripts/ui-inventory.mjs',
-      'testedIn: touchedBy(coverage, r.method, r.url, symbolsOf(r.method, r.url), rivalsOf(r.url)),',
-      'testedIn: touchedBy(coverage, r.method, r.url, symbolsOf(r.method, r.url)),',
+      '        symbolsOf(route.method, route.url),\n        rivalsOf(route.url),\n      );',
+      '        symbolsOf(route.method, route.url),\n      );',
     ),
   },
   {
