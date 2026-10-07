@@ -54,7 +54,21 @@ impl CapturedLogs {
 /// advertisement test needs to tell "shown" from "hidden".
 pub(crate) fn repository_with_server_private_refs(dir: &std::path::Path) -> std::path::PathBuf {
     let repo_path = dir.join("private-refs.git");
-    let repo = gix::init_bare(&repo_path).expect("init bare repository");
+    // Through the server's own two points — the git gateway and
+    // `repository::open` — so the fixture is not a repository opened on the
+    // host's terms (`repository_open_ownership_guard` reads this file as
+    // production: the `cfg(test)` sits on its `mod` line in `lib.rs`).
+    crate::cli_gateway::global_gateway()
+        .as_ref()
+        .expect("git gateway")
+        .run(
+            &["init", "-q", "--bare", &repo_path.to_string_lossy()],
+            None,
+        )
+        .expect("run git init")
+        .ensure_success()
+        .expect("git init --bare");
+    let repo = crate::repository::open(&repo_path).expect("open bare repository");
     let id = repo.write_blob(b"advertised").expect("write blob").detach();
     for refname in [
         "refs/heads/main",
