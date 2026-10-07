@@ -601,7 +601,7 @@ async fn handle_ls_refs<W: AsyncWrite + Unpin>(
     }
 
     let ref_data: RefData = {
-        let advertisement = crate::ref_advertisement::collect(repo_path)
+        let advertisement = crate::ref_advertisement::collect_for_clients(repo_path)
             .context("failed to collect references for ls-refs")?;
 
         let mut ref_entries: Vec<(String, String, Option<String>)> = Vec::new();
@@ -1212,6 +1212,24 @@ async fn stream_packfile<W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use crate::test_support::CapturedLogs;
+
+    #[tokio::test]
+    async fn ls_refs_does_not_list_the_server_private_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = crate::test_support::repository_with_server_private_refs(dir.path());
+        let mut output = Vec::new();
+
+        handle_ls_refs(&repo_path, &mut output, &[], false, true, true, &[])
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("refs/heads/main"), "{output}");
+        assert!(
+            crate::test_support::server_private_refs_in(&output).is_empty(),
+            "{output}"
+        );
+    }
 
     #[tokio::test]
     async fn ls_refs_advertises_only_an_explicitly_unborn_head_as_unborn() {

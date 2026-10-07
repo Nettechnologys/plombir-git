@@ -724,15 +724,19 @@ async fn record_pr_head(db: &sea_orm::DatabaseConnection, pr_id: i64, head_sha: 
         .expect("record the rewritten PR head");
 }
 
-/// Opening a fork PR computes its diff, and the diff copies the fork branch
-/// into the base repository's `refs/forks/<namespace>/<branch>` and leaves it
-/// there. Both that diff and the merge fetched into the ref with an unforced
+/// Opening a fork PR computes its diff, and the diff used to copy the fork
+/// branch into the base repository's `refs/forks/<namespace>/<branch>` and
+/// leave it there. Both that diff and the merge fetched into the ref with an unforced
 /// refspec, so once the author rewrote the branch — an amend, a rebase — git
 /// refused the non-fast-forward update and the pull request could neither be
 /// diffed nor merged again: `500` for good.
 ///
 /// The steps are ordered so each fetch site meets a stale ref on its own: the
 /// diff after the first rewrite, the merge after the second.
+///
+/// card_18044eadb6d6: neither leaves a ref behind any more — the one an older
+/// version left is removed too — and no advertisement shows a client the
+/// server's scratch namespaces.
 #[tokio::test]
 async fn a_fork_pull_request_diffs_and_merges_after_its_branch_is_rewritten() {
     let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
@@ -775,8 +779,18 @@ async fn a_fork_pull_request_diffs_and_merges_after_its_branch_is_rewritten() {
     let number = created["number"].as_i64().expect("created PR number");
     let pr_id = created["id"].as_i64().expect("created PR id");
 
+    let base_path = repo_root.join("pr-rewrite-owner/pr-rewrite-repo.git");
     let first = rewrite_fork_branch(&fork_path, fork_branch, "first rewrite\n");
     record_pr_head(&db, pr_id, &first).await;
+    // What an earlier version left in the base repository, and the merge
+    // queue's own ref.
+    let main_sha = git_stdout(&["rev-parse", "refs/heads/main"], Some(&base_path));
+    for scratch in [
+        format!("refs/forks/pr-rewrite-head/{fork_branch}"),
+        "refs/merge-queue/1".to_string(),
+    ] {
+        git_stdout(&["update-ref", &scratch, &main_sha], Some(&base_path));
+    }
     let diff = client
         .get(format!("{pulls_url}/{number}/diff"))
         .bearer_auth(&owner_token)
@@ -793,6 +807,31 @@ async fn a_fork_pull_request_diffs_and_merges_after_its_branch_is_rewritten() {
         diff_body.contains("first rewrite"),
         "the diff must show the rewritten branch, not the cached one: {diff_body}"
     );
+
+    assert_eq!(
+        git_stdout(&["for-each-ref", "refs/forks"], Some(&base_path)),
+        "",
+        "the diff leaves no fork ref in the base repository"
+    );
+    for service in ["git-upload-pack", "git-receive-pack"] {
+        let advertised = client
+            .get(format!(
+                "{base}/git/pr-rewrite-owner/pr-rewrite-repo/info/refs?service={service}"
+            ))
+            .basic_auth("pr-rewrite-owner", Some(&owner_token))
+            .send()
+            .await
+            .expect("info/refs request");
+        assert_eq!(advertised.status(), 200, "{service}");
+        let advertised = advertised.text().await.unwrap();
+        assert!(advertised.contains("refs/heads/main"), "{advertised}");
+        for private in ["refs/forks/", "refs/merge-queue/"] {
+            assert!(
+                !advertised.contains(private),
+                "{service} advertises {private}: {advertised}"
+            );
+        }
+    }
 
     let second = rewrite_fork_branch(&fork_path, fork_branch, "second rewrite\n");
     record_pr_head(&db, pr_id, &second).await;
@@ -817,6 +856,11 @@ async fn a_fork_pull_request_diffs_and_merges_after_its_branch_is_rewritten() {
     assert_eq!(
         merged, "second rewrite",
         "the merge must carry the branch as it was rewritten last"
+    );
+    assert_eq!(
+        git_stdout(&["for-each-ref", "refs/forks"], Some(&base_path)),
+        "",
+        "the merge leaves no fork ref in the base repository"
     );
 }
 

@@ -233,7 +233,7 @@ where
 
 /// Build the list of refs with their SHAs for advertisement.
 fn build_ref_list(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    let advertisement = crate::ref_advertisement::collect(repo_path)?;
+    let advertisement = crate::ref_advertisement::collect_for_clients(repo_path)?;
     let mut refs = advertisement.refs;
 
     if let Some(head_oid) = advertisement.head_oid {
@@ -1362,6 +1362,17 @@ mod landed_push_tests {
 #[cfg(test)]
 mod ref_advertisement_tests {
     use super::build_ref_list;
+
+    #[test]
+    fn receive_pack_does_not_advertise_the_server_private_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = crate::test_support::repository_with_server_private_refs(dir.path());
+
+        let refs = build_ref_list(&repo_path).unwrap();
+        let names: Vec<&str> = refs.iter().map(|(_, name)| name.as_str()).collect();
+
+        assert_eq!(names, ["HEAD", "refs/heads/main", "refs/tags/v1"]);
+    }
 
     #[test]
     fn receive_pack_keeps_the_protocol_null_ref_for_an_unborn_repository() {

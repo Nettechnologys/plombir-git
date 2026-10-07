@@ -986,7 +986,7 @@ fn build_info_refs(repo_path: &std::path::Path, service: &str) -> Result<String>
     buf.push_str(&svc_line);
     buf.push_str("0000");
 
-    let advertisement = rg_git::ref_advertisement::collect(repo_path)
+    let advertisement = rg_git::ref_advertisement::collect_for_clients(repo_path)
         .context("failed to collect repository refs")?;
     let mut ref_list = advertisement.refs;
 

@@ -48,3 +48,32 @@ impl CapturedLogs {
         String::from_utf8_lossy(&self.0.lock().expect("log lock")).into_owned()
     }
 }
+
+/// A bare repository whose `main`, a tag, and one ref in each of the server's
+/// private namespaces all point at one stored object — the shape every
+/// advertisement test needs to tell "shown" from "hidden".
+pub(crate) fn repository_with_server_private_refs(dir: &std::path::Path) -> std::path::PathBuf {
+    let repo_path = dir.join("private-refs.git");
+    let repo = gix::init_bare(&repo_path).expect("init bare repository");
+    let id = repo.write_blob(b"advertised").expect("write blob").detach();
+    for refname in [
+        "refs/heads/main",
+        "refs/tags/v1",
+        "refs/forks/alice/feature",
+        "refs/merge-queue/7",
+    ] {
+        let path = repo_path.join(refname);
+        std::fs::create_dir_all(path.parent().expect("ref directory")).expect("ref directory");
+        std::fs::write(path, format!("{id}\n")).expect("write ref");
+    }
+    std::fs::write(repo_path.join("HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+    repo_path
+}
+
+/// Every server-private ref name `text` mentions.
+pub(crate) fn server_private_refs_in(text: &str) -> Vec<&'static str> {
+    ["refs/forks/", "refs/merge-queue/"]
+        .into_iter()
+        .filter(|namespace| text.contains(namespace))
+        .collect()
+}

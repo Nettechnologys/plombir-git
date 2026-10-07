@@ -762,31 +762,43 @@ pub async fn compute_diff(
         let head_repo_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
 
         let fetch_ref = format!("refs/heads/{}", pr.head_branch);
-        let local_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
+        let local_ref = scratch_fork_ref();
+        let legacy_ref = legacy_fork_ref(&head_namespace, &pr.head_branch);
         let base_path = base_repo_path;
         let pr_clone = pr.clone();
         return crate::blocking::run_blocking_git(
             "fetching and diffing a fork pull request",
             move || {
-                // Do not let a failed fetch silently reuse an old `refs/forks/...`
-                // ref: a deleted head branch is stale PR state (409), whereas an
+                // A deleted head branch is stale PR state (409), whereas an
                 // unreadable fork repository or failed fetch is retryable (5xx).
                 require_pull_request_branch(&head_repo_path, "head", &pr_clone.head_branch)?;
-                let git = rg_git::cli_gateway::global_gateway()
-                    .as_ref()
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let fetch_output = git.run(
-                    &[
-                        "fetch",
-                        &head_repo_path.to_string_lossy(),
-                        &fork_fetch_refspec(&fetch_ref, &local_ref),
-                    ],
-                    Some(&base_path),
-                )?;
-                fetch_output
-                    .ensure_success()
-                    .context("failed to fetch pull request head branch")?;
-                compute_cross_repo_diff(&base_path, &pr_clone.base_branch, &local_ref, &pr_clone)
+                let diffed = (|| {
+                    let git = rg_git::cli_gateway::global_gateway()
+                        .as_ref()
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    let fetch_output = git.run(
+                        &[
+                            "fetch",
+                            &head_repo_path.to_string_lossy(),
+                            &fork_fetch_refspec(&fetch_ref, &local_ref),
+                        ],
+                        Some(&base_path),
+                    )?;
+                    fetch_output
+                        .ensure_success()
+                        .context("failed to fetch pull request head branch")?;
+                    compute_cross_repo_diff(
+                        &base_path,
+                        &pr_clone.base_branch,
+                        &local_ref,
+                        &pr_clone,
+                    )
+                })();
+                // In the same phase as the fetch, however the diff went: the
+                // ref exists only so the diff can name the fork's head.
+                discard_fork_ref(&base_path, &local_ref);
+                discard_legacy_fork_ref(&base_path, &legacy_ref);
+                diffed
             },
         )
         .await;
@@ -4031,8 +4043,9 @@ async fn merge_claimed_pr(
         let head_repo_path = repo_root.join(format!("{}/{}.git", head_namespace, head_repo.name));
 
         let fetch_ref = format!("refs/heads/{}", pr.head_branch);
-        let local_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
-        let merge_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
+        let local_ref = scratch_fork_ref();
+        let merge_ref = local_ref.clone();
+        let legacy_ref = legacy_fork_ref(&head_namespace, &pr.head_branch);
         let expected_head_sha = expected_head_sha.map(str::to_owned);
         let repo_path_for_git = repo_path.clone();
         let pr_for_git = pr.clone();
@@ -4123,6 +4136,7 @@ async fn merge_claimed_pr(
         let merge_commit_sha = tokio::task::spawn_blocking(move || -> Result<String> {
             let merged = merge_head_rev(&repo_path_for_git, &pr_for_git, &head_sha, strategy);
             discard_fork_ref(&repo_path_for_git, &merge_ref);
+            discard_legacy_fork_ref(&repo_path_for_git, &legacy_ref);
             merged
         })
         .await??;
@@ -4902,23 +4916,51 @@ fn merge_signature_time() -> String {
     format!("{seconds} +0000")
 }
 
-/// Delete a reference using gix (replaces `git update-ref -d <ref>`).
 /// The refspec that copies a fork's head branch into the base repository's
-/// scratch ref `refs/forks/<namespace>/<branch>`.
+/// scratch ref.
 ///
-/// Forced, because that ref is a cache of the fork branch and not history the
-/// base repository owns. Both the diff and the merge write it, and the diff
-/// never removes it, so a plain `<src>:<dst>` refspec made the first rewrite of
-/// the fork branch — a rebase, an amended commit — a non-fast-forward update
-/// git refuses. From then on every diff and every merge of that pull request
-/// answered `500` until someone deleted the ref by hand.
+/// Forced, because that ref is a copy of the fork branch and not history the
+/// base repository owns. When the ref was shared per branch and outlived the
+/// diff, a plain `<src>:<dst>` refspec made the first rewrite of the fork
+/// branch — a rebase, an amended commit — a non-fast-forward update git
+/// refused, and every diff and merge of that pull request answered `500`.
 fn fork_fetch_refspec(fetch_ref: &str, local_ref: &str) -> String {
     format!("+{fetch_ref}:{local_ref}")
 }
 
-/// Remove a merge's scratch fork ref, logging rather than failing: the merge
-/// has already been decided by the time this runs, and a leftover ref is
-/// overwritten by the next forced fetch anyway.
+/// A scratch ref for one diff or merge of a fork pull request:
+/// `refs/forks/<uuid>`.
+///
+/// One per operation, not `refs/forks/<namespace>/<branch>` per pull request.
+/// The shared name lived on in the base repository after every diff, went out
+/// in every advertisement with the fork's branch name in it, and let two
+/// operations on the same pull request fetch over — and delete — each other's
+/// ref. Every operation removes its own in the phase that fetched it.
+fn scratch_fork_ref() -> String {
+    format!("refs/forks/{}", uuid::Uuid::new_v4().simple())
+}
+
+/// The per-pull-request scratch ref earlier versions left behind.
+fn legacy_fork_ref(head_namespace: &str, head_branch: &str) -> String {
+    format!("refs/forks/{head_namespace}/{head_branch}")
+}
+
+/// Remove the per-pull-request scratch ref an earlier version left in the
+/// base repository, if there is one. Quiet when there is not: that is every
+/// pull request opened since.
+fn discard_legacy_fork_ref(repo_path: &std::path::Path, ref_name: &str) {
+    let exists = rg_git::repository::open(repo_path).is_ok_and(|repo| {
+        repo.try_find_reference(ref_name)
+            .is_ok_and(|reference| reference.is_some())
+    });
+    if exists {
+        discard_fork_ref(repo_path, ref_name);
+    }
+}
+
+/// Remove a diff's or merge's scratch fork ref, logging rather than failing:
+/// the outcome has been decided by the time this runs, and a leftover is a ref
+/// no client is shown and nothing reads again.
 fn discard_fork_ref(repo_path: &std::path::Path, ref_name: &str) {
     if let Err(error) = gix_delete_ref(repo_path, ref_name) {
         tracing::warn!(
@@ -4987,6 +5029,7 @@ async fn adopt_fork_lfs_objects(
     )))
 }
 
+/// Delete a reference using gix (replaces `git update-ref -d <ref>`).
 fn gix_delete_ref(repo_path: &std::path::Path, ref_name: &str) -> Result<()> {
     let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;

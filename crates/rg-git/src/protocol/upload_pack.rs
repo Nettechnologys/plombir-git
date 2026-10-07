@@ -52,7 +52,7 @@ async fn upload_pack_stream_impl<S>(repo_path: &Path, stream: &mut S) -> Result<
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let advertisement = crate::ref_advertisement::collect(repo_path)?;
+    let advertisement = crate::ref_advertisement::collect_for_clients(repo_path)?;
     let ref_list = build_ref_advertisement_vec(advertisement.refs, advertisement.head_oid);
 
     // Send ref advertisement
@@ -360,6 +360,21 @@ mod ref_advertisement_tests {
         let mut output = Vec::new();
         client.read_to_end(&mut output).await.unwrap();
         (handler.await.unwrap(), output)
+    }
+
+    #[tokio::test]
+    async fn upload_pack_does_not_advertise_the_server_private_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = crate::test_support::repository_with_server_private_refs(dir.path());
+        let (result, output) = run_live_upload_pack(&repo_path).await;
+        result.unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("refs/heads/main"), "{output}");
+        assert!(
+            crate::test_support::server_private_refs_in(&output).is_empty(),
+            "{output}"
+        );
     }
 
     #[tokio::test]

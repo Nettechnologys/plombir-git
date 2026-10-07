@@ -1,4 +1,11 @@
 //! One fail-closed view of the refs exposed by Git protocol advertisements.
+//!
+//! [`collect`] is the server's own view, every ref the repository holds.
+//! [`collect_for_clients`] is what a protocol advertisement may show: the same
+//! minus the namespaces the server writes for its own work. Those refs used to
+//! go out to every `git ls-remote` and `git clone --mirror` — the branch names
+//! of other people's forks among them — and a mirror client then kept their
+//! objects alive as well (card_18044eadb6d6).
 
 use std::path::Path;
 
@@ -15,6 +22,33 @@ pub struct RefAdvertisement {
     pub head_oid: Option<String>,
     /// The symbolic target of `HEAD`, when it is not detached.
     pub head_target: Option<String>,
+}
+
+/// Ref namespaces the server writes for itself and shows no client.
+///
+/// * `refs/forks/` — the scratch copy of a fork pull request's head, fetched
+///   into the base repository to diff or merge it. Removed when that operation
+///   ends; older versions left one per pull request behind.
+/// * `refs/merge-queue/` — the merge-group commit of a queued pull request,
+///   kept so the commit outlives the pass that built it. Runners receive the
+///   workspace as an archive, not by fetching this ref.
+pub const SERVER_PRIVATE_NAMESPACES: &[&str] = &["refs/forks/", "refs/merge-queue/"];
+
+/// Whether `refname` lies in one of [`SERVER_PRIVATE_NAMESPACES`].
+pub fn is_server_private(refname: &str) -> bool {
+    SERVER_PRIVATE_NAMESPACES
+        .iter()
+        .any(|namespace| refname.starts_with(namespace))
+}
+
+/// The refs a protocol advertisement shows a client: [`collect`] without the
+/// server's private namespaces.
+pub fn collect_for_clients(repo_path: &Path) -> Result<RefAdvertisement> {
+    let mut advertisement = collect(repo_path)?;
+    advertisement
+        .refs
+        .retain(|(_, refname)| !is_server_private(refname));
+    Ok(advertisement)
 }
 
 /// Read every ref required to build a repository advertisement.
@@ -86,7 +120,32 @@ pub fn collect(repo_path: &Path) -> Result<RefAdvertisement> {
 
 #[cfg(test)]
 mod tests {
-    use super::collect;
+    use super::{collect, collect_for_clients};
+
+    #[test]
+    fn clients_are_not_shown_the_server_private_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = crate::test_support::repository_with_server_private_refs(dir.path());
+        // A name that merely starts like a private namespace is an ordinary ref.
+        let main = repo_path.join("refs/heads/main");
+        std::fs::create_dir_all(repo_path.join("refs/forksmith")).unwrap();
+        std::fs::copy(&main, repo_path.join("refs/forksmith/kept")).unwrap();
+
+        let names = |refs: Vec<(String, String)>| {
+            let mut names: Vec<String> = refs.into_iter().map(|(_, name)| name).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(collect_for_clients(&repo_path).unwrap().refs),
+            ["refs/forksmith/kept", "refs/heads/main", "refs/tags/v1"]
+        );
+        assert_eq!(
+            collect(&repo_path).unwrap().refs.len(),
+            5,
+            "the server's own view keeps every ref"
+        );
+    }
 
     #[test]
     fn unborn_repository_is_the_only_successful_empty_head() {
