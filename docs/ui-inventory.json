@@ -1839,7 +1839,9 @@
       "url": "/api/v1/repos/{owner}/{name}/lfs/locks",
       "access": "Foreign:api/lfs_locks.rs",
       "handler": "api::lfs_locks::create_lock",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -1868,6 +1870,7 @@
       "access": "Foreign:api/lfs_locks.rs",
       "handler": "api::lfs_locks::unlock",
       "testedIn": [
+        "rust",
         "web"
       ],
       "reachedFromUi": true
@@ -2562,6 +2565,7 @@
       "access": "RepoRead",
       "handler": "api::repo_content::get_raw",
       "testedIn": [
+        "rust",
         "web"
       ],
       "reachedFromUi": true
@@ -5323,6 +5327,7 @@
               "handler": "api::repo_content::get_raw",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -5406,6 +5411,7 @@
               "handler": "api::repo_content::get_raw",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -5657,6 +5663,7 @@
           "handler": "api::repo_content::get_raw",
           "matched": true,
           "testedIn": [
+            "rust",
             "web"
           ]
         },
@@ -17515,6 +17522,7 @@
               "handler": "api::lfs_locks::unlock",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             }
