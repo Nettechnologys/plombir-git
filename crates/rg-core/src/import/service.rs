@@ -2922,6 +2922,7 @@ async fn import_github_issue(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn import_github_pr(
     db: &DatabaseConnection,
     repo_id: i64,
