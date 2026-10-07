@@ -3,7 +3,9 @@
 //! `git clone --bare` copies pointer files and nothing they point at: the
 //! content lives in the source's LFS store, outside Git. A repository that
 //! arrives that way looks complete and is not — every LFS file in it answers
-//! `404` to `git lfs pull` (card_bc7c8ddbf9b7). This module asks the source's
+//! `404` to `git lfs pull` (card_bc7c8ddbf9b7). An import fetches once, after
+//! its clone; a pull mirror after every pass that moved its refs
+//! (card_f4bc7fe93859). This module asks the source's
 //! batch API for each object the arrived history names, downloads it, checks it
 //! against its oid and publishes it the way an upload is published.
 //!
@@ -15,19 +17,20 @@
 //! ## Where requests go
 //!
 //! Two addresses are involved and the source chooses one of them. The batch
-//! endpoint is derived from the clone URL, which the import has already
+//! endpoint is derived from the clone URL, which the caller has already
 //! admitted. The download `href` comes from the source's answer, and is
-//! treated as what it is — a URL someone else wrote: each one goes through
-//! [`TrustedImportOrigins::api_destination`], the same static check and
-//! connector-owned DNS guard the import's API clients use (card_f958a838ef80),
-//! so an `href` aimed at a private address is refused before anything connects
-//! to it. One on another origin must also be `https`: the plaintext opt-in an
-//! operator gave the source's origin is not an opt-in for wherever it points.
+//! treated as what it is — a URL someone else wrote: each one goes through the
+//! caller's [`LfsSourceGuard`] — for an import the static check and
+//! connector-owned DNS guard its API clients use (card_f958a838ef80), for a
+//! mirror the same guard under the mirror's transport policy — so an `href`
+//! aimed at a private address is refused before anything connects to it. One
+//! on another origin must also be `https`: the plaintext opt-in an operator
+//! gave the source's origin is not an opt-in for wherever it points.
 //! Redirects are followed only within the origin of the request that got them.
 //!
 //! ## The credential
 //!
-//! The import's token goes to the batch endpoint as HTTP Basic, the way `git`
+//! The source's credential goes to the batch endpoint as HTTP Basic, the way `git`
 //! sends it. An `href` gets it only when it is on that same origin and the
 //! source did not name an `Authorization` of its own — the per-host rule the
 //! git-lfs client follows. The headers the source attaches to an action go to
@@ -51,7 +54,6 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::blob_storage::BlobStorage;
-use crate::import::trust::TrustedImportOrigins;
 use crate::lfs::pointer::PointerInHistory;
 use crate::lfs::service::{LfsRepository, LFS_OBJECT_MAX_BYTES};
 use crate::net::HttpOrigin;
@@ -83,6 +85,26 @@ const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const ATTEMPTS: u32 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
+/// Where a fetch may connect, and the only client that may connect there.
+///
+/// The batch endpoint and every download `href` go through it before a
+/// request is built. A guard answers with a client builder rather than a
+/// verdict so the address it checked and the connector that dials are one
+/// value: a separate yes/no would leave the DNS answer free to change between
+/// the check and the connection.
+pub trait LfsSourceGuard: Sync {
+    /// A client builder bound to `url`'s destination, or why `url` may not be
+    /// reached from this server.
+    fn client_for(&self, url: &str) -> Result<reqwest::ClientBuilder>;
+}
+
+impl LfsSourceGuard for crate::import::trust::TrustedImportOrigins {
+    fn client_for(&self, url: &str) -> Result<reqwest::ClientBuilder> {
+        let (_, builder) = self.api_destination(url)?.into_parts();
+        Ok(builder)
+    }
+}
+
 /// One object the destination still does not have, and why.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct LfsFetchFailure {
@@ -90,7 +112,7 @@ pub struct LfsFetchFailure {
     /// A path the object's pointer is committed under.
     pub path: String,
     /// Written here, never quoted from the source: it is stored in a row the
-    /// person who started the import reads.
+    /// person who started the import, or who owns the mirror, reads.
     pub reason: String,
 }
 
@@ -118,7 +140,7 @@ pub struct LfsFetcher<'a> {
     storage: &'a dyn BlobStorage,
     repo_root: &'a std::path::Path,
     destination: LfsRepository<'a>,
-    trusted_origins: &'a TrustedImportOrigins,
+    guard: &'a dyn LfsSourceGuard,
     credentials: Option<GitCredentials>,
     endpoint: reqwest::Url,
     endpoint_origin: HttpOrigin,
@@ -164,15 +186,13 @@ impl<'a> LfsFetcher<'a> {
         destination: LfsRepository<'a>,
         remote_url: &str,
         credentials: Option<GitCredentials>,
-        trusted_origins: &'a TrustedImportOrigins,
+        guard: &'a dyn LfsSourceGuard,
     ) -> Result<Self> {
         let endpoint = batch_endpoint(remote_url)?;
         let endpoint_origin = HttpOrigin::from_url(&endpoint)
             .context("the LFS batch endpoint has no HTTP(S) origin")?;
-        let (_, builder) = trusted_origins
-            .api_destination(endpoint.as_str())?
-            .into_parts();
-        let batch_client = builder
+        let batch_client = guard
+            .client_for(endpoint.as_str())?
             .redirect(crate::net::same_origin_redirect_policy())
             .user_agent("PlombirGit/0.1")
             .build()
@@ -182,7 +202,7 @@ impl<'a> LfsFetcher<'a> {
             storage,
             repo_root,
             destination,
-            trusted_origins,
+            guard,
             credentials,
             endpoint,
             endpoint_origin,
@@ -235,7 +255,7 @@ impl<'a> LfsFetcher<'a> {
                             path = %entry.path,
                             repo_id = self.destination.id,
                             reason,
-                            "an LFS object could not be fetched from the import source"
+                            "an LFS object could not be fetched from its source"
                         );
                         outcome.failed.push(failure(entry, reason));
                     }
@@ -284,7 +304,7 @@ impl<'a> LfsFetcher<'a> {
             tracing::warn!(
                 endpoint = %self.endpoint_origin_label(),
                 error = %format!("{error:#}"),
-                "the import source's LFS batch API could not be reached"
+                "the source's LFS batch API could not be reached"
             );
             "the source's LFS batch API could not be reached".to_string()
         })?;
@@ -293,7 +313,9 @@ impl<'a> LfsFetcher<'a> {
         if !status.is_success() {
             return Err(match status {
                 reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                    format!("the source refused the import's credential for its LFS API ({status})")
+                    format!(
+                        "the source refused this server's credential for its LFS API ({status})"
+                    )
                 }
                 reqwest::StatusCode::NOT_FOUND => {
                     format!("the source has no LFS batch API for this repository ({status})")
@@ -310,7 +332,7 @@ impl<'a> LfsFetcher<'a> {
             .map_err(|error| {
                 tracing::warn!(
                     error = %format!("{error:#}"),
-                    "the import source's LFS batch answer could not be read"
+                    "the source's LFS batch answer could not be read"
                 );
                 "the source's LFS batch answer could not be read".to_string()
             })?;
@@ -381,7 +403,7 @@ impl<'a> LfsFetcher<'a> {
                 tracing::warn!(
                     oid = %entry.pointer.oid,
                     error = %format!("{error:#}"),
-                    "an LFS download from the import source could not be started"
+                    "an LFS download from the source could not be started"
                 );
                 return Ok(Err(
                     "the source's download address could not be reached".to_string()
@@ -460,10 +482,9 @@ impl<'a> LfsFetcher<'a> {
             Some(client) => client.clone(),
             None => {
                 let client = self
-                    .trusted_origins
-                    .api_destination(href.as_str())
-                    .and_then(|destination| {
-                        let (_, builder) = destination.into_parts();
+                    .guard
+                    .client_for(href.as_str())
+                    .and_then(|builder| {
                         builder
                             .redirect(crate::net::same_origin_redirect_policy())
                             .timeout(DOWNLOAD_TIMEOUT)
@@ -476,7 +497,7 @@ impl<'a> LfsFetcher<'a> {
                         tracing::warn!(
                             host = href.host_str().unwrap_or_default(),
                             error = %format!("{error:#}"),
-                            "refused an LFS download address the import source chose"
+                            "refused an LFS download address the source chose"
                         );
                         "the source's download address points where this server may not connect"
                             .to_string()
@@ -527,7 +548,7 @@ struct DownloadRequest {
     client: reqwest::Client,
     href: reqwest::Url,
     headers: reqwest::header::HeaderMap,
-    /// Whether the import's credential may go to this `href`.
+    /// Whether the source's credential may go to this `href`.
     may_carry_credentials: bool,
 }
 
@@ -652,7 +673,7 @@ async fn stream_to_spool(
                 crate::platform::fs::LFS_STORAGE_HINT,
             )
         })?;
-    // Armed from the moment the file exists, so a cancelled import or a
+    // Armed from the moment the file exists, so a cancelled fetch or a
     // refused download leaves nothing behind.
     let mut staged = StagedDownload {
         path: path.to_path_buf(),
@@ -669,7 +690,7 @@ async fn stream_to_spool(
             Err(error) => {
                 tracing::warn!(
                     error = %format!("{error:#}"),
-                    "an LFS download from the import source broke off"
+                    "an LFS download from the source broke off"
                 );
                 return Ok(Err("the download from the source broke off".to_string()));
             }
@@ -751,6 +772,7 @@ struct BatchObjectError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::import::trust::TrustedImportOrigins;
     use crate::lfs::pointer::LfsPointer;
     use sea_orm::{ConnectOptions, Database};
     use std::sync::{Arc, Mutex};
@@ -1247,6 +1269,6 @@ mod tests {
         assert!(outcome
             .failed
             .iter()
-            .all(|failure| failure.reason.contains("refused the import's credential")));
+            .all(|failure| failure.reason.contains("refused this server's credential")));
     }
 }

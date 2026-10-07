@@ -218,30 +218,7 @@ fn blob_paths(
     repo_path: &Path,
     wanted: &BTreeMap<gix::ObjectId, LfsPointer>,
 ) -> Result<HashMap<gix::ObjectId, String>> {
-    let mut tips = Vec::new();
-    let references = repo
-        .references()
-        .with_context(|| format!("failed to open references in {repo_path:?}"))?;
-    for reference in references
-        .all()
-        .with_context(|| format!("failed to list references in {repo_path:?}"))?
-    {
-        let mut reference = reference
-            .map_err(anyhow::Error::from_boxed)
-            .with_context(|| format!("failed to read a reference in {repo_path:?}"))?;
-        let id = reference
-            .peel_to_id()
-            .with_context(|| format!("failed to resolve `{}`", reference.name().as_bstr()))?
-            .detach();
-        let kind = repo
-            .find_header(id)
-            .with_context(|| format!("failed to read the header of object {id}"))?
-            .kind();
-        // A tag of a tree or a blob names no history to walk.
-        if kind == gix::object::Kind::Commit {
-            tips.push(id);
-        }
-    }
+    let tips = ref_commit_tips(repo, repo_path)?;
 
     let mut paths = HashMap::new();
     let mut visited = HashSet::new();
@@ -264,6 +241,151 @@ fn blob_paths(
         }
     }
     Ok(paths)
+}
+
+/// The commits the refs of a repository point at, each once, sorted.
+///
+/// A tag of a tree or a blob names no history and is left out.
+fn ref_commit_tips(repo: &gix::Repository, repo_path: &Path) -> Result<Vec<gix::ObjectId>> {
+    let mut tips = BTreeSet::new();
+    let references = repo
+        .references()
+        .with_context(|| format!("failed to open references in {repo_path:?}"))?;
+    for reference in references
+        .all()
+        .with_context(|| format!("failed to list references in {repo_path:?}"))?
+    {
+        let mut reference = reference
+            .map_err(anyhow::Error::from_boxed)
+            .with_context(|| format!("failed to read a reference in {repo_path:?}"))?;
+        let id = reference
+            .peel_to_id()
+            .with_context(|| format!("failed to resolve `{}`", reference.name().as_bstr()))?
+            .detach();
+        let kind = repo
+            .find_header(id)
+            .with_context(|| format!("failed to read the header of object {id}"))?
+            .kind();
+        if kind == gix::object::Kind::Commit {
+            tips.insert(id);
+        }
+    }
+    Ok(tips.into_iter().collect())
+}
+
+/// The commits a repository's refs point at, as hex, sorted — what a later
+/// [`pointers_added_since`] is told it has already seen.
+pub fn commit_tips(repo_path: &Path) -> Result<Vec<String>> {
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+    Ok(ref_commit_tips(&repo, repo_path)?
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect())
+}
+
+/// Every LFS object that the commits reachable from the refs of `repo_path`,
+/// and from none of `known`, add — one entry per oid, sorted by oid.
+///
+/// What a repository that is refreshed rather than cloned needs: the history
+/// behind `known` was read on an earlier pass, so only what came after it is
+/// read now, and a pass that brought ten commits costs ten tree diffs however
+/// long the history behind them is. Each new commit is compared with its first
+/// parent; the blobs a merge takes from another parent are listed again, which
+/// costs a lookup of an object that is already there and never misses one.
+///
+/// `None` when `known` names a commit the store no longer has — a force-push
+/// upstream and a `gc` since — and the walk cannot be bounded by it. The caller
+/// then reads the whole store with [`objects_in_history`], which never misses
+/// an object.
+pub fn pointers_added_since(
+    repo_path: &Path,
+    known: &[String],
+) -> Result<Option<Vec<PointerInHistory>>> {
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+    let mut hidden = Vec::with_capacity(known.len());
+    for tip in known {
+        let Ok(id) = gix::ObjectId::from_hex(tip.as_bytes()) else {
+            return Ok(None);
+        };
+        match repo.try_find_header(id) {
+            Ok(Some(header)) if header.kind() == gix::object::Kind::Commit => hidden.push(id),
+            Ok(_) => return Ok(None),
+            Err(error) => {
+                return Err(anyhow::Error::from(error)
+                    .context(format!("failed to read the header of object {id}")))
+            }
+        }
+    }
+    let tips = ref_commit_tips(&repo, repo_path)?;
+
+    let mut found: BTreeMap<String, PointerInHistory> = BTreeMap::new();
+    let mut seen_blobs = HashSet::new();
+    let walk = repo
+        .rev_walk(tips)
+        .with_hidden(hidden)
+        .all()
+        .with_context(|| format!("failed to walk the new history of {repo_path:?}"))?;
+    for info in walk {
+        let info = info.with_context(|| format!("failed to walk the history of {repo_path:?}"))?;
+        let commit = repo
+            .find_commit(info.id)
+            .with_context(|| format!("failed to read commit {}", info.id))?;
+        let tree = commit
+            .tree()
+            .with_context(|| format!("failed to read the tree of commit {}", info.id))?;
+        let parent_tree = match info.parent_ids.first() {
+            Some(parent) => repo
+                .find_commit(*parent)
+                .with_context(|| format!("failed to read commit {parent}"))?
+                .tree()
+                .with_context(|| format!("failed to read the tree of commit {parent}"))?,
+            None => repo.empty_tree(),
+        };
+        let mut options = gix::diff::Options::default();
+        options.track_path().track_rewrites(None);
+        let changes = repo
+            .diff_tree_to_tree(Some(&parent_tree), Some(&tree), options)
+            .with_context(|| format!("failed to diff commit {} with its parent", info.id))?;
+        for change in changes {
+            if matches!(
+                change,
+                gix::object::tree::diff::ChangeDetached::Deletion { .. }
+            ) {
+                continue;
+            }
+            let (mode, id) = change.entry_mode_and_id();
+            if !mode.is_blob() || !seen_blobs.insert(id.to_owned()) {
+                continue;
+            }
+            let header = repo
+                .find_header(id)
+                .with_context(|| format!("failed to read the header of object {id}"))?;
+            if header.size() >= POINTER_SIZE_LIMIT {
+                continue;
+            }
+            let blob = repo
+                .find_object(id)
+                .with_context(|| format!("failed to read blob {id}"))?;
+            let Some(pointer) = parse(&blob.data) else {
+                continue;
+            };
+            let path = change.location().to_string();
+            match found.entry(pointer.oid.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(PointerInHistory { pointer, path });
+                }
+                Entry::Occupied(mut entry) => {
+                    let kept = &mut entry.get_mut().path;
+                    if path < *kept {
+                        *kept = path;
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(found.into_values().collect()))
 }
 
 fn collect_blob_paths(

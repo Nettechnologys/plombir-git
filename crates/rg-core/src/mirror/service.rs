@@ -636,6 +636,7 @@ async fn run_sync_pass(
     encryption_key: &str,
 ) -> Result<()> {
     let repo_path = mirror_clone_path(repo_root, mirror.repo_id);
+    let clone_path = repo_path.clone();
 
     // Decrypt before the guard so a credential that can no longer be read is
     // reported as such, rather than as a plain authentication failure from the
@@ -689,6 +690,51 @@ async fn run_sync_pass(
         ),
     };
 
+    // `{e}` printed the outermost `.context(...)` only, both in the persisted
+    // field the UI shows and in the log — under it sits the `git clone
+    // --mirror` failure that actually explains the outage (card_a997f30c142c).
+    let failure = match result {
+        Err(e) => Some(format!("{e:#}")),
+        // The refs arrived, so the pointers in them name objects this server
+        // has to serve too (card_f4bc7fe93859). A fetch that falls short does
+        // not undo the refs — the history is no less the upstream's for one
+        // missing binary — but the pass is not reported as a clean one either:
+        // the row says which objects are missing, and the sweep retries a
+        // mirror in `error` on its next tick.
+        Ok(()) => match super::lfs::fetch_new_objects(
+            db,
+            repo_root,
+            mirror.repo_id,
+            &clone_path,
+            &mirror.url,
+            credentials.as_ref().map(|credentials| {
+                GitCredentials::new(
+                    credentials.username().map(str::to_string),
+                    credentials.password().to_string(),
+                )
+            }),
+            &transport_policy,
+        )
+        .await
+        {
+            Ok(pass) if pass.failed.is_empty() => {
+                if pass.fetched > 0 {
+                    tracing::info!(
+                        repo_id = mirror.repo_id,
+                        fetched = pass.fetched,
+                        "fetched the LFS objects a mirror pass brought pointers for"
+                    );
+                }
+                None
+            }
+            Ok(pass) => Some(super::lfs::describe_shortfall(&pass.failed)),
+            Err(e) => Some(format!(
+                "the refs are up to date, but the LFS objects their history points at could not \
+                 be fetched: {e:#}"
+            )),
+        },
+    };
+
     let now = Utc::now();
     let next_sync = now + chrono::Duration::seconds(effective_sync_interval(mirror));
 
@@ -697,23 +743,18 @@ async fn run_sync_pass(
     model.next_sync_at = Set(Some(next_sync));
     model.updated_at = Set(now);
 
-    match result {
-        Ok(()) => {
+    match failure {
+        None => {
             model.last_sync_error = Set(None);
             model.status = Set(STATUS_ACTIVE.to_string());
         }
-        Err(e) => {
-            // `{e}` printed the outermost `.context(...)` only, both in the
-            // persisted field the UI shows and in the log — under it sits the
-            // `git clone --mirror` failure that actually explains the outage
-            // (card_a997f30c142c).
-            //
+        Some(reason) => {
             // Belt and braces on the way out: the credential is kept out of
             // argv and out of the URL, so git has nothing to echo — but this
             // string is persisted and rendered in the settings UI, which is
             // the last place a secret should surface if that ever stops
             // holding.
-            let reason = mask_credential(&format!("{e:#}"), Some(&credentials));
+            let reason = mask_credential(&reason, Some(&credentials));
             model.last_sync_error = Set(Some(reason.clone()));
             model.status = Set(STATUS_ERROR.to_string());
             tracing::error!(repo_id = mirror.repo_id, error = %reason, "mirror sync failed");

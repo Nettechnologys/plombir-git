@@ -70,6 +70,18 @@ impl MirrorTransportPolicy {
     }
 }
 
+/// The guard a mirror's LFS fetch connects through: the transport policy the
+/// git remote is held to, then the same private-address guard, bound to the
+/// connector. A mirror has no trusted origins — the remote is the repository
+/// owner's choice — so every destination gets the DNS guard.
+impl crate::lfs::fetch::LfsSourceGuard for MirrorTransportPolicy {
+    fn client_for(&self, url: &str) -> Result<reqwest::ClientBuilder> {
+        self.require_confidential_transport(url)?;
+        crate::net::check_url_static(url).context("invalid mirror LFS URL")?;
+        Ok(crate::net::ssrf_bound_outbound_client_builder())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
