@@ -9,11 +9,11 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +22,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SELF = 'script-execution-coverage-contract-check.mjs';
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-script-execution-coverage-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-script-execution-coverage-'));
   mkdirSync(join(fixture, '.github'), { recursive: true });
   mkdirSync(join(fixture, 'web'), { recursive: true });
   cpSync(join(root, 'scripts'), join(fixture, 'scripts'), { recursive: true });

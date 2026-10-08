@@ -7,7 +7,8 @@
 
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -35,7 +36,7 @@ assert.equal(shellInvokes('value=${VERSION#v}; cargo clippy', 'cargo clippy'), t
 console.log('✅ shell source view distinguishes comments, quoted data, and live commands');
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-local-gate-coverage-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-local-gate-coverage-'));
   mkdirSync(join(fixture, '.github', 'workflows'), { recursive: true });
   mkdirSync(join(fixture, '.githooks'), { recursive: true });
   mkdirSync(join(fixture, 'scripts'), { recursive: true });

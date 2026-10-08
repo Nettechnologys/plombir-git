@@ -4,7 +4,8 @@
 // launches it with `web/` as cwd. Both the imported checker and the CLI writer
 // must still read and write the repository tree anchored beside this script.
 
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -32,7 +33,7 @@ function assertSame(actual, expected, label) {
   }
 }
 
-const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-inventory-root.'));
+const fixture = scratchDir(join(tmpdir(), 'plombir-git-ui-inventory-root.'));
 try {
   const rootJson = join(fixture, 'root.json');
   const rootMd = join(fixture, 'root.md');

@@ -26,7 +26,8 @@
 // fails when one is not, when an entry names a job that no longer exists, or
 // when the verifier stops invoking a cargo command CARGO_JOBS says it invokes.
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -195,7 +196,7 @@ export function runDeployConfig({ cwd = root } = {}) {
 
   if (!existsSync(userEnv)) {
     try {
-      temporaryRoot = mkdtempSync(join(tmpdir(), 'plombir-git-deploy-config-'));
+      temporaryRoot = scratchDir(join(tmpdir(), 'plombir-git-deploy-config-'));
       envFile = join(temporaryRoot, '.env');
       const examplePath = join(repoRoot, 'deploy', '.env.example');
       const example = readFileSync(examplePath, 'utf8');

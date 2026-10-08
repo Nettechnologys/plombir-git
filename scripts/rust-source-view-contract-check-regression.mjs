@@ -20,7 +20,8 @@
 // discovery behaves when the shared module is small.
 
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -83,7 +84,7 @@ pub(crate) fn rust_files(dir: &str, out: &mut Vec<String>) {
  * to be able to put one somewhere other than the guard.
  */
 function runCase(name, { body, min = 1, support = SUPPORT, files = {}, expect }) {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-rust-view-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-rust-view-'));
   try {
     mkdirSync(join(fixture, 'crates/demo/src'), { recursive: true });
     mkdirSync(join(fixture, 'tests/support'), { recursive: true });

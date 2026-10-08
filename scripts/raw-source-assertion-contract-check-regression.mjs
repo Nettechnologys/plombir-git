@@ -9,7 +9,8 @@
 // `scripts/lib/` is a copy of the real one, so the normalizer set is discovered
 // the same way it is on `main`, and asserts which side the gate lands on.
 
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,7 +35,7 @@ const cases = [];
  * Resolves to the failure message, or `null` when the case held.
  */
 async function verdict(name, { files, env = {}, withLib = true, expect }) {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-raw-rust-assert-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-raw-rust-assert-'));
   try {
     mkdirSync(join(fixture, 'scripts'), { recursive: true });
     if (withLib) cpSync(join(root, 'scripts', 'lib'), join(fixture, 'scripts', 'lib'), { recursive: true });

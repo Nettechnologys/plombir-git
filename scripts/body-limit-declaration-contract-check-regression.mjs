@@ -24,7 +24,8 @@
 // read as absent.
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,7 +35,7 @@ const checkName = 'body-limit-declaration-contract-check.mjs';
 
 /** A throwaway copy of the tree the check reads: the router, the handlers, itself. */
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-body-limit-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-body-limit-'));
   mkdirSync(join(fixture, 'crates', 'rg-http'), { recursive: true });
   mkdirSync(join(fixture, 'scripts'), { recursive: true });
   cpSync(join(root, 'crates', 'rg-http', 'src'), join(fixture, 'crates', 'rg-http', 'src'), {

@@ -15,7 +15,8 @@
 // compose file mutated the moment a run is interrupted.
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,7 +26,7 @@ const check = 'scripts/observability-compose-contract-check.mjs';
 const compose = 'deploy/docker-compose.observability.yml';
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-observability-compose-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-observability-compose-'));
   mkdirSync(join(fixture, 'scripts'), { recursive: true });
   cpSync(join(root, check), join(fixture, check));
   cpSync(join(root, 'scripts', 'lib'), join(fixture, 'scripts', 'lib'), { recursive: true });

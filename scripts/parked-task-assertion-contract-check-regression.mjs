@@ -7,7 +7,8 @@
 // in a doc comment (the helpers document the trap they replace, and prose is
 // not a program) and the honest three-outcome match that replaced it.
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -25,8 +26,8 @@ function run(fixture) {
   return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
 }
 
-const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-parked-task-contract.'));
-const empty = mkdtempSync(join(tmpdir(), 'plombir-git-parked-task-empty.'));
+const fixture = scratchDir(join(tmpdir(), 'plombir-git-parked-task-contract.'));
+const empty = scratchDir(join(tmpdir(), 'plombir-git-parked-task-empty.'));
 
 try {
   mkdirSync(join(fixture, 'crates/demo/src'), { recursive: true });

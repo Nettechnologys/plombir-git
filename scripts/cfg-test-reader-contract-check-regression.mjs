@@ -23,7 +23,8 @@
 // green, and a ratchet nobody can keep green is one somebody deletes.
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -77,7 +78,7 @@ const JS_CANONICAL = `export function cfgTestItemRanges(source) {
 
 /** A fixture tree that the check passes over, before a case breaks one thing. */
 function buildFixture() {
-  const dir = mkdtempSync(join(tmpdir(), 'plombir-git-cfg-test-reader-'));
+  const dir = scratchDir(join(tmpdir(), 'plombir-git-cfg-test-reader-'));
   for (const sub of ['crates/rg-x/src', 'crates/rg-x/tests/common', 'tests/support', 'scripts/lib']) {
     mkdirSync(join(dir, sub), { recursive: true });
   }

@@ -5,7 +5,8 @@
 // documents and mount drift cannot look like a green repository.
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +16,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const check = join(root, 'scripts', 'grafana-provisioning-contract-check.mjs');
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-grafana-provisioning-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-grafana-provisioning-'));
   cpSync(join(root, 'deploy'), join(fixture, 'deploy'), { recursive: true });
   return fixture;
 }

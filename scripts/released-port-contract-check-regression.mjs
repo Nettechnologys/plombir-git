@@ -5,14 +5,15 @@
 // still goes red when both the Rust and shell variants are reintroduced — and
 // that it stays silent about a commented-out one, which is code no test runs.
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
-const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-released-port-contract.'));
+const fixture = scratchDir(join(tmpdir(), 'plombir-git-released-port-contract.'));
 
 try {
   mkdirSync(join(fixture, 'crates/demo/src'), { recursive: true });

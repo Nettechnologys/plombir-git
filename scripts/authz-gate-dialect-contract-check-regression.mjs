@@ -34,7 +34,8 @@
 // the wrong reason is not evidence about the reason it was written for.
 
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,7 +47,7 @@ let failed = 0;
 
 /** Run the real check over a fixture whose `crates/demo/src/lib.rs` is `body`. */
 function runCase(name, { body, min = 1, expect }) {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-authz-dialect-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-authz-dialect-'));
   try {
     mkdirSync(join(fixture, 'crates/demo/src'), { recursive: true });
     writeFileSync(join(fixture, 'crates/demo/src/lib.rs'), body);

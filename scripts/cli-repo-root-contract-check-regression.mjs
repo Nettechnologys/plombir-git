@@ -16,7 +16,8 @@
 // inventories carry counts. The floors are exercised too: an absence-based
 // check that is quietly reading the wrong tree reports success forever.
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -337,7 +338,7 @@ mod tests {
 
 const failures = [];
 for (const testCase of cases) {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-repo-root-stand-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-repo-root-stand-'));
   try {
     testCase.build(fixture);
     const { status, output } = run(fixture);

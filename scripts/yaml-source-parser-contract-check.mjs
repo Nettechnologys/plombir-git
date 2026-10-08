@@ -19,7 +19,8 @@
 //     content is document data a parser keeps, not a YAML comment.
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -178,7 +179,7 @@ if (!parser) {
   process.exit(1);
 }
 
-const scratch = mkdtempSync(join(tmpdir(), 'plombir-git-yaml-view-'));
+const scratch = scratchDir(join(tmpdir(), 'plombir-git-yaml-view-'));
 try {
   const viewPath = join(scratch, 'view.yml');
   for (const name of corpus) {

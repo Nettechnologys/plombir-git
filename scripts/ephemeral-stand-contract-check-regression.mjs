@@ -8,7 +8,8 @@
 // survives only in a whole-line or inline comment reads as absent. Valid `#`
 // shell data and `//` inside JavaScript strings remain live source.
 
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -200,7 +201,7 @@ const VALID_VARIANTS = [
   },
 ];
 
-let fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ephemeral-stand-contract.'));
+let fixture = scratchDir(join(tmpdir(), 'plombir-git-ephemeral-stand-contract.'));
 try {
   baseline(fixture);
   const clean = runCheck(fixture);
@@ -211,7 +212,7 @@ try {
 
   for (const mutation of MUTATIONS) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ephemeral-stand-contract.'));
+    fixture = scratchDir(join(tmpdir(), 'plombir-git-ephemeral-stand-contract.'));
     baseline(fixture);
     mutation.apply(fixture);
 
@@ -231,7 +232,7 @@ try {
 
   for (const variant of VALID_VARIANTS) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ephemeral-stand-contract.'));
+    fixture = scratchDir(join(tmpdir(), 'plombir-git-ephemeral-stand-contract.'));
     baseline(fixture);
     variant.apply(fixture);
 

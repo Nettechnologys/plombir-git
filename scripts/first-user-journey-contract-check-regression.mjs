@@ -5,7 +5,8 @@
 // shell or JavaScript comment. Valid hashes in shell data and `//` inside a
 // JavaScript string must remain visible without confusing the source views.
 
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -308,7 +309,7 @@ const VALID_VARIANTS = [
   },
 ];
 
-let fixture = mkdtempSync(join(tmpdir(), 'plombir-git-first-user-contract.'));
+let fixture = scratchDir(join(tmpdir(), 'plombir-git-first-user-contract.'));
 try {
   baseline(fixture);
   const clean = run(fixture);
@@ -319,7 +320,7 @@ try {
 
   for (const mutation of [...INLINE_COMMENT_MUTATIONS, ...DIRECT_MUTATIONS]) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-first-user-contract.'));
+    fixture = scratchDir(join(tmpdir(), 'plombir-git-first-user-contract.'));
     baseline(fixture);
     mutation.apply(fixture);
     const result = run(fixture);
@@ -335,7 +336,7 @@ try {
 
   for (const variant of VALID_VARIANTS) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-first-user-contract.'));
+    fixture = scratchDir(join(tmpdir(), 'plombir-git-first-user-contract.'));
     baseline(fixture);
     variant.apply(fixture);
     const result = run(fixture);

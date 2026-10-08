@@ -5,7 +5,8 @@
 // red. The stand uses a minimal throwaway workspace so it tests cargo metadata,
 // not a second parser that could agree with the check by sharing its bug.
 
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -13,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const check = resolve(scriptsDir, 'architecture-crate-dependency-contract-check.mjs');
-const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-architecture-deps-'));
+const fixture = scratchDir(join(tmpdir(), 'plombir-git-architecture-deps-'));
 
 function write(path, body) {
   const full = resolve(fixture, path);

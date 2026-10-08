@@ -10,7 +10,8 @@
 // route mutation renames the mirror path as proof of the other half of the
 // method/path contract.
 
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -73,7 +74,7 @@ function run(fixture) {
   );
 }
 
-const newFixture = () => mkdtempSync(join(tmpdir(), 'plombir-git-ui-inventory-oracle.'));
+const newFixture = () => scratchDir(join(tmpdir(), 'plombir-git-ui-inventory-oracle.'));
 
 // Every case below costs one full check run, and the stand is most of the time
 // the contract-check job spends on it. Do not buy that time back by putting

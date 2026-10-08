@@ -6,7 +6,8 @@
 // floors.
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +16,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const check = 'scripts/observability-contract-check.mjs';
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-observability-contract-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-observability-contract-'));
   mkdirSync(join(fixture, 'scripts'), { recursive: true });
   mkdirSync(join(fixture, 'crates', 'rg-http', 'src'), { recursive: true });
   cpSync(join(root, check), join(fixture, check));

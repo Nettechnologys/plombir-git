@@ -3,12 +3,12 @@
 import {
   appendFileSync,
   cpSync,
-  mkdtempSync,
   mkdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptsDir, '..');
 const check = path.join(scriptsDir, 'server-side-ref-policy-contract-check.mjs');
-const fixture = mkdtempSync(path.join(tmpdir(), 'plombir-git-ref-policy-'));
+const fixture = scratchDir(path.join(tmpdir(), 'plombir-git-ref-policy-'));
 const sources = [
   'crates/rg-git/src/protocol/receive_pack.rs',
   'crates/rg-core/src/repo/service.rs',

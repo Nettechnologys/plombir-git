@@ -10,12 +10,12 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,7 +55,7 @@ function requireSuccess(name, result) {
   }
 }
 
-const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-deploy-config-contract-'));
+const fixture = scratchDir(join(tmpdir(), 'plombir-git-deploy-config-contract-'));
 
 try {
   const deploy = join(fixture, 'deploy');

@@ -5,7 +5,8 @@
 // changing the previously flaky identity migration fixture back to a pool of
 // two proves the rule still rejects the defect that motivated the gate.
 
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -28,7 +29,7 @@ const candidateFiles = [
 ];
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-migrator-pool-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-migrator-pool-'));
   for (const file of candidateFiles) {
     const target = join(fixture, file);
     mkdirSync(dirname(target), { recursive: true });

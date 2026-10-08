@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -257,7 +258,7 @@ const mutations = [
   },
 ];
 
-let fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-access-sweep-contract.'));
+let fixture = scratchDir(join(tmpdir(), 'plombir-git-ui-access-sweep-contract.'));
 try {
   baseline(fixture);
   const clean = run(fixture);
@@ -289,7 +290,7 @@ try {
 
   for (const mutation of mutations) {
     rmSync(fixture, { recursive: true, force: true });
-    fixture = mkdtempSync(join(tmpdir(), 'plombir-git-ui-access-sweep-contract.'));
+    fixture = scratchDir(join(tmpdir(), 'plombir-git-ui-access-sweep-contract.'));
     baseline(fixture);
     mutation.apply(fixture);
     const result = run(fixture);

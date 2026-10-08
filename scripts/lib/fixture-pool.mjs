@@ -15,6 +15,8 @@
 import { spawn } from 'node:child_process';
 import { availableParallelism } from 'node:os';
 
+import { adoptChild } from './scratch-dir.mjs';
+
 /**
  * Run `node <args>` and collect its exit status and combined output.
  *
@@ -24,7 +26,11 @@ import { availableParallelism } from 'node:os';
  */
 export function runNode(args, { cwd, env, timeout = 120_000 } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    // Adopted, so a stand interrupted mid-pool takes its fixtures' processes
+    // with it instead of leaving them running against removed directories.
+    const child = adoptChild(
+      spawn(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }),
+    );
     let output = '';
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');

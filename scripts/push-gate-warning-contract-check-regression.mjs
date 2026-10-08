@@ -4,7 +4,8 @@
 // keep it cheap while preserving the shell, streaming, status and receipt path.
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -20,7 +21,7 @@ function command(command, args, cwd, env = process.env) {
 }
 
 function fixture(mode) {
-  const dir = mkdtempSync(join(tmpdir(), 'plombir-git-push-warning-'));
+  const dir = scratchDir(join(tmpdir(), 'plombir-git-push-warning-'));
   mkdirSync(join(dir, 'scripts'), { recursive: true });
   mkdirSync(join(dir, 'bin'), { recursive: true });
   writeFileSync(

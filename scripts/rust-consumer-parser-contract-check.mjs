@@ -5,7 +5,8 @@
 // or false red verdicts in the real inventory: test-only callers, call-shaped
 // strings, and explicit Rust generic arguments.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -29,7 +30,7 @@ import {
   utoipaRowFor,
 } from './lib/rust-source.mjs';
 
-const root = mkdtempSync(path.join(tmpdir(), 'plombir-git-consumer-contract-'));
+const root = scratchDir(path.join(tmpdir(), 'plombir-git-consumer-contract-'));
 try {
   const src = path.join(root, 'crates/demo/src');
   mkdirSync(src, { recursive: true });

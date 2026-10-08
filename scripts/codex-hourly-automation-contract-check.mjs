@@ -9,12 +9,12 @@ import { spawn } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptsDir, '..');
 const automation = join(scriptsDir, 'codex-hourly-automation.mjs');
-const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-codex-hourly-contract-'));
+const fixture = scratchDir(join(tmpdir(), 'plombir-git-codex-hourly-contract-'));
 const results = join(fixture, 'results');
 const bin = join(fixture, 'bin');
 const standTmp = join(fixture, 'tmp');

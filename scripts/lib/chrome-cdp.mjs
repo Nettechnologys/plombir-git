@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
+import { scratchDir } from './scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -148,7 +149,7 @@ export async function launchChromeCdp({
     throw new Error(`startupTimeoutMs must be positive, got ${startupTimeoutMs}`);
   }
 
-  const profileDir = mkdtempSync(join(tmpdir(), profilePrefix));
+  const profileDir = scratchDir(join(tmpdir(), profilePrefix));
   let child = null;
   let state = null;
   let cleaned = false;

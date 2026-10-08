@@ -12,7 +12,8 @@
 // must produce. A green stand is the only reason to believe a green check.
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +23,7 @@ const checkName = 'route-consumer-contract-check.mjs';
 const originalCheck = join(root, 'scripts', checkName);
 
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-route-consumer-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-route-consumer-'));
   mkdirSync(join(fixture, 'crates', 'rg-http', 'src'), { recursive: true });
   mkdirSync(join(fixture, 'scripts'), { recursive: true });
   cpSync(

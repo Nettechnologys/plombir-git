@@ -8,7 +8,8 @@
 
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -143,7 +144,7 @@ async function runContract() {
     throw new Error('chrome-cdp helper must discover Chrome-owned default endpoints from DevToolsActivePort');
   }
 
-  const fixtureRoot = mkdtempSync(join(tmpdir(), 'plombir-git-browser-cdp-contract-'));
+  const fixtureRoot = scratchDir(join(tmpdir(), 'plombir-git-browser-cdp-contract-'));
   try {
     const defaultRuns = await Promise.all(smokeFiles.flatMap((scriptName, scriptIndex) => [
       runSmoke(fixtureRoot, scriptName, `default-${scriptIndex}-A`),

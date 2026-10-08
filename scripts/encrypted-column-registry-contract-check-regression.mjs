@@ -13,7 +13,8 @@
 // must produce. A green stand is the only reason to believe a green check.
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,7 +27,7 @@ const MIRROR = join('crates', 'rg-core', 'src', 'mirror', 'service.rs');
 
 /** A copy of the Rust workspace plus the check's own library. */
 function fixtureRoot() {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-encrypted-columns-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-encrypted-columns-'));
   mkdirSync(join(fixture, 'crates'), { recursive: true });
   cpSync(join(root, 'crates'), join(fixture, 'crates'), {
     recursive: true,

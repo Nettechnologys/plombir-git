@@ -14,7 +14,8 @@
 // inside a file it already lists — the case a filename allowlist would wave
 // through, and the reason the inventory carries a count.
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -89,11 +90,11 @@ pub(crate) async fn connect_offline_maintenance(db_url: &str) -> anyhow::Result<
   );
 }
 
-const bypass = mkdtempSync(join(tmpdir(), 'plombir-git-cli-db-opener-bypass.'));
-const missingGateway = mkdtempSync(join(tmpdir(), 'plombir-git-cli-db-opener-gateway.'));
-const honest = mkdtempSync(join(tmpdir(), 'plombir-git-cli-db-opener-honest.'));
-const newOnline = mkdtempSync(join(tmpdir(), 'plombir-git-cli-db-opener-new-online.'));
-const grownOnline = mkdtempSync(join(tmpdir(), 'plombir-git-cli-db-opener-grown-online.'));
+const bypass = scratchDir(join(tmpdir(), 'plombir-git-cli-db-opener-bypass.'));
+const missingGateway = scratchDir(join(tmpdir(), 'plombir-git-cli-db-opener-gateway.'));
+const honest = scratchDir(join(tmpdir(), 'plombir-git-cli-db-opener-honest.'));
+const newOnline = scratchDir(join(tmpdir(), 'plombir-git-cli-db-opener-new-online.'));
+const grownOnline = scratchDir(join(tmpdir(), 'plombir-git-cli-db-opener-grown-online.'));
 
 try {
   for (const fixture of [bypass, missingGateway, honest]) {

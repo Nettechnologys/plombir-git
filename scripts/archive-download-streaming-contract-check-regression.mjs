@@ -16,7 +16,8 @@
 // to compare the stream against, and that is the only evidence the check reads
 // the production view rather than raw bytes.
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -116,7 +117,7 @@ where
 };
 
 function writeFixture(overrides = {}) {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-archive-streaming-'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-archive-streaming-'));
   for (const [surface, body] of Object.entries({ ...BASELINE, ...overrides })) {
     const target = join(fixture, surface);
     mkdirSync(dirname(target), { recursive: true });

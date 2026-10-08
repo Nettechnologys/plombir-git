@@ -5,7 +5,8 @@
 // await, but an arbitrary local value must not satisfy the guard merely because
 // a delete call still exists somewhere in the component.
 
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -22,7 +23,7 @@ const copied = [
 ];
 
 function fixtureTree() {
-  const fixture = mkdtempSync(join(tmpdir(), 'plombir-git-user-tokens-contract.'));
+  const fixture = scratchDir(join(tmpdir(), 'plombir-git-user-tokens-contract.'));
   for (const path of copied) {
     const target = join(fixture, path);
     mkdirSync(dirname(target), { recursive: true });
