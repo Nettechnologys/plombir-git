@@ -1,6 +1,5 @@
 use crate::common::{register_full, spawn_test_app_with_db};
 use sea_orm::{ActiveModelTrait, Set};
-use sha2::{Digest, Sha256};
 
 #[tokio::test]
 async fn assigned_runner_downloads_exact_commit_workspace_and_other_runner_is_denied() {
@@ -149,7 +148,9 @@ async fn assigned_runner_downloads_exact_commit_workspace_and_other_runner_is_de
         .unwrap();
     assert_eq!(downloaded.status(), 200);
     assert_eq!(downloaded.bytes().await.unwrap().as_ref(), b"cache-bytes");
-    let key_hash = hex::encode(Sha256::digest(b"build-main"));
+    // The row key is scoped to the job's ref (card_b7a25458b98b).
+    let key_hash = rg_core::ci_cache::CacheScope::for_pipeline("refs/heads/main", "main")
+        .save_hash("build-main");
     let entry = rg_db::ops::ci_retention_ops::find_cache_entry(&db, repo_id, &key_hash)
         .await
         .unwrap()

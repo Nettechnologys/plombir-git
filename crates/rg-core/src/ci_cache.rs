@@ -13,6 +13,89 @@ use uuid::Uuid;
 
 use crate::blob_storage::LocalBlobStorage;
 
+/// Which ref's cache a job reads and writes (card_b7a25458b98b).
+///
+/// A cache key alone used to be the whole address, per repository: any writer
+/// could save `target/` under the key a release job on `main` restores, from a
+/// branch protection keeps out of `main`, and the release then built with it.
+/// Now every entry belongs to the ref of the pipeline that saved it. A job
+/// reads its own ref's entry and falls back to the default branch's, so a new
+/// branch still starts warm; it writes only its own. Both executors — the
+/// embedded runner and the external runners' HTTP route — address entries
+/// through this one type, so they cannot disagree about where a key lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheScope {
+    own: String,
+    fallback: Option<String>,
+}
+
+impl CacheScope {
+    /// The scope of a pipeline on `ref_name` in a repository whose default
+    /// branch is `default_branch`. A bare name is read as a branch, the way
+    /// a manual run spells it.
+    pub fn for_pipeline(ref_name: &str, default_branch: &str) -> Self {
+        let own = qualified_ref(ref_name);
+        let default = qualified_ref(default_branch);
+        let fallback = (default != own).then_some(default);
+        Self { own, fallback }
+    }
+
+    /// Where a save under `key` goes: this ref's entry, never another's.
+    pub fn save_hash(&self, key: &str) -> String {
+        scoped_key_hash(&self.own, key)
+    }
+
+    /// Where a restore of `key` looks, in order: this ref, then the default
+    /// branch.
+    pub fn restore_hashes(&self, key: &str) -> Vec<String> {
+        std::iter::once(&self.own)
+            .chain(self.fallback.as_ref())
+            .map(|scope| scoped_key_hash(scope, key))
+            .collect()
+    }
+}
+
+fn qualified_ref(name: &str) -> String {
+    if name.starts_with("refs/") {
+        name.to_string()
+    } else {
+        format!("refs/heads/{name}")
+    }
+}
+
+/// The row key of `key` under `scope`. The NUL cannot occur in a ref name, so
+/// no ref/key pair can be spelled as another.
+fn scoped_key_hash(scope: &str, key: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(scope.as_bytes());
+    hasher.update([0]);
+    hasher.update(key.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// The cache scope of `pipeline_id`, read from its pipeline and repository.
+pub async fn scope_of_pipeline(
+    db: &rg_db::DatabaseConnection,
+    pipeline_id: i64,
+) -> Result<CacheScope> {
+    let pipeline = rg_db::ops::pipeline_ops::get_pipeline(db, pipeline_id)
+        .await?
+        .with_context(|| format!("pipeline {pipeline_id} not found for its cache scope"))?;
+    let repository = rg_db::ops::repo_ops::find_by_id(db, pipeline.repo_id)
+        .await?
+        .with_context(|| {
+            format!(
+                "repository {} not found for its cache scope",
+                pipeline.repo_id
+            )
+        })?;
+    Ok(CacheScope::for_pipeline(
+        &pipeline.ref_name,
+        &repository.default_branch,
+    ))
+}
+
 /// Create a request-private spool beside the cache archive it may become.
 ///
 /// Keeping source and destination in one directory makes publication an atomic
@@ -166,5 +249,31 @@ async fn discard_replaced(path: &Path, repo_id: i64, key_hash: &str) {
             "superseded CI cache archive not deleted — the file stays on disk after the entry \
              moved to the newly published archive"
         ),
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::CacheScope;
+
+    /// card_b7a25458b98b: a branch never writes where the default branch
+    /// reads first, and still reads the default branch's entry second.
+    #[test]
+    fn a_branch_writes_only_its_own_scope_and_reads_the_default_second() {
+        let feature = CacheScope::for_pipeline("refs/heads/feature", "main");
+        let main = CacheScope::for_pipeline("refs/heads/main", "main");
+
+        assert_ne!(feature.save_hash("k"), main.save_hash("k"));
+        assert_eq!(main.restore_hashes("k"), vec![main.save_hash("k")]);
+        assert_eq!(
+            feature.restore_hashes("k"),
+            vec![feature.save_hash("k"), main.save_hash("k")]
+        );
+        assert!(!main.restore_hashes("k").contains(&feature.save_hash("k")));
+        // A bare branch name is the same scope as its full ref.
+        assert_eq!(CacheScope::for_pipeline("main", "main"), main);
+        // A pull request's pipeline is its own scope too.
+        let pull = CacheScope::for_pipeline("refs/pull/7/head", "main");
+        assert_ne!(pull.save_hash("k"), main.save_hash("k"));
     }
 }

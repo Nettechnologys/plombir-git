@@ -93,11 +93,22 @@ async fn create_cached_job(
     runner_id: i64,
     cache_key: &str,
 ) -> i64 {
+    create_cached_job_on(db, repo_id, runner_id, cache_key, "refs/heads/main").await
+}
+
+/// [`create_cached_job`] for a pipeline on `ref_name`.
+async fn create_cached_job_on(
+    db: &rg_db::DatabaseConnection,
+    repo_id: i64,
+    runner_id: i64,
+    cache_key: &str,
+    ref_name: &str,
+) -> i64 {
     let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
         db,
         repo_id,
         "1234567890123456789012345678901234567890",
-        "refs/heads/main",
+        ref_name,
         "manual",
         None,
     )
@@ -130,8 +141,76 @@ async fn create_cached_job(
     job.id
 }
 
+/// The row key a `main` pipeline's cache is stored under — every fixture job
+/// here runs on `main`, the default branch.
 fn key_hash(key: &str) -> String {
-    hex::encode(Sha256::digest(key.as_bytes()))
+    rg_core::ci_cache::CacheScope::for_pipeline("refs/heads/main", "main").save_hash(key)
+}
+
+/// card_b7a25458b98b: a job on a branch saves under its own ref, so the
+/// release job on `main` restoring the same key finds nothing of it — the
+/// supply-chain bypass of branch protection through a poisoned cache. `main`'s
+/// own entry is what a branch falls back to.
+#[tokio::test]
+async fn a_branch_cache_upload_never_reaches_the_default_branch() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (owner_token, _) = register_full(&base, "scope_owner", "scope_owner@example.com").await;
+    let repo_id = create_private_repo(&base, &owner_token, "scoped-cache").await;
+    let (runner, runner_token) =
+        rg_db::ops::runner_ops::register_runner(&db, repo_id, "scope-runner", "", None, None, None)
+            .await
+            .unwrap();
+    let cache_key = "release-target";
+    let url = |job_id: i64| format!("{base}/api/v1/runners/{}/jobs/{job_id}/cache", runner.id);
+
+    let feature_job =
+        create_cached_job_on(&db, repo_id, runner.id, cache_key, "refs/heads/feature").await;
+    let upload = client
+        .put(url(feature_job))
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .body(b"poisoned target".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), 204);
+
+    let main_job = create_cached_job(&db, repo_id, runner.id, cache_key).await;
+    let restore = client
+        .get(url(main_job))
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        restore.status(),
+        404,
+        "main restored a cache a feature branch uploaded"
+    );
+
+    // The intended direction: main saves, a new branch starts from it.
+    let upload = client
+        .put(url(main_job))
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .body(b"built on main".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), 204);
+    let other_job =
+        create_cached_job_on(&db, repo_id, runner.id, cache_key, "refs/heads/other").await;
+    let restore = client
+        .get(url(other_job))
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), 200);
+    assert_eq!(restore.bytes().await.unwrap().as_ref(), b"built on main");
 }
 
 #[tokio::test]

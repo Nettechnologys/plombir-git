@@ -1452,17 +1452,30 @@ impl PipelineRunner {
             .unwrap_or_else(|| self.repo_path.parent().unwrap_or(&self.repo_path))
     }
 
+    /// Restore `key` from this pipeline's ref, or else from the default
+    /// branch — never from another branch (card_b7a25458b98b).
     async fn restore_cache(&self, key: &str) -> Result<()> {
-        let key_hash = cache_key_hash(key);
+        let scope = rg_core::ci_cache::scope_of_pipeline(&self.db, self.pipeline_id).await?;
+        for key_hash in scope.restore_hashes(key) {
+            if self.restore_cache_entry(&key_hash).await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore the entry stored under `key_hash`; `false` when there is none
+    /// to restore.
+    async fn restore_cache_entry(&self, key_hash: &str) -> Result<bool> {
         let policy = rg_db::ops::ci_retention_ops::get_policy(&self.db, self.repo_id).await?;
         let existing =
-            rg_db::ops::ci_retention_ops::find_cache_entry(&self.db, self.repo_id, &key_hash)
+            rg_db::ops::ci_retention_ops::find_cache_entry(&self.db, self.repo_id, key_hash)
                 .await?;
         // Publications are named per-save, so the row is the only handle on the
         // archive: no row means no cache to restore, whatever is lying in the
         // directory.
         let Some(entry) = existing else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(archive) = recorded_cache_archive(&self.cache_archive_dir(), &entry.file_path)
         else {
@@ -1473,7 +1486,7 @@ impl PipelineRunner {
             {
                 remove_cache_archive(&archive, "the cache entry expired");
             }
-            return Ok(());
+            return Ok(false);
         }
         let workspace = self.workspace_path();
         let expected = entry.sha256.clone();
@@ -1507,7 +1520,7 @@ impl PipelineRunner {
         })
         .await?;
         if !restored {
-            return Ok(());
+            return Ok(false);
         }
         rg_db::ops::ci_retention_ops::refresh_cache_entry(
             &self.db,
@@ -1515,11 +1528,14 @@ impl PipelineRunner {
             policy.cache_retention_days,
         )
         .await?;
-        Ok(())
+        Ok(true)
     }
 
+    /// Save `key` under this pipeline's ref only (card_b7a25458b98b).
     async fn save_cache(&self, key: &str, paths: &[String]) -> Result<()> {
-        let key_hash = cache_key_hash(key);
+        let key_hash = rg_core::ci_cache::scope_of_pipeline(&self.db, self.pipeline_id)
+            .await?
+            .save_hash(key);
         let directory = self.cache_archive_dir();
         let workspace = self.workspace_path();
         let paths = paths.to_vec();
@@ -1750,11 +1766,6 @@ fn append_job_notices(mut log: String, notices: &[String]) -> String {
         }
     }
     log
-}
-
-fn cache_key_hash(key: &str) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(key.as_bytes()))
 }
 
 /// Resolve the archive a cache row names, inside `directory` and nowhere else.
@@ -2020,7 +2031,7 @@ mod tests {
 
         for (function, blocking_calls) in [
             (
-                "restore_cache",
+                "restore_cache_entry",
                 &["hash_archive", "workspace_archive::unpack_into"] as &[&str],
             ),
             ("save_cache", &["pack_cache_archive", "hash_archive"]),
@@ -2281,11 +2292,80 @@ mod tests {
         )
         .await
         .unwrap();
+        cache_runner_on(db, root, repository.id, "refs/heads/main").await
+    }
+
+    /// A runner for a pipeline on `ref_name` of `repo_id`, in `db`.
+    async fn cache_runner_on(
+        db: DatabaseConnection,
+        root: &std::path::Path,
+        repo_id: i64,
+        ref_name: &str,
+    ) -> PipelineRunner {
+        let pipeline =
+            pipeline_ops::create_pipeline(&db, repo_id, &"0".repeat(40), ref_name, "push", None)
+                .await
+                .unwrap();
         let repo_path = root.join("repos/owner/repo.git");
         std::fs::create_dir_all(&repo_path).unwrap();
-        let mut runner = PipelineRunner::new_local_only(db, &repo_path, 77);
-        runner.set_repo_id(repository.id);
+        let mut runner = PipelineRunner::new_local_only(db, &repo_path, pipeline.id);
+        runner.set_repo_id(repo_id);
         runner
+    }
+
+    /// card_b7a25458b98b: a branch cannot poison the cache the default
+    /// branch restores. A job on `feature` saving `build-main` writes only
+    /// `feature`'s entry; `main` restoring the same key finds nothing of it.
+    /// The other way round is the intended fallback: `feature` starts from
+    /// `main`'s entry until it saves its own.
+    #[tokio::test]
+    async fn a_branch_cache_never_reaches_the_default_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = cache_runner(temp.path()).await;
+        let feature = cache_runner_on(
+            main.db.clone(),
+            temp.path(),
+            main.repo_id,
+            "refs/heads/feature",
+        )
+        .await;
+
+        save_workspace_cache(&feature, "build-main", "poisoned by feature")
+            .await
+            .unwrap();
+        assert_eq!(
+            restored_cache_content(&main, "build-main").await,
+            None,
+            "main restored a cache a feature branch saved"
+        );
+
+        save_workspace_cache(&main, "build-main", "built on main")
+            .await
+            .unwrap();
+        assert_eq!(
+            restored_cache_content(&main, "build-main").await.as_deref(),
+            Some("built on main")
+        );
+        // `feature` reads its own entry first, `main`'s only without one.
+        assert_eq!(
+            restored_cache_content(&feature, "build-main")
+                .await
+                .as_deref(),
+            Some("poisoned by feature")
+        );
+        let other = cache_runner_on(
+            main.db.clone(),
+            temp.path(),
+            main.repo_id,
+            "refs/heads/other",
+        )
+        .await;
+        assert_eq!(
+            restored_cache_content(&other, "build-main")
+                .await
+                .as_deref(),
+            Some("built on main")
+        );
     }
 
     /// card_e29c8d4274af: a run that cannot lay down its workspace settles the
@@ -2488,7 +2568,9 @@ mod tests {
     /// What a restore into an emptied workspace produces.
     async fn restored_cache_content(runner: &PipelineRunner, key: &str) -> Option<String> {
         let workspace = runner.workspace_path();
-        std::fs::remove_dir_all(&workspace).unwrap();
+        if workspace.exists() {
+            std::fs::remove_dir_all(&workspace).unwrap();
+        }
         std::fs::create_dir_all(&workspace).unwrap();
         runner.restore_cache(key).await.unwrap();
         std::fs::read_to_string(workspace.join("target/cache.txt")).ok()
@@ -2631,7 +2713,10 @@ mod tests {
             rg_db::ops::ci_retention_ops::find_cache_entry(
                 &runner.db,
                 runner.repo_id,
-                &cache_key_hash("build-main")
+                &rg_core::ci_cache::scope_of_pipeline(&runner.db, runner.pipeline_id)
+                    .await
+                    .unwrap()
+                    .save_hash("build-main")
             )
             .await
             .unwrap()

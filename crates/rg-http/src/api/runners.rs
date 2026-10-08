@@ -1052,7 +1052,7 @@ pub async fn download_cache(
     Path((runner_id, job_id)): Path<(i64, i64)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let (job, repo_id) = match assigned_job_repo(&state, runner_id, job_id).await {
+    let (job, repo_id, pipeline_id) = match assigned_job_repo(&state, runner_id, job_id).await {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
@@ -1063,53 +1063,49 @@ pub async fn download_cache(
         Ok(key) => key,
         Err(error) => return error.into_response(),
     };
-    let key_hash = cache_key_hash(key);
-    // The row is the handle on the archive, not a hint about it: every
-    // publication is written under its own name, so a file this lookup cannot
-    // reach is residue rather than a cache.
-    let entry = match cache_entry_for_download(&state.db, repo_id, &key_hash).await {
-        Ok(Some(entry)) => entry,
-        Ok(None) => return AppError::not_found("cache entry not found").into_response(),
+    // This ref's entry, then the default branch's — never another branch's
+    // (card_b7a25458b98b).
+    let scope = match job_cache_scope(&state, pipeline_id).await {
+        Ok(scope) => scope,
         Err(error) => return error.into_response(),
     };
     let directory = cache_archive_dir(&state, repo_id);
-    let path = match recorded_cache_archive(&directory, &entry.file_path) {
-        Some(path) => path,
-        None => {
-            return AppError::internal(anyhow::anyhow!(
-                "CI cache entry {} names no archive file",
-                entry.id
-            ))
-            .into_response()
+    let mut expired_seen = false;
+    let mut live = None;
+    for key_hash in scope.restore_hashes(key) {
+        // The row is the handle on the archive, not a hint about it: every
+        // publication is written under its own name, so a file this lookup
+        // cannot reach is residue rather than a cache.
+        let entry = match cache_entry_for_download(&state.db, repo_id, &key_hash).await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => continue,
+            Err(error) => return error.into_response(),
+        };
+        let path = match recorded_cache_archive(&directory, &entry.file_path) {
+            Some(path) => path,
+            None => {
+                return AppError::internal(anyhow::anyhow!(
+                    "CI cache entry {} names no archive file",
+                    entry.id
+                ))
+                .into_response()
+            }
+        };
+        if entry.expires_at <= chrono::Utc::now() {
+            evict_expired_cache_entry(&state, repo_id, &entry, &path).await;
+            expired_seen = true;
+            continue;
         }
-    };
-    if entry.expires_at <= chrono::Utc::now() {
-        // Delete the observed expired row first. If a concurrent upload or
-        // restore refreshed/replaced it, the conditional delete returns false
-        // and its archive must stay exactly where the now-live row expects it.
-        match rg_db::ops::ci_retention_ops::delete_cache_entry_if_expired(&state.db, &entry).await {
-            Ok(true) => match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                // Already gone: eviction had nothing to do, not a failure.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => tracing::warn!(
-                    repo_id,
-                    cache_entry_id = entry.id,
-                    path = %path.display(),
-                    error = %error,
-                    "expired CI cache row is gone, but its archive could not be deleted"
-                ),
-            },
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                repo_id,
-                cache_entry_id = entry.id,
-                error = %format!("{error:#}"),
-                "expired CI cache entry kept because its conditional delete failed"
-            ),
-        }
-        return AppError::not_found("cache entry expired").into_response();
+        live = Some((entry, path));
+        break;
     }
+    let Some((entry, path)) = live else {
+        return if expired_seen {
+            AppError::not_found("cache entry expired").into_response()
+        } else {
+            AppError::not_found("cache entry not found").into_response()
+        };
+    };
     // Integrity: hash the archive off disk so a mismatch is a `500` decided
     // BEFORE the first byte of body leaves. The previous shape buffered the
     // whole archive into a `Vec` to hash it (card_f357f874d69e) — the ceiling
@@ -1178,6 +1174,40 @@ pub async fn download_cache(
         crate::http_stream::file_body_with_idle(file, state.git_idle_timeout_secs),
     )
         .into_response()
+}
+
+/// Retire an expired cache row and its archive.
+///
+/// Deletes the observed expired row first. If a concurrent upload or restore
+/// refreshed/replaced it, the conditional delete returns false and its archive
+/// must stay exactly where the now-live row expects it.
+async fn evict_expired_cache_entry(
+    state: &AppState,
+    repo_id: i64,
+    entry: &rg_db::entities::ci_cache_entry::Model,
+    path: &std::path::Path,
+) {
+    match rg_db::ops::ci_retention_ops::delete_cache_entry_if_expired(&state.db, entry).await {
+        Ok(true) => match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            // Already gone: eviction had nothing to do, not a failure.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                repo_id,
+                cache_entry_id = entry.id,
+                path = %path.display(),
+                error = %error,
+                "expired CI cache row is gone, but its archive could not be deleted"
+            ),
+        },
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            repo_id,
+            cache_entry_id = entry.id,
+            error = %format!("{error:#}"),
+            "expired CI cache entry kept because its conditional delete failed"
+        ),
+    }
 }
 
 /// One CI cache archive that has been received in full but is not yet the
@@ -1293,7 +1323,7 @@ pub async fn upload_cache(
     headers: HeaderMap,
     body: Body,
 ) -> impl IntoResponse {
-    let (job, repo_id) = match assigned_job_repo(&state, runner_id, job_id).await {
+    let (job, repo_id, pipeline_id) = match assigned_job_repo(&state, runner_id, job_id).await {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
@@ -1304,7 +1334,12 @@ pub async fn upload_cache(
         Ok(key) => key,
         Err(error) => return error.into_response(),
     };
-    let key_hash = cache_key_hash(key);
+    // Only ever this ref's entry: a branch must not write the entry the
+    // default branch restores (card_b7a25458b98b).
+    let key_hash = match job_cache_scope(&state, pipeline_id).await {
+        Ok(scope) => scope.save_hash(key),
+        Err(error) => return error.into_response(),
+    };
     let directory = cache_archive_dir(&state, repo_id);
     if let Err(error) = tokio::fs::create_dir_all(&directory).await {
         return cache_path_error("CI cache directory", &directory, &error).into_response();
@@ -1386,7 +1421,7 @@ async fn assigned_job_repo(
     state: &AppState,
     runner_id: i64,
     job_id: i64,
-) -> Result<(rg_db::entities::pipeline_job::Model, i64), AppError> {
+) -> Result<(rg_db::entities::pipeline_job::Model, i64, i64), AppError> {
     let job = assigned_job(state, runner_id, job_id).await?;
     let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id)
         .await
@@ -1396,7 +1431,17 @@ async fn assigned_job_repo(
         .await
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("pipeline not found"))?;
-    Ok((job, pipeline.repo_id))
+    Ok((job, pipeline.repo_id, pipeline.id))
+}
+
+/// The cache scope of the job's pipeline — see [`rg_core::ci_cache::CacheScope`].
+async fn job_cache_scope(
+    state: &AppState,
+    pipeline_id: i64,
+) -> Result<rg_core::ci_cache::CacheScope, AppError> {
+    rg_core::ci_cache::scope_of_pipeline(&state.db, pipeline_id)
+        .await
+        .map_err(AppError::from)
 }
 
 /// Read the metadata that makes a cache archive safe to serve.
@@ -1464,13 +1509,8 @@ fn cache_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) 
     ))
 }
 
-fn cache_key_hash(key: &str) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(key.as_bytes()))
-}
-
-/// Hex-encoded SHA-256 of a cache archive's *contents* (distinct from
-/// `cache_key_hash`, which digests the cache key). Used to record and later
+/// Hex-encoded SHA-256 of a cache archive's *contents* (distinct from the
+/// scoped key hash of [`rg_core::ci_cache::CacheScope`]). Used to record and later
 /// verify the integrity of the stored archive.
 ///
 /// Kept for tests that spot-check the digest recorded by

@@ -369,6 +369,42 @@ pub struct WorkflowEventQuery<'a> {
     pub previous_sha: Option<&'a str>,
 }
 
+/// [`WorkflowEventQuery`] with its own copies of every field, so the
+/// evaluation can move to a blocking thread (card_57ccfa9fdde3).
+#[derive(Clone, Debug)]
+pub struct OwnedWorkflowEventQuery {
+    pub repo_path: std::path::PathBuf,
+    pub commit_sha: String,
+    pub event: String,
+    pub ref_name: String,
+    pub base_branch: Option<String>,
+    pub previous_sha: Option<String>,
+}
+
+impl OwnedWorkflowEventQuery {
+    pub fn new(query: WorkflowEventQuery<'_>) -> Self {
+        Self {
+            repo_path: query.repo_path.to_path_buf(),
+            commit_sha: query.commit_sha.to_string(),
+            event: query.event.to_string(),
+            ref_name: query.ref_name.to_string(),
+            base_branch: query.base_branch.map(str::to_string),
+            previous_sha: query.previous_sha.map(str::to_string),
+        }
+    }
+
+    pub fn as_query(&self) -> WorkflowEventQuery<'_> {
+        WorkflowEventQuery {
+            repo_path: &self.repo_path,
+            commit_sha: &self.commit_sha,
+            event: &self.event,
+            ref_name: &self.ref_name,
+            base_branch: self.base_branch.as_deref(),
+            previous_sha: self.previous_sha.as_deref(),
+        }
+    }
+}
+
 /// The immutable repository revision whose manual-run form is being requested.
 ///
 /// This lives next to [`WorkflowEventQuery`] because both are read-only probes
@@ -623,6 +659,22 @@ pub trait CiTrigger: Send + Sync {
     /// workflow that simply does not select this event.
     fn has_workflow_for_event_checked(&self, query: WorkflowEventQuery<'_>) -> Result<bool> {
         Ok(self.has_workflow_for_event(query))
+    }
+
+    /// [`Self::has_workflow_for_event_checked`] for an async caller.
+    ///
+    /// The answer reads every workflow blob at the commit, parses them and
+    /// diffs the event's trees for `paths:` filters — work whose size the
+    /// repository picks, which must not run on an async worker
+    /// (card_57ccfa9fdde3). The production engine moves it to a blocking
+    /// thread; a test double whose probe is free inherits this synchronous
+    /// default.
+    fn has_workflow_for_event_async<'a>(
+        &'a self,
+        query: WorkflowEventQuery<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + 'a>> {
+        let answer = self.has_workflow_for_event_checked(query);
+        Box::pin(async move { answer })
     }
 
     /// Return the validated manual-run form at an immutable commit.

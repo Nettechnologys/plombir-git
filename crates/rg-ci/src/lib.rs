@@ -219,6 +219,18 @@ impl rg_core::ci::CiTrigger for CiEngine {
         workflow_matches_event(query)
     }
 
+    fn has_workflow_for_event_async<'a>(
+        &'a self,
+        query: rg_core::ci::WorkflowEventQuery<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + 'a>> {
+        let query = rg_core::ci::OwnedWorkflowEventQuery::new(query);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || workflow_matches_event(query.as_query()))
+                .await
+                .context("workflow event evaluation did not complete")?
+        })
+    }
+
     fn workflow_dispatch_schema(
         &self,
         query: rg_core::ci::WorkflowDispatchSchemaQuery<'_>,
@@ -273,6 +285,120 @@ mod engine_ci_config_gate_tests {
         assert!(
             !CiEngine::new().has_ci_config(&missing, "deadbeef"),
             "the bool gate stays fail-open so a broken repository never blocks a push"
+        );
+    }
+
+    /// A workflow set at the byte ceiling: sixteen files of large `env:` maps,
+    /// none of which `push` triggers, so matching a push parses every one.
+    fn heavy_workflows() -> Vec<(String, Vec<u8>)> {
+        (0..16)
+            .map(|file| {
+                let mut yaml = String::from(
+                    "on: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n",
+                );
+                for key in 0..24_000 {
+                    yaml.push_str(&format!("      KEY_{file}_{key}: value-{key}\n"));
+                }
+                yaml.push_str("    steps:\n      - run: echo ok\n");
+                (
+                    format!(".gitea/workflows/w{file:02}.yml"),
+                    yaml.into_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    /// card_57ccfa9fdde3: deciding whether an event triggers a workflow reads
+    /// and parses every workflow at the commit — work the pushed content sizes.
+    /// On a one-worker runtime a cheap task keeps getting scheduled while the
+    /// evaluation runs: it is on a blocking thread, not on the worker. The
+    /// evaluation itself has to outlast the bound several times over, or the
+    /// fixture proves nothing.
+    #[test]
+    fn workflow_evaluation_leaves_the_async_worker_free() {
+        const BOUND: std::time::Duration = std::time::Duration::from_millis(500);
+        let files = heavy_workflows();
+        let borrowed: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_slice()))
+            .collect();
+        let (repo, sha) = super::matrix_tests::commit_repo(&borrowed);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // The clock starts before the evaluation does, and the ticker is
+            // already asleep in its first tick when the evaluation begins: a
+            // ticker that first ran after a blocking evaluation would start its
+            // clock late and never see the stall it is here to measure.
+            let mut last = std::time::Instant::now();
+            let ticker = tokio::spawn({
+                let stop = stop.clone();
+                async move {
+                    let mut widest = std::time::Duration::ZERO;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        widest = widest.max(last.elapsed());
+                        last = std::time::Instant::now();
+                    }
+                    widest
+                }
+            });
+
+            tokio::task::yield_now().await;
+            let started = std::time::Instant::now();
+            let matched = CiEngine::new()
+                .has_workflow_for_event_async(rg_core::ci::WorkflowEventQuery {
+                    repo_path: repo.path(),
+                    commit_sha: &sha,
+                    event: "push",
+                    ref_name: "refs/heads/main",
+                    base_branch: None,
+                    previous_sha: None,
+                })
+                .await
+                .expect("the heavy workflow set is valid");
+            let took = started.elapsed();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let widest = ticker.await.unwrap();
+
+            assert!(!matched, "no workflow here is triggered by a push");
+            assert!(
+                took > BOUND * 3,
+                "the fixture is too light to prove anything: evaluation took {took:?}"
+            );
+            assert!(
+                widest < BOUND,
+                "a cheap task waited {widest:?} while a {took:?} evaluation held the worker"
+            );
+        });
+    }
+
+    /// The trigger's half: the config it builds the pipeline from is read on a
+    /// blocking thread too. Pinned in the source because a pipeline cannot be
+    /// triggered without a database this module's tests do not carry.
+    #[test]
+    fn the_trigger_reads_its_config_inside_a_blocking_boundary() {
+        let source = include_str!("lib.rs");
+        let function = "trigger_pipeline_with_barrier_and_engine";
+        let boundary = super::matrix_tests::rust_source::production_function_call_sites(
+            source,
+            function,
+            &["spawn_blocking"],
+        );
+        let reads = super::matrix_tests::rust_source::production_function_call_sites(
+            source,
+            function,
+            &["read_ci_config_with_inputs"],
+        );
+        assert_eq!(boundary.len(), 1, "{boundary:?}");
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert!(
+            super::matrix_tests::rust_source::call_site_contains(source, boundary[0], reads[0]),
+            "the trigger reads its CI config outside the blocking boundary"
         );
     }
 }
@@ -416,21 +542,42 @@ async fn trigger_pipeline_with_barrier_and_engine(
         .as_ref()
         .map(|(owner, name)| (owner.as_str(), name.as_str()))
         .unwrap_or(("", ""));
-    let mut config = read_ci_config_with_inputs(
-        repo_path,
-        RepositoryName {
-            owner: identity_owner,
-            name: identity_name,
-        },
-        commit_sha,
-        ref_name,
-        WorkflowInvocation {
-            event: trigger_type,
-            base_branch,
-            previous_sha,
-            inputs,
-        },
-    )?;
+    // Reading the workflows means opening the repository, reading every
+    // workflow blob (up to `MAX_WORKFLOW_TOTAL_BYTES`), parsing them and diffing
+    // the event's trees for `paths:` — work whose size the pushed content picks.
+    // It runs on a blocking thread, with copies of everything it reads, so a
+    // heavy workflow cannot hold an async worker (card_57ccfa9fdde3).
+    let mut config = {
+        let repo_path = repo_path.to_path_buf();
+        let (owner, name) = (identity_owner.to_string(), identity_name.to_string());
+        let (commit_sha, ref_name, event) = (
+            commit_sha.to_string(),
+            ref_name.to_string(),
+            trigger_type.to_string(),
+        );
+        let base_branch = base_branch.map(str::to_string);
+        let previous_sha = previous_sha.map(str::to_string);
+        let inputs = inputs.cloned();
+        tokio::task::spawn_blocking(move || {
+            read_ci_config_with_inputs(
+                &repo_path,
+                RepositoryName {
+                    owner: &owner,
+                    name: &name,
+                },
+                &commit_sha,
+                &ref_name,
+                WorkflowInvocation {
+                    event: &event,
+                    base_branch: base_branch.as_deref(),
+                    previous_sha: previous_sha.as_deref(),
+                    inputs: inputs.as_ref(),
+                },
+            )
+        })
+        .await
+        .context("reading the CI configuration did not complete")??
+    };
     validate_execution_semantics(&config)?;
     validate_runner_routing(&config, external_runners, engine.runner_labels())?;
     select_jobs_for_ref(&mut config, ref_name)?;
@@ -2930,7 +3077,7 @@ mod matrix_tests {
     use std::collections::{BTreeMap, HashMap};
 
     #[allow(dead_code)]
-    mod rust_source {
+    pub(super) mod rust_source {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/support/rust_source.rs"

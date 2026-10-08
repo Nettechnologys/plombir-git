@@ -219,7 +219,7 @@ pub async fn trigger_pull_request_ci(
     let ref_name = pull_request_ref(pr);
     if !ci
         .trigger
-        .has_workflow_for_event_checked(crate::ci::WorkflowEventQuery {
+        .has_workflow_for_event_async(crate::ci::WorkflowEventQuery {
             repo_path: &repo_path,
             commit_sha: head_sha,
             event: PULL_REQUEST_EVENT,
@@ -229,7 +229,8 @@ pub async fn trigger_pull_request_ci(
             // the event is about the PR's head, and a path filter falls back to
             // that commit's own diff.
             previous_sha: None,
-        })?
+        })
+        .await?
     {
         return Ok(None);
     }

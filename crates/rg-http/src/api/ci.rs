@@ -248,16 +248,24 @@ pub async fn get_workflow_dispatch_schema(
         }
         Err(error) => return AppError::from(error).into_response(),
     };
-    let schema =
-        match state
-            .ci_engine
-            .workflow_dispatch_schema(rg_core::ci::WorkflowDispatchSchemaQuery {
-                repo_path: &repo_path,
-                commit_sha: &commit_sha,
-            }) {
-            Ok(workflows) => workflows,
-            Err(error) => return AppError::from(error).into_response(),
-        };
+    // Every workflow at the commit is read and parsed — up to the workflow
+    // byte ceiling, chosen by whoever pushed it — so the schema is built on a
+    // blocking thread, not on the worker serving this request
+    // (card_57ccfa9fdde3).
+    let engine = state.ci_engine.clone();
+    let schema_commit = commit_sha.clone();
+    let schema = match tokio::task::spawn_blocking(move || {
+        engine.workflow_dispatch_schema(rg_core::ci::WorkflowDispatchSchemaQuery {
+            repo_path: &repo_path,
+            commit_sha: &schema_commit,
+        })
+    })
+    .await
+    .context("building the manual-run form did not complete")
+    {
+        Ok(Ok(workflows)) => workflows,
+        Ok(Err(error)) | Err(error) => return AppError::from(error).into_response(),
+    };
     let workflows = schema
         .workflows
         .into_iter()
