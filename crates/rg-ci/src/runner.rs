@@ -1496,15 +1496,13 @@ impl PipelineRunner {
             }
             let file = std::fs::File::open(&archive)
                 .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?;
-            tar::Archive::new(file)
-                .unpack(&workspace)
-                .with_context(|| {
-                    format!(
-                        "failed to unpack CI cache archive `{}` into workspace `{}`",
-                        archive.display(),
-                        workspace.display()
-                    )
-                })?;
+            rg_process::workspace_archive::unpack_into(file, &workspace).with_context(|| {
+                format!(
+                    "failed to unpack CI cache archive `{}` into workspace `{}`",
+                    archive.display(),
+                    workspace.display()
+                )
+            })?;
             Ok(true)
         })
         .await?;
@@ -1571,28 +1569,14 @@ impl PipelineRunner {
         }
         let file = std::fs::File::create(temporary)
             .map_err(|error| cache_path_error("CI cache archive", temporary, &error))?;
-        let mut builder = tar::Builder::new(file);
+        let mut builder = rg_process::workspace_archive::WorkspaceArchive::new(workspace, file)?;
         for path in paths {
-            let source = workspace.join(path);
-            if source.is_dir() {
-                builder.append_dir_all(path, &source).with_context(|| {
-                    format!(
-                        "failed to add directory `{}` to CI cache archive `{}`",
-                        source.display(),
-                        temporary.display()
-                    )
-                })?;
-            } else if source.is_file() {
-                builder
-                    .append_path_with_name(&source, path)
-                    .with_context(|| {
-                        format!(
-                            "failed to add file `{}` to CI cache archive `{}`",
-                            source.display(),
-                            temporary.display()
-                        )
-                    })?;
-            }
+            builder.append_declared(path).with_context(|| {
+                format!(
+                    "failed to add `{path}` to CI cache archive `{}`",
+                    temporary.display()
+                )
+            })?;
         }
         builder.finish().with_context(|| {
             format!(
@@ -1832,27 +1816,13 @@ fn pack_archive_from(
     }
     let file = std::fs::File::create(archive)
         .map_err(|error| artifact_path_error("CI artifact archive", archive, &error))?;
-    let mut builder = tar::Builder::new(file);
+    let mut builder = rg_process::workspace_archive::WorkspaceArchive::new(workspace, file)?;
     let mut packed = 0usize;
     for path in paths {
-        let source = workspace.join(path);
-        if source.is_dir() {
-            builder.append_dir_all(path, &source).with_context(|| {
-                format!(
-                    "failed to add directory `{}` to CI artifact archive",
-                    source.display()
-                )
-            })?;
-            packed += 1;
-        } else if source.is_file() {
-            builder
-                .append_path_with_name(&source, path)
-                .with_context(|| {
-                    format!(
-                        "failed to add file `{}` to CI artifact archive",
-                        source.display()
-                    )
-                })?;
+        if builder
+            .append_declared(path)
+            .with_context(|| format!("failed to add `{path}` to CI artifact archive"))?
+        {
             packed += 1;
         }
     }
@@ -2051,7 +2021,7 @@ mod tests {
         for (function, blocking_calls) in [
             (
                 "restore_cache",
-                &["hash_archive", "tar::Archive::new"] as &[&str],
+                &["hash_archive", "workspace_archive::unpack_into"] as &[&str],
             ),
             ("save_cache", &["pack_cache_archive", "hash_archive"]),
             ("publish_artifact", &["pack_archive_from"]),
@@ -2082,6 +2052,78 @@ mod tests {
                 assert!(
                     rust_source::call_site_contains(source, boundary[0], calls[0]),
                     "{function}'s `{blocking_call}` call is outside its blocking boundary"
+                );
+            }
+        }
+    }
+
+    /// A job writes its workspace; this process packs it, and this process can
+    /// read the whole instance. Symlinks pointing out of the workspace — a
+    /// relative one as committed in a repository, an absolute one as a
+    /// container creates at run time — must never reach either archive as the
+    /// bytes they point at (card_79b1c2a906ec).
+    #[cfg(unix)]
+    #[test]
+    fn embedded_packers_never_pack_what_a_symlink_points_at() {
+        use std::os::unix::fs::symlink;
+        const SECRET: &[u8] = b"embedded-runner-server-secret";
+
+        let root = tempfile::tempdir().unwrap();
+        // Archives land outside the tree under test: one written inside a
+        // directory a followed link walks would grow by reading itself.
+        let output = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("_ci_workspaces/1/1");
+        let victim = root.path().join("victim.git");
+        std::fs::create_dir_all(workspace.join("dist")).unwrap();
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("config"), SECRET).unwrap();
+        std::fs::write(workspace.join("dist/app.bin"), b"built").unwrap();
+        symlink(
+            "../../../../victim.git/config",
+            workspace.join("dist/relative"),
+        )
+        .unwrap();
+        symlink(victim.join("config"), workspace.join("dist/absolute")).unwrap();
+        symlink("../../../victim.git", workspace.join("leak-relative")).unwrap();
+        symlink(&victim, workspace.join("leak-absolute")).unwrap();
+
+        let carries_secret = |archive: &std::path::Path| {
+            let bytes = std::fs::read(archive).unwrap();
+            bytes.windows(SECRET.len()).any(|window| window == SECRET)
+        };
+        type Packer = fn(&std::path::Path, &[String], &std::path::Path) -> Result<()>;
+        let packers: [(&str, Packer); 2] = [
+            ("artifact", pack_archive_from),
+            ("cache", PipelineRunner::pack_cache_archive),
+        ];
+        for (what, pack) in packers {
+            let archive = output.path().join(format!("{what}.tar"));
+            pack(&workspace, &["dist".to_string()], &archive)
+                .unwrap_or_else(|error| panic!("{what}: dist must pack: {error:#}"));
+            assert!(
+                !carries_secret(&archive),
+                "the {what} archive carries a file a symlink inside `dist` points at"
+            );
+
+            for (index, declared) in [
+                "leak-relative",
+                "leak-absolute",
+                "leak-relative/config",
+                "leak-absolute/config",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let archive = output.path().join(format!("{what}-{index}.tar"));
+                let error = pack(&workspace, &[declared.to_string()], &archive)
+                    .expect_err("a declared path that resolves outside must be refused");
+                assert!(
+                    format!("{error:#}").contains("leaves the CI workspace"),
+                    "{what} {declared}: {error:#}"
+                );
+                assert!(
+                    !archive.exists() || !carries_secret(&archive),
+                    "the {what} archive for `{declared}` carries the target's bytes"
                 );
             }
         }

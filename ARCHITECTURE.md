@@ -108,7 +108,7 @@ ForgeKeep/
 │   ├── rg-ci/                    # CI/CD engine (native + Gitea Actions)
 │   ├── rg-cli/                   # main binary  → plombir-git
 │   ├── rg-runner/                # CI runner agent  → plombir-git-runner
-│   ├── rg-process/               # bounded child-process lifecycle helpers
+│   ├── rg-process/               # bounded child-process lifecycle + CI workspace archives
 │   └── rg-mcp/                   # MCP server  → plombir-git-mcp
 ├── web/                          # SvelteKit frontend
 ├── plombir-git.example.toml        # sample configuration
@@ -140,7 +140,11 @@ are HTTP clients of APIs served by `rg-http`, but neither has a Cargo dependency
 on `rg-http`; the edge runs the other way for `rg-mcp`, whose tools `rg-http`
 embeds to serve MCP over HTTP. `rg-mcp` takes `rg-process` only for the start-up
 refusal every binary shares (`refuse_retired_environment`). `rg-git` remains protocol-only: its sole internal dependency is
-the business-agnostic `rg-process` lifecycle helper.
+the business-agnostic `rg-process` lifecycle helper. `rg-ci` and `rg-runner` also pack and unpack every CI
+workspace archive through `rg_process::workspace_archive`, so the embedded and
+the external runner share one rule for symlinks: a link met while walking a
+declared directory is stored as a link, and a declared path that resolves outside
+the workspace is refused.
 
 `scripts/architecture-crate-dependency-contract-check.mjs` compares this block
 with `cargo metadata`, so adding a crate edge without updating the graph fails

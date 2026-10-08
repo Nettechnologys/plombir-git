@@ -101,19 +101,13 @@ pub(crate) fn pack_artifact(
             archive.display()
         )
     })?;
-    let mut builder = tar::Builder::new(file);
+    let mut builder = rg_process::workspace_archive::WorkspaceArchive::new(workspace, file)?;
     let mut packed = 0usize;
     for path in paths {
-        let source = workspace.join(path);
-        if source.is_dir() {
-            builder
-                .append_dir_all(path, &source)
-                .with_context(|| format!("failed to pack directory `{}`", source.display()))?;
-            packed += 1;
-        } else if source.is_file() {
-            builder
-                .append_path_with_name(&source, path)
-                .with_context(|| format!("failed to pack file `{}`", source.display()))?;
+        if builder
+            .append_declared(path)
+            .with_context(|| format!("failed to pack `{path}`"))?
+        {
             packed += 1;
         }
     }
@@ -571,6 +565,63 @@ mod tests {
             format!("{error:#}").contains("none of the declared artifact paths exist"),
             "{error:#}"
         );
+    }
+
+    /// The runner host packs what a container left in the workspace, and the
+    /// host can read its own `runner.toml`. A symlink out of the workspace —
+    /// relative as committed, absolute as a job creates it — must reach the
+    /// artifact as a link or as a refusal, never as the target's bytes
+    /// (card_79b1c2a906ec).
+    #[cfg(unix)]
+    #[test]
+    fn packing_an_artifact_never_follows_a_symlink_out_of_the_workspace() {
+        use std::os::unix::fs::symlink;
+        const SECRET: &[u8] = b"runner-host-token-secret";
+
+        let root = tempfile::tempdir().unwrap();
+        // Archives land outside the tree under test: one written inside a
+        // directory a followed link walks would grow by reading itself.
+        let output = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("job-7");
+        std::fs::create_dir_all(workspace.join("out")).unwrap();
+        std::fs::write(root.path().join("runner.toml"), SECRET).unwrap();
+        symlink("../../runner.toml", workspace.join("out/relative")).unwrap();
+        symlink(
+            root.path().join("runner.toml"),
+            workspace.join("out/absolute"),
+        )
+        .unwrap();
+        symlink("../runner.toml", workspace.join("leak-relative")).unwrap();
+        symlink(
+            root.path().join("runner.toml"),
+            workspace.join("leak-absolute"),
+        )
+        .unwrap();
+        let carries_secret = |archive: &std::path::Path| {
+            let bytes = std::fs::read(archive).unwrap();
+            bytes.windows(SECRET.len()).any(|window| window == SECRET)
+        };
+
+        let archive = output.path().join("out.tar");
+        pack_artifact(&workspace, &["out".to_string()], &archive).expect("out must pack");
+        assert!(
+            !carries_secret(&archive),
+            "the artifact carries a file a symlink inside `out` points at"
+        );
+
+        for declared in ["leak-relative", "leak-absolute"] {
+            let archive = output.path().join(format!("{declared}.tar"));
+            let error = pack_artifact(&workspace, &[declared.to_string()], &archive)
+                .expect_err("a declared symlink out of the workspace must be refused");
+            assert!(
+                format!("{error:#}").contains("leaves the CI workspace"),
+                "{declared}: {error:#}"
+            );
+            assert!(
+                !archive.exists() || !carries_secret(&archive),
+                "the artifact for `{declared}` carries the target's bytes"
+            );
+        }
     }
 
     #[test]

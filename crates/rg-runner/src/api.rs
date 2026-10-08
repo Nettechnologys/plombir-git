@@ -459,8 +459,7 @@ fn unpack_archive_from_file(
             archive.display()
         )
     })?;
-    tar::Archive::new(std::io::BufReader::new(file))
-        .unpack(unpack_path)
+    rg_process::workspace_archive::unpack_into(std::io::BufReader::new(file), unpack_path)
         .with_context(|| format!("failed to unpack {what} into `{}`", unpack_path.display()))?;
     Ok(())
 }
@@ -512,9 +511,11 @@ pub async fn restore_cache(
                         spool_path.display()
                     )
                 })?;
-                tar::Archive::new(std::io::BufReader::new(file))
-                    .unpack(&workspace)
-                    .context("unpack job cache")
+                rg_process::workspace_archive::unpack_into(
+                    std::io::BufReader::new(file),
+                    &workspace,
+                )
+                .context("unpack job cache")
             })
             .await
             {
@@ -647,16 +648,13 @@ fn pack_cache_archive(
 ) -> Result<u64> {
     let file = std::fs::File::create(archive)
         .with_context(|| format!("failed to create the cache archive `{}`", archive.display()))?;
-    let mut builder = tar::Builder::new(file);
+    let mut builder = rg_process::workspace_archive::WorkspaceArchive::new(workspace, file)?;
     for path in paths {
-        let source = workspace.join(path);
-        if source.is_dir() {
-            builder.append_dir_all(path, source)?;
-        } else if source.is_file() {
-            builder.append_path_with_name(source, path)?;
-        }
+        builder
+            .append_declared(path)
+            .with_context(|| format!("failed to add `{path}` to the cache archive"))?;
     }
-    let mut file = builder.into_inner()?;
+    let mut file = builder.finish()?;
     use std::io::Write;
     file.flush()?;
     let len = file
@@ -912,10 +910,66 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        body_excerpt, error_chain, finish_job, send_heartbeat, start_job, trim_log_for_upload,
-        unpack_archive_from_file, upload_log, FINISH_JOB_ATTEMPTS, LOG_UPLOAD_MAX_BYTES,
-        MAX_LOGGED_BODY,
+        body_excerpt, error_chain, finish_job, pack_cache_archive, send_heartbeat, start_job,
+        trim_log_for_upload, unpack_archive_from_file, upload_log, FINISH_JOB_ATTEMPTS,
+        LOG_UPLOAD_MAX_BYTES, MAX_LOGGED_BODY,
     };
+
+    /// The cache half of `executor`'s
+    /// `packing_an_artifact_never_follows_a_symlink_out_of_the_workspace`: a
+    /// cache is uploaded to the server and restored into every later job, so a
+    /// followed link would carry the runner host's files to all of them
+    /// (card_79b1c2a906ec).
+    #[cfg(unix)]
+    #[test]
+    fn packing_a_cache_never_follows_a_symlink_out_of_the_workspace() {
+        use std::os::unix::fs::symlink;
+        const SECRET: &[u8] = b"runner-host-cache-secret";
+
+        let root = tempfile::tempdir().unwrap();
+        // Archives land outside the tree under test: one written inside a
+        // directory a followed link walks would grow by reading itself.
+        let output = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("job-7");
+        std::fs::create_dir_all(workspace.join("target")).unwrap();
+        std::fs::write(root.path().join("runner.toml"), SECRET).unwrap();
+        symlink("../../runner.toml", workspace.join("target/relative")).unwrap();
+        symlink(
+            root.path().join("runner.toml"),
+            workspace.join("target/absolute"),
+        )
+        .unwrap();
+        symlink("..", workspace.join("leak-relative")).unwrap();
+        symlink(root.path(), workspace.join("leak-absolute")).unwrap();
+        let carries_secret = |archive: &std::path::Path| {
+            let bytes = std::fs::read(archive).unwrap();
+            bytes.windows(SECRET.len()).any(|window| window == SECRET)
+        };
+
+        let archive = output.path().join("target.tar");
+        pack_cache_archive(&workspace, &["target".to_string()], &archive)
+            .expect("target must pack");
+        assert!(
+            !carries_secret(&archive),
+            "the cache carries a file a symlink inside `target` points at"
+        );
+
+        for declared in ["leak-relative", "leak-absolute/runner.toml"] {
+            let archive = output
+                .path()
+                .join(format!("{}.tar", declared.replace('/', "-")));
+            let error = pack_cache_archive(&workspace, &[declared.to_string()], &archive)
+                .expect_err("a declared path resolving out of the workspace must be refused");
+            assert!(
+                format!("{error:#}").contains("leaves the CI workspace"),
+                "{declared}: {error:#}"
+            );
+            assert!(
+                !archive.exists() || !carries_secret(&archive),
+                "the cache for `{declared}` carries the target's bytes"
+            );
+        }
+    }
 
     /// Sink that keeps every formatted log line so a test can assert on what the
     /// operator would actually have seen.

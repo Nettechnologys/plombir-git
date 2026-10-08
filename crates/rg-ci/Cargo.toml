@@ -22,9 +22,9 @@ rg-process = { path = "../rg-process" }
 sha2 = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }
-tar = "0.4"
 
 [dev-dependencies]
+tar = { workspace = true }
 tempfile = "3"
 
 [lints]

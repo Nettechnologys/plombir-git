@@ -12,6 +12,7 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 
 mod retired_environment;
+pub mod workspace_archive;
 
 pub use retired_environment::{refuse_retired_environment, RetiredEnvironment};
 
