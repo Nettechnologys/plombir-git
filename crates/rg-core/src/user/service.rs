@@ -227,8 +227,9 @@ pub async fn register(
         .validate_with_username(plaintext_password, username)
         .map_err(|e| crate::error::invalid_request(e.to_string()))?;
 
-    let password_hash =
-        password::hash_password(plaintext_password).context("failed to hash password")?;
+    let password_hash = password::hash_password(plaintext_password)
+        .await
+        .context("failed to hash password")?;
 
     let now = Utc::now();
     let model = UserActiveModel {
@@ -287,10 +288,15 @@ async fn verify_local_login(
     // and it leaves here as an error carrying `UnusablePasswordHash` rather
     // than as the "invalid credentials" below. The account name rides along in
     // the context so the operator log says which row to go and look at.
+    //
+    // No source address: this door sits behind `auth_rl`, and the only
+    // address on hand here would be one the client could have written itself.
     let password_ok = password::verify_password_or_dummy(
         plaintext_password,
         user.as_ref().map(|u| u.password_hash.as_str()),
+        None,
     )
+    .await
     .with_context(|| format!("cannot verify the password of '{username_or_email}'"))?;
 
     let Some(user) = user else {
@@ -342,8 +348,9 @@ pub async fn login_with_configured_auth(
         }
         Some(_) => {
             // Account exists but authenticates through a provider no password
-            // reaches — burn the same Argon2 work the local branch would.
-            password::burn_dummy_verification(plaintext_password);
+            // reaches — burn the same Argon2 work the local branch would. A
+            // shed burn answers with the shed, as the local branch would.
+            password::burn_dummy_verification(plaintext_password).await?;
             bail!("invalid credentials")
         }
     }
@@ -387,7 +394,10 @@ async fn login_via_ldap(
     )
     .await;
     if outcome.is_err() && !attempted_bind {
-        password::burn_dummy_verification(plaintext_password);
+        // A shed burn replaces the rejection: answering an unknown account
+        // with a fast 401 while a known one gets a 503 would put the
+        // enumeration oracle back, only under load.
+        password::burn_dummy_verification(plaintext_password).await?;
     }
     outcome
 }
@@ -1350,7 +1360,9 @@ pub async fn reset_password(
         .validate_with_username(new_password, &user.username)
         .map_err(|e| crate::error::invalid_request(e.to_string()))?;
 
-    let new_hash = password::hash_password(new_password).context("failed to hash new password")?;
+    let new_hash = password::hash_password(new_password)
+        .await
+        .context("failed to hash new password")?;
 
     // The expensive Argon2 pass stays outside the transaction. Inside it, the
     // link claim, conditional active-user write, session-generation bump and

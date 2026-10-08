@@ -96,7 +96,9 @@ async fn harness(username: &str) -> Harness {
     .unwrap();
     rg_db::run_migrations(&db).await.unwrap();
 
-    let password_hash = rg_core::auth::password::hash_password(PASSWORD).unwrap();
+    let password_hash = rg_core::auth::password::hash_password(PASSWORD)
+        .await
+        .unwrap();
     let user = rg_db::ops::user_ops::create_user(
         &db,
         username,

@@ -1,9 +1,25 @@
 //! Password hashing and verification using Argon2id.
 //!
+//! Argon2 is built to be expensive: tens of milliseconds of CPU and 19 MiB of
+//! memory per pass, on purpose. That makes it the one piece of work an
+//! anonymous caller can make this server do at will — every password door
+//! (web login, SSH, `docker login` against `/v2/auth/token`) verifies a hash,
+//! and the unknown-account branch burns a dummy one so the timing stays flat.
+//! Run inline on a Tokio worker, a stream of wrong passwords pinned every
+//! worker and stopped HTTP, git and SSH at once.
+//!
+//! So the public functions here are `async`, and none of them hashes on the
+//! caller's thread. Each pass runs on the blocking pool under one process-wide
+//! limiter ([`PasswordWorkSaturated`] once it is full): a fixed number of
+//! passes at a time, a bounded queue in front of them, a bounded wait in that
+//! queue, and a per-source share where the caller knows a trustworthy source
+//! address. The synchronous kernels stay private, so a caller cannot reach
+//! Argon2 without going through the limiter.
+//!
 //! Also includes a [`PasswordValidator`] for password strength checks
 //! (Phase 22-D security hardening).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use argon2::{
     password_hash::{
         Error as PasswordHashError, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
@@ -13,7 +29,12 @@ use argon2::{
 use rand_core::OsRng;
 #[cfg(test)]
 use std::cell::Cell;
+use std::collections::{hash_map::Entry, HashMap};
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 /// The *stored* hash could not be used to decide anything.
 ///
@@ -40,8 +61,195 @@ fn unusable_hash(reason: impl std::fmt::Display) -> anyhow::Error {
     })
 }
 
-/// Hash a plaintext password. Returns a PHC-format string (includes algorithm, params, salt, hash).
-pub fn hash_password(password: &str) -> Result<String> {
+/// The password limiter would not take one more Argon2 pass.
+///
+/// This is not a verdict on the credential: nothing was hashed, so nothing is
+/// known about it. HTTP answers `503` — the server is busy, come back — and SSH,
+/// which can only accept or reject, rejects. Neither may count it as a failed
+/// attempt: during a flood the account owner's *correct* password lands here
+/// too, and a strike for it would let the flood lock the owner out.
+///
+/// Carried inside the `anyhow::Error`, like [`UnusablePasswordHash`], so it
+/// survives every `.context(...)` on the way to the transport.
+#[derive(Debug, Error)]
+#[error("password verification is at capacity: {reason}")]
+pub struct PasswordWorkSaturated {
+    pub reason: &'static str,
+}
+
+fn saturated(reason: &'static str) -> anyhow::Error {
+    anyhow::Error::new(PasswordWorkSaturated { reason })
+}
+
+/// Queue places in front of each running pass. With a pass at ~15 ms, a full
+/// queue drains in about half a second; anything past it is shed at once
+/// rather than parked behind work the client will have given up on.
+const QUEUE_PER_PERMIT: usize = 32;
+
+/// Longest a pass may wait for a free slot. The queue bound already keeps the
+/// wait short on a healthy host; this is the ceiling for one whose CPU is
+/// contended so hard that a pass takes far longer than it should.
+const MAX_QUEUE_WAIT: Duration = Duration::from_secs(5);
+
+/// Passes one source address may have admitted (running or queued) at once.
+/// It caps concurrency, not rate: a person, or a whole office behind one NAT,
+/// never has more password checks *in flight* than this, while one address
+/// flooding the door can no longer take every queue place for itself.
+const PER_SOURCE_IN_FLIGHT: usize = 4;
+
+/// The process-wide limiter every Argon2 pass goes through.
+///
+/// Sized at half the cores the process may use (at least one), so a flood
+/// keeps the other half for everything else — Tokio's workers still have to
+/// get scheduled to answer `/health`, serve git and finish the handshakes the
+/// flood is not part of. Memory follows the same bound: 19 MiB a pass.
+fn limiter() -> &'static PasswordWorkLimiter {
+    static LIMITER: OnceLock<PasswordWorkLimiter> = OnceLock::new();
+    LIMITER.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let permits = (cores / 2).max(1);
+        PasswordWorkLimiter::new(
+            permits,
+            permits * QUEUE_PER_PERMIT,
+            PER_SOURCE_IN_FLIGHT,
+            MAX_QUEUE_WAIT,
+        )
+    })
+}
+
+/// Bounded admission in front of Tokio's blocking pool for Argon2 passes.
+///
+/// `spawn_blocking` alone moves the work off the async workers, but the pool
+/// grows to 512 threads: a flood would then run 512 passes at once — every
+/// core pegged and 10 GiB of Argon2 memory — and the workers would starve for
+/// CPU instead of for threads. The semaphore bounds the passes, `capacity`
+/// bounds the queue in front of it.
+struct PasswordWorkLimiter {
+    passes: Arc<Semaphore>,
+    /// Running plus queued passes the limiter admits before it sheds.
+    capacity: usize,
+    per_source: usize,
+    max_wait: Duration,
+    admitted: Arc<Mutex<Admitted>>,
+}
+
+#[derive(Default)]
+struct Admitted {
+    total: usize,
+    by_source: HashMap<IpAddr, usize>,
+}
+
+fn lock_admitted(admitted: &Mutex<Admitted>) -> MutexGuard<'_, Admitted> {
+    // The critical sections only add and subtract; a panic cannot leave the
+    // counts half-written, so a poisoned lock still holds the truth.
+    admitted.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One admitted pass. Dropping it gives the place back.
+struct Admission {
+    admitted: Arc<Mutex<Admitted>>,
+    source: Option<IpAddr>,
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        let mut admitted = lock_admitted(&self.admitted);
+        admitted.total -= 1;
+        if let Some(source) = self.source {
+            if let Entry::Occupied(mut in_flight) = admitted.by_source.entry(source) {
+                *in_flight.get_mut() -= 1;
+                if *in_flight.get() == 0 {
+                    in_flight.remove();
+                }
+            }
+        }
+    }
+}
+
+impl PasswordWorkLimiter {
+    fn new(passes: usize, queue: usize, per_source: usize, max_wait: Duration) -> Self {
+        let passes = passes.max(1);
+        Self {
+            passes: Arc::new(Semaphore::new(passes)),
+            capacity: passes + queue,
+            per_source: per_source.max(1),
+            max_wait,
+            admitted: Arc::default(),
+        }
+    }
+
+    /// Take a place, or say at once why there is none.
+    fn admit(&self, source: Option<IpAddr>) -> Result<Admission> {
+        let mut admitted = lock_admitted(&self.admitted);
+        if admitted.total >= self.capacity {
+            return Err(saturated("every slot and queue place is taken"));
+        }
+        if let Some(source) = source {
+            let in_flight = admitted.by_source.entry(source).or_insert(0);
+            if *in_flight >= self.per_source {
+                return Err(saturated(
+                    "this source address already has its share of checks in flight",
+                ));
+            }
+            *in_flight += 1;
+        }
+        admitted.total += 1;
+        Ok(Admission {
+            admitted: Arc::clone(&self.admitted),
+            source,
+        })
+    }
+
+    /// Run `work` on the blocking pool once a slot is free.
+    ///
+    /// `Err` carrying [`PasswordWorkSaturated`] means `work` never ran.
+    async fn run<T, F>(&self, source: Option<IpAddr>, work: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let admission = self.admit(source)?;
+        let pass =
+            match tokio::time::timeout(self.max_wait, Arc::clone(&self.passes).acquire_owned())
+                .await
+            {
+                Ok(Ok(pass)) => pass,
+                Ok(Err(closed)) => return Err(anyhow::Error::new(closed)),
+                Err(_elapsed) => return Err(saturated("no slot came free within the wait budget")),
+            };
+        // Both the slot and the admission travel into the closure. A caller
+        // that gives up — a client that hangs up mid-login — drops this
+        // future, but a pass that already started runs to its end on the
+        // pool, and its slot has to stay taken until it does; released with
+        // the future, abandoned passes would pile up past the bound.
+        tokio::task::spawn_blocking(move || {
+            let _held = (pass, admission);
+            work()
+        })
+        .await
+        .context("password hashing task failed")
+    }
+}
+
+/// Run one password kernel through the process-wide limiter.
+async fn off_runtime<T, F>(source: Option<IpAddr>, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (output, burned) = limiter().run(source, move || counting_burns(work)).await?;
+    credit_burns(burned);
+    Ok(output)
+}
+
+/// Hash a plaintext password. Returns a PHC-format string (includes algorithm,
+/// params, salt, hash). Runs off the async runtime, under the password limiter.
+pub async fn hash_password(password: &str) -> Result<String> {
+    let password = password.to_owned();
+    off_runtime(None, move || hash_password_blocking(&password)).await?
+}
+
+fn hash_password_blocking(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
     let hash = argon2
@@ -50,18 +258,26 @@ pub fn hash_password(password: &str) -> Result<String> {
     Ok(hash.to_string())
 }
 
-/// Verify a plaintext password against a stored PHC hash.
+/// Verify a plaintext password against a stored PHC hash, off the async
+/// runtime and under the password limiter.
 ///
 /// `Ok(false)` means one thing only: the password does not match. Every other
 /// way the verification can end — an unparseable PHC string, an algorithm this
 /// build cannot verify, parameters it rejects — is [`UnusablePasswordHash`] and
-/// comes back as `Err`, because none of them is the caller's doing.
+/// comes back as `Err`, because none of them is the caller's doing. So is
+/// [`PasswordWorkSaturated`], for a check that never ran.
 ///
 /// The distinction is load-bearing: `.is_ok()` over the whole verification
 /// reported "wrong password" for a hash that was never checked at all, so a
 /// migration that moved the hashes to different Argon2 parameters (or left a
 /// column half-written) locked accounts out with nothing in the log to say why.
-pub fn verify_password(password: &str, hash: &str) -> Result<bool> {
+pub async fn verify_password(password: &str, hash: &str) -> Result<bool> {
+    let password = password.to_owned();
+    let hash = hash.to_owned();
+    off_runtime(None, move || verify_password_blocking(&password, &hash)).await?
+}
+
+fn verify_password_blocking(password: &str, hash: &str) -> Result<bool> {
     let parsed = PasswordHash::new(hash).map_err(unusable_hash)?;
     match Argon2::default().verify_password(password.as_bytes(), &parsed) {
         Ok(()) => Ok(true),
@@ -92,12 +308,33 @@ thread_local! {
     /// Measured before this change: 1 red run in 30 of
     /// `cargo test -p rg-core --lib -- burns wrong_password_against`.
     ///
-    /// The trade is deliberate: a test that pushes the burn onto another thread
-    /// (a `multi_thread` runtime, a `spawn_blocking`) reads 0 and fails on
-    /// every run rather than one run in thirty. A test that is always wrong is
-    /// cheap to fix; a test that is occasionally wrong is what this phase is
-    /// about.
+    /// The burn itself now happens on a blocking-pool thread, so
+    /// [`off_runtime`] carries the count that thread spent back to the thread
+    /// that awaited it (see [`counting_burns`]). A test therefore still reads
+    /// its own work — as long as it awaits on one thread, which a
+    /// `current_thread` runtime guarantees and a `multi_thread` one does not.
     static DUMMY_VERIFICATION_BURNS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Run `work` and report how many dummy burns it spent on this thread. Always
+/// zero outside tests; the count exists only so a test can see the work.
+fn counting_burns<T>(work: impl FnOnce() -> T) -> (T, usize) {
+    #[cfg(test)]
+    let before = dummy_verification_burns();
+    let output = work();
+    #[cfg(test)]
+    let burned = dummy_verification_burns() - before;
+    #[cfg(not(test))]
+    let burned = 0;
+    (output, burned)
+}
+
+/// Add burns spent on a pool thread to the awaiting thread's count.
+fn credit_burns(burned: usize) {
+    #[cfg(test)]
+    DUMMY_VERIFICATION_BURNS.with(|burns| burns.set(burns.get() + burned));
+    #[cfg(not(test))]
+    debug_assert_eq!(burned, 0);
 }
 
 /// Verify `password` against `stored_hash`, spending the same Argon2 work when
@@ -108,20 +345,41 @@ thread_local! {
 /// account exist?" in its response time, no matter how carefully the response
 /// *body* is unified. Callers that resolve a user before checking the password
 /// must pass `None` instead of short-circuiting, so both outcomes cost the same.
+/// Both go through the same limiter too, so a shed answer cannot tell them
+/// apart either.
+///
+/// `source` is the client address *when the transport knows it for certain* —
+/// the TCP peer of an SSH session. It caps how many checks one address may
+/// have in flight. Pass `None` where the only address on hand is one the client
+/// could have written itself.
 ///
 /// `Ok(false)` covers both rejections the caller is allowed to answer with:
 /// there is no such account, or the password is wrong. An unusable stored hash
 /// is [`UnusablePasswordHash`] and comes back as `Err` — every caller must
 /// report it (with the account it happened on) instead of folding it into a
 /// rejection, because a `false` there is an answer we never actually computed.
+/// [`PasswordWorkSaturated`] is the same kind of non-answer.
 ///
-/// With `stored_hash = None` the result is always `Ok(false)`: there is nothing
-/// to verify, only work to spend.
-pub fn verify_password_or_dummy(password: &str, stored_hash: Option<&str>) -> Result<bool> {
+/// With `stored_hash = None` the result is always `Ok(false)` once the work
+/// ran: there is nothing to verify, only work to spend.
+pub async fn verify_password_or_dummy(
+    password: &str,
+    stored_hash: Option<&str>,
+    source: Option<IpAddr>,
+) -> Result<bool> {
+    let password = password.to_owned();
+    let stored_hash = stored_hash.map(str::to_owned);
+    off_runtime(source, move || {
+        verify_password_or_dummy_blocking(&password, stored_hash.as_deref())
+    })
+    .await?
+}
+
+fn verify_password_or_dummy_blocking(password: &str, stored_hash: Option<&str>) -> Result<bool> {
     match stored_hash {
-        Some(hash) => verify_password(password, hash),
+        Some(hash) => verify_password_blocking(password, hash),
         None => {
-            burn_dummy_verification(password);
+            burn_dummy_verification_blocking(password);
             Ok(false)
         }
     }
@@ -133,10 +391,18 @@ pub fn verify_password_or_dummy(password: &str, stored_hash: Option<&str>) -> Re
 /// account on a provider no password reaches, an LDAP rejection that never got
 /// as far as a bind — and therefore would otherwise answer in microseconds
 /// while a real account pays tens of milliseconds. There is no verdict to
-/// return and nothing that can fail: the work *is* the point.
-pub fn burn_dummy_verification(password: &str) {
+/// return; the work *is* the point. `Err` is [`PasswordWorkSaturated`] (or a
+/// lost pool task): the caller must answer with it rather than with its own
+/// rejection, or a full limiter would answer unknown accounts fast and known
+/// ones with a `503`.
+pub async fn burn_dummy_verification(password: &str) -> Result<()> {
+    let password = password.to_owned();
+    off_runtime(None, move || burn_dummy_verification_blocking(&password)).await
+}
+
+fn burn_dummy_verification_blocking(password: &str) {
     // `black_box` keeps the optimizer from noticing the result is thrown away.
-    let verified = verify_password(password, DUMMY_PASSWORD_HASH).is_ok();
+    let verified = verify_password_blocking(password, DUMMY_PASSWORD_HASH).is_ok();
     #[cfg(test)]
     DUMMY_VERIFICATION_BURNS.with(|burns| burns.set(burns.get() + 1));
     std::hint::black_box(verified);
@@ -393,11 +659,11 @@ impl PasswordValidator {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_hash_and_verify() {
-        let hash = hash_password("hunter2").unwrap();
-        assert!(verify_password("hunter2", &hash).unwrap());
-        assert!(!verify_password("wrong", &hash).unwrap());
+    #[tokio::test]
+    async fn test_hash_and_verify() {
+        let hash = hash_password("hunter2").await.unwrap();
+        assert!(verify_password("hunter2", &hash).await.unwrap());
+        assert!(!verify_password("wrong", &hash).await.unwrap());
     }
 
     /// The dummy hash only masks the "unknown account" branch while it costs
@@ -416,19 +682,25 @@ mod tests {
         assert_eq!(params.p_cost(), default.params().p_cost());
     }
 
-    #[test]
-    fn verify_password_or_dummy_burns_once_for_unknown_accounts() {
-        let real = hash_password("correct horse battery staple").unwrap();
+    #[tokio::test]
+    async fn verify_password_or_dummy_burns_once_for_unknown_accounts() {
+        let real = hash_password("correct horse battery staple").await.unwrap();
 
         reset_dummy_verification_burns();
-        assert!(!verify_password_or_dummy("wrong password", Some(real.as_str())).unwrap());
+        assert!(
+            !verify_password_or_dummy("wrong password", Some(real.as_str()), None)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             dummy_verification_burns(),
             0,
             "known accounts must spend their real hash instead of the dummy one"
         );
 
-        assert!(!verify_password_or_dummy("wrong password", None).unwrap());
+        assert!(!verify_password_or_dummy("wrong password", None, None)
+            .await
+            .unwrap());
         assert_eq!(
             dummy_verification_burns(),
             1,
@@ -439,9 +711,12 @@ mod tests {
     /// A hash that cannot be parsed is not a wrong password. Reporting it as
     /// one is what let a broken `password_hash` column lock an account out
     /// while every caller kept answering "invalid credentials".
-    #[test]
-    fn unparseable_stored_hash_is_an_error_not_a_rejection() {
+    #[tokio::test]
+    async fn unparseable_stored_hash_is_an_error_not_a_rejection() {
+        // Through the async door on purpose: the type has to survive the trip
+        // through the blocking pool, or every caller's downcast goes blind.
         let error = verify_password("hunter2", "not-a-phc-string")
+            .await
             .expect_err("a hash that is not PHC at all cannot yield a verdict");
         assert!(
             error.downcast_ref::<UnusablePasswordHash>().is_some(),
@@ -461,7 +736,7 @@ mod tests {
         // Guards the test's own premise: this must fail *past* the parser, in
         // the verification, or it is only re-testing the case above.
         PasswordHash::new(foreign).expect("the fixture must be well-formed PHC");
-        let error = verify_password("hunter2", foreign)
+        let error = verify_password_blocking("hunter2", foreign)
             .expect_err("a hash this build cannot verify cannot yield a verdict");
         assert!(
             error.downcast_ref::<UnusablePasswordHash>().is_some(),
@@ -471,14 +746,24 @@ mod tests {
 
     /// The other half of the split: a hash we *can* verify still answers
     /// `Ok(false)` for a wrong password, with or without the dummy branch.
-    #[test]
-    fn wrong_password_against_a_usable_hash_stays_a_plain_rejection() {
-        let hash = hash_password("hunter2").unwrap();
-        assert!(!verify_password("wrong", &hash).unwrap());
-        assert!(!verify_password_or_dummy("wrong", Some(hash.as_str())).unwrap());
-        assert!(verify_password_or_dummy("hunter2", Some(hash.as_str())).unwrap());
+    #[tokio::test]
+    async fn wrong_password_against_a_usable_hash_stays_a_plain_rejection() {
+        let hash = hash_password("hunter2").await.unwrap();
+        assert!(!verify_password("wrong", &hash).await.unwrap());
+        assert!(
+            !verify_password_or_dummy("wrong", Some(hash.as_str()), None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            verify_password_or_dummy("hunter2", Some(hash.as_str()), None)
+                .await
+                .unwrap()
+        );
         // No account to verify against is a rejection, never an error.
-        assert!(!verify_password_or_dummy("hunter2", None).unwrap());
+        assert!(!verify_password_or_dummy("hunter2", None, None)
+            .await
+            .unwrap());
     }
 
     #[test]
@@ -567,5 +852,262 @@ mod tests {
             v.validate(&long),
             Err(PasswordError::TooLong { .. })
         ));
+    }
+
+    // ── The limiter in front of Argon2 ──────────────────────────────────────
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn shed_reason(error: &anyhow::Error) -> Option<&'static str> {
+        error
+            .downcast_ref::<PasswordWorkSaturated>()
+            .map(|shed| shed.reason)
+    }
+
+    /// Occupy one slot of `limiter` until the returned sender is dropped or
+    /// sent to. Returns once the work is actually running on the pool.
+    async fn hold_a_slot(
+        limiter: &Arc<PasswordWorkLimiter>,
+        source: Option<IpAddr>,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let held = {
+            let limiter = Arc::clone(limiter);
+            tokio::spawn(async move {
+                limiter
+                    .run(source, move || {
+                        started_tx.send(()).expect("the test awaits the start");
+                        // Either a release or the sender going away ends it.
+                        match release_rx.recv() {
+                            Ok(()) | Err(std::sync::mpsc::RecvError) => {}
+                        }
+                    })
+                    .await
+            })
+        };
+        started_rx.await.expect("the held pass starts");
+        (release_tx, held)
+    }
+
+    /// The whole point of the module: a burst of password checks must leave
+    /// the runtime thread free. On a `current_thread` runtime there is exactly
+    /// one worker, so inline Argon2 makes the burst one uninterrupted poll and
+    /// the heartbeat cannot beat even once until it is over.
+    #[tokio::test]
+    async fn an_argon2_burst_leaves_the_runtime_thread_free() {
+        let beats = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let heartbeat = tokio::spawn({
+            let beats = Arc::clone(&beats);
+            let stop = Arc::clone(&stop);
+            async move {
+                while !stop.load(Ordering::SeqCst) {
+                    beats.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        // Let the heartbeat get going before the burst is polled.
+        tokio::task::yield_now().await;
+
+        let before = beats.load(Ordering::SeqCst);
+        let verdicts = futures::future::join_all(
+            (0..4).map(|_| verify_password_or_dummy("a guess", None, None)),
+        )
+        .await;
+        let during = beats.load(Ordering::SeqCst) - before;
+        stop.store(true, Ordering::SeqCst);
+        heartbeat.await.expect("heartbeat joins");
+
+        for verdict in verdicts {
+            assert!(!verdict.expect("an unknown account is a plain rejection"));
+        }
+        assert!(
+            during > 0,
+            "the runtime thread never got to run anything else while four Argon2 passes ran"
+        );
+    }
+
+    /// The semaphore is the bound on CPU and on Argon2's memory: however many
+    /// callers arrive, no more than `passes` hashes run at once.
+    #[tokio::test]
+    async fn the_limiter_never_runs_more_passes_than_it_has_slots() {
+        const SLOTS: usize = 2;
+        let limiter = Arc::new(PasswordWorkLimiter::new(
+            SLOTS,
+            64,
+            64,
+            Duration::from_secs(60),
+        ));
+        let running = Arc::new(AtomicUsize::new(0));
+        let high_water = Arc::new(AtomicUsize::new(0));
+
+        let passes = (0..12).map(|_| {
+            let limiter = Arc::clone(&limiter);
+            let running = Arc::clone(&running);
+            let high_water = Arc::clone(&high_water);
+            async move {
+                limiter
+                    .run(None, move || {
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        high_water.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(15));
+                        running.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .await
+            }
+        });
+        for pass in futures::future::join_all(passes).await {
+            pass.expect("every pass fits the queue and runs");
+        }
+
+        let high_water = high_water.load(Ordering::SeqCst);
+        assert!(
+            (1..=SLOTS).contains(&high_water),
+            "{high_water} passes ran at once with {SLOTS} slots"
+        );
+    }
+
+    /// A full limiter answers at once and never runs the work. Waiting here
+    /// instead would park the flood in memory and hand the real user a timeout.
+    #[tokio::test]
+    async fn a_full_limiter_sheds_at_once_without_running_the_work() {
+        let limiter = Arc::new(PasswordWorkLimiter::new(1, 0, 8, Duration::from_secs(60)));
+        let (release, held) = hold_a_slot(&limiter, None).await;
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let shed = tokio::time::timeout(
+            Duration::from_secs(2),
+            limiter.run(None, {
+                let ran = Arc::clone(&ran);
+                move || ran.store(true, Ordering::SeqCst)
+            }),
+        )
+        .await
+        .expect("a full limiter must answer at once, not queue past its capacity")
+        .expect_err("there is no place left for this pass");
+        assert_eq!(
+            shed_reason(&shed),
+            Some("every slot and queue place is taken"),
+            "{shed:#}"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "shed work must never have run");
+
+        release.send(()).expect("held pass waits for release");
+        held.await.expect("held pass joins").expect("held pass ran");
+        // The place came back with the pass that held it.
+        limiter
+            .run(None, || ())
+            .await
+            .expect("a freed slot admits the next pass");
+    }
+
+    /// A queued pass gives up after the wait budget instead of waiting for as
+    /// long as the slot ahead of it stays busy.
+    #[tokio::test]
+    async fn a_queued_pass_gives_up_after_the_wait_budget() {
+        let limiter = Arc::new(PasswordWorkLimiter::new(1, 4, 8, Duration::from_millis(50)));
+        let (release, held) = hold_a_slot(&limiter, None).await;
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let shed = tokio::time::timeout(
+            Duration::from_secs(10),
+            limiter.run(None, {
+                let ran = Arc::clone(&ran);
+                move || ran.store(true, Ordering::SeqCst)
+            }),
+        )
+        .await
+        .expect("the wait budget, not the slot ahead, decides how long a pass queues")
+        .expect_err("no slot came free in time");
+        assert_eq!(
+            shed_reason(&shed),
+            Some("no slot came free within the wait budget"),
+            "{shed:#}"
+        );
+        assert!(!ran.load(Ordering::SeqCst));
+
+        release.send(()).expect("held pass waits for release");
+        held.await.expect("held pass joins").expect("held pass ran");
+    }
+
+    /// One address cannot take every place: past its share it is shed while
+    /// other addresses — and callers with no trustworthy address — still get in.
+    #[tokio::test]
+    async fn one_source_cannot_take_more_than_its_share() {
+        let flooder: IpAddr = "198.51.100.7".parse().unwrap();
+        let bystander: IpAddr = "203.0.113.9".parse().unwrap();
+        let limiter = Arc::new(PasswordWorkLimiter::new(8, 8, 1, Duration::from_secs(60)));
+        let (release, held) = hold_a_slot(&limiter, Some(flooder)).await;
+
+        let shed = limiter
+            .run(Some(flooder), || ())
+            .await
+            .expect_err("the flooder already has its one check in flight");
+        assert_eq!(
+            shed_reason(&shed),
+            Some("this source address already has its share of checks in flight"),
+            "{shed:#}"
+        );
+        limiter
+            .run(Some(bystander), || ())
+            .await
+            .expect("another address is not held to the flooder's share");
+        limiter
+            .run(None, || ())
+            .await
+            .expect("a caller without an address is held only to the global bound");
+
+        release.send(()).expect("held pass waits for release");
+        held.await.expect("held pass joins").expect("held pass ran");
+        limiter
+            .run(Some(flooder), || ())
+            .await
+            .expect("the share comes back when the check ends");
+    }
+
+    /// A caller that hangs up does not take its pass with it: the Argon2 work
+    /// already on the pool keeps running, so its slot must stay taken until the
+    /// work really ends — otherwise every abandoned login frees a slot early
+    /// and the passes running at once grow without bound.
+    #[tokio::test]
+    async fn an_abandoned_caller_keeps_its_slot_until_the_pass_ends() {
+        let limiter = Arc::new(PasswordWorkLimiter::new(1, 0, 8, Duration::from_secs(60)));
+        let (release, held) = hold_a_slot(&limiter, None).await;
+        held.abort();
+        assert!(
+            held.await
+                .expect_err("the caller was aborted")
+                .is_cancelled(),
+            "the caller must really be gone for this to test anything"
+        );
+
+        let shed = limiter
+            .run(None, || ())
+            .await
+            .expect_err("the abandoned pass is still running and still holds the slot");
+        assert!(shed_reason(&shed).is_some(), "{shed:#}");
+
+        release
+            .send(())
+            .expect("the abandoned pass still waits for release");
+        // The pass ends on the pool on its own schedule; the slot follows it.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match limiter.run(None, || ()).await {
+                    Ok(()) => break,
+                    Err(error) if shed_reason(&error).is_some() => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => panic!("unexpected limiter failure: {error:#}"),
+                }
+            }
+        })
+        .await
+        .expect("the slot is released once the abandoned pass ends");
     }
 }

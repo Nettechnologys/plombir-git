@@ -154,6 +154,23 @@ set `MALLOC_ARENA_MAX` in the **server process** environment. For Docker, pass
 it through the service's `environment:` block; placing it only in the Compose
 `.env` file does not pass it into the container.
 
+### Password checks under load
+
+Every password hash and check (web login, registration, password reset, MFA
+re-confirmation, SSH password auth, `docker login` against `/v2/auth/token`)
+runs off the async workers, on a fixed number of threads: half the CPUs the
+process may use, at least one. A bounded queue sits in front of them, and a
+queued check waits at most 5 seconds. An SSH peer address may have at most 4
+checks in flight at once. There is nothing to configure.
+
+A flood of password guesses therefore cannot stall HTTP, git or SSH. Once the
+queue is full, the doors shed instead of queueing: HTTP answers `503` (the
+registry login too), and SSH rejects the attempt. A shed attempt checked
+nothing, so it is not counted towards the account lockout. Sustained `503`s on
+`/api/v1/users/login` or `/v2/auth/token` alongside `password verification is
+at capacity` in the log mean someone is guessing passwords faster than the
+host can hash them.
+
 ### Who may create an account
 
 `PLOMBIR_GIT_REGISTRATION=closed` (or `[auth].registration = "closed"`, the env

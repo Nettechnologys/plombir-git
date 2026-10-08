@@ -326,6 +326,15 @@ impl OciDbStatus for anyhow::Error {
             );
             return StatusCode::SERVICE_UNAVAILABLE;
         }
+        // `docker login` arrived while every password slot was taken. Nothing
+        // was checked; the client should come back, which a `503` says and
+        // the `500` below would not.
+        if self
+            .downcast_ref::<rg_core::auth::password::PasswordWorkSaturated>()
+            .is_some()
+        {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
         // `downcast_ref` sees through any `.context()` layers to the original
         // `DbErr`, mirroring `From<anyhow::Error> for AppError`.
         match self.downcast_ref::<sea_orm::DbErr>() {
@@ -819,10 +828,17 @@ async fn authenticate_basic(
     let found = rg_db::ops::user_ops::find_by_username(db, user)
         .await
         .with_context(|| format!("registry basic auth: looking up '{user}'"))?;
+    //
+    // No source address: behind a proxy the only one on hand is whatever the
+    // client wrote into `X-Forwarded-For`, and the TCP peer is the proxy that
+    // every client shares. The process-wide bound still holds, and a full
+    // limiter comes back as `PasswordWorkSaturated` — a `503`, never a strike.
     let password_ok = rg_core::auth::password::verify_password_or_dummy(
         pass,
         found.as_ref().map(|u| u.password_hash.as_str()),
+        None,
     )
+    .await
     .with_context(|| format!("registry basic auth: verifying the password of '{user}'"))?;
 
     // Settled after the hash, so neither a deactivated nor a locked account is
@@ -3137,5 +3153,22 @@ mod manifest_body_rejection_tests {
                 .contains(error_codes::MANIFEST_INVALID),
             "a body that is not a manifest at all must not read as a size failure"
         );
+    }
+}
+
+#[cfg(test)]
+mod password_shed_status_tests {
+    use super::*;
+
+    /// `docker login` shed by the password limiter checked nothing. A `500`
+    /// would make docker give up on a login that succeeds once the flood thins
+    /// out; `401` would tell its owner a possibly-right password was wrong.
+    #[test]
+    fn a_shed_registry_login_is_a_503() {
+        let shed = anyhow::Error::new(rg_core::auth::password::PasswordWorkSaturated {
+            reason: "every slot and queue place is taken",
+        })
+        .context("registry basic auth: verifying the password of 'alice'");
+        assert_eq!(oci_status_for(&shed), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

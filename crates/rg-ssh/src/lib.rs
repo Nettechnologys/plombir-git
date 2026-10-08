@@ -837,11 +837,40 @@ impl Handler for SshHandler {
         // Verified even when there is no such user, so that a rejection always
         // costs one Argon2 hash — an early return here would let an attacker
         // enumerate accounts by how fast the server says no.
+        //
+        // The hash runs off this worker, under the process-wide password
+        // limiter, and the TCP peer is the source it is shared by: one address
+        // opening connection after connection cannot take every slot for
+        // itself. The peer is the one address no client can write for itself.
+        let peer_ip = self.peer.map(|peer| peer.ip());
         let password_ok = match rg_core::auth::password::verify_password_or_dummy(
             password,
             found.as_ref().map(|user| user.password_hash.as_str()),
-        ) {
+            peer_ip,
+        )
+        .await
+        {
             Ok(verdict) => verdict,
+            Err(error)
+                if error
+                    .downcast_ref::<rg_core::auth::password::PasswordWorkSaturated>()
+                    .is_some() =>
+            {
+                // Nothing was checked, so nothing is settled: no strike, no
+                // failed-login row. During a flood the owner's *correct*
+                // password lands here too, and a strike for it would let the
+                // flood lock them out.
+                tracing::warn!(
+                    username,
+                    peer = ?self.peer,
+                    error = %format!("{error:#}"),
+                    "SSH password auth shed: password verification is at capacity"
+                );
+                return Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                });
+            }
             Err(error) => {
                 // SSH has no way to say "this is our fault, retry later" — the
                 // client only ever learns accept or reject. So the log line is
@@ -852,7 +881,7 @@ impl Handler for SshHandler {
                     username,
                     user_id = ?found.as_ref().map(|user| user.id),
                     error = %format!("{error:#}"),
-                    "cannot verify SSH password: stored hash is unusable"
+                    "cannot verify SSH password"
                 );
                 false
             }
@@ -863,7 +892,7 @@ impl Handler for SshHandler {
         // "does it exist?" — through the response time. The same helper runs on
         // the registry's `docker login`, so the SSH port can no longer be used
         // to walk past a threshold the web login enforces.
-        let peer_ip = self.peer.map(|peer| peer.ip().to_string());
+        let peer_address = peer_ip.map(|ip| ip.to_string());
         let attempt = rg_core::auth::lockout::settle_password_attempt(
             db,
             found.as_ref(),
@@ -871,7 +900,7 @@ impl Handler for SshHandler {
             rg_core::auth::lockout::AttemptOrigin {
                 login: username,
                 channel: "ssh",
-                ip_address: peer_ip.as_deref(),
+                ip_address: peer_address.as_deref(),
                 user_agent: None,
             },
         )

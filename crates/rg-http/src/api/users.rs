@@ -95,7 +95,7 @@ pub struct UserProfile {
         (status = 400, description = "Invalid input", body = serde_json::Value),
         (status = 403, description = "Self-service registration is closed on this instance", body = serde_json::Value),
         (status = 409, description = "The username or email is already taken", body = serde_json::Value),
-        (status = 503, description = "The database is unreachable", body = serde_json::Value),
+        (status = 503, description = "The database is unreachable, or password verification is at capacity — retry shortly", body = serde_json::Value),
     )
 )]
 pub async fn register(
@@ -225,7 +225,7 @@ pub(crate) fn finalized_login_user(
         (status = 200, description = "Login successful", body = AuthResponse),
         (status = 401, description = "Invalid credentials", body = serde_json::Value),
         (status = 500, description = "The login could not be finalized", body = serde_json::Value),
-        (status = 503, description = "The database is unreachable", body = serde_json::Value),
+        (status = 503, description = "The database is unreachable, or password verification is at capacity — retry shortly", body = serde_json::Value),
     )
 )]
 pub async fn login(
@@ -1021,6 +1021,7 @@ async fn journal_password_reset(
             answered with `mfa_required: true`, an empty token and an MFA challenge cookie \
             instead of a session — exactly as `POST /users/login` answers it.", body = serde_json::Value),
         (status = 400, description = "Invalid or expired token, or invalid password"),
+        (status = 503, description = "The database is unreachable, or password hashing is at capacity — retry shortly; the link stays usable"),
     ),
 )]
 pub async fn reset_password(

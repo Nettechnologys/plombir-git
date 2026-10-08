@@ -596,6 +596,7 @@ async fn confirm_account_password(
     // password is wrong and leaves the operator nothing. Only a genuine
     // mismatch is a 401.
     let password_ok = rg_core::auth::password::verify_password(password, &user.password_hash)
+        .await
         .with_context(|| format!("cannot verify the password of user {}", user.id))
         .map_err(AppError::from)?;
 
@@ -656,6 +657,7 @@ pub struct RegenerateBackupCodesResponse {
         (status = 401, description = "Unauthorized, invalid password, or account temporarily locked"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
+        (status = 503, description = "Password verification is at capacity — retry shortly"),
     ),
 )]
 pub async fn regenerate_backup_codes(
@@ -725,6 +727,7 @@ pub async fn regenerate_backup_codes(
         (status = 401, description = "Unauthorized, invalid password, or account temporarily locked"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
+        (status = 503, description = "Password verification is at capacity — retry shortly"),
     ),
 )]
 pub async fn disable_mfa(

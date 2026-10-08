@@ -357,6 +357,19 @@ impl From<anyhow::Error> for AppError {
             return Self::ServiceUnavailable(full_msg);
         }
 
+        // Every password slot is taken and the queue in front of them is full
+        // (`rg_core::auth::password`). No credential was checked — this is the
+        // server shedding Argon2 work under a flood, and the request would
+        // succeed a moment later. `503`, not the `500` it would otherwise
+        // become, and never a `401`: the password may well have been right.
+        if e.downcast_ref::<rg_core::auth::password::PasswordWorkSaturated>()
+            .is_some()
+        {
+            let full_msg = format!("{e:#}");
+            tracing::warn!(error = %full_msg, "password verification is at capacity, returning 503");
+            return Self::ServiceUnavailable(full_msg);
+        }
+
         // A host we do not own failed to answer. Sits above the four
         // client-fault branches below for the same reason the outage branch
         // does: a call that never completed must not be reported as an absent
@@ -594,6 +607,21 @@ mod tests {
             waited_seconds: 120,
         };
         let err: AppError = anyhow::Error::from(busy).context("store LFS object").into();
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A login shed by the password limiter checked nothing. `401` would tell
+    /// the owner a possibly-right password was wrong (and the login handler
+    /// would count a strike for it); `500` would tell the client not to retry
+    /// a request that succeeds once the flood thins out.
+    #[test]
+    fn a_shed_password_check_maps_to_503() {
+        let shed = rg_core::auth::password::PasswordWorkSaturated {
+            reason: "every slot and queue place is taken",
+        };
+        let err: AppError = anyhow::Error::from(shed)
+            .context("cannot verify the password of 'alice'")
+            .into();
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 

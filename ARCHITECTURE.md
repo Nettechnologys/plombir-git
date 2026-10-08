@@ -215,7 +215,7 @@ git clone/push
     ▼
 russh server (rg-ssh)
   · public-key auth  → looked up in rg-db
-  · password auth    → argon2 verification
+  · password auth    → argon2 verification (off-runtime, password limiter)
   · exec_request routes:
       git-upload-pack  → fetch/clone
       git-receive-pack → push
@@ -339,7 +339,11 @@ which is what lets the server enforce what the CLI cannot:
   `can_read` / `can_write` on Git transport and the REST API.
 - **Transport** — optional TLS/HTTPS (rustls); configurable CORS and CSP.
 - **Abuse controls** — token-bucket rate limiting with a trusted-proxy list for
-  `X-Forwarded-For` / `X-Real-IP`.
+  `X-Forwarded-For` / `X-Real-IP`. Argon2 never runs on an async worker:
+  `rg_core::auth::password` hashes on the blocking pool behind one
+  process-wide limiter (half the cores, a bounded queue and wait, a per-peer
+  share for SSH). When it is full, HTTP sheds with `503` and SSH rejects, and
+  no lockout strike is counted.
 - **Data safety** — parameterized queries, consistent SQLite backup/restore
   commands, health checks (DB ping + filesystem), and an audit log.
 - **Observability** — structured `tracing` logs with daily file rotation and a
