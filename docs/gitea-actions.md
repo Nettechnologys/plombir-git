@@ -364,6 +364,10 @@ character, and the escape is the way back: `c\+\+/**` is everything under a
 directory really named `c++`, and `docs/faq\?.md` is the file with a question
 mark in its name.
 
+A pattern is at most 256 bytes long, and a longer one is refused by name. The
+cost of matching grows with the length of the pattern, and a push asks every
+pattern once per changed path.
+
 ## `workflow_dispatch` and `workflow_call` inputs
 
 ```yaml

@@ -1636,6 +1636,9 @@ impl GiteaWorkflow {
     /// patterns that use one as an ordinary character today, which is why the
     /// message names `\+` / `\[` as the spelling that keeps working.
     ///
+    /// The fifth is size: a pattern longer than [`MAX_FILTER_PATTERN_BYTES`]
+    /// is refused before it reaches the matcher, whose cost grows with it.
+    ///
     /// Naming them here is the answer [`Self::unsupported_event_filter_keys`]
     /// already gives an unknown key. The alternative is what this tree did
     /// before: the pattern parsed, matched nothing anybody meant, and the
@@ -1660,6 +1663,16 @@ impl GiteaWorkflow {
             ] {
                 let Some(patterns) = patterns else { continue };
                 for pattern in patterns {
+                    if pattern.len() > MAX_FILTER_PATTERN_BYTES {
+                        defects.push(format!(
+                            "{trigger_name}.{key}: a pattern of {} bytes is longer than the \
+                             {MAX_FILTER_PATTERN_BYTES} a filter pattern may be",
+                            pattern.len()
+                        ));
+                        // The rest of the checks would quote the pattern back in
+                        // full; the length is the whole answer.
+                        continue;
+                    }
                     if ends_with_dangling_escape(pattern) {
                         defects.push(format!(
                             "{trigger_name}.{key}: `{pattern}` ends in a lone `\\`, which escapes \
@@ -2949,6 +2962,16 @@ fn negated_pattern(pattern: &str) -> Option<&str> {
     pattern.strip_prefix('!')
 }
 
+/// The longest `branches:` / `tags:` / `paths:` pattern (and `-ignore` twin) a
+/// workflow may declare.
+///
+/// [`glob_segments`] costs at most `input length × pattern length` per match,
+/// and a push asks it once per changed path and pattern. The input side is the
+/// pushed tree; this is the cap on the other factor, which the workflow author
+/// alone chooses. A real filter is a few dozen bytes — a deep monorepo path
+/// with a `**` in it is still well under a hundred.
+const MAX_FILTER_PATTERN_BYTES: usize = 256;
+
 /// Does the pattern end in a backslash with nothing left to escape?
 ///
 /// Counted as a run, not as one byte: `a\\` ends in an escaped backslash and is
@@ -2969,11 +2992,11 @@ fn ends_with_dangling_escape(pattern: &str) -> bool {
 ///
 /// GitHub's cheat sheet gives `+` the meaning "one or more of the preceding
 /// character" and `[…]` "one alphanumeric character listed in the brackets or
-/// included in ranges". [`glob_segments`] knows neither, so both reach its
-/// literal arm: `tags: ['v1.[0-9]']` parses, validates, and then matches only a
-/// tag spelled with those five characters. No such tag is ever pushed, the
-/// release workflow never runs, and the author's only evidence is the silence
-/// (card_61e3349073d7).
+/// included in ranges". [`glob_segments`] knows neither, so both reach the
+/// literal arm of [`glob_tokens`]: `tags: ['v1.[0-9]']` parses, validates, and
+/// then matches only a tag spelled with those five characters. No such tag is
+/// ever pushed, the release workflow never runs, and the author's only evidence
+/// is the silence (card_61e3349073d7).
 ///
 /// `?` is the third character of that cheat sheet and the one that used to be
 /// worse than either, because it did not fall through: this matcher read it as
@@ -2990,7 +3013,7 @@ fn ends_with_dangling_escape(pattern: &str) -> bool {
 ///
 /// The escape is honoured, because it is the answer the refusal offers: `\+`,
 /// `\[` and `\?` already reach the literal character through
-/// [`glob_segments`]'s backslash arm, so a pattern for a ref or file genuinely
+/// [`glob_tokens`]'s backslash arm, so a pattern for a ref or file genuinely
 /// named with one is still writable and is not reported here.
 fn unimplemented_metacharacters(pattern: &str) -> Vec<(char, &'static str)> {
     let mut found: Vec<(char, &'static str)> = Vec::new();
@@ -3217,7 +3240,20 @@ fn match_path_pattern(path: &str, pattern: &str) -> bool {
     glob_segments(path.as_bytes(), pattern.as_bytes())
 }
 
-/// Backtracking matcher for `*` and `**` over a path.
+/// One unit of a filter pattern, as [`glob_segments`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlobToken {
+    /// A byte that has to be there: an ordinary one, or one a `\` escaped.
+    Byte(u8),
+    /// `*` — any run of bytes that holds no `/`.
+    Star,
+    /// `**` — any run of bytes, separators included.
+    DoubleStar,
+    /// A trailing `\` that escapes nothing. No input gets past it.
+    Dead,
+}
+
+/// Read a filter pattern into [`GlobToken`]s.
 ///
 /// `?` is deliberately absent, and its absence is the decision recorded in
 /// [`unimplemented_metacharacters`]: the character means "zero or one of the
@@ -3227,50 +3263,136 @@ fn match_path_pattern(path: &str, pattern: &str) -> bool {
 /// refusal promises the author ("it would be matched as the literal
 /// character"), and the promise has to be true for the workflows that never
 /// reach the validator.
-fn glob_segments(path: &[u8], pattern: &[u8]) -> bool {
-    match pattern.first() {
-        None => path.is_empty(),
-        Some(b'*') => {
-            if pattern.get(1) == Some(&b'*') {
-                // `**` spans separators. Skipping an optional `/` right after it
-                // is what makes `**/x.rs` match a top-level `x.rs`, exactly as
-                // GitHub documents.
-                let rest = &pattern[2..];
-                let rest = rest.strip_prefix(b"/").unwrap_or(rest);
-                (0..=path.len()).any(|skip| glob_segments(&path[skip..], rest))
-                    || glob_segments(path, rest)
-            } else {
-                let rest = &pattern[1..];
-                // A single `*` stops at the separator.
-                let bound = path.iter().position(|b| *b == b'/').unwrap_or(path.len());
-                (0..=bound).any(|skip| glob_segments(&path[skip..], rest))
+fn glob_tokens(pattern: &[u8]) -> Vec<GlobToken> {
+    let mut tokens = Vec::with_capacity(pattern.len());
+    let mut at = 0;
+    while let Some(&byte) = pattern.get(at) {
+        match byte {
+            b'*' if pattern.get(at + 1) == Some(&b'*') => {
+                tokens.push(GlobToken::DoubleStar);
+                at += 2;
+                // `**` spans separators. Swallowing an optional `/` right after
+                // it is what makes `**/x.rs` match a top-level `x.rs`, exactly
+                // as GitHub documents.
+                if pattern.get(at) == Some(&b'/') {
+                    at += 1;
+                }
+            }
+            b'*' => {
+                tokens.push(GlobToken::Star);
+                at += 1;
+            }
+            // GitHub's escape: a backslash makes the next byte a literal, so `\*`
+            // reaches the file actually named with a star and `\!` a pattern that
+            // opens with an exclamation mark instead of negating. Without this arm
+            // the backslash stayed in the pattern as an ordinary byte and could
+            // only match a path that physically carried one (card_8dc2adb75578) —
+            // the same defect `pattern_matches` had in CODEOWNERS.
+            b'\\' => match pattern.get(at + 1) {
+                Some(&literal) => {
+                    tokens.push(GlobToken::Byte(literal));
+                    at += 2;
+                }
+                // A trailing backslash escapes nothing.
+                // `unhonourable_filter_patterns` refuses one where the file is
+                // read, so this arm is only reached through the matcher's other
+                // callers.
+                None => {
+                    tokens.push(GlobToken::Dead);
+                    at += 1;
+                }
+            },
+            literal => {
+                tokens.push(GlobToken::Byte(literal));
+                at += 1;
             }
         }
-        // GitHub's escape: a backslash makes the next byte a literal, so `\*`
-        // reaches the file actually named with a star and `\!` a pattern that
-        // opens with an exclamation mark instead of negating. Without this arm
-        // the backslash stayed in the pattern as an ordinary byte and could
-        // only match a path that physically carried one (card_8dc2adb75578) —
-        // the same defect `pattern_matches` had in CODEOWNERS.
-        Some(b'\\') => match pattern.get(1) {
-            Some(literal) => {
-                !path.is_empty() && path[0] == *literal && glob_segments(&path[1..], &pattern[2..])
+    }
+    tokens
+}
+
+/// Match a path or ref name against a filter pattern of `*` and `**`.
+///
+/// Run as a set of live pattern positions advanced one input byte at a time,
+/// so the cost is bounded by `input length × pattern length` whatever the
+/// pattern looks like, and no recursion is involved.
+///
+/// It used to be a recursive backtracker in which every star tried every
+/// possible skip and asked the rest of the pattern again, without remembering
+/// the answers. That is exponential in the number of stars:
+/// `*a*a*a*a*a*a*a*a*a*b` against a branch of 250 `a`s never returns. The
+/// pattern comes from a workflow file any user with push rights writes, and the
+/// match runs on the async worker that handles the push — a few such pushes
+/// stopped every HTTP and SSH request sharing the runtime (card_7b3ccbd2a12c).
+/// [`MAX_FILTER_PATTERN_BYTES`] caps the second factor of the bound.
+fn glob_segments(path: &[u8], pattern: &[u8]) -> bool {
+    let tokens = glob_tokens(pattern);
+    let accept = tokens.len();
+    let mut live = GlobStates::new(accept);
+    let mut next = GlobStates::new(accept);
+    live.insert(&tokens, 0);
+    for &byte in path {
+        next.clear();
+        for &position in &live.positions {
+            match tokens.get(position) {
+                Some(GlobToken::Byte(expected)) if *expected == byte => {
+                    next.insert(&tokens, position + 1);
+                }
+                Some(GlobToken::Star) if byte != b'/' => next.insert(&tokens, position),
+                Some(GlobToken::DoubleStar) => next.insert(&tokens, position),
+                _ => {}
             }
-            // A trailing backslash escapes nothing. `unhonourable_filter_patterns`
-            // refuses one where the file is read, so this arm is only reached
-            // through the matcher's other callers.
-            None => false,
-        },
-        Some(expected) => {
-            !path.is_empty() && path[0] == *expected && glob_segments(&path[1..], &pattern[1..])
+        }
+        if next.positions.is_empty() {
+            return false;
+        }
+        std::mem::swap(&mut live, &mut next);
+    }
+    live.contains(accept)
+}
+
+/// The pattern positions a prefix of the input can leave [`glob_segments`] at.
+struct GlobStates {
+    positions: Vec<usize>,
+    present: Vec<bool>,
+}
+
+impl GlobStates {
+    fn new(accept: usize) -> Self {
+        Self {
+            positions: Vec::new(),
+            present: vec![false; accept + 1],
+        }
+    }
+
+    fn contains(&self, position: usize) -> bool {
+        self.present[position]
+    }
+
+    /// Add a position, and every position a star in front of it can reach by
+    /// matching nothing at all.
+    fn insert(&mut self, tokens: &[GlobToken], mut position: usize) {
+        while !self.present[position] {
+            self.present[position] = true;
+            self.positions.push(position);
+            match tokens.get(position) {
+                Some(GlobToken::Star | GlobToken::DoubleStar) => position += 1,
+                _ => return,
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        for position in self.positions.drain(..) {
+            self.present[position] = false;
         }
     }
 }
 
 /// Match a branch or tag name against a `branches:` / `tags:` pattern.
 ///
-/// The same backtracking matcher the path filters use, on a ref name instead of
-/// a file path. A ref is hierarchical for exactly the same reason a path is
+/// The same matcher the path filters use, on a ref name instead of a file
+/// path. A ref is hierarchical for exactly the same reason a path is
 /// (`release/1.0`, `v1/rc`), and GitHub draws the `*` / `**` distinction on
 /// `/` in both.
 ///
@@ -4226,6 +4348,160 @@ jobs:
                     "the refusal must list supported filter {supported:?}: {error}"
                 );
             }
+        }
+    }
+
+    /// The recursive backtracker [`glob_segments`] used to be, kept verbatim so
+    /// the replacement can be held to every answer it gave. Exponential in the
+    /// number of stars — only ever fed the short inputs below.
+    fn backtracking_glob_segments(path: &[u8], pattern: &[u8]) -> bool {
+        match pattern.first() {
+            None => path.is_empty(),
+            Some(b'*') => {
+                if pattern.get(1) == Some(&b'*') {
+                    let rest = &pattern[2..];
+                    let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+                    (0..=path.len()).any(|skip| backtracking_glob_segments(&path[skip..], rest))
+                        || backtracking_glob_segments(path, rest)
+                } else {
+                    let rest = &pattern[1..];
+                    let bound = path.iter().position(|b| *b == b'/').unwrap_or(path.len());
+                    (0..=bound).any(|skip| backtracking_glob_segments(&path[skip..], rest))
+                }
+            }
+            Some(b'\\') => match pattern.get(1) {
+                Some(literal) => {
+                    !path.is_empty()
+                        && path[0] == *literal
+                        && backtracking_glob_segments(&path[1..], &pattern[2..])
+                }
+                None => false,
+            },
+            Some(expected) => {
+                !path.is_empty()
+                    && path[0] == *expected
+                    && backtracking_glob_segments(&path[1..], &pattern[1..])
+            }
+        }
+    }
+
+    /// Every word over `alphabet` of length `0..=max_len`.
+    fn words(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
+        let mut all = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..max_len {
+            frontier = frontier
+                .iter()
+                .flat_map(|word: &Vec<u8>| {
+                    alphabet.iter().map(move |byte| {
+                        let mut longer = word.clone();
+                        longer.push(*byte);
+                        longer
+                    })
+                })
+                .collect();
+            all.extend(frontier.iter().cloned());
+        }
+        all
+    }
+
+    /// The linear matcher answers exactly what the backtracker answered.
+    ///
+    /// Exhaustive rather than sampled: every pattern and every input up to
+    /// four bytes over the bytes the pattern language gives a meaning to —
+    /// `*`, `**`, the optional `/` after `**`, the `\` escape and a dangling
+    /// one — plus longer star-and-separator shapes, where `**/`, `*/**` and
+    /// `***` live. A rewrite that drifted on any of the rules the earlier cards
+    /// pinned one example at a time (card_8dc2adb75578, card_eeffc067afdd)
+    /// disagrees here.
+    #[test]
+    fn the_linear_glob_matcher_answers_what_the_backtracker_answered() {
+        let mut checked = 0usize;
+        for (pattern_alphabet, pattern_len, input_alphabet, input_len) in [
+            (&b"ab/*\\"[..], 4, &b"ab/*\\"[..], 4),
+            (&b"a/*"[..], 6, &b"a/"[..], 6),
+        ] {
+            let inputs = words(input_alphabet, input_len);
+            for pattern in words(pattern_alphabet, pattern_len) {
+                for input in &inputs {
+                    assert_eq!(
+                        glob_segments(input, &pattern),
+                        backtracking_glob_segments(input, &pattern),
+                        "input {:?} against pattern {:?}",
+                        String::from_utf8_lossy(input),
+                        String::from_utf8_lossy(&pattern),
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 700_000, "the sweep shrank to {checked} pairs");
+    }
+
+    /// A pattern built to make a backtracker try every way of placing its
+    /// stars is answered at once (card_7b3ccbd2a12c).
+    ///
+    /// `*a*a*a*a*a*a*a*a*a*b` against a branch of 250 `a`s used to never
+    /// return, on the async worker that handled the push. The matcher runs on a
+    /// thread of its own here and is waited for with a deadline, so a
+    /// regression fails this test in two seconds instead of hanging the run —
+    /// the stray thread spins until the test process exits.
+    #[test]
+    fn a_pathological_filter_pattern_is_answered_in_bounded_time() {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let branch = "a".repeat(250);
+            let nested = format!("{}a", "a/".repeat(125));
+            let started = std::time::Instant::now();
+            let answers = [
+                match_glob(&branch, &format!("{}b", "*a".repeat(9))),
+                match_glob(&branch, &format!("{}b", "**a".repeat(10))),
+                match_path_pattern(&nested, &format!("{}b", "**a".repeat(10))),
+                match_path_pattern(&branch, &format!("{}b", "*a".repeat(9))),
+                // And the same shapes where the answer is yes, so a matcher
+                // that simply gave up on long input would not pass either.
+                match_glob(&branch, &format!("{}*", "*a".repeat(9))),
+                match_path_pattern(&nested, &format!("{}*", "**a".repeat(10))),
+            ];
+            // The receiver is gone only when the deadline already failed the test.
+            send.send((answers, started.elapsed()))
+                .expect("the test is still waiting for the answers");
+        });
+        let (answers, elapsed) = receive
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a star-heavy filter pattern kept the matcher busy past the deadline");
+        assert_eq!(answers, [false, false, false, false, true, true]);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "six pathological matches took {elapsed:?}"
+        );
+    }
+
+    /// The matcher's cost grows with the pattern, so the pattern is capped where
+    /// the file is read — and the cap is a refusal naming the key, not a
+    /// pattern quietly matched as something shorter.
+    #[test]
+    fn a_filter_pattern_over_the_length_cap_is_refused_by_name() {
+        let workflow = |pattern: &str| {
+            GiteaWorkflow::parse(&format!(
+                "on:\n  push:\n    branches:\n      - '{pattern}'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+            ))
+            .expect("the pattern parses; the validator judges it")
+        };
+        workflow(&"a".repeat(MAX_FILTER_PATTERN_BYTES))
+            .validate_supported_triggers()
+            .expect("a pattern exactly at the cap is accepted");
+        let error = workflow(&"*a".repeat(MAX_FILTER_PATTERN_BYTES / 2 + 1))
+            .validate_supported_triggers()
+            .expect_err("a pattern past the cap must not reach the matcher")
+            .to_string();
+        let length = MAX_FILTER_PATTERN_BYTES + 2;
+        for needle in [
+            "push.branches".to_string(),
+            format!("{length} bytes"),
+            format!("{MAX_FILTER_PATTERN_BYTES}"),
+        ] {
+            assert!(error.contains(&needle), "missing {needle:?}: {error}");
         }
     }
 
