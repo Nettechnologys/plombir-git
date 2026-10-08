@@ -2,14 +2,16 @@
  * Turning what a person typed into the key the API resolves an account by.
  *
  * The endpoints that hand out access — repository collaborators, organization
- * members, team members — all accept `user_id`, `username` or `email`, and the
- * only one a human is ever going to have at hand is the name. So the forms ask
- * for "user", not "User ID", and this decides which key that answer becomes.
+ * members, team members — accept `user_id` or `username`, and the only one a
+ * human is ever going to have at hand is the name. So the forms ask for "user",
+ * not "User ID", and this decides which key that answer becomes.
  *
  * A bare run of digits is read as an id, which keeps working for anyone who
- * genuinely has one; anything containing `@` is an e-mail; everything else is
- * a username. `null` means the field was empty, which is the one case the
- * caller has to refuse locally instead of sending.
+ * genuinely has one; anything containing `@` is sent as an e-mail, which the
+ * server refuses with the reason (addresses are not confirmed on the instance,
+ * so an address names whoever registered it first); everything else is a
+ * username. `null` means the field was empty, which is the one case the caller
+ * has to refuse locally instead of sending.
  */
 export type UserRefPayload = { user_id: number } | { username: string } | { email: string };
 

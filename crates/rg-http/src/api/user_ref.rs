@@ -20,12 +20,25 @@
 //! row, so every handler that hands out access agrees on what it accepts, on
 //! which failures are the caller's, and on what it can say back about who was
 //! added.
+//!
+//! The e-mail is read and **refused** (card_9e97b992d4a6): the instance does not
+//! confirm addresses, so an address identifies the person who typed it first,
+//! and a grant addressed to it can land in a stranger's account. It comes back
+//! only together with address confirmation, and then only for confirmed
+//! addresses.
 
 use serde::Deserialize;
 
 use rg_db::entities::user::Model as User;
 
-/// The three interchangeable ways a request body may name an account.
+/// Why an e-mail does not name a person here. Shared so every surface that
+/// reads a [`UserRef`] gives the same reason.
+pub(crate) const EMAIL_NOT_ACCEPTED: &str =
+    "a person cannot be named by e-mail address here: addresses are not confirmed on this \
+     instance, so an address names whoever registered it first; use the username";
+
+/// The ways a request body may name an account: `user_id` or `username`, and
+/// an `email` that is refused with a reason (see the module note).
 ///
 /// Flattened into a request struct, so an endpoint keeps its own fields and
 /// gains all three names at once — and a client that already sends `user_id`
@@ -47,8 +60,8 @@ impl UserRef {
     /// checked is what let a typo'd `user_id` reach the database and come back
     /// as a constraint failure — a `500` for a request that was simply wrong.
     ///
-    /// Only the four request-shaped outcomes are the caller's: a non-positive
-    /// id, and each of the three names matching nobody. The lookups themselves
+    /// Only the request-shaped outcomes are the caller's: a non-positive id,
+    /// an id or username matching nobody, and an e-mail at all. The lookups themselves
     /// are ours and stay `5xx`, which is why they are `?`-propagated rather
     /// than folded into "no such user".
     pub async fn resolve(&self, db: &rg_db::DatabaseConnection) -> anyhow::Result<User> {
@@ -73,16 +86,19 @@ impl UserRef {
                 });
         }
 
-        if let Some(email) = trimmed(self.email.as_deref()) {
-            return rg_db::ops::user_ops::find_by_email(db, email)
-                .await?
-                .ok_or_else(|| {
-                    rg_core::error::invalid_request(format!("user '{email}' not found"))
-                });
+        // An address is refused, not resolved (card_9e97b992d4a6). Nothing on
+        // this instance confirms that the account holding an address owns it —
+        // local registration takes whatever was typed — so "add
+        // bob@corp.example" would hand the grant to whoever registered that
+        // address first, not to Bob. The field stays in the body so the caller
+        // is told why, instead of the address being dropped and the request
+        // answered as if it named nobody.
+        if trimmed(self.email.as_deref()).is_some() {
+            return Err(rg_core::error::invalid_request(EMAIL_NOT_ACCEPTED));
         }
 
         Err(rg_core::error::invalid_request(
-            "user_id, username, or email is required",
+            "user_id or username is required",
         ))
     }
 }
@@ -208,6 +224,8 @@ impl UserRef {
     /// the same three-way choice in `web/src/lib/api/userRef.ts::buildUserRef`;
     /// this is the server's copy for endpoints whose body carries the
     /// identifier as a single string rather than as the flattened [`UserRef`].
+    /// An `@` still becomes an e-mail, so the person who typed one is told why
+    /// it is refused rather than that no such username exists.
     ///
     /// A number that does not fit `i64` is kept as a username rather than
     /// rejected here — [`UserRef::resolve`] is where "matches nobody" is
@@ -236,7 +254,7 @@ impl UserRef {
 }
 
 /// A present, non-blank name. A field holding `"  "` names nobody, and falling
-/// through to the next branch answers "user_id, username, or email is
+/// through to the next branch answers "user_id or username is
 /// required" — which is the truth about that body — instead of looking up the
 /// empty string.
 fn trimmed(value: Option<&str>) -> Option<&str> {

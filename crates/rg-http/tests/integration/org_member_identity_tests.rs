@@ -115,10 +115,10 @@ async fn an_owner_can_add_a_member_by_username_and_see_them_named() {
 }
 
 /// Teams are the other half of the same surface — and the one the owner in the
-/// report actually reached for. An e-mail names an account here too, and the
+/// report actually reached for. A username names an account here too, and the
 /// team roster comes back named.
 #[tokio::test]
-async fn a_team_member_can_be_added_by_email_and_the_roster_is_named() {
+async fn a_team_member_can_be_added_by_username_and_the_roster_is_named() {
     let base = spawn_test_app().await;
     let (owner_token, _) = register_full(&base, "tmid-owner", "tmid-owner@example.com").await;
     let (_guest_token, guest_id) =
@@ -143,14 +143,14 @@ async fn a_team_member_can_be_added_by_email_and_the_roster_is_named() {
             "{base}/api/v1/orgs/tmidcorp/teams/{team_id}/members"
         ))
         .bearer_auth(&owner_token)
-        .json(&serde_json::json!({"email": "tmid-guest@example.com", "role": "member"}))
+        .json(&serde_json::json!({"username": "tmid-guest", "role": "member"}))
         .send()
         .await
         .expect("request");
     assert_eq!(
         added.status(),
         201,
-        "an e-mail must be enough to join a team"
+        "a username must be enough to join a team"
     );
     let body: serde_json::Value = added.json().await.expect("json body");
     assert_eq!(body["user_id"], guest_id);
@@ -176,6 +176,68 @@ async fn a_team_member_can_be_added_by_email_and_the_roster_is_named() {
         names.contains(&"tmid-guest"),
         "the team roster must name its members, got: {members}"
     );
+}
+
+/// card_9e97b992d4a6: an address names whoever registered it first, because
+/// nothing here confirms addresses. The squatter below typed the address the
+/// owner believes is a colleague's; adding "that address" must not make the
+/// squatter a member — of the organization or of a team.
+#[tokio::test]
+async fn an_email_grants_nothing_to_the_account_that_claimed_it() {
+    let base = spawn_test_app().await;
+    let (owner_token, _) = register_full(&base, "sqat-owner", "sqat-owner@example.com").await;
+    let (_squatter_token, squatter_id) =
+        register_full(&base, "sqat-mallory", "bob-real@corp.example").await;
+    let client = reqwest::Client::new();
+
+    create_org(&base, &owner_token, "sqatcorp", "private").await;
+    let team = client
+        .post(format!("{base}/api/v1/orgs/sqatcorp/teams"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"name": "core", "permission": "write"}))
+        .send()
+        .await
+        .expect("create team");
+    assert_eq!(team.status(), 201);
+    let team: serde_json::Value = team.json().await.expect("json body");
+    let team_id = team["id"].as_i64().expect("team id");
+
+    for url in [
+        format!("{base}/api/v1/orgs/sqatcorp/members"),
+        format!("{base}/api/v1/orgs/sqatcorp/teams/{team_id}/members"),
+    ] {
+        let added = client
+            .post(&url)
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({"email": "bob-real@corp.example", "role": "member"}))
+            .send()
+            .await
+            .expect("request");
+        let status = added.status();
+        let body = added.text().await.expect("body");
+        assert_eq!(status, 400, "{url}: an e-mail must be refused, got: {body}");
+        assert!(
+            body.contains("addresses are not confirmed"),
+            "{url}: the refusal has to say why, got: {body}"
+        );
+
+        let listed = client
+            .get(&url)
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(listed.status(), 200);
+        let members: serde_json::Value = listed.json().await.expect("json body");
+        assert!(
+            !members
+                .as_array()
+                .expect("array")
+                .iter()
+                .any(|m| m["user_id"].as_i64() == Some(squatter_id)),
+            "{url}: the account that claimed the address became a member: {members}"
+        );
+    }
 }
 
 /// The numeric id still works — widening what the endpoint accepts must not

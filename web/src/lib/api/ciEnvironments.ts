@@ -9,8 +9,8 @@ export interface CiEnvironment {
 /**
  * An environment as the API accepts it.
  *
- * `allowed_approvers` is the approver list, one entry per person: a username,
- * an e-mail, or a bare id. The API still accepts the numeric
+ * `allowed_approvers` is the approver list, one entry per person: a username
+ * or a bare id (an e-mail is refused). The API still accepts the numeric
  * `allowed_approver_ids`; the form sends names because approving a deployment
  * is handing out access, and a number is not something the owner of a
  * repository can look up — there is no `/users/{username}` to look it up in.

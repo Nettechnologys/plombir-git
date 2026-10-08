@@ -687,11 +687,25 @@ async fn fetch_gitlab_user(access_token: &str, endpoint: &str) -> Result<SsoUser
             .unwrap_or_default(),
         provider_username: user["username"].as_str().unwrap_or("").to_string(),
         email: user["email"].as_str().unwrap_or("").to_string(),
-        // `/api/v4/user` carries no verification flag for the primary address.
-        email_verified: None,
+        email_verified: gitlab_email_verified(&user),
         display_name: user["name"].as_str().map(str::to_string),
         avatar_url: user["avatar_url"].as_str().map(str::to_string),
     })
+}
+
+/// GitLab's word on the primary address of `/api/v4/user`.
+///
+/// There is no `email_verified` there. What GitLab does keep is `confirmed_at`:
+/// the account's address was confirmed, and a changed primary waits in
+/// `unconfirmed_email` until it is confirmed too, so `email` is the confirmed
+/// one whenever `confirmed_at` is set. Its absence is not a denial — older
+/// servers and restricted tokens omit the field — so it stays `None`, which an
+/// allowlist reads as "not vouched for" (card_7099e8a305bc).
+fn gitlab_email_verified(user: &serde_json::Value) -> Option<bool> {
+    user["confirmed_at"]
+        .as_str()
+        .filter(|confirmed_at| !confirmed_at.trim().is_empty())
+        .map(|_| true)
 }
 
 // ── Google OIDC user info ────────────────────────────────────────
@@ -1277,6 +1291,25 @@ mod tests {
         assert_eq!(identity.provider_user_id, "provider-uid-1");
         assert_eq!(identity.provider_username, "alice");
         assert_eq!(identity.email, "alice@example.com");
+    }
+
+    /// GitLab has no `email_verified`; a confirmed account is its confirmation.
+    #[test]
+    fn gitlab_vouches_for_the_primary_only_once_the_account_is_confirmed() {
+        use super::gitlab_email_verified;
+        assert_eq!(
+            gitlab_email_verified(&serde_json::json!({"confirmed_at": "2026-01-02T03:04:05Z"})),
+            Some(true)
+        );
+        assert_eq!(
+            gitlab_email_verified(&serde_json::json!({"confirmed_at": null})),
+            None
+        );
+        assert_eq!(
+            gitlab_email_verified(&serde_json::json!({"confirmed_at": ""})),
+            None
+        );
+        assert_eq!(gitlab_email_verified(&serde_json::json!({})), None);
     }
 
     /// Some IdPs send the OIDC claim as a JSON string. Reading `"false"` as

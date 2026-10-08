@@ -174,6 +174,7 @@ pub async fn register(
     email: &str,
     plaintext_password: &str,
     jwt_secret: &str,
+    directories: LdapDirectories<'_>,
 ) -> Result<AuthResponse> {
     // Validate inputs. A taken name or a taken address is the caller's to fix
     // and carries `Conflict`; the lookups performing them are ours, and a
@@ -226,6 +227,16 @@ pub async fn register(
     password_validator
         .validate_with_username(plaintext_password, username)
         .map_err(|e| crate::error::invalid_request(e.to_string()))?;
+
+    // A name or address the directory holds belongs to the directory's person,
+    // who signs in through it and gets this account provisioned then. Same
+    // `409` and the same words as a name taken locally: the refusal does not
+    // say *which* list holds it, so registration is no directory browser.
+    if ldap_directory_holds(db, directories, username, Some(email)).await? {
+        return Err(crate::error::conflict(format!(
+            "username '{username}' or email '{email}' is already taken"
+        )));
+    }
 
     let password_hash = password::hash_password(plaintext_password)
         .await
@@ -544,6 +555,97 @@ async fn login_via_ldap_inner(
 /// AES-GCM at rest, and conflating the two is what made a rotated signing
 /// secret break every LDAP login with "bind password could not be decrypted"
 /// (card_d740512de0a8).
+/// What reaching the instance's LDAP directories needs: the key their bind
+/// passwords are encrypted under and the transport policy that approves their
+/// endpoints.
+#[derive(Clone, Copy)]
+pub struct LdapDirectories<'a> {
+    pub encryption_key: &'a str,
+    pub transport_policy: &'a crate::auth::ldap::LdapTransportPolicy,
+}
+
+/// Does an enabled LDAP directory already know this username (or address)?
+///
+/// Asked by the doors that let a *stranger* take a name — self-service
+/// registration and organization creation — before the name is taken
+/// (card_666fc82dd28d). Login sends a local `alice` to the local password and
+/// never tries the directory, so a name squatted here locks the directory's
+/// `alice` out for good, and her colleagues grant access to the squatter.
+///
+/// Fails closed: a directory that did not answer cannot say the name is free,
+/// so the outage travels as [`crate::error::UpstreamUnavailable`] instead of
+/// letting the name through. A provider whose configuration cannot even be
+/// built is skipped, as login skips it — it cannot sign anybody in either.
+/// With no LDAP provider configured this is one query and no network.
+pub async fn ldap_directory_holds(
+    db: &DatabaseConnection,
+    directories: LdapDirectories<'_>,
+    username: &str,
+    email: Option<&str>,
+) -> Result<bool> {
+    let providers = rg_db::ops::sso_provider_ops::list_enabled(db)
+        .await?
+        .into_iter()
+        .filter(|provider| provider.provider_type == "ldap");
+    let mut outage: Option<anyhow::Error> = None;
+    for provider in providers {
+        let config = match ldap_config_from_provider(
+            &provider,
+            directories.encryption_key,
+            directories.transport_policy,
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    provider_id = provider.id,
+                    error = %format!("{error:#}"),
+                    "ignoring invalid LDAP provider configuration"
+                );
+                continue;
+            }
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::auth::ldap::directory_holds(&config, username, email),
+        )
+        .await
+        {
+            Ok(Ok(true)) => return Ok(true),
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    provider_id = provider.id,
+                    error = %format!("{error:#}"),
+                    "LDAP directory lookup failed"
+                );
+                outage.get_or_insert(error);
+            }
+            Err(_) => {
+                outage.get_or_insert_with(|| {
+                    crate::error::upstream_unavailable(format!(
+                        "the LDAP directory of provider {} did not answer within 10s",
+                        provider.id
+                    ))
+                });
+            }
+        }
+    }
+    match outage {
+        // Keep (or add) the upstream tag so the door answers 5xx, not 400.
+        Some(error)
+            if error
+                .downcast_ref::<crate::error::UpstreamUnavailable>()
+                .is_some() =>
+        {
+            Err(error)
+        }
+        Some(error) => Err(error.context(crate::error::UpstreamUnavailable::new(
+            "could not ask the LDAP directory whether the name is free",
+        ))),
+        None => Ok(false),
+    }
+}
+
 fn ldap_config_from_provider(
     provider: &rg_db::entities::sso_provider::Model,
     encryption_key: &str,
@@ -712,7 +814,13 @@ async fn resolve_ldap_identity(
     // dressed as one: the refusal travels as itself and the HTTP layer answers
     // 403 with the reason, rather than telling a member of the directory that
     // their password was wrong.
-    if let Err(refusal) = crate::user::provisioning::authorize(provider, email) {
+    // The address comes from the operator's own directory, not from a profile
+    // field its holder typed, so the directory's word is the confirmation.
+    if let Err(refusal) = crate::user::provisioning::authorize(
+        provider,
+        email,
+        crate::user::provisioning::AddressAssurance::Verified,
+    ) {
         tracing::warn!(
             provider_id = ldap_provider_id,
             username,

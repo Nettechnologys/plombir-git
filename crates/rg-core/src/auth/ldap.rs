@@ -366,6 +366,61 @@ pub async fn authenticate(config: &LdapConfig, username: &str, password: &str) -
     })
 }
 
+/// Does the directory hold an entry under this username — or this address?
+///
+/// Asked before an account or an organization takes a name on the instance
+/// (card_666fc82dd28d). With open registration a stranger could otherwise take
+/// `alice` first; the directory's `alice` then never gets in, because login
+/// routes a local `alice` to the local password, and colleagues hand out access
+/// to the stranger's account believing it is hers. The address matters as much:
+/// LDAP first login refuses an address another account already holds.
+///
+/// Only the forge's service account binds — no user password is involved — and
+/// the search asks for no attributes, just whether anything matched. The same
+/// `user_filter` that login uses decides what "this username" means, so the two
+/// cannot disagree about who the directory's `alice` is.
+pub async fn directory_holds(
+    config: &LdapConfig,
+    username: &str,
+    email: Option<&str>,
+) -> Result<bool> {
+    if !config.user_filter.contains("{username}") {
+        anyhow::bail!("LDAP user filter must contain '{{username}}'");
+    }
+    let url = connection_url(config)?;
+    let (conn, mut ldap) = LdapConnAsync::with_settings(connection_settings(config), &url)
+        .await
+        .directory_call("could not connect to the LDAP directory")?;
+    ldap3::drive!(conn);
+
+    ldap.simple_bind(&config.bind_dn, &config.bind_password)
+        .await
+        .directory_call("the LDAP service bind did not complete")?
+        .success()
+        .directory_call("the LDAP directory refused the service bind")?;
+
+    let by_name = config
+        .user_filter
+        .replace("{username}", &escape_filter_value(username));
+    let filter = match email {
+        Some(email) => format!("(|{by_name}(mail={}))", escape_filter_value(email)),
+        None => by_name,
+    };
+    // `1.1` is RFC 4511's "no attributes": the answer is whether an entry
+    // matched, and nothing about it needs to cross the wire.
+    let (results, _) = ldap
+        .search(&config.base_dn, Scope::Subtree, &filter, vec!["1.1"])
+        .await
+        .directory_call("the LDAP directory search did not complete")?
+        .success()
+        .directory_call("the LDAP directory refused the search")?;
+
+    if let Err(error) = ldap.unbind().await {
+        tracing::warn!(%error, "LDAP service unbind failed after a directory lookup");
+    }
+    Ok(!results.is_empty())
+}
+
 /// Dial the directory and bind with the forge's own service account.
 ///
 /// Every failure here belongs to the same host [`authenticate`] talks to, and

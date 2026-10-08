@@ -138,6 +138,15 @@ pub async fn authorize(
 
 #[cfg(test)]
 mod tests {
+    fn no_directories() -> super::super::service::LdapDirectories<'static> {
+        static POLICY: std::sync::OnceLock<crate::auth::ldap::LdapTransportPolicy> =
+            std::sync::OnceLock::new();
+        super::super::service::LdapDirectories {
+            encryption_key: "test-encryption-key",
+            transport_policy: POLICY.get_or_init(Default::default),
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -197,6 +206,7 @@ mod tests {
             "founder@example.com",
             "Qz7$wRtm",
             "secret",
+            no_directories(),
         )
         .await
         .expect("bootstrap registration");
@@ -224,6 +234,7 @@ mod tests {
             "founder@example.com",
             "Qz7$wRtm",
             "secret",
+            no_directories(),
         )
         .await
         .expect("bootstrap registration");
@@ -257,6 +268,7 @@ mod tests {
             "founder@example.com",
             "Qz7$wRtm",
             "secret",
+            no_directories(),
         )
         .await
         .expect("bootstrap registration");

@@ -140,6 +140,10 @@ pub async fn register(
         &body.email,
         &body.password,
         &state.jwt_secret,
+        rg_core::user::service::LdapDirectories {
+            encryption_key: &state.encryption_key,
+            transport_policy: &state.ldap_transport_policy,
+        },
     )
     .await;
 

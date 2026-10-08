@@ -278,7 +278,19 @@ async fn serve_connection(
                         &ldap_result(RC_INSUFFICIENT_ACCESS),
                     )
                 } else {
-                    let mut reply = search_entry(request.message_id);
+                    // The directory knows one person. BER carries a filter's
+                    // assertion values as raw octet strings, so "the filter
+                    // names `ldapuser`" is a byte search — no filter parser
+                    // needed to tell a lookup of the directory's member from
+                    // a lookup of somebody it has never heard of.
+                    let names_member = msg
+                        .windows(USERNAME.len())
+                        .any(|window| window == USERNAME.as_bytes());
+                    let mut reply = if names_member {
+                        search_entry(request.message_id)
+                    } else {
+                        Vec::new()
+                    };
                     reply.extend(message(request.message_id, 0x65, &ldap_result(RC_SUCCESS)));
                     reply
                 }
@@ -493,16 +505,27 @@ impl Harness {
     /// this instance. The admin is registered per call and named after the
     /// provider, so a test may press the button for more than one row.
     async fn press_test_button(&self, provider_id: i64) -> (StatusCode, String) {
-        let (token, admin_id) = crate::common::register_full(
-            &self.base,
-            &format!("dir_admin_{provider_id}"),
-            &format!("dir_admin_{provider_id}@example.com"),
+        // Created in the database, not through `POST /users/register`:
+        // registration asks the directory whether the name is free, and the
+        // outage fixtures here would refuse the admin before the button is
+        // ever pressed.
+        let admin_name = format!("dir_admin_{provider_id}");
+        let admin = rg_db::ops::user_ops::create_user(
+            &self.db,
+            &admin_name,
+            &format!("{admin_name}@example.com"),
+            "",
+            "Directory Admin",
         )
-        .await;
-        rg_db::ops::user_ops::update_by_id(&self.db, admin_id, None, None, Some(true), None)
+        .await
+        .unwrap();
+        rg_db::ops::user_ops::update_by_id(&self.db, admin.id, None, None, Some(true), None)
             .await
             .unwrap()
-            .expect("the registered admin must exist");
+            .expect("the created admin must exist");
+        let token =
+            rg_core::auth::jwt::generate_token(admin.id, &admin_name, 0, "test-secret-key", 7)
+                .unwrap();
 
         let response = self
             .client
@@ -516,6 +539,29 @@ impl Harness {
             .unwrap();
         let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
         (status, response.text().await.unwrap())
+    }
+
+    /// `POST /users/register`, as a visitor to an open instance sends it.
+    async fn register(&self, username: &str, email: &str) -> (StatusCode, String) {
+        let response = self
+            .client
+            .post(format!("{}/api/v1/users/register", self.base))
+            .json(&serde_json::json!({
+                "username": username,
+                "email": email,
+                "password": "Qz7$wRtm-directory",
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+        (status, response.text().await.unwrap())
+    }
+
+    async fn account_named(&self, username: &str) -> Option<rg_db::entities::user::Model> {
+        rg_db::ops::user_ops::find_by_username(&self.db, username)
+            .await
+            .unwrap()
     }
 
     /// Store an extra provider row and return its id.
@@ -917,4 +963,86 @@ async fn a_directory_that_rejects_the_password_is_still_a_401_and_still_counts()
         "a real rejection must still advance the brute-force counter, or the fix \
          has disarmed the lockout for every LDAP account"
     );
+}
+
+/// card_666fc82dd28d: with open registration a stranger could take the name of
+/// a directory member first. Login then routes the local `ldapuser` to the
+/// local password, the directory's `ldapuser` never gets in, and colleagues
+/// grant access to the stranger. Registration asks the directory, refuses with
+/// the same words as a locally taken name, and the member's first LDAP login
+/// still provisions the account afterwards.
+#[tokio::test]
+async fn registration_refuses_a_name_the_directory_holds() {
+    let harness = Harness::start_with(Behaviour::Healthy, Fixture::default()).await;
+
+    let (status, body) = harness.register(USERNAME, "squatter@elsewhere.org").await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert!(
+        body.contains("already taken") && !body.to_lowercase().contains("directory"),
+        "the refusal must read like a taken name and not say which list holds it, got: {body}"
+    );
+    assert!(
+        harness.account_named(USERNAME).await.is_none(),
+        "a refused registration created the account anyway"
+    );
+
+    let (status, body) = harness.sign_in().await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the directory member must still get in, body: {body}"
+    );
+    let account = harness
+        .account_named(USERNAME)
+        .await
+        .expect("the first LDAP login provisions the account");
+    assert_eq!(account.auth_provider, "ldap");
+}
+
+/// The address is the other half: LDAP first login refuses an address another
+/// account already holds, so a squatted address locks the member out as surely
+/// as a squatted name.
+#[tokio::test]
+async fn registration_refuses_an_address_the_directory_holds() {
+    let harness = Harness::start_with(Behaviour::Healthy, Fixture::default()).await;
+
+    let (status, body) = harness
+        .register("someone-else", "ldapuser@example.com")
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert!(harness.account_named("someone-else").await.is_none());
+}
+
+/// The baseline that makes both refusals mean something: a name and address
+/// the directory does not hold register as before, with the directory asked.
+#[tokio::test]
+async fn registration_admits_a_name_the_directory_does_not_hold() {
+    let harness = Harness::start_with(Behaviour::Healthy, Fixture::default()).await;
+
+    let (status, body) = harness.register("newcomer", "newcomer@elsewhere.org").await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    assert!(harness.account_named("newcomer").await.is_some());
+    assert!(
+        harness
+            .observed_binds
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(dn, _)| dn == SERVICE_BIND_DN),
+        "registration never asked the directory, so the refusals above prove nothing"
+    );
+}
+
+/// A directory that did not answer cannot say the name is free: registration
+/// fails closed with a server-side status and creates nothing.
+#[tokio::test]
+async fn an_unreachable_directory_holds_registration_closed() {
+    let harness = Harness::start_with(Behaviour::Unreachable, Fixture::default()).await;
+
+    let (status, body) = harness.register("newcomer", "newcomer@elsewhere.org").await;
+    assert!(
+        status.is_server_error(),
+        "an unanswered directory must not read as the caller's fault or as a free name, got {status}: {body}"
+    );
+    assert!(harness.account_named("newcomer").await.is_none());
 }

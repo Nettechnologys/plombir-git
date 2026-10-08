@@ -88,26 +88,28 @@ async fn an_issue_is_assigned_by_username_and_answers_with_the_name() {
     );
 }
 
-/// An e-mail is the other name a person has, and the numeric id keeps working
-/// — this widened what the endpoint accepts, it did not replace anything.
+/// An e-mail is refused (card_9e97b992d4a6): addresses are not confirmed, so
+/// it names whoever registered it first. The numeric id keeps working.
 #[tokio::test]
-async fn an_email_and_a_bare_id_are_both_still_accepted() {
+async fn an_email_is_refused_and_a_bare_id_is_still_accepted() {
     let base = spawn_test_app().await;
     let (token, owner_id) = register_full(&base, "assign-owner", "assign-owner@example.com").await;
     let client = reqwest::Client::new();
     let url = seeded_issue(&base, &token).await;
 
-    let by_email: serde_json::Value = client
+    let by_email = client
         .patch(&url)
         .bearer_auth(&token)
         .json(&serde_json::json!({ "assignee": "assign-owner@example.com" }))
         .send()
         .await
-        .expect("request")
-        .json()
-        .await
-        .expect("json body");
-    assert_eq!(by_email["assignee_id"], owner_id, "got: {by_email}");
+        .expect("request");
+    assert_eq!(by_email.status(), 400);
+    let body: serde_json::Value = by_email.json().await.expect("json body");
+    assert!(
+        body.to_string().contains("addresses are not confirmed"),
+        "the refusal has to say why, got: {body}"
+    );
 
     client
         .patch(&url)

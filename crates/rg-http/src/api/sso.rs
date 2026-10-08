@@ -1267,8 +1267,12 @@ async fn find_or_create_sso_user(
         // addresses have accounts here. Someone the provider has verified as
         // the address's owner is told plainly; that tells them nothing new.
         if user_info.email_verified != Some(true) {
-            rg_core::user::provisioning::authorize(provider, &user_info.email)
-                .map_err(|refusal| sso_provisioning_refused(provider, user_info, refusal))?;
+            rg_core::user::provisioning::authorize(
+                provider,
+                &user_info.email,
+                rg_core::user::provisioning::AddressAssurance::Unverified,
+            )
+            .map_err(|refusal| sso_provisioning_refused(provider, user_info, refusal))?;
         }
         return Err(sso_account_link_required(provider, user_info));
     }
@@ -1277,9 +1281,17 @@ async fn find_or_create_sso_user(
     // provisioning policy governs. Signing in through an existing link is not
     // its business: refusing that would log people out of the instance
     // instead of keeping strangers out of it.
-    rg_core::user::provisioning::authorize(provider, &user_info.email)
-        .map_err(|refusal| sso_provisioning_refused(provider, user_info, refusal))?;
-    provision_sso_user(db, headers, provider_slug, user_info)
+    rg_core::user::provisioning::authorize(
+        provider,
+        &user_info.email,
+        rg_core::user::provisioning::AddressAssurance::from_claim(user_info.email_verified),
+    )
+    .map_err(|refusal| sso_provisioning_refused(provider, user_info, refusal))?;
+    let directories = rg_core::user::service::LdapDirectories {
+        encryption_key: &state.encryption_key,
+        transport_policy: &state.ldap_transport_policy,
+    };
+    provision_sso_user(db, headers, provider_slug, user_info, directories)
         .await?
         .ok_or_else(|| sso_account_link_required(provider, user_info))
 }
@@ -1338,9 +1350,10 @@ async fn provision_sso_user(
     headers: &HeaderMap,
     provider_slug: &str,
     user_info: &rg_core::auth::sso::SsoIdentity,
+    directories: rg_core::user::service::LdapDirectories<'_>,
 ) -> Result<Option<i64>, AppError> {
     for attempt in 1..=SSO_PROVISION_ATTEMPTS {
-        let username = generate_unique_username(db, &user_info.provider_username)
+        let username = generate_unique_username(db, directories, &user_info.provider_username)
             .await
             .map_err(AppError::from)?;
 
@@ -1464,6 +1477,7 @@ async fn resolve_raced_sso_user(
 /// Generate a unique username based on the provider username.
 async fn generate_unique_username(
     db: &sea_orm::DatabaseConnection,
+    directories: rg_core::user::service::LdapDirectories<'_>,
     base: &str,
 ) -> Result<String, anyhow::Error> {
     // A reserved base is unavailable in exactly the way a taken one is: nobody
@@ -1472,19 +1486,19 @@ async fn generate_unique_username(
     // call site turns any refusal into a 500, so an identity provider with a
     // user named `admin` would have failed its first login with a server error
     // rather than being provisioned as `admin_1`.
-    if !rg_core::namespace::is_reserved_segment(base)
-        && rg_db::ops::user_ops::find_by_username(db, base)
-            .await?
-            .is_none()
+    //
+    // A name the LDAP directory holds is taken the same way (card_666fc82dd28d):
+    // a public provider's `alice` provisioned as `alice` would send the
+    // directory's `alice` to a local account she cannot sign in to, and her
+    // colleagues' grants to a stranger. She keeps the name; this one gets
+    // `alice_1`.
+    if !rg_core::namespace::is_reserved_segment(base) && name_is_free(db, directories, base).await?
     {
         return Ok(base.to_string());
     }
     for i in 1..100 {
         let candidate = format!("{}_{}", base, i);
-        if rg_db::ops::user_ops::find_by_username(db, &candidate)
-            .await?
-            .is_none()
-        {
+        if name_is_free(db, directories, &candidate).await? {
             return Ok(candidate);
         }
     }
@@ -1493,6 +1507,22 @@ async fn generate_unique_username(
         .map(|c| c as char)
         .collect();
     Ok(format!("{}_{}", base, suffix))
+}
+
+/// Neither an account here nor an entry in an enabled LDAP directory holds
+/// `name`. The directory is asked only once the name is free locally.
+async fn name_is_free(
+    db: &sea_orm::DatabaseConnection,
+    directories: rg_core::user::service::LdapDirectories<'_>,
+    name: &str,
+) -> Result<bool, anyhow::Error> {
+    if rg_db::ops::user_ops::find_by_username(db, name)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(!rg_core::user::service::ldap_directory_holds(db, directories, name, None).await?)
 }
 
 #[cfg(test)]
@@ -1505,6 +1535,17 @@ mod tests {
     use axum::http::{header, HeaderMap};
     use axum::response::IntoResponse;
     use sea_orm::EntityTrait;
+
+    /// No LDAP provider is configured in these databases, so the directory
+    /// half of the username check is one empty query.
+    fn no_directories() -> rg_core::user::service::LdapDirectories<'static> {
+        static POLICY: std::sync::OnceLock<rg_core::auth::ldap::LdapTransportPolicy> =
+            std::sync::OnceLock::new();
+        rg_core::user::service::LdapDirectories {
+            encryption_key: "test-encryption-key",
+            transport_policy: POLICY.get_or_init(Default::default),
+        }
+    }
 
     /// Serialises the two tests that assert a delta on the process-wide
     /// `users_registered_total` counter. Under `cargo nextest` each test is its
@@ -1657,6 +1698,7 @@ mod tests {
             &HeaderMap::new(),
             "gitea",
             &sso_user_info("provider-uid-1", "alice", "alice@example.com"),
+            no_directories(),
         )
         .await
         .expect("provision")
@@ -1722,6 +1764,7 @@ mod tests {
                     provider_name,
                     &format!("person{index}@example.com"),
                 ),
+                no_directories(),
             )
             .await
             .expect("a provider name the local rule refuses is repaired, not refused")
@@ -1775,6 +1818,7 @@ mod tests {
             &HeaderMap::new(),
             "gitea",
             &sso_user_info("provider-uid-1", "alice", "alice@example.com"),
+            no_directories(),
         )
         .await
         .expect("a lost race is not a failed login");
@@ -1818,6 +1862,7 @@ mod tests {
             &HeaderMap::new(),
             "gitea",
             &sso_user_info("provider-uid-1", "alice", "alice@example.com"),
+            no_directories(),
         )
         .await
         .expect("a taken address is an answer, not an error");

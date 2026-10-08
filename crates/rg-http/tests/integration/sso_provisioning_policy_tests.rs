@@ -26,6 +26,9 @@ use rg_db::ops::sso_provider_ops::SsoProviderInput;
 struct MockIdp {
     base_url: String,
     email: String,
+    /// `None` leaves the claim out of the profile, as GitLab and many OIDC
+    /// providers do.
+    email_verified: Option<bool>,
 }
 
 async fn discovery(State(idp): State<MockIdp>) -> Json<serde_json::Value> {
@@ -45,13 +48,16 @@ async fn token(Form(_form): Form<HashMap<String, String>>) -> Json<serde_json::V
 }
 
 async fn userinfo(State(idp): State<MockIdp>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+    let mut profile = serde_json::json!({
         "sub": "subject-1",
         "preferred_username": "newcomer",
         "email": idp.email,
-        "email_verified": true,
         "name": "Newcomer"
-    }))
+    });
+    if let Some(verified) = idp.email_verified {
+        profile["email_verified"] = serde_json::Value::Bool(verified);
+    }
+    Json(profile)
 }
 
 fn cookie_pair(headers: &HeaderMap, name: &str) -> String {
@@ -96,12 +102,23 @@ impl Harness {
         auto_provision: bool,
         allowed_email_domains: Option<&str>,
     ) -> Harness {
+        Self::start_with_claim(email, auto_provision, allowed_email_domains, Some(true)).await
+    }
+
+    /// [`Harness::start`] with the provider's `email_verified` claim chosen.
+    async fn start_with_claim(
+        email: &str,
+        auto_provision: bool,
+        allowed_email_domains: Option<&str>,
+        email_verified: Option<bool>,
+    ) -> Harness {
         let idp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let idp_addr = idp_listener.local_addr().unwrap().to_string();
         let idp_base = format!("http://{idp_addr}");
         let idp = MockIdp {
             base_url: idp_base.clone(),
             email: email.to_string(),
+            email_verified,
         };
         let idp_app = Router::new()
             .route("/.well-known/openid-configuration", get(discovery))
@@ -287,6 +304,61 @@ async fn an_address_inside_the_allowlist_is_provisioned() {
 
     assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
     assert!(app.provisioned("newcomer@example.com").await);
+}
+
+/// card_7099e8a305bc: an allowlist says "accounts for our staff", and the
+/// domain is evidence of that only when the provider vouched for the address.
+/// A profile that does not say — GitLab, OIDC without the claim — or says
+/// "unconfirmed" must not buy a stranger an account, nor the address with it.
+#[tokio::test]
+async fn an_allowlist_refuses_an_address_the_provider_did_not_confirm() {
+    for claim in [None, Some(false)] {
+        let app =
+            Harness::start_with_claim("someone@example.com", true, Some("example.com"), claim)
+                .await;
+
+        let (status, body) = app.sign_in().await;
+
+        // An explicit `false` is already refused one layer earlier, by the
+        // identity gate, with a 400 of its own; `None` reaches the allowlist.
+        let expected = if claim.is_none() {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        assert_eq!(
+            status, expected,
+            "claim {claim:?}: an unconfirmed address inside the allowlist must be refused, body: {body}"
+        );
+        if claim.is_none() {
+            assert!(
+                body.contains("did not confirm"),
+                "the refusal has to say the address was not confirmed, got: {body}"
+            );
+        }
+        assert!(
+            !app.provisioned("someone@example.com").await,
+            "claim {claim:?}: an unconfirmed address got an account through the allowlist"
+        );
+        assert!(!app.linked().await);
+    }
+}
+
+/// Its baseline: the identical profile, now confirmed, is provisioned — and
+/// with no allowlist the claim decides nothing.
+#[tokio::test]
+async fn a_confirmed_address_or_an_unrestricted_provider_still_provisions() {
+    let app =
+        Harness::start_with_claim("someone@example.com", true, Some("example.com"), Some(true))
+            .await;
+    let (status, body) = app.sign_in().await;
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "body: {body}");
+    assert!(app.provisioned("someone@example.com").await);
+
+    let app = Harness::start_with_claim("someone@example.com", true, None, None).await;
+    let (status, body) = app.sign_in().await;
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "body: {body}");
+    assert!(app.provisioned("someone@example.com").await);
 }
 
 /// Turning provisioning off keeps strangers out; it must not lock out the

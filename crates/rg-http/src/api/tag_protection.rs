@@ -19,7 +19,7 @@ pub struct CreateTagProtectionRequest {
     /// The exceptions as ids — what a client written before names were
     /// accepted still sends. See [`allowed_users`](Self::allowed_users).
     pub allowed_user_ids: Option<Vec<i64>>,
-    /// The same exceptions, named: a `username`, an e-mail, or a bare id, one
+    /// The same exceptions, named: a `username` or a bare id (an e-mail is refused, see `user_ref`), one
     /// entry per person. This is the field the settings form fills.
     pub allowed_users: Option<Vec<String>>,
 }

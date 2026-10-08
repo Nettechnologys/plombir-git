@@ -41,6 +41,10 @@ pub enum ProvisioningRefusal {
     AutoProvisionDisabled,
     /// The provider creates accounts, but not for this address's domain.
     EmailDomainNotAllowed,
+    /// The provider creates accounts for some domains only, and did not vouch
+    /// that the address it asserted belongs to the person signing in — so its
+    /// domain proves nothing.
+    EmailNotVerified,
 }
 
 impl ProvisioningRefusal {
@@ -57,6 +61,11 @@ impl ProvisioningRefusal {
                 "this provider does not create accounts for your email domain; \
                  ask an administrator to create one for you"
             }
+            Self::EmailNotVerified => {
+                "this provider creates accounts only for confirmed addresses, and it \
+                 did not confirm yours; confirm the address with the provider, or ask \
+                 an administrator to create an account for you"
+            }
         }
     }
 
@@ -65,6 +74,7 @@ impl ProvisioningRefusal {
         match self {
             Self::AutoProvisionDisabled => "auto_provision_disabled",
             Self::EmailDomainNotAllowed => "email_domain_not_allowed",
+            Self::EmailNotVerified => "email_not_verified",
         }
     }
 }
@@ -77,21 +87,58 @@ impl std::fmt::Display for ProvisioningRefusal {
 
 impl std::error::Error for ProvisioningRefusal {}
 
+/// Whether the provider vouched that the address it asserted is the signing-in
+/// person's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressAssurance {
+    /// The provider confirmed the address (`email_verified: true`, GitHub's
+    /// `/user/emails`, GitLab's confirmed primary), or the address comes from a
+    /// directory the operator runs (LDAP).
+    Verified,
+    /// The provider said nothing about the address, or said it is unconfirmed.
+    Unverified,
+}
+
+impl AddressAssurance {
+    /// Read an SSO profile's three-valued `email_verified`. Only an explicit
+    /// `true` is a confirmation: `None` is a provider that did not say.
+    pub fn from_claim(email_verified: Option<bool>) -> Self {
+        if email_verified == Some(true) {
+            Self::Verified
+        } else {
+            Self::Unverified
+        }
+    }
+}
+
 /// May `provider` create an account for the address it just asserted?
 ///
 /// Called on the creation branch only — see the module note on why an existing
 /// account never reaches this function.
-pub fn authorize(provider: &sso_provider::Model, email: &str) -> Result<(), ProvisioningRefusal> {
+///
+/// An allowlist is a statement about *people* ("accounts only for staff"), and
+/// the domain is evidence of that only when the provider vouched for the
+/// address. GitLab and many OIDC providers let a user type any address into
+/// their profile, so an unconfirmed `someone@corp.example` would otherwise buy
+/// a stranger an account here — and the address with it (card_7099e8a305bc).
+/// Without an allowlist the domain decides nothing, so assurance is not asked.
+pub fn authorize(
+    provider: &sso_provider::Model,
+    email: &str,
+    assurance: AddressAssurance,
+) -> Result<(), ProvisioningRefusal> {
     if !provider.auto_provision {
         return Err(ProvisioningRefusal::AutoProvisionDisabled);
     }
     let Some(allowlist) = provider.allowed_email_domains.as_deref() else {
         return Ok(());
     };
-    if allows_domain(allowlist, email) {
-        Ok(())
-    } else {
-        Err(ProvisioningRefusal::EmailDomainNotAllowed)
+    if !allows_domain(allowlist, email) {
+        return Err(ProvisioningRefusal::EmailDomainNotAllowed);
+    }
+    match assurance {
+        AddressAssurance::Verified => Ok(()),
+        AddressAssurance::Unverified => Err(ProvisioningRefusal::EmailNotVerified),
     }
 }
 
@@ -158,6 +205,8 @@ pub fn normalize_email_domains(raw: &str) -> Result<Option<String>, String> {
 mod tests {
     use super::*;
 
+    const VERIFIED: AddressAssurance = AddressAssurance::Verified;
+
     fn provider(auto_provision: bool, allowed: Option<&str>) -> sso_provider::Model {
         let now = chrono::Utc::now();
         sso_provider::Model {
@@ -187,12 +236,16 @@ mod tests {
     #[test]
     fn a_provider_without_auto_provision_creates_nobody() {
         assert_eq!(
-            authorize(&provider(false, None), "stranger@example.com"),
+            authorize(&provider(false, None), "stranger@example.com", VERIFIED),
             Err(ProvisioningRefusal::AutoProvisionDisabled)
         );
         // The allowlist does not rescue a provider that provisions nobody.
         assert_eq!(
-            authorize(&provider(false, Some("example.com")), "alice@example.com"),
+            authorize(
+                &provider(false, Some("example.com")),
+                "alice@example.com",
+                VERIFIED
+            ),
             Err(ProvisioningRefusal::AutoProvisionDisabled)
         );
     }
@@ -200,7 +253,7 @@ mod tests {
     #[test]
     fn no_allowlist_means_no_domain_restriction() {
         assert_eq!(
-            authorize(&provider(true, None), "anyone@anywhere.io"),
+            authorize(&provider(true, None), "anyone@anywhere.io", VERIFIED),
             Ok(())
         );
     }
@@ -208,9 +261,9 @@ mod tests {
     #[test]
     fn the_allowlist_matches_the_exact_domain_only() {
         let corp = provider(true, Some("example.com,partner.org"));
-        assert_eq!(authorize(&corp, "alice@example.com"), Ok(()));
-        assert_eq!(authorize(&corp, "bob@EXAMPLE.COM"), Ok(()));
-        assert_eq!(authorize(&corp, "carol@partner.org"), Ok(()));
+        assert_eq!(authorize(&corp, "alice@example.com", VERIFIED), Ok(()));
+        assert_eq!(authorize(&corp, "bob@EXAMPLE.COM", VERIFIED), Ok(()));
+        assert_eq!(authorize(&corp, "carol@partner.org", VERIFIED), Ok(()));
 
         // A suffix check would let all three of these in.
         for outsider in [
@@ -219,11 +272,51 @@ mod tests {
             "mallory@example.com.evil.net",
         ] {
             assert_eq!(
-                authorize(&corp, outsider),
+                authorize(&corp, outsider, VERIFIED),
                 Err(ProvisioningRefusal::EmailDomainNotAllowed),
                 "{outsider} slipped past the allowlist"
             );
         }
+    }
+
+    /// card_7099e8a305bc: the domain is evidence about the person only when
+    /// the provider vouched for the address. An unconfirmed address inside the
+    /// allowlist is refused with its own reason; one outside it keeps the
+    /// domain reason, so the refusal names the rule that actually failed.
+    #[test]
+    fn an_allowlist_admits_only_an_address_the_provider_vouched_for() {
+        let corp = provider(true, Some("example.com"));
+        assert_eq!(
+            authorize(&corp, "someone@example.com", AddressAssurance::Unverified),
+            Err(ProvisioningRefusal::EmailNotVerified)
+        );
+        assert_eq!(
+            authorize(&corp, "someone@outsider.io", AddressAssurance::Unverified),
+            Err(ProvisioningRefusal::EmailDomainNotAllowed)
+        );
+        assert_eq!(authorize(&corp, "someone@example.com", VERIFIED), Ok(()));
+        // Without an allowlist the domain decides nothing, so neither does
+        // whether anybody confirmed it.
+        assert_eq!(
+            authorize(
+                &provider(true, None),
+                "someone@example.com",
+                AddressAssurance::Unverified
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            AddressAssurance::from_claim(None),
+            AddressAssurance::Unverified
+        );
+        assert_eq!(
+            AddressAssurance::from_claim(Some(false)),
+            AddressAssurance::Unverified
+        );
+        assert_eq!(
+            AddressAssurance::from_claim(Some(true)),
+            AddressAssurance::Verified
+        );
     }
 
     #[test]
@@ -231,7 +324,7 @@ mod tests {
         let corp = provider(true, Some("example.com"));
         for malformed in ["not-an-address", "trailing@", ""] {
             assert_eq!(
-                authorize(&corp, malformed),
+                authorize(&corp, malformed, VERIFIED),
                 Err(ProvisioningRefusal::EmailDomainNotAllowed)
             );
         }
@@ -242,7 +335,7 @@ mod tests {
     #[test]
     fn an_unparseable_allowlist_admits_nobody() {
         assert_eq!(
-            authorize(&provider(true, Some(" , ")), "alice@example.com"),
+            authorize(&provider(true, Some(" , ")), "alice@example.com", VERIFIED),
             Err(ProvisioningRefusal::EmailDomainNotAllowed)
         );
     }
@@ -277,7 +370,11 @@ mod tests {
     fn a_normalised_list_matches_the_address_it_was_written_for() {
         let stored = normalize_email_domains("@Corp.Example ").unwrap();
         assert_eq!(
-            authorize(&provider(true, stored.as_deref()), "alice@corp.example"),
+            authorize(
+                &provider(true, stored.as_deref()),
+                "alice@corp.example",
+                VERIFIED
+            ),
             Ok(())
         );
     }

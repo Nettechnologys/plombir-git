@@ -306,8 +306,8 @@
   async function addOrganizationMember(event: SubmitEvent) {
     event.preventDefault();
     if (busyAction !== null) return;
-    // The name is enough — the API resolves username / e-mail / id itself, and
-    // an unknown one comes back as a 400 naming what was typed.
+    // The name is enough — the API resolves username / id itself; an unknown
+    // one, or an e-mail (refused), comes back as a 400 saying what was wrong.
     if (buildUserRef(newMemberIdentifier) === null) {
       error = t('orgs.member_required');
       return;

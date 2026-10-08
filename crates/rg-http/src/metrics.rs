@@ -613,7 +613,8 @@ pub mod recorder {
     /// `outcome` label on the *source* (`"ldap"` / `"sso"`), so a refusal filed
     /// there would be counted as an account created by a provider named
     /// "refused". It gets its own event, with `reason` carrying the rule that
-    /// refused (`"auto_provision_disabled"` / `"email_domain_not_allowed"`).
+    /// refused (`"auto_provision_disabled"` / `"email_domain_not_allowed"` /
+    /// `"email_not_verified"`).
     pub fn provisioning_refused(reason: &str) {
         auth_event("provision_refused", reason);
     }

@@ -24,7 +24,7 @@ pub struct EnvironmentRequest {
     /// still sends. See [`allowed_approvers`](Self::allowed_approvers).
     #[serde(default)]
     pub allowed_approver_ids: Option<Vec<i64>>,
-    /// The same approvers, named: a `username`, an e-mail, or a bare id, one
+    /// The same approvers, named: a `username` or a bare id (an e-mail is refused, see `user_ref`), one
     /// entry per person. This is the field the settings form fills.
     ///
     /// Approving a deployment *is* handing out access, and this route asked for

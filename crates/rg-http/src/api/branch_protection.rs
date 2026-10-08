@@ -35,7 +35,7 @@ pub struct CreateProtectionRequest {
     /// were accepted still sends. See [`allowed_push_users`](Self::allowed_push_users).
     #[serde(default)]
     pub allowed_push_user_ids: Option<Vec<i64>>,
-    /// The same exceptions, named: a `username`, an e-mail, or a bare id, one
+    /// The same exceptions, named: a `username` or a bare id (an e-mail is refused, see `user_ref`), one
     /// entry per person. This is the field the settings form fills, because the
     /// number the other one wants is not something the owner of a repository
     /// can look up anywhere on this instance.

@@ -63,15 +63,35 @@ async fn a_branch_rule_takes_the_names_of_the_people_it_excepts_and_gives_them_b
     let endpoint =
         format!("{base}/api/v1/repos/namedpush-owner/namedpush-repo/branches/protection");
 
-    // One username and one e-mail: `UserRef::from_identifier` decides which is
-    // which, so the form can ask for "user" and mean any of the three.
-    let created = client
+    // card_9e97b992d4a6: an e-mail on an allow-list is refused, not resolved —
+    // the account holding an unconfirmed address is whoever typed it first,
+    // and this list decides who may push past the protection.
+    let by_email = client
         .post(&endpoint)
         .bearer_auth(&owner_token)
         .json(&serde_json::json!({
             "branch_name": "main",
             "require_pr": true,
             "allowed_push_users": ["namedpush-alice", "namedpush-bob@example.com"]
+        }))
+        .send()
+        .await
+        .expect("create the rule");
+    assert_eq!(
+        by_email.status(),
+        400,
+        "an e-mail must not name an exception"
+    );
+
+    // A username and a bare id: `UserRef::from_identifier` decides which is
+    // which, so the form can ask for "user".
+    let created = client
+        .post(&endpoint)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "branch_name": "main",
+            "require_pr": true,
+            "allowed_push_users": ["namedpush-alice", bob_id.to_string()]
         }))
         .send()
         .await
@@ -245,8 +265,9 @@ async fn an_environment_takes_the_names_of_its_approvers_and_gives_them_back() {
     create_repo(&base, &owner_token, "namedenv-repo").await;
     let endpoint = format!("{base}/api/v1/repos/namedenv-owner/namedenv-repo/actions/environments");
 
-    // One username and one e-mail, as on the other two rules.
-    let created = client
+    // An e-mail is refused here too: whoever registered the address first
+    // would be the one releasing production deployments.
+    let by_email = client
         .post(&endpoint)
         .bearer_auth(&owner_token)
         .json(&serde_json::json!({
@@ -254,6 +275,25 @@ async fn an_environment_takes_the_names_of_its_approvers_and_gives_them_back() {
             "protected": true,
             "required_approvals": 2,
             "allowed_approvers": ["namedenv-alice", "namedenv-bob@example.com"]
+        }))
+        .send()
+        .await
+        .expect("create the environment");
+    assert_eq!(
+        by_email.status(),
+        400,
+        "an e-mail must not name an approver"
+    );
+
+    // A username and a bare id, as on the other two rules.
+    let created = client
+        .post(&endpoint)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "name": "production",
+            "protected": true,
+            "required_approvals": 2,
+            "allowed_approvers": ["namedenv-alice", bob_id.to_string()]
         }))
         .send()
         .await
@@ -310,7 +350,7 @@ async fn an_environment_takes_the_names_of_its_approvers_and_gives_them_back() {
                 "name": "production",
                 "protected": true,
                 "required_approvals": 2,
-                "allowed_approvers": ["namedenv-alice", "namedenv-alice@example.com"]
+                "allowed_approvers": ["namedenv-alice", alice_id.to_string()]
             }))
             .send()
             .await
