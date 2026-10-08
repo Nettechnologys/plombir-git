@@ -529,3 +529,118 @@ async fn a_path_someone_else_has_locked_cannot_be_changed_by_a_web_edit_or_a_for
     assert_ne!(main(&bare), main_before);
     drop(root);
 }
+
+/// Protect `main` of `owner/repo` through the API, as the settings form does.
+async fn protect_main(
+    base: &str,
+    session: &str,
+    owner: &str,
+    repo: &str,
+    require_pr: bool,
+    allow_force_push: bool,
+    allowed_push_users: &[&str],
+) {
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/branches/protection"
+        ))
+        .bearer_auth(session)
+        .json(&serde_json::json!({
+            "branch_name": "main",
+            "require_pr": require_pr,
+            "allow_force_push": allow_force_push,
+            "allowed_push_users": allowed_push_users,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+}
+
+/// card_a5c343996db3: "push directly, never rewrite" refused *every* push —
+/// the rule refused the whole ref without asking whether the update rewrote
+/// anything — while the direct-push allow-list skipped the rule and could
+/// rewrite freely. The matrix: fast-forward and rewrite, under a rule that
+/// forbids force push, one that allows it, and an allow-listed pusher on a
+/// pull-request-only branch. The SSH twin is in `ssh_push_policy_tests`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_push_protection_refuses_rewrites_and_admits_fast_forwards() {
+    const OWNER: &str = "ffp_owner";
+    const BOB: &str = "ffp_bob";
+    let (base, _db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (owner_session, _) = register_full(&base, OWNER, "ffp_owner@example.com").await;
+    let (bob_session, _) = register_full(&base, BOB, "ffp_bob@example.com").await;
+    let bob_pat = pat_for(&base, &bob_session).await;
+    let root = tempfile::tempdir().unwrap();
+
+    // (repo, require_pr, allow_force_push, allow-list, rewrite admitted?)
+    let cases: [(&str, bool, bool, &[&str], bool); 3] = [
+        ("ff-only", false, false, &[], false),
+        ("force-ok", false, true, &[], true),
+        ("listed", true, false, &[BOB], false),
+    ];
+    for (repo, require_pr, allow_force_push, listed, rewrite_admitted) in cases {
+        create_initialised_repo(&base, &owner_session, repo).await;
+        let added = reqwest::Client::new()
+            .post(format!("{base}/api/v1/repos/{OWNER}/{repo}/collaborators"))
+            .bearer_auth(&owner_session)
+            .json(&serde_json::json!({"username": BOB, "permission": "write"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(added.status(), 201);
+        protect_main(
+            &base,
+            &owner_session,
+            OWNER,
+            repo,
+            require_pr,
+            allow_force_push,
+            listed,
+        )
+        .await;
+        let bare = repo_root.join(format!("{OWNER}/{repo}.git"));
+
+        let (root_path, base_url, pat) = (root.path().to_path_buf(), base.clone(), bob_pat.clone());
+        let (fast_forward, ff_head, rewrite, rewritten) = on_machine(move || {
+            let work = checkout(&root_path, &base_url, BOB, &pat, OWNER, repo);
+            let ff_head = commit(&work, BOB, "next.txt", "next\n");
+            let fast_forward = git(&work, BOB, &["push", "origin", "HEAD:main"]);
+            git_ok(&work, BOB, &["reset", "-q", "--hard", "HEAD~1"]);
+            let rewritten = commit(&work, BOB, "other.txt", "rewritten history\n");
+            let rewrite = git(&work, BOB, &["push", "--force", "origin", "HEAD:main"]);
+            (fast_forward, ff_head, rewrite, rewritten)
+        })
+        .await;
+
+        assert!(
+            fast_forward.success,
+            "{repo}: a fast-forward was refused:\n{}",
+            fast_forward.output
+        );
+        let tip = git_ok(&bare, "server", &["rev-parse", "refs/heads/main"]);
+        if rewrite_admitted {
+            assert!(
+                rewrite.success,
+                "{repo}: a rewrite the rule allows was refused:\n{}",
+                rewrite.output
+            );
+            assert_eq!(tip, rewritten, "{repo}");
+        } else {
+            assert!(
+                !rewrite.success,
+                "{repo}: a rewrite of a branch that forbids force push went through:\n{}",
+                rewrite.output
+            );
+            assert!(
+                rewrite
+                    .output
+                    .contains("force push to protected branch 'main' is not allowed"),
+                "{repo}: the refusal does not say why:\n{}",
+                rewrite.output
+            );
+            assert_eq!(tip, ff_head, "{repo}: the refused rewrite moved main");
+        }
+    }
+    drop(root);
+}

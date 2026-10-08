@@ -1976,23 +1976,56 @@ mod tests {
     /// body instead. A clean end here would hand the client a well-formed,
     /// truncated clone that looks complete (`card_2bfc8c1d8648`).
     ///
-    /// `git pack-objects` is pointed at a directory that is not a repository, so
-    /// it fails *after* `handle_upload_pack_http` has already written NAK.
+    /// The repository advertises `main` at a commit whose tree is missing: the
+    /// want is an advertised tip, so it passes every check that runs before
+    /// NAK, and `git pack-objects` fails only *after* `handle_upload_pack_http`
+    /// has written it.
     #[tokio::test]
     async fn upload_pack_failing_mid_response_breaks_the_body() {
-        if rg_git::cli_gateway::global_gateway().is_err() {
+        let Ok(gateway) = rg_git::cli_gateway::global_gateway() else {
             eprintln!("skipping mid-response failure test: git not available");
             return;
-        }
+        };
 
-        let not_a_repo = tempfile::tempdir().expect("scratch dir");
-        let mut request = pkt(&format!("want {}\0side-band-64k\n", "0".repeat(40)));
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let repo = scratch.path().join("hollow.git");
+        gix::init_bare(&repo).expect("init bare");
+        let body = scratch.path().join("hollow-commit");
+        std::fs::write(
+            &body,
+            "tree 1111111111111111111111111111111111111111\n\
+             author a <a@example.invalid> 0 +0000\n\
+             committer a <a@example.invalid> 0 +0000\n\nhollow\n",
+        )
+        .unwrap();
+        let written = gateway
+            .run(
+                &[
+                    "hash-object",
+                    "-w",
+                    "--literally",
+                    "-t",
+                    "commit",
+                    &body.to_string_lossy(),
+                ],
+                Some(&repo),
+            )
+            .unwrap();
+        written.ensure_success().unwrap();
+        let hollow = written.stdout_str().trim().to_string();
+        gateway
+            .run(&["update-ref", "refs/heads/main", &hollow], Some(&repo))
+            .unwrap()
+            .ensure_success()
+            .unwrap();
+
+        let mut request = pkt(&format!("want {hollow}\0side-band-64k\n"));
         request.extend_from_slice(b"0000");
         request.extend_from_slice(&pkt("done\n"));
 
         let response = super::stream_upload_pack_response(
             super::UploadPackProtocol::V1,
-            not_a_repo.path().to_path_buf(),
+            repo,
             staged_request(&request).await,
             30,
             30,

@@ -60,6 +60,7 @@ pub async fn load_receive_pack_policy(
         }));
     }
     let require_signed_refs = signed_commit_required_refs(&protection_rules);
+    let fast_forward_only_refs = branch_protection_fast_forward_refs(&protection_rules);
     rejected_refs.extend(branch_protection_rejected_refs(protection_rules, actor_id)?);
 
     let tag_protection_rules = protected_tag_ops::list_rules_by_repo(db, repo_id)
@@ -77,15 +78,23 @@ pub async fn load_receive_pack_policy(
     Ok(PushPolicy {
         rejected_refs,
         require_signed_refs,
+        fast_forward_only_refs,
         foreign_locks,
     })
 }
 
 /// Refs that must be rejected because a protected-branch rule forbids this push.
 ///
-/// Returns `(ref_name, human_readable_reason)` pairs. A rule is skipped when the
-/// actor is explicitly allowed to push directly to it. Fails when a rule's
-/// stored allow-list cannot be decoded — see the module comment.
+/// Returns `(ref_name, human_readable_reason)` pairs. Only `require_pr` refuses
+/// a ref outright, and the direct-push allow-list is exactly the exception to
+/// it. Force push is a different question — whether the update *rewrites*
+/// history, which needs the objects — and is answered after the pack is read,
+/// from [`branch_protection_fast_forward_refs`] (card_a5c343996db3). It used to
+/// be answered here, by refusing the whole ref: "push directly, never rewrite"
+/// refused every fast-forward, and the allow-list skipped the rule entirely.
+///
+/// Fails when a rule's stored allow-list cannot be decoded — see the module
+/// comment.
 pub fn branch_protection_rejected_refs(
     protections: Vec<protected_branch_ops::Rule>,
     actor_id: Option<i64>,
@@ -96,28 +105,41 @@ pub fn branch_protection_rejected_refs(
         if direct_push_allowed_by_rule(&protection, actor_id)? {
             continue;
         }
-
-        let message = if protection.protection.require_pr {
-            format!(
-                "push to protected branch '{}' is not allowed; open a pull request instead",
-                protection.protection.branch_name
-            )
-        } else if !protection.protection.allow_force_push {
-            format!(
-                "force push to protected branch '{}' is not allowed",
-                protection.protection.branch_name
-            )
-        } else {
+        if !protection.protection.require_pr {
             continue;
-        };
+        }
 
         rejected.push((
             format!("refs/heads/{}", protection.protection.branch_name),
-            message,
+            format!(
+                "push to protected branch '{}' is not allowed; open a pull request instead",
+                protection.protection.branch_name
+            ),
         ));
     }
 
     Ok(rejected)
+}
+
+/// Protected branches whose history may only grow: every rule that does not
+/// allow force push, for every pusher — the direct-push allow-list lets its
+/// members skip the pull request, not rewrite the branch.
+pub fn branch_protection_fast_forward_refs(
+    protections: &[protected_branch_ops::Rule],
+) -> Vec<(String, String)> {
+    protections
+        .iter()
+        .filter(|rule| !rule.protection.allow_force_push)
+        .map(|rule| {
+            (
+                format!("refs/heads/{}", rule.protection.branch_name),
+                format!(
+                    "force push to protected branch '{}' is not allowed",
+                    rule.protection.branch_name
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Whether `actor_id` is on the protection rule's direct-push allow-list.
@@ -243,6 +265,44 @@ mod tests {
         let rejected = tag_protection_rejected_refs(vec![tag_rule("v*", &[7])], Some(9)).unwrap();
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].0, "refs/tags/v*");
+    }
+
+    /// card_a5c343996db3: only `require_pr` refuses a ref outright, and only
+    /// for someone off the allow-list. Forbidding force push never refuses a
+    /// ref here — it marks it fast-forward-only, for every pusher, the
+    /// allow-list included.
+    #[test]
+    fn force_push_is_a_fast_forward_rule_not_a_refusal() {
+        let mut direct = branch_rule(&[7]);
+        direct.protection.require_pr = false;
+        for actor in [Some(7), Some(9), None] {
+            assert!(
+                branch_protection_rejected_refs(vec![direct.clone()], actor)
+                    .unwrap()
+                    .is_empty(),
+                "{actor:?}: a rule without require_pr refused the whole ref"
+            );
+        }
+        assert_eq!(
+            branch_protection_fast_forward_refs(&[direct.clone()]),
+            vec![(
+                "refs/heads/main".to_string(),
+                "force push to protected branch 'main' is not allowed".to_string()
+            )]
+        );
+
+        // The allow-list skips the pull request, not the force-push rule.
+        let pr_only = branch_rule(&[7]);
+        assert!(
+            branch_protection_rejected_refs(vec![pr_only.clone()], Some(7))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(branch_protection_fast_forward_refs(&[pr_only]).len(), 1);
+
+        let mut force_ok = direct;
+        force_ok.protection.allow_force_push = true;
+        assert!(branch_protection_fast_forward_refs(&[force_ok]).is_empty());
     }
 
     #[test]

@@ -708,6 +708,20 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
     use sideband::{write_sideband_flush, write_sideband_progress};
 
     validate_fetch_features(shallow, filter)?;
+    // A want the advertisement did not offer is refused, as over v0/v1: the
+    // tip of a server-private ref, or a commit a force push left behind, is
+    // not the client's to fetch by SHA (card_ad83ad72d14a).
+    let checked = {
+        let (repo_path, wants) = (repo_path.to_path_buf(), wants.to_vec());
+        tokio::task::spawn_blocking(move || {
+            crate::ref_advertisement::unadvertised_want(&repo_path, &wants)
+        })
+        .await
+        .context("V2 fetch want check did not complete")??
+    };
+    if let Some(want) = checked {
+        bail!("upload-pack: not our ref {want}");
+    }
     let shallow_update = build_shallow_update(repo_path, wants, shallow)?;
 
     // Check if client supports sideband (Protocol V2 fetch always uses sideband)
@@ -725,14 +739,14 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
     // acknowledgments section without `ready` followed by another section as a
     // protocol violation. During negotiation, advertise `ready` inside the
     // acknowledgments section before delimiting the following packfile section.
-    if needs_acknowledgments(haves, done) {
-        // Check which haves we have — synchronously, before any .await
-        // CRITICAL: gix::Repository is !Send (contains RefCell), must not cross .await
-        let acked_oids = acknowledged_haves(repo_path, haves);
-
-        if !write_acknowledgments(writer, &acked_oids).await? {
-            return Ok(());
-        }
+    // Only the haves this repository holds may reach `pack-objects`: it dies
+    // on `^<oid>` of an object it cannot find, so a client with commits of its
+    // own — the ordinary case — failed its fetch the moment a common one
+    // arrived in the same round and the server answered `ready`.
+    // Checked synchronously, before any .await: gix::Repository is !Send.
+    let common = acknowledged_haves(repo_path, haves);
+    if needs_acknowledgments(haves, done) && !write_acknowledgments(writer, &common).await? {
+        return Ok(());
     }
 
     if let Some(update) = &shallow_update {
@@ -761,7 +775,7 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
         repo_path,
         writer,
         wants,
-        haves,
+        &common,
         shallow_update.as_ref(),
         filter.as_deref(),
         use_sideband,

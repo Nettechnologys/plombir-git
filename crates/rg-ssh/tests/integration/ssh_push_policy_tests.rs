@@ -7,6 +7,11 @@
 //!   (card_97a2c0209056).
 //! * A path someone else has locked cannot be changed; the holder's push goes
 //!   through (card_4a40b70a6796).
+//! * A branch that forbids force push takes fast-forwards and refuses
+//!   rewrites, from the allow-list too (card_a5c343996db3).
+//!
+//! And the fetch half of the same stream: a protocol v0 fetch over SSH gets
+//! what it lacks and never a hidden ref's objects (card_ad83ad72d14a).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -303,5 +308,168 @@ async fn a_path_someone_else_has_locked_cannot_be_changed_over_ssh() {
     // The same commit, pushed by the lock holder.
     let accepted = fixture.push(&fixture.owner, &["main"]).await;
     assert!(accepted.success, "{}", accepted.output);
+    fixture.server.abort();
+}
+
+/// card_a5c343996db3, over SSH: a rule that forbids force push refuses only a
+/// rewrite — a fast-forward goes through — and the direct-push allow-list,
+/// which lets its members skip the pull request, does not let them rewrite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn force_push_protection_refuses_rewrites_and_admits_fast_forwards_over_ssh() {
+    let fixture = fixture().await;
+    rg_core::branch_protection::service::create_protection(
+        &fixture.db,
+        "owner",
+        "policy",
+        "main".to_string(),
+        true,
+        false,
+        None,
+        false,
+        None,
+        false,
+        false,
+        Some(vec![fixture.owner.id]),
+    )
+    .await
+    .unwrap();
+
+    let ff_head = commit(&fixture.work, "next.txt", "next\n");
+    let fast_forward = fixture.push(&fixture.owner, &["HEAD:main"]).await;
+    assert!(fast_forward.success, "{}", fast_forward.output);
+    assert_eq!(fixture.served("refs/heads/main"), Some(ff_head.clone()));
+
+    git_ok(&fixture.work, &["reset", "-q", "--hard", "HEAD~1"]);
+    commit(&fixture.work, "other.txt", "rewritten history\n");
+    let rewrite = fixture
+        .push(&fixture.owner, &["--force", "HEAD:main"])
+        .await;
+    assert!(!rewrite.success, "{}", rewrite.output);
+    assert!(
+        rewrite
+            .output
+            .contains("force push to protected branch 'main' is not allowed"),
+        "{}",
+        rewrite.output
+    );
+    assert_eq!(fixture.served("refs/heads/main"), Some(ff_head));
+
+    // The same rewrite under a rule that allows it.
+    fixture
+        .db
+        .execute_unprepared("UPDATE protected_branches SET allow_force_push = 1")
+        .await
+        .unwrap();
+    let allowed = fixture
+        .push(&fixture.owner, &["--force", "HEAD:main"])
+        .await;
+    assert!(allowed.success, "{}", allowed.output);
+    fixture.server.abort();
+}
+
+/// card_ad83ad72d14a, over SSH: a stock git client pinned to protocol v0
+/// clones without the objects of a server-private ref, and an incremental
+/// fetch from a clone with commits of its own — several rounds of haves on
+/// one stream — receives only what it lacks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protocol_v0_fetch_over_ssh_gets_what_it_lacks_and_never_a_hidden_ref() {
+    let fixture = fixture().await;
+    for index in 0..20 {
+        commit(&fixture.work, &format!("history-{index}.txt"), "history\n");
+    }
+    git_ok(&fixture.work, &["checkout", "-q", "-b", "secret"]);
+    let secret = commit(&fixture.work, "secret.txt", "secret\n");
+    git_ok(&fixture.work, &["checkout", "-q", "main"]);
+    let pushed = fixture.push(&fixture.owner, &["main"]).await;
+    assert!(pushed.success, "{}", pushed.output);
+    let bare = fixture.bare.to_string_lossy().to_string();
+    git_ok(&fixture.work, &["push", "-q", &bare, "secret:refs/forks/x"]);
+
+    let clone = fixture._dir.path().join("v0-clone");
+    let remote = format!("ssh://git@{}/owner/policy.git", fixture.server.addr());
+    let (root, command, clone_arg) = (
+        fixture._dir.path().to_path_buf(),
+        fixture.owner.ssh_command.clone(),
+        clone.to_string_lossy().to_string(),
+    );
+    let cloned = tokio::task::spawn_blocking(move || {
+        git(
+            &root,
+            &[
+                "-c",
+                "protocol.version=0",
+                "clone",
+                "-q",
+                &remote,
+                &clone_arg,
+            ],
+            Some(&command),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(cloned.success, "{}", cloned.output);
+    assert!(
+        !git(&clone, &["cat-file", "-e", &secret], None).success,
+        "a v0 clone received the commit only refs/forks/x holds"
+    );
+
+    for index in 0..40 {
+        commit(&clone, &format!("local-{index}.txt"), "local\n");
+    }
+    let before = git_ok(&fixture.work, &["rev-parse", "main"]);
+    let upstream = commit(&fixture.work, "upstream.txt", "upstream\n");
+    let pushed = fixture.push(&fixture.owner, &["main"]).await;
+    assert!(pushed.success, "{}", pushed.output);
+
+    let packs = |dir: &Path| -> std::collections::BTreeSet<PathBuf> {
+        std::fs::read_dir(dir.join(".git/objects/pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+            .collect()
+    };
+    let packs_before = packs(&clone);
+    let (clone_dir, command) = (clone.clone(), fixture.owner.ssh_command.clone());
+    let fetched = tokio::task::spawn_blocking(move || {
+        git(
+            &clone_dir,
+            &[
+                "-c",
+                "protocol.version=0",
+                "-c",
+                "fetch.unpackLimit=1",
+                "fetch",
+                "-q",
+                "origin",
+            ],
+            Some(&command),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(fetched.success, "{}", fetched.output);
+    assert_eq!(git_ok(&clone, &["rev-parse", "origin/main"]), upstream);
+    let new_packs: Vec<_> = packs(&clone).difference(&packs_before).cloned().collect();
+    let [pack] = new_packs.as_slice() else {
+        panic!("one fetched pack expected, got {new_packs:?}");
+    };
+    let bytes = std::fs::read(pack).unwrap();
+    let count = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+    let lacking = git_ok(
+        &fixture.bare,
+        &["rev-list", "--objects", &upstream, "--not", &before],
+    )
+    .lines()
+    .count() as u32;
+    let whole = git_ok(&fixture.bare, &["rev-list", "--objects", "--all"])
+        .lines()
+        .count() as u32;
+    // `index-pack --fix-thin` appends the delta bases a thin pack needed, so
+    // the kept pack may hold a few more objects than were sent.
+    assert!(
+        (lacking..=2 * lacking).contains(&count) && count < whole / 4,
+        "the incremental v0 fetch kept {count} objects; it lacked {lacking}, the repository holds {whole}"
+    );
     fixture.server.abort();
 }

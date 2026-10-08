@@ -73,6 +73,80 @@ pub fn collect_for_clients(repo_path: &Path) -> Result<RefAdvertisement> {
     Ok(advertisement)
 }
 
+/// The first of `wants` a fetch may not ask for, or `None` when every one is
+/// fine (card_ad83ad72d14a).
+///
+/// A client asks for what an advertisement showed it. A want that is no
+/// advertised tip is accepted only when it is a commit reachable from one —
+/// the ref may have moved between the advertisement and the request, which is
+/// how stateless HTTP behaves, and what git's own `upload-pack` accepts there.
+/// Anything else is an object the client learnt some other way: the tip of a
+/// server-private ref, or a commit a force push left behind. Packing it would
+/// hand out exactly what [`collect_for_clients`] keeps out of the
+/// advertisement.
+pub fn unadvertised_want(repo_path: &Path, wants: &[String]) -> Result<Option<String>> {
+    let advertisement = collect_for_clients(repo_path)?;
+    let advertised: std::collections::HashSet<&str> = advertisement
+        .refs
+        .iter()
+        .map(|(oid, _)| oid.as_str())
+        .chain(advertisement.head_oid.as_deref())
+        .collect();
+    let candidates: Vec<&String> = wants
+        .iter()
+        .filter(|want| !advertised.contains(want.as_str()))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let repo = crate::repository::open(repo_path).with_context(|| {
+        format!(
+            "failed to open repository to check fetch wants: {}",
+            repo_path.display()
+        )
+    })?;
+    for want in &candidates {
+        let id = gix::ObjectId::from_hex(want.as_bytes())
+            .with_context(|| format!("fetch want {want} is not an object id"))?;
+        // An object store that cannot answer is a failure of the check, not a
+        // want that names nothing.
+        let header = repo
+            .try_find_header(id)
+            .with_context(|| format!("failed to look up fetch want {want}"))?;
+        if header.is_none_or(|header| header.kind() != gix::object::Kind::Commit) {
+            return Ok(Some((*want).clone()));
+        }
+    }
+    drop(repo);
+
+    for want in candidates {
+        if !reachable_from_advertised_refs(repo_path, want)? {
+            return Ok(Some(want.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `commit` is reachable from a ref [`collect_for_clients`] shows:
+/// `rev-list` names nothing reachable from it once everything reachable from
+/// those refs is taken away.
+fn reachable_from_advertised_refs(repo_path: &Path, commit: &str) -> Result<bool> {
+    let excludes: Vec<String> = SERVER_PRIVATE_NAMESPACES
+        .iter()
+        .map(|namespace| format!("--exclude={namespace}*"))
+        .collect();
+    let mut args: Vec<&str> = vec!["rev-list", "-n1", commit, "--not"];
+    args.extend(excludes.iter().map(String::as_str));
+    args.push("--all");
+    let output = crate::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .run(&args, Some(repo_path))?;
+    output.ensure_success()?;
+    Ok(output.stdout_str().trim().is_empty())
+}
+
 /// Read every ref required to build a repository advertisement.
 ///
 /// An advertisement is a snapshot clients cache and act on. Returning a

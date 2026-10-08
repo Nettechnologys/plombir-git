@@ -22,6 +22,11 @@ where
 }
 
 /// Handle upload-pack for HTTP mode where ref advertisement is already sent.
+///
+/// Stateless: one request carries the wants and the negotiation so far, and
+/// ends either with `done` — answered with the pack — or with a flush, which
+/// is answered with acknowledgments alone; the client then sends the next
+/// request (see [`negotiate`]).
 pub async fn handle_upload_pack_http<R, W>(repo_path: &Path, reader: R, writer: W) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -29,22 +34,7 @@ where
 {
     let mut reader = BufReader::new(reader);
     let mut writer = writer;
-
-    // Read client request and negotiate
-    let (wants, haves, client_caps) = read_want_have_split(&mut reader).await?;
-
-    if wants.is_empty() {
-        write_flush(&mut writer).await?;
-        return Ok(());
-    }
-
-    // Send NAK
-    write_pkt_line(&mut writer, &PktLine::data(b"NAK")).await?;
-
-    // Send packfile
-    let use_sideband = client_caps.contains(&"side-band-64k".to_string())
-        || client_caps.contains(&"side-band".to_string());
-    send_packfile(repo_path, &wants, &haves, &mut writer, use_sideband).await
+    serve_fetch(repo_path, &mut reader, &mut writer, Transport::Stateless).await
 }
 
 /// Internal: SSH mode implementation with single stream type.
@@ -62,59 +52,104 @@ where
     }
     write_flush(stream).await?;
 
-    // Negotiation + packfile (single stream type)
-    negotiate_and_send_pack_single(repo_path, stream).await
+    // The negotiation answers each round as it ends while the client keeps
+    // writing, so it reads and writes the one stream at once. The buffered
+    // reader lives for the whole exchange: whatever it has read ahead belongs
+    // to the next round.
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    serve_fetch(repo_path, &mut reader, &mut write_half, Transport::Stateful).await
 }
 
-/// Internal: negotiate and send pack with single stream type (SSH mode).
-async fn negotiate_and_send_pack_single<S>(repo_path: &Path, stream: &mut S) -> Result<()>
+/// How the client's requests reach the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transport {
+    /// HTTP: every round is its own request, and a request that ends without
+    /// `done` is answered with acknowledgments only.
+    Stateless,
+    /// SSH: one conversation; rounds follow each other on the same stream.
+    Stateful,
+}
+
+/// The two acknowledgment dialects this server speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AckMode {
+    /// No `multi_ack` capability: one `ACK` for the first common object, and a
+    /// `NAK` at a round's end only while none has been found.
+    Plain,
+    /// `multi_ack_detailed`: `ACK <oid> common` for every common object and a
+    /// `NAK` at the end of every round. A stateless client needs this one to
+    /// carry the common objects into its final request; under the plain
+    /// dialect that request names none and gets the whole repository.
+    Detailed,
+}
+
+/// Read the wants, negotiate, and send the pack the negotiation agreed on.
+async fn serve_fetch<R, W>(
+    repo_path: &Path,
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+    transport: Transport,
+) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
-    let (wants, haves, client_caps) = read_want_have_stream(stream).await?;
-
-    let use_sideband = client_caps.contains(&"side-band-64k".to_string())
-        || client_caps.contains(&"side-band".to_string());
-
+    let (wants, client_caps) = read_wants(reader).await?;
     if wants.is_empty() {
-        stream.flush().await?;
+        match transport {
+            Transport::Stateless => write_flush(writer).await?,
+            Transport::Stateful => writer.flush().await?,
+        }
         return Ok(());
     }
 
-    write_pkt_line(stream, &PktLine::data(b"NAK")).await?;
-    send_packfile(repo_path, &wants, &haves, stream, use_sideband).await
+    // A want the advertisement did not offer is refused before anything else
+    // is read: packing it would hand out what the advertisement hides.
+    let checked = {
+        let (repo_path, wants) = (repo_path.to_path_buf(), wants.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::ref_advertisement::unadvertised_want(&repo_path, &wants)
+        })
+        .await
+        .context("upload-pack want check did not complete")??
+    };
+    if let Some(want) = checked {
+        write_pkt_line(
+            writer,
+            &PktLine::text(&format!("ERR upload-pack: not our ref {want}")),
+        )
+        .await?;
+        writer.flush().await?;
+        bail!("upload-pack: not our ref {want}");
+    }
+
+    let has = |cap: &str| client_caps.iter().any(|offered| offered == cap);
+    let mode = if has("multi_ack_detailed") {
+        AckMode::Detailed
+    } else {
+        AckMode::Plain
+    };
+    let Some(common) = negotiate(repo_path, reader, writer, transport, mode, wants.len()).await?
+    else {
+        writer.flush().await?;
+        return Ok(());
+    };
+
+    let options = PackOptions {
+        use_sideband: has("side-band-64k") || has("side-band"),
+        thin: has("thin-pack"),
+        ofs_delta: has("ofs-delta"),
+    };
+    send_packfile(repo_path, &wants, &common, writer, options).await
 }
 
-/// Read want/have lines from separate reader (HTTP mode).
-async fn read_want_have_split<R: AsyncRead + Unpin>(
+/// Read the `want` lines up to the flush that ends them, with the client's
+/// capabilities from the first one.
+async fn read_wants<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
-) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
-    read_want_have_impl(reader).await
-}
-
-/// Read want/have lines from single stream (SSH mode).
-/// Wraps stream in a BufReader temporarily, then passes it straight to impl.
-async fn read_want_have_stream<S: AsyncRead + Unpin>(
-    stream: &mut S,
-) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
-    // Safety: BufReader here only pre-reads the negotiation phase.
-    // After returning, any remaining bytes in the BufReader internal buffer
-    // would be lost, but for pkt-line protocol each read_pkt_line consumes
-    // exactly the announced bytes, so there should be no unconsumed buffered data.
-    let mut reader = BufReader::new(stream);
-    read_want_have_impl(&mut reader).await
-}
-
-/// Internal: parse want/have negotiation from a BufReader using proper pkt-line parsing.
-///
-/// Each pkt-line on the wire is:
-///   `<4-hex-length><payload>`
-/// where the 4-byte length includes itself. `read_pkt_line` handles this and
-/// returns only the payload bytes (or `PktLine::Flush` for "0000").
-async fn read_want_have_impl<R: AsyncRead + Unpin>(
-    reader: &mut BufReader<R>,
-) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
-    read_want_have_impl_with_limits(
+) -> Result<(Vec<String>, Vec<String>)> {
+    read_wants_with_limits(
         reader,
         super::MAX_NEGOTIATION_ENTRIES,
         super::MAX_NEGOTIATION_INPUT_BYTES,
@@ -122,115 +157,232 @@ async fn read_want_have_impl<R: AsyncRead + Unpin>(
     .await
 }
 
-async fn read_want_have_impl_with_limits<R: AsyncRead + Unpin>(
+async fn read_wants_with_limits<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     max_entries: usize,
     max_bytes: usize,
-) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut wants = Vec::new();
-    let mut haves = Vec::new();
     let mut capabilities = Vec::new();
     let mut input_bytes = 0_usize;
 
     loop {
-        let pkt = read_pkt_line(reader).await?;
-
-        // Flush packet ("0000") or EOF → end of negotiation
-        // Delim/ResponseEnd are V2-only and shouldn't appear in V1 protocol
-        let raw = match pkt {
+        let raw = match read_pkt_line(reader).await? {
             PktLine::Flush => break,
             PktLine::Data(bytes) => {
-                input_bytes = input_bytes
-                    .checked_add(bytes.len())
-                    .filter(|size| *size <= max_bytes)
-                    .context("upload-pack negotiation exceeds the configured byte limit")?;
+                input_bytes = checked_negotiation_bytes(input_bytes, bytes.len(), max_bytes)?;
                 bytes
             }
-            PktLine::Delim | PktLine::ResponseEnd => continue, // Skip in V1 context
+            PktLine::Delim | PktLine::ResponseEnd => continue, // V2-only framing
         };
-
-        // Convert bytes to string (pkt-line payload, no length prefix)
         let line = String::from_utf8_lossy(&raw);
         let line = line.trim_end_matches('\n');
-
         if line.is_empty() {
             continue;
         }
 
-        // Git want/have lines come in two forms:
-        //
-        //   Form A (first want line, v1 protocol):
-        //     `want <sha1>\0<cap1> <cap2> ...`
-        //     NUL separates sha+command from capability list.
-        //
-        //   Form B (git client sends capabilities space-separated after the SHA,
-        //     without a NUL, when the server did NOT advertise them with NUL):
-        //     `want <sha1> <cap1> <cap2> ...`
-        //
-        // In practice the macOS git client sends Form B (space-separated after sha).
-        // We handle both by first checking for NUL, then splitting on the second space
-        // for commands that start with "want " or "have ".
-
-        let (command, caps_part): (String, Option<&str>) = if line.contains('\0') {
-            // Form A: NUL-separated capabilities
-            let mut parts = line.splitn(2, '\0');
-            let cmd = parts.next().unwrap_or("");
-            let caps = parts.next().unwrap_or("");
-            (
-                cmd.to_string(),
-                if caps.is_empty() { None } else { Some(caps) },
-            )
-        } else if let Some(after_want) = line.strip_prefix("want ") {
-            // Form B: `want <sha1> [cap1 cap2 ...]` — space after sha1
-            if let Some((sha, caps)) = after_want.split_once(' ') {
-                let command = format!("want {sha}");
-                (command, if caps.is_empty() { None } else { Some(caps) })
-            } else {
-                (line.to_string(), None)
-            }
-        } else {
-            (line.to_string(), None)
+        // The first want carries the capability list, either after a NUL or,
+        // from clients that saw them advertised without one, after a space:
+        //   `want <sha1>\0<cap1> <cap2> ...`
+        //   `want <sha1> <cap1> <cap2> ...`
+        let (command, caps_part): (&str, Option<&str>) = match line.split_once('\0') {
+            Some((command, caps)) => (command, Some(caps)),
+            None => match line
+                .strip_prefix("want ")
+                .and_then(|rest| rest.split_once(' '))
+            {
+                Some((sha, caps)) => (&line[..5 + sha.len()], Some(caps)),
+                None => (line, None),
+            },
         };
-
-        if let Some(caps) = caps_part {
-            // Parse space-separated capabilities
+        if let Some(caps) = caps_part.filter(|caps| !caps.is_empty()) {
             capabilities = caps
                 .split([' ', '\0'])
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty())
+                .filter(|cap| !cap.is_empty())
+                .map(str::to_string)
                 .collect();
             tracing::debug!(caps = ?capabilities, "Parsed client capabilities");
         }
 
         if let Some(sha) = command.strip_prefix("want ") {
-            if wants.len() + haves.len() >= max_entries {
+            if wants.len() >= max_entries {
                 bail!("upload-pack negotiation exceeds the configured entry limit");
             }
-            let sha = sha.trim().to_string();
-            tracing::debug!(sha = %sha, "Client wants");
-            wants.push(sha);
-        } else if let Some(sha) = command.strip_prefix("have ") {
-            if wants.len() + haves.len() >= max_entries {
-                bail!("upload-pack negotiation exceeds the configured entry limit");
-            }
-            let sha = sha.trim().to_string();
-            haves.push(sha);
-        } else if command == "done" {
-            break;
+            wants.push(validated_oid(sha.trim())?);
         } else {
-            tracing::debug!(line = %command, "Unknown want/have line, ignoring");
+            // `shallow` / `deepen` are not advertised and not honoured.
+            tracing::debug!(line = %command, "Unknown upload-pack request line, ignoring");
         }
     }
 
     tracing::info!(
         wants = wants.len(),
-        haves = haves.len(),
         caps = capabilities.len(),
-        "Want/have negotiation complete"
+        "Upload-pack wants read"
     );
-
-    Ok((wants, haves, capabilities))
+    Ok((wants, capabilities))
 }
+
+/// How a round of `have` lines ended.
+enum RoundEnd {
+    Flush,
+    Done,
+}
+
+/// Run the `have` / `ACK` / `NAK` exchange (card_ad83ad72d14a).
+///
+/// Returns the common objects to leave out of the pack once the client says
+/// `done`, or `None` when a stateless request ended without it — that request
+/// is answered with its acknowledgments and nothing else, and the client
+/// sends the next one. Before this the haves were never read at all and every
+/// fetch got `pack-objects --all`: the whole repository, objects of hidden
+/// refs included, on every poll — and a stateless request that ended in a
+/// flush got a pack where its client expected acknowledgments.
+///
+/// What each dialect writes is what git's own `upload-pack` writes (see
+/// [`AckMode`]). The early `ACK <oid> ready` is never sent: it only lets a
+/// client stop negotiating sooner, and every client falls back to `done`.
+async fn negotiate<R, W>(
+    repo_path: &Path,
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+    transport: Transport,
+    mode: AckMode,
+    wants: usize,
+) -> Result<Option<Vec<String>>>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut common: Vec<String> = Vec::new();
+    let mut entries = wants;
+    let mut input_bytes = 0_usize;
+
+    loop {
+        let mut round = Vec::new();
+        let end = loop {
+            match read_pkt_line(reader).await? {
+                PktLine::Flush => break RoundEnd::Flush,
+                PktLine::Data(bytes) => {
+                    input_bytes = checked_negotiation_bytes(
+                        input_bytes,
+                        bytes.len(),
+                        super::MAX_NEGOTIATION_INPUT_BYTES,
+                    )?;
+                    let line = String::from_utf8_lossy(&bytes);
+                    let line = line.trim_end_matches('\n');
+                    if line == "done" {
+                        break RoundEnd::Done;
+                    }
+                    if let Some(sha) = line.strip_prefix("have ") {
+                        entries += 1;
+                        if entries > super::MAX_NEGOTIATION_ENTRIES {
+                            bail!("upload-pack negotiation exceeds the configured entry limit");
+                        }
+                        round.push(validated_oid(sha.trim())?);
+                    }
+                }
+                PktLine::Delim | PktLine::ResponseEnd => continue,
+            }
+        };
+
+        // A stateful client flushes only after a round of haves; an empty one
+        // is the end of its stream (`read_pkt_line` reads EOF as a flush), and
+        // waiting for more would wait forever.
+        if transport == Transport::Stateful && matches!(end, RoundEnd::Flush) && round.is_empty() {
+            bail!("upload-pack client ended the negotiation without `done`");
+        }
+
+        for oid in present_objects(repo_path, round).await? {
+            if common.contains(&oid) {
+                continue;
+            }
+            match mode {
+                AckMode::Detailed => {
+                    write_pkt_line(writer, &PktLine::text(&format!("ACK {oid} common"))).await?;
+                }
+                AckMode::Plain if common.is_empty() => {
+                    write_pkt_line(writer, &PktLine::text(&format!("ACK {oid}"))).await?;
+                }
+                AckMode::Plain => {}
+            }
+            common.push(oid);
+        }
+
+        match end {
+            RoundEnd::Flush => {
+                if mode == AckMode::Detailed || common.is_empty() {
+                    write_pkt_line(writer, &PktLine::text("NAK")).await?;
+                }
+                if transport == Transport::Stateless {
+                    return Ok(None);
+                }
+                writer.flush().await?;
+            }
+            RoundEnd::Done => {
+                match (mode, common.last()) {
+                    (_, None) => write_pkt_line(writer, &PktLine::text("NAK")).await?,
+                    (AckMode::Detailed, Some(last)) => {
+                        write_pkt_line(writer, &PktLine::text(&format!("ACK {last}"))).await?
+                    }
+                    // The plain dialect acknowledged its first common object
+                    // the moment it saw it, and says nothing more.
+                    (AckMode::Plain, Some(_)) => {}
+                }
+                return Ok(Some(common));
+            }
+        }
+    }
+}
+
+/// The haves of one round that this repository holds, in the client's order.
+async fn present_objects(repo_path: &Path, haves: Vec<String>) -> Result<Vec<String>> {
+    if haves.is_empty() {
+        return Ok(haves);
+    }
+    let repo_path = repo_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let repo = crate::repository::open(&repo_path)
+            .context("failed to open repository to negotiate a fetch")?;
+        let mut present = Vec::with_capacity(haves.len());
+        for have in haves {
+            let id = gix::ObjectId::from_hex(have.as_bytes())
+                .context("upload-pack have is not an object id")?;
+            // Three-valued on purpose: an object store that cannot answer is a
+            // failure, not an object the client has and we lack.
+            if repo
+                .try_find_header(id)
+                .with_context(|| format!("failed to look up have {have}"))?
+                .is_some()
+            {
+                present.push(have);
+            }
+        }
+        Ok(present)
+    })
+    .await
+    .context("upload-pack negotiation lookup did not complete")?
+}
+
+fn checked_negotiation_bytes(current: usize, frame: usize, max_bytes: usize) -> Result<usize> {
+    current
+        .checked_add(frame)
+        .filter(|size| *size <= max_bytes)
+        .context("upload-pack negotiation exceeds the configured byte limit")
+}
+
+/// A want or have names one object by its full SHA-1. Anything else would
+/// reach `pack-objects` as a revision expression.
+fn validated_oid(sha: &str) -> Result<String> {
+    if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("upload-pack object id must be 40 hexadecimal characters");
+    }
+    Ok(sha.to_ascii_lowercase())
+}
+
+/// What the SSH advertisement offers a v0/v1 fetch.
+const UPLOAD_PACK_CAPABILITIES: &str =
+    "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=plombir-git/0.1";
 
 /// Build ref advertisement from ref list.
 fn build_ref_advertisement_vec(
@@ -259,17 +411,19 @@ fn build_ref_advertisement(ref_list: &[(String, String)], service: &str) -> Vec<
     // First line includes service announcement and capabilities
     if let Some((sha, refname)) = ref_list.first() {
         // Capabilities: advertise only what we implement.
+        // - multi_ack_detailed: `ACK <oid> common` per common object, see
+        //   `negotiate`. `no-done` is the stateless (HTTP) half and is not
+        //   offered on this stream.
         // - side-band-64k: packfile in sideband channel 1, messages in channel 2
+        // - thin-pack: deltas against objects the client said it has
         // - ofs-delta: server can send OFS_DELTA objects (smaller packs)
         // - agent: server identification
-        // NOTE: We do NOT advertise multi_ack / multi_ack_detailed / no-done because
-        // our negotiation loop only handles the simple NAK→packfile flow.
-        let caps = "side-band-64k ofs-delta agent=plombir-git/0.1";
+        let caps = UPLOAD_PACK_CAPABILITIES;
         let line = format!("{} {}\0{}", sha, refname, caps);
         lines.push(PktLine::Data(line.into_bytes()));
     } else {
         // Empty repo — still need capabilities
-        let caps = "side-band-64k ofs-delta agent=plombir-git/0.1";
+        let caps = UPLOAD_PACK_CAPABILITIES;
         let line = format!(
             "0000000000000000000000000000000000000000 capabilities^{}\0{}",
             service, caps
@@ -286,7 +440,16 @@ fn build_ref_advertisement(ref_list: &[(String, String)], service: &str) -> Vec<
     lines
 }
 
-/// Generate and send the packfile.
+/// What the client's capabilities ask of the pack.
+#[derive(Clone, Copy, Debug)]
+struct PackOptions {
+    use_sideband: bool,
+    thin: bool,
+    ofs_delta: bool,
+}
+
+/// Generate and send the pack of `wants` minus everything reachable from
+/// `common`.
 ///
 /// The pack is forwarded to `writer` as `git pack-objects` produces it — see
 /// [`crate::protocol::pack_stream`] for why it is never collected first. The
@@ -294,35 +457,55 @@ fn build_ref_advertisement(ref_list: &[(String, String)], service: &str) -> Vec<
 /// which are reached solely on a clean exit: a failed generation returns `Err`
 /// from the stream instead, having announced itself on band 3.
 ///
+/// `common` holds only objects the repository has (see [`negotiate`]):
+/// `pack-objects` dies on `^<oid>` of an object it cannot find.
+///
 /// TODO(gix): Replace with gix pack generation when available.
 /// Currently using git pack-objects CLI as gix doesn't have a direct replacement.
 async fn send_packfile<W: AsyncWrite + Unpin>(
     repo_path: &Path,
     wants: &[String],
-    _haves: &[String],
+    common: &[String],
     writer: &mut W,
-    use_sideband: bool,
+    options: PackOptions,
 ) -> Result<()> {
-    // Use git pack-objects to generate the packfile via gateway
+    let mut revs = String::new();
+    for want in wants {
+        revs.push_str(want);
+        revs.push('\n');
+    }
+    for have in common {
+        revs.push('^');
+        revs.push_str(have);
+        revs.push('\n');
+    }
+    let mut args = vec!["pack-objects", "--revs", "--stdout"];
+    if options.thin {
+        args.push("--thin");
+    }
+    if options.ofs_delta {
+        args.push("--delta-base-offset");
+    }
+
     let mut cmd = crate::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?
-        .spawn_async(&["pack-objects", "--all", "--stdout"], Some(repo_path))
+        .spawn_async(&args, Some(repo_path))
         .await
         .context("failed to spawn git pack-objects")?;
 
-    // Close stdin immediately — `--all` packs all objects without stdin input,
-    // but the piped stdin keeps the child waiting for EOF if we don't close it.
-    // Pitfall: Stdio::piped() creates a pipe but git pack-objects blocks reading stdin
-    // until EOF; must take and drop stdin to signal EOF.
-    {
-        let stdin = cmd.stdin.take();
-        drop(stdin); // Close stdin pipe → child sees EOF
+    // The revision list goes in whole and the pipe is closed, so the child
+    // sees EOF and starts packing.
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin
+            .write_all(revs.as_bytes())
+            .await
+            .context("failed to write revs to pack-objects stdin")?;
     }
 
-    let pack_size = pack_stream::stream_pack_objects(cmd, writer, use_sideband).await?;
+    let pack_size = pack_stream::stream_pack_objects(cmd, writer, options.use_sideband).await?;
 
-    if use_sideband {
+    if options.use_sideband {
         // Send "Done." progress message (band 2)
         sideband::write_sideband_progress(writer, "Done.\n").await?;
 
@@ -330,7 +513,12 @@ async fn send_packfile<W: AsyncWrite + Unpin>(
         sideband::write_sideband_flush(writer).await?;
     }
 
-    tracing::info!(pack_size, objects = wants.len(), "Upload-pack complete");
+    tracing::info!(
+        pack_size,
+        wants = wants.len(),
+        common = common.len(),
+        "Upload-pack complete"
+    );
 
     Ok(())
 }
@@ -408,13 +596,13 @@ mod ref_advertisement_tests {
     }
 
     #[tokio::test]
-    async fn want_have_parser_refuses_entries_past_its_ceiling() {
+    async fn want_parser_refuses_entries_past_its_ceiling() {
         let mut input = pkt(&format!("want {}\n", "a".repeat(40)));
-        input.extend_from_slice(&pkt(&format!("have {}\n", "b".repeat(40))));
+        input.extend_from_slice(&pkt(&format!("want {}\n", "b".repeat(40))));
         input.extend_from_slice(b"0000");
         let mut reader = BufReader::new(Cursor::new(input));
 
-        let error = super::read_want_have_impl_with_limits(&mut reader, 1, 1024)
+        let error = super::read_wants_with_limits(&mut reader, 1, 1024)
             .await
             .expect_err("the second retained negotiation entry must be refused");
 
@@ -422,11 +610,11 @@ mod ref_advertisement_tests {
     }
 
     #[tokio::test]
-    async fn want_have_parser_refuses_wire_bytes_past_its_ceiling() {
+    async fn want_parser_refuses_wire_bytes_past_its_ceiling() {
         let input = pkt(&format!("want {}\n", "a".repeat(40)));
         let mut reader = BufReader::new(Cursor::new(input));
 
-        let error = super::read_want_have_impl_with_limits(&mut reader, 10, 8)
+        let error = super::read_wants_with_limits(&mut reader, 10, 8)
             .await
             .expect_err("a negotiation frame above the byte ceiling must be refused");
 
@@ -654,5 +842,271 @@ mod pack_streaming_tests {
 
         let response = read_sideband_response(response, "packfile").await;
         assert_pack_is_whole(&response, &bare, tmp.path(), "v2");
+    }
+}
+
+/// card_ad83ad72d14a: what a v0/v1 fetch is answered with — the negotiation
+/// it asked for, and a pack of what it lacks, never the whole repository.
+#[cfg(test)]
+mod negotiation_tests {
+    use std::io::Cursor;
+    use std::path::{Path, PathBuf};
+
+    use tokio::io::AsyncReadExt;
+
+    fn git_ok(args: &[&str], cwd: &Path) -> String {
+        let out = crate::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run_with_env(
+                args,
+                Some(cwd),
+                &[
+                    ("GIT_AUTHOR_NAME", "fixture"),
+                    ("GIT_AUTHOR_EMAIL", "fixture@example.invalid"),
+                    ("GIT_COMMITTER_NAME", "fixture"),
+                    ("GIT_COMMITTER_EMAIL", "fixture@example.invalid"),
+                ],
+            )
+            .expect("run git");
+        out.ensure_success().expect("git succeeded");
+        out.stdout_str().trim().to_string()
+    }
+
+    fn pkt(payload: &str) -> Vec<u8> {
+        let mut encoded = format!("{:04x}", payload.len() + 4).into_bytes();
+        encoded.extend_from_slice(payload.as_bytes());
+        encoded
+    }
+
+    /// `main` at `newer` (child of `older`), and `refs/forks/x` at `hidden`, a
+    /// commit no advertised ref reaches.
+    struct Served {
+        _dir: tempfile::TempDir,
+        bare: PathBuf,
+        older: String,
+        newer: String,
+        hidden: String,
+    }
+
+    fn served() -> Served {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_ok(&["init", "-q", "--initial-branch=main", "."], &work);
+        let commit = |file: &str| {
+            std::fs::write(work.join(file), format!("{file}\n")).unwrap();
+            git_ok(&["add", file], &work);
+            git_ok(&["commit", "-q", "-m", file], &work);
+            git_ok(&["rev-parse", "HEAD"], &work)
+        };
+        let older = commit("older.txt");
+        let newer = commit("newer.txt");
+        git_ok(&["checkout", "-q", "--detach", &older], &work);
+        let hidden = commit("hidden-secret.txt");
+        // Back on main: a bare clone takes over the source's HEAD, and a HEAD
+        // detached at `hidden` would advertise it.
+        git_ok(&["checkout", "-q", "main"], &work);
+        let bare = dir.path().join("served.git");
+        git_ok(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            dir.path(),
+        );
+        git_ok(&["fetch", "-q", work.to_str().unwrap(), &hidden], &bare);
+        git_ok(&["update-ref", "refs/forks/x", &hidden], &bare);
+        Served {
+            _dir: dir,
+            bare,
+            older,
+            newer,
+            hidden,
+        }
+    }
+
+    /// The pkt-lines of a response and the raw pack after them, if any.
+    fn split_response(response: &[u8]) -> (Vec<String>, Option<Vec<u8>>) {
+        let mut lines = Vec::new();
+        let mut rest = response;
+        loop {
+            if rest.is_empty() {
+                return (lines, None);
+            }
+            if rest.starts_with(b"PACK") {
+                return (lines, Some(rest.to_vec()));
+            }
+            let len = usize::from_str_radix(std::str::from_utf8(&rest[..4]).unwrap(), 16).unwrap();
+            if len == 0 {
+                lines.push("0000".to_string());
+                rest = &rest[4..];
+                continue;
+            }
+            lines.push(
+                String::from_utf8_lossy(&rest[4..len])
+                    .trim_end()
+                    .to_string(),
+            );
+            rest = &rest[len..];
+        }
+    }
+
+    fn object_count(pack: &[u8]) -> u32 {
+        u32::from_be_bytes(pack[8..12].try_into().unwrap())
+    }
+
+    fn objects_between(bare: &Path, tip: &str, exclude: Option<&str>) -> u32 {
+        let mut args = vec!["rev-list", "--objects", tip];
+        if let Some(exclude) = exclude {
+            args.extend(["--not", exclude]);
+        }
+        git_ok(&args, bare).lines().count() as u32
+    }
+
+    async fn stateless(bare: &Path, request: Vec<u8>) -> (anyhow::Result<()>, Vec<u8>) {
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+        let repo = bare.to_path_buf();
+        let handler = tokio::spawn(async move {
+            super::handle_upload_pack_http(&repo, Cursor::new(request), &mut server).await
+        });
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        (handler.await.unwrap(), response)
+    }
+
+    fn request(want_line: &str, haves: &[&str], end: &str) -> Vec<u8> {
+        let mut request = pkt(want_line);
+        request.extend_from_slice(b"0000");
+        for have in haves {
+            request.extend_from_slice(&pkt(&format!("have {have}\n")));
+        }
+        match end {
+            "done" => request.extend_from_slice(&pkt("done\n")),
+            _ => request.extend_from_slice(b"0000"),
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn an_incremental_fetch_packs_only_what_the_client_lacks() {
+        let served = served();
+        let unknown = "1".repeat(40);
+
+        for (caps, expected) in [
+            // Plain: one ACK for the first common object, nothing at `done`.
+            ("ofs-delta", vec![format!("ACK {}", served.older)]),
+            (
+                "multi_ack_detailed ofs-delta",
+                vec![
+                    format!("ACK {} common", served.older),
+                    format!("ACK {}", served.older),
+                ],
+            ),
+        ] {
+            let (result, response) = stateless(
+                &served.bare,
+                request(
+                    &format!("want {}\0{caps}\n", served.newer),
+                    &[&unknown, &served.older],
+                    "done",
+                ),
+            )
+            .await;
+            result.unwrap();
+            let (lines, pack) = split_response(&response);
+            assert_eq!(lines, expected, "{caps}");
+            let pack = pack.expect("a request ending in done gets a pack");
+            assert_eq!(
+                object_count(&pack),
+                objects_between(&served.bare, &served.newer, Some(&served.older)),
+                "{caps}: the pack carried objects the client said it has"
+            );
+        }
+
+        // A clone — no haves — gets the whole of main and nothing of the
+        // hidden ref.
+        let (result, response) = stateless(
+            &served.bare,
+            request(&format!("want {}\0ofs-delta\n", served.newer), &[], "done"),
+        )
+        .await;
+        result.unwrap();
+        let (lines, pack) = split_response(&response);
+        assert_eq!(lines, vec!["NAK".to_string()]);
+        assert_eq!(
+            object_count(&pack.unwrap()),
+            objects_between(&served.bare, &served.newer, None),
+            "a clone must get main and only main — not `pack-objects --all`"
+        );
+    }
+
+    /// A stateless request that ends in a flush is one negotiation round: it is
+    /// answered with acknowledgments, and the pack waits for `done`.
+    #[tokio::test]
+    async fn a_round_without_done_gets_acknowledgments_and_no_pack() {
+        let served = served();
+        let unknown = "2".repeat(40);
+
+        let (result, response) = stateless(
+            &served.bare,
+            request(
+                &format!("want {}\0multi_ack_detailed side-band-64k\n", served.newer),
+                &[&unknown, &served.older],
+                "flush",
+            ),
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(
+            split_response(&response),
+            (
+                vec![format!("ACK {} common", served.older), "NAK".to_string()],
+                None
+            )
+        );
+
+        let (result, response) = stateless(
+            &served.bare,
+            request(
+                &format!("want {}\0side-band-64k\n", served.newer),
+                &[&unknown],
+                "flush",
+            ),
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(split_response(&response), (vec!["NAK".to_string()], None));
+    }
+
+    /// Only what an advertisement offers may be wanted: the tip of a hidden
+    /// ref is refused, a commit an advertised ref reaches is not.
+    #[tokio::test]
+    async fn a_want_the_advertisement_did_not_offer_is_refused() {
+        let served = served();
+
+        let (result, response) = stateless(
+            &served.bare,
+            request(&format!("want {}\0ofs-delta\n", served.hidden), &[], "done"),
+        )
+        .await;
+        assert!(result.is_err(), "a hidden tip was served");
+        let (lines, pack) = split_response(&response);
+        assert_eq!(
+            lines,
+            vec![format!("ERR upload-pack: not our ref {}", served.hidden)]
+        );
+        assert!(pack.is_none());
+
+        let (result, response) = stateless(
+            &served.bare,
+            request(&format!("want {}\0ofs-delta\n", served.older), &[], "done"),
+        )
+        .await;
+        result.unwrap();
+        assert!(split_response(&response).1.is_some());
     }
 }

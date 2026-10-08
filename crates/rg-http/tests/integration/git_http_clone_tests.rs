@@ -119,3 +119,174 @@ async fn public_repo_clones_over_live_http() {
 
     server.abort();
 }
+
+/// The `.pack` files under a clone's object store.
+fn packs_in(clone: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    std::fs::read_dir(clone.join(".git/objects/pack"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .collect()
+}
+
+fn pack_object_count(pack: &Path) -> u32 {
+    let bytes = std::fs::read(pack).unwrap();
+    assert_eq!(&bytes[..4], b"PACK");
+    u32::from_be_bytes(bytes[8..12].try_into().unwrap())
+}
+
+/// card_ad83ad72d14a: a protocol v0/v1 fetch — libgit2, JGit, go-git, any git
+/// older than 2.26 — used to get `pack-objects --all` on every request: the
+/// whole repository, the objects of hidden refs included, and a pack in answer
+/// to a negotiation round that expected acknowledgments. A stock git client
+/// pinned to v0 now clones without the hidden ref's objects, and an
+/// incremental fetch from a clone with commits of its own — more than one
+/// stateless round of haves — receives only what it lacks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_protocol_v0_fetch_gets_what_it_lacks_and_never_a_hidden_ref() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let user = rg_db::ops::user_ops::create_user(&db, "v0-owner", "v0-owner@example.com", "", "V0")
+        .await
+        .unwrap();
+    rg_core::repo::service::create_repo(&db, user.id, "v0-repo", None, false, &repo_root, None)
+        .await
+        .unwrap();
+    let bare = repo_root.join("v0-owner/v0-repo.git");
+    let bare_str = bare.to_string_lossy().to_string();
+
+    let scratch = tempfile::tempdir().unwrap();
+    let seed = scratch.path().join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    git(&["init", "-q", "--initial-branch=main"], Some(&seed));
+    git(&["config", "user.name", "V0 Seed"], Some(&seed));
+    git(
+        &["config", "user.email", "v0-seed@example.com"],
+        Some(&seed),
+    );
+    let commit = |work: &Path, name: &str| {
+        std::fs::write(work.join(name), format!("{name}\n")).unwrap();
+        git(&["add", name], Some(work));
+        git(&["commit", "-q", "-m", name], Some(work));
+        git(&["rev-parse", "HEAD"], Some(work))
+    };
+    for index in 0..20 {
+        commit(&seed, &format!("history-{index}.txt"));
+    }
+    git(&["push", "-q", &bare_str, "main"], Some(&seed));
+    git(
+        &[
+            "--git-dir",
+            &bare_str,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+        None,
+    );
+    // A commit only a server-private ref holds.
+    git(&["checkout", "-q", "-b", "secret"], Some(&seed));
+    let secret = commit(&seed, "secret.txt");
+    git(
+        &["push", "-q", &bare_str, "secret:refs/forks/x"],
+        Some(&seed),
+    );
+    git(&["checkout", "-q", "main"], Some(&seed));
+
+    let state = build_test_app_state(db.clone(), repo_root.clone());
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    wait_for_listener(&addr).await;
+
+    let url = format!("http://{addr}/v0-owner/v0-repo.git");
+    let clone = scratch.path().join("clone");
+    let (clone_for_git, url_for_git) = (clone.clone(), url.clone());
+    tokio::task::spawn_blocking(move || {
+        git(
+            &[
+                "-c",
+                "protocol.version=0",
+                "clone",
+                "-q",
+                &url_for_git,
+                &clone_for_git.to_string_lossy(),
+            ],
+            None,
+        );
+    })
+    .await
+    .unwrap();
+    let probe = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .unwrap()
+        .run(&["cat-file", "-e", &secret], Some(&clone))
+        .unwrap();
+    assert!(
+        !probe.success(),
+        "a v0 clone received the commit only refs/forks/x holds"
+    );
+
+    // Commits of the clone's own, so its haves start with objects the server
+    // has never seen and take more than one stateless round.
+    git(&["config", "user.name", "V0 Client"], Some(&clone));
+    git(
+        &["config", "user.email", "v0-client@example.com"],
+        Some(&clone),
+    );
+    for index in 0..40 {
+        commit(&clone, &format!("local-{index}.txt"));
+    }
+    let before = git(&["rev-parse", "main"], Some(&seed));
+    let upstream = commit(&seed, "upstream.txt");
+    git(&["push", "-q", &bare_str, "main"], Some(&seed));
+
+    let packs_before = packs_in(&clone);
+    let clone_for_git = clone.clone();
+    tokio::task::spawn_blocking(move || {
+        git(
+            &[
+                "-c",
+                "protocol.version=0",
+                "-c",
+                "fetch.unpackLimit=1",
+                "fetch",
+                "-q",
+                "origin",
+            ],
+            Some(&clone_for_git),
+        );
+    })
+    .await
+    .unwrap();
+    assert_eq!(git(&["rev-parse", "origin/main"], Some(&clone)), upstream);
+    let new_packs: Vec<_> = packs_in(&clone)
+        .difference(&packs_before)
+        .cloned()
+        .collect();
+    let [pack] = new_packs.as_slice() else {
+        panic!("one fetched pack expected, got {new_packs:?}");
+    };
+    let lacking = git(
+        &["rev-list", "--objects", &upstream, "--not", &before],
+        Some(&bare),
+    )
+    .lines()
+    .count() as u32;
+    let whole = git(&["rev-list", "--objects", "--all"], Some(&bare))
+        .lines()
+        .count() as u32;
+    // A thin pack is completed on arrival: `index-pack --fix-thin` appends
+    // the delta bases it needed from the clone, so the kept pack may carry a
+    // few more objects than were sent — never the repository.
+    let count = pack_object_count(pack);
+    assert!(
+        (lacking..=2 * lacking).contains(&count) && count < whole / 4,
+        "the incremental v0 fetch kept {count} objects; it lacked {lacking}, the repository holds {whole}"
+    );
+
+    server.abort();
+    drop(dir);
+}

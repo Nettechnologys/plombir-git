@@ -56,6 +56,11 @@ pub struct PushPolicy {
     pub rejected_refs: Vec<(String, String)>,
     /// Ref patterns every new commit of which must carry a valid signature.
     pub require_signed_refs: Vec<String>,
+    /// `(pattern, message)` pairs for refs whose history may only grow: an
+    /// update of an existing matching ref is refused with that message unless
+    /// its old value is an ancestor of the new one (card_a5c343996db3). A ref
+    /// being created has no history to rewrite and is not affected.
+    pub fast_forward_only_refs: Vec<(String, String)>,
     /// LFS locks held by someone other than the pusher. A new commit that
     /// changes one of these paths refuses its ref.
     pub foreign_locks: Vec<ForeignLock>,
@@ -471,7 +476,22 @@ where
         index_pack_via_git(repo_path, reader).await?;
     }
 
-    enforce_signed_commit_policies(repo_path, &mut updates, &policy.require_signed_refs);
+    // Everything below reads the object database the pack just landed in, with
+    // git subprocesses and gix — synchronous work whose cost the push chooses,
+    // so it runs off the async workers. Connectivity goes first: the
+    // fast-forward and signature checks walk history from the new tip, which
+    // they can only do once the tip is known to be a complete object graph.
+    let repo = repo_path.to_path_buf();
+    let fast_forward_only = policy.fast_forward_only_refs.clone();
+    let signed = policy.require_signed_refs.clone();
+    updates = tokio::task::spawn_blocking(move || {
+        enforce_connectivity(&repo, &mut updates);
+        enforce_fast_forward_only(&repo, &mut updates, &fast_forward_only);
+        enforce_signed_commit_policies(&repo, &mut updates, &signed);
+        updates
+    })
+    .await
+    .context("receive-pack ref checks did not complete")?;
     enforce_foreign_lfs_locks(repo_path, &mut updates, &policy.foreign_locks).await;
 
     // Update the refs
@@ -826,6 +846,214 @@ fn enforce_signed_commit_policies(
                 update.message = error.receive_pack_message();
             }
         }
+    }
+}
+
+/// The `ng` reason for a ref whose new value is not a complete object graph in
+/// this repository after the pack was indexed.
+const INCOMPLETE_PUSH: &str =
+    "the pushed objects are incomplete: the new value or something it references is missing";
+
+/// The `ng` reason for a ref refused because the connectivity check itself
+/// could not run. Fixed text: the failure chain names server paths.
+const CONNECTIVITY_CHECK_UNAVAILABLE: &str = "connectivity check could not run on the server";
+
+/// How many tips one `rev-list` invocation names, so a mirror push of many refs
+/// stays well inside the argument-length limit.
+const CONNECTIVITY_BATCH: usize = 1_000;
+
+/// Refuse every ref whose new value is missing, the wrong kind of object, or
+/// not fully connected (card_01e62e2fcdcc).
+///
+/// `index-pack` stores whatever the client sent; it does not ask whether the
+/// refs about to move can be followed to the end. Without this a writer could
+/// point `refs/heads/x` at a SHA the pack never carried, at a blob, or at a
+/// commit whose tree is missing — the ref lands, and clone, CI checkout,
+/// archives and the UI of that branch break for everyone. This is git's own
+/// `check_connected`: `rev-list --objects <tips> --not --all` walks exactly
+/// what the push added and asks for every object on the way.
+///
+/// A branch must point at a commit. Other refs (tags, notes) may name any
+/// object kind git allows, but it has to exist and be complete.
+///
+/// A check that cannot run refuses the ref, as the signature check does.
+fn enforce_connectivity(repo_path: &Path, updates: &mut [RefUpdate]) {
+    let repo = match crate::repository::open(repo_path) {
+        Ok(repo) => repo,
+        Err(error) => {
+            refuse_unchecked(
+                updates,
+                &anyhow::Error::from(error),
+                "open repository for connectivity check",
+            );
+            return;
+        }
+    };
+    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+        let Ok(id) = gix::ObjectId::from_hex(update.new_sha.as_bytes()) else {
+            update.status = "error".into();
+            update.message = INCOMPLETE_PUSH.into();
+            continue;
+        };
+        // Three-valued: a missing tip is the pusher's, an object store that
+        // cannot answer is ours, and the two must not share a message.
+        match repo.try_find_header(id) {
+            Ok(Some(header)) => {
+                if update.refname.starts_with("refs/heads/")
+                    && header.kind() != gix::object::Kind::Commit
+                {
+                    update.status = "error".into();
+                    update.message = format!(
+                        "a branch must point at a commit, and {} is a {}",
+                        update.new_sha,
+                        header.kind()
+                    );
+                }
+            }
+            Ok(None) => {
+                update.status = "error".into();
+                update.message = INCOMPLETE_PUSH.into();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    refname = %update.refname,
+                    error = %format!("{error:#}"),
+                    "receive-pack could not look up the pushed tip"
+                );
+                update.status = "error".into();
+                update.message = CONNECTIVITY_CHECK_UNAVAILABLE.into();
+            }
+        }
+    }
+
+    let tips: Vec<String> = updates
+        .iter()
+        .filter(|update| update.status == "ok")
+        .map(|update| update.new_sha.clone())
+        .collect();
+    let mut incomplete: Vec<String> = Vec::new();
+    for batch in tips.chunks(CONNECTIVITY_BATCH) {
+        match tips_connected(repo_path, batch) {
+            Ok(true) => {}
+            // One answer for the whole batch; ask tip by tip to name the
+            // refs that are actually broken instead of failing the push.
+            Ok(false) => {
+                for tip in batch {
+                    match tips_connected(repo_path, std::slice::from_ref(tip)) {
+                        Ok(true) => {}
+                        Ok(false) => incomplete.push(tip.clone()),
+                        Err(error) => {
+                            refuse_unchecked(updates, &error, "per-tip connectivity check");
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                refuse_unchecked(updates, &error, "connectivity check");
+                return;
+            }
+        }
+    }
+    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+        if incomplete.contains(&update.new_sha) {
+            update.status = "error".into();
+            update.message = INCOMPLETE_PUSH.into();
+        }
+    }
+}
+
+/// `true` when every object reachable from `tips` and not from an existing ref
+/// is present and readable.
+fn tips_connected(repo_path: &Path, tips: &[String]) -> Result<bool> {
+    // `--objects` alone asks the object database for every object it lists,
+    // blobs included, and dies on a missing one — git's own `check_connected`
+    // runs exactly this. `--verify-objects` would additionally inflate every
+    // blob, which costs a second read of the whole push for nothing more.
+    let mut args: Vec<&str> = vec!["rev-list", "--objects", "--quiet"];
+    args.extend(tips.iter().map(String::as_str));
+    args.extend(["--not", "--all"]);
+    let output = crate::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .run(&args, Some(repo_path))?;
+    Ok(output.success())
+}
+
+/// Refuse every still-accepted ref of a push whose check could not run.
+fn refuse_unchecked(updates: &mut [RefUpdate], error: &anyhow::Error, what: &str) {
+    tracing::warn!(error = %format!("{error:#}"), "receive-pack {what} failed");
+    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+        update.status = "error".into();
+        update.message = CONNECTIVITY_CHECK_UNAVAILABLE.into();
+    }
+}
+
+/// The `ng` reason for a ref refused because the ancestry check itself could
+/// not run.
+const FAST_FORWARD_CHECK_UNAVAILABLE: &str = "fast-forward check could not run on the server";
+
+/// Refuse a rewrite of history on a ref that only allows it to grow
+/// (card_a5c343996db3).
+///
+/// "Force push not allowed" used to mean "no push at all": the rule refused
+/// the whole ref without asking whether the update rewrote anything, so the
+/// most ordinary protection — push directly, never rewrite — refused every
+/// fast-forward, while the people on the allow-list skipped the rule and
+/// could rewrite freely. The question is the one git asks: is the old value
+/// an ancestor of the new one?
+///
+/// `old_sha` is the client's word for the current value, but `update_ref`
+/// writes only if the ref still holds exactly that, so the ancestry checked
+/// here is the ancestry of the ref that is actually replaced.
+fn enforce_fast_forward_only(
+    repo_path: &Path,
+    updates: &mut [RefUpdate],
+    patterns: &[(String, String)],
+) {
+    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+        if update.old_sha == NULL_SHA1 {
+            continue;
+        }
+        let Some((_, message)) = patterns
+            .iter()
+            .find(|(pattern, _)| ref_matches_rejection_pattern(&update.refname, pattern))
+        else {
+            continue;
+        };
+        match is_ancestor(repo_path, &update.old_sha, &update.new_sha) {
+            Ok(true) => {}
+            Ok(false) => {
+                update.status = "error".into();
+                update.message = message.clone();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    refname = %update.refname,
+                    error = %format!("{error:#}"),
+                    "receive-pack fast-forward check failed"
+                );
+                update.status = "error".into();
+                update.message = FAST_FORWARD_CHECK_UNAVAILABLE.into();
+            }
+        }
+    }
+}
+
+/// `git merge-base --is-ancestor`: exit 0 is yes, 1 is no, anything else is a
+/// check that did not run.
+fn is_ancestor(repo_path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = crate::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .run(
+            &["merge-base", "--is-ancestor", ancestor, descendant],
+            Some(repo_path),
+        )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => output.ensure_success().map(|()| false),
     }
 }
 
@@ -1269,11 +1497,37 @@ mod landed_push_tests {
     /// accepts it, so the push reaches ref writing without a fixture pack.
     const EMPTY_PACK_CHECKSUM: &str = "029d08823bd8a8eab510ad6ac75c823cfd3ed31e";
 
-    /// The commit the pushed branch is moved to. `update_ref` compares the wire
-    /// old SHA and writes the reference; it does not resolve the new object, so
-    /// no commit has to be fabricated to observe the branch move.
+    /// The commit the pushed branch is moved to. Receive-pack refuses a ref on
+    /// an object the repository cannot follow (card_01e62e2fcdcc), so the
+    /// commit is real: an empty-tree commit with a fixed identity and date, which
+    /// is what [`init_with_pushed_commit`] writes and why its id is a constant.
     fn pushed_sha() -> String {
-        "a".repeat(40)
+        "03e54192425e5f61108c32d6be71e0035e6d87ac".to_string()
+    }
+
+    /// A bare repository already holding [`pushed_sha`], as it would after the
+    /// client's objects arrived — the empty pack then carries nothing new.
+    fn init_with_pushed_commit(repo_path: &std::path::Path) {
+        gix::init_bare(repo_path).unwrap();
+        let body = repo_path.join("pushed-commit");
+        std::fs::write(
+            &body,
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+             author fixture <fixture@example.invalid> 0 +0000\n\
+             committer fixture <fixture@example.invalid> 0 +0000\n\npushed\n",
+        )
+        .unwrap();
+        let written = crate::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(
+                &["hash-object", "-w", "-t", "commit", &body.to_string_lossy()],
+                Some(repo_path),
+            )
+            .unwrap();
+        written.ensure_success().unwrap();
+        std::fs::remove_file(body).unwrap();
+        assert_eq!(written.stdout_str().trim(), pushed_sha());
     }
 
     /// One `git push` of `refs/heads/main`, wire-shaped: the update command
@@ -1440,7 +1694,12 @@ mod landed_push_tests {
         let head = gix::open(repo_path)
             .expect("open pushed repository")
             .find_reference("refs/heads/main")
-            .expect("the push must have created the branch")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the push must have created the branch ({error}); updates: {:?}",
+                    outcome.ref_updates
+                )
+            })
             .id()
             .to_string();
         assert_eq!(head, pushed_sha(), "the branch did not take the pushed SHA");
@@ -1464,7 +1723,7 @@ mod landed_push_tests {
     async fn http_push_keeps_its_ref_updates_when_the_report_status_cannot_be_sent() {
         let dir = tempfile::tempdir().unwrap();
         let repo_path = dir.path().join("http-push.git");
-        gix::init_bare(&repo_path).unwrap();
+        init_with_pushed_commit(&repo_path);
 
         let outcome = handle_receive_pack_http_with_rejections(
             &repo_path,
@@ -1483,7 +1742,7 @@ mod landed_push_tests {
     async fn ssh_push_keeps_its_ref_updates_when_the_report_status_cannot_be_sent() {
         let dir = tempfile::tempdir().unwrap();
         let repo_path = dir.path().join("ssh-push.git");
-        gix::init_bare(&repo_path).unwrap();
+        init_with_pushed_commit(&repo_path);
         let mut client = HungUpClient::new(ResponseFate::Broken, Arc::new(Notify::new()));
 
         let outcome = handle_receive_pack_stream_with_rejections(
@@ -1528,7 +1787,7 @@ mod landed_push_tests {
     async fn http_push_cancelled_after_its_refs_landed_still_yields_them() {
         let dir = tempfile::tempdir().unwrap();
         let repo_path = dir.path().join("http-timeout-push.git");
-        gix::init_bare(&repo_path).unwrap();
+        init_with_pushed_commit(&repo_path);
         let applied = AppliedRefUpdates::new();
         let reached_response = Arc::new(Notify::new());
 
@@ -1562,7 +1821,7 @@ mod landed_push_tests {
     async fn ssh_push_cancelled_after_its_refs_landed_still_yields_them() {
         let dir = tempfile::tempdir().unwrap();
         let repo_path = dir.path().join("ssh-timeout-push.git");
-        gix::init_bare(&repo_path).unwrap();
+        init_with_pushed_commit(&repo_path);
         let applied = AppliedRefUpdates::new();
         let reached_response = Arc::new(Notify::new());
         let mut client = HungUpClient::new(ResponseFate::Hangs, reached_response.clone());
@@ -2744,8 +3003,26 @@ mod push_policy_tests {
     async fn a_lock_check_that_cannot_run_refuses_rather_than_admits() {
         let served = Served::new();
         // An object id the repository does not have: `git log` cannot walk
-        // from it, which is the check failing, not the pusher.
+        // from it, which is the check failing, not the pusher. A push can no
+        // longer get such a tip this far — the connectivity check refuses it
+        // first — so the lock check is driven directly; the push below shows
+        // the ghost refused all the same.
         let missing = "b".repeat(40);
+        let mut updates = vec![RefUpdate {
+            old_sha: NULL_SHA1.to_string(),
+            new_sha: missing.clone(),
+            refname: "refs/heads/ghost".to_string(),
+            status: "ok".to_string(),
+            message: String::new(),
+        }];
+        super::enforce_foreign_lfs_locks(
+            &served.bare,
+            &mut updates,
+            &alice_holds("castle.level").foreign_locks,
+        )
+        .await;
+        assert_eq!(updates[0].status, "error");
+        assert_eq!(updates[0].message, LFS_LOCK_CHECK_UNAVAILABLE);
 
         let updates = push(
             &served.bare,
@@ -2753,10 +3030,133 @@ mod push_policy_tests {
             &alice_holds("castle.level"),
         )
         .await;
-
-        let ghost = outcome(&updates, "refs/heads/ghost");
-        assert_eq!(ghost.status, "error");
-        assert_eq!(ghost.message, LFS_LOCK_CHECK_UNAVAILABLE);
+        assert_eq!(outcome(&updates, "refs/heads/ghost").status, "error");
         assert_eq!(branch(&served.bare, "ghost"), None);
+    }
+
+    /// Write `contents` as a loose object of `kind` straight into the served
+    /// repository — `--literally`, so a commit naming a tree that does not
+    /// exist is stored as written.
+    fn write_object(repo: &Path, kind: &str, contents: &str) -> String {
+        let file = repo.join("fixture-object");
+        std::fs::write(&file, contents).unwrap();
+        let sha = git(
+            repo,
+            &[
+                "hash-object",
+                "-w",
+                "--literally",
+                "-t",
+                kind,
+                &file.to_string_lossy(),
+            ],
+        );
+        std::fs::remove_file(file).unwrap();
+        sha
+    }
+
+    /// card_01e62e2fcdcc: a ref may not land on something the repository
+    /// cannot follow to the end — a SHA the pack never carried, a blob on a
+    /// branch, a commit whose tree is missing. Each is refused ref by ref, and
+    /// the complete update in the same push still lands.
+    #[tokio::test]
+    async fn a_ref_on_a_missing_wrong_or_incomplete_object_is_refused() {
+        let served = Served::new();
+        let next = commit(&served.work, "next.txt", "next\n");
+        served.deliver_objects(&next);
+        let absent = "1234567890123456789012345678901234567890";
+        let blob = write_object(&served.bare, "blob", "just bytes\n");
+        let hollow = write_object(
+            &served.bare,
+            "commit",
+            "tree 1111111111111111111111111111111111111111\n\
+             author a <a@example.invalid> 0 +0000\n\
+             committer a <a@example.invalid> 0 +0000\n\nhollow\n",
+        );
+
+        let updates = push(
+            &served.bare,
+            &[
+                (NULL_SHA1, absent, "refs/heads/absent"),
+                (NULL_SHA1, &blob, "refs/heads/blob"),
+                (NULL_SHA1, &hollow, "refs/heads/hollow"),
+                (NULL_SHA1, &blob, "refs/tags/blob-tag"),
+                (&served.base, &next, "refs/heads/main"),
+            ],
+            &PushPolicy::default(),
+        )
+        .await;
+
+        for refname in ["refs/heads/absent", "refs/heads/hollow"] {
+            let update = outcome(&updates, refname);
+            assert_eq!(update.status, "error", "{refname} was accepted");
+            assert_eq!(update.message, super::INCOMPLETE_PUSH, "{refname}");
+        }
+        let blob_branch = outcome(&updates, "refs/heads/blob");
+        assert_eq!(blob_branch.status, "error");
+        assert!(
+            blob_branch.message.contains("must point at a commit"),
+            "{}",
+            blob_branch.message
+        );
+        for name in ["absent", "blob", "hollow"] {
+            assert_eq!(branch(&served.bare, name), None, "{name} was written");
+        }
+        // A tag may name any complete object, and the good branch lands.
+        assert_eq!(outcome(&updates, "refs/tags/blob-tag").status, "ok");
+        assert_eq!(outcome(&updates, "refs/heads/main").status, "ok");
+        assert_eq!(branch(&served.bare, "main"), Some(next));
+    }
+
+    /// card_a5c343996db3: a fast-forward-only ref takes an update whose old
+    /// value is an ancestor of the new one and refuses a rewrite, with the
+    /// rule's message; creating the ref rewrites nothing and is admitted.
+    #[tokio::test]
+    async fn a_fast_forward_only_ref_refuses_a_rewrite_and_takes_a_fast_forward() {
+        let served = Served::new();
+        let ahead = commit(&served.work, "ahead.txt", "ahead\n");
+        served.deliver_objects(&ahead);
+        git(&served.work, &["reset", "-q", "--hard", &served.base]);
+        let sideways = commit(&served.work, "sideways.txt", "sideways\n");
+        served.deliver_objects(&sideways);
+        let policy = PushPolicy {
+            fast_forward_only_refs: vec![
+                (
+                    "refs/heads/main".to_string(),
+                    "no rewrites on main".to_string(),
+                ),
+                (
+                    "refs/heads/fresh".to_string(),
+                    "no rewrites on fresh".to_string(),
+                ),
+            ],
+            ..PushPolicy::default()
+        };
+
+        let fast_forward = push(
+            &served.bare,
+            &[
+                (&served.base, &ahead, "refs/heads/main"),
+                (NULL_SHA1, &sideways, "refs/heads/fresh"),
+            ],
+            &policy,
+        )
+        .await;
+        assert_eq!(outcome(&fast_forward, "refs/heads/main").status, "ok");
+        assert_eq!(outcome(&fast_forward, "refs/heads/fresh").status, "ok");
+        assert_eq!(branch(&served.bare, "main"), Some(ahead.clone()));
+
+        // `sideways` grew from `base`, not from `ahead`: moving main there
+        // drops `ahead` from its history.
+        let rewrite = push(
+            &served.bare,
+            &[(&ahead, &sideways, "refs/heads/main")],
+            &policy,
+        )
+        .await;
+        let refused = outcome(&rewrite, "refs/heads/main");
+        assert_eq!(refused.status, "error");
+        assert_eq!(refused.message, "no rewrites on main");
+        assert_eq!(branch(&served.bare, "main"), Some(ahead));
     }
 }
