@@ -183,7 +183,11 @@ const EXEMPT = [];
 // Back up to 9 with the MCP endpoint (`POST /api/v1/mcp`, a `Bytes` body under
 // its own declared ceiling): ten registrations, the floor one under them, so
 // losing the two `String` routes still trips it.
-const MIN_BUFFERING_ROUTES = 9;
+//
+// 10 with the avatar upload (`PUT /api/v1/users/me/avatar`, a `Bytes` body
+// under `AVATAR_UPLOAD_MAX_BYTES`, card_ca894e30ac80): eleven registrations,
+// the floor one under them, for the same reason.
+const MIN_BUFFERING_ROUTES = 10;
 
 /** `api::runners::upload_log` → the file it lives in and the fn name. */
 function locate(handler) {

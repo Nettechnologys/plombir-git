@@ -132,6 +132,15 @@ export const GATES = [
     run: runDeployConfig,
     invokes: 'docker compose',
   },
+  // The second half of `deploy-config`: the reverse-proxy examples an operator
+  // copies out of deploy/, loaded by nginx and Caddy themselves through the
+  // one script the workflow step runs too (card_b7bfdbf0b00d).
+  {
+    job: 'deploy-config',
+    name: 'Reverse-proxy examples',
+    run: runReverseProxyExamples,
+    invokes: 'bash scripts/check-reverse-proxy-examples.sh',
+  },
   {
     job: 'observability-config',
     name: 'Prometheus, Alertmanager and Grafana config',
@@ -250,13 +259,6 @@ export function runDeployConfig({ cwd = root } = {}) {
     env: { PLOMBIR_GIT_DEPLOY_ENV_FILE: envFile },
   }));
 
-  // The reverse-proxy examples ride with the compose files: both are what an
-  // operator copies out of deploy/, and the workflow validates them in the same
-  // job, through the same script (card_b7bfdbf0b00d).
-  if (gate.ok) {
-    const proxies = fromResult(sh('bash scripts/check-reverse-proxy-examples.sh', { cwd: repoRoot }));
-    gate = { ok: proxies.ok, output: `${gate.output}\n${proxies.output}`.trim() };
-  }
 
   if (temporaryRoot) {
     try {
@@ -270,6 +272,13 @@ export function runDeployConfig({ cwd = root } = {}) {
   }
 
   return { ...gate, output: `${preface}\n${gate.output}`.trim() };
+}
+
+export function runReverseProxyExamples({ cwd = root } = {}) {
+  const missing = requireTool('docker', 'nginx -t and caddy validate run inside the official images')
+    || requireTool('openssl', 'nginx -t loads the certificate the example names, so one is made up for it');
+  if (missing) return { ok: false, output: missing };
+  return fromResult(sh('bash scripts/check-reverse-proxy-examples.sh', { cwd: resolve(cwd) }));
 }
 
 export function runObservability({ cwd = root } = {}) {

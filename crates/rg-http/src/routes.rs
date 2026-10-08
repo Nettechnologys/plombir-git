@@ -1065,7 +1065,7 @@ pub(crate) fn build_all_routes(
     let limit_101mb = Wrap::body_limit(101 * 1024 * 1024);
     let lfs_upload_limit = Wrap::body_limit(rg_core::lfs::service::LFS_OBJECT_MAX_BYTES);
     let release_asset_limit = Wrap::body_limit(api::releases::RELEASE_ASSET_UPLOAD_MAX_BYTES);
-    let avatar_limit = Wrap::body_limit(rg_core::user::account::MAX_AVATAR_BYTES);
+    let avatar_limit = Wrap::body_limit(api::account::AVATAR_UPLOAD_MAX_BYTES);
     // Multipart package clients add framing around the artifact (and npm adds
     // base64 JSON on its own route). Lift Axum's hidden 2 MiB extractor limit
     // to a bounded envelope allowance; `publish_package` independently checks

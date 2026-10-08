@@ -30,6 +30,11 @@ use crate::api::users::{build_auth_cookie, build_clear_cookie};
 use crate::error::AppError;
 use crate::AppState;
 
+/// Largest avatar upload the route accepts — the body limit `routes.rs`
+/// mounts, and the same number the core refuses past.
+pub(crate) const AVATAR_UPLOAD_MAX_BYTES: usize = 512 * 1024;
+const _: () = assert!(AVATAR_UPLOAD_MAX_BYTES == rg_core::user::account::MAX_AVATAR_BYTES);
+
 fn directories(state: &AppState) -> rg_core::user::service::LdapDirectories<'_> {
     rg_core::user::service::LdapDirectories {
         encryption_key: &state.encryption_key,
