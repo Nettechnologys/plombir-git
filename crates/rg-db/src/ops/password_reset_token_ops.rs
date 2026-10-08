@@ -190,6 +190,22 @@ pub async fn complete_password_reset(
     .await
 }
 
+/// Whether a reset link was issued to `user_id` at or after `since` and is
+/// still on file — the per-account cooldown of `forgot_password`.
+pub async fn issued_since(
+    db: &DatabaseConnection,
+    user_id: i64,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, sea_orm::DbErr> {
+    use sea_orm::PaginatorTrait;
+    let count = password_reset_token::Entity::find()
+        .filter(password_reset_token::Column::UserId.eq(user_id))
+        .filter(password_reset_token::Column::CreatedAt.gte(since))
+        .count(db)
+        .await?;
+    Ok(count > 0)
+}
+
 /// Invalidate all unused tokens for a user (e.g., after successful reset).
 pub async fn invalidate_user_tokens<C>(db: &C, user_id: i64) -> Result<(), sea_orm::DbErr>
 where

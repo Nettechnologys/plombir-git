@@ -2998,6 +2998,11 @@ const ROUTE_CALL_SIGNED_OFF: &[(&str, RouteCallSignOff, &str)] = &[
         RouteCallSignOff::TestScaffold,
         "a one-route scaffold inside `#[cfg(test)]`, to drive the limiter middleware",
     ),
+    (
+        "client_ip.rs",
+        RouteCallSignOff::TestScaffold,
+        "a one-route scaffold inside `#[cfg(test)]`, to drive the client-address middleware",
+    ),
 ];
 
 /// `crates/rg-http/src`, the tree both route-call guards walk.

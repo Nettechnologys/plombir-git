@@ -173,3 +173,57 @@ async fn a_private_repository_does_not_report_its_checks_to_strangers() {
         );
     }
 }
+
+/// card_36b620ab3467: the link beside a check is rendered as `<a href>`, so
+/// only an absolute http(s) URL is stored; a blank one is no link.
+#[tokio::test]
+async fn a_status_link_must_be_an_http_url() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "signal-owner", "signal-owner@example.com").await;
+    create_repo(&base, &token, "signal-repo").await;
+    let post = |target_url: &'static str, context: &'static str| {
+        let (base, token) = (base.clone(), token.clone());
+        async move {
+            reqwest::Client::new()
+                .post(format!(
+                    "{base}/api/v1/repos/signal-owner/signal-repo/statuses/{SHA}"
+                ))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "state": "success",
+                    "context": context,
+                    "target_url": target_url,
+                }))
+                .send()
+                .await
+                .expect("post commit status")
+                .status()
+        }
+    };
+
+    for hostile in [
+        "javascript:alert(document.domain)",
+        "JavaScript:alert(1)",
+        "data:text/html,<script>alert(1)</script>",
+        "/relative/path",
+        "https://",
+    ] {
+        assert_eq!(post(hostile, "hostile").await, 400, "{hostile}");
+    }
+    assert_eq!(post("https://ci.example.com/job/1", "good").await, 201);
+    assert_eq!(post("   ", "blank").await, 201);
+
+    let listed = statuses(&base, &token, SHA).await;
+    let link = |context: &str| {
+        listed
+            .iter()
+            .find(|status| status["context"] == context)
+            .map(|status| status["target_url"].clone())
+    };
+    assert_eq!(
+        link("good"),
+        Some(serde_json::json!("https://ci.example.com/job/1"))
+    );
+    assert_eq!(link("blank"), Some(serde_json::Value::Null));
+    assert_eq!(link("hostile"), None, "a refused status is not stored");
+}

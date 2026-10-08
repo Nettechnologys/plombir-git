@@ -31,6 +31,59 @@ use axum::http::HeaderValue;
 /// The name used when a caller supplies one that survives neither form.
 const FALLBACK: &str = "download";
 
+/// The media types a user-uploaded download is served under as they were
+/// stored: ones a browser only ever *displays* — never runs as script or
+/// style, never renders as a document of our origin.
+///
+/// Anything else is served as `application/octet-stream`. The stored type is
+/// whatever the uploader said (a release asset's `Content-Type`, a multipart
+/// part's), and `attachment` plus `nosniff` do not stop `<script src>` from
+/// running a file served with a JavaScript type: `script-src 'self'` lets it
+/// in, so any later HTML injection would become a full XSS with no nonce
+/// needed (card_36b620ab3467).
+const PASSIVE_UPLOAD_TYPES: &[&str] = &[
+    "application/gzip",
+    "application/json",
+    "application/pdf",
+    "application/zip",
+    "image/avif",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    // Scripts inside an SVG never run from `<img>`; opened directly it is a
+    // download, and `UPLOAD_SANDBOX_CSP` holds even if a browser renders it.
+    "image/svg+xml",
+    "image/webp",
+    "text/csv",
+    "text/plain",
+    "video/mp4",
+    "video/quicktime",
+    "video/webm",
+];
+
+/// `Content-Security-Policy` for a user-uploaded download: whatever a browser
+/// makes of the bytes runs nothing and loads nothing. The same policy the raw
+/// file route serves committed content under.
+pub(crate) const UPLOAD_SANDBOX_CSP: &str = "default-src 'none'; sandbox";
+
+/// The `Content-Type` a user-uploaded file is served with, given the one it
+/// was stored with. See [`PASSIVE_UPLOAD_TYPES`].
+pub(crate) fn served_upload_type(stored: &str) -> HeaderValue {
+    let essence = stored
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match PASSIVE_UPLOAD_TYPES
+        .iter()
+        .find(|passive| **passive == essence)
+    {
+        Some(passive) => HeaderValue::from_static(passive),
+        None => HeaderValue::from_static("application/octet-stream"),
+    }
+}
+
 /// Build the `Content-Disposition` value for a download named `filename`.
 ///
 /// Both parameters are always present. RFC 6266 §4.3 lets a recipient that
@@ -232,7 +285,7 @@ fn hex_value(byte: u8) -> Result<u8, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{attachment, filename_from_disposition};
+    use super::{attachment, filename_from_disposition, served_upload_type};
 
     fn header(filename: &str) -> String {
         attachment(filename)
@@ -389,5 +442,33 @@ mod tests {
             Some("paket.tgz")
         );
         assert_eq!(filename_from_disposition("attachment"), None);
+    }
+
+    /// card_36b620ab3467: a type the uploader chose is served only when a
+    /// browser can do nothing with it but display it.
+    #[test]
+    fn an_uploaded_file_is_never_served_as_something_a_browser_runs() {
+        for active in [
+            "text/javascript",
+            "application/javascript; charset=utf-8",
+            "text/html",
+            "text/css",
+            "application/xhtml+xml",
+            "text/xml",
+            "Application/ECMAScript",
+            "",
+            "nonsense",
+        ] {
+            assert_eq!(
+                served_upload_type(active),
+                "application/octet-stream",
+                "{active:?}"
+            );
+        }
+        assert_eq!(served_upload_type("image/PNG"), "image/png");
+        assert_eq!(
+            served_upload_type("text/plain; charset=utf-8"),
+            "text/plain"
+        );
     }
 }

@@ -283,6 +283,7 @@ async fn verify_local_login(
     db: &DatabaseConnection,
     username_or_email: &str,
     plaintext_password: &str,
+    source: Option<std::net::IpAddr>,
 ) -> Result<rg_db::entities::user::Model> {
     // Try username first, then email
     let user = if username_or_email.contains('@') {
@@ -300,12 +301,12 @@ async fn verify_local_login(
     // than as the "invalid credentials" below. The account name rides along in
     // the context so the operator log says which row to go and look at.
     //
-    // No source address: this door sits behind `auth_rl`, and the only
-    // address on hand here would be one the client could have written itself.
+    // `source` is the address the server resolved, so one client cannot take
+    // every place in the process-wide password limiter (card_a0f0cc7aed3a).
     let password_ok = password::verify_password_or_dummy(
         plaintext_password,
         user.as_ref().map(|u| u.password_hash.as_str()),
-        None,
+        source,
     )
     .await
     .with_context(|| format!("cannot verify the password of '{username_or_email}'"))?;
@@ -327,12 +328,17 @@ async fn verify_local_login(
 
 /// Authenticate through the account's configured provider. Unknown users may
 /// be provisioned only after a successful bind against an enabled LDAP source.
+///
+/// `source` is the client address when the caller knows it for certain — see
+/// [`password::verify_password_or_dummy`]. It bounds the share of the password
+/// limiter one client can hold.
 pub async fn login_with_configured_auth(
     db: &DatabaseConnection,
     username_or_email: &str,
     plaintext_password: &str,
     encryption_key: &str,
     ldap_transport_policy: &crate::auth::ldap::LdapTransportPolicy,
+    source: Option<std::net::IpAddr>,
 ) -> Result<LoginOutcome> {
     let existing = find_login_user(db, username_or_email).await?;
     if existing.as_ref().is_some_and(|user| {
@@ -343,7 +349,7 @@ pub async fn login_with_configured_auth(
     }
     match existing.as_ref().map(|user| user.auth_provider.as_str()) {
         Some("local") => Ok(LoginOutcome {
-            user: verify_local_login(db, username_or_email, plaintext_password).await?,
+            user: verify_local_login(db, username_or_email, plaintext_password, source).await?,
             method: LoginMethod::Password,
         }),
         Some("ldap") | None => {
@@ -354,6 +360,7 @@ pub async fn login_with_configured_auth(
                 plaintext_password,
                 encryption_key,
                 ldap_transport_policy,
+                source,
             )
             .await
         }
@@ -361,7 +368,7 @@ pub async fn login_with_configured_auth(
             // Account exists but authenticates through a provider no password
             // reaches — burn the same Argon2 work the local branch would. A
             // shed burn answers with the shed, as the local branch would.
-            password::burn_dummy_verification(plaintext_password).await?;
+            password::burn_dummy_verification(plaintext_password, source).await?;
             bail!("invalid credentials")
         }
     }
@@ -392,6 +399,7 @@ async fn login_via_ldap(
     plaintext_password: &str,
     encryption_key: &str,
     ldap_transport_policy: &crate::auth::ldap::LdapTransportPolicy,
+    source: Option<std::net::IpAddr>,
 ) -> Result<LoginOutcome> {
     let mut attempted_bind = false;
     let outcome = login_via_ldap_inner(
@@ -408,7 +416,7 @@ async fn login_via_ldap(
         // A shed burn replaces the rejection: answering an unknown account
         // with a fast 401 while a known one gets a 503 would put the
         // enumeration oracle back, only under load.
-        password::burn_dummy_verification(plaintext_password).await?;
+        password::burn_dummy_verification(plaintext_password, source).await?;
     }
     outcome
 }
@@ -1286,6 +1294,16 @@ pub async fn get_user_by_id(db: &DatabaseConnection, user_id: i64) -> Result<Opt
 /// round-trip (network-bound, unbounded) is detached rather than awaited.
 const FORGOT_PASSWORD_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How long after one reset link an account gets no other.
+///
+/// Every request used to mail a new link and void the previous one, so an
+/// anonymous loop on one address was a mail bomb that also kept the owner
+/// from ever using the link in their inbox (card_0beff149adbd). A request
+/// inside the window is answered exactly like every other — same body, same
+/// padded deadline — and changes nothing: no mail, the link already sent
+/// stays the valid one.
+pub const PASSWORD_RESET_COOLDOWN: Duration = Duration::seconds(60);
+
 /// Initiate a password reset. Generates a token and sends an email.
 /// Silently succeeds even if the email is not found (to prevent user enumeration).
 /// H-5: every code path returns at the same deadline ([`FORGOT_PASSWORD_BUDGET`]
@@ -1357,6 +1375,18 @@ async fn forgot_password_inner(
     // the mail still lands in the mailbox the offboarded user controls, and
     // `reset_password` hands out a working session at the end of it.
     if !user.is_usable() {
+        return Ok(None);
+    }
+
+    // One link per cooldown: the one already in the inbox stays the one that
+    // works, and no second mail goes out.
+    if rg_db::ops::password_reset_token_ops::issued_since(
+        db,
+        user.id,
+        Utc::now() - PASSWORD_RESET_COOLDOWN,
+    )
+    .await?
+    {
         return Ok(None);
     }
 
@@ -1960,6 +1990,7 @@ mod tests {
             "definitely-not-the-password",
             "encryption-key",
             &crate::auth::ldap::LdapTransportPolicy::default(),
+            None,
         )
         .await
         {
@@ -2078,6 +2109,64 @@ mod tests {
             "expected exactly one reset token to be written before the call returned"
         );
         assert_eq!(tokens[0].user_id, user.id);
+    }
+
+    /// card_0beff149adbd: a second request inside the cooldown issues nothing —
+    /// the link already mailed stays the valid one — and is answered like any
+    /// other; once the cooldown is over, a new link is issued again.
+    #[tokio::test]
+    async fn forgot_password_issues_one_link_per_cooldown() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        seed_user(&db, "alice", "local").await;
+        let tokens = || async {
+            rg_db::entities::password_reset_token::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+        };
+
+        let first = forgot_password(&db, "alice@example.com", None, "https://forge.example.com")
+            .await
+            .unwrap();
+        assert!(first.is_some(), "the first request issues a link");
+        let issued = tokens().await;
+        assert_eq!(issued.len(), 1);
+
+        let second = forgot_password(&db, "alice@example.com", None, "https://forge.example.com")
+            .await
+            .unwrap();
+        assert!(
+            second.is_none(),
+            "a request inside the cooldown issues nothing"
+        );
+        assert_eq!(
+            tokens().await,
+            issued,
+            "the link already sent must stay the valid one"
+        );
+
+        // Age the link past the cooldown.
+        let mut aged: rg_db::entities::password_reset_token::ActiveModel = issued[0].clone().into();
+        aged.created_at =
+            Set(issued[0].created_at - PASSWORD_RESET_COOLDOWN - Duration::seconds(1));
+        aged.update(&db).await.unwrap();
+
+        let third = forgot_password(&db, "alice@example.com", None, "https://forge.example.com")
+            .await
+            .unwrap();
+        assert!(third.is_some(), "after the cooldown a new link is issued");
+        let replaced = tokens().await;
+        assert_eq!(replaced.len(), 1);
+        assert_ne!(replaced[0].token_hash, issued[0].token_hash);
     }
 }
 

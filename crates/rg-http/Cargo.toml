@@ -28,6 +28,8 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
+# Stock git gzips stateless upload-pack request bodies over 1 KiB.
+flate2 = { workspace = true }
 tokio-rustls = { workspace = true }
 axum-server = { workspace = true }
 utoipa = { version = "5", features = ["chrono"] }

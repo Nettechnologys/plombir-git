@@ -216,7 +216,8 @@ pub(crate) struct RateLimitConfig {
     pub(crate) trusted_proxies: Vec<String>,
     /// Hard cap on distinct client keys the limiter tracks (memory guard).
     pub(crate) max_keys: Option<usize>,
-    /// Stricter per-IP cap for credential endpoints (register/login).
+    /// Stricter per-IP cap for the unauthenticated credential endpoints
+    /// (register, login, password reset, MFA verify, passkey login).
     pub(crate) auth_max: Option<u32>,
     /// Window (seconds) for the credential-endpoint limiter.
     pub(crate) auth_window_secs: Option<u64>,
@@ -339,6 +340,14 @@ pub(crate) struct ObservabilityConfig {
     pub(crate) service_name: Option<String>,
     /// Head sampling ratio in 0.0..=1.0 (default 1.0 = sample every trace).
     pub(crate) sample_ratio: Option<f64>,
+    /// Whether `GET /metrics` answers at all (default true). Off, the route is
+    /// a 404 — for an instance scraped through a separate exporter or not at
+    /// all.
+    pub(crate) metrics_enabled: Option<bool>,
+    /// Bearer token a scraper must present to read `GET /metrics`. Unset, the
+    /// endpoint is open to whoever reaches the HTTP port. Also settable as
+    /// `PLOMBIR_GIT_METRICS_TOKEN`, which wins.
+    pub(crate) metrics_token: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -621,7 +630,8 @@ pub(crate) const DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP: bool = false;
 /// limiter's own bound", `rg_http::rate_limit::DEFAULT_MAX_KEYS`.
 pub(crate) const DEFAULT_RATE_LIMIT_MAX_KEYS: usize = 0;
 
-/// The credential-endpoint limiter (`/users/register`, `/users/login`). Always
+/// The credential-endpoint limiter (register, login, forgot/reset password,
+/// `mfa/verify`, `passkeys/login/*`). Always
 /// on, independent of `[rate_limit].max`, so registration spam and password
 /// guessing stay throttled on an instance that disabled the global limit.
 pub(crate) const DEFAULT_AUTH_RATE_LIMIT_MAX: u32 = 10;
@@ -636,6 +646,10 @@ pub(crate) const DEFAULT_AGENT_RATE_LIMIT_WINDOW: u64 = 60;
 /// `[audit].enabled`: on by default, because an audit log that is never trimmed
 /// grows until the disk does.
 pub(crate) const DEFAULT_AUDIT_ENABLED: bool = true;
+
+/// `[observability].metrics_enabled`: on by default, the historical behaviour —
+/// the shipped Prometheus scrapes it. Exposure is `metrics_token`'s job.
+pub(crate) const DEFAULT_METRICS_ENABLED: bool = true;
 
 /// `[backup].enabled`: off by default so an upgrade never starts consuming
 /// `keep_last` × database-size of disk unannounced. Both shipped templates turn
@@ -1915,6 +1929,12 @@ mod tests {
                 super::DEFAULT_AUDIT_ENABLED.to_string(),
             ),
             row(
+                "observability",
+                "metrics_enabled",
+                "DEFAULT_METRICS_ENABLED",
+                super::DEFAULT_METRICS_ENABLED.to_string(),
+            ),
+            row(
                 "audit",
                 "archive_dir",
                 "DEFAULT_AUDIT_ARCHIVE_DIR",
@@ -2066,7 +2086,14 @@ mod tests {
     /// rows that happen to be right today — a new `key = 42` line is either
     /// paired with the code that produces the 42, or declared here with a
     /// reason.
-    const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 30] = [
+    const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 31] = [
+        (
+            "plombir-git.example.toml",
+            "observability",
+            "metrics_token",
+            "a secret to paste and hand to the scraper, not a value the server picks; \
+             unset, /metrics is open",
+        ),
         (
             "plombir-git.example.toml",
             "server",

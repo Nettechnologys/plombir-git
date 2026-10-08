@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::{load_secret_key, Algorithm, PrivateKey};
-use russh::server::{Auth, Config, Handler, Msg, Server as _, Session};
+use russh::server::{Auth, Config, Handler, Msg, Session};
 use russh::{Channel, ChannelId, ChannelStream};
 use sea_orm::DatabaseConnection;
 use tokio::io::AsyncWriteExt;
@@ -123,6 +123,10 @@ enum GitServiceError {
     /// client gets, so it says what to do instead.
     NotOffered(&'static str),
     ServerUnavailable(anyhow::Error),
+    /// No place in the process-wide git-session limiter the HTTP transport
+    /// shares (card_b14a241b1e18). Nothing was started; trying again later is
+    /// the whole answer.
+    Busy(rg_core::git_sessions::GitSessionsSaturated),
 }
 
 impl GitServiceError {
@@ -133,6 +137,7 @@ impl GitServiceError {
             Self::AccessDenied(_) => "repository access denied",
             Self::NotOffered(reason) => reason,
             Self::ServerUnavailable(_) => "server temporarily unavailable; try again later",
+            Self::Busy(saturated) => saturated.client_message(),
         }
     }
 
@@ -143,6 +148,7 @@ impl GitServiceError {
             Self::AccessDenied(_) => "access_denied",
             Self::NotOffered(_) => "not_offered",
             Self::ServerUnavailable(_) => "server_unavailable",
+            Self::Busy(_) => "busy",
         }
     }
 
@@ -152,6 +158,7 @@ impl GitServiceError {
             Self::RepositoryNotFound => "repository not found".to_string(),
             Self::AccessDenied(reason) | Self::NotOffered(reason) => (*reason).to_string(),
             Self::ServerUnavailable(error) => format!("{error:#}"),
+            Self::Busy(saturated) => saturated.to_string(),
         }
     }
 
@@ -285,6 +292,10 @@ struct SshServer {
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     /// How long a stopping server waits for its in-flight git sessions.
     shutdown_grace: std::time::Duration,
+    /// What one client may hold of this listener.
+    limits: ConnectionLimits,
+    /// Open connections per source, for `limits.per_source`.
+    connections: ConnectionsBySource,
 }
 
 /// Wait for the git sessions this server is streaming, bounded by `grace`.
@@ -438,6 +449,99 @@ fn check_host_key_readable(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// What one client may hold of this listener (card_b14a241b1e18).
+///
+/// Before these, russh's defaults were the only bounds: a connection that
+/// never authenticated held its slot for the 600 s inactivity timeout, one
+/// address could open as many as it liked, and one authenticated connection
+/// could multiplex any number of session channels, each with an `exec` behind
+/// it.
+#[derive(Debug, Clone, Copy)]
+struct ConnectionLimits {
+    /// From accept to a successful authentication, SSH version exchange and
+    /// key exchange included. Long enough for a person to type a key
+    /// passphrase; far shorter than russh's 600 s.
+    pre_auth: std::time::Duration,
+    /// Connections one source ([`rg_core::net::abuse_source`]) may hold open at
+    /// once, authenticated or not. A CI farm behind one NAT fits; a single host
+    /// opening connection after connection does not.
+    per_source: usize,
+    /// Session channels one connection may hold open at once, waiting for an
+    /// `exec` or running one. `ssh` multiplexing and git use a handful.
+    channels: usize,
+}
+
+const CONNECTION_LIMITS: ConnectionLimits = ConnectionLimits {
+    pre_auth: std::time::Duration::from_secs(60),
+    per_source: 32,
+    channels: 16,
+};
+
+/// Open connections per source, for [`ConnectionLimits::per_source`].
+#[derive(Clone, Default)]
+struct ConnectionsBySource(Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>);
+
+impl ConnectionsBySource {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<std::net::IpAddr, usize>> {
+        // Only additions and subtractions happen under it; a poisoned lock
+        // still holds the truth.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A place for one more connection from `peer`, or `None` when its
+    /// source already holds `max`.
+    fn try_open(&self, peer: std::net::IpAddr, max: usize) -> Option<ConnectionSlot> {
+        let source = rg_core::net::abuse_source(peer);
+        let mut open = self.lock();
+        let held = open.entry(source).or_insert(0);
+        if *held >= max {
+            return None;
+        }
+        *held += 1;
+        Some(ConnectionSlot {
+            sources: self.clone(),
+            source,
+        })
+    }
+}
+
+/// One open connection. Dropping it gives the place back.
+struct ConnectionSlot {
+    sources: ConnectionsBySource,
+    source: std::net::IpAddr,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let mut open = self.sources.lock();
+        if let std::collections::hash_map::Entry::Occupied(mut held) = open.entry(self.source) {
+            *held.get_mut() -= 1;
+            if *held.get() == 0 {
+                held.remove();
+            }
+        }
+    }
+}
+
+/// Counts a running `exec` against its connection's channel budget until the
+/// git session behind it ends.
+struct LiveExec(Arc<std::sync::atomic::AtomicUsize>);
+
+impl LiveExec {
+    fn start(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for LiveExec {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl SshServer {
     /// Create a new SSH server from configuration.
     /// Loads the host key and validates the key file permissions.
@@ -473,6 +577,8 @@ impl SshServer {
             config: Arc::new(config),
             shared,
             id: 0,
+            limits: CONNECTION_LIMITS,
+            connections: ConnectionsBySource::default(),
             shutdown: ssh_config.shutdown,
             shutdown_grace: std::time::Duration::from_secs(ssh_config.shutdown_grace_secs),
         })
@@ -506,15 +612,16 @@ impl SshServer {
 
         tracing::info!(%listen_addr, "Starting SSH server");
 
-        // Read out before `run_on_socket` borrows `self` for the server's
+        // Read out before the accept loop borrows `self` for the server's
         // lifetime.
         let config = self.config.clone();
         let sessions = self.shared.git_sessions.clone();
         let grace = self.shutdown_grace;
         let mut shutdown = self.shutdown.clone();
+        let (disconnect_all, _) = tokio::sync::broadcast::channel::<String>(1);
 
-        let mut server = self.run_on_socket(config, listener);
-        let handle = server.handle();
+        let server = self.accept_connections(config, listener, disconnect_all.clone());
+        tokio::pin!(server);
 
         tokio::select! {
             result = &mut server => return result.context("SSH server error"),
@@ -537,15 +644,127 @@ impl SshServer {
                 "git SSH sessions did not finish within the grace window — disconnecting"
             );
         }
-        handle.shutdown("server is shutting down".to_string());
-        // Bounded too: `RunningServer` resolves once its accept loop sees the
-        // broadcast, but a wedged peer must not hold the process open past the
-        // window the operator configured.
+        if disconnect_all
+            .send("server is shutting down".to_string())
+            .is_err()
+        {
+            // Nobody listening: the accept loop and every session are gone.
+            tracing::debug!("no SSH connection left to disconnect");
+        }
+        // Bounded too: the accept loop returns once it sees the broadcast, but
+        // a wedged peer must not hold the process open past the window the
+        // operator configured.
         match tokio::time::timeout(grace, server).await {
             Ok(result) => result.context("SSH server error")?,
             Err(_) => tracing::warn!("SSH server did not stop within the grace window"),
         }
         Ok(())
+    }
+
+    /// Accept connections until `disconnect_all` fires, serving each one with
+    /// russh's [`russh::server::run_stream`] under [`ConnectionLimits`].
+    ///
+    /// russh's own `run_on_socket` loop offers no hook between accept and
+    /// authentication, which is exactly where the per-source connection bound
+    /// and the pre-authentication deadline have to sit. This is that loop with
+    /// those two added; the disconnect-on-shutdown half is unchanged.
+    async fn accept_connections(
+        &mut self,
+        config: Arc<Config>,
+        listener: &tokio::net::TcpListener,
+        disconnect_all: tokio::sync::broadcast::Sender<String>,
+    ) -> std::io::Result<()> {
+        let mut stop = disconnect_all.subscribe();
+        loop {
+            let (socket, peer) = tokio::select! {
+                _ = stop.recv() => return Ok(()),
+                accepted = listener.accept() => accepted?,
+            };
+            let Some(slot) = self.connections.try_open(peer.ip(), self.limits.per_source) else {
+                tracing::warn!(
+                    %peer,
+                    max = self.limits.per_source,
+                    "SSH connection refused: this source already holds as many as it may"
+                );
+                drop(socket);
+                continue;
+            };
+            let handler = russh::server::Server::new_client(self, Some(peer));
+            let authenticated = Arc::clone(&handler.authenticated);
+            let config = Arc::clone(&config);
+            let mut disconnect = disconnect_all.subscribe();
+            let pre_auth = self.limits.pre_auth;
+
+            tokio::spawn(async move {
+                let _slot = slot;
+                let deadline = tokio::time::Instant::now() + pre_auth;
+                // The version and key exchange run inside the deadline too: a
+                // peer that never sends its version line holds a slot just the
+                // same.
+                let session = match tokio::time::timeout_at(
+                    deadline,
+                    russh::server::run_stream(config, socket, handler),
+                )
+                .await
+                {
+                    Ok(Ok(session)) => session,
+                    Ok(Err(error)) => {
+                        tracing::debug!(%peer, ?error, "SSH connection setup failed");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::info!(%peer, "SSH connection dropped: no handshake before the deadline");
+                        return;
+                    }
+                };
+                let handle = session.handle();
+                let unauthenticated_at_deadline = async {
+                    tokio::time::sleep_until(deadline).await;
+                    if authenticated.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::future::pending::<()>().await;
+                    }
+                };
+
+                tokio::select! {
+                    reason = disconnect.recv() => {
+                        if handle
+                            .disconnect(
+                                russh::Disconnect::ByApplication,
+                                reason.unwrap_or_default(),
+                                String::new(),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            tracing::debug!(%peer, "failed to send the SSH disconnect message");
+                        }
+                    }
+                    result = session => {
+                        if let Err(error) = result {
+                            tracing::error!("Session error: {:?}", error);
+                        }
+                    }
+                    () = unauthenticated_at_deadline => {
+                        tracing::info!(
+                            %peer,
+                            secs = pre_auth.as_secs(),
+                            "SSH connection dropped: not authenticated before the deadline"
+                        );
+                        if handle
+                            .disconnect(
+                                russh::Disconnect::ByApplication,
+                                "authentication timed out".to_string(),
+                                String::new(),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            tracing::debug!(%peer, "failed to send the SSH disconnect message");
+                        }
+                    }
+                }
+            });
+        }
     }
 }
 
@@ -558,6 +777,9 @@ impl russh::server::Server for SshServer {
             id: self.id,
             peer,
             channels: HashMap::new(),
+            limits: self.limits,
+            authenticated: Arc::default(),
+            live_execs: Arc::default(),
             authenticated_identity: None,
             git_protocol_version: "1".to_string(),
         };
@@ -584,6 +806,15 @@ struct SshHandler {
     /// over THAT channel — a single slot would hand an exec the channel opened
     /// last, and the next exec none at all.
     channels: HashMap<ChannelId, Channel<Msg>>,
+    /// The listener's bounds; this handler enforces the channel budget.
+    limits: ConnectionLimits,
+    /// Set once authentication succeeds; the accept loop's pre-auth deadline
+    /// reads it.
+    authenticated: Arc<std::sync::atomic::AtomicBool>,
+    /// `exec`s on this connection whose git session is still running — they
+    /// count against the channel budget once their channel has left
+    /// `channels`.
+    live_execs: Arc<std::sync::atomic::AtomicUsize>,
     /// Repository-scoped identity resolved during authentication.
     authenticated_identity: Option<AuthenticatedIdentity>,
     /// Git protocol version requested by the client (default: "1").
@@ -985,12 +1216,30 @@ impl Handler for SshHandler {
         Ok(())
     }
 
+    /// The pre-authentication deadline stops here: russh calls this once, on
+    /// the accept that ends authentication, whichever method it was.
+    async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), Self::Error> {
+        self.authenticated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
         tracing::debug!(id = self.id, channel_id = ?channel.id(), "channel_open_session");
+        let open = self.channels.len() + self.live_execs.load(std::sync::atomic::Ordering::SeqCst);
+        if open >= self.limits.channels {
+            tracing::warn!(
+                id = self.id,
+                peer = ?self.peer,
+                max = self.limits.channels,
+                "SSH channel refused: this connection already holds as many as it may"
+            );
+            return Ok(false);
+        }
         self.channels.insert(channel.id(), channel);
         Ok(true)
     }
@@ -1206,6 +1455,33 @@ impl Handler for SshHandler {
             }
         };
 
+        // A place in the git-session limiter the HTTP transport shares,
+        // charged to the account (or, for a deploy key, to the address):
+        // without it one connection multiplexing channels ran a git process
+        // per channel, with no ceiling (card_b14a241b1e18).
+        let git_session = match rg_core::git_sessions::global().try_acquire(
+            rg_core::git_sessions::SessionSource::of(
+                self.authenticated_identity
+                    .as_ref()
+                    .and_then(AuthenticatedIdentity::user_id),
+                self.peer.map(|peer| peer.ip()),
+            ),
+        ) {
+            Ok(permit) => permit,
+            Err(saturated) => {
+                reject_git_exec(
+                    session,
+                    channel_id,
+                    &GitServiceError::Busy(saturated),
+                    self.authenticated_identity.as_ref(),
+                    &service,
+                    &repo_path,
+                )?;
+                return Ok(());
+            }
+        };
+        let live_exec = LiveExec::start(&self.live_execs);
+
         let ch = self
             .channels
             .remove(&channel_id)
@@ -1238,6 +1514,9 @@ impl Handler for SshHandler {
         // is severed mid-objects by a `SIGTERM` unless the shutdown path can
         // find it. See `SharedState::git_sessions`.
         self.shared.git_sessions.spawn(async move {
+            // Both live exactly as long as the git session.
+            let _git_session = git_session;
+            let _live_exec = live_exec;
             tracing::info!(%service_name, path = %repo_full_path.display(), "Starting git SSH session");
 
             // Two watchdogs guard the streaming git session:
@@ -2574,5 +2853,190 @@ mod tests {
         .expect("production SSH entry point ignored the pending shutdown signal");
 
         result.expect("production SSH entry point stopped cleanly");
+    }
+
+    /// A server over an empty database with `limits` in place of the shipped
+    /// ones, listening on an ephemeral port.
+    async fn limited_server(
+        limits: super::ConnectionLimits,
+    ) -> (
+        tempfile::TempDir,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let dir = tempfile::tempdir().expect("create SSH limits test directory");
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            2,
+        )
+        .await
+        .expect("connect SSH limits test database");
+        rg_db::run_migrations(&db)
+            .await
+            .expect("migrate SSH limits test database");
+        let mut server = super::SshServer::new(super::SshServerConfig {
+            host_key_path: dir.path().join("host_ed25519"),
+            listen_addr: "127.0.0.1:0".to_string(),
+            repo_root: dir.path().join("repos"),
+            db,
+            instance_settings: Default::default(),
+            git_stream_timeout_secs: 300,
+            git_idle_timeout_secs: 30,
+            shutdown: None,
+            shutdown_grace_secs: 1,
+            post_push: None,
+            lfs: None,
+        })
+        .expect("build SSH server");
+        server.limits = limits;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind SSH limits listener");
+        let addr = listener.local_addr().expect("read SSH limits address");
+        let task = tokio::spawn(async move {
+            server
+                .run_on_listener(&listener)
+                .await
+                .expect("the SSH limits test server stopped with an error");
+        });
+        (dir, addr, task)
+    }
+
+    /// Read from a raw connection until the server closes it; the bytes it
+    /// sent first.
+    async fn read_until_closed(stream: &mut tokio::net::TcpStream, within: Duration) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        tokio::time::timeout(within, async {
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen.extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+        .await
+        .expect("the server did not close the connection in time");
+        seen
+    }
+
+    /// card_b14a241b1e18: a connection that never authenticates — here, one
+    /// that never even sends its version line — is closed at the deadline
+    /// instead of holding its place for russh's 600 s.
+    #[tokio::test]
+    async fn an_unauthenticated_connection_is_closed_at_the_deadline() {
+        let (_dir, addr, task) = limited_server(super::ConnectionLimits {
+            pre_auth: Duration::from_millis(300),
+            ..super::CONNECTION_LIMITS
+        })
+        .await;
+
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let banner = read_until_closed(&mut silent, Duration::from_secs(10)).await;
+        assert!(
+            banner.starts_with(b"SSH-2.0-"),
+            "the server spoke first: {banner:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "closed after {:?}, not at the 300 ms deadline",
+            started.elapsed()
+        );
+        task.abort();
+    }
+
+    /// The other half of the deadline: a client that completes the key
+    /// exchange and then never authenticates is disconnected too.
+    #[tokio::test]
+    async fn a_handshaken_but_unauthenticated_connection_is_closed_at_the_deadline() {
+        struct AnyHostKey;
+        impl russh::client::Handler for AnyHostKey {
+            type Error = russh::Error;
+            async fn check_server_key(
+                &mut self,
+                _key: &russh::keys::ssh_key::PublicKey,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+
+        let (_dir, addr, task) = limited_server(super::ConnectionLimits {
+            pre_auth: Duration::from_millis(500),
+            ..super::CONNECTION_LIMITS
+        })
+        .await;
+        let client = russh::client::connect(
+            std::sync::Arc::new(russh::client::Config::default()),
+            addr,
+            AnyHostKey,
+        )
+        .await
+        .expect("the key exchange completes inside the deadline");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !client.is_closed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "an unauthenticated connection outlived its deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        task.abort();
+    }
+
+    /// card_b14a241b1e18: one source holds at most `per_source` connections;
+    /// the next is closed before the server says anything, and the place comes
+    /// back when one of the open ones ends.
+    #[tokio::test]
+    async fn one_source_holds_at_most_its_connections() {
+        let (_dir, addr, task) = limited_server(super::ConnectionLimits {
+            per_source: 2,
+            ..super::CONNECTION_LIMITS
+        })
+        .await;
+
+        async fn banner(stream: &mut tokio::net::TcpStream) -> [u8; 8] {
+            use tokio::io::AsyncReadExt as _;
+            let mut buf = [0u8; 8];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+                .await
+                .expect("no banner")
+                .expect("read banner");
+            buf
+        }
+        let mut first = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert_eq!(&banner(&mut first).await, b"SSH-2.0-");
+        let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert_eq!(&banner(&mut second).await, b"SSH-2.0-");
+
+        let mut third = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(
+            read_until_closed(&mut third, Duration::from_secs(5))
+                .await
+                .is_empty(),
+            "the third connection from one source must be closed unanswered"
+        );
+
+        drop(first);
+        let mut admitted = false;
+        for _ in 0..50 {
+            let mut retry = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut buf = [0u8; 8];
+            use tokio::io::AsyncReadExt as _;
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(200), retry.read_exact(&mut buf)).await
+            {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(admitted, "a closed connection's place came back");
+        drop(second);
+        task.abort();
     }
 }

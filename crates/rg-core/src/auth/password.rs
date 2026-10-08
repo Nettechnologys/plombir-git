@@ -180,6 +180,9 @@ impl PasswordWorkLimiter {
 
     /// Take a place, or say at once why there is none.
     fn admit(&self, source: Option<IpAddr>) -> Result<Admission> {
+        // One subscriber's share, not one address's: an IPv6 host has a /64
+        // of addresses to spread its checks over.
+        let source = source.map(crate::net::abuse_source);
         let mut admitted = lock_admitted(&self.admitted);
         if admitted.total >= self.capacity {
             return Err(saturated("every slot and queue place is taken"));
@@ -349,9 +352,10 @@ fn credit_burns(burned: usize) {
 /// apart either.
 ///
 /// `source` is the client address *when the transport knows it for certain* —
-/// the TCP peer of an SSH session. It caps how many checks one address may
-/// have in flight. Pass `None` where the only address on hand is one the client
-/// could have written itself.
+/// the TCP peer of an SSH session, or the address the HTTP server resolved
+/// against its trusted proxies. It caps how many checks one source (an IPv4
+/// address, an IPv6 /64) may have in flight. Pass `None` where the only
+/// address on hand is one the client could have written itself.
 ///
 /// `Ok(false)` covers both rejections the caller is allowed to answer with:
 /// there is no such account, or the password is wrong. An unusable stored hash
@@ -395,9 +399,12 @@ fn verify_password_or_dummy_blocking(password: &str, stored_hash: Option<&str>) 
 /// lost pool task): the caller must answer with it rather than with its own
 /// rejection, or a full limiter would answer unknown accounts fast and known
 /// ones with a `503`.
-pub async fn burn_dummy_verification(password: &str) -> Result<()> {
+///
+/// `source` is the same as [`verify_password_or_dummy`]'s: the burn takes the
+/// place of a verification and shares its per-source share.
+pub async fn burn_dummy_verification(password: &str, source: Option<IpAddr>) -> Result<()> {
     let password = password.to_owned();
-    off_runtime(None, move || burn_dummy_verification_blocking(&password)).await
+    off_runtime(source, move || burn_dummy_verification_blocking(&password)).await
 }
 
 fn burn_dummy_verification_blocking(password: &str) {

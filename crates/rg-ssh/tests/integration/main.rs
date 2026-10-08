@@ -25,4 +25,5 @@ mod ssh_mfa_password_tests;
 mod ssh_push_hook_tests;
 mod ssh_push_policy_tests;
 mod ssh_push_tests;
+mod ssh_resource_limit_tests;
 mod ssh_shutdown_tests;

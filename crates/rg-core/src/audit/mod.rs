@@ -18,4 +18,4 @@ pub mod archiver;
 #[path = "audit.rs"]
 mod audit_impl;
 
-pub use audit_impl::{extract_ip_and_ua, record, AuditActor};
+pub use audit_impl::{extract_ip_and_ua, record, AuditActor, CLIENT_IP_HEADER};

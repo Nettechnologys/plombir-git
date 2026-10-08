@@ -25,7 +25,7 @@ use crate::config::{
     DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX, DEFAULT_AUTH_RATE_LIMIT_WINDOW,
     DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER, DEFAULT_CI_DOCKER,
     DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_LOG_MAX_SIZE_MB,
-    DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
+    DEFAULT_METRICS_ENABLED, DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
 };
 use crate::dbconn;
 use crate::telemetry;
@@ -648,6 +648,31 @@ async fn establish_encryption_key(
     let had_marker = rg_core::auth::key_check::has_encryption_key_check(db).await?;
     let legacy_probe =
         rg_core::auth::key_check::verify_encryption_key(db, &secrets.encryption_key).await?;
+    let holds_encrypted_data = had_marker || !legacy_probe.is_empty();
+
+    // An at-rest key set to the signing secret makes the two one secret again:
+    // whoever reads the JWT secret — it signs every session, and lives in every
+    // `.env` — also decrypts TOTP seeds, CI secrets and SSO/LDAP passwords. The
+    // deployment guide's own quick start used to write one value into both
+    // (card_60b16673b390). On a database that holds nothing encrypted yet there
+    // is nothing to keep readable, so the start is refused; on one that does, the
+    // data was encrypted under that value and refusing would only lock it away,
+    // so it is said loudly instead, with the way out.
+    if secrets.missing_key_file.is_none() && secrets.encryption_key == secrets.jwt_secret {
+        if !holds_encrypted_data {
+            anyhow::bail!(
+                "the at-rest encryption key is the same value as the JWT signing secret. Give \
+                 PLOMBIR_GIT_ENCRYPTION_KEY (or [auth].encryption_key) a value of its own, or \
+                 leave it unset so the server creates its own key file. Nothing has been \
+                 written."
+            );
+        }
+        tracing::warn!(
+            "the at-rest encryption key is the same value as the JWT signing secret: a leak \
+             of one is a leak of both. Move the data to a key of its own with \
+             `plombir-git rotate-encryption-key` (see deploy/README.md, \"Secrets and rotation\")"
+        );
+    }
 
     if let Some(path) = secrets.missing_key_file.take() {
         let key_to_persist = if had_marker || !legacy_probe.is_empty() {
@@ -880,6 +905,35 @@ pub(crate) async fn run_serve(
     if resolved_external_webhook_secret.is_some() {
         tracing::info!("Inbound external-webhook HMAC-SHA256 verification enabled");
     }
+
+    // `GET /metrics` sits on the main HTTP port: behind the recommended proxy
+    // it is on the internet unless the proxy refuses it or a token guards it
+    // (card_ab8a1ca92a56). Env var wins, then the config file.
+    let resolved_metrics_enabled = cfg
+        .as_ref()
+        .and_then(|c| c.observability.metrics_enabled)
+        .unwrap_or(DEFAULT_METRICS_ENABLED);
+    let resolved_metrics_token = env_secret("PLOMBIR_GIT_METRICS_TOKEN")
+        .or_else(|| {
+            cfg.as_ref()
+                .and_then(|c| c.observability.metrics_token.clone())
+        })
+        .filter(|token| !token.trim().is_empty());
+    if !resolved_metrics_enabled {
+        tracing::info!("GET /metrics is switched off ([observability].metrics_enabled = false)");
+    } else if resolved_metrics_token.is_some() {
+        tracing::info!("GET /metrics requires the configured bearer token");
+    } else {
+        tracing::warn!(
+            "GET /metrics is open to anyone who reaches the HTTP port: set \
+             [observability].metrics_token (or PLOMBIR_GIT_METRICS_TOKEN), or have the reverse \
+             proxy refuse /metrics"
+        );
+    }
+    let resolved_metrics_access = rg_http::metrics::MetricsAccess::new(
+        resolved_metrics_enabled,
+        resolved_metrics_token.as_deref().map(str::trim),
+    );
 
     // Timeouts from config (with defaults)
     let resolved_job_timeout = cfg
@@ -1376,6 +1430,7 @@ pub(crate) async fn run_serve(
         source_url: resolved_source_url,
         notification_hub: Some(notification_hub.clone()),
         instance_settings: instance_settings.clone(),
+        metrics_access: resolved_metrics_access,
     };
 
     // ── SSH server ────────────────────────────────────────────────
@@ -2041,6 +2096,65 @@ mod serve_tests {
             "{message}"
         );
         assert!(message.contains("Nothing has been changed"), "{message}");
+    }
+
+    /// card_60b16673b390: an at-rest key equal to the signing secret is refused
+    /// on a database that holds nothing encrypted yet — the quick-start mistake —
+    /// and only warned about on one whose data was encrypted under it.
+    #[tokio::test]
+    async fn an_encryption_key_equal_to_the_jwt_secret_is_refused_on_a_fresh_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path()).await;
+        let shared = "one-value-pasted-into-both-variables";
+        let mut equal = super::AuthSecrets {
+            jwt_secret: shared.to_owned(),
+            encryption_key: shared.to_owned(),
+            missing_key_file: None,
+        };
+        let error = super::establish_encryption_key(&db, &mut equal)
+            .await
+            .expect_err("equal secrets on a fresh database must refuse the start");
+        let message = format!("{error:#}");
+        assert!(message.contains("same value"), "{message}");
+        assert!(
+            !rg_core::auth::key_check::has_encryption_key_check(&db)
+                .await
+                .unwrap(),
+            "a refused start must not stamp the marker"
+        );
+
+        let mut distinct = super::AuthSecrets {
+            jwt_secret: shared.to_owned(),
+            encryption_key: "a-key-of-its-own".to_owned(),
+            missing_key_file: None,
+        };
+        super::establish_encryption_key(&db, &mut distinct)
+            .await
+            .expect("distinct secrets start");
+    }
+
+    #[tokio::test]
+    async fn equal_secrets_over_data_encrypted_with_them_still_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path()).await;
+        let shared = "the-value-an-older-guide-put-in-both";
+        let mut first = super::AuthSecrets {
+            jwt_secret: "a-different-signing-secret".to_owned(),
+            encryption_key: shared.to_owned(),
+            missing_key_file: None,
+        };
+        super::establish_encryption_key(&db, &mut first)
+            .await
+            .expect("stamp the marker under the shared value");
+
+        let mut equal = super::AuthSecrets {
+            jwt_secret: shared.to_owned(),
+            encryption_key: shared.to_owned(),
+            missing_key_file: None,
+        };
+        super::establish_encryption_key(&db, &mut equal)
+            .await
+            .expect("refusing would lock away data encrypted under this key");
     }
 
     /// `FOO=` in a `.env` is "not set", not "the empty secret" — see

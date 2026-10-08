@@ -320,30 +320,11 @@ pub async fn get_audit_log(
     }))
 }
 
-/// Extract client IP and User-Agent from request headers.
+/// Client IP and User-Agent for the login log — the same reading the audit
+/// log takes, so the two journals cannot disagree about where a request came
+/// from.
 pub(crate) fn extract_ip_and_ua(headers: &HeaderMap) -> (Option<String>, Option<String>) {
-    use axum::http::header;
-
-    let ip_address = headers
-        .get("X-Forwarded-For")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
-        .map(|address| address.to_string())
-        .or_else(|| {
-            headers
-                .get("X-Real-IP")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
-                .map(|address| address.to_string())
-        });
-
-    let user_agent = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.chars().take(512).collect());
-
-    (ip_address, user_agent)
+    rg_core::audit::extract_ip_and_ua(headers)
 }
 
 #[cfg(test)]
@@ -364,7 +345,16 @@ mod tests {
             HeaderValue::from_str(&"a".repeat(600)).unwrap(),
         );
         let (ip, user_agent) = extract_ip_and_ua(&headers);
-        assert_eq!(ip.as_deref(), Some("2001:db8::1"));
+        assert_eq!(ip, None, "a forwarding header is the client's word");
         assert_eq!(user_agent.unwrap().len(), 512);
+
+        headers.insert(
+            crate::client_ip::CLIENT_IP_HEADER,
+            HeaderValue::from_static("2001:db8::1"),
+        );
+        assert_eq!(
+            extract_ip_and_ua(&headers).0.as_deref(),
+            Some("2001:db8::1")
+        );
     }
 }

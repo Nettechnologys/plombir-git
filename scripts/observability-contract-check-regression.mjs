@@ -113,6 +113,7 @@ function runHelperFixture(
   {
     plombirGitPorts = [['8080', '8080'], ['2222', '2222']],
     sidecarPorts = [],
+    alertsUnrouted = true,
   } = {},
 ) {
   const fixture = fixtureRoot();
@@ -162,6 +163,9 @@ exit 0
         ...process.env,
         FAKE_COMPOSE_CONFIG: composeConfig,
         CURL_LOG: curlLog,
+        // The shipped receivers are placeholders, and the helper refuses them
+        // unless told this run knowingly routes alerts nowhere.
+        PLOMBIR_GIT_ALERTS_UNROUTED: alertsUnrouted ? '1' : '',
         PATH: `${bin}:${process.env.PATH ?? ''}`,
       },
     });
@@ -189,8 +193,8 @@ runMutationFixture(
   'a changed compose host port without updated operator URLs fails the contract',
   (fixture) => replaceRequired(
     join(fixture, 'deploy', 'docker-compose.yml'),
-    '- "8080:8080"   # HTTP',
-    '- "8181:8080"   # HTTP',
+    '- "127.0.0.1:8080:8080"   # HTTP',
+    '- "127.0.0.1:8181:8080"   # HTTP',
   ),
   'Quick Start Access URL disagrees with the compose published HTTP port: 8080 != 8181',
 );
@@ -199,8 +203,8 @@ runMutationFixture(
   'a changed compose container port without an updated scrape target fails the contract',
   (fixture) => replaceRequired(
     join(fixture, 'deploy', 'docker-compose.yml'),
-    '- "8080:8080"   # HTTP',
-    '- "8080:8181"   # HTTP',
+    '- "127.0.0.1:8080:8080"   # HTTP',
+    '- "127.0.0.1:8080:8181"   # HTTP',
   ),
   'Prometheus Plombir Git target disagrees with the compose container HTTP port: 8080 != 8181',
 );
@@ -267,20 +271,20 @@ runMutationFixture(
   'a quoted sidecar cannot lend its HTTP mapping to the Plombir Git service',
   (fixture) => {
     const compose = join(fixture, 'deploy', 'docker-compose.yml');
-    replaceRequired(compose, '      - "8080:8080"   # HTTP\n', '');
+    replaceRequired(compose, '      - "127.0.0.1:8080:8080"   # HTTP\n', '');
     replaceRequired(
       compose,
       '\nvolumes:\n',
       `\n  "sidecar":
     image: busybox:1.36
     ports:
-      - "8080:8080"   # HTTP
+      - "127.0.0.1:8080:8080"   # HTTP
 
 volumes:
 `,
     );
   },
-  'deploy/docker-compose.yml # HTTP mapping "8080:8080" must identify exactly one services.plombir-git.ports entry',
+  'deploy/docker-compose.yml # HTTP mapping "127.0.0.1:8080:8080" must identify exactly one services.plombir-git.ports entry',
 );
 
 runMutationFixture(
@@ -294,13 +298,13 @@ runMutationFixture(
       `\n  "sidecar":
     image: busybox:1.36
     ports:
-      - "8080:8080"   # HTTP
+      - "127.0.0.1:8080:8080"   # HTTP
 
 volumes:
 `,
     );
   },
-  'deploy/docker-compose.yml # HTTP mapping "8080:8080" must identify exactly one services.plombir-git.ports entry',
+  'deploy/docker-compose.yml # HTTP mapping "127.0.0.1:8080:8080" must identify exactly one services.plombir-git.ports entry',
 );
 
 runMutationFixture(
@@ -310,7 +314,7 @@ runMutationFixture(
     '# HTTP',
     '# WEB',
   ),
-  'must contain exactly one numeric "HOST:CONTAINER" Plombir Git port mapping marked "# HTTP"; parsed 0',
+  'must contain exactly one loopback "127.0.0.1:HOST:CONTAINER" Plombir Git port mapping marked "# HTTP"; parsed 0',
 );
 
 runMutationFixture(
@@ -342,11 +346,20 @@ runHelperFixture(
 );
 
 runHelperFixture(
+  'the helper refuses to start while alerts go to the shipped placeholder receivers',
+  null,
+  1,
+  'still routes alerts to the shipped placeholders',
+  '',
+  { alertsUnrouted: false },
+);
+
+runHelperFixture(
   'the helper follows a changed compose host port without a second literal',
   (fixture) => replaceRequired(
     join(fixture, 'deploy', 'docker-compose.yml'),
-    '- "8080:8080"   # HTTP',
-    '- "8181:8080"   # HTTP',
+    '- "127.0.0.1:8080:8080"   # HTTP',
+    '- "127.0.0.1:8181:8080"   # HTTP',
   ),
   0,
   'Plombir Git:      http://localhost:8181/metrics',
@@ -369,14 +382,14 @@ runHelperFixture(
   'the helper rejects an HTTP mapping owned by a quoted sidecar service',
   (fixture) => {
     const compose = join(fixture, 'deploy', 'docker-compose.yml');
-    replaceRequired(compose, '      - "8080:8080"   # HTTP\n', '');
+    replaceRequired(compose, '      - "127.0.0.1:8080:8080"   # HTTP\n', '');
     replaceRequired(
       compose,
       '\nvolumes:\n',
       `\n  "sidecar":
     image: busybox:1.36
     ports:
-      - "8181:8080"   # HTTP
+      - "127.0.0.1:8181:8080"   # HTTP
 
 volumes:
 `,
@@ -402,7 +415,7 @@ runHelperFixture(
       `\n  "sidecar":
     image: busybox:1.36
     ports:
-      - "8080:8080"   # HTTP
+      - "127.0.0.1:8080:8080"   # HTTP
 
 volumes:
 `,

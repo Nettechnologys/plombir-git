@@ -91,11 +91,13 @@ struct StagedGitBody {
 /// bounded channel so socket backpressure trips the same idle window.
 async fn stage_git_body(
     body: axum::body::Body,
+    coding: RequestCoding,
     repo_root: &std::path::Path,
     max_bytes: usize,
     idle_secs: u64,
 ) -> Result<StagedGitBody, (StatusCode, String)> {
     use http_body_util::BodyExt;
+    use std::io::Write as _;
 
     let staging_dir = rg_core::staging::StagingArea::GitRequests.path_in(repo_root);
     tokio::fs::create_dir_all(&staging_dir)
@@ -131,6 +133,12 @@ async fn stage_git_body(
     let idle = (idle_secs > 0).then(|| std::time::Duration::from_secs(idle_secs));
     let mut body = body;
     let mut written = 0_usize;
+    // The ceiling counts what git will read — the decoded bytes — so a small
+    // compressed body cannot expand past it.
+    let mut decoder = match coding {
+        RequestCoding::Identity => None,
+        RequestCoding::Gzip => Some(flate2::write::GzDecoder::new(Vec::new())),
+    };
 
     loop {
         // Await the next frame, bounded by the idle window when enabled.
@@ -150,28 +158,22 @@ async fn stage_git_body(
         match framed {
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
-                    written = written
-                        .checked_add(data.len())
-                        .filter(|size| *size <= max_bytes)
-                        .ok_or_else(|| {
-                            (
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                format!(
-                                    "git request body exceeds the configured {max_bytes}-byte limit"
-                                ),
-                            )
-                        })?;
-                    file.write_all(&data).await.map_err(|error| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            rg_core::platform::fs::describe_path_error(
-                                "git request staging file",
-                                &path,
-                                &error,
-                                rg_core::platform::fs::BLOB_STORAGE_HINT,
-                            ),
-                        )
-                    })?;
+                    match decoder.as_mut() {
+                        None => {
+                            append_staged(&mut file, &path, &mut written, max_bytes, &data).await?;
+                        }
+                        // Fed a slice at a time, the decoded output on hand is
+                        // bounded by one slice's worth of deflate expansion
+                        // (~1 MiB), not by the frame the client chose to send.
+                        Some(decoder) => {
+                            for slice in data.chunks(GZIP_INPUT_SLICE) {
+                                decoder.write_all(slice).map_err(malformed_gzip)?;
+                                let decoded = std::mem::take(decoder.get_mut());
+                                append_staged(&mut file, &path, &mut written, max_bytes, &decoded)
+                                    .await?;
+                            }
+                        }
+                    }
                 }
                 // A trailers-only frame carries no data — nothing to stage.
             }
@@ -196,6 +198,13 @@ async fn stage_git_body(
                 ));
             }
         }
+    }
+
+    if let Some(mut decoder) = decoder {
+        // A body that ends inside the gzip stream is a truncated request.
+        decoder.try_finish().map_err(malformed_gzip)?;
+        let decoded = std::mem::take(decoder.get_mut());
+        append_staged(&mut file, &path, &mut written, max_bytes, &decoded).await?;
     }
 
     file.flush().await.map_err(|error| {
@@ -224,6 +233,87 @@ async fn stage_git_body(
         })?;
 
     Ok(StagedGitBody { file, path })
+}
+
+/// How a git request body is encoded on the wire.
+///
+/// Stock git compresses every stateless upload-pack request longer than 1 KiB
+/// (`remote-curl.c`: `Content-Encoding: gzip`), which is any fetch with more
+/// than a couple of dozen `have` lines — a clone that has commits of its own,
+/// or many branches. The body went to the protocol parser as compressed bytes,
+/// and the fetch died with `500 invalid utf-8 sequence`; whether one did
+/// depended on how many haves the client's negotiator put in that round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestCoding {
+    Identity,
+    Gzip,
+}
+
+/// The coding of a git request body, or a `415` for one this server does not
+/// decode — never compressed bytes handed to the parser as if they were
+/// pkt-lines.
+fn request_coding(headers: &axum::http::HeaderMap) -> Result<RequestCoding, (StatusCode, String)> {
+    let Some(value) = headers.get(header::CONTENT_ENCODING) else {
+        return Ok(RequestCoding::Identity);
+    };
+    let coding = value
+        .to_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match coding.as_str() {
+        "" | "identity" => Ok(RequestCoding::Identity),
+        "gzip" | "x-gzip" => Ok(RequestCoding::Gzip),
+        _ => Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("git request body uses Content-Encoding `{coding}`; only gzip is accepted"),
+        )),
+    }
+}
+
+/// Compressed input fed to the gzip decoder per step. Deflate expands at most
+/// ~1032:1, so this caps the decoded bytes held in memory at about 1 MiB.
+const GZIP_INPUT_SLICE: usize = 1024;
+
+fn malformed_gzip(error: std::io::Error) -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("git request body is not a valid gzip stream: {error}"),
+    )
+}
+
+/// Write `bytes` to the staging file, refusing the request once the total
+/// passes `max_bytes`.
+async fn append_staged(
+    file: &mut tokio::fs::File,
+    path: &std::path::Path,
+    written: &mut usize,
+    max_bytes: usize,
+    bytes: &[u8],
+) -> Result<(), (StatusCode, String)> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    *written = written
+        .checked_add(bytes.len())
+        .filter(|size| *size <= max_bytes)
+        .ok_or_else(|| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("git request body exceeds the configured {max_bytes}-byte limit"),
+            )
+        })?;
+    file.write_all(bytes).await.map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            rg_core::platform::fs::describe_path_error(
+                "git request staging file",
+                path,
+                &error,
+                rg_core::platform::fs::BLOB_STORAGE_HINT,
+            ),
+        )
+    })
 }
 
 /// Check repository access for git protocol.
@@ -631,10 +721,12 @@ enum UploadPackOutcome {
 /// mid-pack ones, and those are reported the way the git protocol reports them:
 /// a band-3 error from rg-git plus a broken body here, never a tidy short
 /// response that reads as a complete clone (`card_2bfc8c1d8648`).
+#[allow(clippy::too_many_arguments)]
 async fn stream_upload_pack_response(
     protocol: UploadPackProtocol,
     repo_path: std::path::PathBuf,
     staged: StagedGitBody,
+    session: rg_core::git_sessions::GitSessionPermit,
     stream_timeout_secs: u64,
     idle_timeout_secs: u64,
     owner: &str,
@@ -644,6 +736,9 @@ async fn stream_upload_pack_response(
     let operation = protocol.operation();
 
     let handler = tokio::spawn(async move {
+        // The place in the git-session limiter lives exactly as long as the
+        // task that owns the `git` child, however the response ends.
+        let _session = session;
         // The spool file travels with its handler: dropping the `TempPath` here
         // rather than in the request scope unlinks it as soon as the pack that
         // reads it is done.
@@ -1107,8 +1202,20 @@ pub(crate) async fn handle_git_upload_pack(
     // Authenticate and resolve repository storage before reading attacker-owned
     // bytes. The request is then spooled under the negotiation ceiling, keeping
     // both unauthenticated work and per-request RAM bounded.
+    let coding = match request_coding(&headers) {
+        Ok(coding) => coding,
+        Err((status, msg)) => {
+            return (
+                status,
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(msg),
+            )
+                .into_response();
+        }
+    };
     let staged = match stage_git_body(
         body,
+        coding,
         &state.repo_root,
         rg_git::protocol::MAX_NEGOTIATION_INPUT_BYTES,
         state.git_idle_timeout_secs,
@@ -1132,10 +1239,16 @@ pub(crate) async fn handle_git_upload_pack(
         UploadPackProtocol::V1
     };
 
+    let session = match acquire_git_session(actor_id, &headers, "upload-pack") {
+        Ok(permit) => permit,
+        Err(saturated) => return git_busy_response(saturated),
+    };
+
     stream_upload_pack_response(
         protocol,
         repo_path,
         staged,
+        session,
         state.git_stream_timeout_secs,
         state.git_idle_timeout_secs,
         &owner,
@@ -1144,12 +1257,50 @@ pub(crate) async fn handle_git_upload_pack(
     .await
 }
 
+/// A place for one git session in the process-wide limiter both transports
+/// share, charged to the account or — anonymous — to the client address the
+/// server resolved (card_444288887c81).
+///
+/// Taken after the request is authorized and staged and before any `git` is
+/// spawned, so a refusal starts nothing. No place is a `503` with
+/// `Retry-After`: the server is busy, which is neither the client's fault nor
+/// a lasting state.
+fn acquire_git_session(
+    actor_id: Option<i64>,
+    headers: &axum::http::HeaderMap,
+    operation: &'static str,
+) -> Result<rg_core::git_sessions::GitSessionPermit, rg_core::git_sessions::GitSessionsSaturated> {
+    let source =
+        rg_core::git_sessions::SessionSource::of(actor_id, crate::client_ip::from_headers(headers));
+    rg_core::git_sessions::global()
+        .try_acquire(source)
+        .inspect_err(|saturated| {
+            tracing::warn!(?source, %operation, %saturated, "git session refused: no place in the limiter");
+        })
+}
+
+/// The answer to a git session [`acquire_git_session`] found no place for.
+fn git_busy_response(saturated: rg_core::git_sessions::GitSessionsSaturated) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (header::CONTENT_TYPE, "text/plain"),
+            (header::RETRY_AFTER, GIT_SESSION_RETRY_AFTER_SECS),
+        ],
+        Body::from(format!("{saturated}\n")),
+    )
+        .into_response()
+}
+
+/// How long a refused git client is told to wait — about one fetch.
+const GIT_SESSION_RETRY_AFTER_SECS: &str = "5";
+
 pub(crate) async fn handle_git_receive_pack(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     axum::extract::Path((owner, repo)): axum::extract::Path<(String, String)>,
     body: axum::body::Body,
-) -> impl IntoResponse {
+) -> Response {
     // Strip .git suffix so both `owner/repo.git` and `owner/repo` work
     let repo = strip_git_suffix(&repo);
     // H-02: Validate owner/repo before constructing repository path
@@ -1158,14 +1309,16 @@ pub(crate) async fn handle_git_receive_pack(
             StatusCode::BAD_REQUEST,
             [(header::CONTENT_TYPE, "text/plain")],
             Body::from(e.to_string()),
-        );
+        )
+            .into_response();
     }
     if let Err(e) = rg_core::platform::validate_repo_path(&repo) {
         return (
             StatusCode::BAD_REQUEST,
             [(header::CONTENT_TYPE, "text/plain")],
             Body::from(e.to_string()),
-        );
+        )
+            .into_response();
     }
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
@@ -1178,16 +1331,17 @@ pub(crate) async fn handle_git_receive_pack(
                 git_db_status(&e),
                 [(header::CONTENT_TYPE, "text/plain")],
                 Body::from(git_failure_body("resolve git credential", &e)),
-            );
+            )
+                .into_response();
         }
     };
     let actor_id = credential.as_ref().map(|credential| credential.user_id);
     if let Err(resp) = git_grant_refusal(&state, credential.as_ref(), &owner, &repo, &headers).await
     {
-        return (resp.0, resp.1, Body::from(resp.2));
+        return (resp.0, resp.1, Body::from(resp.2)).into_response();
     }
     if let Err(resp) = check_git_access(&state.db, &owner, &repo, actor_id, true).await {
-        return (resp.0, resp.1, Body::from(resp.2));
+        return (resp.0, resp.1, Body::from(resp.2)).into_response();
     }
 
     if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
@@ -1198,7 +1352,8 @@ pub(crate) async fn handle_git_receive_pack(
                 "application/x-git-receive-pack-result",
             )],
             Body::from(git_failure_body("open repository", &e)),
-        );
+        )
+            .into_response();
     }
 
     // Record push duration + count across every return path below.
@@ -1214,7 +1369,8 @@ pub(crate) async fn handle_git_receive_pack(
                     "application/x-git-receive-pack-result",
                 )],
                 Body::from("repository not found"),
-            );
+            )
+                .into_response();
         }
         Err(e) => {
             return (
@@ -1224,7 +1380,8 @@ pub(crate) async fn handle_git_receive_pack(
                     "application/x-git-receive-pack-result",
                 )],
                 Body::from(git_failure_body("load repository", &e)),
-            );
+            )
+                .into_response();
         }
     };
     // Decided before anything is spawned, in the one loader SSH calls too: the
@@ -1255,15 +1412,28 @@ pub(crate) async fn handle_git_receive_pack(
                     "application/x-git-receive-pack-result",
                 )],
                 Body::from(git_failure_body("load push policy", &e)),
-            );
+            )
+                .into_response();
         }
     };
 
     // All access and policy reads happen before the body is consumed. A valid
     // pusher's request is spooled to disk under the same ceiling rg-git applies
     // again at pack ingestion, so neither HTTP nor SSH has an unbounded path.
+    let coding = match request_coding(&headers) {
+        Ok(coding) => coding,
+        Err((status, msg)) => {
+            return (
+                status,
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(msg),
+            )
+                .into_response();
+        }
+    };
     let staged = match stage_git_body(
         body,
+        coding,
         &state.repo_root,
         rg_git::protocol::receive_pack::MAX_PACK_INPUT_BYTES,
         state.git_idle_timeout_secs,
@@ -1276,8 +1446,15 @@ pub(crate) async fn handle_git_receive_pack(
                 status,
                 [(header::CONTENT_TYPE, "text/plain")],
                 Body::from(msg),
-            );
+            )
+                .into_response();
         }
+    };
+    // Held until this handler returns, which is when the `git` children of
+    // the push are gone.
+    let _session = match acquire_git_session(actor_id, &headers, "receive-pack") {
+        Ok(permit) => permit,
+        Err(saturated) => return git_busy_response(saturated),
     };
     let StagedGitBody {
         file,
@@ -1340,7 +1517,7 @@ pub(crate) async fn handle_git_receive_pack(
                 ref_updates,
             );
 
-            response
+            response.into_response()
         }
         // No outcome came back — but "no outcome" does not mean "nothing
         // happened". A wall-clock budget that elapses after `update_ref` drops
@@ -1379,7 +1556,7 @@ pub(crate) async fn handle_git_receive_pack(
                 );
             }
 
-            response
+            response.into_response()
         }
     }
 }
@@ -1490,7 +1667,7 @@ mod tests {
         }));
 
         let root = tempfile::tempdir().unwrap();
-        let err = stage_git_body(body, root.path(), 1024, 1)
+        let err = stage_git_body(body, super::RequestCoding::Identity, root.path(), 1024, 1)
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::GATEWAY_TIMEOUT, "idle drip → 504");
@@ -1510,7 +1687,7 @@ mod tests {
         }));
 
         let root = tempfile::tempdir().unwrap();
-        let mut staged = stage_git_body(body, root.path(), 1024, 1)
+        let mut staged = stage_git_body(body, super::RequestCoding::Identity, root.path(), 1024, 1)
             .await
             .expect("continuous traffic must not trip");
         let mut bytes = Vec::new();
@@ -1532,7 +1709,7 @@ mod tests {
         }));
 
         let root = tempfile::tempdir().unwrap();
-        let mut staged = stage_git_body(body, root.path(), 1024, 0)
+        let mut staged = stage_git_body(body, super::RequestCoding::Identity, root.path(), 1024, 0)
             .await
             .expect("disabled window must not trip");
         let mut bytes = Vec::new();
@@ -1549,12 +1726,103 @@ mod tests {
             Ok::<_, std::io::Error>(Bytes::from_static(b"45")),
         ]));
 
-        let error = stage_git_body(body, root.path(), 4, 0)
+        let error = stage_git_body(body, super::RequestCoding::Identity, root.path(), 4, 0)
             .await
             .expect_err("the fifth byte must be refused");
 
         assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(std::fs::read_dir(staging_dir).unwrap().count(), 0);
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Stock git gzips every upload-pack request over 1 KiB; the staged file
+    /// must hold what git wrote, not what went over the wire.
+    #[tokio::test]
+    async fn stage_git_body_decodes_a_gzip_request() {
+        let request: Vec<u8> = (0..200)
+            .flat_map(|n| format!("0032have {n:040}\n").into_bytes())
+            .collect();
+        let compressed = gzip(&request);
+        // Split mid-stream, the way the transport may deliver it.
+        let (head, tail) = compressed.split_at(compressed.len() / 2);
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::copy_from_slice(head)),
+            Ok::<_, std::io::Error>(Bytes::copy_from_slice(tail)),
+        ]));
+        let root = tempfile::tempdir().unwrap();
+        let mut staged = stage_git_body(body, super::RequestCoding::Gzip, root.path(), 1 << 20, 0)
+            .await
+            .expect("a gzip request is staged decoded");
+        let mut bytes = Vec::new();
+        staged.file.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, request);
+    }
+
+    /// The ceiling is on the decoded size: a few KiB of gzip that expands past
+    /// it is refused, however small it was on the wire.
+    #[tokio::test]
+    async fn stage_git_body_holds_a_gzip_bomb_to_the_decoded_ceiling() {
+        let bomb = gzip(&vec![0u8; 8 << 20]);
+        assert!(
+            bomb.len() < 64 << 10,
+            "the fixture must be small on the wire"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let error = stage_git_body(
+            Body::from(bomb),
+            super::RequestCoding::Gzip,
+            root.path(),
+            1 << 20,
+            0,
+        )
+        .await
+        .expect_err("the decoded bytes pass the ceiling");
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn stage_git_body_refuses_a_body_that_is_not_gzip() {
+        let root = tempfile::tempdir().unwrap();
+        let mut truncated = gzip(b"0009done\n0000");
+        truncated.truncate(truncated.len() - 6);
+        for body in [b"0009done\n".to_vec(), truncated] {
+            let error = stage_git_body(
+                Body::from(body),
+                super::RequestCoding::Gzip,
+                root.path(),
+                1 << 20,
+                0,
+            )
+            .await
+            .expect_err("not a complete gzip stream");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn request_coding_accepts_gzip_and_refuses_what_it_cannot_decode() {
+        let with = |value: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::CONTENT_ENCODING, value.parse().unwrap());
+            super::request_coding(&headers)
+        };
+        assert_eq!(
+            super::request_coding(&axum::http::HeaderMap::new()),
+            Ok(super::RequestCoding::Identity)
+        );
+        assert_eq!(with("gzip"), Ok(super::RequestCoding::Gzip));
+        assert_eq!(with(" GZIP "), Ok(super::RequestCoding::Gzip));
+        assert_eq!(with("identity"), Ok(super::RequestCoding::Identity));
+        assert_eq!(
+            with("br").map_err(|(status, _)| status),
+            Err(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
     }
 
     #[test]
@@ -1953,6 +2221,7 @@ mod tests {
             super::UploadPackProtocol::V1,
             std::path::PathBuf::from("/nonexistent-repo.git"),
             staged_request(b"zzzz").await,
+            rg_core::git_sessions::global().try_acquire(None).unwrap(),
             30,
             30,
             "owner",
@@ -2027,6 +2296,7 @@ mod tests {
             super::UploadPackProtocol::V1,
             repo,
             staged_request(&request).await,
+            rg_core::git_sessions::global().try_acquire(None).unwrap(),
             30,
             30,
             "owner",
@@ -2053,6 +2323,7 @@ mod tests {
             super::UploadPackProtocol::V2,
             std::path::PathBuf::from("/nonexistent-repo.git"),
             staged_request(b"0000").await,
+            rg_core::git_sessions::global().try_acquire(None).unwrap(),
             30,
             30,
             "owner",

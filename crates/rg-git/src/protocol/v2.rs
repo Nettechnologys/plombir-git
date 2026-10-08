@@ -120,7 +120,7 @@ where
                 shallow,
                 filter,
                 done,
-                client_caps,
+                pack,
             } => {
                 tracing::debug!(
                     wants = wants.len(),
@@ -137,7 +137,7 @@ where
                     &shallow,
                     &filter,
                     done,
-                    &client_caps,
+                    pack,
                 )
                 .await?;
             }
@@ -219,7 +219,7 @@ where
                 shallow,
                 filter,
                 done,
-                client_caps,
+                pack,
             } => {
                 tracing::debug!(
                     wants = wants.len(),
@@ -236,7 +236,7 @@ where
                     &shallow,
                     &filter,
                     done,
-                    &client_caps,
+                    pack,
                 )
                 .await?;
             }
@@ -283,6 +283,16 @@ pub async fn send_capability_advertisement<W: AsyncWrite + Unpin>(writer: &mut W
     Ok(())
 }
 
+/// The pack-shaping arguments of a v2 `fetch`. Both default to off: in v2
+/// they are things the client asks for, not things the server assumes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchPackOptions {
+    /// `thin-pack`: deltas may name bases the client already has.
+    pub thin: bool,
+    /// `ofs-delta`: deltas may address their base by pack offset.
+    pub ofs_delta: bool,
+}
+
 /// Command request types in Protocol V2
 #[derive(Debug)]
 pub enum CommandRequest {
@@ -299,7 +309,9 @@ pub enum CommandRequest {
         shallow: ShallowRequest,
         filter: Option<String>,
         done: bool,
-        client_caps: Vec<String>,
+        /// What the client's `thin-pack` / `ofs-delta` arguments allow the
+        /// pack to contain.
+        pack: FetchPackOptions,
     },
     ObjectInfo {
         oid: String,
@@ -329,13 +341,9 @@ pub struct ShallowRequest {
 ///   command-args...
 ///   0000 (flush)
 async fn read_command_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<CommandRequest> {
-    let (command, capabilities, args) = match read_command_frames(reader).await? {
+    let (command, args) = match read_command_frames(reader).await? {
         CommandFrames::Flush => return Ok(CommandRequest::Flush),
-        CommandFrames::Command {
-            command,
-            capabilities,
-            args,
-        } => (command, capabilities, args),
+        CommandFrames::Command { command, args } => (command, args),
     };
 
     let cmd = match command {
@@ -346,7 +354,7 @@ async fn read_command_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Co
     // Parse based on command type
     match cmd.as_str() {
         "ls-refs" => Ok(parse_ls_refs_args(&args)),
-        "fetch" => parse_fetch_args(&args, capabilities),
+        "fetch" => parse_fetch_args(&args),
         "object-info" => Ok(parse_object_info_args(&args, cmd)),
         _ => Ok(CommandRequest::Unknown(cmd)),
     }
@@ -357,11 +365,12 @@ async fn read_command_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Co
 enum CommandFrames {
     /// An empty flush or response-end — the caller should return `Flush`.
     Flush,
-    /// The parsed frames: the `command=` line, capabilities (header section),
-    /// and the args section (after the `0001` delimiter).
+    /// The parsed frames: the `command=` line and the args section (after the
+    /// `0001` delimiter). The header's capability lines (`agent=`,
+    /// `object-format=`, ...) count toward the limits but steer nothing: every
+    /// option a command can ask for is one of its arguments.
     Command {
         command: Option<String>,
-        capabilities: Vec<String>,
         args: Vec<String>,
     },
 }
@@ -383,7 +392,6 @@ async fn read_command_frames_with_limits<R: AsyncRead + Unpin>(
     max_bytes: usize,
 ) -> Result<CommandFrames> {
     let mut command = None;
-    let mut capabilities = Vec::new();
     let mut args = Vec::new();
     let mut found_delimiter = false;
     let mut data_frames = 0_usize;
@@ -425,8 +433,6 @@ async fn read_command_frames_with_limits<R: AsyncRead + Unpin>(
                     // Capability negotiation phase
                     if let Some(cmd) = line.strip_prefix("command=") {
                         command = Some(cmd.to_string());
-                    } else if !line.is_empty() {
-                        capabilities.push(line.to_string());
                     }
                 } else {
                     // Command arguments phase
@@ -436,11 +442,7 @@ async fn read_command_frames_with_limits<R: AsyncRead + Unpin>(
         }
     }
 
-    Ok(CommandFrames::Command {
-        command,
-        capabilities,
-        args,
-    })
+    Ok(CommandFrames::Command { command, args })
 }
 
 /// Parse the args section of an `ls-refs` command.
@@ -479,7 +481,7 @@ fn parse_ls_refs_args(args: &[String]) -> CommandRequest {
 /// Protocol V2 fetch: want/have/done are in the ARGS section (after 0001 delimiter),
 /// while capabilities are in the header section (before 0001 delimiter).
 /// Bug note: earlier version incorrectly parsed args from `capabilities`.
-fn parse_fetch_args(args: &[String], capabilities: Vec<String>) -> Result<CommandRequest> {
+fn parse_fetch_args(args: &[String]) -> Result<CommandRequest> {
     let mut wants = Vec::new();
     let mut haves = Vec::new();
     let mut shallows = Vec::new();
@@ -489,6 +491,7 @@ fn parse_fetch_args(args: &[String], capabilities: Vec<String>) -> Result<Comman
     let mut deepen_not = Vec::new();
     let mut filter = None;
     let mut done = false;
+    let mut pack = FetchPackOptions::default();
 
     for arg in args {
         if let Some(want) = arg.strip_prefix("want ") {
@@ -513,10 +516,13 @@ fn parse_fetch_args(args: &[String], capabilities: Vec<String>) -> Result<Comman
             filter = Some(f.to_string());
         } else if *arg == "done" {
             done = true;
+        } else if *arg == "thin-pack" {
+            pack.thin = true;
+        } else if *arg == "ofs-delta" {
+            pack.ofs_delta = true;
         }
     }
 
-    // capabilities remain in the capabilities list (side-band, ofs-delta, etc.)
     Ok(CommandRequest::Fetch {
         wants,
         haves,
@@ -529,7 +535,7 @@ fn parse_fetch_args(args: &[String], capabilities: Vec<String>) -> Result<Comman
         },
         filter,
         done,
-        client_caps: capabilities,
+        pack,
     })
 }
 
@@ -703,7 +709,7 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
     shallow: &ShallowRequest,
     filter: &Option<String>,
     done: bool,
-    _client_caps: &[String],
+    pack: FetchPackOptions,
 ) -> Result<()> {
     use sideband::{write_sideband_flush, write_sideband_progress};
 
@@ -779,6 +785,7 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
         shallow_update.as_ref(),
         filter.as_deref(),
         use_sideband,
+        pack,
     )
     .await?;
 
@@ -1144,6 +1151,7 @@ fn get_object_size(repo_path: &Path, oid: &str) -> Result<u64> {
 /// TODO(gix): Replace with gix pack generation when available.
 /// The `gix` crate does not yet expose a stable pack-objects API,
 /// so we fall back to the git CLI for this step.
+#[allow(clippy::too_many_arguments)]
 async fn stream_packfile<W: AsyncWrite + Unpin>(
     repo_path: &Path,
     writer: &mut W,
@@ -1152,6 +1160,7 @@ async fn stream_packfile<W: AsyncWrite + Unpin>(
     shallow_update: Option<&ShallowUpdate>,
     filter: Option<&str>,
     use_sideband: bool,
+    pack: FetchPackOptions,
 ) -> Result<u64> {
     use crate::cli_gateway::global_gateway;
     use tokio::io::AsyncWriteExt as _;
@@ -1185,8 +1194,16 @@ async fn stream_packfile<W: AsyncWrite + Unpin>(
         "pack-objects".to_string(),
         "--revs".to_string(),
         "--stdout".to_string(),
-        "--thin".to_string(),
     ];
+    // A thin pack deltas against objects the client claims to have and leaves
+    // them out; a client that did not ask for one cannot resolve those deltas
+    // and fails on `missing delta base`. Same rule as v0/v1 (`PackOptions`).
+    if pack.thin {
+        pack_args.push("--thin".to_string());
+    }
+    if pack.ofs_delta {
+        pack_args.push("--delta-base-offset".to_string());
+    }
     if shallow_update.is_some_and(|update| !update.boundaries.is_empty()) {
         pack_args.push("--shallow".to_string());
     }
@@ -1541,7 +1558,7 @@ mod tests {
         let have = "b".repeat(40);
         let mut buf = Vec::new();
         buf.extend_from_slice(&pkt_bytes(b"command=fetch\n"));
-        buf.extend_from_slice(&pkt_bytes(b"ofs-delta\n"));
+        buf.extend_from_slice(&pkt_bytes(b"agent=git/2.40\n"));
         buf.extend_from_slice(b"0001");
         buf.extend_from_slice(&pkt_bytes(format!("want {want}\n").as_bytes()));
         buf.extend_from_slice(&pkt_bytes(format!("have {have}\n").as_bytes()));
@@ -1551,14 +1568,213 @@ mod tests {
         let mut reader = Cursor::new(buf);
         match read_command_request(&mut reader).await.unwrap() {
             CommandRequest::Fetch {
-                wants, haves, done, ..
+                wants,
+                haves,
+                done,
+                pack,
+                ..
             } => {
                 assert_eq!(wants, vec![want]);
                 assert_eq!(haves, vec![have]);
                 assert!(done);
+                // Nothing asked for, nothing assumed.
+                assert_eq!(pack, FetchPackOptions::default());
             }
             other => panic!("expected Fetch, got {other:?}"),
         }
+    }
+
+    /// card_54503ff49d6b: `thin-pack` and `ofs-delta` are fetch *arguments* in
+    /// v2 — after the delimiter, where stock git sends them.
+    #[tokio::test]
+    async fn read_command_request_reads_pack_arguments() {
+        use std::io::Cursor;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&pkt_bytes(b"command=fetch\n"));
+        buf.extend_from_slice(b"0001");
+        buf.extend_from_slice(&pkt_bytes(b"thin-pack\n"));
+        buf.extend_from_slice(&pkt_bytes(b"ofs-delta\n"));
+        buf.extend_from_slice(&pkt_bytes(format!("want {}\n", "a".repeat(40)).as_bytes()));
+        buf.extend_from_slice(&pkt_bytes(b"done\n"));
+        buf.extend_from_slice(b"0000");
+
+        match read_command_request(&mut Cursor::new(buf)).await.unwrap() {
+            CommandRequest::Fetch { pack, .. } => assert_eq!(
+                pack,
+                FetchPackOptions {
+                    thin: true,
+                    ofs_delta: true
+                }
+            ),
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+    }
+
+    /// A repository whose `newer` commit rewrites one line of a file `older`
+    /// already holds — the shape `pack-objects --thin` deltas against the
+    /// excluded base.
+    fn repository_with_a_deltifiable_change(
+    ) -> (tempfile::TempDir, std::path::PathBuf, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("repo");
+        let git = crate::cli_gateway::GitCommandGateway::new().unwrap();
+        git.run_or_bail(&["init", "-q", repo_path.to_str().unwrap()], None)
+            .unwrap();
+        for args in [
+            vec!["config", "user.email", "fetch@example.com"],
+            vec!["config", "user.name", "Fetch"],
+        ] {
+            git.run_or_bail(&args, Some(&repo_path)).unwrap();
+        }
+        let body: String = (0..400)
+            .map(|n| format!("line {n} of a file long enough to be worth a delta\n"))
+            .collect();
+        let commit = |text: &str, message: &str| {
+            std::fs::write(repo_path.join("big.txt"), text).unwrap();
+            git.run_or_bail(&["add", "big.txt"], Some(&repo_path))
+                .unwrap();
+            git.run_or_bail(&["commit", "-qm", message], Some(&repo_path))
+                .unwrap();
+            git.run(&["rev-parse", "HEAD"], Some(&repo_path))
+                .unwrap()
+                .stdout_str()
+                .trim()
+                .to_string()
+        };
+        let older = commit(&body, "older");
+        let newer = commit(&body.replace("line 200 ", "line 200 changed "), "newer");
+        (dir, repo_path, older, newer)
+    }
+
+    /// Fetch `want` with `have` over v2, and return the band-1 pack bytes.
+    async fn v2_fetch_pack(repo_path: &Path, args: &[&str]) -> Vec<u8> {
+        use std::io::Cursor;
+        let mut request = pkt_bytes(b"command=fetch\n");
+        request.extend_from_slice(b"0001");
+        for arg in args {
+            request.extend_from_slice(&pkt_bytes(format!("{arg}\n").as_bytes()));
+        }
+        request.extend_from_slice(&pkt_bytes(b"done\n"));
+        request.extend_from_slice(b"0000");
+
+        let mut response = Vec::new();
+        handle_v2_http(repo_path, Cursor::new(request), &mut response)
+            .await
+            .expect("v2 fetch succeeded");
+
+        let mut reader = Cursor::new(response);
+        let mut pack = Vec::new();
+        loop {
+            match read_pkt_line(&mut reader).await.unwrap() {
+                PktLine::Data(payload) if payload.first() == Some(&1) => {
+                    pack.extend_from_slice(&payload[1..]);
+                }
+                PktLine::Data(_) | PktLine::Delim => {}
+                PktLine::Flush | PktLine::ResponseEnd => break,
+            }
+        }
+        assert!(pack.starts_with(b"PACK"), "no pack in the response");
+        pack
+    }
+
+    /// Run `git index-pack --strict` without `--fix-thin` on `pack`, inside the
+    /// repository the client is fetching into — here the served one, which
+    /// has every base. `--strict` wants the commit's parent to exist; only
+    /// `--fix-thin` would let a delta borrow its base from the repository, so
+    /// a thin pack fails on its unresolved deltas.
+    fn index_pack(repo_path: &Path, pack: &[u8]) -> crate::cli_gateway::GitOutput {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_path = dir.path().join("fetched.pack");
+        std::fs::write(&pack_path, pack).unwrap();
+        crate::cli_gateway::GitCommandGateway::new()
+            .unwrap()
+            .run(
+                &["index-pack", "--strict", pack_path.to_str().unwrap()],
+                Some(repo_path),
+            )
+            .unwrap()
+    }
+
+    /// A partial clone fetches the blobs its filter left out by id, through no
+    /// advertisement. One the public history reaches is served; one only a
+    /// server-private ref reaches is not (card_ad83ad72d14a).
+    #[tokio::test]
+    async fn a_partial_clone_gets_public_blobs_by_id_and_never_private_ones() {
+        if crate::cli_gateway::global_gateway().is_err() {
+            eprintln!("skipping v2 blob-want test: git not available");
+            return;
+        }
+        let (_dir, repo_path, older, _newer) = repository_with_a_deltifiable_change();
+        let git = crate::cli_gateway::GitCommandGateway::new().unwrap();
+        let rev = |spec: &str| {
+            git.run(&["rev-parse", spec], Some(&repo_path))
+                .unwrap()
+                .stdout_str()
+                .trim()
+                .to_string()
+        };
+        let public_blob = rev(&format!("{older}:big.txt"));
+
+        // A commit only `refs/forks/x` holds, carrying a blob nothing else has.
+        let private_blob = {
+            std::fs::write(repo_path.join("secret.txt"), "fork-only content\n").unwrap();
+            git.run_or_bail(&["add", "secret.txt"], Some(&repo_path))
+                .unwrap();
+            git.run_or_bail(&["commit", "-qm", "fork"], Some(&repo_path))
+                .unwrap();
+            let fork = rev("HEAD");
+            git.run_or_bail(&["update-ref", "refs/forks/x", &fork], Some(&repo_path))
+                .unwrap();
+            git.run_or_bail(&["reset", "-q", "--hard", "HEAD~1"], Some(&repo_path))
+                .unwrap();
+            rev("refs/forks/x:secret.txt")
+        };
+
+        let pack = v2_fetch_pack(&repo_path, &[&format!("want {public_blob}")]).await;
+        assert!(pack.len() > 32, "the public blob is packed");
+
+        let mut request = pkt_bytes(b"command=fetch\n");
+        request.extend_from_slice(b"0001");
+        request.extend_from_slice(&pkt_bytes(format!("want {private_blob}\n").as_bytes()));
+        request.extend_from_slice(&pkt_bytes(b"done\n"));
+        request.extend_from_slice(b"0000");
+        let mut response = Vec::new();
+        let refused =
+            handle_v2_http(&repo_path, std::io::Cursor::new(request), &mut response).await;
+        let error = refused.expect_err("a blob only refs/forks reaches must not be served");
+        assert!(format!("{error:#}").contains("not our ref"), "{error:#}");
+    }
+
+    /// card_54503ff49d6b: a v2 client that did not send `thin-pack` gets a
+    /// self-contained pack; one that did gets a thin one.
+    #[tokio::test]
+    async fn fetch_sends_a_thin_pack_only_when_the_client_asks_for_one() {
+        if crate::cli_gateway::global_gateway().is_err() {
+            eprintln!("skipping v2 thin-pack test: git not available");
+            return;
+        }
+        let (_dir, repo_path, older, newer) = repository_with_a_deltifiable_change();
+        let want = format!("want {newer}");
+        let have = format!("have {older}");
+
+        let full = v2_fetch_pack(&repo_path, &[&want, &have]).await;
+        let indexed = index_pack(&repo_path, &full);
+        assert!(
+            indexed.status.success(),
+            "a pack the client did not ask to be thin must resolve on its own: {}",
+            indexed.stderr_str()
+        );
+
+        let thin = v2_fetch_pack(&repo_path, &["thin-pack", &want, &have]).await;
+        let indexed = index_pack(&repo_path, &thin);
+        assert!(
+            !indexed.status.success(),
+            "a requested thin pack must delta against the client's base"
+        );
+        assert!(
+            thin.len() < full.len(),
+            "the thin pack must be the smaller one"
+        );
     }
 
     #[tokio::test]

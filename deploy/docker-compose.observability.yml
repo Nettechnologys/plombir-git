@@ -7,8 +7,12 @@ services:
     image: prom/prometheus:v2.55.0
     container_name: plombir-git-prometheus
     restart: unless-stopped
+    # Every port of this stack is loopback-only: Prometheus and Alertmanager
+    # have no authentication (anyone could silence alerts), and node-exporter
+    # describes the host. Reach them through an SSH tunnel or an authenticating
+    # proxy.
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -31,7 +35,7 @@ services:
     container_name: plombir-git-alertmanager
     restart: unless-stopped
     ports:
-      - "9093:9093"
+      - "127.0.0.1:9093:9093"
     volumes:
       - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     command:
@@ -46,10 +50,11 @@ services:
     container_name: plombir-git-grafana
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      # Required: no admin/admin fallback (see deploy/.env.example).
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in deploy/.env}
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_SERVER_ROOT_URL=http://localhost:3000
       - GF_INSTALL_PLUGINS=
@@ -68,7 +73,7 @@ services:
     container_name: plombir-git-node-exporter
     restart: unless-stopped
     ports:
-      - "9100:9100"
+      - "127.0.0.1:9100:9100"
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro

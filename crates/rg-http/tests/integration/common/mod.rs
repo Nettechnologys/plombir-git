@@ -320,6 +320,9 @@ pub struct StateOverrides {
     /// Replaces the bot-account limiter, which the harness leaves disabled so
     /// no test trips over a budget it did not ask for.
     pub agent_rate_limiter: Option<rg_http::rate_limit::RateLimiter>,
+    /// Replaces the resolver that trusts no proxy. Only a server served with
+    /// `into_make_service_with_connect_info` resolves an address at all.
+    pub client_ip: Option<rg_http::client_ip::ClientIpResolver>,
     /// Replaces this state's provenance signing identity.
     ///
     /// The default is derived from [`TEST_INSTANCE_KEY_SECRET`] rather than
@@ -457,6 +460,8 @@ pub fn build_test_app_state_with(
             .agent_rate_limiter
             .unwrap_or_else(|| rg_http::rate_limit::RateLimiter::new(0, 60)),
         mcp_router: Default::default(),
+        client_ip: overrides.client_ip.unwrap_or_default(),
+        metrics_access: Default::default(),
     }
 }
 

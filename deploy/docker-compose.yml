@@ -28,9 +28,13 @@ services:
         PLOMBIR_GIT_SOURCE_COMMIT: ${PLOMBIR_GIT_SOURCE_COMMIT:-}
     container_name: plombir-git
     restart: unless-stopped
+    # Loopback only: this is the try-out stack, and on an empty instance the
+    # first account registered becomes its administrator. Register yours, then
+    # put a TLS proxy in front of 127.0.0.1:8080 or drop the "127.0.0.1:"
+    # prefixes. See deploy/README.md.
     ports:
-      - "8080:8080"   # HTTP
-      - "2222:2222"   # SSH
+      - "127.0.0.1:8080:8080"   # HTTP
+      - "127.0.0.1:2222:2222"   # SSH
     volumes:
       # Persistent data (repos, DB, logs)
       - plombir-git-data:/data

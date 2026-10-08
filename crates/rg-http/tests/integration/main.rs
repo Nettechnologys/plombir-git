@@ -23,6 +23,7 @@
 
 mod access_grant_audit_guard;
 mod agent_accounts_tests;
+mod client_address_tests;
 mod common;
 
 mod account_deletion_serialized_grant_tests;
@@ -85,6 +86,7 @@ mod fork_tests;
 mod git_auth_tests;
 mod git_http_clone_tests;
 mod git_http_failure_status_tests;
+mod git_session_limit_tests;
 mod global_id_anchor_guard;
 mod import_lfs_tests;
 mod import_target_namespace_tests;
@@ -249,6 +251,7 @@ mod undecodable_allow_list_tests;
 mod undecodable_status_check_tests;
 mod undecodable_stored_blob_tests;
 mod unmatched_route_tests;
+mod upload_content_type_tests;
 mod upload_failure_status_tests;
 mod user_grant_writer_tests;
 mod user_scoped_id_scope_sweep_tests;

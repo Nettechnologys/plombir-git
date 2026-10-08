@@ -212,26 +212,30 @@ fn with_credential(
     Some(serde_json::Value::Object(object))
 }
 
+/// The request header under which the HTTP server hands the resolved client
+/// address down to code that sees only a `HeaderMap`.
+///
+/// `rg-http` strips it from every incoming request and writes it back with the
+/// address it resolved against `[rate_limit].trusted_proxies` — the right-most
+/// untrusted hop of `X-Forwarded-For`, or the TCP peer. A value under this
+/// name is therefore always the server's, never the client's, which is the
+/// whole point: `X-Forwarded-For` itself is whatever the client chose to write
+/// (card_5d48237b16b0).
+pub const CLIENT_IP_HEADER: &str = "x-plombir-git-client-ip";
+
 /// Client IP and User-Agent, as far as either can be trusted.
 ///
-/// The forwarded address is parsed as an `IpAddr` rather than copied through: an
-/// unparsed `X-Forwarded-For` is attacker-controlled text landing in a column an
-/// operator reads as an address. The User-Agent is cut at 512 characters for the
-/// same reason — it is a header, and its length is the client's choice.
+/// The address is the one the server resolved ([`CLIENT_IP_HEADER`]); none is
+/// recorded when there is none, rather than one the client wrote. It is parsed
+/// as an `IpAddr` rather than copied through, so a column an operator reads as
+/// an address only ever holds one. The User-Agent is cut at 512 characters — it
+/// is a header, and its length is the client's choice.
 pub fn extract_ip_and_ua(headers: &http::HeaderMap) -> (Option<String>, Option<String>) {
     let ip_address = headers
-        .get("X-Forwarded-For")
+        .get(CLIENT_IP_HEADER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
         .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok())
-        .map(|address| address.to_string())
-        .or_else(|| {
-            headers
-                .get("X-Real-IP")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok())
-                .map(|address| address.to_string())
-        });
+        .map(|address| address.to_string());
 
     let user_agent = headers
         .get(http::header::USER_AGENT)
@@ -324,19 +328,23 @@ mod tests {
         );
     }
 
-    /// A header the client wrote is not an address until it parses as one.
+    /// Only the address the server resolved is recorded — never one the client
+    /// wrote into a forwarding header (card_5d48237b16b0).
     #[test]
-    fn a_forwarded_address_that_is_not_an_address_is_not_recorded() {
+    fn only_the_server_resolved_address_is_recorded() {
         let mut headers = http::HeaderMap::new();
-        headers.insert("X-Forwarded-For", "not-an-ip".parse().unwrap());
+        headers.insert("X-Forwarded-For", "203.0.113.7".parse().unwrap());
+        headers.insert("X-Real-IP", "203.0.113.8".parse().unwrap());
         assert_eq!(extract_ip_and_ua(&headers).0, None);
 
-        headers.insert("X-Forwarded-For", "203.0.113.7, 10.0.0.1".parse().unwrap());
+        headers.insert(CLIENT_IP_HEADER, "198.51.100.9".parse().unwrap());
         assert_eq!(
             extract_ip_and_ua(&headers).0.as_deref(),
-            Some("203.0.113.7"),
-            "the client-facing hop is the first entry"
+            Some("198.51.100.9")
         );
+
+        headers.insert(CLIENT_IP_HEADER, "not-an-ip".parse().unwrap());
+        assert_eq!(extract_ip_and_ua(&headers).0, None);
     }
 
     /// A row written while a token is the request's credential says which one,

@@ -27,6 +27,27 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rg_git::credentials::OutboundGitInvocation;
 
+/// The address an *inbound* abuse budget is kept for — one subscriber.
+///
+/// An IPv4 address stands alone. An IPv6 address is masked to its /64, the
+/// block one subscriber is handed: keyed by the full address, one host rotates
+/// through 2^64 of them and gets a fresh budget every request
+/// (card_c2f0454ceb89). An IPv4-mapped address (`::ffff:a.b.c.d`, what a
+/// dual-stack listener reports) is its IPv4 address — masked as IPv6 it would
+/// put every IPv4 client into the single block `::/64`.
+///
+/// Every per-source budget uses it: the HTTP request limiters, the password
+/// limiter's per-source share, the git session limiter.
+pub fn abuse_source(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+    }
+}
+
 /// Default request timeout for outbound HTTP (whole request, including body).
 const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default connect timeout for outbound HTTP (TCP + TLS handshake only).

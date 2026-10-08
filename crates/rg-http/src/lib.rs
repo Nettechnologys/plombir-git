@@ -15,6 +15,7 @@
 
 pub mod api;
 pub mod build_info;
+pub mod client_ip;
 pub mod error;
 pub mod git_v2;
 pub mod instance;
@@ -197,6 +198,14 @@ pub struct AppState {
     /// tool calls through in-process. Filled by `routes` once the router is
     /// built; `Default::default()` is correct at every construction site.
     pub mcp_router: api::mcp::McpRouterSlot,
+    /// How the outermost layer works out a request's client address, against
+    /// `[rate_limit].trusted_proxies`. The per-IP limiters are built from the
+    /// same resolver, so the address a request was limited under is the one
+    /// the audit log records. See [`client_ip`].
+    pub client_ip: client_ip::ClientIpResolver,
+    /// Who may read `GET /metrics` — `[observability].metrics_enabled` and
+    /// `metrics_token`.
+    pub metrics_access: metrics::MetricsAccess,
 }
 
 impl AppState {
@@ -382,7 +391,8 @@ pub struct HttpServerConfig {
     /// at once (memory-exhaustion guard). 0 = use the built-in default (100k).
     pub rate_limit_max_keys: usize,
     /// Stricter per-IP request cap applied only to the credential endpoints
-    /// (`/users/register`, `/users/login`). 0 disables the auth limiter.
+    /// (register, login, forgot/reset password, MFA verify, passkey login).
+    /// 0 disables the auth limiter.
     pub rate_limit_auth_max: u32,
     /// Window duration (seconds) for the credential-endpoint limiter.
     pub rate_limit_auth_window_secs: u64,
@@ -436,6 +446,8 @@ pub struct HttpServerConfig {
     /// when both transports run in one process, so admin updates take effect on
     /// every write path immediately.
     pub instance_settings: rg_core::instance::InstanceSettingsCache,
+    /// Who may read `GET /metrics`. See [`metrics::MetricsAccess`].
+    pub metrics_access: metrics::MetricsAccess,
 }
 
 /// Start the HTTP server and run forever.
@@ -463,21 +475,22 @@ async fn run_with_listener(
     config: HttpServerConfig,
     prebound_listener: Option<tokio::net::TcpListener>,
 ) -> Result<()> {
-    let trusted_proxies = config.rate_limit_trusted_proxies;
-    let rate_limiter = rate_limit::RateLimiter::with_trusted_proxies(
+    let client_ip = client_ip::ClientIpResolver::new(config.rate_limit_trusted_proxies);
+    let rate_limiter = rate_limit::RateLimiter::with_resolver(
         config.rate_limit_max,
         config.rate_limit_window_secs,
-        trusted_proxies.clone(),
+        client_ip.clone(),
     )
     .with_max_keys(config.rate_limit_max_keys);
-    // Separate, stricter limiter for the credential endpoints (register/login).
+    // Separate, stricter limiter for the unauthenticated credential endpoints
+    // (register, login, password reset, MFA verify, passkey login).
     // It shares the trusted-proxy set and the same memory cap, but is always
     // active by default so registration spam / password guessing is throttled
     // even when the global limiter is disabled.
-    let auth_rate_limiter = rate_limit::RateLimiter::with_trusted_proxies(
+    let auth_rate_limiter = rate_limit::RateLimiter::with_resolver(
         config.rate_limit_auth_max,
         config.rate_limit_auth_window_secs,
-        trusted_proxies,
+        client_ip.clone(),
     )
     .with_max_keys(config.rate_limit_max_keys);
     let shutdown_rx = config.shutdown_rx.clone();
@@ -612,6 +625,8 @@ async fn run_with_listener(
         instance_settings: config.instance_settings,
         agent_rate_limiter,
         mcp_router: Default::default(),
+        client_ip,
+        metrics_access: config.metrics_access,
     };
 
     // The per-IP limiters go to the router and nowhere else. `AppState` used to carry a

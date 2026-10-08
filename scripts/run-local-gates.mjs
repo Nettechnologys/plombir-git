@@ -204,9 +204,17 @@ export function runDeployConfig({ cwd = root } = {}) {
       if (!secretLine.test(example)) {
         throw new Error(`${examplePath} no longer declares PLOMBIR_GIT_JWT_SECRET`);
       }
+      // The observability stack refuses to interpolate without a Grafana admin
+      // password (no admin/admin fallback), and `.env.example` ships it empty.
+      const grafanaLine = /^GRAFANA_ADMIN_PASSWORD=.*$/m;
+      if (!grafanaLine.test(example)) {
+        throw new Error(`${examplePath} no longer declares GRAFANA_ADMIN_PASSWORD`);
+      }
       writeFileSync(
         envFile,
-        example.replace(secretLine, `PLOMBIR_GIT_JWT_SECRET=${randomBytes(32).toString('hex')}`),
+        example
+          .replace(secretLine, `PLOMBIR_GIT_JWT_SECRET=${randomBytes(32).toString('hex')}`)
+          .replace(grafanaLine, `GRAFANA_ADMIN_PASSWORD=${randomBytes(16).toString('hex')}`),
         { mode: 0o600 },
       );
       preface = 'deploy/.env is absent; validating with an isolated temporary env file.';

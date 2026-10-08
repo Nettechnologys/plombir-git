@@ -147,17 +147,25 @@ attestation_enabled = false
 [rate_limit]
 max = 0          # 0 = disabled (global per-IP limit for every request)
 window_secs = 60
-# Only these proxy source IPs may supply X-Forwarded-For / X-Real-IP for rate limiting.
+# Only these proxy source IPs may supply X-Forwarded-For / X-Real-IP. The
+# address they yield is the client address everywhere: the rate limiters, the
+# audit and login logs, the password-check share per client. Behind them the
+# client is the right-most X-Forwarded-For entry that is not one of these proxies;
+# everything to its left was written by the client and is ignored.
 # Leave empty when Plombir Git is directly exposed.
 trusted_proxies = []
 # trusted_proxies = ["127.0.0.1", "::1", "10.0.0.10"]
-# Hard cap on the number of distinct client IPs tracked at once. Bounds memory
-# under a distinct-IP flood: once full, a previously-unseen IP is rejected (429)
-# instead of growing the map without limit. 0 = built-in default (100000).
+# Hard cap on the number of distinct clients tracked at once (an IPv6 client is
+# its /64). Bounds memory under a distinct-IP flood: once full, every
+# previously-unseen client shares one overflow budget instead of growing the map
+# without limit. 0 = built-in default (100000).
 max_keys = 0
-# Stricter limit applied ONLY to the credential endpoints (/users/register and
-# /users/login), independent of `max` above. Always on by default so
-# registration spam and password guessing are throttled even when `max = 0`.
+# Stricter limit applied ONLY to the unauthenticated credential endpoints
+# (/users/register, /users/login, /users/forgot-password,
+# /users/reset-password, /users/mfa/verify, /users/passkeys/login/*), which
+# share one budget per client, independent of `max` above. Always on by default
+# so registration spam, password guessing and reset-mail floods are throttled
+# even when `max = 0`.
 # Set auth_max = 0 to disable it.
 auth_max = 10
 auth_window_secs = 60
@@ -318,9 +326,9 @@ batch_size = 10
 # db_idle_secs = 600
 
 [observability]
-# OpenTelemetry distributed tracing (OTLP/HTTP export). Prometheus metrics at
-# /metrics are always on and independent of this section — these knobs only add
-# *traces*. Leave otlp_endpoint unset to keep tracing off (zero overhead).
+# OpenTelemetry distributed tracing (OTLP/HTTP export), and who may read the
+# Prometheus metrics at /metrics (the last two knobs below). The OTLP knobs only
+# add *traces*. Leave otlp_endpoint unset to keep tracing off (zero overhead).
 #
 # OTLP/HTTP endpoint of your collector. The "/v1/traces" path is appended
 # automatically, so the base URL is enough. Overridden by the standard
@@ -332,3 +340,12 @@ batch_size = 10
 # Head sampling ratio in 0.0..=1.0 (default 1.0 = record every trace). Lower it
 # on a busy instance to reduce export volume, e.g. 0.1 = sample 10%.
 # sample_ratio = 1.0
+#
+# Prometheus metrics at GET /metrics, on the main HTTP port. Behind a public
+# reverse proxy that port is the internet: business counters, failed-login
+# rates and per-route traffic go to whoever asks. Either have the proxy refuse
+# /metrics, or set a token and give it to the scraper (Prometheus:
+# `authorization: { credentials: ... }`). PLOMBIR_GIT_METRICS_TOKEN wins over
+# metrics_token. metrics_enabled = false answers 404.
+metrics_enabled = true
+# metrics_token = "a-long-random-string"

@@ -695,10 +695,15 @@ async fn stream_attachment(
     };
     rg_db::ops::attachment_ops::increment_download_count(&state.db, attachment.id).await?;
 
+    // The part's own `Content-Type` is the uploader's word; only a passive
+    // one is passed through (card_36b620ab3467).
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_str(&attachment.content_type)
-            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+        crate::content_disposition::served_upload_type(&attachment.content_type),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(crate::content_disposition::UPLOAD_SANDBOX_CSP),
     );
     if let Ok(value) = HeaderValue::from_str(&attachment.size.to_string()) {
         response.headers_mut().insert(header::CONTENT_LENGTH, value);

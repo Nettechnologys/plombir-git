@@ -190,3 +190,76 @@ async fn the_credential_endpoints_carry_the_strict_auth_rate_limiter() {
         "the credential limiter must not gate the rest of the server"
     );
 }
+
+/// card_0beff149adbd: every door that takes a credential or mails one out
+/// without a session carries the same strict budget — not just register and
+/// login. With a budget of one, the second request to each route is refused,
+/// whatever the first one was answered.
+#[tokio::test]
+async fn every_unauthenticated_credential_door_carries_the_auth_rate_limiter() {
+    let doors: [(&str, serde_json::Value); 5] = [
+        (
+            "/api/v1/users/forgot-password",
+            serde_json::json!({"email": "nobody@example.com"}),
+        ),
+        (
+            "/api/v1/users/reset-password",
+            serde_json::json!({"token": "not-a-token", "new_password": PASSWORD}),
+        ),
+        (
+            "/api/v1/users/mfa/verify",
+            serde_json::json!({"mfa_token": "not-a-token", "code": "000000"}),
+        ),
+        ("/api/v1/users/passkeys/login/start", serde_json::json!({})),
+        (
+            "/api/v1/users/passkeys/login/finish",
+            serde_json::json!({"state": "not-a-state", "credential": {}}),
+        ),
+    ];
+    for (path, body) in doors {
+        let base = spawn_prod_app_with_rate_limits(0, 1).await;
+        let client = reqwest::Client::new();
+        let first = client
+            .post(format!("{base}{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_ne!(first, 429, "{path}: the first request is inside the budget");
+        let second = client
+            .post(format!("{base}{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(second, 429, "{path} does not carry the auth rate limiter");
+    }
+}
+
+/// The acceptance of card_0beff149adbd in the shipped numbers: ten reset
+/// requests a minute from one client are answered, the eleventh is not.
+#[tokio::test]
+async fn the_eleventh_reset_request_in_a_window_is_refused() {
+    let base = spawn_prod_app_with_rate_limits(0, 10).await;
+    let client = reqwest::Client::new();
+    for attempt in 1..=10 {
+        let status = client
+            .post(format!("{base}/api/v1/users/forgot-password"))
+            .json(&serde_json::json!({"email": format!("victim{attempt}@example.com")}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 200, "reset request {attempt} of 10");
+    }
+    let eleventh = client
+        .post(format!("{base}/api/v1/users/forgot-password"))
+        .json(&serde_json::json!({"email": "victim11@example.com"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(eleventh, 429);
+}

@@ -290,3 +290,51 @@ async fn a_protocol_v0_fetch_gets_what_it_lacks_and_never_a_hidden_ref() {
     server.abort();
     drop(dir);
 }
+
+/// Stock git sends every stateless upload-pack request over 1 KiB with
+/// `Content-Encoding: gzip`. The body used to reach the protocol parser still
+/// compressed, so a fetch with enough `have` lines died with `500 invalid utf-8
+/// sequence` — intermittently, because the number of haves per round is the
+/// client negotiator's choice. Here the request is gzipped on purpose.
+#[tokio::test]
+async fn a_gzipped_upload_pack_request_is_read_decoded() {
+    use std::io::Write as _;
+
+    let base = crate::common::spawn_test_app().await;
+    let token =
+        crate::common::register_user(&base, "gzip-owner", "gzip-owner@example.com", "Qz7$wRtm")
+            .await;
+    crate::common::create_repo(&base, &token, "gzip-repo").await;
+
+    let mut request = b"0014command=ls-refs\n0001".to_vec();
+    for n in 0..60 {
+        let line = format!("ref-prefix refs/heads/branch-{n:03}\n");
+        request.extend_from_slice(format!("{:04x}{line}", line.len() + 4).as_bytes());
+    }
+    request.extend_from_slice(b"0000");
+    assert!(
+        request.len() > 1024,
+        "large enough that git itself would gzip it"
+    );
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&request).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/gzip-owner/gzip-repo.git/git-upload-pack"))
+        .bearer_auth(&token)
+        .header("Git-Protocol", "version=2")
+        .header("Content-Type", "application/x-git-upload-pack-request")
+        .header("Content-Encoding", "gzip")
+        .body(compressed)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.bytes().await.unwrap();
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        body.ends_with(b"0000"),
+        "an ls-refs answer ends in a flush: {body:?}"
+    );
+}

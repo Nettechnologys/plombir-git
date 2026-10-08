@@ -245,6 +245,7 @@ pub async fn login(
         &body.password,
         &state.encryption_key,
         &state.ldap_transport_policy,
+        crate::client_ip::from_headers(&headers),
     )
     .await
     {
@@ -919,7 +920,13 @@ pub async fn forgot_password(
     .await
     {
         Ok(issued) => {
-            tracing::info!("password reset requested for email: {}", body.email);
+            // By account id, and only when a link went out: this endpoint is
+            // anonymous, so the address in the body is whatever a stranger
+            // typed, and a log line per request is a list of addresses tried
+            // (card_36b620ab3467).
+            if let Some(issued) = &issued {
+                tracing::info!(user_id = issued.user_id, "password reset link issued");
+            }
             // A reset link is a one-time way back into the account, so its issue
             // is a credential event — and the journal must learn about it only
             // when one was actually issued, or it answers "does this address

@@ -20,18 +20,18 @@ compose_http_ports() {
 
     mapfile -t marked_mappings < <(
         awk '
-            /^[[:space:]]*-[[:space:]]*"?[0-9]+:[0-9]+"?[[:space:]]*#[[:space:]]*HTTP[[:space:]]*$/ { print }
+            /^[[:space:]]*-[[:space:]]*"?(127\.0\.0\.1:)?[0-9]+:[0-9]+"?[[:space:]]*#[[:space:]]*HTTP[[:space:]]*$/ { print }
         ' "${compose}"
     )
 
     if [ "${#marked_mappings[@]}" -ne 1 ] ||
-        [[ ! "${marked_mappings[0]}" =~ ^[[:space:]]*-[[:space:]]*\"?([0-9]+):([0-9]+)\"?[[:space:]]*#[[:space:]]*HTTP[[:space:]]*$ ]]; then
+        [[ ! "${marked_mappings[0]}" =~ ^[[:space:]]*-[[:space:]]*\"?(127\.0\.0\.1:)?([0-9]+):([0-9]+)\"?[[:space:]]*#[[:space:]]*HTTP[[:space:]]*$ ]]; then
         echo "❌ ${compose}: expected exactly one numeric HOST:CONTAINER Plombir Git port mapping marked # HTTP." >&2
         return 1
     fi
 
-    local marked_host_port="${BASH_REMATCH[1]}"
-    local marked_container_port="${BASH_REMATCH[2]}"
+    local marked_host_port="${BASH_REMATCH[2]}"
+    local marked_container_port="${BASH_REMATCH[3]}"
 
     if ! normalized_compose="$(
         docker compose -f "${compose}" config --no-interpolate
@@ -134,6 +134,20 @@ else
     echo "⚠️  Plombir Git not detected on :${PLOMBIR_GIT_HOST_PORT} (will still start the stack)"
 fi
 
+# Alerts that reach nobody are worse than none: the stack looks watched. The
+# shipped receivers are placeholders (a `.invalid` Slack host, a PagerDuty key
+# of `replace-me`, a webhook on the container's own localhost), so starting with
+# them is refused until they are replaced — or until the operator says, with
+# PLOMBIR_GIT_ALERTS_UNROUTED=1, that they only want the dashboards.
+if grep -Eq 'hooks\.slack\.invalid|replace-me|localhost:5001' alertmanager/alertmanager.yml \
+    && [ "${PLOMBIR_GIT_ALERTS_UNROUTED:-}" != "1" ]; then
+    echo "❌ alertmanager/alertmanager.yml still routes alerts to the shipped placeholders," >&2
+    echo "   so every alert would be dropped. Replace the receivers with your Slack webhook," >&2
+    echo "   PagerDuty key or webhook URL, or run with PLOMBIR_GIT_ALERTS_UNROUTED=1 to start" >&2
+    echo "   the stack knowing that alerts go nowhere." >&2
+    exit 1
+fi
+
 # Start the stack
 echo ""
 echo "🚀 Starting Prometheus + Grafana + Alertmanager..."
@@ -161,7 +175,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "  📊 Service Endpoints"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Prometheus:     http://localhost:9090"
-echo "  Grafana:        http://localhost:3000  (admin/admin)"
+echo "  Grafana:        http://localhost:3000  (GRAFANA_ADMIN_USER / GRAFANA_ADMIN_PASSWORD from deploy/.env)"
 echo "  Alertmanager:   http://localhost:9093"
 echo "  Node Exporter:  http://localhost:9100/metrics"
 echo ""

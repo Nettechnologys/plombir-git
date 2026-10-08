@@ -503,6 +503,8 @@ jobs:
           install -m 600 deploy/.env.example deploy/.env
           secret="$(openssl rand -hex 32)"
           sed -i "s/^PLOMBIR_GIT_JWT_SECRET=.*/PLOMBIR_GIT_JWT_SECRET=${secret}/" deploy/.env
+          # The observability compose requires a Grafana admin password.
+          sed -i "s/^GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=$(openssl rand -hex 16)/" deploy/.env
           trap 'rm -f deploy/.env' EXIT
 
           shopt -s nullglob

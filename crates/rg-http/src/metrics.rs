@@ -755,8 +755,86 @@ where
 }
 
 /// GET /metrics — return Prometheus-formatted metrics.
-pub async fn metrics_handler() -> impl IntoResponse {
-    render(REGISTRY.get())
+/// Who may read `GET /metrics` — `[observability].metrics_enabled` and
+/// `metrics_token`.
+///
+/// The endpoint sits on the main HTTP port, so behind the reverse proxy the
+/// deployment guide recommends it was on the internet: business counters, the
+/// rate of failed logins, traffic per route (card_ab8a1ca92a56). With a token
+/// set, only a scraper that presents it reads anything; switched off, the route
+/// answers 404 like a route that does not exist.
+#[derive(Debug, Clone)]
+pub struct MetricsAccess {
+    /// Whether the endpoint answers at all.
+    pub enabled: bool,
+    /// SHA-256 of the bearer token a scraper must present, when one is set.
+    /// Only the digest is kept, so the comparison below is between two values
+    /// of one fixed length and cannot leak the token's length or a prefix.
+    token_digest: Option<[u8; 32]>,
+}
+
+impl Default for MetricsAccess {
+    /// The historical behaviour: on, and open to anyone who reaches it.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            token_digest: None,
+        }
+    }
+}
+
+impl MetricsAccess {
+    /// `enabled`, guarded by `token` when there is one.
+    pub fn new(enabled: bool, token: Option<&str>) -> Self {
+        Self {
+            enabled,
+            token_digest: token.map(digest),
+        }
+    }
+
+    fn admits(&self, headers: &axum::http::HeaderMap) -> bool {
+        let Some(expected) = self.token_digest else {
+            return true;
+        };
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|presented| digest(presented.trim()) == expected)
+    }
+}
+
+fn digest(token: &str) -> [u8; 32] {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(token.as_bytes()).into()
+}
+
+pub async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    gate(&state.metrics_access, &headers).unwrap_or_else(|| render(REGISTRY.get()))
+}
+
+/// The refusal for a request [`MetricsAccess`] does not admit, if any.
+fn gate(
+    access: &MetricsAccess,
+    headers: &axum::http::HeaderMap,
+) -> Option<axum::response::Response> {
+    if !access.enabled {
+        return Some((StatusCode::NOT_FOUND, "Not Found").into_response());
+    }
+    if !access.admits(headers) {
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+                "a bearer token is required to read metrics",
+            )
+                .into_response(),
+        );
+    }
+    None
 }
 
 /// The handler's whole body, with the registry passed in rather than read from
@@ -826,5 +904,45 @@ mod tests {
     fn installing_the_registry_twice_is_not_an_error() {
         init_registry().expect("install the registry");
         init_registry().expect("a second installation must be a no-op, not a group-level error");
+    }
+
+    fn bearer(token: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    /// card_ab8a1ca92a56: with a token configured, a scrape without it — or
+    /// with any other — is a 401; with it, the scrape goes through.
+    #[test]
+    fn a_metrics_token_admits_only_its_bearer() {
+        let access = MetricsAccess::new(true, Some("scrape-secret"));
+        let status = |headers: &axum::http::HeaderMap| gate(&access, headers).map(|r| r.status());
+        assert_eq!(
+            status(&axum::http::HeaderMap::new()),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            status(&bearer("scrape-secre")),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            status(&bearer("scrape-secret-and-more")),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(status(&bearer("scrape-secret")), None);
+    }
+
+    #[test]
+    fn switched_off_metrics_are_not_found_and_the_default_is_open() {
+        let off = MetricsAccess::new(false, None);
+        assert_eq!(
+            gate(&off, &axum::http::HeaderMap::new()).map(|r| r.status()),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert!(gate(&MetricsAccess::default(), &axum::http::HeaderMap::new()).is_none());
     }
 }

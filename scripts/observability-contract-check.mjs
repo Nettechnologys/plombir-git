@@ -257,11 +257,11 @@ const composePlombirGitPorts = servicePorts(
 // everything else against.
 const composeHttpMappings = yamlAnnotatedLines(composeYml)
   .filter(({ comment }) => comment === 'HTTP')
-  .map(({ code }) => /^[ \t]+-[ \t]*"([0-9]+):([0-9]+)"[ \t]*$/.exec(code))
+  .map(({ code }) => /^[ \t]+-[ \t]*"127\.0\.0\.1:([0-9]+):([0-9]+)"[ \t]*$/.exec(code))
   .filter((match) => match !== null);
 if (composeHttpMappings.length !== 1) {
   failures.push(
-    'deploy/docker-compose.yml must contain exactly one numeric "HOST:CONTAINER" ' +
+    'deploy/docker-compose.yml must contain exactly one loopback "127.0.0.1:HOST:CONTAINER" ' +
       `Plombir Git port mapping marked "# HTTP"; parsed ${composeHttpMappings.length}`,
   );
 }
@@ -269,7 +269,7 @@ let composeHostPort;
 let composeContainerPort;
 if (composeHttpMappings.length === 1) {
   const [, published, target] = composeHttpMappings[0];
-  const value = `${published}:${target}`;
+  const value = `127.0.0.1:${published}:${target}`;
   const owners = servicePortOwners(composeDocument, value);
   const plombirGitMatches = composePlombirGitPorts.filter((port) => port === value);
   if (owners.length !== 1 || owners[0]?.service !== 'plombir-git' || plombirGitMatches.length !== 1) {

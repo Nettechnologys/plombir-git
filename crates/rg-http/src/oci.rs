@@ -829,14 +829,15 @@ async fn authenticate_basic(
         .await
         .with_context(|| format!("registry basic auth: looking up '{user}'"))?;
     //
-    // No source address: behind a proxy the only one on hand is whatever the
-    // client wrote into `X-Forwarded-For`, and the TCP peer is the proxy that
-    // every client shares. The process-wide bound still holds, and a full
-    // limiter comes back as `PasswordWorkSaturated` — a `503`, never a strike.
+    // The source is the address the server resolved against its trusted
+    // proxies, so one client flooding `/v2/auth/token` with wrong passwords
+    // fills its own share of the password limiter, not everyone's
+    // (card_a0f0cc7aed3a). A full share or a full limiter comes back as
+    // `PasswordWorkSaturated` — a `503`, never a strike.
     let password_ok = rg_core::auth::password::verify_password_or_dummy(
         pass,
         found.as_ref().map(|u| u.password_hash.as_str()),
-        None,
+        crate::client_ip::from_headers(headers),
     )
     .await
     .with_context(|| format!("registry basic auth: verifying the password of '{user}'"))?;

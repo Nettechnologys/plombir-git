@@ -64,6 +64,7 @@ pub(crate) mod blocking; // Keep synchronous Git/IO phases off Tokio's worker th
 pub(crate) mod committed_blob; // Size a committed file before it is read whole into memory
 pub(crate) mod db_retry; // One retry policy for the bounded database-write loops
 pub mod error; // Domain error types (CoreError)
+pub mod git_sessions;
 pub mod metrics_hook; // Observer hooks so the HTTP layer can meter core-crate events
 
 #[cfg(test)]

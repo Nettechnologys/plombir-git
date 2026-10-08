@@ -610,9 +610,16 @@ pub async fn download_asset(
     };
 
     let mut resp_headers = HeaderMap::new();
-    if let Ok(v) = HeaderValue::from_str(&asset.content_type) {
-        resp_headers.insert(header::CONTENT_TYPE, v);
-    }
+    // Never the uploader's type verbatim: a `.js` asset uploaded as
+    // `text/javascript` was a script of this origin (card_36b620ab3467).
+    resp_headers.insert(
+        header::CONTENT_TYPE,
+        crate::content_disposition::served_upload_type(&asset.content_type),
+    );
+    resp_headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(crate::content_disposition::UPLOAD_SANDBOX_CSP),
+    );
     // Unconditional: the old `if let Ok(..)` around a plain `filename="…"`
     // dropped the header entirely for an asset whose name is not ASCII, and the
     // browser then saved the file under whatever the URL suggested — a `200`

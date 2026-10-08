@@ -2247,7 +2247,7 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 18] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 19] = [
         (
             "DEFAULT_SOURCE_URL",
             "config-file-only: `[server].source_url` has no CLI flag, so no help text names it",
@@ -2304,6 +2304,10 @@ const AFTER: &str = "after";
         (
             "DEFAULT_AUDIT_ENABLED",
             "config-file-only: `[audit].enabled` has no CLI flag",
+        ),
+        (
+            "DEFAULT_METRICS_ENABLED",
+            "config-file-only: `[observability].metrics_enabled` has no CLI flag",
         ),
         (
             "DEFAULT_AUDIT_ARCHIVE_DIR",

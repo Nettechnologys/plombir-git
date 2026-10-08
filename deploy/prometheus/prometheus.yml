@@ -23,6 +23,10 @@ scrape_configs:
   # Plombir Git main app
   - job_name: 'plombir-git'
     metrics_path: '/metrics'
+    # With [observability].metrics_token set on the server, give the scrape
+    # the same token (see deploy/README.md, "/metrics and the outside world"):
+    # authorization:
+    #   credentials: 'the-metrics-token'
     scrape_interval: 15s
     scrape_timeout: 10s
     static_configs:

@@ -3510,6 +3510,7 @@ pub async fn create_commit_status(
             "invalid commit status state: '{state}', must be one of: {valid_states:?}"
         )));
     }
+    let target_url = commit_status_target_url(target_url)?;
 
     let now = Utc::now();
     let model = rg_db::entities::commit_status::ActiveModel {
@@ -3528,6 +3529,27 @@ pub async fn create_commit_status(
     rg_db::ops::commit_status_ops::create_or_update(db, repo_id, sha, context, model)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))
+}
+
+/// The link a commit status offers, if any: an absolute `http(s)` URL.
+///
+/// The UI renders it as `<a href>` beside every commit, and whoever can post a
+/// status — a CI token, an external webhook — chose it. A `javascript:` link
+/// stored as-is was one click from running in the viewer's session, held back
+/// only by the CSP (card_36b620ab3467). A blank value is no link at all.
+fn commit_status_target_url(target_url: Option<&str>) -> Result<Option<&str>> {
+    let Some(raw) = target_url.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    let usable = reqwest::Url::parse(raw)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+    if !usable {
+        return Err(crate::error::invalid_request(
+            "target_url must be an absolute http(s) URL",
+        ));
+    }
+    Ok(Some(raw))
 }
 
 /// List all statuses for a commit SHA in a repository.

@@ -287,7 +287,8 @@ pub(crate) struct Routers {
 ///
 /// `rate_limiter` is the global per-IP limiter applied to every request;
 /// `auth_rate_limiter` is a separate, stricter limiter applied only to the
-/// unauthenticated credential endpoints (`/users/register`, `/users/login`) to
+/// unauthenticated credential endpoints (register, login, password reset, the
+/// MFA step and the passkey login) to
 /// blunt registration spam and password guessing independently of the global
 /// limit (which is off by default).
 pub(crate) fn create_router(
@@ -408,6 +409,15 @@ fn apply_middleware(
     let router = router.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         middleware::maintenance_middleware,
+    ));
+
+    // The client address is resolved before any layer that keys on it — the
+    // per-IP limiter just above, the per-route auth limiter, the audit log —
+    // so they all read one answer (see `client_ip`). It needs no `ConnectInfo`
+    // to run: without one it publishes no address rather than a forged one.
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        state.client_ip.clone(),
+        crate::client_ip::resolve_client_ip_middleware,
     ));
 
     // The last layer runs first and therefore sees every response, including a
@@ -996,7 +1006,9 @@ fn rubygems_protocol_routes(table: RouteTable) -> RouteTable {
 /// Build every route the server serves, and the access level of each.
 ///
 /// `auth_rate_limiter` is layered only onto the unauthenticated credential
-/// endpoints (`/users/register`, `/users/login`). The test router passes
+/// endpoints — register, login, forgot/reset password, the MFA step of a login
+/// and the passkey login ceremony — which all draw on one per-client budget
+/// (card_0beff149adbd). The test router passes
 /// `None` so those routes carry no extra layer: the limiter middleware extracts
 /// `ConnectInfo`, which the test harness (plain `oneshot`, no
 /// `into_make_service_with_connect_info`) does not provide. That the two routes
@@ -1118,12 +1130,18 @@ pub(crate) fn build_all_routes(
         .post_with(Public, "/users/login", api::users::login, &auth_rl)
         .post(User, "/users/logout", api::users::logout)
         .get(User, "/users/me", api::users::me)
-        .post(
+        .post_with(
             Public,
             "/users/forgot-password",
             api::users::forgot_password,
+            &auth_rl,
         )
-        .post(Public, "/users/reset-password", api::users::reset_password)
+        .post_with(
+            Public,
+            "/users/reset-password",
+            api::users::reset_password,
+            &auth_rl,
+        )
         // PAT
         .get(User, "/users/tokens", api::users::list_tokens)
         .post(User, "/users/tokens", api::users::create_token)
@@ -1168,7 +1186,7 @@ pub(crate) fn build_all_routes(
         .post(User, "/users/mfa/enable", api::mfa::enable_mfa)
         // The second factor of a login: the caller has a password but no
         // session yet, so this one is reachable without a token by design.
-        .post(Public, "/users/mfa/verify", api::mfa::verify_mfa)
+        .post_with(Public, "/users/mfa/verify", api::mfa::verify_mfa, &auth_rl)
         .get(User, "/users/mfa/backup", api::mfa::get_backup_codes)
         .post(
             User,
@@ -1189,15 +1207,17 @@ pub(crate) fn build_all_routes(
             "/users/passkeys/register/finish",
             api::passkeys::register_finish,
         )
-        .post(
+        .post_with(
             Public,
             "/users/passkeys/login/start",
             api::passkeys::login_start,
+            &auth_rl,
         )
-        .post(
+        .post_with(
             Public,
             "/users/passkeys/login/finish",
             api::passkeys::login_finish,
+            &auth_rl,
         )
         // SSO
         .get(Public, "/auth/sso/providers", api::sso::list_providers)

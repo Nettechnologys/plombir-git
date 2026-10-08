@@ -46,7 +46,9 @@ route:
 #
 # The host is `.invalid`, a TLD reserved by RFC 2606 that can never resolve. An
 # operator who forgets to replace it gets a DNS failure in the Alertmanager log,
-# not alerts delivered to somebody else's webhook.
+# not alerts delivered to somebody else's webhook — and `start-observability.sh`
+# refuses to start the stack while these placeholders are still here, because
+# a stack whose alerts reach nobody only looks watched.
 receivers:
   - name: 'default'
     webhook_configs:

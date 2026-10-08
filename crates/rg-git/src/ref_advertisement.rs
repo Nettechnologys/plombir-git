@@ -84,6 +84,11 @@ pub fn collect_for_clients(repo_path: &Path) -> Result<RefAdvertisement> {
 /// server-private ref, or a commit a force push left behind. Packing it would
 /// hand out exactly what [`collect_for_clients`] keeps out of the
 /// advertisement.
+///
+/// A blob or tree is a partial clone fetching what its filter left out, and is
+/// accepted unless only a server-private ref reaches it. Stock git (v2) serves
+/// any object that exists; an object no ref reaches stays served here too — its
+/// id cannot be learnt without its content.
 pub fn unadvertised_want(repo_path: &Path, wants: &[String]) -> Result<Option<String>> {
     let advertisement = collect_for_clients(repo_path)?;
     let advertised: std::collections::HashSet<&str> = advertisement
@@ -106,6 +111,8 @@ pub fn unadvertised_want(repo_path: &Path, wants: &[String]) -> Result<Option<St
             repo_path.display()
         )
     })?;
+    let mut commits = Vec::new();
+    let mut others = Vec::new();
     for want in &candidates {
         let id = gix::ObjectId::from_hex(want.as_bytes())
             .with_context(|| format!("fetch want {want} is not an object id"))?;
@@ -114,18 +121,65 @@ pub fn unadvertised_want(repo_path: &Path, wants: &[String]) -> Result<Option<St
         let header = repo
             .try_find_header(id)
             .with_context(|| format!("failed to look up fetch want {want}"))?;
-        if header.is_none_or(|header| header.kind() != gix::object::Kind::Commit) {
-            return Ok(Some((*want).clone()));
+        match header {
+            None => return Ok(Some((*want).clone())),
+            Some(header) if header.kind() == gix::object::Kind::Commit => commits.push(*want),
+            Some(_) => others.push(*want),
         }
     }
     drop(repo);
 
-    for want in candidates {
+    // A blob or tree is what a partial clone asks for when it needs content
+    // its filter left out — by id, never through an advertisement. Refusing
+    // every one of them broke `--filter=blob:none` at its first checkout. What
+    // stays refused is content only the server-private refs reach.
+    if !others.is_empty() {
+        let private_only = objects_only_private_refs_reach(repo_path)?;
+        if let Some(want) = others
+            .iter()
+            .find(|want| private_only.contains(want.as_str()))
+        {
+            return Ok(Some((*want).clone()));
+        }
+    }
+
+    for want in commits {
         if !reachable_from_advertised_refs(repo_path, want)? {
             return Ok(Some(want.clone()));
         }
     }
     Ok(None)
+}
+
+/// Every object reachable from a server-private ref and from nothing a client
+/// is shown: everything `--all` reaches, less everything the advertised refs
+/// reach. Bounded by how far the private refs (fork heads, merge-queue
+/// candidates) diverge from the public history, not by the repository.
+fn objects_only_private_refs_reach(repo_path: &Path) -> Result<std::collections::HashSet<String>> {
+    let excludes: Vec<String> = SERVER_PRIVATE_NAMESPACES
+        .iter()
+        .map(|namespace| format!("--exclude={namespace}*"))
+        .collect();
+    let mut args: Vec<&str> = vec![
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        "--all",
+        "--not",
+    ];
+    args.extend(excludes.iter().map(String::as_str));
+    args.push("--all");
+    let output = crate::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .run(&args, Some(repo_path))?;
+    output.ensure_success()?;
+    Ok(output
+        .stdout_str()
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect())
 }
 
 /// Whether `commit` is reachable from a ref [`collect_for_clients`] shows:
