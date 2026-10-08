@@ -124,6 +124,34 @@ where
     txn.commit().await
 }
 
+/// [`set_codes`] as a transaction of its own, run again when the backend
+/// refuses it for contention — the entry point for a caller that holds no
+/// transaction (card_d71c4875993c).
+///
+/// The refusal is not exotic. On InnoDB the delete takes next-key locks on the
+/// `user_id` index, including the gap after the account's last entry, and the
+/// insert of the account next door needs an insert-intention lock in that same
+/// gap. Two re-issues for neighbouring accounts therefore deadlock with no row
+/// in common, and InnoDB rolls one back with 1213 and asks for the transaction
+/// to be run again. Re-running is safe: the set is generated before the call,
+/// and each attempt deletes and inserts from scratch.
+///
+/// A caller that already holds a transaction passes it to [`set_codes`] and
+/// retries at its own level — a deadlock rolls back the whole transaction, so
+/// a retry of the inner savepoint alone would run on a transaction that is gone.
+pub async fn reissue_codes(
+    db: &DatabaseConnection,
+    user_id: i64,
+    codes: &[String],
+) -> anyhow::Result<()> {
+    crate::contention::retry_transaction("re-issue MFA backup codes", || async {
+        set_codes(db, user_id, codes)
+            .await
+            .map_err(anyhow::Error::from)
+    })
+    .await
+}
+
 /// Spend a backup code, reporting whether this call is the one that spent it.
 ///
 /// A compare-and-swap, not a read followed by a write: the `WHERE` names the

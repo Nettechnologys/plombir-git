@@ -197,10 +197,10 @@ pub async fn register(
     // instance that decides to hide it has to drop the *message*, and the status
     // code follows it; hiding behind 400 while the body spells the name out
     // protects nothing.
-    if rg_db::ops::user_ops::find_by_username(db, username)
-        .await?
-        .is_some()
-    {
+    //
+    // "Taken" means by an account *or* an organization: both answer to the
+    // same `/{owner}` segment (card_4b0594a02218).
+    if crate::namespace::owner_name_is_taken(db, username).await? {
         return Err(crate::error::conflict(format!(
             "username '{username}' is already taken"
         )));
@@ -795,7 +795,9 @@ async fn resolve_ldap_identity(
         return synced.ok_or_else(|| anyhow::anyhow!(LDAP_IDENTITY_CONFLICT));
     }
 
-    if user_ops::find_by_username(db, username).await?.is_some() {
+    // An organization holding the name is the same conflict: a provisioned
+    // account would answer `/{name}` in its place (card_4b0594a02218).
+    if crate::namespace::owner_name_is_taken(db, username).await? {
         bail!(LDAP_IDENTITY_CONFLICT);
     }
     // From here the function creates an account, so the URL-space rule applies

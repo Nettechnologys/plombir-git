@@ -183,15 +183,19 @@ USER plombir-git
 # Expose ports
 EXPOSE 8080 2222
 
-# Health check (uses plombir-git's built-in /health endpoint)
+# Health check: /readyz — the database answers and the repository storage is
+# readable. Not /health, whose full report includes optional dependencies
+# (SMTP) that must not mark the container unhealthy.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD curl -f http://localhost:8080/readyz || exit 1
 
 # Default command: serve with config via env vars.
 # Set PLOMBIR_GIT_JWT_SECRET env var before running.
+# No --log-file: the log goes to stdout, which is what `docker compose logs`
+# and every Docker log driver read. A file here left `docker compose logs`
+# empty while deploy/README.md told operators to look there.
 CMD ["plombir-git", "serve", \
      "--repo-root", "/data/repos", \
      "--http-addr", "0.0.0.0:8080", \
      "--ssh-addr", "0.0.0.0:2222", \
-     "--db-url", "sqlite:///data/plombir-git.db?mode=rwc", \
-     "--log-file", "/data/logs/plombir-git.log"]
+     "--db-url", "sqlite:///data/plombir-git.db?mode=rwc"]

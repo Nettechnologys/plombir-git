@@ -1,0 +1,26 @@
+# Plombir Git behind Caddy: TLS on 443 with a certificate Caddy obtains and
+# renews itself, the server on the loopback port both Docker stacks publish
+# (127.0.0.1:8080).
+#
+#   1. Copy to /etc/caddy/Caddyfile and replace git.example.com.
+#   2. In plombir-git.toml set external_url and [rate_limit].trusted_proxies —
+#      see "Reverse proxy" in deploy/README.md. Without trusted_proxies every
+#      client is counted as this proxy: one login budget for the whole instance.
+#   3. caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy
+#
+# What Caddy already does that nginx has to be told: no request-body ceiling
+# (the server enforces its own per-endpoint limits), no read timeout on a
+# proxied response, WebSocket upgrades, and X-Forwarded-For / X-Forwarded-Proto
+# set from the connection it accepted. Git over SSH does not pass through here:
+# port 2222 is published by compose directly.
+#
+# Checked by scripts/check-reverse-proxy-examples.sh (`caddy validate`) on
+# every push.
+
+git.example.com {
+	reverse_proxy 127.0.0.1:8080 {
+		# Hand each chunk of a clone's pack, and each line of a live log, to
+		# the client as the server produces it rather than when a buffer fills.
+		flush_interval -1
+	}
+}

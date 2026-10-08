@@ -69,7 +69,7 @@ services:
       # The override is used by the local config gate to validate against an
       # isolated throwaway file; normal deployments keep reading this .env.
       - ${PLOMBIR_GIT_DEPLOY_ENV_FILE:-.env}
-    # The image's default CMD passes --repo-root/--db-url/--log-file flags, and
+    # The image's default CMD passes --repo-root/--db-url flags, and
     # a CLI flag always beats the config file. Override it so plombir-git.toml is
     # the single source of truth.
     command: ["plombir-git", "serve", "--config", "/app/plombir-git.toml"]

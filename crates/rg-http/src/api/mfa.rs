@@ -692,8 +692,9 @@ pub async fn regenerate_backup_codes(
 
     // `set_codes` replaces the unused rows inside one transaction, so the old
     // set stops working exactly when the new one starts — there is no window
-    // where both, or neither, are live.
-    rg_db::ops::mfa_backup_code_ops::set_codes(&state.db, user_id, &backup_codes)
+    // where both, or neither, are live. `reissue_codes` runs that transaction
+    // again when a neighbouring account's re-issue deadlocks it on MySQL.
+    rg_db::ops::mfa_backup_code_ops::reissue_codes(&state.db, user_id, &backup_codes)
         .await
         .map_err(AppError::from)?;
 

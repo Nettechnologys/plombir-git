@@ -16,6 +16,49 @@ async fn test_health_endpoint() {
     assert!(body["checks"]["filesystem"] == "ok");
 }
 
+/// card_0d7755e0dfe0: an unreachable SMTP relay stops outgoing mail and
+/// nothing else, so it must not fail the probes an orchestrator acts on. It
+/// used to turn `/health` into a 503 — an unhealthy container to Docker, a
+/// backend that is not up to the web UI's readiness check.
+#[tokio::test]
+async fn an_unreachable_smtp_relay_fails_no_probe() {
+    let (base, _db) = crate::common::spawn_test_app_with_overrides(crate::common::StateOverrides {
+        // Port 9 (discard) on loopback: nothing listens, the connect fails.
+        smtp_config: Some(rg_core::email::SmtpConfig::new(
+            "127.0.0.1",
+            9,
+            "mailer",
+            "secret",
+            "noreply@example.com",
+        )),
+        ..Default::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    for probe in ["/livez", "/readyz", "/health"] {
+        let resp = client.get(format!("{base}{probe}")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{probe}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "ok", "{probe}: {body}");
+    }
+
+    // The report still names the relay as down: reported, not decisive.
+    let body: serde_json::Value = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(body["checks"]["smtp"], "ok", "{body}");
+    assert!(
+        body.get("phase").is_none(),
+        "an internal phase number is not health: {body}"
+    );
+}
+
 // ── User registration ────────────────────────────────────────────
 
 #[tokio::test]

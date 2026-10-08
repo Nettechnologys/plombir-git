@@ -7,7 +7,6 @@
 //! had no way to read `[database].url` or `[server].repo_root` at all.
 
 use std::io::Write;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -24,8 +23,8 @@ use crate::config::{
     DEFAULT_AGENT_RATE_LIMIT_WINDOW, DEFAULT_ATTESTATION_ENABLED, DEFAULT_AUDIT_ARCHIVE_DIR,
     DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX, DEFAULT_AUTH_RATE_LIMIT_WINDOW,
     DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER, DEFAULT_CI_DOCKER,
-    DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_LOG_MAX_SIZE_MB,
-    DEFAULT_METRICS_ENABLED, DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
+    DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_METRICS_ENABLED,
+    DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
 };
 use crate::dbconn;
 use crate::telemetry;
@@ -170,13 +169,18 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-fn parse_rate_limit_trusted_proxies(values: &[String]) -> anyhow::Result<Vec<IpAddr>> {
+fn parse_rate_limit_trusted_proxies(
+    values: &[String],
+) -> anyhow::Result<Vec<rg_http::client_ip::TrustedProxy>> {
     values
         .iter()
         .map(|value| {
-            value
-                .parse::<IpAddr>()
-                .with_context(|| format!("invalid rate_limit trusted proxy IP: {value}"))
+            value.parse().map_err(|reason: String| {
+                anyhow::anyhow!(
+                    "invalid [rate_limit].trusted_proxies entry: {reason} — expected an IP address \
+                     or a CIDR network such as 172.16.0.0/12"
+                )
+            })
         })
         .collect()
 }
@@ -719,6 +723,7 @@ pub(crate) async fn run_serve(
     tls_key: Option<String>,
     config: Option<String>,
     log_file: Option<String>,
+    log_format: Option<crate::config::LogFormat>,
     log_max_size_mb: Option<u64>,
     log_max_files: Option<usize>,
     listen_address_file: Option<String>,
@@ -729,6 +734,16 @@ pub(crate) async fn run_serve(
     } else {
         None
     };
+
+    // `max_size_mb` is resolved like every other knob below, but nothing
+    // enforces it; whether anyone *asked* for it is what decides the warning.
+    let log_max_size_mb_was_set = log_max_size_mb.is_some()
+        || cfg
+            .as_ref()
+            .is_some_and(|c| c.logging.max_size_mb.is_some());
+    let resolved_log_format = log_format
+        .or_else(|| cfg.as_ref().and_then(|c| c.logging.format))
+        .unwrap_or_default();
 
     // Resolve every dual-source knob in one place: CLI args > config file >
     // built-in default.
@@ -1033,7 +1048,8 @@ pub(crate) async fn run_serve(
         cfg.as_ref().and_then(|c| c.observability.sample_ratio),
     );
 
-    let telemetry_guard = telemetry::init(log_writer, appender_guard, otel_config)?;
+    let telemetry_guard =
+        telemetry::init(log_writer, appender_guard, otel_config, resolved_log_format)?;
 
     tracing::info!(
         state_permissions = %resolved_state_permissions,
@@ -1043,14 +1059,24 @@ pub(crate) async fn run_serve(
         "Installed the process-wide creation policy for server-owned state"
     );
 
-    if let Some(ref log_path) = resolved_log_file {
-        tracing::info!(file = %log_path, "Logging to file with rotation");
-        if resolved_log_max_size_mb != DEFAULT_LOG_MAX_SIZE_MB {
-            tracing::warn!(
-                max_size_mb = resolved_log_max_size_mb,
-                "log_max_size_mb is not enforced: the file appender rotates daily (not by size). Use log_max_files to cap the number of retained files."
-            );
-        }
+    match resolved_log_file {
+        Some(ref log_path) => tracing::info!(
+            file = %log_path,
+            format = resolved_log_format.as_str(),
+            "Logging to file with daily rotation"
+        ),
+        None => tracing::info!(format = resolved_log_format.as_str(), "Logging to stdout"),
+    }
+    // Said whenever it is set, not only when it differs from the default: the
+    // example config used to carry `max_size_mb = 10`, which matched the
+    // default and so never warned — a size cap every reader believed in and
+    // nothing applied (card_0d7755e0dfe0).
+    if log_max_size_mb_was_set {
+        tracing::warn!(
+            max_size_mb = resolved_log_max_size_mb,
+            "[logging].max_size_mb / --log-max-size-mb is not enforced: log files rotate daily, \
+             not by size. Use max_files to cap how many are kept, and remove this setting."
+        );
     }
 
     // A half-written `[smtp]` or `[tls]` stops the start here, before the
@@ -1207,6 +1233,7 @@ pub(crate) async fn run_serve(
     // for good. Read-only and never fatal: renaming somebody's account is the
     // operator's decision, and a boot pass has no business making it.
     rg_core::namespace::report_owners_holding_reserved_names(&db).await;
+    rg_core::namespace::report_names_held_by_an_account_and_an_organization(&db).await;
     rg_core::namespace::report_repositories_the_transport_cannot_address(&db).await;
     rg_core::namespace::report_repositories_with_names_that_are_not_ascii(&db).await;
 

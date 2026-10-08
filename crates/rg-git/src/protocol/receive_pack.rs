@@ -209,14 +209,16 @@ where
 {
     let mut reader = BufReader::new(reader);
 
-    let ref_updates =
-        process_push_with_rejections(repo_path, &mut reader, &policy, applied).await?;
+    let ReceivedPush {
+        updates: ref_updates,
+        report,
+    } = process_push_with_rejections(repo_path, &mut reader, &policy, applied).await?;
     // Point of no return: the line above indexed the pack and wrote every
     // accepted ref. `send_response` is an ordinary network write and may fail
     // for reasons that have nothing to do with the push, so its error travels
     // *beside* the applied updates rather than through `?` — see
     // [`ReceivePackOutcome`].
-    let report_status = send_response(&mut writer, &ref_updates).await;
+    let report_status = send_response(&mut writer, &ref_updates, report).await;
     Ok(ReceivePackOutcome {
         ref_updates,
         report_status,
@@ -240,7 +242,10 @@ where
     }
     write_flush(stream).await?;
 
-    let ref_updates = {
+    let ReceivedPush {
+        updates: ref_updates,
+        report,
+    } = {
         let mut reader = BufReader::new(&mut *stream);
         process_push_with_rejections(repo_path, &mut reader, &policy, applied).await?
     };
@@ -248,7 +253,7 @@ where
     // Point of no return crossed above, exactly as on the HTTP twin: the
     // report-status write is reported beside the applied updates instead of
     // taking them down with it (see [`ReceivePackOutcome`]).
-    let report_status = send_response(stream, &ref_updates).await;
+    let report_status = send_response(stream, &ref_updates, report).await;
     Ok(ReceivePackOutcome {
         ref_updates,
         report_status,
@@ -301,6 +306,43 @@ fn build_ref_advertisement(ref_list: &[(String, String)], _service: &str) -> Vec
     lines
 }
 
+/// What the client asked to hear back once the push is done, from the
+/// capabilities on its first command line.
+///
+/// The advertisement offers `report-status`, `report-status-v2` and
+/// `side-band-64k`; offering is not agreeing. A client that did not ask for a
+/// report reads none, and one that did not ask for the sideband reads the
+/// report as plain pkt-lines — the sideband frame it never negotiated would
+/// be garbage to it (card_c5ac69953162).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReportRequest {
+    /// `report-status` or `report-status-v2`: the v1 lines this server writes
+    /// are a valid v2 report too, whose `option` lines are optional.
+    report_status: bool,
+    side_band_64k: bool,
+}
+
+impl ReportRequest {
+    fn from_capabilities(capabilities: &str) -> Self {
+        let asked = |wanted: &str| {
+            capabilities
+                .split(' ')
+                .any(|capability| capability == wanted)
+        };
+        Self {
+            report_status: asked("report-status") || asked("report-status-v2"),
+            side_band_64k: asked("side-band-64k"),
+        }
+    }
+}
+
+/// The updates a push produced, and how the client asked to be told of them.
+#[derive(Debug)]
+struct ReceivedPush {
+    updates: Vec<RefUpdate>,
+    report: ReportRequest,
+}
+
 /// Process the push: read update commands, packfile, and update refs.
 ///
 /// An empty [`PushPolicy`] means "no policy applies to this push", which is a
@@ -312,12 +354,14 @@ async fn process_push_with_rejections<R>(
     reader: &mut BufReader<R>,
     policy: &PushPolicy,
     applied: &AppliedRefUpdates,
-) -> Result<Vec<RefUpdate>>
+) -> Result<ReceivedPush>
 where
     R: AsyncRead + Unpin,
 {
     let mut updates = Vec::new();
     let mut negotiation_bytes = 0_usize;
+    // Capabilities ride on the first command line only.
+    let mut report = None;
 
     // Read update commands using proper pkt-line parsing.
     // Each line is: `old_sha new_sha refname[\0capabilities]`
@@ -355,12 +399,14 @@ where
                     );
                 }
 
-                // First update line may include capabilities after NUL
-                let clean_line = if line.contains('\0') {
-                    line.split('\0').next().unwrap_or(line)
-                } else {
-                    line
+                // The first update line carries the capabilities after NUL.
+                let (clean_line, capabilities) = match line.split_once('\0') {
+                    Some((command, capabilities)) => (command, capabilities),
+                    None => (line, ""),
                 };
+                if report.is_none() {
+                    report = Some(ReportRequest::from_capabilities(capabilities));
+                }
 
                 let parts: Vec<&str> = clean_line.split_whitespace().collect();
                 if parts.len() < 3 {
@@ -434,8 +480,9 @@ where
         }
     }
 
+    let report = report.unwrap_or_default();
     if updates.is_empty() {
-        return Ok(updates);
+        return Ok(ReceivedPush { updates, report });
     }
 
     for update in &mut updates {
@@ -455,7 +502,7 @@ where
 
     if !updates.iter().any(|update| update.status == "ok") {
         drain_pack(reader).await?;
-        return Ok(updates);
+        return Ok(ReceivedPush { updates, report });
     }
 
     // Receive the incoming pack and index it into the repository.
@@ -518,7 +565,7 @@ where
     // No `.await` sits between the last `update_ref` and this call.
     applied.record(&updates);
 
-    Ok(updates)
+    Ok(ReceivedPush { updates, report })
 }
 
 fn checked_receive_negotiation_bytes(
@@ -1416,10 +1463,12 @@ fn update_ref(repo_path: &Path, refname: &str, old_sha: &str, new_sha: &str) -> 
     Ok(())
 }
 
-/// Send the response back to the client using the report-status protocol.
+/// Send the response back to the client using the report-status protocol —
+/// if it asked for one, and in the framing it asked for ([`ReportRequest`]).
 ///
-/// When `side-band-64k` is negotiated (which we always advertise), the entire
-/// report-status payload MUST be sideband-encoded as band 1 data.
+/// When `side-band-64k` is negotiated, the entire report-status payload MUST
+/// be sideband-encoded as band 1 data; without it the same pkt-lines go out
+/// as they are, the way stock `receive-pack` writes them.
 ///
 /// Observed correct wire format (verified against real git receive-pack):
 ///
@@ -1433,7 +1482,17 @@ fn update_ref(repo_path: &Path, refname: &str, old_sha: &str, new_sha: &str) -> 
 ///
 /// The git client reads sideband until it gets a sideband flush `0000`.
 /// The band-1 content is then parsed as report-status pkt-lines.
-async fn send_response<W: AsyncWrite + Unpin>(writer: &mut W, results: &[RefUpdate]) -> Result<()> {
+async fn send_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    results: &[RefUpdate],
+    request: ReportRequest,
+) -> Result<()> {
+    if !request.report_status {
+        writer.flush().await?;
+        tracing::info!("Receive-pack done; the client asked for no report-status");
+        return Ok(());
+    }
+
     // Build the report-status pkt-lines into an in-memory buffer.
     // These will be sent as band-1 sideband data in one shot.
     let mut report_buf: Vec<u8> = Vec::new();
@@ -1455,11 +1514,15 @@ async fn send_response<W: AsyncWrite + Unpin>(writer: &mut W, results: &[RefUpda
     // 3. Flush packet embedded in the band-1 payload
     write_flush(&mut report_buf).await?;
 
-    // Send the entire report as sideband band-1 data
-    sideband::write_sideband_data(writer, &report_buf).await?;
+    if request.side_band_64k {
+        // Send the entire report as sideband band-1 data
+        sideband::write_sideband_data(writer, &report_buf).await?;
 
-    // Send sideband flush to signal end of the sideband stream
-    sideband::write_sideband_flush(writer).await?;
+        // Send sideband flush to signal end of the sideband stream
+        sideband::write_sideband_flush(writer).await?;
+    } else {
+        writer.write_all(&report_buf).await?;
+    }
 
     // Ensure everything is flushed to the transport layer
     writer.flush().await?;
@@ -2264,7 +2327,16 @@ mod wire_tests {
         ];
 
         let mut out: Vec<u8> = Vec::new();
-        send_response(&mut out, &results).await.unwrap();
+        send_response(
+            &mut out,
+            &results,
+            ReportRequest {
+                report_status: true,
+                side_band_64k: true,
+            },
+        )
+        .await
+        .unwrap();
 
         // Outer layer: a single sideband band-1 pkt-line carrying the report.
         let mut outer = BufReader::new(Cursor::new(out));
@@ -2295,6 +2367,88 @@ mod wire_tests {
         ));
     }
 
+    /// card_c5ac69953162: the report goes out in the framing the client asked
+    /// for, and not at all when it asked for none. Stock git always asks for
+    /// both, which is why the unconditional sideband never showed there.
+    #[tokio::test]
+    async fn report_status_follows_what_the_client_asked_for() {
+        let results = vec![RefUpdate {
+            old_sha: "a".repeat(40),
+            new_sha: "b".repeat(40),
+            refname: "refs/heads/main".into(),
+            status: "ok".into(),
+            message: "ok".into(),
+        }];
+        let mut plain_report = pkt(b"unpack ok\n");
+        plain_report.extend_from_slice(&pkt(b"ok refs/heads/main\n"));
+        plain_report.extend_from_slice(b"0000");
+
+        for (capabilities, expected) in [
+            ("report-status", plain_report.clone()),
+            ("report-status-v2 quiet agent=x", plain_report),
+            ("side-band-64k agent=x", Vec::new()),
+            ("", Vec::new()),
+        ] {
+            let mut out = Vec::new();
+            send_response(
+                &mut out,
+                &results,
+                ReportRequest::from_capabilities(capabilities),
+            )
+            .await
+            .unwrap();
+            assert_eq!(out, expected, "capabilities `{capabilities}`");
+        }
+    }
+
+    /// The capabilities are read off the first command line, where the
+    /// client puts them, and decide the report for the whole push.
+    #[tokio::test]
+    async fn the_first_command_line_decides_the_report() {
+        let repo = tempfile::tempdir().unwrap();
+        let delete = |name: &str, capabilities: &str| {
+            pkt(format!(
+                "{} {} refs/heads/{name}{capabilities}\n",
+                "c".repeat(40),
+                "0".repeat(40)
+            )
+            .as_bytes())
+        };
+
+        for (first, expected) in [
+            (
+                "\0report-status side-band-64k",
+                ReportRequest {
+                    report_status: true,
+                    side_band_64k: true,
+                },
+            ),
+            (
+                "\0report-status",
+                ReportRequest {
+                    report_status: true,
+                    side_band_64k: false,
+                },
+            ),
+            ("", ReportRequest::default()),
+        ] {
+            let mut stream = delete("one", first);
+            stream.extend_from_slice(&delete("two", "\0report-status side-band-64k"));
+            stream.extend_from_slice(b"0000");
+            let mut reader = BufReader::new(Cursor::new(stream));
+            let received = process_push_with_rejections(
+                repo.path(),
+                &mut reader,
+                &PushPolicy::default(),
+                &AppliedRefUpdates::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(received.updates.len(), 2);
+            assert_eq!(received.report, expected, "first line `{first:?}`");
+        }
+    }
+
     #[tokio::test]
     async fn process_push_handles_malformed_commands_without_spawning_indexer() {
         // A garbage line (too few fields) is skipped; a deletion (null target)
@@ -2317,7 +2471,8 @@ mod wire_tests {
             &AppliedRefUpdates::new(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .updates;
 
         assert_eq!(updates.len(), 1, "only the deletion produces an update");
         assert_eq!(updates[0].refname, "refs/heads/gone");
@@ -2343,7 +2498,8 @@ mod wire_tests {
             &AppliedRefUpdates::new(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .updates;
 
         assert_eq!(updates.len(), 4);
         for update in updates {
@@ -2777,6 +2933,7 @@ mod push_policy_tests {
         process_push_with_rejections(repo, &mut reader, policy, &AppliedRefUpdates::new())
             .await
             .expect("the push itself must run to the end")
+            .updates
     }
 
     fn outcome<'a>(updates: &'a [RefUpdate], refname: &str) -> &'a RefUpdate {

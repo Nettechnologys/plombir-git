@@ -66,11 +66,7 @@ pub async fn create_bot(
     }
 
     let taken = || crate::error::conflict(format!("username '{username}' is already taken"));
-    if user_ops::find_by_username(db, username).await?.is_some()
-        || rg_db::ops::org_ops::get_org_by_name(db, username)
-            .await?
-            .is_some()
-    {
+    if crate::namespace::owner_name_is_taken(db, username).await? {
         return Err(taken());
     }
 

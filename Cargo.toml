@@ -58,7 +58,7 @@ redundant_explicit_links = "deny"
 # HTTP
 axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "fs", "limit"] }
+tower-http = { version = "0.6", features = ["catch-panic", "cors", "trace", "fs", "limit"] }
 
 # SSH
 # russh 0.60.3 is the first release fixing RUSTSEC-2026-0153/0154 (unbounded
@@ -98,7 +98,7 @@ quick-xml = { version = "0.41", features = ["serialize"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Error handling
 anyhow = "1"
@@ -256,5 +256,12 @@ opt-level = 3
 lto = true
 strip = true
 codegen-units = 1
-panic = "abort"
+# `panic = "unwind"` (the default), deliberately — NOT "abort". Under abort one
+# panic anywhere ends the process: every HTTP request in flight, every SSH
+# session, every push half-written, followed by the recovery passes on the next
+# start. Under unwind tokio confines it to the task it happened in, and the
+# server's `CatchPanicLayer` turns it into a 500 for that one request. The code
+# here is disciplined about unwrap; its dependencies parse untrusted packs,
+# archives, XML and YAML, and are not something to bet the process on
+# (card_be36b7e817b8).
 opt-level = 3

@@ -98,7 +98,30 @@ runFixture(
   null,
   0,
   '13 job(s) in regression.yml — 4 mirrored by run-local-gates.mjs, 3 by the card verifier, '
-    + '1 excluded by design, 5 running nowhere',
+    + '1 excluded by design, 5 in CI only, 0 running nowhere',
+);
+
+// card_6ed21f52b0aa: "runs in CI" is a claim the check proves against the
+// workflow, not a label that replaced "nowhere" for free. Both ways CI can stop
+// running a job while it stays in the file must turn the claim red.
+runFixture(
+  'a workflow nothing a contributor does triggers is not CI coverage',
+  ({ workflow }) => replaceRequired(
+    workflow,
+    'on:\n  pull_request:\n  push:\n    branches:\n      - main\n',
+    'on:\n',
+  ),
+  1,
+  'CARGO_JOBS says `rust` runs in CI, but regression.yml is triggered by neither `push` nor `pull_request`',
+  'local gate coverage:',
+);
+
+runFixture(
+  'a ciOnly job switched off with if: false is not CI coverage',
+  ({ workflow }) => replaceRequired(workflow, '  rust:\n', '  rust:\n    if: ${{ false }}\n'),
+  1,
+  'CARGO_JOBS says `rust` runs in CI, but its `if:` switches the job off.',
+  'local gate coverage:',
 );
 
 runFixture(

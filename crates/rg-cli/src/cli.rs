@@ -164,7 +164,8 @@ pub(crate) enum Commands {
         #[arg(long)]
         rate_limit_window: Option<u64>,
 
-        /// Comma-separated proxy IPs whose X-Forwarded-For / X-Real-IP headers are trusted
+        /// Comma-separated proxies — IP addresses or CIDR networks — whose
+        /// X-Forwarded-For / X-Real-IP headers are trusted
         #[arg(long, value_delimiter = ',')]
         rate_limit_trusted_proxies: Vec<String>,
 
@@ -205,8 +206,14 @@ pub(crate) enum Commands {
         #[arg(long)]
         log_file: Option<String>,
 
-        /// Log rotation: nominal max log file size in MB. NOTE: the file
-        /// appender rotates daily, not by size — this value is advisory only.
+        /// Log line format: `text` for people, `json` for a log shipper
+        /// [config: [logging].format] [default: text]
+        #[arg(long, value_enum)]
+        log_format: Option<crate::config::LogFormat>,
+
+        /// Log rotation: nominal max log file size in MB. NOT ENFORCED: the
+        /// file appender rotates daily, not by size, and the server warns at
+        /// startup when this is set. Kept so older configs still start.
         /// [config: [logging].max_size_mb] [default: 10]
         #[arg(long)]
         log_max_size_mb: Option<u64>,

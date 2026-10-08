@@ -49,10 +49,12 @@ pub const RESERVED_SEGMENTS: &[&str] = &[
     "health",
     "help",
     "imports",
+    "livez",
     "login",
     "metrics",
     "notifications",
     "orgs",
+    "readyz",
     "register",
     "reset-password",
     "search",
@@ -72,6 +74,67 @@ pub fn is_reserved_segment(name: &str) -> bool {
     RESERVED_SEGMENTS
         .iter()
         .any(|segment| name.eq_ignore_ascii_case(segment))
+}
+
+/// Whether an account or an organization already holds `name`.
+///
+/// Accounts and organizations live in two tables but answer to one URL segment
+/// (`/{owner}`), and `resolve_owner` reads the account first. A door that asks
+/// only its own table therefore hands out a name the other one already holds:
+/// a stranger registering `acme` next to the organization `acme` took over
+/// everything that resolves the owner by name — new repositories "in acme",
+/// the `/acme/...` links — and an organization named after an account did the
+/// same to the account (card_4b0594a02218). Every door that mints an owner
+/// name asks this instead: registration, organization creation, bots, and the
+/// SSO and LDAP paths that generate a name without a human seeing it.
+///
+/// Exact match, like the two lookups it combines. Two concurrent creates of
+/// one name across the two tables can still both pass it: no constraint spans
+/// the tables, so this narrows the window to a race rather than closing it.
+pub async fn owner_name_is_taken(
+    db: &rg_db::DatabaseConnection,
+    name: &str,
+) -> anyhow::Result<bool> {
+    if rg_db::ops::user_ops::find_by_username(db, name)
+        .await?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(rg_db::ops::org_ops::get_org_by_name(db, name)
+        .await?
+        .is_some())
+}
+
+/// Name every organization whose name an account holds too.
+///
+/// A sibling of [`report_owners_holding_reserved_names`]: the doors refuse new
+/// collisions, this says which ones came through first. The organization is the
+/// one that lost — `/{name}` resolves to the account — and which of the two to
+/// rename is the operator's call, so a warning and a startup that continues.
+pub async fn report_names_held_by_an_account_and_an_organization(db: &rg_db::DatabaseConnection) {
+    let shared = match rg_db::ops::org_ops::list_names_held_by_an_account_too(db).await {
+        Ok(shared) => shared,
+        // Silence here reads exactly like "none", which is the answer the
+        // operator would act on.
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "could not check whether any organization shares its name with an account"
+            );
+            return;
+        }
+    };
+    if shared.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        names = shared.join(", "),
+        "these names are held by an account and by an organization at once; `/{{name}}` and \
+         everything that resolves an owner by name reach the account, so the organization is \
+         unreachable by its name; they predate the rule and renaming one of the two is a \
+         decision for you, not for the server"
+    );
 }
 
 /// Name every account and organization already holding a reserved segment.
@@ -267,6 +330,52 @@ mod tests {
             organizations.is_empty(),
             "no organization was seeded: {organizations:?}"
         );
+    }
+
+    /// card_4b0594a02218: the doors now ask both tables, and the boot pass
+    /// names the collisions that came through before they did — only those.
+    #[tokio::test]
+    async fn a_name_held_by_an_account_and_an_organization_is_found_and_named() {
+        let db = crate::test_support::migrated_memory_database().await;
+        let founder = rg_db::ops::user_ops::create_user(
+            &db,
+            "founder",
+            "founder@example.invalid",
+            "",
+            "Founder",
+        )
+        .await
+        .expect("seed the organizations' owner");
+        // Straight through the ops, the way such a pair got in before.
+        rg_db::ops::user_ops::create_user(&db, "acme", "acme@example.invalid", "", "Acme")
+            .await
+            .expect("seed the account that shadows the organization");
+        for org in ["acme", "lonely"] {
+            rg_db::ops::org_ops::create_org(&db, org, None, None, founder.id, "public")
+                .await
+                .expect("seed an organization");
+        }
+
+        assert_eq!(
+            rg_db::ops::org_ops::list_names_held_by_an_account_too(&db)
+                .await
+                .expect("list collisions"),
+            vec!["acme".to_string()]
+        );
+        for (name, taken) in [
+            ("acme", true),
+            ("lonely", true),
+            ("founder", true),
+            ("free", false),
+        ] {
+            assert_eq!(
+                owner_name_is_taken(&db, name)
+                    .await
+                    .expect("look the name up"),
+                taken,
+                "{name}"
+            );
+        }
     }
 
     /// The list is what the guard compares against, so a duplicate or an

@@ -90,7 +90,8 @@ ssh -p 2222 -o StrictHostKeyChecking=no git@localhost 2>&1 | head -1
 ```
 
 HTTP is published on `127.0.0.1:8080` only — put a TLS-terminating reverse
-proxy in front of it. Git-over-SSH listens on `0.0.0.0:2222`.
+proxy in front of it ([Reverse proxy](#reverse-proxy) below has working nginx
+and Caddy configurations). Git-over-SSH listens on `0.0.0.0:2222`.
 
 `plombir-git.toml` and `data/` are git-ignored, so a rebuilt container keeps
 reading the settings and data you edited on the host.
@@ -123,6 +124,55 @@ docker compose -f docker-compose.hostdir.yml run --rm --entrypoint id plombir-gi
 
 Note that `PLOMBIR_GIT_UID` is a **build** argument: after changing it you must
 `up --build`, not just `restart`.
+
+### Reverse proxy
+
+Two configurations that work as they are, apart from the domain name:
+
+- [`nginx.conf.example`](nginx.conf.example) — drop into `/etc/nginx/conf.d/`;
+- [`Caddyfile.example`](Caddyfile.example) — Caddy fetches the certificate itself.
+
+Both are loaded by the proxies themselves on every push
+(`scripts/check-reverse-proxy-examples.sh`: `nginx -t`, `caddy validate`), so
+they do not rot. What they set beyond a stock proxy, and why, is commented in
+each file: no request-body ceiling (pushes, LFS, packages and OCI layers carry
+their own limits on the server), streaming instead of buffering in both
+directions, timeouts longer than a large clone, the WebSocket upgrade for live
+CI logs, and `X-Forwarded-For` / `X-Forwarded-Proto`.
+
+Then tell the server two things in `plombir-git.toml`:
+
+```toml
+[server]
+external_url = "https://git.example.com"
+
+[rate_limit]
+trusted_proxies = ["172.16.0.0/12"]
+```
+
+**`trusted_proxies` is not optional behind a proxy.** Without it every request
+comes from the proxy as far as the server can tell: every limiter is keyed by
+the proxy's address — ten logins a minute for the *whole instance*, which one
+client can spend for everybody — and every audit and login entry names the
+proxy. The server says so once in its log when it sees forwarded requests from a
+private address with the list empty.
+
+Which address to list is where people go wrong. A proxy on the host that
+connects to the published `127.0.0.1:8080` reaches the container from the
+**gateway of the compose network** (`plombir-git-net`), not from `docker0`'s
+`172.17.0.1`, and Docker picks that network's subnet when it creates it. Hence
+the bridge range above. It is safe in this layout because the port is published
+on loopback only — nothing but the host reaches it. To narrow it to the one
+address:
+
+```bash
+docker network inspect plombir-git-net \
+  --format '{{(index .IPAM.Config 0).Gateway}}'
+```
+
+Running the binary directly on the host instead of in Docker, the proxy is
+`127.0.0.1` (and `::1`). Entries are addresses or CIDR networks; anything else
+is refused at startup with the entry named.
 
 ### Troubleshooting a failed first start
 

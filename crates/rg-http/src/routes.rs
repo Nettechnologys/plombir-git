@@ -420,6 +420,11 @@ fn apply_middleware(
         crate::client_ip::resolve_client_ip_middleware,
     ));
 
+    // A panic anywhere below — a handler, a gate, the address resolver — ends
+    // as a 500 for its request, not as a dropped connection. Inside the
+    // security headers, so that answer carries them too.
+    let router = router.layer(crate::middleware::panic_boundary());
+
     // The last layer runs first and therefore sees every response, including a
     // 503 or 429 produced by the gates above. It also inserts the CSP nonce into
     // request extensions before forwarding, so the deeper SPA fallback still
@@ -1115,6 +1120,8 @@ pub(crate) fn build_all_routes(
             git_http::handle_git_receive_pack,
         )
         .get(Public, "/health", handlers::health)
+        .get(Public, "/livez", handlers::livez)
+        .get(Public, "/readyz", handlers::readyz)
         .get(Public, "/metrics", metrics::metrics_handler)
         .finish();
 

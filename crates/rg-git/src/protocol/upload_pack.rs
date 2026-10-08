@@ -8,7 +8,7 @@ use std::path::Path;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing;
 
-use super::pack_stream;
+use super::{pack_stream, ClientRefusal};
 use crate::pkt_line::{read_pkt_line, write_flush, write_pkt_line, PktLine};
 use crate::sideband;
 
@@ -85,7 +85,22 @@ enum AckMode {
 }
 
 /// Read the wants, negotiate, and send the pack the negotiation agreed on.
+/// A request refused on the client's account reaches it as an `ERR` packet.
 async fn serve_fetch<R, W>(
+    repo_path: &Path,
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+    transport: Transport,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let outcome = negotiate_and_send(repo_path, reader, writer, transport).await;
+    super::tell_client_of_refusal(writer, outcome).await
+}
+
+async fn negotiate_and_send<R, W>(
     repo_path: &Path,
     reader: &mut BufReader<R>,
     writer: &mut W,
@@ -115,13 +130,7 @@ where
         .context("upload-pack want check did not complete")??
     };
     if let Some(want) = checked {
-        write_pkt_line(
-            writer,
-            &PktLine::text(&format!("ERR upload-pack: not our ref {want}")),
-        )
-        .await?;
-        writer.flush().await?;
-        bail!("upload-pack: not our ref {want}");
+        return Err(ClientRefusal::new(format!("upload-pack: not our ref {want}")).into());
     }
 
     let has = |cap: &str| client_caps.iter().any(|offered| offered == cap);
@@ -206,7 +215,7 @@ async fn read_wants_with_limits<R: AsyncRead + Unpin>(
 
         if let Some(sha) = command.strip_prefix("want ") {
             if wants.len() >= max_entries {
-                bail!("upload-pack negotiation exceeds the configured entry limit");
+                return Err(ClientRefusal::new(ENTRY_LIMIT_REFUSAL).into());
             }
             wants.push(validated_oid(sha.trim())?);
         } else {
@@ -277,7 +286,7 @@ where
                     if let Some(sha) = line.strip_prefix("have ") {
                         entries += 1;
                         if entries > super::MAX_NEGOTIATION_ENTRIES {
-                            bail!("upload-pack negotiation exceeds the configured entry limit");
+                            return Err(ClientRefusal::new(ENTRY_LIMIT_REFUSAL).into());
                         }
                         round.push(validated_oid(sha.trim())?);
                     }
@@ -364,18 +373,24 @@ async fn present_objects(repo_path: &Path, haves: Vec<String>) -> Result<Vec<Str
     .context("upload-pack negotiation lookup did not complete")?
 }
 
+const ENTRY_LIMIT_REFUSAL: &str = "upload-pack negotiation exceeds the configured entry limit";
+
 fn checked_negotiation_bytes(current: usize, frame: usize, max_bytes: usize) -> Result<usize> {
     current
         .checked_add(frame)
         .filter(|size| *size <= max_bytes)
-        .context("upload-pack negotiation exceeds the configured byte limit")
+        .ok_or_else(|| {
+            ClientRefusal::new("upload-pack negotiation exceeds the configured byte limit").into()
+        })
 }
 
 /// A want or have names one object by its full SHA-1. Anything else would
 /// reach `pack-objects` as a revision expression.
 fn validated_oid(sha: &str) -> Result<String> {
     if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("upload-pack object id must be 40 hexadecimal characters");
+        return Err(
+            ClientRefusal::new("upload-pack object id must be 40 hexadecimal characters").into(),
+        );
     }
     Ok(sha.to_ascii_lowercase())
 }

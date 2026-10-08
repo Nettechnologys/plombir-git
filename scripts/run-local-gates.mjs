@@ -2,16 +2,23 @@
 
 // Runs the cargo-free gates of `.github/workflows/regression.yml` locally.
 //
-// Why this exists: the workflow has never executed a single step. 400 runs out
-// of 400, from the first one on 2026-07-26 onward, were refused before a runner
-// was ever assigned — GitHub's own check-run annotation on every job reads "The
-// job was not started because recent account payments have failed or your
-// spending limit needs to be increased". So every gate declared in that file was
-// enforced by nothing, and the push verifier mirrored two of the twelve jobs
-// there were then (`cargo fmt`, `cargo clippy`). A gate nobody executes is a
-// comment, and a
-// silenced gate is indistinguishable by construction from one that keeps
-// passing — which is why nobody noticed that green had never happened once.
+// Why this exists: for its first ten weeks the workflow never executed a single
+// step. 400 runs out of 400, from the first one on 2026-07-26 onward, were
+// refused before a runner was ever assigned — GitHub's own check-run annotation
+// on every job read "The job was not started because recent account payments
+// have failed or your spending limit needs to be increased". So every gate
+// declared in that file was enforced by nothing, and the push verifier mirrored
+// two of the twelve jobs there were then (`cargo fmt`, `cargo clippy`). A gate
+// nobody executes is a comment, and a silenced gate is indistinguishable by
+// construction from one that keeps passing — which is why nobody noticed that
+// green had never happened once.
+//
+// That ended when the repository went public: Actions runs every job since
+// 2026-10-08, and the first runs of `rust` and `git-protocol` caught two real
+// defects. The local mirror stays for what it is now — the gate that runs
+// BEFORE a push rather than after it — and the jobs it cannot mirror are
+// recorded as running in CI only, not "nowhere": a notice claiming CI never
+// runs teaches the reader to ignore a red CI (card_6ed21f52b0aa).
 //
 // This runner covers the gates that need no Rust build, so it remains a single
 // reusable target for the card verifier and pre-push fallback. Measured on a
@@ -52,18 +59,21 @@ export const EXCLUDED = new Map([
 // The cargo half of regression.yml, and where each job actually runs today.
 // This runner does not execute any of them — a Rust build is not a pre-push
 // budget — but the accounting has to live somewhere, because without it the
-// cargo half is exactly the hand-written list this runner exists to replace:
-// the card verifier names two cargo commands, five jobs run nowhere at all,
-// and nothing goes red when either fact changes.
+// cargo half is exactly the hand-written list this runner exists to replace,
+// and nothing goes red when a fact in it changes.
 //
-// Each entry declares one of two things, and the coverage contract check proves
-// it rather than trusting it:
+// Each entry declares exactly one of three things, and the coverage contract
+// check proves it rather than trusting it:
 //   verifier:  a command `scripts/verify-push-gates.sh` must invoke. Delete the
 //              line and the check goes red, so the gate cannot be dropped
 //              quietly while the hook keeps accepting old workflow assumptions.
-//   uncovered: this gate is enforced by NOTHING right now, with the reason it
-//              cannot be mirrored before a push. The count is printed, so
-//              "covered" and "half covered" stop looking identical.
+//   ciOnly:    the job runs in GitHub Actions on every push and pull request
+//              and nowhere before it, with the reason it cannot be mirrored
+//              locally. The check proves the workflow is triggered by push or
+//              pull_request and the job is not switched off with an `if:`.
+//   uncovered: this gate is enforced by NOTHING right now, with the reason.
+//              The count is printed, so "covered" and "half covered" stop
+//              looking identical.
 export const CARGO_JOBS = new Map([
   ['fmt', { verifier: 'cargo fmt' }],
   ['clippy', { verifier: 'cargo clippy' }],
@@ -71,31 +81,31 @@ export const CARGO_JOBS = new Map([
   [
     'rust',
     {
-      uncovered: 'the workspace test suite, doc-tests and the fresh-DB migration smoke; '
-        + '25-30 minutes measured, and `cargo test -p rg-http` is not yet green on HEAD anyway.',
+      ciOnly: 'the workspace test suite, doc-tests and the fresh-DB migration smoke; '
+        + '25-30 minutes measured, far past a pre-push budget.',
     },
   ],
   [
     'security-audit',
     {
-      uncovered: '`cargo audit`, `cargo deny` and osv-scanner need three tools installed and an '
+      ciOnly: '`cargo audit`, `cargo deny` and osv-scanner need three tools installed and an '
         + 'advisory-database fetch — a push must not depend on the network being up.',
     },
   ],
   [
     'git-protocol',
     {
-      uncovered: 'drives a real git client over HTTP and SSH against a release build of Plombir Git; '
+      ciOnly: 'drives a real git client over HTTP and SSH against a release build of Plombir Git; '
         + 'needs the binary built and ports bound.',
     },
   ],
   [
     'postgres-smoke',
-    { uncovered: 'needs a live PostgreSQL; the workflow gets one from a service container.' },
+    { ciOnly: 'needs a live PostgreSQL; the workflow gets one from a service container.' },
   ],
   [
     'mysql-smoke',
-    { uncovered: 'needs a live MySQL; the workflow gets one from a service container.' },
+    { ciOnly: 'needs a live MySQL; the workflow gets one from a service container.' },
   ],
 ]);
 
@@ -239,6 +249,14 @@ export function runDeployConfig({ cwd = root } = {}) {
     cwd: repoRoot,
     env: { PLOMBIR_GIT_DEPLOY_ENV_FILE: envFile },
   }));
+
+  // The reverse-proxy examples ride with the compose files: both are what an
+  // operator copies out of deploy/, and the workflow validates them in the same
+  // job, through the same script (card_b7bfdbf0b00d).
+  if (gate.ok) {
+    const proxies = fromResult(sh('bash scripts/check-reverse-proxy-examples.sh', { cwd: repoRoot }));
+    gate = { ok: proxies.ok, output: `${gate.output}\n${proxies.output}`.trim() };
+  }
 
   if (temporaryRoot) {
     try {
@@ -405,14 +423,20 @@ function main() {
   console.log(`\n${failures.length === 0 ? '✅' : '❌'} ${summary}`);
 
   // Said out loud on every verification: a green run here covers the cargo-free
-  // half. The verifier covers the two cargo commands; the rest of regression.yml
-  // is still enforced by nothing, and silence would read as coverage.
-  const uncovered = [...CARGO_JOBS].filter(([, where]) => where.uncovered).map(([job]) => job);
-  if (uncovered.length > 0) {
+  // half and the verifier's cargo commands. The rest of regression.yml is
+  // enforced after the push, by CI — a red CI there is a real failure, not
+  // noise — and anything enforced by nothing is named as such.
+  const jobsClaiming = (claim) => [...CARGO_JOBS].filter(([, where]) => where[claim]).map(([job]) => job);
+  const ciOnly = jobsClaiming('ciOnly');
+  if (ciOnly.length > 0) {
     console.log(
-      `ℹ️  ${uncovered.length} gate(s) of regression.yml run nowhere — ${uncovered.join(', ')}. `
-        + 'CI has never executed a step; see the header of this file.',
+      `ℹ️  ${ciOnly.length} gate(s) of regression.yml run in CI only, after the push — ${ciOnly.join(', ')}. `
+        + 'Check the Actions run of the pushed commit.',
     );
+  }
+  const uncovered = jobsClaiming('uncovered');
+  if (uncovered.length > 0) {
+    console.log(`⚠️  ${uncovered.length} gate(s) of regression.yml run nowhere — ${uncovered.join(', ')}.`);
   }
 
   process.exit(failures.length === 0 ? 0 : 1);

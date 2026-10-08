@@ -18,8 +18,8 @@
 // asserts the shape rather than trusting the comments.
 //
 // Why here and not only in Rust: the workspace test suite runs in no gate that
-// precedes a push (`rust` is recorded `uncovered` in
-// `scripts/run-local-gates.mjs`, and regression.yml has never executed). The
+// precedes a push (`rust` is recorded `ciOnly` in `scripts/run-local-gates.mjs`:
+// CI runs it, after the commit is already pushed). The
 // Rust tests beside the code carry the behaviour — a pack larger than every
 // internal window arrives whole, a late `pack-objects` failure breaks the body
 // instead of ending it cleanly — and this carries the teeth.

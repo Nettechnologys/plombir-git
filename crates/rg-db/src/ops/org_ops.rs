@@ -45,6 +45,32 @@ pub async fn get_org(db: &DatabaseConnection, id: i64) -> Result<Option<organiza
 }
 
 /// Get an organization by name.
+/// Organization names an account holds too, sorted.
+///
+/// Owners share the first URL segment, and `resolve_owner` answers a name with
+/// the account before the organization — so every name listed here addresses
+/// the account, and the organization behind it is unreachable by name
+/// (card_4b0594a02218). The doors refuse new collisions; this finds the ones
+/// that came through before they did.
+pub async fn list_names_held_by_an_account_too(db: &DatabaseConnection) -> Result<Vec<String>> {
+    use sea_orm::sea_query::Query;
+
+    let accounts = Query::select()
+        .column(crate::entities::user::Column::Username)
+        .from(crate::entities::user::Entity)
+        .to_owned();
+    let mut names: Vec<String> = organization::Entity::find()
+        .select_only()
+        .column(organization::Column::Name)
+        .filter(organization::Column::Name.in_subquery(accounts))
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list organization names an account holds too")?;
+    names.sort();
+    Ok(names)
+}
+
 pub async fn get_org_by_name(
     db: &DatabaseConnection,
     name: &str,

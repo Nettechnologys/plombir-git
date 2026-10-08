@@ -1,0 +1,75 @@
+# Plombir Git behind nginx: TLS on 443, the server on the loopback port both
+# Docker stacks publish (127.0.0.1:8080).
+#
+#   1. Copy to /etc/nginx/conf.d/plombir-git.conf and replace git.example.com.
+#   2. Point the two ssl_certificate lines at your certificate (certbot's
+#      default paths are shown).
+#   3. In plombir-git.toml set external_url and [rate_limit].trusted_proxies —
+#      see "Reverse proxy" in deploy/README.md. Without trusted_proxies every
+#      client is counted as this proxy: one login budget for the whole instance.
+#   4. nginx -t && systemctl reload nginx
+#
+# Git over SSH does not pass through here: port 2222 is published by compose
+# directly.
+#
+# Checked by scripts/check-reverse-proxy-examples.sh (`nginx -t`) on every push.
+
+# WebSocket upgrade for the live CI log and notification streams.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name git.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    # nginx >= 1.25.1. On an older one, drop this line and write
+    # `listen 443 ssl http2;` above instead.
+    http2 on;
+    server_name git.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/git.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/git.example.com/privkey.pem;
+
+    # Pushes, LFS objects, packages and OCI layers. The server enforces its own
+    # per-endpoint ceilings (package_upload_max_mb, the LFS and OCI limits);
+    # nginx's default 1 MB would refuse an ordinary push with an HTML page git
+    # cannot read.
+    client_max_body_size 0;
+
+    # Stream both directions instead of spooling them to disk first: a clone is
+    # sent while `pack-objects` produces it, and a push is read while it
+    # arrives. Buffering a multi-gigabyte pack here doubles the disk it needs
+    # and holds the client in silence until the whole thing has landed.
+    proxy_request_buffering off;
+    proxy_buffering off;
+
+    # Long enough for a large clone or push. The server bounds the git
+    # transport itself ([timeouts].git_stream_secs, git_idle_secs); nginx's
+    # 60 s default would cut a slow pack mid-stream first.
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        # Appends the peer nginx saw. The server walks this chain from the
+        # right and stops at the first address that is not a trusted proxy, so
+        # whatever a client wrote to the left of it is never read.
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # Generated clone URLs, redirects and cookies use https because of it.
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+}

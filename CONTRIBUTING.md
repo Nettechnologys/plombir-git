@@ -48,9 +48,12 @@ cargo tree                  # inspect the dependency graph
 git clone https://github.com/Nettechnologys/plombir-git.git
 cd plombir-git
 
-# Use the repository-owned pre-push fallback for this clone. GitHub Actions is
-# blocked on account billing and has never executed a step, so local checks are
-# currently the only gates that actually run.
+# Use the repository-owned pre-push fallback for this clone. GitHub Actions runs
+# every job of regression.yml on each push and pull request, but only after the
+# push; these local checks are the part that runs before it. The jobs they
+# cannot mirror (the workspace tests, the security audit, the git-protocol and
+# database smokes) are reported as "run in CI only" — check the Actions run of
+# the commit you pushed.
 #
 # The normal card workflow runs the verifier once after committing. It checks
 # Rustfmt, strict workspace Clippy, and every cargo-free job of regression.yml,

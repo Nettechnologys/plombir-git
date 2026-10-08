@@ -353,6 +353,26 @@
     },
     {
       "method": "GET",
+      "url": "/livez",
+      "access": "Public",
+      "handler": "handlers::livez",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "GET",
+      "url": "/readyz",
+      "access": "Public",
+      "handler": "handlers::readyz",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "GET",
       "url": "/metrics",
       "access": "Public",
       "handler": "metrics::metrics_handler",

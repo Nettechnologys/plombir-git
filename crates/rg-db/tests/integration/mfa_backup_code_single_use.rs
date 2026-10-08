@@ -113,7 +113,7 @@ async fn second_account(db: &DatabaseConnection) -> i64 {
 /// Enrol one distinguishable code for a user and hand the plaintext back.
 async fn issue(db: &DatabaseConnection, user_id: i64, label: &str) -> String {
     let code = format!("{label}{}", uuid::Uuid::new_v4().simple());
-    mfa_backup_code_ops::set_codes(db, user_id, std::slice::from_ref(&code))
+    mfa_backup_code_ops::reissue_codes(db, user_id, std::slice::from_ref(&code))
         .await
         .expect("enrol a backup code");
     code
@@ -252,3 +252,57 @@ where
     }
     out
 }
+
+/// card_d71c4875993c: re-issuing one account's codes must not fail because
+/// a neighbouring account is re-issuing its own at the same moment.
+///
+/// `set_codes` is `DELETE … WHERE user_id = ? AND used = false` + `INSERT` in
+/// one transaction. On InnoDB the delete takes next-key locks on the
+/// `user_id` index, *including the gap after the last matching entry*, and
+/// the insert of the account next door needs an insert-intention lock in that
+/// very gap. Two such transactions on adjacent ids wait on each other and
+/// InnoDB kills one with 1213 — no shared row, no second writer to the same
+/// account. That is the deadlock CI run 37834361883 hit in [`issue`], with the
+/// other tests of this file as the neighbours. InnoDB's documented answer is
+/// to run the transaction again, which is what `reissue_codes` does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_reissues_for_neighbouring_accounts_all_land() {
+    let (db, _temp, first) = setup("reissue").await;
+    let mut accounts = vec![first];
+    for _ in 1..CALLERS {
+        accounts.push(second_account(&db).await);
+    }
+
+    let reissues = accounts.iter().map(|&user_id| {
+        let db = db.clone();
+        async move {
+            for round in 0..ROUNDS {
+                let codes =
+                    mfa_backup_code_ops::generate_codes(mfa_backup_code_ops::BACKUP_CODE_COUNT);
+                mfa_backup_code_ops::reissue_codes(&db, user_id, &codes)
+                    .await
+                    .map_err(|error| format!("account {user_id}, round {round}: {error:#}"))?;
+            }
+            Ok::<_, String>(user_id)
+        }
+    });
+
+    for result in join_all(reissues).await {
+        let user_id = result.unwrap_or_else(|error| panic!("a re-issue failed: {error}"));
+        let live = mfa_backup_code_ops::list_codes(&db, user_id)
+            .await
+            .expect("read the live set")
+            .into_iter()
+            .filter(|row| !row.used)
+            .count();
+        assert_eq!(
+            live,
+            mfa_backup_code_ops::BACKUP_CODE_COUNT,
+            "account {user_id} must hold exactly one whole set"
+        );
+    }
+}
+
+/// Re-issues per account in [`concurrent_reissues_for_neighbouring_accounts_all_land`]:
+/// enough interleavings that adjacent transactions meet in the shared gap.
+const ROUNDS: usize = 12;

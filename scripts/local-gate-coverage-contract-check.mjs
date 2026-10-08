@@ -3,7 +3,8 @@
 // Asserts that EVERY job of `.github/workflows/regression.yml` is accounted for
 // in `scripts/run-local-gates.mjs` — mirrored by the local runner, mirrored by a
 // command `scripts/verify-push-gates.sh` provably still invokes, excluded on
-// purpose, or declared as running nowhere with the reason. It also proves that
+// purpose, declared as running in CI only, or declared as running nowhere with
+// the reason. It also proves that
 // `.githooks/pre-push` retains the verifier as its no-receipt fallback.
 //
 // Why this exists: the local mirror is only worth having if it cannot drift away
@@ -178,7 +179,31 @@ for (const job of EXCLUDED.keys()) {
   }
 }
 
-// --- cargo half: mirrored by the receipt-producing verifier, or nowhere ---
+// --- cargo half: mirrored by the verifier, run by CI only, or nowhere ---
+
+// "Runs in CI" is a claim about the workflow, so it is checked against the
+// workflow: a trigger that fires on what a contributor does (push / pull
+// request), and no `if:` on the job that turns it off. `workflow_dispatch`
+// alone would make every job a gate somebody has to remember to press.
+//
+// YAML 1.1 parsers read the bare key `on` as the boolean `true`, so the
+// trigger is looked up under both spellings.
+const workflowDocument = parsed.document ?? {};
+const triggers = workflowDocument.on ?? workflowDocument[true] ?? workflowDocument.true;
+const triggerNames = typeof triggers === 'string'
+  ? [triggers]
+  : Array.isArray(triggers)
+    ? triggers
+    : Object.keys(triggers ?? {});
+const runsOnContribution = triggerNames.some((name) => name === 'push' || name === 'pull_request');
+
+function switchedOff(definition) {
+  if (!Object.hasOwn(definition ?? {}, 'if')) return false;
+  const condition = definition.if;
+  if (condition === false) return true;
+  const text = String(condition).replace(/^\s*\$\{\{\s*|\s*\}\}\s*$/g, '').trim();
+  return text === 'false';
+}
 
 // Comments are stripped before grepping shell files for the same reason they are
 // stripped from the workflow: prose naming `cargo clippy` executes nothing.
@@ -209,7 +234,8 @@ for (const job of cargoBearing) {
   if (!CARGO_JOBS.has(job)) {
     problems.push(
       `${job} is a cargo job of regression.yml that CARGO_JOBS in run-local-gates.mjs does not account for. `
-        + 'Give it a `verifier` command the card verifier runs, or an `uncovered` reason saying it runs nowhere.',
+        + 'Give it a `verifier` command the card verifier runs, a `ciOnly` reason it cannot be mirrored before a push, '
+        + 'or an `uncovered` reason saying it runs nowhere.',
     );
   }
 }
@@ -223,13 +249,25 @@ for (const [job, where] of CARGO_JOBS) {
     problems.push(`CARGO_JOBS accounts for \`${job}\`, which no longer invokes cargo — it belongs in GATES or EXCLUDED now.`);
     continue;
   }
-  const claims = ['verifier', 'uncovered'].filter((key) => where[key]);
+  const claims = ['verifier', 'ciOnly', 'uncovered'].filter((key) => where[key]);
   if (claims.length !== 1) {
     problems.push(
-      `CARGO_JOBS entry \`${job}\` claims ${claims.length === 0 ? 'neither `verifier` nor' : 'both `verifier` and'} \`uncovered\` — `
-        + 'a gate runs in exactly one place, or in none of them.',
+      `CARGO_JOBS entry \`${job}\` claims ${claims.length === 0 ? 'none' : claims.map((claim) => `\`${claim}\``).join(' and ')} `
+        + 'of `verifier`, `ciOnly`, `uncovered` — a gate is accounted for in exactly one way.',
     );
     continue;
+  }
+  if (where.ciOnly && !runsOnContribution) {
+    problems.push(
+      `CARGO_JOBS says \`${job}\` runs in CI, but regression.yml is triggered by neither \`push\` nor \`pull_request\` — `
+        + 'nothing a contributor does starts it. Restore the trigger, or move the entry to `uncovered`.',
+    );
+  }
+  if (where.ciOnly && switchedOff(jobs[job])) {
+    problems.push(
+      `CARGO_JOBS says \`${job}\` runs in CI, but its \`if:\` switches the job off. `
+        + 'Remove the condition, or move the entry to `uncovered`.',
+    );
   }
   if (where.verifier && !shellInvokes(verifierCommands, where.verifier)) {
     problems.push(
@@ -245,10 +283,11 @@ if (problems.length > 0) {
 }
 
 const verifierMirrored = [...CARGO_JOBS.values()].filter((where) => where.verifier).length;
+const ciOnly = [...CARGO_JOBS.values()].filter((where) => where.ciOnly).length;
 const uncovered = [...CARGO_JOBS.values()].filter((where) => where.uncovered).length;
 
 console.log(
   `local gate coverage: ${Object.keys(jobs).length} job(s) in regression.yml — `
     + `${mirrored.size} mirrored by run-local-gates.mjs, ${verifierMirrored} by the card verifier, `
-    + `${EXCLUDED.size} excluded by design, ${uncovered} running nowhere`,
+    + `${EXCLUDED.size} excluded by design, ${ciOnly} in CI only, ${uncovered} running nowhere`,
 );

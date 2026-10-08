@@ -244,10 +244,34 @@ pub(crate) struct TlsConfig {
     pub(crate) key: Option<String>,
 }
 
+/// `[logging].format` / `--log-format`: how each log line is written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum LogFormat {
+    /// One human-readable line per event.
+    #[default]
+    Text,
+    /// One JSON object per event — for a log shipper (Loki, Elasticsearch,
+    /// a Docker log driver feeding either) that would otherwise have to parse
+    /// the text form back apart (card_0d7755e0dfe0).
+    Json,
+}
+
+impl LogFormat {
+    /// The configured spelling, as `[logging].format` accepts it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LoggingConfig {
     pub(crate) file: Option<String>,
+    pub(crate) format: Option<LogFormat>,
     pub(crate) max_size_mb: Option<u64>,
     pub(crate) max_files: Option<usize>,
 }
@@ -1923,6 +1947,12 @@ mod tests {
                 super::DEFAULT_LOG_MAX_FILES.to_string(),
             ),
             row(
+                "logging",
+                "format",
+                "LogFormat::default",
+                format!("{:?}", super::LogFormat::default().as_str()),
+            ),
+            row(
                 "audit",
                 "enabled",
                 "DEFAULT_AUDIT_ENABLED",
@@ -2255,8 +2285,8 @@ mod tests {
             "deploy/plombir-git.docker.toml",
             "rate_limit",
             "trusted_proxies",
-            "an illustration of the shape, with the address a default Docker bridge \
-             happens to use",
+            "an illustration of the shape: the range Docker allocates its bridge \
+             networks from, which the README explains how to narrow",
         ),
         (
             "deploy/plombir-git.docker.toml",

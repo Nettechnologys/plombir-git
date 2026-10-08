@@ -18,6 +18,30 @@ static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 ///
 /// Uses `MatchedPath` to normalize route templates like `/users/{id}` instead of
 /// concrete paths like `/users/123` to avoid label cardinality explosion.
+/// The boundary a panic in a request stops at.
+///
+/// With `panic = "unwind"` tokio already confines a panic to the task it
+/// happened in, so the process survives — but the task is the connection, and
+/// hyper drops it: the client sees a reset with no status, and keep-alive
+/// neighbours on the same connection go with it. This layer catches the unwind
+/// at the edge of the request instead and answers it as what it is, a failure of
+/// ours: the same sanitized `500` envelope as any other internal error, with
+/// the panic message in the log and never in the body (card_be36b7e817b8).
+pub(crate) fn panic_boundary(
+) -> tower_http::catch_panic::CatchPanicLayer<fn(Box<dyn std::any::Any + Send + 'static>) -> Response>
+{
+    tower_http::catch_panic::CatchPanicLayer::custom(answer_a_panic as fn(_) -> Response)
+}
+
+fn answer_a_panic(panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&'static str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    crate::error::AppError::internal(format!("request handler panicked: {message}")).into_response()
+}
+
 pub async fn http_metrics_middleware(request: Request, next: Next) -> Response {
     use crate::metrics::http_requests::{IN_FLIGHT, REQUEST_COUNT, REQUEST_DURATION};
 

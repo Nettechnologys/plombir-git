@@ -776,6 +776,19 @@ async fn stream_upload_pack_response(
                     anyhow::Error::from(error).context("failed to flush git upload-pack response"),
                 ),
             },
+            // The client asked for what it may not have and was told so in an
+            // `ERR` packet: that is the whole protocol answer, delivered, not a
+            // failure of ours to report as `500` (card_bd1b7010d482).
+            Ok(Err(error))
+                if rg_git::protocol::client_refusal(&error).is_some() && flushed.is_ok() =>
+            {
+                tracing::warn!(
+                    refusal = %format!("{error:#}"),
+                    %operation,
+                    "git {operation} request refused"
+                );
+                UploadPackOutcome::Completed
+            }
             Ok(Err(error)) => UploadPackOutcome::Failed(error),
             Err(_elapsed) => UploadPackOutcome::TimedOut,
         }
@@ -2312,6 +2325,57 @@ mod tests {
             response.into_body().collect().await.is_err(),
             "a failure after the response began must break the body"
         );
+    }
+
+    /// card_bd1b7010d482: a want the advertisement did not offer is the
+    /// client's mistake, not a failure of ours. Both dialects answer it the
+    /// way stock `upload-pack` does — a delivered `ERR` packet the client
+    /// prints as `remote error: upload-pack: not our ref …` — and never the
+    /// `500` that reads to the client as a broken server and to the
+    /// operator's 5xx alert as an incident.
+    #[tokio::test]
+    async fn a_refused_want_is_a_delivered_err_packet_not_a_500() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let repo = scratch.path().join("empty.git");
+        gix::init_bare(&repo).expect("init bare");
+        let absent = "1111111111111111111111111111111111111111";
+
+        let mut v1 = pkt(&format!("want {absent}\0side-band-64k\n"));
+        v1.extend_from_slice(b"0000");
+        v1.extend_from_slice(&pkt("done\n"));
+        let mut v2 = pkt("command=fetch\n");
+        v2.extend_from_slice(b"0001");
+        v2.extend_from_slice(&pkt(&format!("want {absent}\n")));
+        v2.extend_from_slice(&pkt("done\n"));
+        v2.extend_from_slice(b"0000");
+
+        for (protocol, request) in [
+            (super::UploadPackProtocol::V1, v1),
+            (super::UploadPackProtocol::V2, v2),
+        ] {
+            let label = protocol.operation();
+            let response = super::stream_upload_pack_response(
+                protocol,
+                repo.clone(),
+                staged_request(&request).await,
+                rg_core::git_sessions::global().try_acquire(None).unwrap(),
+                30,
+                30,
+                "owner",
+                "repo",
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK, "{label}");
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .unwrap_or_else(|error| panic!("{label}: refusal body broke: {error}"))
+                .to_bytes();
+            let expected = pkt(&format!("ERR upload-pack: not our ref {absent}\n"));
+            assert_eq!(body.as_ref(), expected.as_slice(), "{label}");
+        }
     }
 
     /// A handler that legitimately produces nothing still answers 200 with an

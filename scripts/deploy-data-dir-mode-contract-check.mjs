@@ -14,9 +14,9 @@
 // This is checked here, and not only by the Rust doc-contract test beside
 // `every_documented_env_install_creates_an_owner_only_file`, because the
 // workspace test suite is not part of any gate that runs before a push: the
-// `rust` job of regression.yml is recorded `uncovered` in
-// `scripts/run-local-gates.mjs`, and regression.yml itself has never executed.
-// A fact nothing runs is not guarded. The Rust test keeps its own value — its
+// `rust` job of regression.yml is recorded `ciOnly` in
+// `scripts/run-local-gates.mjs`, so CI finds a broken fact only after it is
+// pushed. A fact nothing checks before the push is guarded late. The Rust test keeps its own value — its
 // `include_str!` binds the document paths at compile time — but the teeth are
 // here.
 //

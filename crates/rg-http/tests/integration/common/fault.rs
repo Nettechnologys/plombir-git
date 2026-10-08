@@ -106,6 +106,7 @@ pub struct BlobFaults {
     get: Arc<AtomicBool>,
     delete: Arc<AtomicBool>,
     delete_prefix: Arc<AtomicBool>,
+    panic_put_file: Arc<AtomicBool>,
 }
 
 /// Not every switch has a test yet; the set is complete because a harness that
@@ -123,6 +124,12 @@ impl BlobFaults {
 
     pub fn fail_get(&self) {
         self.get.store(true, Ordering::SeqCst);
+    }
+
+    /// Make `put_file` panic instead of failing: the stand-in for a
+    /// dependency that panics on hostile input, which no `Result` reports.
+    pub fn panic_put_file(&self) {
+        self.panic_put_file.store(true, Ordering::SeqCst);
     }
 
     pub fn fail_delete(&self) {
@@ -159,6 +166,7 @@ impl BlobFaults {
             &self.get,
             &self.delete,
             &self.delete_prefix,
+            &self.panic_put_file,
         ] {
             flag.store(false, Ordering::SeqCst);
         }
@@ -223,6 +231,9 @@ impl BlobStorage for FaultyBlobStorage {
         Box::pin(async move {
             if self.faults.put_file.load(Ordering::SeqCst) {
                 return Err(injected("blob storage put_file", key));
+            }
+            if self.faults.panic_put_file.load(Ordering::SeqCst) {
+                panic!("injected panic in blob storage put_file for {key}");
             }
             self.inner.put_file(key, source).await
         })

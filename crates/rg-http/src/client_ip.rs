@@ -44,26 +44,137 @@ pub use rg_core::audit::CLIENT_IP_HEADER;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientIp(pub IpAddr);
 
+/// One `trusted_proxies` entry: a single address, or a network in CIDR
+/// notation (`172.16.0.0/12`).
+///
+/// Networks are what a container deployment needs. A proxy on the host that
+/// reaches a published port arrives from the gateway of the compose network,
+/// and Docker picks that network's subnet at `up` time — `172.18.0.1` on one
+/// host, `172.19.0.1` on the next, never the `docker0` address `172.17.0.1`.
+/// An exact-address list could only be filled in after the fact, by hand, and
+/// an operator who guessed wrong got a limiter keyed by the proxy: one shared
+/// login budget for the whole instance (card_b7bfdbf0b00d).
+///
+/// Host bits below the prefix are cleared, the way nginx's `set_real_ip_from`
+/// reads `172.18.0.1/16`. An IPv4-mapped IPv6 entry is its IPv4 address, as
+/// every peer is canonicalized before it is compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedProxy {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedProxy {
+    /// Whether `ip` is this proxy, or inside this network.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.network, ip.to_canonical()) {
+            (IpAddr::V4(network), IpAddr::V4(ip)) => {
+                masked_v4(u32::from(ip), self.prefix_len) == u32::from(network)
+            }
+            (IpAddr::V6(network), IpAddr::V6(ip)) => {
+                masked_v6(u128::from(ip), self.prefix_len) == u128::from(network)
+            }
+            _ => false,
+        }
+    }
+
+    fn new(network: IpAddr, prefix_len: u8) -> Self {
+        let network = match network {
+            IpAddr::V4(v4) => IpAddr::V4(masked_v4(u32::from(v4), prefix_len).into()),
+            IpAddr::V6(v6) => IpAddr::V6(masked_v6(u128::from(v6), prefix_len).into()),
+        };
+        Self {
+            network,
+            prefix_len,
+        }
+    }
+}
+
+/// `bits` with everything below the first `prefix_len` bits cleared.
+fn masked_v4(bits: u32, prefix_len: u8) -> u32 {
+    match prefix_len {
+        0 => 0,
+        len => bits & (u32::MAX << (32 - u32::from(len))),
+    }
+}
+
+/// [`masked_v4`] for IPv6.
+fn masked_v6(bits: u128, prefix_len: u8) -> u128 {
+    match prefix_len {
+        0 => 0,
+        len => bits & (u128::MAX << (128 - u32::from(len))),
+    }
+}
+
+impl From<IpAddr> for TrustedProxy {
+    fn from(ip: IpAddr) -> Self {
+        let ip = ip.to_canonical();
+        let full = if ip.is_ipv4() { 32 } else { 128 };
+        Self::new(ip, full)
+    }
+}
+
+impl std::str::FromStr for TrustedProxy {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        let Some((address, prefix)) = text.split_once('/') else {
+            return text
+                .parse::<IpAddr>()
+                .map(Self::from)
+                .map_err(|_| format!("`{text}` is neither an IP address nor a CIDR network"));
+        };
+        let address: IpAddr = address
+            .parse()
+            .map_err(|_| format!("`{text}`: `{address}` is not an IP address"))?;
+        let prefix_len: u8 = prefix
+            .parse()
+            .map_err(|_| format!("`{text}`: `/{prefix}` is not a prefix length"))?;
+        let (address, prefix_len) = match address {
+            IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() && prefix_len >= 96 => {
+                (address.to_canonical(), prefix_len - 96)
+            }
+            _ => (address, prefix_len),
+        };
+        let full = if address.is_ipv4() { 32 } else { 128 };
+        if prefix_len > full {
+            return Err(format!(
+                "`{text}`: a prefix length is at most {full} for this address family"
+            ));
+        }
+        Ok(Self::new(address, prefix_len))
+    }
+}
+
+impl std::fmt::Display for TrustedProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix_len)
+    }
+}
+
 /// Resolves the client address against the operator's `trusted_proxies`.
 #[derive(Debug, Clone, Default)]
 pub struct ClientIpResolver {
-    trusted_proxies: Arc<[IpAddr]>,
+    trusted_proxies: Arc<[TrustedProxy]>,
 }
 
 impl ClientIpResolver {
-    /// A resolver that believes forwarding headers only from these peers.
-    pub fn new(trusted_proxies: Vec<IpAddr>) -> Self {
-        let trusted: Vec<IpAddr> = trusted_proxies
-            .into_iter()
-            .map(|ip| ip.to_canonical())
-            .collect();
+    /// A resolver that believes forwarding headers only from these peers —
+    /// addresses, or networks they are inside.
+    pub fn new<P: Into<TrustedProxy>>(trusted_proxies: impl IntoIterator<Item = P>) -> Self {
         Self {
-            trusted_proxies: trusted.into(),
+            trusted_proxies: trusted_proxies.into_iter().map(Into::into).collect(),
         }
     }
 
     fn is_trusted(&self, ip: IpAddr) -> bool {
-        self.trusted_proxies.contains(&ip)
+        self.trusted_proxies.iter().any(|proxy| proxy.contains(ip))
+    }
+
+    /// Whether any proxy is trusted at all.
+    fn trusts_a_proxy(&self) -> bool {
+        !self.trusted_proxies.is_empty()
     }
 
     /// The client address of a request that arrived from `peer`.
@@ -152,6 +263,44 @@ pub fn from_headers(headers: &HeaderMap) -> Option<IpAddr> {
         .and_then(|value| value.parse().ok())
 }
 
+/// Say once per process that a proxy seems to be in front of this server but
+/// none is trusted.
+///
+/// The shape is unambiguous enough to name: a request arrives from a private
+/// or loopback peer *with* an `X-Forwarded-For` chain, and `trusted_proxies`
+/// is empty. That is a reverse proxy nobody declared, and every limiter is now
+/// keyed by its address — the whole instance shares one budget of ten logins a
+/// minute, which a single client can spend for everyone, and every audit entry
+/// names the proxy (card_b7bfdbf0b00d). It cannot be decided at startup, since
+/// nothing is known about the peers until they connect, so the first such
+/// request says it, once.
+fn warn_once_about_an_untrusted_forwarding_peer(
+    resolver: &ClientIpResolver,
+    peer: IpAddr,
+    headers: &HeaderMap,
+) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    if resolver.trusts_a_proxy() || !headers.contains_key("x-forwarded-for") {
+        return;
+    }
+    let peer = peer.to_canonical();
+    let private = match peer {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+    };
+    if private && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            %peer,
+            "a request from a private address carries X-Forwarded-For, but [rate_limit].trusted_proxies \
+             is empty: if a reverse proxy is in front of this server, every client is being counted \
+             as the proxy — one shared login budget, and the proxy's address in the audit log. \
+             List the proxy (or its network, e.g. \"172.16.0.0/12\" for a Docker bridge) in \
+             trusted_proxies; see deploy/README.md"
+        );
+    }
+}
+
 /// Resolve the client address once, before every other layer sees the
 /// request. See the module documentation.
 pub async fn resolve_client_ip_middleware(
@@ -165,6 +314,7 @@ pub async fn resolve_client_ip_middleware(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip());
     if let Some(peer) = peer {
+        warn_once_about_an_untrusted_forwarding_peer(&resolver, peer, request.headers());
         let ip = resolver.resolve(peer, request.headers());
         request.extensions_mut().insert(ClientIp(ip));
         if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
@@ -233,6 +383,55 @@ mod tests {
             ("x-forwarded-for", "10.0.0.3"),
         ]);
         assert_eq!(resolver.resolve(ip(PROXY), &split), ip("203.0.113.7"));
+    }
+
+    /// card_b7bfdbf0b00d: a Docker deployment cannot name its proxy's exact
+    /// address ahead of time — the compose network's gateway is whatever
+    /// subnet Docker picked — so a network has to be trustable as a whole.
+    #[test]
+    fn a_trusted_network_covers_every_proxy_inside_it() {
+        let resolver = ClientIpResolver::new(
+            ["172.16.0.0/12", "fd00:abcd::/32"].map(|entry| entry.parse::<TrustedProxy>().unwrap()),
+        );
+        let chain = headers(&[("x-forwarded-for", "203.0.113.7")]);
+        for gateway in [
+            "172.18.0.1",
+            "172.31.255.254",
+            "::ffff:172.19.0.1",
+            "fd00:abcd:1::1",
+        ] {
+            assert_eq!(
+                resolver.resolve(ip(gateway), &chain),
+                ip("203.0.113.7"),
+                "{gateway} is inside a trusted network"
+            );
+        }
+        for outside in ["172.32.0.1", "172.15.255.255", "10.0.0.2", "fd00:abce::1"] {
+            assert_eq!(
+                resolver.resolve(ip(outside), &chain),
+                ip(outside),
+                "{outside} is not a trusted proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trusted_proxy_entry_parses_as_an_address_or_a_network() {
+        let parsed = |text: &str| text.parse::<TrustedProxy>().map(|proxy| proxy.to_string());
+        assert_eq!(parsed("10.0.0.2").as_deref(), Ok("10.0.0.2/32"));
+        assert_eq!(parsed(" 172.18.0.1/16 ").as_deref(), Ok("172.18.0.0/16"));
+        assert_eq!(parsed("0.0.0.0/0").as_deref(), Ok("0.0.0.0/0"));
+        assert_eq!(parsed("::ffff:10.0.0.0/104").as_deref(), Ok("10.0.0.0/8"));
+        assert_eq!(parsed("2001:db8::1").as_deref(), Ok("2001:db8::1/128"));
+        for refused in [
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "10.0.0/8",
+            "10.0.0.0/x",
+            "proxy",
+        ] {
+            assert!(parsed(refused).is_err(), "{refused} must be refused");
+        }
     }
 
     #[test]

@@ -1650,6 +1650,13 @@ impl Handler for SshHandler {
                     idle_timeout_secs = git_idle_timeout_secs,
                     "git SSH session idle (no read/write progress within idle window) — killed git, closing channel"
                 ),
+                // Refused on the client's account and told so in an `ERR`
+                // packet: exit 1 like stock git, but not a server failure.
+                Err(e) if rg_git::protocol::client_refusal(e).is_some() => tracing::warn!(
+                    refusal = %format!("{e:#}"),
+                    %service_name,
+                    "Git SSH request refused"
+                ),
                 Err(e) => {
                     tracing::error!(error = %format!("{e:#}"), %service_name, "Git SSH session failed")
                 }

@@ -2489,6 +2489,40 @@ async fn an_lfs_upload_whose_row_was_never_written_leaves_no_staging_file() {
     );
 }
 
+/// card_be36b7e817b8: a panic inside a request is a 500 for that request, and
+/// the server goes on serving. Before the panic boundary the unwind took the
+/// connection down with no status at all; under the old `panic = "abort"`
+/// release profile it took the whole process down, every push and SSH session
+/// with it.
+#[tokio::test]
+async fn a_panic_in_a_request_is_a_500_and_the_next_request_is_served() {
+    let app = crate::common::fault::spawn_test_app_for_fault_sweep().await;
+    let (token, _user_id) = register_full(&app.base, "lfs_panic", "lfs_panic@example.com").await;
+    create_repo(&app.base, &token, "panicky-lfs").await;
+
+    app.blob_faults.panic_put_file();
+    let (status, _oid) = upload_lfs_object(
+        &app.base,
+        &token,
+        "lfs_panic",
+        "panicky-lfs",
+        b"plombir-git-lfs-panic",
+    )
+    .await;
+    assert_eq!(status, 500, "a panic is a failure of ours, answered as one");
+    app.blob_faults.heal();
+
+    let (status, _oid) = upload_lfs_object(
+        &app.base,
+        &token,
+        "lfs_panic",
+        "panicky-lfs",
+        b"plombir-git-lfs-after-the-panic",
+    )
+    .await;
+    assert_eq!(status, 200, "the server must keep serving after a panic");
+}
+
 /// A blob store that refused the object must not keep either staging file.
 #[tokio::test]
 async fn an_lfs_object_the_blob_store_refused_leaves_no_staging_file() {

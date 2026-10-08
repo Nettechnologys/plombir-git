@@ -129,14 +129,23 @@ pub(crate) fn init(
     writer: BoxMakeWriter,
     appender_guard: Option<WorkerGuard>,
     otel: Option<OtelConfig>,
+    format: crate::config::LogFormat,
 ) -> anyhow::Result<TelemetryGuard> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // `.with_target(false)` preserves the terser log format the server used
     // before the registry refactor.
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(false)
-        .with_writer(writer);
+    let fmt_layer = match format {
+        crate::config::LogFormat::Text => tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_writer(writer)
+            .boxed(),
+        crate::config::LogFormat::Json => tracing_subscriber::fmt::layer()
+            .json()
+            .with_target(false)
+            .with_writer(writer)
+            .boxed(),
+    };
 
     // Build the optional OTLP layer. `Option<Layer>` itself implements `Layer`,
     // so the `None` arm contributes nothing to the subscriber.

@@ -126,6 +126,7 @@ const SMTP_HINT: &str =
 /// The two channels deliberately carry different detail. `/health` is reachable
 /// without auth, so the body stays free of filesystem layout, hostnames and
 /// errno; the log — which only the operator sees — gets the whole cause.
+#[derive(Clone)]
 struct Check {
     status: &'static str,
     diagnostic: Option<String>,
@@ -246,13 +247,50 @@ async fn smtp_check(host: &str, port: u16) -> Check {
     smtp_check_from(probe, host, port)
 }
 
-pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
+/// `GET /livez`: the process is up and its router answers.
+///
+/// Nothing else, on purpose. This is what an orchestrator restarts on, and a
+/// restart cures none of what `/readyz` and `/health` can find wrong — a database
+/// that is down, a volume that is not mounted, an SMTP relay that is away. A
+/// liveness probe that failed on those turned an outage of one of them into a
+/// restart loop of this server on top of it (card_0d7755e0dfe0).
+pub(crate) async fn livez() -> impl IntoResponse {
+    axum::Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// `GET /readyz`: this instance can serve requests — the database answers and
+/// the repository storage is readable. `503` otherwise.
+///
+/// The two dependencies without which no request can do its work, and only
+/// those: git is checked once at startup and reported by `/health`, and SMTP is
+/// optional by design — an outbound mail relay that is unreachable must not take
+/// the instance out of rotation or mark its container unhealthy.
+pub(crate) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    let mut checks = serde_json::Map::new();
+    let db_ok = record(&mut checks, "database", database_check(&state).await);
+    let fs_ok = record(
+        &mut checks,
+        "filesystem",
+        filesystem_check(&state.repo_root).await,
+    );
+    let ready = db_ok && fs_ok;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        axum::Json(serde_json::json!({
+            "status": if ready { "ok" } else { "unavailable" },
+            "checks": checks,
+        })),
+    )
+}
+
+async fn database_check(state: &AppState) -> Check {
     use sea_orm::{ConnectionTrait, Statement};
 
-    let mut checks = serde_json::Map::new();
-
-    // DB ping
-    let db_check = match state
+    match state
         .db
         .execute(Statement::from_string(
             state.db.get_database_backend(),
@@ -262,8 +300,21 @@ pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     {
         Ok(_) => Check::ok(),
         Err(error) => Check::failed("error", format!("database ping `SELECT 1` failed: {error}")),
-    };
-    let db_ok = record(&mut checks, "database", db_check);
+    }
+}
+
+/// `GET /health`: the full report — every dependency, and which build this is.
+///
+/// The status code follows what the instance cannot serve without: the
+/// database, the repository storage and git. SMTP is reported and does not
+/// decide it. Mail is optional, and an unreachable relay used to turn `/health`
+/// into a `503` — which Docker's `HEALTHCHECK` read as an unhealthy container and
+/// the web UI's readiness check read as a backend that is not up, for an outage
+/// that stops nothing but outgoing mail (card_0d7755e0dfe0).
+pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let mut checks = serde_json::Map::new();
+
+    let db_ok = record(&mut checks, "database", database_check(&state).await);
 
     // Filesystem check
     let fs_ok = record(
@@ -286,40 +337,77 @@ pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     };
     let git_ok = record(&mut checks, "git", git_check);
 
-    // SMTP connectivity check (TCP connect with timeout)
-    let smtp_ok = match state.smtp_config {
-        Some(ref smtp) => record(
-            &mut checks,
-            "smtp",
-            smtp_check(smtp.host.as_str(), smtp.port).await,
-        ),
+    // SMTP: reported, never decisive, and probed at most once a minute.
+    match state.smtp_config {
+        Some(ref smtp) => {
+            record(
+                &mut checks,
+                "smtp",
+                cached_smtp_check(smtp.host.as_str(), smtp.port).await,
+            );
+        }
         // Skipped when unconfigured — no section, nothing to be wrong about.
-        None => record(&mut checks, "smtp", Check::ok()),
-    };
+        None => {
+            record(&mut checks, "smtp", Check::ok());
+        }
+    }
 
-    // Overall: all critical checks must pass
-    let overall = if db_ok && fs_ok && git_ok && smtp_ok {
+    let serving = db_ok && fs_ok && git_ok;
+    let overall = if serving {
         "ok"
     } else if db_ok || fs_ok {
         "degraded"
     } else {
         "unhealthy"
     };
-    let status_code = if db_ok && fs_ok && git_ok && smtp_ok {
+    let status_code = if serving {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
 
+    // `version` alone is the workspace's crate version, the same on every
+    // build; the commit is what tells two builds apart. `null` when the build
+    // was not told which commit it came from — never a guess.
     (
         status_code,
         axum::Json(serde_json::json!({
             "status": overall,
             "version": env!("CARGO_PKG_VERSION"),
-            "phase": 22,
+            "commit": crate::build_info::source_commit().known(),
             "checks": checks,
         })),
     )
+}
+
+/// How long one SMTP probe's verdict is reused.
+///
+/// `/health` is public, so each anonymous request used to open a fresh outbound
+/// TCP connection to the operator's mail relay — a reflector anybody could aim
+/// at it, one connection per request. One probe a minute answers every poller.
+const SMTP_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`smtp_check`], answered from the last probe while it is younger than
+/// [`SMTP_PROBE_TTL`]. Concurrent pollers on a stale cache wait for one probe
+/// rather than each starting their own.
+async fn cached_smtp_check(host: &str, port: u16) -> Check {
+    type Cached = Option<(std::time::Instant, String, u16, Check)>;
+    static LAST: tokio::sync::Mutex<Cached> = tokio::sync::Mutex::const_new(None);
+
+    let mut last = LAST.lock().await;
+    if let Some((at, cached_host, cached_port, check)) = last.as_ref() {
+        if at.elapsed() < SMTP_PROBE_TTL && cached_host == host && *cached_port == port {
+            return check.clone();
+        }
+    }
+    let check = smtp_check(host, port).await;
+    *last = Some((
+        std::time::Instant::now(),
+        host.to_string(),
+        port,
+        check.clone(),
+    ));
+    check
 }
 
 /// The published OpenAPI document, rendered once when the router was built.

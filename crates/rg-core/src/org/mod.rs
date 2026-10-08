@@ -35,8 +35,9 @@ pub async fn create_org(
     let already_taken =
         || crate::error::conflict(format!("organization name '{name}' is already taken"));
 
-    // Check if org name is already taken
-    if org_ops::get_org_by_name(db, name).await?.is_some() {
+    // Taken by an organization or by an account: both answer to `/{name}`,
+    // and the account would win that lookup (card_4b0594a02218).
+    if crate::namespace::owner_name_is_taken(db, name).await? {
         return Err(already_taken());
     }
 

@@ -52,7 +52,6 @@ mod routes;
 // escaping first.
 pub use agent_scope::McpToolCall;
 
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -385,8 +384,9 @@ pub struct HttpServerConfig {
     pub rate_limit_max: u32,
     /// Rate limit: window duration in seconds.
     pub rate_limit_window_secs: u64,
-    /// Proxy source IPs whose forwarding headers are trusted for rate limiting.
-    pub rate_limit_trusted_proxies: Vec<IpAddr>,
+    /// Proxies — addresses or CIDR networks — whose forwarding headers are
+    /// trusted to name the client.
+    pub rate_limit_trusted_proxies: Vec<client_ip::TrustedProxy>,
     /// Hard cap on the number of distinct client keys the rate limiter tracks
     /// at once (memory-exhaustion guard). 0 = use the built-in default (100k).
     pub rate_limit_max_keys: usize,

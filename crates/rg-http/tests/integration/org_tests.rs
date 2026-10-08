@@ -323,3 +323,61 @@ async fn test_remove_org_member() {
         .unwrap();
     assert_eq!(again.status(), 404);
 }
+
+/// card_4b0594a02218: an account and an organization answer to the same
+/// `/{owner}` segment, so each door has to refuse a name the *other* table
+/// holds. Before, registration asked only `users` and organization creation
+/// only `organizations`, and a stranger registering `acme` beside the
+/// organization took over every owner lookup by that name.
+#[tokio::test]
+async fn an_owner_name_is_refused_whichever_table_already_holds_it() {
+    let base = spawn_test_app().await;
+    let client = reqwest::Client::new();
+    let token = register_user(&base, "acmefounder", "acmefounder@example.com", PW).await;
+
+    let created = client
+        .post(format!("{base}/api/v1/orgs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"name": "acme"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+
+    // Organization first, account second.
+    let squat = client
+        .post(format!("{base}/api/v1/users/register"))
+        .json(&serde_json::json!({"username": "acme", "email": "squatter@example.com", "password": PW}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        squat.status(),
+        409,
+        "registering an organization's name must be refused"
+    );
+
+    // Account first, organization second.
+    register_user(&base, "bob", "bob@example.com", PW).await;
+    let shadow = client
+        .post(format!("{base}/api/v1/orgs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"name": "bob"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        shadow.status(),
+        409,
+        "naming an organization after an account must be refused"
+    );
+
+    // The owner lookup still reaches the organization the name belongs to.
+    let owner = client
+        .get(format!("{base}/api/v1/orgs/acme"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(owner.status(), 200);
+}

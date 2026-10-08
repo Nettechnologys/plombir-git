@@ -147,14 +147,20 @@ attestation_enabled = false
 [rate_limit]
 max = 0          # 0 = disabled (global per-IP limit for every request)
 window_secs = 60
-# Only these proxy source IPs may supply X-Forwarded-For / X-Real-IP. The
-# address they yield is the client address everywhere: the rate limiters, the
-# audit and login logs, the password-check share per client. Behind them the
-# client is the right-most X-Forwarded-For entry that is not one of these proxies;
-# everything to its left was written by the client and is ignored.
-# Leave empty when Plombir Git is directly exposed.
+# Only these proxies may supply X-Forwarded-For / X-Real-IP — each entry an
+# address or a CIDR network. The address they yield is the client address
+# everywhere: the rate limiters, the audit and login logs, the password-check
+# share per client. Behind them the client is the right-most X-Forwarded-For
+# entry that is not one of these proxies; everything to its left was written by
+# the client and is ignored.
+# Leave empty when Plombir Git is directly exposed. Behind a proxy, leaving it
+# empty keys every limiter by the proxy: one login budget for the whole
+# instance. The server warns once when it sees that shape.
 trusted_proxies = []
 # trusted_proxies = ["127.0.0.1", "::1", "10.0.0.10"]
+# In Docker, a proxy reaches the container from the compose network's gateway,
+# whose subnet Docker picks: trust the bridge range rather than guess it.
+# trusted_proxies = ["172.16.0.0/12"]
 # Hard cap on the number of distinct clients tracked at once (an IPv6 client is
 # its /64). Bounds memory under a distinct-IP flood: once full, every
 # previously-unseen client shares one overflow budget instead of growing the map
@@ -198,8 +204,13 @@ agent_window_secs = 60
 
 [logging]
 # file = "/var/log/plombir-git/plombir-git.log"
-max_size_mb = 10
+# "text" for people, "json" for a log shipper (one JSON object per line).
+format = "text"
+# Files rotate DAILY; max_files is how many are kept.
 max_files = 5
+# max_size_mb is accepted so older configs still start, and NOT enforced —
+# there is no size-based rotation. The server warns at startup when it is set.
+# max_size_mb = 10
 
 [audit]
 enabled = true

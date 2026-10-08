@@ -1509,17 +1509,17 @@ async fn generate_unique_username(
     Ok(format!("{}_{}", base, suffix))
 }
 
-/// Neither an account here nor an entry in an enabled LDAP directory holds
-/// `name`. The directory is asked only once the name is free locally.
+/// Neither an account or organization here nor an entry in an enabled LDAP
+/// directory holds `name`. The directory is asked only once the name is free
+/// locally. An organization counts: an account provisioned as `acme` beside
+/// the organization `acme` would answer `/acme` in its place
+/// (card_4b0594a02218).
 async fn name_is_free(
     db: &sea_orm::DatabaseConnection,
     directories: rg_core::user::service::LdapDirectories<'_>,
     name: &str,
 ) -> Result<bool, anyhow::Error> {
-    if rg_db::ops::user_ops::find_by_username(db, name)
-        .await?
-        .is_some()
-    {
+    if rg_core::namespace::owner_name_is_taken(db, name).await? {
         return Ok(false);
     }
     Ok(!rg_core::user::service::ldap_directory_holds(db, directories, name, None).await?)
@@ -1787,6 +1787,45 @@ mod tests {
                 created.username
             );
         }
+        drop(guard);
+    }
+
+    /// card_4b0594a02218: an identity named after an organization gets a
+    /// suffixed account, not the organization's segment. Provisioned as
+    /// `acme`, it would answer `/acme` and every owner lookup by that name in
+    /// the organization's place.
+    #[tokio::test]
+    async fn an_identity_named_after_an_organization_is_provisioned_beside_it() {
+        let guard = PROVISION_COUNTER_LOCK.lock().await;
+        let db = migrated_db().await;
+        let founder = rg_db::ops::user_ops::create_user(
+            &db,
+            "acmefounder",
+            "acmefounder@example.com",
+            "",
+            "Founder",
+        )
+        .await
+        .expect("create the organization's owner");
+        rg_db::ops::org_ops::create_org(&db, "acme", None, None, founder.id, "public")
+            .await
+            .expect("create the organization");
+
+        let user_id = provision_sso_user(
+            &db,
+            &HeaderMap::new(),
+            "gitea",
+            &sso_user_info("provider-uid-acme", "acme", "acme-person@example.com"),
+            no_directories(),
+        )
+        .await
+        .expect("the name is taken, not invalid")
+        .expect("a free address is provisioned");
+        let created = rg_db::ops::user_ops::find_by_id(&db, user_id)
+            .await
+            .expect("read back")
+            .expect("the account exists");
+        assert_eq!(created.username, "acme_1");
         drop(guard);
     }
 

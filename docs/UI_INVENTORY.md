@@ -23,7 +23,7 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 373 |
+| Роутов в роутере (с объявленным `Access`) | 375 |
 | Из них достижимы из браузера | 254 (68%) |
 | Layout-модулей | 2 |
 | Страниц | 64 |
@@ -43,7 +43,7 @@
 | `User` | 43 | 31 | 6 | 0 |
 | `RepoAdmin` | 32 | 32 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
-| `Public` | 20 | 9 | 2 | 0 |
+| `Public` | 22 | 9 | 2 | 0 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
 | `RepoAuthRead` | 12 | 12 | 1 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
@@ -1164,6 +1164,8 @@
 | GET | `/{owner}/{repo}/info/refs` | `Foreign:git_http.rs` | rust |
 | POST | `/{owner}/{repo}/git-upload-pack` | `Foreign:git_http.rs` | rust |
 | POST | `/{owner}/{repo}/git-receive-pack` | `Foreign:git_http.rs` | rust |
+| GET | `/livez` | `Public` | rust |
+| GET | `/readyz` | `Public` | rust |
 | GET | `/metrics` | `Public` | rust+smoke |
 | POST | `/api/v1/users/register` | `Public` | rust+smoke |
 | POST | `/api/v1/users/login` | `Public` | rust+smoke |

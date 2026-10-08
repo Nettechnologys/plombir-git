@@ -16,7 +16,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use tokio::io::{split, AsyncRead, AsyncWrite, BufReader};
 
-use super::pack_stream;
+use super::{pack_stream, ClientRefusal};
 use crate::pkt_line::{read_pkt_line, write_flush, write_pkt_line, PktLine};
 use crate::sideband;
 
@@ -89,7 +89,8 @@ where
     // No capability advertisement — it was sent in the info/refs GET response.
     // Directly enter command processing loop.
     loop {
-        match read_command_request(&mut reader).await? {
+        let command = read_command_request(&mut reader).await;
+        match super::tell_client_of_refusal(&mut writer, command).await? {
             CommandRequest::LsRefs {
                 ref_patterns,
                 peel,
@@ -186,7 +187,8 @@ where
     // We read the command first (storing the result), then match on it,
     // so that the mutable borrow of `reader` ends before the match arms execute.
     loop {
-        let command = read_command_request(&mut reader).await?;
+        let command = read_command_request(&mut reader).await;
+        let command = super::tell_client_of_refusal(&mut write_half, command).await?;
 
         match command {
             CommandRequest::LsRefs {
@@ -419,13 +421,20 @@ async fn read_command_frames_with_limits<R: AsyncRead + Unpin>(
             }
             PktLine::Data(bytes) => {
                 if data_frames >= max_entries {
-                    bail!("protocol v2 negotiation exceeds the configured entry limit");
+                    return Err(ClientRefusal::new(
+                        "protocol v2 negotiation exceeds the configured entry limit",
+                    )
+                    .into());
                 }
                 data_frames += 1;
                 input_bytes = input_bytes
                     .checked_add(bytes.len())
                     .filter(|size| *size <= max_bytes)
-                    .context("protocol v2 negotiation exceeds the configured byte limit")?;
+                    .ok_or_else(|| {
+                        ClientRefusal::new(
+                            "protocol v2 negotiation exceeds the configured byte limit",
+                        )
+                    })?;
                 let line = String::from_utf8_lossy(&bytes);
                 let line = line.trim_end_matches('\n');
 
@@ -501,14 +510,17 @@ fn parse_fetch_args(args: &[String]) -> Result<CommandRequest> {
         } else if let Some(shallow) = arg.strip_prefix("shallow ") {
             shallows.push(shallow.to_string());
         } else if let Some(d) = arg.strip_prefix("deepen ") {
-            deepen = Some(d.parse().context("invalid Protocol V2 deepen value")?);
+            deepen = Some(
+                d.parse()
+                    .map_err(|_| ClientRefusal::new("invalid Protocol V2 deepen value"))?,
+            );
         } else if *arg == "deepen-relative" {
             deepen_relative = true;
         } else if let Some(timestamp) = arg.strip_prefix("deepen-since ") {
             deepen_since = Some(
                 timestamp
                     .parse()
-                    .context("invalid Protocol V2 deepen-since value")?,
+                    .map_err(|_| ClientRefusal::new("invalid Protocol V2 deepen-since value"))?,
             );
         } else if let Some(revision) = arg.strip_prefix("deepen-not ") {
             deepen_not.push(revision.to_string());
@@ -700,8 +712,26 @@ async fn handle_ls_refs<W: AsyncWrite + Unpin>(
 ///   - Band 1: pack data
 ///   - Band 2: progress messages
 ///   - Band 3: error messages
+///
+/// A request refused on the client's account reaches it as an `ERR` packet.
 #[allow(clippy::too_many_arguments)]
 async fn handle_fetch<W: AsyncWrite + Unpin>(
+    repo_path: &Path,
+    writer: &mut W,
+    wants: &[String],
+    haves: &[String],
+    shallow: &ShallowRequest,
+    filter: &Option<String>,
+    done: bool,
+    pack: FetchPackOptions,
+) -> Result<()> {
+    let outcome =
+        fetch_response(repo_path, writer, wants, haves, shallow, filter, done, pack).await;
+    super::tell_client_of_refusal(writer, outcome).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_response<W: AsyncWrite + Unpin>(
     repo_path: &Path,
     writer: &mut W,
     wants: &[String],
@@ -726,7 +756,7 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
         .context("V2 fetch want check did not complete")??
     };
     if let Some(want) = checked {
-        bail!("upload-pack: not our ref {want}");
+        return Err(ClientRefusal::new(format!("upload-pack: not our ref {want}")).into());
     }
     let shallow_update = build_shallow_update(repo_path, wants, shallow)?;
 
@@ -888,19 +918,27 @@ fn validate_fetch_features(shallow: &ShallowRequest, filter: &Option<String>) ->
                 .chars()
                 .any(|character| character.is_whitespace() || character.is_control())
         {
-            bail!("invalid Protocol V2 partial-clone filter specification");
+            return Err(ClientRefusal::new(
+                "invalid Protocol V2 partial-clone filter specification",
+            )
+            .into());
         }
     }
     if shallow.deepen == Some(0) {
-        bail!("Protocol V2 deepen depth must be greater than zero");
+        return Err(
+            ClientRefusal::new("Protocol V2 deepen depth must be greater than zero").into(),
+        );
     }
     if shallow.deepen_relative && shallow.deepen.is_none() {
-        bail!("Protocol V2 deepen-relative requires deepen");
+        return Err(ClientRefusal::new("Protocol V2 deepen-relative requires deepen").into());
     }
     if shallow.deepen.is_some()
         && (shallow.deepen_since.is_some() || !shallow.deepen_not.is_empty())
     {
-        bail!("Protocol V2 deepen cannot be combined with deepen-since or deepen-not");
+        return Err(ClientRefusal::new(
+            "Protocol V2 deepen cannot be combined with deepen-since or deepen-not",
+        )
+        .into());
     }
     Ok(())
 }
@@ -926,7 +964,10 @@ fn build_shallow_update(
     let boundaries = if let Some(depth) = request.deepen {
         if request.deepen_relative {
             if request.shallows.is_empty() {
-                bail!("Protocol V2 deepen-relative requires at least one shallow boundary");
+                return Err(ClientRefusal::new(
+                    "Protocol V2 deepen-relative requires at least one shallow boundary",
+                )
+                .into());
             }
             compute_depth_boundaries(repo_path, &request.shallows, depth, true)?
         } else {
@@ -1743,6 +1784,13 @@ mod tests {
             handle_v2_http(&repo_path, std::io::Cursor::new(request), &mut response).await;
         let error = refused.expect_err("a blob only refs/forks reaches must not be served");
         assert!(format!("{error:#}").contains("not our ref"), "{error:#}");
+        // The client hears why, as over v0/v1, and the transports can tell the
+        // refusal from a failure of ours (card_bd1b7010d482).
+        assert!(super::super::client_refusal(&error).is_some(), "{error:#}");
+        assert_eq!(
+            response,
+            pkt_bytes(format!("ERR upload-pack: not our ref {private_blob}\n").as_bytes())
+        );
     }
 
     /// card_54503ff49d6b: a v2 client that did not send `thin-pack` gets a

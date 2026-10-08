@@ -518,6 +518,12 @@ jobs:
             docker compose -f "${compose}" config >/dev/null
           done
 
+      # The reverse-proxy examples deploy/README.md tells operators to copy,
+      # loaded by the proxies themselves (`nginx -t`, `caddy validate`). The
+      # same script runs in the local mirror (card_b7bfdbf0b00d).
+      - name: Validate the reverse-proxy examples
+        run: bash scripts/check-reverse-proxy-examples.sh
+
   # The observability stack's configuration is production configuration, and
   # `deploy-config` above does not cover it: `docker compose config` merges and
   # prints compose YAML, and never opens the files compose bind-mounts into the

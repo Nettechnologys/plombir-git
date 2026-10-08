@@ -82,9 +82,16 @@ allow_host_runner = false
 [rate_limit]
 max = 0          # 0 = no global per-IP limit
 window_secs = 60
-# Behind a reverse proxy, list the proxy's IP so X-Forwarded-For is trusted for
-# rate limiting — without it every request looks like it comes from the proxy.
-# trusted_proxies = ["172.17.0.1"]
+# Behind a reverse proxy, list the proxy so X-Forwarded-For names the client —
+# without it every request looks like it comes from the proxy, and the whole
+# instance shares one login budget. A proxy on the host that connects to the
+# published 127.0.0.1:8080 arrives from the gateway of `plombir-git-net`, NOT
+# from docker0's 172.17.0.1: Docker picks that network's subnet at `up` time.
+# Trust the Docker bridge range (only the host can reach the loopback-published
+# port, so nothing else arrives from it), or narrow it to the gateway printed by
+#   docker network inspect plombir-git-net --format '{{(index .IPAM.Config 0).Gateway}}'
+# See deploy/README.md, "Reverse proxy".
+# trusted_proxies = ["172.16.0.0/12"]
 auth_max = 10
 auth_window_secs = 60
 # Per-account limit shared by every token of one bot account (AI agent).
@@ -99,6 +106,9 @@ agent_window_secs = 60
 # max_files caps how many are kept):
 # file = "/data/logs/plombir-git.log"
 max_files = 5
+# "text" for people; "json" writes one JSON object per line, for a log driver
+# or shipper (Loki, Elasticsearch) that would otherwise parse the text back apart.
+format = "text"
 
 [audit]
 enabled = true

@@ -11,7 +11,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use rg_core::task_tracker::wait_optional_shutdown;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use crate::client_ip::{budget_key, ClientIp, ClientIpResolver};
 use std::sync::{Arc, Mutex};
@@ -159,7 +159,7 @@ impl RateLimiter {
     pub fn with_trusted_proxies(
         max_requests: u32,
         window_secs: u64,
-        trusted_proxies: Vec<IpAddr>,
+        trusted_proxies: Vec<crate::client_ip::TrustedProxy>,
     ) -> Self {
         Self::with_resolver(
             max_requests,
@@ -401,6 +401,7 @@ pub async fn rate_limit_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
 
     #[test]
     fn test_rate_limiter_allows_within_limit() {

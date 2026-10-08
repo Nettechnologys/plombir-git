@@ -310,7 +310,8 @@ Common `serve` flags:
 | `--external-runners` | Use external runners instead of the embedded one | `false` |
 | `--rate-limit-max` / `--rate-limit-window` | Rate limit (0 = disabled) | `0` / `60` |
 | `--smtp-host` … `--smtp-from` | SMTP settings for email notifications | — |
-| `--log-file` / `--log-max-files` | Enable rotating file logs | — / `5` |
+| `--log-file` / `--log-max-files` | Enable daily-rotated file logs, keeping this many | — / `5` |
+| `--log-format` | `text`, or `json` for a log shipper | `text` |
 
 Prefer a config file? Create it with
 `install -m 600 plombir-git.example.toml plombir-git.toml`, edit it, and pass
