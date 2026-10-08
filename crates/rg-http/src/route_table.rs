@@ -441,9 +441,13 @@ impl RouteTable {
         // added without it, and a handler cannot forget it
         // (card_60a80311d512).
         let gateway = full_path == crate::agent_scope::MCP_ENDPOINT_PATH;
+        // The template this layer sits on is the route the router matched, so
+        // an MCP tool call is judged against where it landed, not against the
+        // path it spelled (card_5b6ce4ccc0a7).
+        let route: std::sync::Arc<str> = full_path.as_str().into();
         let method_router = method_router.layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
-                crate::agent_scope::enforce(access, gateway, req, next)
+                crate::agent_scope::enforce(access, gateway, route.clone(), req, next)
             },
         ));
         self.facts.push(RouteFact {

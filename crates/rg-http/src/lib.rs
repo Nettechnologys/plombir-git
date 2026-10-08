@@ -43,6 +43,14 @@ mod refusal;
 pub mod pat_auth;
 mod routes;
 
+// Public so a test can prove the per-route binding by itself: an HTTP client
+// has no way to attach a request extension, which is the whole reason the
+// marker is one, so only in-process code can ever hand the router this type.
+// The binding has to be shown refusing a path no tool builds any more, and a
+// test that went through the MCP endpoint would be stopped by the argument
+// escaping first.
+pub use agent_scope::McpToolCall;
+
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;

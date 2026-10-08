@@ -23,6 +23,12 @@
 //!   call to the API in-process and marks those inner requests with
 //!   [`McpToolCall`] — an extension no client can set. Decided in `pat_auth`,
 //!   before routing, and again by the endpoint before it dispatches.
+//! - **The routes a tool calls.** Naming the tool is not enough: its arguments
+//!   end up in the path, and a repository called `app/pulls/12/ci-approval?`
+//!   once turned `retry_pipeline` into an approval of a fork's CI run
+//!   (card_5b6ce4ccc0a7). So an inner call is bound to the routes its tool
+//!   declares, judged here, on the route the router actually matched — for every
+//!   caller, narrowed token or not.
 //! - **Protected branches.** Decided where the branch is known, in `rg-core`,
 //!   from the [`rg_core::auth::credential_context`] the PAT middleware publishes.
 //!
@@ -50,14 +56,48 @@ pub(crate) fn is_mcp_endpoint(path: &str) -> bool {
 }
 
 /// Marks a request the MCP endpoint dispatched in-process on an agent's behalf,
-/// and names the tool it serves.
+/// names the tool it serves, and carries the API routes that tool may call.
 ///
 /// Lives only in request extensions: there is no header or query spelling of
 /// it, so a client cannot claim an inner call it did not make through the
 /// endpoint.
 #[derive(Clone, Debug)]
 pub struct McpToolCall {
-    pub tool: String,
+    pub(crate) tool: String,
+    routes: &'static [rg_mcp::ApiRoute],
+}
+
+impl McpToolCall {
+    /// The marker for a call of `tool`, bound to the routes it declares.
+    /// `None` for a tool `rg-mcp` does not implement.
+    pub fn for_tool(tool: &str) -> Option<Self> {
+        rg_mcp::tools::tool_routes(tool).map(|routes| Self {
+            tool: tool.to_string(),
+            routes,
+        })
+    }
+
+    /// The marker for a read of the resource `uri`: named after the tool whose
+    /// permission the read needs, bound to the routes the resource declares.
+    pub fn for_resource(uri: &str) -> Option<Self> {
+        rg_mcp::resources::resource_binding(uri).map(|(tool, routes)| Self {
+            tool: tool.to_string(),
+            routes,
+        })
+    }
+
+    /// The tool this call serves.
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    /// Whether this call may be answered by the route registered as `route`
+    /// (full path template, `/api/v1` included) under `method`.
+    fn admits_route(&self, method: &axum::http::Method, route: &str) -> bool {
+        self.routes
+            .iter()
+            .any(|declared| declared.method == method.as_str() && declared.path == route)
+    }
 }
 
 /// The Personal Access Token behind the current request, resolved once by the
@@ -242,14 +282,51 @@ pub(crate) async fn record_scope_denial(
     .await;
 }
 
-/// The per-route layer: refuse a repository-confined token any route that is
-/// not about one of its repositories.
+/// The per-route layer: refuse an MCP tool call any route its tool does not
+/// declare, and a repository-confined token any route that is not about one
+/// of its repositories.
 ///
-/// `gateway` is the MCP endpoint, the one non-repository route a confined
-/// token is meant to call — the tool calls it dispatches come back through
-/// this layer one by one, each judged on its own route.
-pub(crate) async fn enforce(access: Access, gateway: bool, req: Request, next: Next) -> Response {
-    let Some(grant) = req.extensions().get::<TokenGrant>().cloned() else {
+/// `route` is the path template this layer was registered on — the route the
+/// router matched, not the path the request spelled. `gateway` is the MCP
+/// endpoint, the one non-repository route a confined token is meant to call —
+/// the tool calls it dispatches come back through this layer one by one, each
+/// judged on its own route.
+pub(crate) async fn enforce(
+    access: Access,
+    gateway: bool,
+    route: Arc<str>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let grant = req.extensions().get::<TokenGrant>().cloned();
+    if let Some(call) = req.extensions().get::<McpToolCall>() {
+        if !call.admits_route(req.method(), &route) {
+            let message = format!(
+                "the MCP tool '{}' may not call {} {}",
+                call.tool,
+                req.method(),
+                route
+            );
+            let details = serde_json::json!({
+                "reason": "mcp_route",
+                "tool": call.tool,
+                "method": req.method().as_str(),
+                "path": req.uri().path(),
+                "route": &*route,
+            });
+            let refusal = match &grant {
+                Some(grant) => grant.deny(req.headers(), &message, details).await,
+                None => {
+                    // A session credential carries no token to journal the
+                    // refusal against; the log is where it goes instead.
+                    tracing::warn!(%details, "refused an MCP call outside its tool's routes");
+                    AppError::forbidden(message)
+                }
+            };
+            return refusal.into_response();
+        }
+    }
+    let Some(grant) = grant else {
         return next.run(req).await;
     };
     if !grant.is_repo_restricted() || gateway || matches!(access, Access::Public) {

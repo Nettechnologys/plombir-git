@@ -40,6 +40,9 @@ struct Fixture {
     alice: String,
     alice_id: i64,
     http: reqwest::Client,
+    /// The router the server serves, for the one test that has to hand it a
+    /// request extension no HTTP client can send.
+    app: axum::Router,
     _dir: tempfile::TempDir,
 }
 
@@ -54,8 +57,9 @@ async fn fixture(overrides: StateOverrides) -> Fixture {
     let app = rg_http::create_router_for_test(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+    let served = app.clone();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, served).await.unwrap();
     });
     wait_for_listener(&addr).await;
     let base = format!("http://{addr}");
@@ -123,6 +127,7 @@ async fn fixture(overrides: StateOverrides) -> Fixture {
         alice,
         alice_id,
         http,
+        app,
         _dir: dir,
     }
 }
@@ -1137,4 +1142,281 @@ async fn an_agents_pull_request_merges_only_after_a_code_owner_approves() {
         ],
         "every step the agent took is in the audit log under its tool"
     );
+}
+
+impl Fixture {
+    async fn comment_count(&self) -> usize {
+        rg_db::entities::issue_comment::Entity::find()
+            .all(&self.db)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    async fn issue_count(&self) -> usize {
+        rg_db::entities::issue::Entity::find()
+            .all(&self.db)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// Send one request straight into the router, carrying the marker the MCP
+    /// endpoint puts on the calls it dispatches — the one thing no HTTP client
+    /// can attach.
+    async fn inner_call(
+        &self,
+        marker: rg_http::McpToolCall,
+        bearer: &str,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {bearer}"),
+            )
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        request.extensions_mut().insert(marker);
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                40_000,
+            ))));
+        let response = self.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// `resources/read`: the HTTP status and the JSON-RPC body.
+    async fn resource(&self, token: &str, uri: &str) -> (reqwest::StatusCode, serde_json::Value) {
+        self.mcp(token, "resources/read", serde_json::json!({ "uri": uri }))
+            .await
+    }
+}
+
+/// card_5b6ce4ccc0a7, end to end: a token confined to `create_issue` used to
+/// comment on an issue — a different tool's write — by naming its repository
+/// `app/issues/1/comments?`. The tool spliced that into
+/// `POST /repos/alice/{repo}/issues`, and the server routed what it got.
+///
+/// Both layers of the fix stand behind this test, so it cannot tell which one
+/// held; `an_inner_call_is_held_to_its_tools_routes_without_the_escaping` and
+/// `rg-mcp`'s `every_tool_keeps_owner_and_repo_inside_their_own_segments`
+/// prove each one alone. What it asserts is the trace: no comment exists
+/// afterwards, and no issue appeared anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tool_confined_token_cannot_reach_another_route_through_its_arguments() {
+    let f = fixture(StateOverrides::default()).await;
+    let token = f
+        .bot_token(serde_json::json!({ "name": "filer", "mcp_tools": ["create_issue"] }))
+        .await;
+
+    let (failed, created) = f
+        .tool(
+            &token,
+            "create_issue",
+            serde_json::json!({ "owner": "alice", "repo": "app", "title": "Target" }),
+        )
+        .await;
+    assert!(!failed, "the confined tool itself works: {created}");
+    let number = serde_json::from_str::<serde_json::Value>(&created).unwrap()["number"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(f.issue_count().await, 1);
+    assert_eq!(f.comment_count().await, 0);
+
+    for repo in [
+        format!("app/issues/{number}/comments?"),
+        format!("app/issues/{number}/comments#"),
+        format!("app/issues/{number}/comments%3F"),
+    ] {
+        let (failed, answer) = f
+            .tool(
+                &token,
+                "create_issue",
+                serde_json::json!({
+                    "owner": "alice", "repo": repo,
+                    "title": "Injected", "body": "written through create_issue",
+                }),
+            )
+            .await;
+        assert!(failed, "repo={repo:?} was accepted: {answer}");
+        assert_eq!(
+            f.comment_count().await,
+            0,
+            "repo={repo:?} commented through create_issue: {answer}"
+        );
+        assert_eq!(
+            f.issue_count().await,
+            1,
+            "repo={repo:?} created an issue somewhere: {answer}"
+        );
+    }
+
+    // `..` is refused before a request exists, rather than escaped into one.
+    let (failed, answer) = f
+        .tool(
+            &token,
+            "create_issue",
+            serde_json::json!({ "owner": "alice", "repo": "..", "title": "Dots" }),
+        )
+        .await;
+    assert!(failed && answer.contains("'.' or '..'"), "{answer}");
+    assert_eq!(f.issue_count().await, 1);
+}
+
+/// The second layer by itself: a request the MCP endpoint could have sent
+/// before card_5b6ce4ccc0a7 — a tool's marker on another route's path — handed
+/// straight to the router, where no argument escaping exists to stop it. The
+/// per-route layer refuses it on the route it matched, journals the refusal,
+/// and the handler never runs. A positive control on the tool's own route
+/// proves the harness can succeed, so the `403` is the binding's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inner_call_is_held_to_its_tools_routes_without_the_escaping() {
+    let f = fixture(StateOverrides::default()).await;
+    let token = f
+        .bot_token(serde_json::json!({ "name": "filer", "mcp_tools": ["create_issue"] }))
+        .await;
+    let marker = || rg_http::McpToolCall::for_tool("create_issue").expect("a known tool");
+
+    let (status, body) = f
+        .inner_call(
+            marker(),
+            &token,
+            "POST",
+            "/api/v1/repos/alice/app/issues",
+            serde_json::json!({ "title": "Control" }),
+        )
+        .await;
+    assert_eq!(status, 201, "the tool's own route answers: {body}");
+    let number = serde_json::from_str::<serde_json::Value>(&body).unwrap()["number"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(f.issue_count().await, 1);
+
+    let comments = format!("/api/v1/repos/alice/app/issues/{number}/comments");
+    let (status, body) = f
+        .inner_call(
+            marker(),
+            &token,
+            "POST",
+            &comments,
+            serde_json::json!({ "body": "not create_issue's route" }),
+        )
+        .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(f.comment_count().await, 0, "the handler ran: {body}");
+
+    let refused = f.denials("mcp_route").await;
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["tool"], "create_issue");
+    assert_eq!(refused[0]["method"], "POST");
+    assert_eq!(
+        refused[0]["route"],
+        "/api/v1/repos/{owner}/{name}/issues/{number}/comments"
+    );
+
+    // The binding is about the tool, not the token: a person's own session,
+    // which carries no narrowing at all, is held to the same routes when the
+    // call comes through a tool.
+    let (status, body) = f
+        .inner_call(
+            marker(),
+            &f.alice,
+            "POST",
+            &comments,
+            serde_json::json!({ "body": "through a person's session" }),
+        )
+        .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(f.comment_count().await, 0, "the handler ran: {body}");
+
+    // Same method, same repository, a route the router ranks differently:
+    // `PATCH /issues/{number}` belongs to update_issue, never to create_issue.
+    let (status, body) = f
+        .inner_call(
+            marker(),
+            &token,
+            "PATCH",
+            &format!("/api/v1/repos/alice/app/issues/{number}"),
+            serde_json::json!({ "title": "Renamed through create_issue" }),
+        )
+        .await;
+    assert_eq!(status, 403, "{body}");
+    let issue = rg_db::entities::issue::Entity::find()
+        .one(&f.db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(issue.title, "Control");
+}
+
+/// A resource read reads what one tool reads, and is held to that tool. Before
+/// card_5b6ce4ccc0a7 its inner calls carried no marker at all: the endpoint
+/// checked a tool only for `tools/call`, so a token confined to `get_issue`
+/// read files through `file://` and repository cards through `repo://`, and
+/// `rg-core` never saw which credential was acting. The repository list still
+/// held — the grant rode along as an extension — and still does here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resource_read_is_held_to_the_tokens_tools_and_repositories() {
+    let f = fixture(StateOverrides::default()).await;
+    let token = f
+        .bot_token(serde_json::json!({
+            "name": "reader",
+            "mcp_tools": ["read_file"],
+            "repositories": ["alice/app"],
+        }))
+        .await;
+
+    let (status, body) = f.resource(&token, "file://alice/app/README.md").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["result"]["contents"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("seed")),
+        "the admitted read works: {body}"
+    );
+
+    let (status, body) = f.resource(&token, "file://alice/other/README.md").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["result"].is_null()
+            && body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("403")),
+        "a repository outside the token's list was read through file://: {body}"
+    );
+    assert!(f
+        .denials("repository_not_allowed")
+        .await
+        .iter()
+        .any(|details| details["repository"] == "alice/other"
+            && details["credential"]["mcp_tool"] == "read_file"));
+
+    for uri in ["repo://alice/app", "issue://alice/app/1"] {
+        let (status, body) = f.resource(&token, uri).await;
+        assert_eq!(status, 403, "{uri}: {body}");
+        assert_eq!(body["error"]["code"], -32003, "{uri}: {body}");
+    }
+
+    let (status, listed) = f.mcp(&token, "resources/list", serde_json::json!({})).await;
+    assert_eq!(status, 200);
+    let uris: Vec<&str> = listed["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|resource| resource["uri"].as_str().unwrap())
+        .collect();
+    assert_eq!(uris, ["file://{owner}/{name}/{path}"]);
 }

@@ -310,7 +310,16 @@ which is what lets the server enforce what the CLI cannot:
 - **Token narrowing.** A token can be confined to named repositories, to named
   MCP tools (then it works only through `/api/v1/mcp`), and kept off protected
   branches (merge, push, server-side commit). A request outside that narrowing
-  answers `403` and writes `agent.scope_denied` to the audit log.
+  answers `403` and writes `agent.scope_denied` to the audit log. A resource
+  read is held to the tool that reads the same thing (`file://` to `read_file`,
+  `issue://` to `get_issue`, `repo://` to `list_repos`).
+- **A tool reaches only its own routes.** Every tool and resource declares the
+  API routes it calls (`rg_mcp::tools::tool_routes`), and the per-route layer
+  refuses an in-process call that the router matched to any other route — for
+  every caller, narrowed or not. Agent-supplied values are percent-encoded
+  into their own path segment and `.` / `..` are refused before that, so a
+  repository named `app/pulls/12/ci-approval?` is a repository that does not
+  exist, not a different route.
 - **Human approval.** Branch protection counts an approval only from a person
   with write access who is neither the pull request's author nor, for a bot's
   pull request, the bot's owner (`branch_protection::service::tally_approvals`);

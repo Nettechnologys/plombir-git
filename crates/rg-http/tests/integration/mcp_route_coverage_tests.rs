@@ -43,7 +43,7 @@ use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::Response;
 
-use crate::common::{build_test_app_state, setup_test_db, wait_for_listener};
+use crate::common::{build_test_app_state, register_user, setup_test_db, wait_for_listener};
 
 /// The body the SPA fallback answers a path inside `/api/v1` with, verbatim
 /// from `routes::protocol_subtrees_are_not_pages`. Spelled out rather than
@@ -431,6 +431,121 @@ async fn every_mcp_resource_addresses_a_route_this_server_mounts() {
         assert!(
             !answer.contains(NO_SUCH_ROUTE),
             "{scheme} addressed a path no route claims: {answer}"
+        );
+    }
+
+    server.abort();
+}
+
+/// The words the per-route layer refuses an MCP call off its tool's routes
+/// with (card_5b6ce4ccc0a7). Spelled out for the same reason as
+/// [`NO_SUCH_ROUTE`].
+const OFF_ITS_ROUTES: &str = "may not call";
+
+/// Every route a tool or a resource declares is one this server mounts, under
+/// that method. A declared route the router does not have is a binding that
+/// admits nothing — the tool would be refused on every call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_route_an_mcp_tool_declares_is_mounted() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create the test repo root");
+    let (_router, facts) =
+        rg_http::create_router_for_test_with_routes(build_test_app_state(db, repo_root));
+    let mounted: std::collections::BTreeSet<(&str, &str)> = facts
+        .iter()
+        .map(|fact| (fact.method, fact.path.as_str()))
+        .collect();
+
+    let mut declared = Vec::new();
+    for (name, _) in tool_probes() {
+        let routes = rg_mcp::tools::tool_routes(name).expect("a probed tool is implemented");
+        declared.extend(routes.iter().map(|route| (name.to_string(), *route)));
+    }
+    for (scheme, uri) in resource_probes() {
+        let (_, routes) =
+            rg_mcp::resources::resource_binding(uri).expect("a probed resource is served");
+        declared.extend(routes.iter().map(|route| (format!("{scheme}://"), *route)));
+    }
+    assert!(!declared.is_empty(), "nothing declares a route");
+    let unmounted: Vec<_> = declared
+        .iter()
+        .filter(|(_, route)| !mounted.contains(&(route.method, route.path)))
+        .collect();
+    assert!(
+        unmounted.is_empty(),
+        "declared but not mounted: {unmounted:?}"
+    );
+}
+
+/// The other half of the binding: every tool and every resource, called the
+/// way an agent calls them — through this server's own `POST /api/v1/mcp`, so
+/// each API call it makes is bound to the routes it declares — lands on a
+/// route it declared. A row that forgot a route would make its tool answer
+/// `403` on every call; this is where that shows up, rather than in an
+/// agent's session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_mcp_tool_call_stays_on_the_routes_it_declares() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create the test repo root");
+    let app = rg_http::create_router_for_test(build_test_app_state(db, repo_root));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr).await;
+    let base_url = format!("http://{addr}");
+    let token = register_user(&base_url, "prober", "prober@example.test", "Qz7$wRtm").await;
+    let http = reqwest::Client::new();
+
+    let send = |method: &'static str, params: serde_json::Value| {
+        let request = http
+            .post(format!("{base_url}/api/v1/mcp"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+            }));
+        async move {
+            let response = request.send().await.expect("the MCP endpoint answers");
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.expect("a JSON-RPC body");
+            (status, body.to_string())
+        }
+    };
+
+    for (name, arguments) in tool_probes() {
+        let (status, answer) = send(
+            "tools/call",
+            serde_json::json!({ "name": name, "arguments": arguments }),
+        )
+        .await;
+        assert_eq!(status, 200, "{name}: {answer}");
+        assert!(
+            !answer.contains("is required") && !answer.contains("are required"),
+            "{name} rejected the probe's arguments and never reached the server: {answer}"
+        );
+        assert!(
+            !answer.contains(OFF_ITS_ROUTES),
+            "{name} called a route it does not declare: {answer}"
+        );
+        assert!(
+            !answer.contains("not bound to any API route"),
+            "{name} was dispatched without a binding: {answer}"
+        );
+    }
+    for (scheme, uri) in resource_probes() {
+        let (status, answer) = send("resources/read", serde_json::json!({ "uri": uri })).await;
+        assert_eq!(status, 200, "{scheme}: {answer}");
+        assert!(
+            !answer.contains(OFF_ITS_ROUTES),
+            "{scheme} called a route it does not declare: {answer}"
+        );
+        assert!(
+            !answer.contains("not bound to any API route"),
+            "{scheme} was dispatched without a binding: {answer}"
         );
     }
 

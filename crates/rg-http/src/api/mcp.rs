@@ -12,7 +12,10 @@
 //!
 //! - [`McpToolCall`] names the tool, so a token confined to some tools is
 //!   refused the rest, and the audit rows those calls write say which tool
-//!   they came through;
+//!   they came through. It also carries the API routes the tool declares, and
+//!   the per-route layer refuses an inner call that lands anywhere else — a
+//!   tool's arguments are spliced into its path, and that is not where a
+//!   tool's reach may be decided (card_5b6ce4ccc0a7);
 //! - the caller's [`TokenGrant`], so the narrowing the PAT middleware resolved
 //!   once applies to every inner call without the raw token travelling again.
 //!
@@ -85,7 +88,10 @@ struct InProcessTransport {
     forwarded: Vec<(header::HeaderName, HeaderValue)>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     grant: Option<TokenGrant>,
-    tool: Option<String>,
+    /// The tool (or the tool a resource read is gated by) every call serves,
+    /// with the routes it may reach. `None` refuses every call: an inner
+    /// request must be bound, or it is not sent.
+    binding: Option<McpToolCall>,
 }
 
 impl rg_mcp::ApiTransport for InProcessTransport {
@@ -97,6 +103,11 @@ impl rg_mcp::ApiTransport for InProcessTransport {
     ) -> rg_mcp::ApiFuture<'_> {
         Box::pin(async move {
             let transport_error = |what: String| rg_mcp::Error::Transport(what);
+            let Some(binding) = &self.binding else {
+                return Err(transport_error(format!(
+                    "{path}: this MCP request is not bound to any API route"
+                )));
+            };
             let method = axum::http::Method::from_bytes(method.as_str().as_bytes())
                 .map_err(|error| transport_error(error.to_string()))?;
             let mut builder = axum::http::Request::builder().method(method).uri(&path);
@@ -117,9 +128,7 @@ impl rg_mcp::ApiTransport for InProcessTransport {
                 .body(body)
                 .map_err(|error| transport_error(error.to_string()))?;
             let extensions = request.extensions_mut();
-            if let Some(tool) = &self.tool {
-                extensions.insert(McpToolCall { tool: tool.clone() });
-            }
+            extensions.insert(binding.clone());
             if let Some(grant) = &self.grant {
                 extensions.insert(grant.clone());
             }
@@ -228,22 +237,39 @@ pub async fn mcp_endpoint(
         return StatusCode::ACCEPTED.into_response();
     }
 
-    let tool = (request.method == "tools/call")
-        .then(|| {
-            request
-                .params
-                .as_ref()
-                .and_then(|params| params.get("name"))
-                .and_then(|name| name.as_str())
-                .map(str::to_string)
-        })
-        .flatten();
+    let param = |key: &str| {
+        request
+            .params
+            .as_ref()
+            .and_then(|params| params.get(key))
+            .and_then(|value| value.as_str())
+    };
+    // What this message will call the API as. A tool call is its tool; a
+    // resource read reads what one tool reads, and is held to that tool's
+    // permission — before card_5b6ce4ccc0a7 it was held to no tool at all, so a
+    // token confined to `get_issue` read any file through `file://`.
+    let (tool, binding) = match request.method.as_str() {
+        "tools/call" => {
+            let tool = param("name").map(str::to_string);
+            let binding = tool.as_deref().and_then(McpToolCall::for_tool);
+            (tool, binding)
+        }
+        "resources/read" => {
+            let binding = param("uri").and_then(McpToolCall::for_resource);
+            (binding.as_ref().map(|b| b.tool().to_string()), binding)
+        }
+        _ => (None, None),
+    };
     if let (Some(tool), Some(grant)) = (&tool, &grant) {
         if !grant.admits_tool(tool) {
             grant
                 .record_denial(
                     &headers,
-                    serde_json::json!({ "reason": "mcp_tool", "tool": tool }),
+                    serde_json::json!({
+                        "reason": "mcp_tool",
+                        "tool": tool,
+                        "method": request.method,
+                    }),
                 )
                 .await;
             return json_rpc(
@@ -275,7 +301,7 @@ pub async fn mcp_endpoint(
             .collect(),
         connect_info: connect_info.map(|Extension(info)| info),
         grant: grant.clone(),
-        tool: tool.clone(),
+        binding,
     };
     let mcp_state = rg_mcp::AppState::in_process(Arc::new(transport));
 
@@ -313,8 +339,26 @@ pub async fn mcp_endpoint(
             }
         }
     }
+    // The resource twin: offer only what a read would be allowed to do.
+    if request.method == "resources/list" {
+        if let Some(allowed) = grant.as_ref().and_then(TokenGrant::mcp_tools) {
+            if let Some(resources) = response
+                .pointer_mut("/result/resources")
+                .and_then(|resources| resources.as_array_mut())
+            {
+                resources.retain(|resource| {
+                    resource
+                        .get("uri")
+                        .and_then(|uri| uri.as_str())
+                        .and_then(rg_mcp::resources::resource_binding)
+                        .is_some_and(|(tool, _)| allowed.contains(&tool))
+                });
+            }
+        }
+    }
 
-    if let Some(tool) = &tool {
+    // One audit row per tool call; a resource read keeps the journal it had.
+    if let Some(tool) = tool.as_ref().filter(|_| request.method == "tools/call") {
         let is_error = response
             .pointer("/result/isError")
             .and_then(|flag| flag.as_bool())

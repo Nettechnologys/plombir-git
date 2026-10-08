@@ -7,7 +7,9 @@
 //! |`resources/read`    | read a resource by URI         |
 
 use super::protocol::*;
+use super::ApiRoute;
 use super::AppState;
+use crate::tools::RepoPath;
 use serde_json::Value;
 
 // ── public: list ────────────────────────────────────
@@ -48,11 +50,50 @@ type ResourceHandler = fn(&AppState, &JsonRpcRequest, &str) -> JsonRpcResponse;
 /// advertised by [`list_resources`] with the schemes that answer. As a table
 /// the two sets are comparable, and `advertised_resources_match_the_dispatch_table`
 /// fails on either drift direction.
-const RESOURCE_DISPATCH: &[(&str, ResourceHandler)] = &[
-    ("repo://", handle_repo_meta),
-    ("file://", handle_file_content),
-    ("issue://", handle_issue_details),
+///
+/// The last two columns are what a read may reach (card_5b6ce4ccc0a7): the
+/// tool whose permission it needs — a resource reads what that tool reads, so a
+/// token confined to tools is held to the same list for both — and the API
+/// routes it calls, which the embedding server binds every in-process call to,
+/// exactly as it does a tool's.
+const RESOURCE_DISPATCH: &[(&str, ResourceHandler, &str, &[ApiRoute])] = &[
+    (
+        "repo://",
+        handle_repo_meta,
+        "list_repos",
+        &[ApiRoute {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{name}",
+        }],
+    ),
+    (
+        "file://",
+        handle_file_content,
+        "read_file",
+        &[ApiRoute {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{name}/blob/{*path}",
+        }],
+    ),
+    (
+        "issue://",
+        handle_issue_details,
+        "get_issue",
+        &[ApiRoute {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{name}/issues/{number}",
+        }],
+    ),
 ];
+
+/// What reading `uri` may reach: the tool whose permission it needs and the
+/// API routes it calls. `None` for a scheme this server does not serve.
+pub fn resource_binding(uri: &str) -> Option<(&'static str, &'static [ApiRoute])> {
+    RESOURCE_DISPATCH
+        .iter()
+        .find(|(scheme, _, _, _)| uri.starts_with(scheme))
+        .map(|(_, _, tool, routes)| (*tool, *routes))
+}
 
 pub fn read_resource(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
     let params = match &req.params {
@@ -72,9 +113,9 @@ pub fn read_resource(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse 
     // dispatch by URI scheme
     match RESOURCE_DISPATCH
         .iter()
-        .find(|(scheme, _)| uri.starts_with(scheme))
+        .find(|(scheme, _, _, _)| uri.starts_with(scheme))
     {
-        Some((_, handler)) => handler(state, req, &uri),
+        Some((_, handler, _, _)) => handler(state, req, &uri),
         None => make_error(
             req.id.clone(),
             -32602,
@@ -91,11 +132,15 @@ fn handle_repo_meta(state: &AppState, req: &JsonRpcRequest, uri: &str) -> JsonRp
     if parts.len() != 2 {
         return make_error(req.id.clone(), -32602, "invalid repo URI format");
     }
-    let owner = parts[0];
-    let name = parts[1];
+    // Escaped like every tool's: `repo://alice/app/pulls/1` names a repository
+    // called `app/pulls/1`, not another route under `alice/app`.
+    let repo = match RepoPath::new(parts[0], parts[1]) {
+        Ok(repo) => repo,
+        Err(message) => return make_error(req.id.clone(), -32602, &message),
+    };
 
     let client = crate::client::ApiClient::new(state);
-    let path = format!("/repos/{}/{}", owner, name);
+    let path = repo.api("");
     match tokio::runtime::Handle::current().block_on(client.get::<Value>(&path)) {
         Ok(v) => {
             let contents = serde_json::json!([{
@@ -116,8 +161,6 @@ fn handle_file_content(state: &AppState, req: &JsonRpcRequest, uri: &str) -> Jso
     if parts.len() < 3 {
         return make_error(req.id.clone(), -32602, "invalid file URI format");
     }
-    let owner = parts[0];
-    let name = parts[1];
     let path = parts[2];
 
     let client = crate::client::ApiClient::new(state);
@@ -125,7 +168,12 @@ fn handle_file_content(state: &AppState, req: &JsonRpcRequest, uri: &str) -> Jso
     // `/contents/{path}` is mounted for `POST` and `DELETE` only, so this
     // resource answered a router error for every URI it advertised
     // (card_66aa21756448).
-    let api_path = crate::tools::read_file_path(owner, name, path, "");
+    let api_path = match RepoPath::new(parts[0], parts[1])
+        .and_then(|repo| crate::tools::read_file_path(&repo, path, ""))
+    {
+        Ok(api_path) => api_path,
+        Err(message) => return make_error(req.id.clone(), -32602, &message),
+    };
     match tokio::runtime::Handle::current().block_on(client.get_raw(&api_path)) {
         Ok(text) => {
             let contents = serde_json::json!([{
@@ -161,11 +209,13 @@ fn handle_issue_details(state: &AppState, req: &JsonRpcRequest, uri: &str) -> Js
     if on_parts.len() != 2 {
         return make_error(req.id.clone(), -32602, "invalid issue URI format");
     }
-    let owner = on_parts[1];
-    let name = on_parts[0];
+    let repo = match RepoPath::new(on_parts[1], on_parts[0]) {
+        Ok(repo) => repo,
+        Err(message) => return make_error(req.id.clone(), -32602, &message),
+    };
 
     let client = crate::client::ApiClient::new(state);
-    let path = format!("/repos/{}/{}/issues/{}", owner, name, number);
+    let path = repo.api(&format!("/issues/{number}"));
     match tokio::runtime::Handle::current().block_on(client.get::<Value>(&path)) {
         Ok(v) => {
             let contents = serde_json::json!([{
@@ -225,7 +275,7 @@ mod tests {
         let advertised_set: BTreeSet<&str> = advertised.iter().map(String::as_str).collect();
         let dispatched_set: BTreeSet<&str> = RESOURCE_DISPATCH
             .iter()
-            .map(|(scheme, _)| *scheme)
+            .map(|(scheme, _, _, _)| *scheme)
             .collect();
 
         assert_eq!(
@@ -247,6 +297,25 @@ mod tests {
             "served by read_resource but never advertised — implemented and undiscoverable: \
              {unadvertised:?}"
         );
+    }
+
+    /// Every resource reads through a tool's permission that exists, and
+    /// declares routes in the server's spelling.
+    #[test]
+    fn every_resource_is_bound_to_a_tool_and_its_routes() {
+        for (scheme, _, tool, routes) in RESOURCE_DISPATCH {
+            assert!(
+                crate::tools::tool_names().any(|name| name == *tool),
+                "{scheme} is gated by {tool}, which is not a tool"
+            );
+            assert!(!routes.is_empty(), "{scheme} declares no route");
+            for route in *routes {
+                assert!(route.path.starts_with("/api/v1/"), "{scheme}: {route:?}");
+            }
+            let uri = format!("{scheme}o/n/1");
+            assert_eq!(resource_binding(&uri), Some((*tool, *routes)));
+        }
+        assert_eq!(resource_binding("gopher://o/n"), None);
     }
 
     #[test]

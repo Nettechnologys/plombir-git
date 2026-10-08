@@ -175,6 +175,23 @@ pub struct ApiResponse {
     pub body: Vec<u8>,
 }
 
+/// One route of the Plombir Git REST API as the server mounts it: the method
+/// and the full path template, `/api/v1` included — `GET
+/// /api/v1/repos/{owner}/{name}/issues/{number}`.
+///
+/// Every tool and every resource declares the routes it addresses
+/// ([`tools::tool_routes`], [`resources::resource_binding`]). The server that
+/// embeds this crate binds each in-process API call to that list, so a value an
+/// agent passes in cannot turn a tool's request into a request for some other
+/// route — whatever ends up in the path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApiRoute {
+    /// Uppercase HTTP method, e.g. `"POST"`.
+    pub method: &'static str,
+    /// Path template in the server's own spelling, `/api/v1` included.
+    pub path: &'static str,
+}
+
 /// A future an [`ApiTransport`] answers with.
 pub type ApiFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<ApiResponse>> + Send + 'a>>;
@@ -184,6 +201,11 @@ pub type ApiFuture<'a> =
 ///
 /// `path` is the full API path including `/api/v1` and any query string. The
 /// implementation owns authentication: the tools never see a credential.
+///
+/// Every value an agent supplied is percent-encoded into its own segment
+/// before it reaches `path`, and `.` / `..` segments are refused (see
+/// `tools::path_segment`); the declared [`ApiRoute`]s are the second, independent
+/// fence an implementation is expected to hold the call to.
 pub trait ApiTransport: Send + Sync {
     fn exchange(
         &self,
