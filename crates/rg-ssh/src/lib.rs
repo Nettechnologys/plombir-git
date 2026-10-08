@@ -1168,6 +1168,20 @@ impl Handler for SshHandler {
                     partial_success: false,
                 })
             }
+            Ok(rg_core::auth::lockout::PasswordAttempt::PasswordChangeRequired) => {
+                // An administrator chose this password, and it opens nothing
+                // until its holder has replaced it — which only the web login
+                // can ask for.
+                tracing::warn!(
+                    username,
+                    "SSH password auth refused: the password was set by an administrator and \
+                     must be changed through the web login first"
+                );
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
             Ok(rg_core::auth::lockout::PasswordAttempt::Rejected { locked }) => {
                 tracing::warn!(username, locked, "SSH password auth rejected");
                 Ok(Auth::Reject {

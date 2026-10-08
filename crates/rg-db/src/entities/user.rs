@@ -85,6 +85,11 @@ pub struct Model {
     /// for it (`auth_provider = "bot"`, no password), and it stops working the
     /// moment its owner does: see `rg_http::pat_auth::resolve_pat`.
     pub bot_owner_id: Option<i64>,
+    /// The password was chosen by an administrator — a new account, or a reset
+    /// handed over by hand — and must be replaced before it opens a session.
+    /// Cleared by the holder's own password change.
+    #[sea_orm(default_value = false)]
+    pub password_change_required: bool,
 }
 
 impl Model {

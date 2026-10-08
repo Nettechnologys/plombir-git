@@ -48,11 +48,21 @@ pub enum RegistrationMode {
     /// first one, on an instance that has never had a user. See
     /// [`authorize`].
     Closed,
+    /// Anyone may register, and the account exists once the link mailed to
+    /// its address has been followed. Until then nothing is created, and the
+    /// answer to a taken address is the same as to a free one — the only way
+    /// to stop registration from telling strangers which addresses have
+    /// accounts here (card_45f98ab2fe1a). Needs outbound mail; the server
+    /// refuses to start with this mode and no `[smtp]`.
+    ///
+    /// The bootstrap account on an empty instance is still created at once:
+    /// the operator registering first must not depend on mail working.
+    VerifyEmail,
 }
 
 impl RegistrationMode {
     /// The values `[auth].registration` / `PLOMBIR_GIT_REGISTRATION` accept.
-    pub const ACCEPTED: [&'static str; 2] = ["open", "closed"];
+    pub const ACCEPTED: [&'static str; 3] = ["open", "closed", "verify-email"];
 
     /// Parse a configured value, case- and whitespace-insensitively.
     ///
@@ -64,6 +74,7 @@ impl RegistrationMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "open" => Ok(Self::Open),
             "closed" => Ok(Self::Closed),
+            "verify-email" => Ok(Self::VerifyEmail),
             other => Err(format!(
                 "expected one of {} (got {other:?})",
                 Self::ACCEPTED
@@ -80,6 +91,7 @@ impl RegistrationMode {
         match self {
             Self::Open => "open",
             Self::Closed => "closed",
+            Self::VerifyEmail => "verify-email",
         }
     }
 
@@ -95,9 +107,17 @@ impl RegistrationMode {
 /// is there to close.
 pub struct RegistrationPermit {
     _bootstrap: Option<tokio::sync::MutexGuard<'static, ()>>,
+    confirm_email: bool,
 }
 
 impl RegistrationPermit {
+    /// Whether this registration waits for its address to be proved before
+    /// any account exists — [`RegistrationMode::VerifyEmail`], and not the
+    /// bootstrap account.
+    pub fn needs_email_confirmation(&self) -> bool {
+        self.confirm_email
+    }
+
     /// Whether this capability belongs to the account that initialises the
     /// instance. Kept crate-private so callers cannot choose their own role;
     /// [`authorize`] is the only constructor.
@@ -126,12 +146,20 @@ pub async fn authorize(
     if !rg_db::ops::user_ops::has_any(db).await? {
         return Ok(Some(RegistrationPermit {
             _bootstrap: Some(guard),
+            confirm_email: false,
         }));
     }
     drop(guard);
 
     match mode {
-        RegistrationMode::Open => Ok(Some(RegistrationPermit { _bootstrap: None })),
+        RegistrationMode::Open => Ok(Some(RegistrationPermit {
+            _bootstrap: None,
+            confirm_email: false,
+        })),
+        RegistrationMode::VerifyEmail => Ok(Some(RegistrationPermit {
+            _bootstrap: None,
+            confirm_email: true,
+        })),
         RegistrationMode::Closed => Ok(None),
     }
 }

@@ -76,6 +76,10 @@ jwt_secret = "change-me-in-production"
 #   "open"   — anyone who can reach the endpoint may sign up (the default).
 #   "closed" — the endpoint answers 403 before hashing a password or touching
 #              the database.
+#   "verify-email" — anyone may sign up, and the account is created when the
+#              link mailed to its address is followed. A taken address gets the
+#              same answer as a free one, so sign-up does not tell strangers
+#              which addresses have accounts. Needs [smtp] and external_url.
 # Also settable as PLOMBIR_GIT_REGISTRATION, which wins. An unrecognised value
 # (e.g. "close") fails the start instead of quietly leaving the instance open.
 #

@@ -1084,7 +1084,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "() => handleUnlock(u)",
-          "line": 246,
+          "line": 324,
           "symbol": "admin.unlockUser",
           "method": "POST",
           "routeUrl": "/api/v1/admin/users/{id}/unlock",
@@ -1094,7 +1094,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "() => handleUnlock(u)",
-          "line": 246,
+          "line": 324,
           "symbol": "admin.listUsers",
           "method": "GET",
           "routeUrl": "/api/v1/admin/users",
@@ -1113,7 +1113,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "handleSave",
-          "line": 310,
+          "line": 391,
           "symbol": "admin.updateUser",
           "method": "PATCH",
           "routeUrl": "/api/v1/admin/users/{id}",
@@ -1123,10 +1123,58 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "handleSave",
-          "line": 310,
+          "line": 391,
           "symbol": "admin.listUsers",
           "method": "GET",
           "routeUrl": "/api/v1/admin/users",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-users-create",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/users",
+          "kind": "control",
+          "control": "handleCreate",
+          "line": 263,
+          "symbol": "admin.createUser",
+          "method": "POST",
+          "routeUrl": "/api/v1/admin/users",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/users",
+          "kind": "control",
+          "control": "handleCreate",
+          "line": 263,
+          "symbol": "admin.listUsers",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/users",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-users-reset-password",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/users",
+          "kind": "control",
+          "control": "() => handleResetPassword(u)",
+          "line": 330,
+          "symbol": "admin.resetUserPassword",
+          "method": "POST",
+          "routeUrl": "/api/v1/admin/users/{id}/password-reset",
           "access": "InstanceAdmin"
         }
       ]
@@ -1142,7 +1190,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "handleDelete",
-          "line": 337,
+          "line": 418,
           "symbol": "admin.deleteUser",
           "method": "DELETE",
           "routeUrl": "/api/v1/admin/users/{id}",
@@ -1152,7 +1200,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "handleDelete",
-          "line": 337,
+          "line": 418,
           "symbol": "admin.listUsers",
           "method": "GET",
           "routeUrl": "/api/v1/admin/users",

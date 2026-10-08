@@ -17,6 +17,29 @@ let error = $state<string | null>(null);
 let authReady = $state(false); // True after initial fetchUser() completes
 let sessionCheckError = $state<string | null>(null);
 let pendingMfaUsername = $state<string | null>(null);
+// The login (username or email) whose administrator-chosen password has to be
+// replaced before any session exists.
+let pendingPasswordChangeLogin = $state<string | null>(null);
+
+function sessionUser(me: Awaited<ReturnType<typeof auth.me>>): User {
+  return {
+    id: me.id,
+    username: me.username,
+    email: me.email,
+    is_admin: me.is_admin ?? false,
+    display_name: me.display_name,
+  };
+}
+
+/** Take the session a successful answer opened, and load who it belongs to. */
+async function adoptSession(token: string) {
+  pendingMfaUsername = null;
+  pendingPasswordChangeLogin = null;
+  setToken(token);
+  currentUser = sessionUser(await auth.me());
+  authReady = true;
+  sessionCheckError = null;
+}
 
 export function getUser() {
   return currentUser;
@@ -48,6 +71,10 @@ export function beginMfa(username: string) {
   error = null;
 }
 
+export function isPasswordChangeRequired() {
+  return pendingPasswordChangeLogin !== null;
+}
+
 export function isAuthReady() {
   return authReady;
 }
@@ -61,6 +88,15 @@ export async function login(username: string, password: string) {
   error = null;
   try {
     const res = await auth.login(username, password);
+    if (res.password_change_required) {
+      setToken(null);
+      currentUser = null;
+      authReady = true;
+      sessionCheckError = null;
+      pendingMfaUsername = null;
+      pendingPasswordChangeLogin = username;
+      return false;
+    }
     if (res.mfa_required) {
       setToken(null);
       currentUser = null;
@@ -86,6 +122,35 @@ export async function login(username: string, password: string) {
     return true;
   } catch (e: any) {
     error = e.message || 'Login failed';
+    return false;
+  } finally {
+    isLoading = false;
+  }
+}
+
+/**
+ * Replace the administrator-chosen password the last login answered with
+ * `password_change_required`. `password` is that password, proved again by
+ * the server. Ends signed in, or at the second-factor form.
+ */
+export async function completeInitialPassword(password: string, newPassword: string) {
+  if (!pendingPasswordChangeLogin) {
+    error = 'No password change is pending';
+    return false;
+  }
+  isLoading = true;
+  error = null;
+  try {
+    const res = await auth.setInitialPassword(pendingPasswordChangeLogin, password, newPassword);
+    if (res.mfa_required) {
+      pendingMfaUsername = res.username;
+      pendingPasswordChangeLogin = null;
+      return false;
+    }
+    await adoptSession(res.token);
+    return true;
+  } catch (e: any) {
+    error = e.message || 'Could not set the new password';
     return false;
   } finally {
     isLoading = false;
@@ -154,11 +219,22 @@ export async function loginWithPasskey(username: string) {
   }
 }
 
-export async function register(username: string, email: string, password: string) {
+/**
+ * `true` when the account exists and is signed in, `'confirmation_sent'` when
+ * the instance waits for the address to be proved first, `false` on failure.
+ */
+export async function register(
+  username: string,
+  email: string,
+  password: string,
+): Promise<boolean | 'confirmation_sent'> {
   isLoading = true;
   error = null;
   try {
-    await auth.register(username, email, password);
+    const res = await auth.register(username, email, password);
+    if ('status' in res && res.status === 'confirmation_sent') {
+      return 'confirmation_sent';
+    }
     // Auto login after register
     return await login(username, password);
   } catch (e: any) {
@@ -218,4 +294,18 @@ export async function logout() {
   authReady = true;
   sessionCheckError = null;
   pendingMfaUsername = null;
+  pendingPasswordChangeLogin = null;
+}
+
+/** Sign in with the session a confirmed registration opened. */
+export async function adoptConfirmedSession(token: string) {
+  await adoptSession(token);
+}
+
+/** Forget the account locally once the server has deleted it. */
+export function forgetDeletedAccount() {
+  setToken(null);
+  currentUser = null;
+  authReady = true;
+  sessionCheckError = null;
 }

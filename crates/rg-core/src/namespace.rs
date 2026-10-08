@@ -59,6 +59,7 @@ pub const RESERVED_SEGMENTS: &[&str] = &[
     "reset-password",
     "search",
     "settings",
+    "verify-email",
 ];
 
 /// Whether `name` is a segment the application answers for itself.

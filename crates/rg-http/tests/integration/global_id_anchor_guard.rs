@@ -575,8 +575,10 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// anchored by `token.user_id == bot.id` for a bot the caller owns. 131 since
 /// card_e8afcaf3edf6: `api::lfs_locks::unlock` takes a lock id, a scoped call —
 /// `rg_core::lfs::locks::unlock` receives the gated repository's id beside it
-/// and finds the lock only by both.
-const CENSUS_TOTAL: usize = 131;
+/// and finds the lock only by both. 132 since card_9f18b657580b:
+/// `api::admin::reset_user_password` takes a user id behind `InstanceAdmin`,
+/// whose scope is the whole instance — every account is its to reset.
+const CENSUS_TOTAL: usize = 132;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

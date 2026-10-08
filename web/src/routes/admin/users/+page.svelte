@@ -24,6 +24,15 @@
   let showDeleteConfirm = $state(false);
   let deleteTarget = $state<AdminUser | null>(null);
   let busyUserIds = $state<Set<number>>(new Set());
+  let showCreate = $state(false);
+  let newUsername = $state('');
+  let newEmail = $state('');
+  let newDisplayName = $state('');
+  let newIsAdmin = $state(false);
+  let creating = $state(false);
+  // A generated password is shown once, right after it was made, for the
+  // administrator to hand over; its holder has to replace it at first sign-in.
+  let issuedPassword = $state<{ username: string; password: string } | null>(null);
   const listRequests = new LatestRequestFence<string>();
 
   $effect(() => {
@@ -146,6 +155,46 @@
     }
   }
 
+  async function handleCreate(e: Event) {
+    e.preventDefault();
+    creating = true;
+    error = '';
+    try {
+      const created = await admin.createUser({
+        username: newUsername.trim(),
+        email: newEmail.trim(),
+        display_name: newDisplayName.trim() || undefined,
+        is_admin: newIsAdmin,
+      });
+      issuedPassword = { username: created.user.username, password: created.temporary_password };
+      newUsername = '';
+      newEmail = '';
+      newDisplayName = '';
+      newIsAdmin = false;
+      showCreate = false;
+      await loadUsers();
+    } catch (e: any) {
+      error = e.message;
+    } finally {
+      creating = false;
+    }
+  }
+
+  async function handleResetPassword(user: AdminUser) {
+    if (!confirm(`Give ${user.username} a new password? Every session they have is signed out.`)) return;
+    const userId = user.id;
+    if (!claimUser(userId)) return;
+    try {
+      error = '';
+      const { temporary_password } = await admin.resetUserPassword(userId);
+      issuedPassword = { username: user.username, password: temporary_password };
+    } catch (e: any) {
+      error = e.message;
+    } finally {
+      releaseUser(userId);
+    }
+  }
+
   function isLocked(user: AdminUser) {
     return !!user.locked_until && new Date(user.locked_until).getTime() > Date.now();
   }
@@ -198,6 +247,35 @@
     <div class="error">{error}</div>
   {/if}
 
+  {#if issuedPassword}
+    <div class="issued-password" role="status">
+      <p>
+        Temporary password for <strong>{issuedPassword.username}</strong> — shown only now.
+        Hand it over; it must be replaced at the first sign-in.
+      </p>
+      <code class="temporary-password">{issuedPassword.password}</code>
+      <button class="btn-sm" onclick={() => (issuedPassword = null)}>Done</button>
+    </div>
+  {/if}
+
+  <div class="create-user">
+    {#if showCreate}
+      <form class="create-user-form" onsubmit={handleCreate}>
+        <input id="admin-new-username" type="text" placeholder="Username" bind:value={newUsername} required autocomplete="off" />
+        <input id="admin-new-email" type="email" placeholder="Email" bind:value={newEmail} required autocomplete="off" />
+        <input type="text" placeholder="Display name (optional)" bind:value={newDisplayName} />
+        <label class="checkbox-label">
+          <input type="checkbox" bind:checked={newIsAdmin} />
+          Administrator
+        </label>
+        <button type="submit" class="btn-sm" disabled={creating}>{creating ? 'Creating...' : 'Create user'}</button>
+        <button type="button" class="btn-sm" onclick={() => (showCreate = false)}>{t('common.cancel', 'Cancel')}</button>
+      </form>
+    {:else}
+      <button class="btn-sm open-create-user" onclick={() => (showCreate = true)}>New user</button>
+    {/if}
+  </div>
+
   {#if loading}
     <p class="loading">{t('common.loading')}</p>
   {:else}
@@ -248,6 +326,9 @@
                   </button>
                 {/if}
                 <button class="btn-sm" disabled={isUserBusy(u.id)} onclick={() => openEdit(u)}>{t('common.edit')}</button>
+                {#if u.auth_provider === 'local' && u.id !== getUser()?.id}
+                  <button class="btn-sm reset-password" disabled={isUserBusy(u.id)} onclick={() => handleResetPassword(u)}>Reset password</button>
+                {/if}
                 {#if u.id !== getUser()?.id}
                   <button class="btn-danger" disabled={isUserBusy(u.id)} onclick={() => confirmDelete(u)}>{t('common.delete')}</button>
                 {/if}
@@ -344,6 +425,31 @@
 {/if}
 
 <style>
+  .issued-password {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-secondary);
+  }
+
+  .issued-password p { margin: 0; flex-basis: 100%; }
+
+  .temporary-password { font-size: 15px; user-select: all; }
+
+  .create-user { margin-bottom: 16px; }
+
+  .create-user-form {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+
   .header { margin-bottom: 1.5rem; }
   .back { color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; }
   .back:hover { color: var(--accent); text-decoration: none; }

@@ -458,6 +458,36 @@ fn resolve_registration_mode(
     }
 }
 
+/// `verify-email` registration creates nothing until a mailed link is followed,
+/// so an instance that cannot send mail — or can only build links from the
+/// requester's own `Host` — would accept every registration and complete none.
+/// That is refused at startup rather than discovered by the first person who
+/// waits for a mail that never comes.
+fn require_mail_for_registration(
+    mode: rg_core::user::registration::RegistrationMode,
+    smtp_configured: bool,
+    external_url_configured: bool,
+) -> anyhow::Result<()> {
+    if mode != rg_core::user::registration::RegistrationMode::VerifyEmail {
+        return Ok(());
+    }
+    if !smtp_configured {
+        anyhow::bail!(
+            "[auth].registration = \"verify-email\" mails a confirmation link to every new \
+             address, and no [smtp] is configured; configure outbound mail, or choose \
+             \"open\" or \"closed\""
+        );
+    }
+    if !external_url_configured {
+        anyhow::bail!(
+            "[auth].registration = \"verify-email\" mails links into strangers' inboxes, and \
+             [server].external_url is not set; a link built from the request Host would let \
+             the requester choose where the token goes"
+        );
+    }
+    Ok(())
+}
+
 /// Resolve the pair of secrets every server-side path needs: the one that
 /// *signs* and the one that *encrypts*. Shared with the one-shot subcommands
 /// that also have to open at-rest data, so "which key opens this database" has
@@ -1373,6 +1403,11 @@ pub(crate) async fn run_serve(
     }
 
     validate_config(&resolved_auth_secrets.jwt_secret, &repo_root, &tls_config)?;
+    require_mail_for_registration(
+        resolved_registration,
+        smtp_config.is_some(),
+        resolved_external_url.is_some(),
+    )?;
 
     // Logged after the subscriber is up, so the one line an operator greps for
     // when a colleague "cannot sign up" actually reaches the log.
@@ -1913,6 +1948,26 @@ mod serve_tests {
     /// `[auth].registration` has to reach the model for the same
     /// `deny_unknown_fields` reason, and has to resolve in the documented
     /// order: env > config file > `"open"`.
+    #[test]
+    fn verify_email_registration_needs_mail_and_a_public_url() {
+        use rg_core::user::registration::RegistrationMode;
+
+        assert!(
+            super::require_mail_for_registration(RegistrationMode::VerifyEmail, true, true).is_ok()
+        );
+        let no_mail =
+            super::require_mail_for_registration(RegistrationMode::VerifyEmail, false, true)
+                .unwrap_err();
+        assert!(format!("{no_mail:#}").contains("[smtp]"), "{no_mail:#}");
+        let no_url =
+            super::require_mail_for_registration(RegistrationMode::VerifyEmail, true, false)
+                .unwrap_err();
+        assert!(format!("{no_url:#}").contains("external_url"), "{no_url:#}");
+        for mode in [RegistrationMode::Open, RegistrationMode::Closed] {
+            assert!(super::require_mail_for_registration(mode, false, false).is_ok());
+        }
+    }
+
     #[test]
     fn the_registration_mode_resolves_env_then_config_then_open() {
         use rg_core::user::registration::RegistrationMode;

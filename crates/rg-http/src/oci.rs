@@ -729,6 +729,10 @@ enum BasicIdentity {
     /// guesser nothing, while an owner who just switched MFA on would otherwise
     /// watch `docker login` degrade into anonymous pulls with no reason given.
     SecondFactorRequired,
+    /// The password was right and an administrator chose it; it opens nothing
+    /// until its holder has changed it in the web login. Explained for the
+    /// same reason as [`Self::SecondFactorRequired`].
+    PasswordChangeRequired,
 }
 
 /// Resolve Basic-auth credentials from the request headers.
@@ -871,6 +875,9 @@ async fn authenticate_basic(
         rg_core::auth::lockout::PasswordAttempt::SecondFactorRequired => {
             Ok(BasicIdentity::SecondFactorRequired)
         }
+        rg_core::auth::lockout::PasswordAttempt::PasswordChangeRequired => {
+            Ok(BasicIdentity::PasswordChangeRequired)
+        }
         rg_core::auth::lockout::PasswordAttempt::Rejected { .. } => Ok(BasicIdentity::Rejected),
     }
 }
@@ -987,6 +994,14 @@ pub async fn get_token(
                 error_codes::UNAUTHORIZED,
                 "this account requires a second factor: authenticate with a personal \
                  access token instead of your password",
+            );
+        }
+        Ok(BasicIdentity::PasswordChangeRequired) => {
+            return oci_err(
+                StatusCode::UNAUTHORIZED,
+                error_codes::UNAUTHORIZED,
+                "this password was set by an administrator: sign in to the web interface \
+                 and choose your own before using it here",
             );
         }
         Err(e) => {

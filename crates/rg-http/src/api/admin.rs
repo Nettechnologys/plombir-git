@@ -239,6 +239,141 @@ pub async fn update_user(
     }
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub email: String,
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub is_admin: bool,
+}
+
+/// POST /api/v1/admin/users
+///
+/// The way to add a colleague to an instance whose registration is closed and
+/// that has no identity provider (card_9f18b657580b). The account gets a
+/// generated password, shown once in this response for the administrator to
+/// hand over; it opens nothing until its holder has chosen their own.
+#[utoipa::path(
+    post,
+    path = "/admin/users",
+    tag = "Admin",
+    request_body = CreateUserRequest,
+    responses(
+        (status = 201, description = "Created. `temporary_password` is shown only here", body = serde_json::Value),
+        (status = 400, description = "Invalid username or email", body = serde_json::Value),
+        (status = 403, description = "Admin required", body = serde_json::Value),
+        (status = 409, description = "The name or the address is taken", body = serde_json::Value),
+    ),
+)]
+pub async fn create_user(
+    State(state): State<AppState>,
+    InstanceAdmin(current_id): InstanceAdmin,
+    headers: HeaderMap,
+    Json(body): Json<CreateUserRequest>,
+) -> impl IntoResponse {
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, current_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    let directories = rg_core::user::service::LdapDirectories {
+        encryption_key: &state.encryption_key,
+        transport_policy: &state.ldap_transport_policy,
+    };
+    match rg_core::user::account::create_account(
+        &state.db,
+        directories,
+        body.username.trim(),
+        body.email.trim(),
+        body.display_name.as_deref(),
+        body.is_admin,
+    )
+    .await
+    {
+        Ok(provisioned) => {
+            let user = provisioned.user;
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                "admin.create_user",
+                Some("user"),
+                Some(user.id),
+                Some(user.username.as_str()),
+                Some(&headers),
+                Some(serde_json::json!({ "is_admin": user.is_admin })),
+            )
+            .await;
+            let info: rg_core::user::service::UserInfo = user.into();
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "user": info,
+                    "temporary_password": provisioned.temporary_password,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+/// POST /api/v1/admin/users/:id/password-reset
+///
+/// A new generated password, shown once, which its holder must replace at
+/// the next sign-in. Every session and reset link the account had stops
+/// working in the same commit; personal access tokens and SSH keys are
+/// separate credentials and are revoked by deactivating the account.
+#[utoipa::path(
+    post,
+    path = "/admin/users/{id}/password-reset",
+    tag = "Admin",
+    params(("id" = i64, Path, description = "User ID")),
+    responses(
+        (status = 200, description = "`temporary_password` is shown only here", body = serde_json::Value),
+        (status = 400, description = "The account signs in through an identity provider, or is your own", body = serde_json::Value),
+        (status = 403, description = "Admin required", body = serde_json::Value),
+        (status = 404, description = "User not found", body = serde_json::Value),
+    ),
+)]
+pub async fn reset_user_password(
+    State(state): State<AppState>,
+    InstanceAdmin(current_id): InstanceAdmin,
+    headers: HeaderMap,
+    Path(user_id): Path<i64>,
+) -> impl IntoResponse {
+    if current_id == user_id {
+        return AppError::bad_request("change your own password from your account settings")
+            .into_response();
+    }
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, current_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    match rg_core::user::account::reset_password(&state.db, user_id).await {
+        Ok(provisioned) => {
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                "admin.reset_password",
+                Some("user"),
+                Some(user_id),
+                Some(provisioned.user.username.as_str()),
+                Some(&headers),
+                Some(serde_json::json!({ "sessions_revoked": true })),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "temporary_password": provisioned.temporary_password,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
 /// POST /api/v1/admin/users/:id/unlock
 #[utoipa::path(
     post,

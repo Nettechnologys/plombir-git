@@ -1065,6 +1065,7 @@ pub(crate) fn build_all_routes(
     let limit_101mb = Wrap::body_limit(101 * 1024 * 1024);
     let lfs_upload_limit = Wrap::body_limit(rg_core::lfs::service::LFS_OBJECT_MAX_BYTES);
     let release_asset_limit = Wrap::body_limit(api::releases::RELEASE_ASSET_UPLOAD_MAX_BYTES);
+    let avatar_limit = Wrap::body_limit(rg_core::user::account::MAX_AVATAR_BYTES);
     // Multipart package clients add framing around the artifact (and npm adds
     // base64 JSON on its own route). Lift Axum's hidden 2 MiB extractor limit
     // to a bounded envelope allowance; `publish_package` independently checks
@@ -1137,6 +1138,30 @@ pub(crate) fn build_all_routes(
         .post_with(Public, "/users/login", api::users::login, &auth_rl)
         .post(User, "/users/logout", api::users::logout)
         .get(User, "/users/me", api::users::me)
+        .patch(User, "/users/me", api::account::update_profile)
+        .delete(User, "/users/me", api::account::delete_account)
+        .put(User, "/users/me/password", api::account::change_password)
+        .post_with(
+            Public,
+            "/users/password/initial",
+            api::account::set_initial_password,
+            &auth_rl,
+        )
+        .post(User, "/users/me/email", api::account::request_email_change)
+        .post_with(
+            Public,
+            "/users/verify-email",
+            api::account::confirm_email,
+            &auth_rl,
+        )
+        .put_with(
+            User,
+            "/users/me/avatar",
+            api::account::upload_avatar,
+            &avatar_limit,
+        )
+        .delete(User, "/users/me/avatar", api::account::delete_avatar)
+        .get(Public, "/avatars/{username}", api::account::get_avatar)
         .post_with(
             Public,
             "/users/forgot-password",
@@ -2607,6 +2632,12 @@ pub(crate) fn build_all_routes(
             api::runners::delete_runner_admin,
         )
         .get(InstanceAdmin, "/admin/users", api::admin::list_users)
+        .post(InstanceAdmin, "/admin/users", api::admin::create_user)
+        .post(
+            InstanceAdmin,
+            "/admin/users/{id}/password-reset",
+            api::admin::reset_user_password,
+        )
         .get(InstanceAdmin, "/admin/users/{id}", api::admin::get_user)
         .patch(InstanceAdmin, "/admin/users/{id}", api::admin::update_user)
         .delete(InstanceAdmin, "/admin/users/{id}", api::admin::delete_user)

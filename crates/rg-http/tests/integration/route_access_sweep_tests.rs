@@ -2331,6 +2331,30 @@ async fn every_route_answers_its_declared_access_level() {
     let public_repo_id = create_repo(&fx, PUBLIC_REPO, false).await;
     let (team_id, doomed_team_id) = create_org_with_teams(&fx, &org_member, &team_member).await;
     let owner_rows = seed_owner_rows(&fx, &db, owner_id).await;
+    // Every account wears a picture, so `GET /avatars/{username}` has one to
+    // serve whichever account a row names, and `Allowed` is proved by a `200`
+    // rather than excused by a `404` (card_ca894e30ac80).
+    {
+        use sea_orm::EntityTrait as _;
+        let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8; 8]].concat();
+        for account in rg_db::entities::user::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+        {
+            let url = rg_core::user::account::avatar_url(&account.username, "00");
+            rg_db::ops::user_avatar_ops::replace(
+                &db,
+                account.id,
+                "image/png",
+                "00",
+                png.clone(),
+                &url,
+            )
+            .await
+            .expect("fixture: seed an avatar");
+        }
+    }
     let globals = GlobalSeed {
         team_id,
         doomed_team_id,

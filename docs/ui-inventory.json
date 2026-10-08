@@ -404,6 +404,7 @@
       "handler": "api::users::register",
       "testedIn": [
         "rust",
+        "web",
         "smoke"
       ],
       "reachedFromUi": false
@@ -415,6 +416,7 @@
       "handler": "api::users::login",
       "testedIn": [
         "rust",
+        "web",
         "smoke"
       ],
       "reachedFromUi": false
@@ -439,6 +441,104 @@
         "rust",
         "web",
         "smoke"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "PATCH",
+      "url": "/api/v1/users/me",
+      "access": "User",
+      "handler": "api::account::update_profile",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/users/me",
+      "access": "User",
+      "handler": "api::account::delete_account",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "PUT",
+      "url": "/api/v1/users/me/password",
+      "access": "User",
+      "handler": "api::account::change_password",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/users/password/initial",
+      "access": "Public",
+      "handler": "api::account::set_initial_password",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/users/me/email",
+      "access": "User",
+      "handler": "api::account::request_email_change",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/users/verify-email",
+      "access": "Public",
+      "handler": "api::account::confirm_email",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "PUT",
+      "url": "/api/v1/users/me/avatar",
+      "access": "User",
+      "handler": "api::account::upload_avatar",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/users/me/avatar",
+      "access": "User",
+      "handler": "api::account::delete_avatar",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/avatars/{username}",
+      "access": "Public",
+      "handler": "api::account::get_avatar",
+      "testedIn": [
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -4221,9 +4321,42 @@
       ],
       "reachedFromUi": true,
       "browserScenarios": [
+        "admin-users-create",
         "admin-users-delete",
         "admin-users-unlock",
         "admin-users-update"
+      ]
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/admin/users",
+      "access": "InstanceAdmin",
+      "handler": "api::admin::create_user",
+      "testedIn": [
+        "rust",
+        "web",
+        "smoke",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "admin-users-create"
+      ]
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/admin/users/{id}/password-reset",
+      "access": "InstanceAdmin",
+      "handler": "api::admin::reset_user_password",
+      "testedIn": [
+        "rust",
+        "web",
+        "smoke",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "admin-users-reset-password"
       ]
     },
     {
@@ -21166,7 +21299,7 @@
         {
           "tag": "a",
           "label": "←",
-          "line": 192,
+          "line": 241,
           "via": null,
           "href": "/admin",
           "handler": null,
@@ -21175,8 +21308,106 @@
         },
         {
           "tag": "button",
+          "label": "Done",
+          "line": 257,
+          "via": null,
+          "href": null,
+          "handler": "() => (issuedPassword = null)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "form",
+          "label": "Administrator (showCreate = false)}>",
+          "line": 263,
+          "via": null,
+          "href": null,
+          "handler": "handleCreate",
+          "calls": [
+            {
+              "symbol": "admin.createUser",
+              "method": "POST",
+              "url": "/api/v1/admin/users",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/users",
+              "access": "InstanceAdmin",
+              "handler": "api::admin::create_user",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "admin-users-create"
+              ]
+            },
+            {
+              "symbol": "admin.listUsers",
+              "method": "GET",
+              "url": "/api/v1/admin/users",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/users",
+              "access": "InstanceAdmin",
+              "handler": "api::admin::list_users",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "admin-users-create"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
           "label": "",
-          "line": 246,
+          "line": 268,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 271,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 272,
+          "via": null,
+          "href": null,
+          "handler": "() => (showCreate = false)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "New user",
+          "line": 275,
+          "via": null,
+          "href": null,
+          "handler": "() => (showCreate = true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 324,
           "via": null,
           "href": null,
           "handler": "() => handleUnlock(u)",
@@ -21224,7 +21455,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 250,
+          "line": 328,
           "via": null,
           "href": null,
           "handler": "() => openEdit(u)",
@@ -21233,8 +21464,38 @@
         },
         {
           "tag": "button",
+          "label": "Reset password",
+          "line": 330,
+          "via": null,
+          "href": null,
+          "handler": "() => handleResetPassword(u)",
+          "calls": [
+            {
+              "symbol": "admin.resetUserPassword",
+              "method": "POST",
+              "url": "/api/v1/admin/users/{id}/password-reset",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/users/{id}/password-reset",
+              "access": "InstanceAdmin",
+              "handler": "api::admin::reset_user_password",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "admin-users-reset-password"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
           "label": "i18n:common.delete",
-          "line": 252,
+          "line": 333,
           "via": null,
           "href": null,
           "handler": "() => confirmDelete(u)",
@@ -21244,7 +21505,7 @@
         {
           "tag": "button",
           "label": "← Prev",
-          "line": 264,
+          "line": 345,
           "via": null,
           "href": null,
           "handler": "prevPage",
@@ -21269,7 +21530,7 @@
         {
           "tag": "button",
           "label": "Next →",
-          "line": 266,
+          "line": 347,
           "via": null,
           "href": null,
           "handler": "nextPage",
@@ -21294,7 +21555,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 295,
+          "line": 376,
           "via": null,
           "href": null,
           "handler": null,
@@ -21304,7 +21565,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 300,
+          "line": 381,
           "via": null,
           "href": null,
           "handler": null,
@@ -21314,7 +21575,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 304,
+          "line": 385,
           "via": null,
           "href": null,
           "handler": null,
@@ -21324,7 +21585,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 310,
+          "line": 391,
           "via": null,
           "href": null,
           "handler": "handleSave",
@@ -21372,7 +21633,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 313,
+          "line": 394,
           "via": null,
           "href": null,
           "handler": "closeEdit",
@@ -21382,7 +21643,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 337,
+          "line": 418,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -21430,7 +21691,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 340,
+          "line": 421,
           "via": null,
           "href": null,
           "handler": "() => showDeleteConfirm = false",
@@ -22094,8 +22355,28 @@
       "controls": [
         {
           "tag": "form",
+          "label": "i18n:auth.login.password_change_required",
+          "line": 147,
+          "via": null,
+          "href": null,
+          "handler": "handleInitialPassword",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:auth.login.set_password",
+          "line": 162,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "form",
           "label": "i18n:auth.login.mfa_code",
-          "line": 126,
+          "line": 167,
           "via": null,
           "href": null,
           "handler": "handleMfaSubmit",
@@ -22105,7 +22386,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 140,
+          "line": 181,
           "via": null,
           "href": null,
           "handler": null,
@@ -22115,7 +22396,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.verifying",
-          "line": 144,
+          "line": 185,
           "via": null,
           "href": null,
           "handler": null,
@@ -22125,7 +22406,7 @@
         {
           "tag": "form",
           "label": "Sign in with a passkey",
-          "line": 149,
+          "line": 190,
           "via": null,
           "href": null,
           "handler": "handleSubmit",
@@ -22135,7 +22416,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.submitting",
-          "line": 160,
+          "line": 201,
           "via": null,
           "href": null,
           "handler": null,
@@ -22145,7 +22426,7 @@
         {
           "tag": "button",
           "label": "Sign in with a passkey",
-          "line": 165,
+          "line": 206,
           "via": null,
           "href": null,
           "handler": "handlePasskeyLogin",
@@ -22155,7 +22436,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.sso_retry",
-          "line": 187,
+          "line": 228,
           "via": null,
           "href": null,
           "handler": "loadSsoProviders",
@@ -22180,7 +22461,7 @@
         {
           "tag": "a",
           "label": ")}",
-          "line": 195,
+          "line": 236,
           "via": null,
           "href": "auth.ssoAuthorizeUrl(provider.slug)",
           "handler": null,
@@ -22190,7 +22471,7 @@
         {
           "tag": "a",
           "label": "i18n:auth.login.footer_link",
-          "line": 207,
+          "line": 248,
           "via": null,
           "href": "/register",
           "handler": null,
@@ -22200,7 +22481,7 @@
         {
           "tag": "a",
           "label": "Forgot password?",
-          "line": 209,
+          "line": 250,
           "via": null,
           "href": "/forgot-password",
           "handler": null,
@@ -23041,7 +23322,7 @@
         {
           "tag": "form",
           "label": "i18n:auth.register.username",
-          "line": 41,
+          "line": 53,
           "via": null,
           "href": null,
           "handler": "handleSubmit",
@@ -23051,7 +23332,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.register.submitting",
-          "line": 57,
+          "line": 69,
           "via": null,
           "href": null,
           "handler": null,
@@ -23061,7 +23342,7 @@
         {
           "tag": "a",
           "label": "i18n:auth.register.footer_link",
-          "line": 64,
+          "line": 77,
           "via": null,
           "href": "/login",
           "handler": null,
@@ -23489,6 +23770,240 @@
               ]
             }
           ],
+          "unresolved": false
+        }
+      ],
+      "passive": []
+    },
+    {
+      "route": "/settings/profile",
+      "file": "web/src/routes/settings/profile/+page.svelte",
+      "admin": false,
+      "controls": [
+        {
+          "tag": "button",
+          "label": "i18n:settings.profile.retry",
+          "line": 195,
+          "via": null,
+          "href": null,
+          "handler": "load",
+          "calls": [
+            {
+              "symbol": "auth.me",
+              "method": "GET",
+              "url": "/api/v1/users/me",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me",
+              "access": "User",
+              "handler": "api::users::me",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web",
+                "smoke"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "form",
+          "label": "i18n:settings.profile.display_name",
+          "line": 202,
+          "via": null,
+          "href": null,
+          "handler": "saveProfile",
+          "calls": [
+            {
+              "symbol": "auth.updateProfile",
+              "method": "PATCH",
+              "url": "/api/v1/users/me",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me",
+              "access": "User",
+              "handler": "api::account::update_profile",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "textarea",
+          "label": "",
+          "line": 209,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.profile.save",
+          "line": 213,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 227,
+          "via": null,
+          "href": null,
+          "handler": "uploadAvatar",
+          "calls": [
+            {
+              "symbol": "auth.uploadAvatar",
+              "method": "PUT",
+              "url": "/api/v1/users/me/avatar",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/avatar",
+              "access": "User",
+              "handler": "api::account::upload_avatar",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.profile.remove_avatar",
+          "line": 236,
+          "via": null,
+          "href": null,
+          "handler": "removeAvatar",
+          "calls": [
+            {
+              "symbol": "auth.deleteAvatar",
+              "method": "DELETE",
+              "url": "/api/v1/users/me/avatar",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/avatar",
+              "access": "User",
+              "handler": "api::account::delete_avatar",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "form",
+          "label": "i18n:settings.profile.current_password",
+          "line": 248,
+          "via": null,
+          "href": null,
+          "handler": "changePassword",
+          "calls": [
+            {
+              "symbol": "auth.changePassword",
+              "method": "PUT",
+              "url": "/api/v1/users/me/password",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/password",
+              "access": "User",
+              "handler": "api::account::change_password",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.profile.change_password",
+          "line": 263,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "form",
+          "label": "i18n:settings.profile.new_email",
+          "line": 272,
+          "via": null,
+          "href": null,
+          "handler": "changeEmail",
+          "calls": [
+            {
+              "symbol": "auth.requestEmailChange",
+              "method": "POST",
+              "url": "/api/v1/users/me/email",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/email",
+              "access": "User",
+              "handler": "api::account::request_email_change",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.profile.send_confirmation",
+          "line": 283,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "form",
+          "label": "i18n:settings.profile.delete_password",
+          "line": 307,
+          "via": null,
+          "href": null,
+          "handler": "deleteAccount",
+          "calls": [
+            {
+              "symbol": "auth.deleteAccount",
+              "method": "DELETE",
+              "url": "/api/v1/users/me",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me",
+              "access": "User",
+              "handler": "api::account::delete_account",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.profile.delete_button",
+          "line": 320,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
           "unresolved": false
         }
       ],
@@ -24186,6 +24701,49 @@
         }
       ],
       "passive": []
+    },
+    {
+      "route": "/verify-email",
+      "file": "web/src/routes/verify-email/+page.svelte",
+      "admin": false,
+      "controls": [
+        {
+          "tag": "a",
+          "label": "i18n:auth.verify_email.to_settings",
+          "line": 55,
+          "via": null,
+          "href": "/settings/profile",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:auth.verify_email.working",
+          "line": 58,
+          "via": null,
+          "href": null,
+          "handler": "confirm",
+          "calls": [
+            {
+              "symbol": "auth.confirmEmail",
+              "method": "POST",
+              "url": "/api/v1/users/verify-email",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/verify-email",
+              "access": "Public",
+              "handler": "api::account::confirm_email",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        }
+      ],
+      "passive": []
     }
   ],
   "browserSweep": {
@@ -24193,10 +24751,10 @@
       "owner",
       "outsider"
     ],
-    "scenarios": 41,
-    "inventoryEntries": 686,
-    "coveredEntries": 162,
-    "coveredRoutes": 154,
+    "scenarios": 43,
+    "inventoryEntries": 697,
+    "coveredEntries": 165,
+    "coveredRoutes": 156,
     "maxUiRoutesWithoutFrontendTest": 27
   }
 }

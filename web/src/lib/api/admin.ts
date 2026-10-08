@@ -163,6 +163,17 @@ export const admin = {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
+  // The generated password comes back once, here; the account must replace
+  // it at its first sign-in.
+  createUser: (data: { username: string; email: string; display_name?: string; is_admin?: boolean }) =>
+    request<{ user: AdminUser; temporary_password: string }>('/admin/users', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  resetUserPassword: (id: number) =>
+    request<{ temporary_password: string }>(`/admin/users/${id}/password-reset`, {
+      method: 'POST',
+    }),
   unlockUser: (id: number) =>
     request<AdminUser>(`/admin/users/${id}/unlock`, { method: 'POST' }),
   deleteUser: (id: number) =>

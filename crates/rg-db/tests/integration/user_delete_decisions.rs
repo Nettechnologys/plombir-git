@@ -94,6 +94,18 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "the account's own one-shot reset grant",
     ),
     (
+        "email_confirmations",
+        "user_id",
+        "CASCADE",
+        "card_ca894e30ac80: the account's own pending move to another address",
+    ),
+    (
+        "user_avatars",
+        "user_id",
+        "CASCADE",
+        "card_ca894e30ac80: the account's own picture",
+    ),
+    (
         "pr_reviewer_requests",
         "reviewer_id",
         "CASCADE",

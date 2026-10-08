@@ -8,12 +8,16 @@
   let email = $state('');
   let password = $state('');
   let localError = $state('');
+  // The instance creates the account only once the mailed link is followed.
+  let confirmationSent = $state(false);
 
   async function handleSubmit(e: Event) {
     e.preventDefault();
     localError = '';
     const ok = await register(username, email, password);
-    if (ok) {
+    if (ok === 'confirmation_sent') {
+      confirmationSent = true;
+    } else if (ok) {
       window.location.href = '/dashboard';
     } else {
       localError = getAuthError() || t('auth.register.failed');
@@ -38,6 +42,14 @@
       <div class="error-banner">{localError}</div>
     {/if}
 
+    {#if confirmationSent}
+      <p class="confirmation-sent" role="status">
+        {t(
+          'auth.register.confirmation_sent',
+          'Check your inbox: we sent a link to confirm the address. The account is created when you follow it.',
+        )}
+      </p>
+    {:else}
     <form onsubmit={handleSubmit}>
       <label>
         {t('auth.register.username')}
@@ -58,6 +70,7 @@
         {getAuthLoading() ? t('auth.register.submitting') : t('auth.register.submit')}
       </button>
     </form>
+    {/if}
 
     <p class="footer">
       {t('auth.register.footer', { link: '' })}
@@ -67,6 +80,12 @@
 </div>
 
 <style>
+  .confirmation-sent {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--text-primary);
+  }
+
 
   .login-card {
     width: 340px;

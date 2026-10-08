@@ -583,7 +583,7 @@ pub struct DisableMfaRequest {
 ///
 /// `channel` names the door in the attempt record; the strike itself is the
 /// account-wide one `POST /users/login`, SSH and `docker login` record.
-async fn confirm_account_password(
+pub(crate) async fn confirm_account_password(
     state: &AppState,
     user: &rg_db::entities::user::Model,
     password: &str,
@@ -615,6 +615,14 @@ async fn confirm_account_password(
     .await
     .map_err(AppError::from)?;
 
+    if matches!(
+        attempt,
+        rg_core::auth::lockout::PasswordAttempt::PasswordChangeRequired
+    ) {
+        return Err(AppError::unauthorized(
+            "this password was set by an administrator; choose your own first",
+        ));
+    }
     if let rg_core::auth::lockout::PasswordAttempt::Rejected { locked } = attempt {
         // The caller is authenticated as this very account, so naming the lock
         // leaks nothing — it is what `POST /users/mfa/verify` already answers,

@@ -242,6 +242,29 @@ pub async fn register(
         .await
         .context("failed to hash password")?;
 
+    let user = create_registered_account(db, permit, username, email, password_hash).await?;
+    let token = jwt::generate_token(user.id, &user.username, user.session_version, jwt_secret, 7)?;
+
+    Ok(AuthResponse {
+        token,
+        user_id: user.id,
+        username: user.username,
+    })
+}
+
+/// Insert the account a self-registration produces, once every rule has been
+/// checked and the password hashed: directly from [`register`], or from a
+/// confirmed address (`account::confirm`).
+///
+/// `permit` is consumed: the first row is committed when this returns, so a
+/// waiting registration may observe a non-empty database.
+pub(crate) async fn create_registered_account(
+    db: &DatabaseConnection,
+    permit: super::registration::RegistrationPermit,
+    username: &str,
+    email: &str,
+    password_hash: String,
+) -> Result<rg_db::entities::user::Model> {
     let now = Utc::now();
     let model = UserActiveModel {
         username: Set(username.to_string()),
@@ -270,13 +293,7 @@ pub async fn register(
     // The first row is committed, so a waiting registration can now observe a
     // non-empty database. Do not serialise token generation behind the lock.
     drop(permit);
-    let token = jwt::generate_token(user.id, &user.username, user.session_version, jwt_secret, 7)?;
-
-    Ok(AuthResponse {
-        token,
-        user_id: user.id,
-        username: user.username,
-    })
+    Ok(user)
 }
 
 async fn verify_local_login(

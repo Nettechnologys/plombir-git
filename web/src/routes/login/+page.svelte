@@ -7,6 +7,8 @@
     getAuthLoading,
     isLoggedIn,
     isMfaRequired,
+    isPasswordChangeRequired,
+    completeInitialPassword,
     beginMfa,
   } from '$lib/stores/auth.svelte';
   import { createT } from '$lib/i18n';
@@ -19,6 +21,8 @@
   let username = $state('');
   let password = $state('');
   let mfaCode = $state('');
+  let newPassword = $state('');
+  let confirmPassword = $state('');
   let useBackupCode = $state(false);
   let localError = $state('');
   const SSO_UNAVAILABLE = 'unavailable';
@@ -79,6 +83,23 @@
     }
   }
 
+  // An administrator chose the password that just worked: it opens nothing
+  // until it is replaced. The server proves it once more with the new one.
+  async function handleInitialPassword(e: Event) {
+    e.preventDefault();
+    localError = '';
+    if (newPassword !== confirmPassword) {
+      localError = t('auth.login.passwords_differ', 'The two new passwords differ.');
+      return;
+    }
+    const ok = await completeInitialPassword(password, newPassword);
+    if (ok) {
+      window.location.href = '/dashboard';
+    } else if (!isMfaRequired()) {
+      localError = getAuthError() || t('auth.login.failed');
+    }
+  }
+
   async function handlePasskeyLogin() {
     localError = '';
     if (!username.trim()) {
@@ -122,7 +143,27 @@
       <div class="error-banner">{localError}</div>
     {/if}
 
-    {#if isMfaRequired()}
+    {#if isPasswordChangeRequired()}
+      <form class="initial-password-form" onsubmit={handleInitialPassword}>
+        <p class="hint">
+          {t(
+            'auth.login.password_change_required',
+            'An administrator set this password. Choose your own to continue.',
+          )}
+        </p>
+        <label>
+          {t('auth.login.new_password', 'New password')}
+          <input type="password" bind:value={newPassword} required autocomplete="new-password" />
+        </label>
+        <label>
+          {t('auth.login.confirm_password', 'Repeat the new password')}
+          <input type="password" bind:value={confirmPassword} required autocomplete="new-password" />
+        </label>
+        <button type="submit" class="btn-primary" disabled={getAuthLoading() || !newPassword}>
+          {t('auth.login.set_password', 'Set password and sign in')}
+        </button>
+      </form>
+    {:else if isMfaRequired()}
       <form onsubmit={handleMfaSubmit}>
         <label>
           {t('auth.login.mfa_code')}
@@ -248,6 +289,12 @@
 
   input {
     padding: 8px 12px;
+  }
+
+  .hint {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-secondary);
   }
 
   .checkbox-label {

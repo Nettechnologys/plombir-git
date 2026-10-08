@@ -18,7 +18,7 @@ use crate::error::AppError;
 use crate::AppState;
 
 /// M-4: Build a `Set-Cookie` header value for the HttpOnly auth cookie.
-fn build_auth_cookie(token: &str, is_https: bool) -> String {
+pub(crate) fn build_auth_cookie(token: &str, is_https: bool) -> String {
     let mut cookie = format!(
         "{}={}; HttpOnly; Path=/; SameSite=Strict; Max-Age=604800",
         AUTH_COOKIE_NAME, token
@@ -30,7 +30,7 @@ fn build_auth_cookie(token: &str, is_https: bool) -> String {
 }
 
 /// M-4: Build a `Set-Cookie` header value that clears the auth cookie.
-fn build_clear_cookie(is_https: bool) -> String {
+pub(crate) fn build_clear_cookie(is_https: bool) -> String {
     let mut cookie = format!(
         "{}=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0",
         AUTH_COOKIE_NAME
@@ -92,6 +92,7 @@ pub struct UserProfile {
     request_body = RegisterRequest,
     responses(
         (status = 201, description = "User registered successfully", body = AuthResponse),
+        (status = 202, description = "`[auth].registration = \"verify-email\"`: a confirmation link was mailed, and the account is created when it is followed. The same answer whether or not the address already has an account", body = serde_json::Value),
         (status = 400, description = "Invalid input", body = serde_json::Value),
         (status = 403, description = "Self-service registration is closed on this instance", body = serde_json::Value),
         (status = 409, description = "The username or email is already taken", body = serde_json::Value),
@@ -132,6 +133,52 @@ pub async fn register(
             return AppError::from(error).into_response();
         }
     };
+
+    // `verify-email`: nothing is created yet, and a taken address is answered
+    // exactly like a free one — same status, same body (card_45f98ab2fe1a).
+    if permit.needs_email_confirmation() {
+        drop(permit);
+        let mailer = match (state.smtp_config.as_ref(), state.external_url.as_deref()) {
+            (Some(smtp), Some(base_url)) => rg_core::user::account::Mailer { smtp, base_url },
+            // Refused at startup; reaching it means the state was built
+            // around that check.
+            _ => {
+                return AppError::internal(
+                    "verify-email registration is configured without [smtp] and external_url",
+                )
+                .into_response()
+            }
+        };
+        return match rg_core::user::account::register_pending(
+            &state.db,
+            rg_core::user::service::LdapDirectories {
+                encryption_key: &state.encryption_key,
+                transport_policy: &state.ldap_transport_policy,
+            },
+            mailer,
+            &body.username,
+            &body.email,
+            &body.password,
+        )
+        .await
+        {
+            Ok(()) => {
+                crate::metrics::recorder::auth_event("register", "pending");
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "status": "confirmation_sent",
+                        "message": "Check your inbox: follow the link we sent to finish creating the account.",
+                    })),
+                )
+                    .into_response()
+            }
+            Err(error) => {
+                crate::metrics::recorder::auth_event("register", "failure");
+                AppError::from(error).into_response()
+            }
+        };
+    }
 
     let outcome = rg_core::user::service::register(
         &state.db,
@@ -268,6 +315,40 @@ pub async fn login(
                     return error.into_response();
                 }
             };
+            // A password an administrator chose opens no session — not even
+            // the MFA challenge. The holder replaces it first, through
+            // `POST /users/password/initial`, which proves it again
+            // (card_9f18b657580b).
+            if finalized.password_change_required {
+                crate::metrics::recorder::auth_event("login", "password_change_required");
+                if let Err(error) = rg_db::ops::login_log_ops::log_attempt(
+                    &state.db,
+                    Some(finalized.id),
+                    &finalized.username,
+                    login_method,
+                    ip_address.as_deref(),
+                    user_agent.as_deref(),
+                    false,
+                    Some("password_change_required"),
+                )
+                .await
+                {
+                    tracing::warn!(error = %format!("{error:#}"), "failed to record a login that owes a password change");
+                }
+                let is_https = crate::public_url::request_is_https(&state, &headers);
+                return (
+                    StatusCode::OK,
+                    [(axum::http::header::SET_COOKIE, build_clear_cookie(is_https))],
+                    Json(serde_json::json!({
+                        "token": "",
+                        "user_id": finalized.id,
+                        "username": finalized.username,
+                        "mfa_required": false,
+                        "password_change_required": true,
+                    })),
+                )
+                    .into_response();
+            }
             let mfa_required = finalized.mfa_enabled;
             let mut resp = AuthResponse {
                 token: String::new(),
@@ -559,6 +640,8 @@ pub async fn me(State(state): State<AppState>, AuthUser(user_id): AuthUser) -> i
                 "email": user.email,
                 "display_name": user.display_name,
                 "avatar_url": user.avatar_url,
+                "bio": user.bio,
+                "auth_provider": user.auth_provider,
                 "is_admin": user.is_admin,
                 "created_at": user.created_at,
             })),

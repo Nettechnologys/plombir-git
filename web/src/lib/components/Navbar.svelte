@@ -120,6 +120,7 @@
               <a href="/notifications" onclick={close} role="menuitem">{t('nav.notifications')}</a>
               <a href="/orgs" onclick={close} role="menuitem">{t('nav.organizations')}</a>
               <a href="/imports" onclick={close} role="menuitem">{t('nav.imports', 'Imports')}</a>
+              <a href="/settings/profile" onclick={close} role="menuitem">{t('nav.profile', 'Profile')}</a>
               <a href="/settings/security" onclick={close} role="menuitem">{t('nav.security', 'Security')}</a>
               <a href="/settings/ssh-keys" onclick={close} role="menuitem">{t('nav.ssh_keys', 'SSH keys')}</a>
               <a href="/settings/tokens" onclick={close} role="menuitem">{t('nav.access_tokens', 'Access tokens')}</a>

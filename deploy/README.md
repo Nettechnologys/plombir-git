@@ -252,8 +252,24 @@ Two things `closed` still admits, on purpose:
   provider — see below. `PLOMBIR_GIT_REGISTRATION` does not reach it in either
   direction.
 
-A value neither `open` nor `closed` fails the start with the accepted spellings
-named, rather than booting an instance you believe is closed.
+A third value, `verify-email`, keeps sign-up open and creates the account only
+once the link mailed to its address is followed. A taken address gets the same
+answer as a free one (its owner is mailed a note instead), so the sign-up form
+stops telling strangers which addresses have accounts here. It needs `[smtp]`
+and `[server].external_url`; without them the server refuses to start. The
+bootstrap account above is still created at once.
+
+Any other value fails the start with the accepted spellings named, rather than
+booting an instance you believe is closed.
+
+**Adding people to a closed instance.** An administrator creates the account
+under *Admin → Users → New user*; the response shows a generated password
+once. Hand it over: it opens nothing — not the web login, not `git` over
+HTTPS or SSH, not `docker login` — until its holder has signed in through the
+web and chosen their own. *Reset password* on the same page does the same for
+an existing local account and signs it out everywhere. Accounts change their own
+password, profile, picture and address, and can delete themselves, under
+*Profile* in the user menu.
 
 ### Who may get an account through an identity provider
 

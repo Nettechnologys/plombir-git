@@ -407,6 +407,7 @@ pub(crate) fn oauth_user_model(
         updated_at: Set(now),
         deleted_at: Set(None),
         bot_owner_id: Set(None),
+        password_change_required: Set(false),
     }
 }
 
@@ -452,6 +453,7 @@ pub async fn create_bot(
             updated_at: Set(now),
             deleted_at: Set(None),
             bot_owner_id: Set(Some(owner_id)),
+            password_change_required: Set(false),
         },
     )
     .await
@@ -509,6 +511,7 @@ pub async fn create_ldap_user(
             updated_at: Set(now),
             deleted_at: Set(None),
             bot_owner_id: Set(None),
+            password_change_required: Set(false),
         },
     )
     .await
@@ -1290,6 +1293,173 @@ where
         Ok(true)
     })
     .await
+}
+
+/// Replace the password of `user_id` — its holder's own change, proved with
+/// the password it had.
+///
+/// `expected_hash` is the hash the caller verified the current password
+/// against, and the write is conditional on it still being the stored one. A
+/// reset or an administrator's password that landed between the check and
+/// this write is not overwritten by a request that proved a password which no
+/// longer exists. `None` covers that, and an account that is gone or retiring.
+///
+/// In the same commit: every bearer session issued before is revoked
+/// (`session_version`), any reset link still in a mailbox stops working, and
+/// the requirement to change an administrator-chosen password is met.
+/// Personal access tokens and SSH keys survive, as they survive a reset — see
+/// [`invalidate_sessions`].
+pub async fn change_password(
+    db: &DatabaseConnection,
+    user_id: i64,
+    expected_hash: &str,
+    new_hash: &str,
+) -> Result<Option<User>> {
+    write_password(
+        db,
+        user_id,
+        Some(expected_hash),
+        new_hash,
+        false,
+        "change password",
+    )
+    .await
+}
+
+/// Set a password an administrator chose for `user_id`, which its holder has
+/// to replace before it opens a session.
+///
+/// Local accounts only: a directory or identity-provider account has no
+/// password here to set. Revokes the account's sessions and reset links in the
+/// same commit. `None` when there is no such local, open account.
+pub async fn set_password_by_administrator(
+    db: &DatabaseConnection,
+    user_id: i64,
+    new_hash: &str,
+) -> Result<Option<User>> {
+    write_password(
+        db,
+        user_id,
+        None,
+        new_hash,
+        true,
+        "administrator password reset",
+    )
+    .await
+}
+
+async fn write_password(
+    db: &DatabaseConnection,
+    user_id: i64,
+    expected_hash: Option<&str>,
+    new_hash: &str,
+    change_required: bool,
+    what: &'static str,
+) -> Result<Option<User>> {
+    crate::contention::retry_transaction(what, || async move {
+        let transaction = db
+            .begin()
+            .await
+            .with_context(|| format!("db: begin {what}"))?;
+        let result: Result<Option<User>> = async {
+            let mut update = UserEntity::update_many()
+                .col_expr(
+                    user::Column::PasswordHash,
+                    Expr::value(new_hash.to_string()),
+                )
+                .col_expr(
+                    user::Column::PasswordChangeRequired,
+                    Expr::value(change_required),
+                )
+                .col_expr(
+                    user::Column::SessionVersion,
+                    Expr::col(user::Column::SessionVersion).add(1),
+                )
+                .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+                .filter(user::Column::Id.eq(user_id))
+                .filter(user::Column::AuthProvider.eq("local"))
+                .filter(user::Column::IsActive.eq(true))
+                .filter(user::Column::DeletedAt.is_null());
+            if let Some(expected_hash) = expected_hash {
+                update = update.filter(user::Column::PasswordHash.eq(expected_hash));
+            }
+            let updated = update
+                .exec(&transaction)
+                .await
+                .with_context(|| format!("db: write {what}"))?;
+            match updated.rows_affected {
+                0 => return Ok(None),
+                1 => {}
+                rows => anyhow::bail!("db: {what} affected {rows} rows for user {user_id}"),
+            }
+            crate::ops::password_reset_token_ops::invalidate_user_tokens(&transaction, user_id)
+                .await
+                .with_context(|| format!("db: invalidate reset links on {what}"))?;
+            UserEntity::find_by_id(user_id)
+                .one(&transaction)
+                .await
+                .with_context(|| format!("db: reload user after {what}"))
+        }
+        .await;
+        match result {
+            Ok(Some(user)) => {
+                transaction
+                    .commit()
+                    .await
+                    .with_context(|| format!("db: commit {what}"))?;
+                Ok(Some(user))
+            }
+            Ok(None) => {
+                transaction
+                    .rollback()
+                    .await
+                    .with_context(|| format!("db: roll back {what}"))?;
+                Ok(None)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error).context(format!("db: roll back {what}: {rollback_error}"));
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
+/// Move `user_id` to `email`, an address its holder has just proved.
+///
+/// `None` when the account is gone or retiring. Another account holding the
+/// address surfaces as the unique violation it is, for the caller to answer.
+pub async fn update_email(
+    db: &DatabaseConnection,
+    user_id: i64,
+    email: &str,
+) -> Result<Option<User>> {
+    let updated = UserEntity::update_many()
+        .col_expr(user::Column::Email, Expr::value(email.to_string()))
+        .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+        .filter(user::Column::Id.eq(user_id))
+        .filter(user::Column::IsActive.eq(true))
+        .filter(user::Column::DeletedAt.is_null())
+        .exec(db)
+        .await
+        .context("db: change a user's email")?;
+    if updated.rows_affected == 0 {
+        return Ok(None);
+    }
+    find_by_id(db, user_id).await
+}
+
+/// How many open accounts hold the instance-administrator flag.
+pub async fn count_active_admins(db: &DatabaseConnection) -> Result<u64> {
+    UserEntity::find()
+        .filter(user::Column::IsAdmin.eq(true))
+        .filter(user::Column::IsActive.eq(true))
+        .filter(user::Column::DeletedAt.is_null())
+        .count(db)
+        .await
+        .context("db: count instance administrators")
 }
 
 #[cfg(test)]

@@ -86,6 +86,45 @@ const adminUsersUpdate = privileged(
   ]),
 );
 
+// card_9f18b657580b: the administrator's way to add a colleague to a closed
+// instance. The outsider posts the same account first and must be refused.
+const adminUsersCreate = privileged(
+  async (context) => {
+    await context.navigate('/admin/users');
+    await context.click('.open-create-user');
+    await context.fill('#admin-new-username', 'browser-sweep-created');
+    await context.fill('#admin-new-email', 'browser-sweep-created@example.invalid');
+    await context.click('.create-user-form button[type="submit"]');
+  },
+  (context) => requestSequence(context, [
+    ['/api/v1/admin/users', {
+      method: 'POST',
+      json: {
+        username: 'outsider-must-not-create',
+        email: 'outsider-must-not-create@example.invalid',
+      },
+    }],
+    ['/api/v1/admin/users'],
+  ]),
+);
+
+// Ahead of `admin-users-delete`, which removes the same target account.
+const adminUsersResetPassword = privileged(
+  async (context) => {
+    await context.navigate('/admin/users');
+    await context.setConfirm(true);
+    await context.clickWithin(
+      '.users-table tbody tr',
+      context.fixture.targetUsername,
+      'button',
+      'Reset password',
+    );
+  },
+  (context) => requestSequence(context, [
+    [`/api/v1/admin/users/${context.fixture.targetUserId}/password-reset`, { method: 'POST' }],
+  ]),
+);
+
 const adminUsersDelete = privileged(
   async (context) => {
     await context.navigate('/admin/users');
@@ -1262,6 +1301,8 @@ export const UI_ACCESS_SWEEP_SCENARIOS = new Map([
   ['repo-release-asset-delete', repoReleaseAssetDelete],
   ['admin-users-unlock', adminUsersUnlock],
   ['admin-users-update', adminUsersUpdate],
+  ['admin-users-create', adminUsersCreate],
+  ['admin-users-reset-password', adminUsersResetPassword],
   ['admin-users-delete', adminUsersDelete],
   ['admin-orgs-delete', adminOrgsDelete],
   ['admin-runners-register', adminRunnersRegister],

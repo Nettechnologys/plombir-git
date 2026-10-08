@@ -23,14 +23,14 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 375 |
-| Из них достижимы из браузера | 254 (68%) |
+| Роутов в роутере (с объявленным `Access`) | 386 |
+| Из них достижимы из браузера | 264 (68%) |
 | Layout-модулей | 2 |
-| Страниц | 64 |
-| Интерактивных элементов | 835 |
-| — из них дёргают API | 316 |
+| Страниц | 66 |
+| Интерактивных элементов | 858 |
+| — из них дёргают API | 326 |
 | — приходят из общих компонентов | 303 |
-| Browser sweep: сценариев / записей инвентаря / роутов | 41 / 162 / 154 |
+| Browser sweep: сценариев / записей инвентаря / роутов | 43 / 165 / 156 |
 | **UI-роутов без единого web/smoke/browser-теста** | **27** |
 | UI-роутов без corpus-hit и browser-сценария | 0 |
 
@@ -40,10 +40,10 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 105 | 67 | 4 | 0 |
 | `RepoWrite` | 80 | 63 | 13 | 0 |
-| `User` | 43 | 31 | 6 | 0 |
+| `User` | 49 | 38 | 6 | 0 |
 | `RepoAdmin` | 32 | 32 | 0 | 0 |
-| `InstanceAdmin` | 23 | 19 | 0 | 0 |
-| `Public` | 22 | 9 | 2 | 0 |
+| `Public` | 25 | 10 | 2 | 0 |
+| `InstanceAdmin` | 25 | 21 | 0 | 0 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
 | `RepoAuthRead` | 12 | 12 | 1 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
@@ -75,6 +75,7 @@
 | `/[owner]/[repo]/releases/new` | 21 | 5 | 11 |
 | `/[owner]/[repo]` | 20 | 5 | 12 |
 | `/[owner]/[repo]/milestones` | 20 | 8 | 11 |
+| `/admin/users` 🔒 | 20 | 7 | 0 |
 | `/[owner]/[repo]/network` | 19 | 6 | 11 |
 | `/[owner]/[repo]/packages` | 18 | 9 | 11 |
 | `/[owner]/[repo]/releases/edit/[id]` | 18 | 5 | 11 |
@@ -91,12 +92,12 @@
 | `/[owner]/[repo]/commits` | 13 | 4 | 11 |
 | `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/settings/branches` | 13 | 2 | 0 |
-| `/admin/users` 🔒 | 13 | 5 | 0 |
+| `/login` | 12 | 1 | 0 |
+| `/settings/profile` | 12 | 7 | 0 |
 | `/[owner]/[repo]/settings/webhooks` | 11 | 6 | 0 |
 | `/settings/agents` | 11 | 5 | 0 |
 | `/` | 10 | 1 | 0 |
 | `/admin/runners` 🔒 | 10 | 4 | 0 |
-| `/login` | 10 | 1 | 0 |
 | `/[owner]/[repo]/edit/[...path]` | 8 | 0 | 8 |
 | `/[owner]/[repo]/new` | 8 | 0 | 8 |
 | `/[owner]/[repo]/settings/labels` | 8 | 2 | 0 |
@@ -124,6 +125,7 @@
 | `/register` | 3 | 0 | 0 |
 | `/[owner]/[repo]/settings` | 2 | 2 | 0 |
 | `/[owner]/[repo]/settings/lfs-locks` | 2 | 2 | 0 |
+| `/verify-email` | 2 | 1 | 0 |
 | `/[owner]/[repo]/settings/runners` | 1 | 0 | 0 |
 
 ## План тестов: элемент → роут → уровень доступа
@@ -961,14 +963,17 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| () => handleUnlock(u) | :246 | `POST /api/v1/admin/users/{id}/unlock` | `InstanceAdmin` | rust+web+smoke+browser |
-| () => handleUnlock(u) | :246 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
-| ← Prev | :264 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web |
-| Next → | :266 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web |
-| i18n:common.loading | :310 | `PATCH /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :310 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
-| i18n:common.loading | :337 | `DELETE /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :337 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
+| Administrator (showCreate = false)}> | :263 | `POST /api/v1/admin/users` | `InstanceAdmin` | rust+web+smoke+browser |
+| Administrator (showCreate = false)}> | :263 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
+| () => handleUnlock(u) | :324 | `POST /api/v1/admin/users/{id}/unlock` | `InstanceAdmin` | rust+web+smoke+browser |
+| () => handleUnlock(u) | :324 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
+| Reset password | :330 | `POST /api/v1/admin/users/{id}/password-reset` | `InstanceAdmin` | rust+web+smoke+browser |
+| ← Prev | :345 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web |
+| Next → | :347 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web |
+| i18n:common.loading | :391 | `PATCH /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
+| i18n:common.loading | :391 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
+| i18n:common.loading | :418 | `DELETE /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
+| i18n:common.loading | :418 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
 
 ### `/dashboard`
 
@@ -1008,7 +1013,7 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:auth.login.sso_retry | :187 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
+| i18n:auth.login.sso_retry | :228 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
 
 ### `/notifications`
 
@@ -1079,6 +1084,18 @@
 | () => revokeToken(token) | :364 | `DELETE /api/v1/users/bots/{bot}/tokens/{id}` | `User` | web |
 | () => revokeToken(token) | :364 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
 
+### `/settings/profile`
+
+| Элемент | Откуда | Вызов | `Access` | тест |
+|---|---|---|---|---|
+| i18n:settings.profile.retry | :195 | `GET /api/v1/users/me` | `User` | rust+web+smoke |
+| i18n:settings.profile.display_name | :202 | `PATCH /api/v1/users/me` | `User` | rust+web |
+| uploadAvatar | :227 | `PUT /api/v1/users/me/avatar` | `User` | rust+web |
+| i18n:settings.profile.remove_avatar | :236 | `DELETE /api/v1/users/me/avatar` | `User` | rust+web |
+| i18n:settings.profile.current_password | :248 | `PUT /api/v1/users/me/password` | `User` | rust+web |
+| i18n:settings.profile.new_email | :272 | `POST /api/v1/users/me/email` | `User` | rust+web |
+| i18n:settings.profile.delete_password | :307 | `DELETE /api/v1/users/me` | `User` | rust+web |
+
 ### `/settings/security`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
@@ -1124,6 +1141,12 @@
 | () => revokeToken(token) | :227 | `DELETE /api/v1/users/tokens/{id}` | `User` | rust |
 | () => revokeToken(token) | :227 | `GET /api/v1/users/tokens` | `User` | rust+web |
 
+### `/verify-email`
+
+| Элемент | Откуда | Вызов | `Access` | тест |
+|---|---|---|---|---|
+| i18n:auth.verify_email.working | :58 | `POST /api/v1/users/verify-email` | `Public` | rust+web |
+
 ## Роуты, недостижимые из браузера
 
 Не дефект: git, OCI, LFS, CI-раннер и вебхуки — легитимные не-браузерные
@@ -1167,10 +1190,11 @@
 | GET | `/livez` | `Public` | rust |
 | GET | `/readyz` | `Public` | rust |
 | GET | `/metrics` | `Public` | rust+smoke |
-| POST | `/api/v1/users/register` | `Public` | rust+smoke |
-| POST | `/api/v1/users/login` | `Public` | rust+smoke |
+| POST | `/api/v1/users/register` | `Public` | rust+web+smoke |
+| POST | `/api/v1/users/login` | `Public` | rust+web+smoke |
 | POST | `/api/v1/users/logout` | `User` | rust+web |
-| GET | `/api/v1/users/me` | `User` | rust+web+smoke |
+| POST | `/api/v1/users/password/initial` | `Public` | rust+web |
+| GET | `/api/v1/avatars/{username}` | `Public` | rust |
 | POST | `/api/v1/users/mfa/verify` | `Public` | rust |
 | POST | `/api/v1/users/passkeys/register/start` | `User` | rust |
 | POST | `/api/v1/users/passkeys/register/finish` | `User` | rust |

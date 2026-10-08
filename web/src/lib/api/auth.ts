@@ -5,7 +5,37 @@ export interface AuthLoginResponse {
   user_id: number;
   username: string;
   mfa_required?: boolean;
+  /**
+   * The password was chosen by an administrator: no session was opened, and
+   * `setInitialPassword` replaces it before one is.
+   */
+  password_change_required?: boolean;
 }
+
+/**
+ * `POST /users/register` either signs the account in at once, or — on an
+ * instance whose registration is `verify-email` — answers that a link went
+ * to the address and nothing exists yet.
+ */
+export type RegisterResponse =
+  | AuthLoginResponse
+  | { status: 'confirmation_sent'; message: string };
+
+/** The signed-in account, as `/users/me` describes it. */
+export interface Me {
+  id: number;
+  username: string;
+  email: string;
+  is_admin: boolean;
+  display_name: string | null;
+  avatar_url: string | null;
+  bio: string | null;
+  /** `local` accounts have a password and an address of their own here. */
+  auth_provider: string;
+}
+
+/** Following a mailed confirmation link: a new account, or a moved address. */
+export type ConfirmEmailResponse = AuthLoginResponse | { email: string };
 
 export interface PublicSsoProvider {
   slug: string;
@@ -31,7 +61,7 @@ export interface SsoLink {
 
 export const auth = {
   register: (username: string, email: string, password: string) =>
-    request<{ id: number; username: string }>('/users/register', {
+    request<RegisterResponse>('/users/register', {
       method: 'POST',
       body: JSON.stringify({ username, email, password }),
     }),
@@ -45,8 +75,51 @@ export const auth = {
       method: 'POST',
       body: JSON.stringify({ username, code, backup }),
     }),
-  me: () =>
-    request<{ id: number; username: string; email: string; is_admin: boolean; display_name: string | null }>('/users/me'),
+  me: () => request<Me>('/users/me'),
+  // Signs every other session out; this one continues with the token in the
+  // answer, which the HttpOnly cookie already carries.
+  changePassword: (currentPassword: string, newPassword: string) =>
+    request<AuthLoginResponse>('/users/me/password', {
+      method: 'PUT',
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+    }),
+  // The second half of a login that answered `password_change_required`.
+  setInitialPassword: (login: string, password: string, newPassword: string) =>
+    request<AuthLoginResponse>('/users/password/initial', {
+      method: 'POST',
+      body: JSON.stringify({ login, password, new_password: newPassword }),
+    }),
+  // `null` clears a field; leaving a key out keeps it.
+  updateProfile: (data: { display_name?: string | null; bio?: string | null }) =>
+    request<Me>('/users/me', {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+  requestEmailChange: (email: string, password: string) =>
+    request<{ status: string; message: string }>('/users/me/email', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    }),
+  confirmEmail: (token: string) =>
+    request<ConfirmEmailResponse>('/users/verify-email', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    }),
+  // A local account confirms with its password; one that signs in through a
+  // provider types its username instead.
+  deleteAccount: (confirmation: { password?: string; confirm_username?: string }) =>
+    request<{ deleted: boolean }>('/users/me', {
+      method: 'DELETE',
+      body: JSON.stringify(confirmation),
+    }),
+  uploadAvatar: (image: Blob) =>
+    request<{ avatar_url: string }>('/users/me/avatar', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: image,
+    }),
+  deleteAvatar: () =>
+    request<void>('/users/me/avatar', { method: 'DELETE' }),
   forgotPassword: (email: string) =>
     request<{ message: string }>('/users/forgot-password', {
       method: 'POST',

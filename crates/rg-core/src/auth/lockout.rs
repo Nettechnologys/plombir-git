@@ -76,6 +76,14 @@ pub enum PasswordAttempt {
     /// — and the account's owner otherwise has no way to learn why the password
     /// that works in the browser stopped working here.
     SecondFactorRequired,
+    /// The password was right, and it is one an administrator chose: a new
+    /// account, or a reset handed over by hand. It opens nothing until its
+    /// holder has replaced it with one only they know — through the web login,
+    /// which is the one door that can ask for the new one (card_9f18b657580b).
+    ///
+    /// Named out loud for the same reason as [`Self::SecondFactorRequired`]:
+    /// only the holder of the right password ever reaches it.
+    PasswordChangeRequired,
     /// Refused. `locked` says the brute-force lock was the reason (or has just
     /// become one); it is for the server's log only — a client that could tell
     /// the two rejections apart would be told which usernames are real.
@@ -122,6 +130,7 @@ pub async fn settle_password_attempt(
             .is_some_and(|locked_until| locked_until > now)
     });
     let mut second_factor_required = false;
+    let mut password_change_required = false;
 
     // A locked account is refused even when the password is right — that is the
     // entire point of the lock — and a deactivated one is refused for the
@@ -134,6 +143,11 @@ pub async fn settle_password_attempt(
             // SSH/registry path with no check after password verification, so a
             // retirement which won in that gap could still be answered Accept.
             match user_ops::reset_login_failures_if_open(db, user.id).await? {
+                // Ahead of the second factor: a password nobody but an
+                // administrator knows yet must not get as far as a session.
+                Some(finalized) if finalized.password_change_required => {
+                    password_change_required = true;
+                }
                 Some(finalized) if !finalized.mfa_enabled => {
                     return Ok(PasswordAttempt::Accepted(Box::new(finalized)));
                 }
@@ -187,7 +201,9 @@ pub async fn settle_password_attempt(
         origin.ip_address,
         origin.user_agent,
         false,
-        Some(if second_factor_required {
+        Some(if password_change_required {
+            "password_change_required"
+        } else if second_factor_required {
             "mfa_required"
         } else if locked {
             "account_locked"
@@ -205,7 +221,9 @@ pub async fn settle_password_attempt(
         );
     }
 
-    if second_factor_required {
+    if password_change_required {
+        Ok(PasswordAttempt::PasswordChangeRequired)
+    } else if second_factor_required {
         Ok(PasswordAttempt::SecondFactorRequired)
     } else {
         Ok(PasswordAttempt::Rejected { locked })

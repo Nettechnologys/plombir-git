@@ -38,8 +38,13 @@ if [[ ! -s "${FIXTURE_DIR}/port" ]]; then
 fi
 LDAP_PORT="$(head -n 1 "${FIXTURE_DIR}/port")"
 
-printf '[auth]\nallow_insecure_ldap_endpoints = ["ldap://127.0.0.1:%s"]\n' \
-  "${LDAP_PORT}" >"${FIXTURE_DIR}/plombir-git.toml"
+# Owner-only, or the server refuses to read it: a config may carry secrets, and
+# a group- or world-readable one is refused at startup whatever it holds.
+(
+  umask 077
+  printf '[auth]\nallow_insecure_ldap_endpoints = ["ldap://127.0.0.1:%s"]\n' \
+    "${LDAP_PORT}" >"${FIXTURE_DIR}/plombir-git.toml"
+)
 
 STAND_REBUILD_FRONTEND=1 \
 STAND_CONFIG_PATH="${FIXTURE_DIR}/plombir-git.toml" \
