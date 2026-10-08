@@ -1203,6 +1203,9 @@ pub(crate) fn build_all_routes(
         .get(Public, "/auth/sso/providers", api::sso::list_providers)
         .get(Public, "/auth/sso/{slug}", api::sso::authorize)
         .get(Public, "/auth/sso/{slug}/callback", api::sso::callback)
+        // The only door through which an identity joins an account that
+        // already exists — from inside that account's session.
+        .post(User, "/auth/sso/{slug}/link", api::sso::start_link)
         .delete(
             User,
             "/auth/sso/{slug}/unlink",

@@ -15,9 +15,11 @@
 //!
 //! * **Provisioning is not signing in.** The policy is consulted on the branch
 //!   that would create an account and nowhere else. An account that already
-//!   exists — linked to this provider, or matched by email — keeps signing in
-//!   after the switch goes off. Turning `auto_provision` off must lock out
-//!   strangers, not the people already using the instance.
+//!   exists — linked to this provider, or (for LDAP) bound to this directory —
+//!   keeps signing in after the switch goes off. Turning `auto_provision` off
+//!   must lock out strangers, not the people already using the instance. An SSO
+//!   identity is never matched to an existing account by its email
+//!   (card_4753cfe7b985): the account links the provider from inside itself.
 //! * **A refusal is an answer, not a failure.** Both call sites turn
 //!   [`ProvisioningRefusal`] into a `403` that says which of the two rules
 //!   refused, because "ask an administrator" is only actionable if the person

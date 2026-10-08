@@ -340,7 +340,11 @@ pub async fn update_by_id(
     .await
 }
 
-/// Create a user with high-level parameters (used by SSO).
+/// Create an `oauth2` account row with high-level parameters, and nothing else.
+///
+/// A first SSO sign-in does not come through here: it needs the account and its
+/// identity link in one transaction, which is
+/// `oauth_account_ops::link_with_new_user`. This is the fixture spelling.
 pub async fn create_user(
     db: &DatabaseConnection,
     username: &str,
@@ -348,9 +352,28 @@ pub async fn create_user(
     password_hash: &str,
     display_name: &str,
 ) -> Result<User> {
+    create(
+        db,
+        oauth_user_model(username, email, password_hash, display_name),
+    )
+    .await
+}
+
+/// The row [`create_user`] inserts — `auth_provider = "oauth2"`, no second
+/// factor, nothing locked.
+///
+/// Shared with `oauth_account_ops::link_with_new_user`, which has to insert the
+/// same row inside the transaction that also writes the account's first
+/// external-identity link.
+pub(crate) fn oauth_user_model(
+    username: &str,
+    email: &str,
+    password_hash: &str,
+    display_name: &str,
+) -> ActiveModel {
     use crate::entities::user;
     let now = chrono::Utc::now();
-    let model = user::ActiveModel {
+    user::ActiveModel {
         id: NotSet,
         username: Set(username.to_string()),
         email: Set(email.to_string()),
@@ -384,8 +407,7 @@ pub async fn create_user(
         updated_at: Set(now),
         deleted_at: Set(None),
         bot_owner_id: Set(None),
-    };
-    create(db, model).await
+    }
 }
 
 /// Create a bot account owned by `owner_id`.

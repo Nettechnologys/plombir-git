@@ -4,8 +4,21 @@
 //!   GET  /auth/sso/providers                — List enabled SSO providers
 //!   GET  /auth/sso/{slug}                    — Redirect to provider's auth page
 //!   GET  /auth/sso/{slug}/callback           — OAuth2/OIDC callback
+//!   POST /auth/sso/{slug}/link               — Start linking a provider to the signed-in account
 //!   DELETE /auth/sso/{slug}/unlink           — Unlink OAuth account
 //!   GET  /users/me/sso                       — List this account's linked identities
+//!
+//! ## An identity joins an existing account only when that account asks
+//!
+//! A first sign-in through a provider used to attach the identity to whatever
+//! account already held the email address the provider asserted. Local
+//! registration does not verify addresses, so anybody could register
+//! `victim@corp.com` with a password of their own and wait: the victim's first
+//! SSO sign-in then landed in the attacker's account (card_4753cfe7b985). The
+//! callback now never matches an account by email. A provider is added to an
+//! existing account through [`start_link`], from a signed-in session, and the
+//! callback that completes it attaches the identity to *that* session's
+//! account and to no other.
 
 use axum::{
     extract::{Path, Query, State},
@@ -18,7 +31,7 @@ use tracing;
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::AuthUser;
+use crate::api::auth::{AuthUser, SessionUser};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -27,6 +40,9 @@ use crate::AppState;
 /// Cookie names for secure OAuth2 flow.
 const SSO_STATE_COOKIE: &str = "plombir_git_sso_state";
 const SSO_VERIFIER_COOKIE: &str = "plombir_git_sso_code_verifier";
+/// Set by [`start_link`] only: which signed-in account asked to link the
+/// identity this round trip returns with. See [`link_intent_cookie_value`].
+const SSO_LINK_COOKIE: &str = "plombir_git_sso_link";
 
 fn append_set_cookie(response: &mut axum::response::Response, cookie: String) {
     if let Ok(header_value) = HeaderValue::from_str(&cookie) {
@@ -152,6 +168,108 @@ fn sign_cookie_value(value: &str, secret: &str) -> String {
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
     mac.update(value.as_bytes());
     hex::encode(mac.finalize().into_bytes())
+}
+
+// ── Link intent ──────────────────────────────────────────────────
+
+/// The MAC behind a link intent: which account, under which session
+/// generation, asked to link which provider, in which OAuth round trip.
+///
+/// The provider slug and the CSRF state are covered by the MAC but not carried
+/// in the cookie — the callback supplies both from its own request, so an
+/// intent minted for one provider or one round trip verifies against no other.
+/// The domain prefix keeps this MAC from ever equalling the plain value MAC of
+/// [`sign_cookie_value`], which signs a random state string under the same key.
+fn link_intent_mac(
+    user_id: i64,
+    session_version: i64,
+    slug: &str,
+    csrf_state: &str,
+    secret: &str,
+) -> hmac::Hmac<sha2::Sha256> {
+    use hmac::Mac;
+    // HMAC accepts a key of any length, so init cannot fail.
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(format!("sso-link\0{user_id}\0{session_version}\0{slug}\0{csrf_state}").as_bytes());
+    mac
+}
+
+/// `user_id.session_version.signature`.
+///
+/// The callback is a top-level navigation coming back from the identity
+/// provider's site, so the `SameSite=Strict` session cookie is not on it: the
+/// callback cannot see who is signed in. This cookie is how [`start_link`] —
+/// which can — tells it.
+fn link_intent_cookie_value(
+    user_id: i64,
+    session_version: i64,
+    slug: &str,
+    csrf_state: &str,
+    secret: &str,
+) -> String {
+    use hmac::Mac;
+    let signature = link_intent_mac(user_id, session_version, slug, csrf_state, secret)
+        .finalize()
+        .into_bytes();
+    format!("{user_id}.{session_version}.{}", hex::encode(signature))
+}
+
+/// What the callback learned about a link request.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkIntent {
+    /// No link cookie: an ordinary sign-in.
+    Absent,
+    /// A link cookie this server minted for this provider and this round trip.
+    Valid { user_id: i64, session_version: i64 },
+    /// A link cookie that does not verify. Never downgraded to a sign-in: the
+    /// person asked to link, and signing them in somewhere instead is the
+    /// outcome they did not ask for.
+    Invalid,
+}
+
+fn read_link_intent(headers: &HeaderMap, slug: &str, csrf_state: &str, secret: &str) -> LinkIntent {
+    use hmac::Mac;
+
+    let Some(raw) = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .find_map(|part| {
+            part.trim()
+                .strip_prefix(SSO_LINK_COOKIE)
+                .and_then(|rest| rest.strip_prefix('='))
+        })
+        .filter(|value| !value.is_empty())
+    else {
+        return LinkIntent::Absent;
+    };
+
+    let mut fields = raw.splitn(3, '.');
+    let (Some(user_id), Some(session_version), Some(signature)) =
+        (fields.next(), fields.next(), fields.next())
+    else {
+        return LinkIntent::Invalid;
+    };
+    let (Ok(user_id), Ok(session_version), Ok(signature)) = (
+        user_id.parse::<i64>(),
+        session_version.parse::<i64>(),
+        hex::decode(signature),
+    ) else {
+        return LinkIntent::Invalid;
+    };
+    // Constant-time comparison, as for the state cookies.
+    if link_intent_mac(user_id, session_version, slug, csrf_state, secret)
+        .verify_slice(&signature)
+        .is_err()
+    {
+        return LinkIntent::Invalid;
+    }
+    LinkIntent::Valid {
+        user_id,
+        session_version,
+    }
 }
 
 // ── Extract base URL ─────────────────────────────────────────────
@@ -443,8 +561,227 @@ pub async fn authorize(
         &code_verifier,
         &state.jwt_secret,
     );
+    // A sign-in is not a link. An intent left behind by an abandoned link
+    // round trip would no longer verify against the new state anyway; dropping
+    // it here keeps that from surfacing as a refused sign-in.
+    clear_state_cookie(&mut redirect, SSO_LINK_COOKIE);
 
     Ok(redirect)
+}
+
+// ── Link a provider to the signed-in account ─────────────────────
+
+/// Where the browser goes to authenticate the identity being linked.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SsoLinkStart {
+    authorize_url: String,
+}
+
+/// POST /auth/sso/{slug}/link
+///
+/// The only way an identity from `slug` joins an account that already exists.
+/// Holding a session proves the account; the provider round trip that follows
+/// proves the identity; the callback attaches the second to the first.
+///
+/// A login session, not a PAT: a linked identity is a way to sign in, so a
+/// token scoped to anything less than the account must not be able to mint
+/// one — that is exactly the escalation [`SessionUser`] exists to refuse.
+#[utoipa::path(
+    post,
+    path = "/auth/sso/{slug}/link",
+    tag = "SSO",
+    params(
+        ("slug" = String, Path, description = "SSO provider slug"),
+    ),
+    responses(
+        (status = 200, description = "Provider authorization URL to send the browser to", body = SsoLinkStart),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "A login session is required, or the provider is disabled"),
+        (status = 404, description = "SSO provider not found"),
+        (status = 409, description = "This account already has an identity from this provider"),
+    ),
+)]
+pub async fn start_link(
+    State(state): State<AppState>,
+    SessionUser(user_id): SessionUser,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let provider = resolve_usable_provider(&state, &slug).await?;
+
+    let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
+        .await
+        .map_err(AppError::from)?
+        .filter(|user| user.is_usable())
+        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
+
+    // Asked here so the person is told before a provider round trip rather than
+    // after it; the callback asks again, because this answer can go stale.
+    refuse_second_identity_from(&state, user.id, &provider).await?;
+
+    let base_url = get_api_base_url(&state, &headers)?;
+    let redirect_url = format!("{}/auth/sso/{}/callback", base_url, slug);
+    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
+    let config = provider_config(
+        &provider,
+        &enc_key,
+        redirect_url,
+        &state.oidc_transport_policy,
+    )?;
+    let (authorize_url, csrf_state, code_verifier) =
+        rg_core::auth::sso::oauth2_authorize_url(&config)
+            .await
+            .map_err(|e| {
+                tracing::error!("SSO link authorize error: {}", e);
+                AppError::internal("SSO authorization failed")
+            })?;
+
+    let mut response = Json(SsoLinkStart { authorize_url }).into_response();
+    set_state_cookie(
+        &mut response,
+        SSO_STATE_COOKIE,
+        &csrf_state,
+        &state.jwt_secret,
+    );
+    set_state_cookie(
+        &mut response,
+        SSO_VERIFIER_COOKIE,
+        &code_verifier,
+        &state.jwt_secret,
+    );
+    append_set_cookie(
+        &mut response,
+        format!(
+            "{SSO_LINK_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600",
+            link_intent_cookie_value(
+                user.id,
+                user.session_version,
+                &provider.slug,
+                &csrf_state,
+                &state.jwt_secret,
+            )
+        ),
+    );
+    Ok(response)
+}
+
+/// One identity per provider per account.
+///
+/// `oauth_accounts` keys uniqueness on the identity, not on the account, so the
+/// table would hold two GitHub identities for one account — and every reader of
+/// it addresses a link by its provider slug (`DELETE /auth/sso/{slug}/unlink`,
+/// the settings page), which would then reach one of the two at random.
+async fn refuse_second_identity_from(
+    state: &AppState,
+    user_id: i64,
+    provider: &rg_db::entities::sso_provider::Model,
+) -> Result<(), AppError> {
+    let links = rg_db::ops::oauth_account_ops::find_by_user_id(&state.db, user_id)
+        .await
+        .map_err(AppError::from)?;
+    if links.iter().any(|link| link.provider == provider.slug) {
+        return Err(AppError::conflict(format!(
+            "this account is already linked to a {} identity; unlink it first",
+            provider.name
+        )));
+    }
+    Ok(())
+}
+
+/// Complete a link [`start_link`] began: attach the identity the provider just
+/// proved to the account whose session asked for it.
+async fn link_identity_to_requesting_account(
+    state: &AppState,
+    provider: &rg_db::entities::sso_provider::Model,
+    user_info: &rg_core::auth::sso::SsoIdentity,
+    requester: (i64, i64),
+    headers: &HeaderMap,
+) -> Result<axum::response::Response, AppError> {
+    let (user_id, session_version) = requester;
+    let db = &state.db;
+
+    // The intent outlives nothing it was minted under: a logout, a password
+    // reset or a deactivation since `start_link` ends the session that asked,
+    // and with it the request.
+    let user = rg_db::ops::user_ops::find_by_id(db, user_id)
+        .await
+        .map_err(AppError::from)?
+        .filter(|user| user.is_usable() && user.session_version == session_version)
+        .ok_or_else(|| {
+            AppError::unauthorized(
+                "the session that asked for this link has ended; sign in and start linking again",
+            )
+        })?;
+
+    let already_linked_elsewhere = || {
+        AppError::conflict(format!(
+            "this {} identity is already linked to another account",
+            provider.name
+        ))
+    };
+
+    if let Some(existing) = rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
+        db,
+        &provider.slug,
+        &user_info.provider_user_id,
+    )
+    .await
+    .map_err(AppError::from)?
+    {
+        if existing.user_id != user.id {
+            return Err(already_linked_elsewhere());
+        }
+        // Linked to this very account already — a repeated round trip, not a
+        // new way in, so nothing is written and nothing is journalled.
+        return Ok(link_completed_redirect(&provider.slug));
+    }
+
+    refuse_second_identity_from(state, user.id, provider).await?;
+
+    // Named before the link is written, per the rule in `access_audit`.
+    let actor = grant_actor(state, user.id).await?;
+    let linked = rg_db::ops::oauth_account_ops::link(
+        db,
+        user.id,
+        &provider.slug,
+        &user_info.provider_user_id,
+        &user_info.provider_username,
+        &user_info.email,
+    )
+    .await
+    .map_err(AppError::from)?
+    .ok_or_else(sso_identity_link_changed)?;
+    // `link` converges on whoever won a concurrent insert of this identity —
+    // and the winner may be another account.
+    if linked.user_id != user.id {
+        return Err(already_linked_elsewhere());
+    }
+
+    record_credential(
+        state,
+        &actor,
+        "user.link_oauth_account",
+        user.id,
+        headers,
+        oauth_link_details(&linked),
+    )
+    .await;
+
+    Ok(link_completed_redirect(&provider.slug))
+}
+
+/// Back to the page the link was started from. No session cookie is set: the
+/// browser already holds the session that asked.
+fn link_completed_redirect(slug: &str) -> axum::response::Response {
+    let mut redirect = Redirect::temporary(&format!(
+        "/settings/security?sso_linked={}",
+        encode_query_component(slug)
+    ))
+    .into_response();
+    clear_state_cookie(&mut redirect, SSO_STATE_COOKIE);
+    clear_state_cookie(&mut redirect, SSO_VERIFIER_COOKIE);
+    clear_state_cookie(&mut redirect, SSO_LINK_COOKIE);
+    redirect
 }
 
 // ── Callback ─────────────────────────────────────────────────────
@@ -504,6 +841,21 @@ pub async fn callback(
         AppError::forbidden("missing PKCE code verifier cookie")
     })?;
 
+    // Read before anything is exchanged: a link request that does not verify
+    // is refused outright rather than spending the provider's code on it.
+    let link_intent = read_link_intent(
+        &headers,
+        &slug,
+        query.state.as_deref().unwrap_or_default(),
+        &state.jwt_secret,
+    );
+    if link_intent == LinkIntent::Invalid {
+        tracing::warn!(provider = %slug, "SSO link intent cookie did not verify");
+        return Err(AppError::forbidden(
+            "this provider link request is invalid or has expired; start linking again from your security settings",
+        ));
+    }
+
     // ── Get provider config ──────────────────────────────────────
     let provider = resolve_usable_provider(&state, &slug).await?;
 
@@ -542,6 +894,22 @@ pub async fn callback(
         rg_core::auth::sso::oauth2_fetch_user_info(&config, &token_response.access_token)
             .await
             .map_err(|error| sso_user_info_error(&provider.slug, error))?;
+
+    // ── A link completes here, without signing anybody in ────────
+    if let LinkIntent::Valid {
+        user_id,
+        session_version,
+    } = link_intent
+    {
+        return link_identity_to_requesting_account(
+            &state,
+            &provider,
+            &user_info,
+            (user_id, session_version),
+            &headers,
+        )
+        .await;
+    }
 
     // ── Find or create user ──────────────────────────────────────
     let user_id = find_or_create_sso_user(&state, &provider, &user_info, &headers).await?;
@@ -660,6 +1028,7 @@ pub async fn callback(
         (status = 200, description = "Account unlinked"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "No OAuth account linked"),
+        (status = 409, description = "The link is the account's last way to sign in"),
     ),
 )]
 pub async fn unlink_oauth_account(
@@ -682,6 +1051,14 @@ pub async fn unlink_oauth_account(
         .iter()
         .find(|a| a.provider == slug)
         .ok_or_else(|| AppError::not_found("no OAuth account linked"))?;
+
+    crate::api::sign_in_methods::refuse_removing_the_last_way_in(
+        &state,
+        user_id,
+        crate::api::sign_in_methods::WayIn::ProviderLink,
+        account.id,
+    )
+    .await?;
 
     // Named before the link is dropped, per the rule in `access_audit`: a
     // failed name lookup afterwards would leave the one record of who removed
@@ -761,27 +1138,81 @@ fn sso_user_info_error(provider_slug: &str, error: anyhow::Error) -> AppError {
 /// A `403` and not a `500`: nothing failed. The provider authenticated them,
 /// this instance simply does not hand out accounts through that door — and the
 /// message says which of the two rules refused, because the remedies differ.
+///
+/// It also says what to do if they already have an account: since a first
+/// sign-in no longer joins an account by its email, "link it from the account"
+/// is the remedy for exactly the people this refusal used to wave through. It
+/// is said to everybody, whether or not their address is taken here, so the
+/// refusal itself tells nobody which addresses are.
 fn sso_provisioning_refused(
-    provider_slug: &str,
+    provider: &rg_db::entities::sso_provider::Model,
     user_info: &rg_core::auth::sso::SsoIdentity,
     refusal: rg_core::user::provisioning::ProvisioningRefusal,
 ) -> AppError {
     crate::metrics::recorder::provisioning_refused(refusal.reason());
     tracing::warn!(
-        provider = %provider_slug,
+        provider = %provider.slug,
         provider_username = %user_info.provider_username,
         reason = refusal.reason(),
         "SSO first login refused: this provider may not create accounts here"
     );
-    AppError::forbidden(refusal.message())
+    AppError::forbidden(format!(
+        "{}; if you already have an account here, sign in to it and link {} under Settings → Security",
+        refusal.message(),
+        provider.name
+    ))
+}
+
+/// The answer to a first sign-in whose address an existing account holds.
+///
+/// A `409`: the request is well-formed and nothing failed, but a row that
+/// already exists stands in the way, and no edit to this request removes it —
+/// the same reading `POST /users/register` gives a taken address. Nothing was
+/// linked and no session was issued; the person who owns that account adds the
+/// provider from inside it.
+fn sso_account_link_required(
+    provider: &rg_db::entities::sso_provider::Model,
+    user_info: &rg_core::auth::sso::SsoIdentity,
+) -> AppError {
+    tracing::info!(
+        provider = %provider.slug,
+        provider_username = %user_info.provider_username,
+        "SSO first login refused: an existing account holds this address; it has to link the provider itself"
+    );
+    AppError::conflict(format!(
+        "an account on this instance already uses this email address; sign in to that account and link {} under Settings → Security",
+        provider.name
+    ))
 }
 
 fn sso_identity_link_changed() -> AppError {
     AppError::conflict("identity link changed; restart SSO")
 }
 
-/// Resolve the callback's identity to a Plombir Git account, creating the link —
-/// and, on a first login, the account — when there is none yet.
+/// Sign in through a link that already exists.
+async fn sign_in_through_link(
+    db: &sea_orm::DatabaseConnection,
+    oauth: rg_db::entities::oauth_account::Model,
+) -> Result<i64, AppError> {
+    // Mark the link as used again. Swallowing the failure would report a
+    // successful sign-in through a link the database never acknowledged.
+    let touched = rg_db::ops::oauth_account_ops::touch_existing(db, oauth.id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(sso_identity_link_changed)?;
+    Ok(touched.user_id)
+}
+
+/// Resolve the callback's identity to a Plombir Git account: the one it is
+/// linked to, or — on a first sign-in — a new one.
+///
+/// **Never an existing account found by email.** This used to be a merge:
+/// whoever held the address the provider asserted got the identity attached.
+/// Local registration does not verify addresses, so the holder could be anyone
+/// who typed it first (card_4753cfe7b985) — and `email_verified` cannot close
+/// that, because it speaks for the provider's copy of the address, not for the
+/// person who registered it here. An identity joins an existing account only
+/// through [`start_link`], from inside that account.
 ///
 /// The provider's access and refresh tokens are used to read the identity and
 /// then dropped. They are deliberately not persisted: the endpoint that read
@@ -800,7 +1231,6 @@ async fn find_or_create_sso_user(
     let db = &state.db;
     let provider_slug = provider.slug.as_str();
 
-    // Check if OAuth account already exists
     if let Some(oauth) = rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
         db,
         provider_slug,
@@ -809,73 +1239,49 @@ async fn find_or_create_sso_user(
     .await
     .map_err(AppError::from)?
     {
-        // Mark the link as used again. Swallowing the failure would report a
-        // successful sign-in through a link the database never acknowledged.
-        let touched = rg_db::ops::oauth_account_ops::touch_existing(db, oauth.id)
-            .await
-            .map_err(AppError::from)?
-            .ok_or_else(sso_identity_link_changed)?;
-
-        return Ok(touched.user_id);
+        return sign_in_through_link(db, oauth).await;
     }
 
-    // Check if user with this email already exists.
-    //
-    // This is a *merge*: whoever holds this address gets the new provider link
-    // attached to their account. `SsoIdentity` is what makes it safe to run —
-    // an absent email would arrive here as `""` and match whichever account was
-    // provisioned with it first, which is a login into a stranger's account
-    // rather than a merge.
-    let user_id = match rg_db::ops::user_ops::find_by_email(db, &user_info.email)
+    if rg_db::ops::user_ops::find_by_email(db, &user_info.email)
         .await
         .map_err(AppError::from)?
+        .is_some()
     {
-        Some(existing) => existing.id,
-        None => {
-            // The only branch on this path that *creates* an account, and so
-            // the only one the provisioning policy governs. Both branches above
-            // sign in an account that already exists; refusing them would log
-            // people out of the instance instead of keeping strangers out of it.
-            rg_core::user::provisioning::authorize(provider, &user_info.email)
-                .map_err(|refusal| sso_provisioning_refused(provider_slug, user_info, refusal))?;
-            provision_sso_user(db, provider_slug, user_info).await?
+        // A concurrent first sign-in of this same identity commits its account
+        // and its link together, so if that is whose address this is, the link
+        // is visible now even though it was not a moment ago.
+        if let Some(oauth) = rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
+            db,
+            provider_slug,
+            &user_info.provider_user_id,
+        )
+        .await
+        .map_err(AppError::from)?
+        {
+            return sign_in_through_link(db, oauth).await;
         }
-    };
 
-    // Named before the link is written, per the rule in `access_audit`. The
-    // branch above returns before reaching here, so this is the only path that
-    // attaches an identity that could not open this account a moment ago —
-    // a first sign-in, or an existing account gaining a second provider.
-    let actor = grant_actor(state, user_id).await?;
+        // A provider that has not vouched for the address gets exactly the
+        // answer an untaken address would get from a provider that may not
+        // create accounts — so a closed provider is not a way to ask which
+        // addresses have accounts here. Someone the provider has verified as
+        // the address's owner is told plainly; that tells them nothing new.
+        if user_info.email_verified != Some(true) {
+            rg_core::user::provisioning::authorize(provider, &user_info.email)
+                .map_err(|refusal| sso_provisioning_refused(provider, user_info, refusal))?;
+        }
+        return Err(sso_account_link_required(provider, user_info));
+    }
 
-    // Write the link itself — the identity on the far side, and nothing the
-    // instance could act with on this person's behalf.
-    let linked = rg_db::ops::oauth_account_ops::link(
-        db,
-        user_id,
-        provider_slug,
-        &user_info.provider_user_id,
-        &user_info.provider_username,
-        &user_info.email,
-    )
-    .await
-    .map_err(AppError::from)?
-    .ok_or_else(sso_identity_link_changed)?;
-
-    // Every later sign-in through this link takes the branch above and records
-    // nothing: a row per login would bury the one event an incident review is
-    // looking for — the moment a new way into this account appeared.
-    record_credential(
-        state,
-        &actor,
-        "user.link_oauth_account",
-        user_id,
-        headers,
-        oauth_link_details(&linked),
-    )
-    .await;
-
-    Ok(user_id)
+    // The only branch that *creates* an account, and so the only one the
+    // provisioning policy governs. Signing in through an existing link is not
+    // its business: refusing that would log people out of the instance
+    // instead of keeping strangers out of it.
+    rg_core::user::provisioning::authorize(provider, &user_info.email)
+        .map_err(|refusal| sso_provisioning_refused(provider, user_info, refusal))?;
+    provision_sso_user(db, headers, provider_slug, user_info)
+        .await?
+        .ok_or_else(|| sso_account_link_required(provider, user_info))
 }
 
 /// What a journal entry about an external identity may say.
@@ -903,33 +1309,36 @@ fn oauth_link_details(account: &rg_db::entities::oauth_account::Model) -> serde_
 /// persistent constraint failure into a spin.
 const SSO_PROVISION_ATTEMPTS: usize = 3;
 
-/// Create the Plombir Git account behind a first SSO login, tolerating a
-/// concurrent callback for the same identity.
+/// Create the Plombir Git account behind a first SSO login together with its
+/// link, tolerating a concurrent callback for the same identity.
 ///
-/// `users.username` and `users.email` are both UNIQUE
-/// (`m20260424_000001_create_users`), and this path reaches the `INSERT` after
-/// two separate reads: no OAuth link for `(provider, provider_user_id)`, no
-/// account on that email. Two callbacks of the same first login both pass those
-/// reads, so one of them meets the constraint. Losing that race is neither the
-/// client's fault nor a failed login — the winner created exactly the account
-/// this call was about to — so the loser adopts it instead of answering 500 and
-/// leaving the user staring at a broken first sign-in.
+/// `Ok(None)` means the address turned out to be taken by an account this
+/// identity is not linked to — a registration that won the gap since the
+/// caller looked. That account is not this login's to enter.
 ///
-/// Two things it deliberately does not do:
+/// `users.username`, `users.email` and `oauth_accounts (provider,
+/// provider_user_id)` are all UNIQUE, and this path reaches the `INSERT` after
+/// separate reads. Two callbacks of the same first login both pass those reads,
+/// so one of them meets a constraint. Losing that race is neither the client's
+/// fault nor a failed login — the winner created exactly the account this call
+/// was about to — so the loser signs in to it instead of answering 500.
 ///
-/// * **Adopt an account merely because it holds the username.** The username is
-///   derived from the provider's, and an unrelated local user may legitimately
-///   own it; treating that collision as "this is me" would hand the login
-///   someone else's account. Only the OAuth link and the email identify this
-///   person — a bare username collision is retried with a new candidate.
-/// * **Count the provision twice.** `user_provisioned("sso")` fires only on the
-///   branch that actually inserted the row, so a raced double callback adds one
-///   registration to the funnel, not two.
+/// The winner is recognised by its **link**, and only by its link: the account
+/// and the link are one transaction
+/// (`oauth_account_ops::link_with_new_user`), so a winner whose account is
+/// visible has its link visible too. An account that merely holds the address
+/// or the generated username is somebody else's.
+///
+/// `user_provisioned("sso")` fires only on the branch that actually inserted
+/// the row, so a raced double callback adds one registration to the funnel, not
+/// two. The journal entry for the new link is written here, beside the write,
+/// like every other credential's.
 async fn provision_sso_user(
     db: &sea_orm::DatabaseConnection,
+    headers: &HeaderMap,
     provider_slug: &str,
     user_info: &rg_core::auth::sso::SsoIdentity,
-) -> Result<i64, AppError> {
+) -> Result<Option<i64>, AppError> {
     for attempt in 1..=SSO_PROVISION_ATTEMPTS {
         let username = generate_unique_username(db, &user_info.provider_username)
             .await
@@ -947,20 +1356,42 @@ async fn provision_sso_user(
             ))
         })?;
 
-        let error = match rg_db::ops::user_ops::create_user(
+        let error = match rg_db::ops::oauth_account_ops::link_with_new_user(
             db,
             &username,
             &user_info.email,
-            "", // no password for SSO users
             user_info.display_name.as_deref().unwrap_or(&username),
+            provider_slug,
+            &user_info.provider_user_id,
+            &user_info.provider_username,
         )
         .await
         {
-            Ok(created) => {
+            Ok((created, linked)) => {
                 // SSO first-login provision is a new account: count it in the
                 // `users_registered_total` funnel with `sso` provenance.
                 crate::metrics::recorder::user_provisioned("sso");
-                return Ok(created.id);
+                // The account is the actor, and it did not exist a moment ago,
+                // so it cannot be named before the write the way an existing
+                // one is. The write is done and the sign-in is owed, so a
+                // failed name lookup leaves the id rather than failing it.
+                let actor =
+                    rg_core::audit::AuditActor::resolve_after_the_fact(db, created.id).await;
+                // Every later sign-in through this link records nothing: a row
+                // per login would bury the one event an incident review is
+                // looking for — the moment a new way into this account appeared.
+                rg_core::audit::record(
+                    db,
+                    &actor,
+                    "user.link_oauth_account",
+                    Some("user"),
+                    Some(created.id),
+                    actor.name(),
+                    Some(headers),
+                    Some(oauth_link_details(&linked)),
+                )
+                .await;
+                return Ok(Some(created.id));
             }
             Err(error) => error,
         };
@@ -968,20 +1399,27 @@ async fn provision_sso_user(
         // Anything that is not a UNIQUE violation is a real write failure and
         // keeps its classification — `AppError::from` still tells a connection
         // outage (503) apart from a statement-level fault (500).
-        if !rg_db::is_unique_violation_anyhow(&error) {
+        if !rg_db::is_unique_violation(&error) {
             return Err(AppError::from(error));
         }
 
-        // A race was lost — but to whom? Re-read the two keys that identify
-        // *this* login. A hit means a concurrent callback already built the
-        // account, and reusing it is the correct answer.
+        // A race was lost — but to whom? A link for this identity means a
+        // concurrent callback built the account, and signing in to it is the
+        // correct answer.
         if let Some(user_id) = resolve_raced_sso_user(db, provider_slug, user_info).await? {
-            return Ok(user_id);
+            return Ok(Some(user_id));
         }
 
-        // Neither key is taken, so the collision was on the generated username
-        // alone — someone else's account, not this one. A fresh candidate is a
-        // different row; try again.
+        // No link: the address is somebody else's now, or the collision was
+        // on the generated username alone. Only the second is retried.
+        if rg_db::ops::user_ops::find_by_email(db, &user_info.email)
+            .await
+            .map_err(AppError::from)?
+            .is_some()
+        {
+            return Ok(None);
+        }
+
         tracing::debug!(
             provider = provider_slug,
             attempt,
@@ -997,13 +1435,15 @@ async fn provision_sso_user(
 
 /// Find the account a concurrent SSO callback created for this same identity.
 ///
-/// Both keys belong to the login itself: the OAuth link is `(provider,
-/// provider_user_id)` — precisely the row this callback was going to write —
-/// and the email is the key the non-racing path merges on. Nothing else
-/// (username, display name) identifies the person, so nothing else is consulted.
+/// The OAuth link is `(provider, provider_user_id)` — precisely the row this
+/// callback was going to write — and it is the only key consulted. The email
+/// used to be the second one, and it is exactly the key that let an account
+/// somebody else registered on this address be "resolved" as this person's
+/// (card_4753cfe7b985). Nothing else (username, display name) identifies the
+/// person either.
 ///
-/// Both are read off an [`SsoIdentity`](rg_core::auth::sso::SsoIdentity), so
-/// neither can be the empty string here. That matters more on this path than on
+/// The key is read off an [`SsoIdentity`](rg_core::auth::sso::SsoIdentity), so
+/// it cannot be the empty string here. That matters more on this path than on
 /// the ordinary one: it runs *after* a UNIQUE violation, where an empty key
 /// would reliably match the row that just caused it.
 async fn resolve_raced_sso_user(
@@ -1011,21 +1451,14 @@ async fn resolve_raced_sso_user(
     provider_slug: &str,
     user_info: &rg_core::auth::sso::SsoIdentity,
 ) -> Result<Option<i64>, AppError> {
-    if let Some(oauth) = rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
+    Ok(rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
         db,
         provider_slug,
         &user_info.provider_user_id,
     )
     .await
     .map_err(AppError::from)?
-    {
-        return Ok(Some(oauth.user_id));
-    }
-
-    Ok(rg_db::ops::user_ops::find_by_email(db, &user_info.email)
-        .await
-        .map_err(AppError::from)?
-        .map(|user| user.id))
+    .map(|oauth| oauth.user_id))
 }
 
 /// Generate a unique username based on the provider username.
@@ -1065,11 +1498,13 @@ async fn generate_unique_username(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_auth_cookie, encode_query_component, provision_sso_user, resolve_raced_sso_user,
-        set_state_cookie, verify_state_cookie, SSO_STATE_COOKIE, SSO_VERIFIER_COOKIE,
+        build_auth_cookie, encode_query_component, link_intent_cookie_value, provision_sso_user,
+        read_link_intent, resolve_raced_sso_user, set_state_cookie, verify_state_cookie,
+        LinkIntent, SSO_LINK_COOKIE, SSO_STATE_COOKIE, SSO_VERIFIER_COOKIE,
     };
     use axum::http::{header, HeaderMap};
     use axum::response::IntoResponse;
+    use sea_orm::EntityTrait;
 
     /// Serialises the two tests that assert a delta on the process-wide
     /// `users_registered_total` counter. Under `cargo nextest` each test is its
@@ -1162,16 +1597,19 @@ mod tests {
         assert_eq!(resolved, Some(winner.id));
     }
 
+    /// The key the race resolution used to fall back to, and the one that made
+    /// it a pre-hijack: an account holding this address but not this identity
+    /// is somebody else's — a registration that got the address first — and a
+    /// lost insert is not a reason to sign into it (card_4753cfe7b985). The
+    /// winner of a genuine race of this identity commits its link together with
+    /// its account, so the link alone finds it.
     #[tokio::test]
-    async fn a_lost_first_login_race_is_resolved_through_the_email_before_the_link_exists() {
+    async fn an_account_holding_the_address_without_this_link_is_not_this_identity() {
         let db = migrated_db().await;
 
-        // The winner is between its two writes: the user row is in, the OAuth
-        // link is not yet.
-        let winner =
-            rg_db::ops::user_ops::create_user(&db, "alice", "alice@example.com", "", "Alice")
-                .await
-                .expect("create the winning account");
+        rg_db::ops::user_ops::create_user(&db, "alice", "alice@example.com", "", "Alice")
+            .await
+            .expect("create the account that holds the address");
 
         let resolved = resolve_raced_sso_user(
             &db,
@@ -1181,7 +1619,7 @@ mod tests {
         .await
         .expect("resolve");
 
-        assert_eq!(resolved, Some(winner.id));
+        assert_eq!(resolved, None, "an email address is not an identity");
     }
 
     #[tokio::test]
@@ -1216,11 +1654,13 @@ mod tests {
 
         let user_id = provision_sso_user(
             &db,
+            &HeaderMap::new(),
             "gitea",
             &sso_user_info("provider-uid-1", "alice", "alice@example.com"),
         )
         .await
-        .expect("provision");
+        .expect("provision")
+        .expect("a free address is provisioned");
 
         let created = rg_db::ops::user_ops::find_by_id(&db, user_id)
             .await
@@ -1233,6 +1673,25 @@ mod tests {
             1,
             "a genuine first login is one registration",
         );
+        // The account and its link are one write: a winner whose account is
+        // visible to a racing callback has its link visible too.
+        let link =
+            rg_db::ops::oauth_account_ops::find_by_provider_and_uid(&db, "gitea", "provider-uid-1")
+                .await
+                .expect("read the link")
+                .expect("the first login wrote its link");
+        assert_eq!(link.user_id, user_id);
+        // ...and the moment the new way in appeared is journalled.
+        let journalled = rg_db::entities::audit_log::Entity::find()
+            .all(&db)
+            .await
+            .expect("read the journal")
+            .into_iter()
+            .filter(|row| {
+                row.action == "user.link_oauth_account" && row.resource_id == Some(user_id)
+            })
+            .count();
+        assert_eq!(journalled, 1, "the new link has exactly one journal entry");
         drop(guard);
     }
 
@@ -1256,6 +1715,7 @@ mod tests {
         {
             let user_id = provision_sso_user(
                 &db,
+                &HeaderMap::new(),
                 "gitea",
                 &sso_user_info(
                     &format!("provider-uid-{index}"),
@@ -1264,7 +1724,8 @@ mod tests {
                 ),
             )
             .await
-            .expect("a provider name the local rule refuses is repaired, not refused");
+            .expect("a provider name the local rule refuses is repaired, not refused")
+            .expect("a free address is provisioned");
 
             let created = rg_db::ops::user_ops::find_by_id(&db, user_id)
                 .await
@@ -1291,15 +1752,18 @@ mod tests {
         let guard = PROVISION_COUNTER_LOCK.lock().await;
         let db = migrated_db().await;
 
-        // The concurrent callback got there first: the account is in, under a
-        // different username, on the email this login carries. `users.email` is
-        // UNIQUE, so the INSERT below really does fail — no injection needed.
-        let winner = rg_db::ops::user_ops::create_user(
+        // The concurrent callback got there first: the account and its link
+        // are in, under a different username, on the email this login carries.
+        // `users.email` is UNIQUE, so the INSERT below really does fail — no
+        // injection needed.
+        let (winner, _) = rg_db::ops::oauth_account_ops::link_with_new_user(
             &db,
             "alice_from_the_other_callback",
             "alice@example.com",
-            "",
             "Alice",
+            "gitea",
+            "provider-uid-1",
+            "alice",
         )
         .await
         .expect("create the winning account");
@@ -1308,19 +1772,181 @@ mod tests {
         let before = registered_total();
         let user_id = provision_sso_user(
             &db,
+            &HeaderMap::new(),
             "gitea",
             &sso_user_info("provider-uid-1", "alice", "alice@example.com"),
         )
         .await
         .expect("a lost race is not a failed login");
 
-        assert_eq!(user_id, winner.id, "both callbacks resolve to one identity");
+        assert_eq!(
+            user_id,
+            Some(winner.id),
+            "both callbacks resolve to one identity"
+        );
         assert_eq!(
             registered_total() - before,
             0,
             "adopting an account someone else created is not a new registration",
         );
         drop(guard);
+    }
+
+    /// The gap between the callback's email check and its insert: a local
+    /// registration takes the address in between. The insert then fails on
+    /// `users.email`, and the account that holds the address now is not linked
+    /// to this identity — so it is not this login's, and nothing is written.
+    #[tokio::test]
+    async fn an_address_registered_in_the_gap_is_not_adopted_by_a_lost_insert() {
+        let guard = PROVISION_COUNTER_LOCK.lock().await;
+        let db = migrated_db().await;
+
+        let registered = rg_db::ops::user_ops::create_user(
+            &db,
+            "squatter",
+            "alice@example.com",
+            "$argon2id$not-a-real-hash",
+            "Squatter",
+        )
+        .await
+        .expect("create the account that registered the address");
+
+        let _counter = REGISTRATION_COUNTER.lock().await;
+        let before = registered_total();
+        let outcome = provision_sso_user(
+            &db,
+            &HeaderMap::new(),
+            "gitea",
+            &sso_user_info("provider-uid-1", "alice", "alice@example.com"),
+        )
+        .await
+        .expect("a taken address is an answer, not an error");
+
+        assert_eq!(outcome, None, "the registered account was adopted");
+        assert!(
+            rg_db::ops::oauth_account_ops::find_by_user_id(&db, registered.id)
+                .await
+                .expect("read links")
+                .is_empty(),
+            "the identity was linked to the account that registered the address"
+        );
+        assert!(
+            rg_db::ops::oauth_account_ops::find_by_provider_and_uid(&db, "gitea", "provider-uid-1")
+                .await
+                .expect("read the link")
+                .is_none(),
+            "a refused first login left a link behind"
+        );
+        assert_eq!(registered_total() - before, 0);
+        drop(guard);
+    }
+
+    /// The account and its first link are one write. A link that cannot be
+    /// written must take the account down with it — otherwise the account
+    /// would sit there holding the address and no identity, and the next
+    /// sign-in would meet exactly the unlinked-holder case it is refused for.
+    #[tokio::test]
+    async fn a_first_login_whose_link_fails_leaves_no_account_behind() {
+        let db = migrated_db().await;
+        let holder =
+            rg_db::ops::user_ops::create_user(&db, "holder", "holder@example.com", "", "Holder")
+                .await
+                .expect("create the identity's holder");
+        rg_db::ops::oauth_account_ops::link(
+            &db,
+            holder.id,
+            "gitea",
+            "provider-uid-1",
+            "holder",
+            "holder@example.com",
+        )
+        .await
+        .expect("link")
+        .expect("the identity is held");
+
+        let error = rg_db::ops::oauth_account_ops::link_with_new_user(
+            &db,
+            "newcomer",
+            "newcomer@example.com",
+            "Newcomer",
+            "gitea",
+            "provider-uid-1",
+            "newcomer",
+        )
+        .await
+        .expect_err("the identity is already linked");
+
+        assert!(rg_db::is_unique_violation(&error), "{error}");
+        assert!(
+            rg_db::ops::user_ops::find_by_email(&db, "newcomer@example.com")
+                .await
+                .expect("read back")
+                .is_none(),
+            "the account outlived the link it was created with"
+        );
+    }
+
+    fn link_cookie_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("other=1; {SSO_LINK_COOKIE}={value}")
+                .parse()
+                .unwrap(),
+        );
+        headers
+    }
+
+    /// The intent is bound to the account, its session generation, the
+    /// provider and the OAuth round trip — change any one and it is refused,
+    /// rather than read as somebody's request to link.
+    #[test]
+    fn a_link_intent_verifies_only_for_its_own_provider_and_round_trip() {
+        let value = link_intent_cookie_value(7, 3, "github", "state-1", "secret");
+        let headers = link_cookie_headers(&value);
+
+        assert_eq!(
+            read_link_intent(&headers, "github", "state-1", "secret"),
+            LinkIntent::Valid {
+                user_id: 7,
+                session_version: 3
+            }
+        );
+        assert_eq!(
+            read_link_intent(&headers, "gitlab", "state-1", "secret"),
+            LinkIntent::Invalid,
+            "an intent for one provider completed a link through another"
+        );
+        assert_eq!(
+            read_link_intent(&headers, "github", "state-2", "secret"),
+            LinkIntent::Invalid,
+            "an intent from one round trip completed another"
+        );
+        assert_eq!(
+            read_link_intent(&headers, "github", "state-1", "other-secret"),
+            LinkIntent::Invalid
+        );
+
+        let (_, signature) = value.split_at(value.find('.').unwrap());
+        let retargeted = link_cookie_headers(&format!("8{signature}"));
+        assert_eq!(
+            read_link_intent(&retargeted, "github", "state-1", "secret"),
+            LinkIntent::Invalid,
+            "an intent rewritten to name another account still verified"
+        );
+        assert_eq!(
+            read_link_intent(
+                &link_cookie_headers("garbage"),
+                "github",
+                "state-1",
+                "secret"
+            ),
+            LinkIntent::Invalid
+        );
+        assert_eq!(
+            read_link_intent(&HeaderMap::new(), "github", "state-1", "secret"),
+            LinkIntent::Absent
+        );
     }
 
     #[test]

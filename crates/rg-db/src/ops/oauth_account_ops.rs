@@ -93,6 +93,67 @@ pub async fn link(
     }
 }
 
+/// Create the account behind a first SSO login **and** its first link, as one
+/// transaction.
+///
+/// The two rows used to be two statements, and the gap between them was
+/// load-bearing for the wrong reason: a concurrent callback of the same login
+/// could find the new account by its email before the link existed, so the
+/// race resolution had to adopt "whoever holds this address" — the very rule
+/// that let a pre-registered account capture somebody's provider identity
+/// (card_4753cfe7b985). With both rows committed together, a concurrent
+/// callback sees either nothing or the link, and the link alone is enough to
+/// identify the winner.
+///
+/// Any failure — a UNIQUE violation on the username, the email or the
+/// identity included — rolls back both rows and is returned unchanged; the
+/// caller decides what a collision means.
+pub async fn link_with_new_user(
+    db: &DatabaseConnection,
+    username: &str,
+    email: &str,
+    display_name: &str,
+    provider: &str,
+    provider_user_id: &str,
+    provider_username: &str,
+) -> Result<(crate::entities::user::Model, oauth_account::Model), DbErr> {
+    let transaction = db.begin().await?;
+    let written: Result<_, DbErr> = async {
+        let user = crate::ops::user_ops::oauth_user_model(username, email, "", display_name)
+            .insert(&transaction)
+            .await?;
+        let now = chrono::Utc::now();
+        let link = oauth_account::ActiveModel {
+            id: NotSet,
+            user_id: Set(user.id),
+            provider: Set(provider.to_string()),
+            provider_user_id: Set(provider_user_id.to_string()),
+            provider_username: Set(provider_username.to_string()),
+            email: Set(email.to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&transaction)
+        .await?;
+        Ok((user, link))
+    }
+    .await;
+    match written {
+        Ok(rows) => {
+            transaction.commit().await?;
+            Ok(rows)
+        }
+        Err(error) => {
+            if let Err(rollback_error) = transaction.rollback().await {
+                return Err(DbErr::Custom(format!(
+                    "{error}; rolling back the first SSO login also failed: {rollback_error}"
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Record that an already-observed link was used again.
 ///
 /// The callback's lookup and this write are separate statements. An explicit

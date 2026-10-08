@@ -69,6 +69,14 @@ export const auth = {
   ssoAuthorizeUrl: (slug: string) =>
     withApiBase(`/auth/sso/${encodeURIComponent(slug)}`),
   listSsoLinks: () => request<SsoLink[]>('/users/me/sso'),
+  // Starts linking a provider to the signed-in account. The browser then goes
+  // to `authorize_url`; the provider's callback attaches the identity to this
+  // account and comes back to `/settings/security?sso_linked=<slug>`. A first
+  // sign-in through a provider never joins an existing account by itself.
+  linkSso: (slug: string) =>
+    request<{ authorize_url: string }>(`/auth/sso/${encodeURIComponent(slug)}/link`, {
+      method: 'POST',
+    }),
   unlinkSso: (slug: string) =>
     request<{ unlinked: boolean }>(`/auth/sso/${encodeURIComponent(slug)}/unlink`, {
       method: 'DELETE',

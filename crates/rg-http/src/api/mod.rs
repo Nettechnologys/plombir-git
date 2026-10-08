@@ -40,6 +40,7 @@ pub mod repos;
 pub mod reviews;
 pub mod runners;
 pub mod search;
+pub(crate) mod sign_in_methods;
 pub mod ssh_keys;
 pub mod sso;
 pub mod tag_protection;

@@ -11,6 +11,7 @@
     type MfaBackupStatus,
     type MfaSetupResponse,
     type PasskeyInfo,
+    type PublicSsoProvider,
     type SsoLink,
   } from '$lib/api/client.svelte';
 
@@ -44,6 +45,7 @@
   const passkeySupported = isPasskeySupported();
 
   let ssoLinks = $state<SsoLink[] | Unknown>([]);
+  let ssoProviders = $state<PublicSsoProvider[] | Unknown>([]);
   let ssoBusy = $state(false);
   const securityRequests = new LatestRequestFence<'security-load'>();
   const backupStatusRequests = new LatestRequestFence<'backup-status'>();
@@ -57,12 +59,24 @@
   const knownPasskeys = $derived(passkeyList === UNKNOWN ? [] : passkeyList);
   const ssoLinksUnknown = $derived(ssoLinks === UNKNOWN);
   const knownSsoLinks = $derived(ssoLinks === UNKNOWN ? [] : ssoLinks);
+  // Providers this account can still link. Offered only while the links are
+  // known: with the listing unread, a button could offer a provider that is
+  // already linked.
+  const linkableProviders = $derived(
+    ssoLinks === UNKNOWN || ssoProviders === UNKNOWN
+      ? []
+      : ssoProviders.filter((provider) => !knownSsoLinks.some((link) => link.slug === provider.slug)),
+  );
 
   $effect(() => {
     if (!isAuthReady()) return;
     if (!isLoggedIn()) {
       goto('/login');
       return;
+    }
+    // Where the provider's callback lands after `linkSsoProvider` below.
+    if (new URLSearchParams(window.location.search).has('sso_linked')) {
+      success = 'Provider linked. You can now sign in through it.';
     }
     loadSecurity();
   });
@@ -74,7 +88,12 @@
     // Each slot claims its own state owner, synchronously, inside its loader,
     // so a retry of one section cannot publish over a mutation running in
     // another — and so one refused read leaves the other two intact.
-    await Promise.all([loadBackupStatus(), loadPasskeyList(), loadSsoLinks()]);
+    await Promise.all([
+      loadBackupStatus(),
+      loadPasskeyList(),
+      loadSsoLinks(),
+      loadSsoProviders(),
+    ]);
     if (securityRequests.owns(claim, 'security-load')) loading = false;
   }
 
@@ -120,6 +139,30 @@
     }
   }
 
+  async function loadSsoProviders() {
+    const result = await optionalSection(
+      Promise.resolve().then(() => auth.listSsoProviders()),
+      'the sign-in providers this account could link',
+    );
+    ssoProviders = isUnavailable(result) ? UNKNOWN : Array.isArray(result) ? result : [];
+  }
+
+  // The only way a provider joins an account that already exists: a first
+  // sign-in through it never attaches to an account by its email address.
+  async function linkSsoProvider(provider: PublicSsoProvider) {
+    if (ssoBusy) return;
+    try {
+      ssoBusy = true;
+      error = '';
+      success = '';
+      const { authorize_url } = await auth.linkSso(provider.slug);
+      window.location.assign(authorize_url);
+    } catch (err: any) {
+      error = err.message || `Failed to start linking ${provider.name}`;
+      ssoBusy = false;
+    }
+  }
+
   async function addPasskey(event: SubmitEvent) {
     event.preventDefault();
     if (passkeyBusy) return;
@@ -162,8 +205,8 @@
   async function unlinkSsoProvider(link: SsoLink) {
     if (
       !confirm(
-        `Unlink ${link.name}? Signing in through that provider will create the link again, ` +
-          'so make sure you can still sign in some other way first.',
+        `Unlink ${link.name}? You will not be able to sign in through it until you link it ` +
+          'again from this page.',
       )
     )
       return;
@@ -492,7 +535,24 @@
         {/each}
       </ul>
     {:else}
-      <p class="muted">No external accounts are linked. Sign in through a provider to link one.</p>
+      <p class="muted">No external accounts are linked.</p>
+    {/if}
+
+    {#if !loading && linkableProviders.length > 0}
+      <div class="sso-link-actions">
+        {#each linkableProviders as provider (provider.slug)}
+          <button
+            type="button"
+            class="btn btn-secondary"
+            onclick={() => linkSsoProvider(provider)}
+            disabled={ssoBusy}
+          >
+            Link {provider.name}
+          </button>
+        {/each}
+      </div>
+    {:else if !loading && ssoProviders === UNKNOWN}
+      <p class="muted state-unknown">The providers this account could link could not be read.</p>
     {/if}
   </section>
 
@@ -681,6 +741,13 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--bg-primary);
+  }
+
+  .sso-link-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 12px;
   }
 
   .passkey-list {

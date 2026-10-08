@@ -290,15 +290,32 @@ async fn an_address_inside_the_allowlist_is_provisioned() {
 }
 
 /// Turning provisioning off keeps strangers out; it must not lock out the
-/// people already on the instance. The account exists on the asserted address
-/// before the login, so the callback takes the merge branch — which is not a
-/// provisioning and is not the policy's business.
+/// people already on the instance. The identity is linked to an existing
+/// account before the login, so the callback signs in through the link — which
+/// is not a provisioning and is not the policy's business.
+///
+/// "Already on the instance" means *linked*. It used to mean "holds the email
+/// the provider asserts", and that was the pre-hijack of card_4753cfe7b985:
+/// see `sso_account_link_tests.rs` for what an unlinked account holding the
+/// address gets now.
 #[tokio::test]
 async fn an_existing_account_still_signs_in_through_a_closed_provider() {
     let app = Harness::start("member@example.com", false, Some("nowhere.invalid")).await;
-    rg_db::ops::user_ops::create_user(&app.db, "member", "member@example.com", "", "Member")
-        .await
-        .unwrap();
+    let member =
+        rg_db::ops::user_ops::create_user(&app.db, "member", "member@example.com", "", "Member")
+            .await
+            .unwrap();
+    rg_db::ops::oauth_account_ops::link(
+        &app.db,
+        member.id,
+        "idp",
+        "subject-1",
+        "member",
+        "member@example.com",
+    )
+    .await
+    .unwrap()
+    .expect("the identity is linked");
 
     let (status, body) = app.sign_in().await;
 
@@ -309,6 +326,22 @@ async fn an_existing_account_still_signs_in_through_a_closed_provider() {
     );
     assert!(
         app.linked().await,
-        "the existing account did not get its provider link"
+        "the existing account lost its provider link"
+    );
+}
+
+/// A refused provisioning names the way in for somebody who does have an
+/// account here — said to everyone, so it discloses nothing about whether this
+/// person's address is taken.
+#[tokio::test]
+async fn a_refused_provisioning_points_an_existing_member_at_linking() {
+    let app = Harness::start("newcomer@example.com", false, None).await;
+
+    let (status, body) = app.sign_in().await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert!(
+        body.contains("link Mock IdP under Settings"),
+        "the refusal does not say how an existing member gets in, got: {body}"
     );
 }

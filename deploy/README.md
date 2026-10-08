@@ -185,7 +185,7 @@ policy, because "who may sign in" and "who may be *created*" are different
 questions on a public IdP, where everyone already holds a valid identity:
 
 * **Create accounts on first login** (`auto_provision`). Off means only people
-  who already have an account here can use this provider; a stranger with a
+  who have linked this provider to their account can use it; a stranger with a
   perfectly valid identity at it gets a `403` naming the reason, and no row in
   `users`. A provider you create today starts **off** — handing out accounts is
   something you turn on deliberately.
@@ -195,8 +195,39 @@ questions on a public IdP, where everyone already holds a valid identity:
   `mail.example.com` nor `evil-example.com`.
 
 Both only govern account *creation*. Turning provisioning off never locks out an
-account that already exists, whether it was linked to the provider or matched on
-its email — so the switch is safe to flip on a live instance.
+account already linked to the provider — so the switch is safe to flip on a live
+instance.
+
+### A provider joins an existing account only from inside it
+
+A first sign-in through a provider **never** attaches to an existing account,
+even one holding exactly the email address the provider asserts. Local
+registration does not verify addresses, so "the account with this email" can
+be an account somebody else registered first, with a password of their own;
+attaching the provider identity to it would hand them the real owner's
+sign-ins. Instead:
+
+* A first sign-in whose address an existing account already holds is refused
+  with `409` and the hint to sign in to that account and link the provider
+  under **Settings → Security**. Nothing is linked and no session is issued.
+  A provider that does not vouch for the address (no `email_verified: true`)
+  and may not create accounts gets the ordinary provisioning `403` instead, so
+  a closed provider cannot be used to ask which addresses have accounts here.
+* **Settings → Security → Link *provider*** starts the provider round trip from
+  a signed-in session (a personal access token cannot start it) and attaches
+  the identity to that session's account. The identity's address does not have
+  to match the account's. An identity already linked to another account stays
+  where it is (`409`).
+* An account created by a first SSO sign-in has no password. Its last provider
+  link and its last passkey cannot be removed (`409`), because nothing would
+  let its owner back in.
+
+**Upgrading:** people who used to rely on the automatic match — a local account
+whose address equals their SSO address, or one provider account reached through
+a second provider — now get the `409` on their next first sign-in through a
+provider they never linked. They sign in the way they did before (password, or
+the provider already linked) and link the new one from **Settings → Security**.
+Identities that are already linked keep signing in unchanged.
 
 > **Upgrading.** Providers that already existed keep `auto_provision = true`, so
 > an upgrade changes nothing about who can log in. If one of them is a public

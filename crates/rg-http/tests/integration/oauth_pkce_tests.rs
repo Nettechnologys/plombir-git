@@ -684,6 +684,20 @@ async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_t
          feature on this instance reads them"
     );
 
+    // The provisioned account has no password, so this link is its only way
+    // in, and dropping the last one is refused (card_4753cfe7b985). A passkey
+    // gives it a second one; the unlink is what this test journals.
+    rg_db::ops::passkey_credential_ops::create(
+        &db,
+        user.id,
+        "journal-test-credential",
+        "{}",
+        "Second way in",
+        "localhost",
+    )
+    .await
+    .expect("give the account a passkey");
+
     let unlink = client
         .delete(format!("{base}/api/v1/auth/sso/oidc-journal/unlink"))
         .bearer_auth(&session)

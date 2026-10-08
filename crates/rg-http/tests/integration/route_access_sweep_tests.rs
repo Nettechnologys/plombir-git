@@ -411,6 +411,10 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
         "no SSO provider is configured on this instance",
     ),
     (
+        "POST /api/v1/auth/sso/{slug}/link",
+        "no SSO provider is configured on this instance",
+    ),
+    (
         "GET /api/v1/imports/{id}",
         "no repository import is seeded",
     ),

@@ -92,3 +92,39 @@ describe('linked SSO identity production wiring', () => {
 		).toBe(false);
 	});
 });
+
+describe('linking an SSO provider from the account', () => {
+	// card_4753cfe7b985: a first sign-in through a provider no longer joins an
+	// existing account by its email address. Linking from inside the account is
+	// the way in that replaces it, so the page has to offer it.
+	it('starts the link by the provider slug, escaped, as a POST', () => {
+		auth.linkSso('corp idp/staging');
+
+		expect(base.request).toHaveBeenCalledWith('/auth/sso/corp%20idp%2Fstaging/link', {
+			method: 'POST',
+		});
+	});
+
+	it('offers only the providers that are not linked yet, and sends the browser to the provider', async () => {
+		routeAuth.listSsoProviders.mockResolvedValue([
+			{ slug: 'corp', name: 'Corporate SSO', provider_type: 'oidc', icon_url: null },
+			{ slug: 'github', name: 'GitHub', provider_type: 'github', icon_url: null },
+		]);
+		routeAuth.linkSso.mockResolvedValue({
+			authorize_url: 'https://idp.example/authorize?state=s',
+		});
+		const assign = vi.fn();
+		vi.stubGlobal('location', { ...window.location, search: '', assign });
+
+		rendered = await renderComponent(SecurityPage);
+
+		expect(
+			Array.from(rendered.container.querySelectorAll('button')).some(
+				(candidate) => candidate.textContent?.trim() === 'Link Corporate SSO',
+			),
+		).toBe(false);
+		await click(button(rendered.container, 'Link GitHub'));
+		expect(routeAuth.linkSso).toHaveBeenCalledWith('github');
+		expect(assign).toHaveBeenCalledWith('https://idp.example/authorize?state=s');
+	});
+});

@@ -752,6 +752,7 @@ pub async fn list_passkeys(
         (status = 204, description = "Passkey deleted"),
         (status = 401, description = "Authentication required", body = serde_json::Value),
         (status = 404, description = "Passkey not found", body = serde_json::Value),
+        (status = 409, description = "The passkey is the account's last way to sign in", body = serde_json::Value),
     ),
 )]
 pub async fn delete_passkey(
@@ -768,6 +769,19 @@ pub async fn delete_passkey(
         .map_err(AppError::from)?
         .into_iter()
         .find(|key| key.id == id);
+
+    // Asked of the row the caller's own listing returned, not of the path id:
+    // a key that is not theirs is the 404 below, not a question about their
+    // remaining ways in.
+    if let Some(key) = &removed_key {
+        crate::api::sign_in_methods::refuse_removing_the_last_way_in(
+            &state,
+            user_id,
+            crate::api::sign_in_methods::WayIn::Passkey,
+            key.id,
+        )
+        .await?;
+    }
 
     let audit_actor = grant_actor(&state, user_id).await?;
 

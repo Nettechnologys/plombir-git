@@ -180,6 +180,14 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
       'backup-code spelling, this one is the seam beneath it',
   ],
   [
+    'crates/rg-db/src/ops/user_ops.rs::create_user',
+    'the link-less spelling of an SSO account. Production provisions a first SSO sign-in through ' +
+      '`oauth_account_ops::link_with_new_user`, which writes the account and its first identity ' +
+      'link in one transaction — an account without its link is exactly the unlinked holder of an ' +
+      'address that the callback must refuse (card_4753cfe7b985). What is left calling this one is ' +
+      'the fixtures across the workspace that want a plain account row without going through HTTP',
+  ],
+  [
     'crates/rg-db/src/ops/audit_log_ops.rs::insert',
     'the append path is `rg_core::audit::record`, and it writes the row through ' +
       '`audit_log::Entity::insert(...).exec(db)` rather than this op on purpose: the op reads the ' +

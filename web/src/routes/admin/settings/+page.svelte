@@ -599,8 +599,8 @@
         <label for="sso-auto-provision">Create accounts on first login</label>
       </div>
       <p class="field-hint">
-        Off means only people who already have an account here can sign in through this provider.
-        On a public identity provider (GitHub, Google) leaving it on hands an account to anyone
+        Off means only people who have linked this provider to their account (Settings → Security)
+        can sign in through it. On a public identity provider (GitHub, Google) leaving it on hands an account to anyone
         with an account there.
       </p>
       <div class="form-group">
@@ -609,7 +609,7 @@
         <p class="field-hint">
           Comma-separated. Empty means no domain restriction. Exact match — <code>example.com</code>
           does not admit <code>mail.example.com</code>. Only limits who gets an account created;
-          existing accounts keep signing in.
+          accounts already linked to this provider keep signing in.
         </p>
       </div>
       <div class="inline-actions">
