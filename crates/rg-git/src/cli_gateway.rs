@@ -290,6 +290,7 @@ fn is_host_git_env(key: &OsStr) -> bool {
 trait GitChildEnvironment {
     fn unset(&mut self, key: &OsStr);
     fn set(&mut self, key: &str, value: &str);
+    fn working_directory(&mut self, dir: &Path);
 }
 
 impl GitChildEnvironment for Command {
@@ -299,6 +300,10 @@ impl GitChildEnvironment for Command {
 
     fn set(&mut self, key: &str, value: &str) {
         self.env(key, value);
+    }
+
+    fn working_directory(&mut self, dir: &Path) {
+        self.current_dir(dir);
     }
 }
 
@@ -310,6 +315,67 @@ impl GitChildEnvironment for tokio::process::Command {
     fn set(&mut self, key: &str, value: &str) {
         self.env(key, value);
     }
+
+    fn working_directory(&mut self, dir: &Path) {
+        self.current_dir(dir);
+    }
+}
+
+/// A directory that exists on every host and is never a work tree.
+const NEUTRAL_WORKING_DIRECTORY: &str = "/";
+
+/// Subcommands that take a path relative to the caller's working directory and
+/// do not look for a repository around it: they create one.
+const PATH_CREATING_SUBCOMMANDS: &[&str] = &["clone", "init"];
+
+/// The subcommand of a git argument vector, past the global options.
+fn git_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match *arg {
+            // Global options whose value is the next argument.
+            "-c" | "-C" | "--config-env" | "--exec-path" | "--git-dir" | "--work-tree"
+            | "--namespace" => {
+                args.next();
+            }
+            option if option.starts_with('-') => {}
+            subcommand => return Some(subcommand),
+        }
+    }
+    None
+}
+
+/// Take the repository around the server's working directory away from a `git`
+/// child that was given none.
+///
+/// Without `-C`, a command such as `ls-remote` discovers a repository upward
+/// from the process's working directory and reads *its* `.git/config`. A server
+/// started from a git checkout (`WorkingDirectory=` a source tree, a worktree in
+/// a developer's shell) had that checkout's `url.<base>.insteadOf`,
+/// `http.proxy` and `core.*` steer an outbound request after the SSRF guard had
+/// approved its URL, and a broken `.git` in that directory failed the command
+/// outright (`fatal: not a git repository`). The disarmed environment above does
+/// not cover it: repository-local configuration is not the system or global
+/// file. `GIT_CEILING_DIRECTORIES` does not either — it stops the walk upward
+/// but the working directory itself is always examined.
+///
+/// `clone` and `init` keep the caller's directory: they take a destination path
+/// that may be relative to it (the default repository root is), and they make a
+/// repository rather than look for one.
+fn disarm_enclosing_repository<C: GitChildEnvironment>(
+    builder: &mut C,
+    args: &[&str],
+    repo_path: Option<&Path>,
+) {
+    if repo_path.is_some() {
+        return;
+    }
+    if git_subcommand(args)
+        .is_some_and(|subcommand| PATH_CREATING_SUBCOMMANDS.contains(&subcommand))
+    {
+        return;
+    }
+    builder.working_directory(Path::new(NEUTRAL_WORKING_DIRECTORY));
 }
 
 /// Take the host's configuration away from a `git` child.
@@ -499,6 +565,7 @@ impl GitCommandGateway {
         let mut builder = Command::new("git");
         builder.args(&full_cmd);
         disarm_host_configuration(&mut builder, inherited_env_to_remove);
+        disarm_enclosing_repository(&mut builder, args, repo_path);
         // Applied last, so a caller can still hand the child an identity
         // (`GIT_AUTHOR_NAME` and friends) or state one of the disarmed values
         // itself — the removal above would otherwise take it away again.
@@ -605,6 +672,7 @@ impl GitCommandGateway {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         disarm_host_configuration(&mut builder, &[]);
+        disarm_enclosing_repository(&mut builder, args, repo_path);
 
         let child = builder
             .spawn()
@@ -1147,6 +1215,158 @@ let typed = Command::new::<&str>("git");
         assert_eq!(hits[0].0, 8);
         assert_eq!(hits[0].1.trim(), "let git = std::process::Command::new(");
         assert_eq!(hits[1], (11, "let typed = Command::new::<&str>(\"git\");"));
+    }
+
+    #[test]
+    fn the_subcommand_is_found_past_the_global_options() {
+        assert_eq!(
+            git_subcommand(&["ls-remote", "--heads", "u"]),
+            Some("ls-remote")
+        );
+        assert_eq!(
+            git_subcommand(&["-c", "http.extraHeader=x", "-c", "a=b", "clone", "--bare"]),
+            Some("clone")
+        );
+        assert_eq!(
+            git_subcommand(&["--git-dir", "init", "--no-pager", "fetch"]),
+            Some("fetch")
+        );
+        assert_eq!(git_subcommand(&["--version"]), None);
+    }
+
+    /// `clone` and `init` take a destination that may be relative to the
+    /// caller's directory; everything else given no repository starts from
+    /// the neutral one, and a command given a repository is left alone.
+    #[test]
+    fn only_a_repository_less_command_that_looks_for_a_repository_is_moved() {
+        let moved = |args: &[&str], repo_path: Option<&Path>| {
+            let mut command = Command::new("git");
+            disarm_enclosing_repository(&mut command, args, repo_path);
+            command.get_current_dir().map(Path::to_path_buf)
+        };
+
+        let neutral = Some(std::path::PathBuf::from(NEUTRAL_WORKING_DIRECTORY));
+        assert_eq!(moved(&["ls-remote", "--heads", "u"], None), neutral);
+        assert_eq!(moved(&["-c", "a=b", "ls-remote", "u"], None), neutral);
+        assert_eq!(
+            moved(&["-c", "a=b", "clone", "--bare", "u", "d"], None),
+            None
+        );
+        assert_eq!(moved(&["init", "-q", "repos/x.git"], None), None);
+        assert_eq!(
+            moved(&["ls-remote", "origin"], Some(Path::new("/srv/repo.git"))),
+            None
+        );
+    }
+
+    const ENCLOSING_REPOSITORY_PROBE: &str =
+        "cli_gateway::tests::ls_remote_probe_run_from_an_enclosing_repository";
+
+    /// Re-executed by [`a_server_started_inside_a_repository_does_not_lend_it_to_git`]
+    /// from a hostile working directory: changing the directory of this test
+    /// process would change it for every test sharing the process.
+    #[test]
+    #[ignore = "a probe re-executed from a hostile working directory"]
+    fn ls_remote_probe_run_from_an_enclosing_repository() {
+        let url = std::env::var("RG_GIT_ENCLOSING_PROBE_URL").expect("probe URL");
+        let output = GitCommandGateway::new()
+            .unwrap()
+            .run(&["ls-remote", "--heads", &url], None)
+            .unwrap();
+        assert!(
+            output.success(),
+            "ls-remote from {:?} failed: {}",
+            std::env::current_dir(),
+            output.stderr_str()
+        );
+        assert!(
+            output.stdout_str().contains("refs/heads/main"),
+            "ls-remote answered for another remote: {}",
+            output.stdout_str()
+        );
+    }
+
+    /// card_2fcb52e49eb3: a server started from a git checkout lent that
+    /// checkout's `.git/config` to every git it ran without `-C` — a
+    /// `url.<base>.insteadOf` there rewrote the remote of a wiki import, and a
+    /// broken `.git` failed the command outright.
+    #[test]
+    fn a_server_started_inside_a_repository_does_not_lend_it_to_git() {
+        let gateway = GitCommandGateway::new().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let upstream = temp.path().join("upstream");
+        let upstream_arg = upstream.to_string_lossy();
+        gateway
+            .run_or_bail(&["init", "-q", "-b", "main", &upstream_arg], None)
+            .unwrap();
+        gateway
+            .run_or_bail(
+                &[
+                    "-c",
+                    "user.name=Probe",
+                    "-c",
+                    "user.email=probe@example.invalid",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "page",
+                ],
+                Some(&upstream),
+            )
+            .unwrap();
+        let url = format!("file://{}", upstream.display());
+
+        // A checkout whose configuration sends that remote somewhere else.
+        let steering = temp.path().join("steering-checkout");
+        let steering_arg = steering.to_string_lossy();
+        gateway
+            .run_or_bail(&["init", "-q", &steering_arg], None)
+            .unwrap();
+        gateway
+            .run_or_bail(
+                &[
+                    "config",
+                    &format!("url.file://{}/nowhere/.insteadOf", temp.path().display()),
+                    &url,
+                ],
+                Some(&steering),
+            )
+            .unwrap();
+
+        // A worktree whose `.git` points at a directory that is gone.
+        let broken = temp.path().join("broken-worktree");
+        std::fs::create_dir(&broken).unwrap();
+        std::fs::write(broken.join(".git"), "gitdir: /nonexistent/worktree\n").unwrap();
+
+        let probe = std::env::current_exe().unwrap();
+        for cwd in [&steering, &broken] {
+            let output = std::process::Command::new(&probe)
+                .args([
+                    ENCLOSING_REPOSITORY_PROBE,
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("RG_GIT_ENCLOSING_PROBE_URL", &url)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            let report = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.status.success(),
+                "git run from {} without a repository answered from it:\n{report}",
+                cwd.display()
+            );
+            assert!(
+                report.contains("1 passed"),
+                "the probe did not run:\n{report}"
+            );
+        }
     }
 
     /// Regression guard: ensure no crates use raw `Command::new("git")` outside this file.
