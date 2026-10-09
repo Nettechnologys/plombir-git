@@ -421,13 +421,16 @@ fn total_pages_from(headers: &reqwest::header::HeaderMap, url: &str) -> Result<i
 }
 
 /// URL-encode a project identifier (e.g., "group/project" → "group%2Fproject").
+/// A GitLab project id as one path segment: a number as it is, a
+/// `namespace/project` path with every reserved byte percent-encoded.
+///
+/// Escaping only `/` let a `?`, `#`, `%` or space through raw, so the request
+/// went to another endpoint or another project than the one named.
 fn urlencoding(s: &str) -> String {
     if s.parse::<i64>().is_ok() {
-        // Numeric ID, no encoding needed
         s.to_string()
     } else {
-        // Path encoding: replace '/' with '%2F'
-        s.replace('/', "%2F")
+        ::urlencoding::encode(s).into_owned()
     }
 }
 
@@ -786,5 +789,24 @@ mod redirect_tests {
                 "same-origin request lost its token: {request}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod project_id_tests {
+    use super::urlencoding;
+
+    #[test]
+    fn a_project_path_is_one_segment_whatever_it_contains() {
+        assert_eq!(urlencoding("42"), "42");
+        assert_eq!(urlencoding("group/project"), "group%2Fproject");
+        // Each of these used to reach the URL raw: `?` started a query, `#` a
+        // fragment, `%` an escape of its own, and a space broke the request.
+        assert_eq!(urlencoding("grp/a?b#c"), "grp%2Fa%3Fb%23c");
+        assert_eq!(urlencoding("grp/100%"), "grp%2F100%25");
+        assert_eq!(
+            urlencoding("my group/my project"),
+            "my%20group%2Fmy%20project"
+        );
     }
 }

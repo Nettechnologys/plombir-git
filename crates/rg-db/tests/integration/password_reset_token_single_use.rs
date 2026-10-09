@@ -103,6 +103,41 @@ async fn issue(db: &DatabaseConnection, user_id: i64, label: &str, minutes: i64)
     .id
 }
 
+/// Plant a link that expired `minutes_ago` minutes ago and hand back its id.
+///
+/// On this test's own SQLite file that is a plain `issue` with a past expiry —
+/// nothing else sweeps, and `create` sweeping before its insert is part of what
+/// is under test. On the shared server database the smokes use, a row born
+/// expired is fair game for every neighbouring test's sweep from the instant it
+/// is written: on MySQL `insert` re-reads the row by `LAST_INSERT_ID()` in a
+/// second statement, and a sweep landing between the two turns the insert
+/// itself into `RecordNotFound`. There the link is issued live and back-dated
+/// afterwards, so it is expired only once this test holds its id.
+async fn issue_expired(
+    db: &DatabaseConnection,
+    private_db: bool,
+    user_id: i64,
+    label: &str,
+    minutes_ago: i64,
+) -> i64 {
+    if private_db {
+        return issue(db, user_id, label, -minutes_ago).await;
+    }
+    let id = issue(db, user_id, label, 15).await;
+    rg_db::entities::password_reset_token::Entity::update_many()
+        .col_expr(
+            rg_db::entities::password_reset_token::Column::ExpiresAt,
+            rg_db::sea_orm::sea_query::Expr::value(
+                chrono::Utc::now() - chrono::Duration::minutes(minutes_ago),
+            ),
+        )
+        .filter(rg_db::entities::password_reset_token::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .expect("back-date the link");
+    id
+}
+
 /// Whether the stored row is marked spent.
 async fn is_spent(db: &DatabaseConnection, token_id: i64) -> bool {
     rg_db::entities::password_reset_token::Entity::find()
@@ -184,7 +219,7 @@ async fn a_first_spend_lands_and_spent_or_expired_links_are_refused() {
     );
 
     // Expired, and nobody checked the clock before calling.
-    let stale = issue(&db, user_id, "stale", -1).await;
+    let stale = issue_expired(&db, temp.is_some(), user_id, "stale", 1).await;
     assert!(
         !rg_db::ops::password_reset_token_ops::consume(&db, stale)
             .await
@@ -229,18 +264,24 @@ async fn a_first_spend_lands_and_spent_or_expired_links_are_refused() {
 /// depends on somebody remembering to start a loop is a comment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issuing_a_link_drops_the_links_that_can_no_longer_be_spent() {
-    let (db, _temp, user_id) = setup("retention").await;
+    let (db, temp, user_id) = setup("retention").await;
+    let private_db = temp.is_some();
 
     // Two dead links and one that is still inside its window. `issue` goes
     // through `create`, so each call also sweeps — which is why the live one is
     // planted last and the ids are read before the next call.
-    let stale_one = issue(&db, user_id, "stale1", -30).await;
-    assert!(
-        exists(&db, stale_one).await,
-        "the sweep runs before the insert, so a link cannot delete itself"
-    );
+    let stale_one = issue_expired(&db, private_db, user_id, "stale1", 30).await;
+    // Only this test's own file can answer this: on the shared database the
+    // smokes use, a neighbouring test's `create` sweeps every expired link,
+    // this one included, at any moment after it exists.
+    if private_db {
+        assert!(
+            exists(&db, stale_one).await,
+            "the sweep runs before the insert, so a link cannot delete itself"
+        );
+    }
 
-    let stale_two = issue(&db, user_id, "stale2", -1).await;
+    let stale_two = issue_expired(&db, private_db, user_id, "stale2", 1).await;
     assert!(
         !exists(&db, stale_one).await,
         "issuing a link must drop the expired rows that were already there"

@@ -535,6 +535,19 @@ pub async fn upload_asset(
         }
     };
 
+    // The name is a path twice over once stored — the blob key, and the
+    // pre-migration layout under `repo_root` — and `filename*` is
+    // percent-decoded, so `%2F` and `..` used to reach the row as `/` and
+    // `..` (security audit finding #1). The service refuses the same name
+    // again before it inserts anything; checking here first keeps a body of
+    // up to the asset limit from being staged for a request that cannot
+    // succeed. Typed `InvalidRequest`, so `AppError::from` answers `400`.
+    if let Err(error) =
+        rg_core::platform::path::validate_upload_filename("release asset", &filename)
+    {
+        return AppError::from(error).into_response();
+    }
+
     // Stored already normalised (security audit finding #8): the row never
     // carries a type a browser would run, so a reader that forgets
     // `served_upload_type` — or any other consumer of the column — cannot

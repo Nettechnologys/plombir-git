@@ -23,7 +23,14 @@ services:
       - '--web.console.libraries=/usr/share/prometheus/console_libraries'
       - '--web.console.templates=/usr/share/prometheus/consoles'
       - '--storage.tsdb.retention.time=30d'
-      - '--web.enable-lifecycle'
+      # No `--web.enable-lifecycle`: it adds an unauthenticated `POST /-/quit`
+      # and `POST /-/reload`, so anything that reaches the port — a tunnel left
+      # open, another container on the host, an SSRF from the app — could stop
+      # Prometheus or make it load an edited config. The loopback bind narrows
+      # the audience; it does not authenticate it. After editing
+      # prometheus.yml or alerts.yml, run
+      #   docker compose -f docker-compose.observability.yml restart prometheus
+      # (or `docker kill -s HUP plombir-git-prometheus`) instead.
     depends_on:
       - alertmanager
     networks:
@@ -77,6 +84,9 @@ services:
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
+      # The whole host filesystem, read-only, for the filesystem collector. It
+      # is tolerable only because 9100 is published on 127.0.0.1 above — never
+      # widen that bind without dropping this mount.
       - /:/rootfs:ro
     command:
       - '--path.procfs=/host/proc'

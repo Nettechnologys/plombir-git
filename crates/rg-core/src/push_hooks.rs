@@ -1250,7 +1250,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
                 pipeline_id, target.owner, target.name
             );
             let body = format!(
-                "A CI pipeline has been triggered for repository {}/{} on branch {}.<br/><br/>Commit: {}<br/>Pipeline ID: {}",
+                "A CI pipeline has been triggered for repository {}/{} on branch {}.\n\nCommit: {}\nPipeline ID: {}",
                 target.owner, target.name, update.refname, update.new_sha, pipeline_id
             );
             if let Err(e) =

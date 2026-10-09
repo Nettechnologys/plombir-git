@@ -35,6 +35,7 @@ mod content_disposition;
 mod git_http;
 mod handlers;
 mod http_stream;
+mod log_redaction;
 mod public_url;
 mod refusal;
 // Public for the same reason `route_table` is: `required_pat_scope` states

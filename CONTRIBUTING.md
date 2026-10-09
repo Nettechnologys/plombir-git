@@ -29,8 +29,10 @@ rustup update stable
 cargo fmt
 cargo clippy
 
-# System dependency: git (used for a few pack / diff operations)
-which git
+# System dependency: git 2.38 or newer (pack / diff operations, and the
+# `http.curloptResolve` DNS pin on import / mirror clones that older git ignores —
+# the server and the tests refuse an older binary; Ubuntu 22.04 ships 2.34)
+git --version
 ```
 
 ### Recommended tools

@@ -1217,28 +1217,8 @@ fn get_blob_content(
     let is_binary = data.contains(&0);
 
     let (content, encoding) = if is_binary {
-        let mut s = String::with_capacity(data.len() * 4 / 3 + 4);
-        // Simple base64 encoding
-        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let chunks = data.chunks(3);
-        for chunk in chunks {
-            let b0 = chunk[0] as u32;
-            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-            let triple = (b0 << 16) | (b1 << 8) | b2;
-            s.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
-            s.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
-            if chunk.len() > 1 {
-                s.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
-            } else {
-                s.push('=');
-            }
-            if chunk.len() > 2 {
-                s.push(ALPHABET[(triple & 0x3F) as usize] as char);
-            } else {
-                s.push('=');
-            }
-        }
+        use base64::Engine as _;
+        let s = base64::engine::general_purpose::STANDARD.encode(data);
         (s, "base64".to_string())
     } else {
         (

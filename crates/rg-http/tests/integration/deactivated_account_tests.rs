@@ -306,11 +306,12 @@ async fn deactivating_an_account_kills_the_session_it_already_issued() {
     );
 }
 
-/// The notification WebSocket is the one handshake a browser cannot put a
-/// header on, so it grew two header-free ways to carry the session: the
-/// `bearer.<jwt>` subprotocol and a `?token=` query parameter. Both are session
-/// presentations, and a revocation gate that only reads headers would leave the
-/// offboarded user a live push channel.
+/// The notification WebSocket is the one handshake a browser cannot put an
+/// `Authorization` header on, so it grew a header-free way to carry the
+/// session: the `bearer.<jwt>` subprotocol. It is a session presentation, and
+/// a revocation gate that only reads `Authorization` would leave the offboarded
+/// user a live push channel. (The `?token=` query parameter it once also
+/// accepted is gone — `websocket_query_token_tests` covers its refusal.)
 #[tokio::test]
 async fn a_revoked_session_cannot_open_the_notification_socket() {
     let (base, db) = spawn_test_app_with_db().await;
@@ -321,13 +322,7 @@ async fn a_revoked_session_cannot_open_the_notification_socket() {
     // whether the gate answers before the handler ever sees them, so a live
     // account must get anything *except* 401 and a revoked one exactly 401.
     let socket = format!("{}/api/v1/ws/notifications", base);
-    let via_query = format!("{}?token={}", socket, jwt);
 
-    let by_query = || {
-        let client = client.clone();
-        let url = via_query.clone();
-        async move { client.get(url).send().await.unwrap().status().as_u16() }
-    };
     let by_subprotocol = || {
         let client = client.clone();
         let url = socket.clone();
@@ -345,11 +340,6 @@ async fn a_revoked_session_cannot_open_the_notification_socket() {
     };
 
     assert_ne!(
-        by_query().await,
-        401,
-        "baseline: a live session should not be turned away at the socket via a query parameter"
-    );
-    assert_ne!(
         by_subprotocol().await,
         401,
         "baseline: a live session should not be turned away at the socket via a subprotocol"
@@ -357,11 +347,6 @@ async fn a_revoked_session_cannot_open_the_notification_socket() {
 
     deactivate(&db, user_id).await;
 
-    assert_eq!(
-        by_query().await,
-        401,
-        "a revoked session still reaches the notification socket via a query parameter"
-    );
     assert_eq!(
         by_subprotocol().await,
         401,

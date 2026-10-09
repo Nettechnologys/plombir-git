@@ -189,6 +189,7 @@ failures, prints the uid to `chown` to.
 | `SSH host key path … is a directory` | bind-mounted a host key file that did not exist | remove the directory and let the server generate the key |
 | `audit archive_dir … is unusable` | `[audit].archive_dir` not writable by the container uid | `chown` it as above, point the key elsewhere, or set `[audit].enabled = false` |
 | `backup dir … is unusable` | `[backup].dir` not writable by the container uid | as above, or set `[backup].enabled = false` |
+| `git 2.34.1 is too old: Plombir Git needs git 2.38.0 or newer` | binary run outside the image on a host whose git predates `http.curloptResolve` | install git ≥ 2.38 (Debian 12+, Ubuntu 24.04+, the `git-core` PPA) or use the image |
 | `scheduled database backups … cannot run on the Postgres backend` | `[backup].enabled = true` on a non-SQLite database | set `[backup].enabled = false` and schedule `pg_dump` / `mysqldump` instead |
 | HTTP works, SSH silent | SSH failed on its own; HTTP is unaffected by design | `docker compose logs \| grep 'SSH server error'` |
 
@@ -348,6 +349,27 @@ deleted key file fail immediately with the recovery source named, rather than
 letting MFA, CI and mirror operations fail later. A blank
 `PLOMBIR_GIT_JWT_SECRET=` in `.env` counts as unset, not as "the empty secret".
 
+**Upgrading a quick-start stack (`docker-compose.yml`) started from an older
+image.** Older images ran without `--host-key`, so the server kept the at-rest
+key and the SSH host key in `/home/plombir-git/.ssh/` inside the container, not
+on the volume. Recreating the container (`docker compose up -d` after a `pull`
+or `build`) drops both, and the next start refuses the database because its key
+check no longer matches. Copy them onto the volume **before** you upgrade, while
+the old container is still running:
+
+```bash
+docker compose exec plombir-git sh -c '
+  cp -p /home/plombir-git/.ssh/encryption_key /data/encryption_key &&
+  cp -p /home/plombir-git/.ssh/id_ed25519 /data/ssh_host_key'
+```
+
+The current image passes `--host-key /data/ssh_host_key`, so the server finds
+both there from then on. If the old container is already gone, the key went
+with it, and the start refuses with a message naming the columns it can no
+longer open: those values (TOTP seeds, CI secrets, mirror, LDAP and SSO
+passwords) cannot be recovered by anyone and have to be cleared and re-entered. The `docker-compose.hostdir.yml` layout was
+never affected; its config pins `[server].host_key` under `/data`.
+
 If the encryption key itself leaks, move the database onto a new one with the
 server stopped. The `docker compose stop` below is not advisory: on a
 file-backed SQLite database the command refuses to start while a Plombir Git
@@ -390,7 +412,7 @@ loopback, and link-local SSRF checks remain active.
 ### Volumes
 | Path | Purpose |
 |------|---------|
-| `/data` | Repos, SQLite DB, logs (persistent) |
+| `/data` | Repos, SQLite DB, logs, the SSH host key (`ssh_host_key`) and the at-rest key (`encryption_key`) — all persistent |
 
 ### Runtime Binaries
 
@@ -401,6 +423,16 @@ The Docker image includes all runtime binaries:
 | `plombir-git` | Main server and admin CLI |
 | `plombir-git-runner` | Standalone CI runner agent |
 | `plombir-git-mcp` | MCP stdio server |
+
+The server needs **git 2.38 or newer** on its `PATH` and refuses to start on
+anything older: import and mirror clones pin the remote's checked address
+through `http.curloptResolve`, a key git before 2.38 silently ignores, which
+would let the clone resolve the host itself and bypass the SSRF guard. The
+image's runtime stage is Debian bookworm, whose git (2.39) satisfies this. When
+running the binary outside the image, check `git --version` — Debian 12 and
+Ubuntu 24.04 are fine, Ubuntu 22.04 (2.34) is not without the `git-core` PPA.
+The runner does not need git at all: it receives workspaces from the server as
+archives.
 
 ### SQLite Backup / Restore
 
@@ -594,6 +626,11 @@ rm -f .env.bak
 
 # View logs
 docker compose -f docker-compose.observability.yml logs -f
+
+# Apply an edited prometheus.yml / alerts.yml. Prometheus runs without
+# --web.enable-lifecycle (its reload/quit endpoints have no authentication),
+# so reload by restarting the container:
+docker compose -f docker-compose.observability.yml restart prometheus
 ```
 
 Prometheus scrapes the app at `plombir-git:8080` through the shared Docker
@@ -722,8 +759,10 @@ export OTEL_SERVICE_NAME="plombir-git"
 ```
 
 With no endpoint configured, none of the tracing machinery runs. When enabled,
-each HTTP request produces an `http_request` span (method, uri, status,
-request_id) plus any nested `tracing` spans, and the W3C `traceparent` header is
+each HTTP request produces an `http_request` span (method, path, query, status,
+request_id — the query string with credential-bearing parameters such as
+`token`, `code`, `state` or `signature` replaced by `[redacted]`) plus any
+nested `tracing` spans, and the W3C `traceparent` header is
 honoured so traces stitch across services. Spans are batched on a background
 thread and flushed on graceful shutdown.
 
@@ -749,9 +788,11 @@ The main dashboard (`plombir-git-main`) includes:
 
 ### Environment Variables
 ```bash
-# Grafana admin
+# Grafana admin, read from deploy/.env. The password has no default — the
+# stack refuses to start without one. Generate it, do not invent it:
+#   sed -i.bak "s/^GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=$(openssl rand -hex 16)/" .env
 GRAFANA_ADMIN_USER=admin
-GRAFANA_ADMIN_PASSWORD=your-secure-password
+GRAFANA_ADMIN_PASSWORD=<output of: openssl rand -hex 16>
 
 # Alertmanager (set in alertmanager.yml)
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...

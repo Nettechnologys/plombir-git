@@ -29,6 +29,26 @@ pub enum GitCliError {
     #[error("git not found or not executable: {0}")]
     NotFound(String),
 
+    /// The installed git is below [`MIN_GIT_VERSION`]. Refused at construction
+    /// rather than tolerated, because the missing feature is the DNS pin on
+    /// outbound clones — see the constant for why that is a security boundary.
+    #[error(
+        "git {found} is too old: Plombir Git needs git {minimum} or newer. Outbound clones \
+         (imports, mirror sync) pin the remote's checked address with `http.curloptResolve`, \
+         which git before 2.38 silently ignores — the clone would resolve the host itself, \
+         bypassing the SSRF guard with the stored credential attached"
+    )]
+    UnsupportedVersion { found: String, minimum: String },
+
+    /// `git --version` printed something no known git prints. Refused for the
+    /// same reason as [`Self::UnsupportedVersion`]: a version that cannot be
+    /// read cannot be shown to satisfy the floor.
+    #[error(
+        "could not read a version out of `git --version` output {output:?}; \
+         Plombir Git needs git {minimum} or newer"
+    )]
+    UnrecognizedVersion { output: String, minimum: String },
+
     #[error("git command timed out after {timeout:?}: {command}")]
     Timeout { command: String, timeout: Duration },
 
@@ -52,6 +72,79 @@ pub enum GitCliError {
 
     #[error("I/O error running git: {0}")]
     Io(#[from] std::io::Error),
+}
+
+// ── Version floor ───────────────────────────────────────────────
+
+/// The oldest git this workspace runs against, as `(major, minor, patch)`.
+///
+/// 2.38 is the release that added `http.curloptResolve`. Outbound clones of a
+/// user-selected remote — imports and mirror sync, through
+/// `OutboundGitInvocation::lock_http_destination` in `credentials.rs` — pin
+/// the DNS answer the SSRF guard checked by passing it through that key, and
+/// git treats an `http.*` key it does not know as a no-op: an older binary
+/// resolves the name itself at connect time, after the guard looked, with the
+/// stored credential attached as Basic auth. That is the DNS rebinding the
+/// guard exists to stop, so the floor is a security boundary rather than a
+/// convenience, and every constructor refuses a git below it instead of
+/// letting the server come up and clone through an unpinned resolver.
+pub const MIN_GIT_VERSION: (u64, u64, u64) = (2, 38, 0);
+
+/// Render a `(major, minor, patch)` triple the way git prints one.
+fn format_version((major, minor, patch): (u64, u64, u64)) -> String {
+    format!("{major}.{minor}.{patch}")
+}
+
+/// The leading run of ASCII digits of one dotted component, if there is one.
+///
+/// `0-rc1` reads as 0 and `windows` as nothing: suffixes carry no ordering
+/// this floor cares about.
+fn leading_number(part: &str) -> Option<u64> {
+    let end = part
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(part.len());
+    if end == 0 {
+        return None;
+    }
+    part[..end].parse().ok()
+}
+
+/// Parse the `(major, minor, patch)` out of `git --version` output.
+///
+/// Accepts the shapes real binaries print — `git version 2.39.2`,
+/// `git version 2.45.0.windows.1`, `git version 2.50.0-rc1`,
+/// `git version 2.39.5 (Apple Git-154)` — and returns `None` for anything that
+/// does not start with `git version` followed by at least `major.minor`. A
+/// missing patch component reads as 0.
+pub fn parse_git_version(output: &str) -> Option<(u64, u64, u64)> {
+    let rest = output.trim_start().strip_prefix("git version")?;
+    let token = rest.split_whitespace().next()?;
+    let mut parts = token.split('.');
+    let major = leading_number(parts.next()?)?;
+    let minor = leading_number(parts.next()?)?;
+    let patch = parts.next().and_then(leading_number).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Check `git --version` output against [`MIN_GIT_VERSION`].
+///
+/// Returns the parsed version on success so the caller can log it. The error
+/// names the version found, the floor and the reason, because the person
+/// reading it is an operator deciding whether to upgrade a host package.
+pub fn check_git_version(output: &str) -> Result<(u64, u64, u64), GitCliError> {
+    let first_line = output.lines().next().unwrap_or_default().trim();
+    let version =
+        parse_git_version(first_line).ok_or_else(|| GitCliError::UnrecognizedVersion {
+            output: first_line.to_string(),
+            minimum: format_version(MIN_GIT_VERSION),
+        })?;
+    if version < MIN_GIT_VERSION {
+        return Err(GitCliError::UnsupportedVersion {
+            found: format_version(version),
+            minimum: format_version(MIN_GIT_VERSION),
+        });
+    }
+    Ok(version)
 }
 
 // ── Output ceilings ─────────────────────────────────────────────
@@ -265,31 +358,29 @@ impl Default for GitCommandGateway {
 }
 
 impl GitCommandGateway {
-    /// Create a new gateway, validating that `git` is available.
+    /// Create a new gateway, validating that `git` is available and at least
+    /// [`MIN_GIT_VERSION`].
     pub fn new() -> Result<Self> {
-        let gateway = Self::default();
-        let version = gateway.run(&["--version"], None)?;
-        let version_str = version.stdout_str();
-        if !version_str.starts_with("git version") {
-            bail!("unexpected git --version output: {}", version_str.trim());
-        }
-        tracing::debug!(git_version = %version_str.trim(), "GitCommandGateway initialized");
-        Ok(gateway)
+        Self::default().verified()
     }
 
     /// Create a new gateway with a custom timeout.
     pub fn with_timeout(timeout: Duration) -> Result<Self> {
-        let gateway = Self { timeout };
-        // Validate git availability (cheap call)
-        let version = gateway.run(&["--version"], None)?;
-        if !version.stdout_str().starts_with("git version") {
-            bail!(
-                "unexpected git --version output: {}",
-                version.stdout_str().trim()
-            );
-        }
-        tracing::debug!(?timeout, git_version = %version.stdout_str().trim(), "GitCommandGateway initialized");
-        Ok(gateway)
+        Self { timeout }.verified()
+    }
+
+    /// Run `git --version` and refuse a git that is missing, broken or below
+    /// [`MIN_GIT_VERSION`] (cheap call, once per gateway).
+    fn verified(self) -> Result<Self> {
+        let output = self.run(&["--version"], None)?;
+        output.ensure_success()?;
+        let version = check_git_version(&output.stdout_str())?;
+        tracing::debug!(
+            timeout = ?self.timeout,
+            git_version = %format_version(version),
+            "GitCommandGateway initialized"
+        );
+        Ok(self)
     }
 
     /// Run a git command synchronously and capture its output.
@@ -590,6 +681,105 @@ mod tests {
         let out = gateway.run(&["--version"], None).unwrap();
         assert!(out.stdout_str().contains("git version"));
         assert!(out.success());
+        // The gateway constructed, so the installed git passed the floor; the
+        // parser must agree about what it saw.
+        let version = check_git_version(&out.stdout_str()).expect("installed git parses");
+        assert!(version >= MIN_GIT_VERSION);
+    }
+
+    #[test]
+    fn parse_git_version_accepts_the_shapes_real_binaries_print() {
+        let cases = [
+            ("git version 2.39.2\n", (2, 39, 2)),
+            ("git version 2.45.0.windows.1", (2, 45, 0)),
+            ("git version 2.50.0-rc1", (2, 50, 0)),
+            ("git version 2.39.5 (Apple Git-154)", (2, 39, 5)),
+            ("git version 2.34.1", (2, 34, 1)),
+            ("git version 2.38", (2, 38, 0)),
+            ("git version 2.38.0.rc2", (2, 38, 0)),
+            ("  git version 2.43.0  ", (2, 43, 0)),
+        ];
+        for (output, expected) in cases {
+            assert_eq!(parse_git_version(output), Some(expected), "{output:?}");
+        }
+    }
+
+    #[test]
+    fn parse_git_version_rejects_output_without_a_version() {
+        for output in [
+            "",
+            "git version",
+            "git version x.y.z",
+            "git version .38.0",
+            "usage: git [-v | --version] [-h | --help]",
+            "2.39.2",
+            "hg version 6.0",
+        ] {
+            assert_eq!(parse_git_version(output), None, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn check_git_version_compares_against_the_floor_in_order() {
+        assert_eq!(MIN_GIT_VERSION, (2, 38, 0));
+        for output in [
+            "git version 2.38.0",
+            "git version 2.38.1",
+            "git version 2.39.2",
+            "git version 2.45.0.windows.1",
+            "git version 2.100.0",
+            "git version 3.0.0",
+        ] {
+            assert!(check_git_version(output).is_ok(), "{output:?}");
+        }
+        // Highest versions below the floor on each axis: comparison must be
+        // numeric and lexicographic by component, not textual.
+        for output in [
+            "git version 2.37.9",
+            "git version 2.37.100",
+            "git version 2.9.9",
+            "git version 1.99.99",
+        ] {
+            let error = check_git_version(output).expect_err(output);
+            assert!(
+                matches!(error, GitCliError::UnsupportedVersion { .. }),
+                "{output:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_old_git_is_rejected_naming_found_minimum_and_reason() {
+        let error = check_git_version("git version 2.34.1\n").expect_err("2.34.1 is below 2.38.0");
+        let message = error.to_string();
+        assert!(
+            matches!(
+                &error,
+                GitCliError::UnsupportedVersion { found, minimum }
+                    if found == "2.34.1" && minimum == "2.38.0"
+            ),
+            "{error:?}"
+        );
+        assert!(message.contains("git 2.34.1 is too old"), "{message}");
+        assert!(message.contains("git 2.38.0 or newer"), "{message}");
+        assert!(message.contains("http.curloptResolve"), "{message}");
+        assert!(message.contains("SSRF"), "{message}");
+    }
+
+    #[test]
+    fn unparsable_version_output_is_rejected_quoting_it() {
+        let error = check_git_version("usage: git [-v | --version]\nmore lines\n")
+            .expect_err("usage text is not a version");
+        let message = error.to_string();
+        assert!(
+            matches!(&error, GitCliError::UnrecognizedVersion { output, .. } if output == "usage: git [-v | --version]"),
+            "{error:?}"
+        );
+        assert!(message.contains("usage: git [-v | --version]"), "{message}");
+        assert!(message.contains("2.38.0 or newer"), "{message}");
+
+        let empty = check_git_version("").expect_err("empty output is not a version");
+        assert!(matches!(empty, GitCliError::UnrecognizedVersion { .. }));
     }
 
     #[test]

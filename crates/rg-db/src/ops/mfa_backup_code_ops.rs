@@ -172,12 +172,39 @@ pub async fn reissue_codes(
 /// `false` covers both "no such code" and "already spent" — deliberately, and
 /// not only because the caller does not need to tell them apart: answering them
 /// differently would tell whoever is guessing that a code existed.
+///
+/// A contention refusal is run again. The `UPDATE` reaches its row through the
+/// `user_id` index — the only one the table has — and on InnoDB that takes
+/// next-key locks in the same gaps [`reissue_codes`] for the account next door
+/// deletes and inserts in. The MySQL smoke has seen InnoDB pick this statement
+/// as the deadlock victim (1213, from the "another account's code" spend in
+/// `mfa_backup_code_single_use`, while the neighbouring-reissue test ran);
+/// the exact interleaving has not been reproduced on demand. The statement runs
+/// on its own, so a victim was rolled back whole and nothing was spent: running
+/// it again is what InnoDB asks for, and the alternative is a second factor
+/// that fails with a 500 because somebody else regenerated their codes.
 pub async fn verify_and_consume(
     db: &DatabaseConnection,
     user_id: i64,
     code: &str,
 ) -> Result<bool, DbErr> {
     let hash = hash_code(code);
+    let mut attempt = 1;
+    loop {
+        match consume_once(db, user_id, &hash).await {
+            Err(error)
+                if attempt < crate::contention::MAX_ATTEMPTS
+                    && crate::is_retryable_transaction_error(&error) =>
+            {
+                tokio::time::sleep(crate::contention::contention_backoff(attempt)).await;
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+async fn consume_once(db: &DatabaseConnection, user_id: i64, hash: &str) -> Result<bool, DbErr> {
     let result = Entity::update_many()
         .col_expr(mfa_backup_code::Column::Used, Expr::value(true))
         .col_expr(

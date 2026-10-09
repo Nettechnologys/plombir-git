@@ -139,6 +139,11 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    # git 2.38 or newer, which bookworm's 2.39 satisfies: the server refuses to
+    # start below it, because the DNS pin on import/mirror clones
+    # (`http.curloptResolve`) only exists from 2.38 — see
+    # `rg_git::cli_gateway::MIN_GIT_VERSION`. Changing the base image means
+    # re-checking this.
     git \
     curl \
     libsqlite3-0 \
@@ -191,6 +196,13 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 # Default command: serve with config via env vars.
 # Set PLOMBIR_GIT_JWT_SECRET env var before running.
+# `--host-key` keeps every file the server creates for itself on the `/data`
+# volume: the SSH host key, and beside it the at-rest encryption key
+# (`resolve_encryption_key_file` puts `encryption_key` next to the host key).
+# Without it both defaulted to `$HOME/.ssh` — the container layer — so
+# recreating the container (any image upgrade) dropped the key that decrypts
+# TOTP seeds, CI secrets and SSO/LDAP passwords, and the next start refused the
+# database it no longer matched.
 # No --log-file: the log goes to stdout, which is what `docker compose logs`
 # and every Docker log driver read. A file here left `docker compose logs`
 # empty while deploy/README.md told operators to look there.
@@ -198,4 +210,5 @@ CMD ["plombir-git", "serve", \
      "--repo-root", "/data/repos", \
      "--http-addr", "0.0.0.0:8080", \
      "--ssh-addr", "0.0.0.0:2222", \
+     "--host-key", "/data/ssh_host_key", \
      "--db-url", "sqlite:///data/plombir-git.db?mode=rwc"]

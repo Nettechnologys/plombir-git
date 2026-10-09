@@ -336,6 +336,11 @@ jobs:
       # Single-use and compare-and-swap are claims the *database* arbitrates, so
       # they are claims about each backend. Both files honour
       # PLOMBIR_GIT_TEST_DATABASE_URL for exactly this step.
+      # SQLite answers `SUM(integer)` with an INTEGER; this backend does not,
+      # and only a non-NULL total exposes the difference.
+      - name: Prove integer SUM aggregates decode on PostgreSQL
+        run: "cargo test -p rg-db -j 6 --test integration aggregate_sums_decode:: -- --nocapture"
+
       - name: Prove single-use credentials hold on PostgreSQL
         run: >-
           cargo test -p rg-db -j 6 --test integration -- --nocapture
@@ -409,6 +414,11 @@ jobs:
       # *changed* rows rather than matched ones, so a compare-and-swap that
       # answers from `rows_affected` alone reads a no-op as a lost race here and
       # nowhere else.
+      # SQLite answers `SUM(integer)` with an INTEGER; this backend does not,
+      # and only a non-NULL total exposes the difference.
+      - name: Prove integer SUM aggregates decode on MySQL
+        run: "cargo test -p rg-db -j 6 --test integration aggregate_sums_decode:: -- --nocapture"
+
       - name: Prove single-use credentials hold on MySQL
         run: >-
           cargo test -p rg-db -j 6 --test integration -- --nocapture
@@ -908,6 +918,18 @@ jobs:
             docker logs plombir-git-smoke >&2 || true
             exit 1
           fi
+
+          # The image's own state files must land on the volume, not in the
+          # container layer: a key kept in `$HOME/.ssh` is gone with the
+          # container, and the next start refuses the database it encrypted.
+          for state_file in /data/encryption_key /data/ssh_host_key; do
+            if ! docker exec plombir-git-smoke test -s "${state_file}"; then
+              echo "The default command left ${state_file} missing: the server" >&2
+              echo "keeps its keys outside the /data volume." >&2
+              docker logs plombir-git-smoke >&2 || true
+              exit 1
+            fi
+          done
 
           if ! curl -fsS http://127.0.0.1:18080/ | grep -qi '<!doctype html'; then
             echo "The server is healthy but / is not the frontend — check the" >&2

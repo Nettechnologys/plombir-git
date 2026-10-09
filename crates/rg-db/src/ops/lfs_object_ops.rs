@@ -165,7 +165,10 @@ pub async fn usage(db: &DatabaseConnection, repo_id: i64) -> Result<(u64, i64)> 
     let usage = LfsEntity::find()
         .select_only()
         .column_as(lfs_object::Column::Id.count(), "count")
-        .column_as(lfs_object::Column::Size.sum(), "bytes")
+        .column_as(
+            super::aggregate::sum_i64(db.get_database_backend(), lfs_object::Column::Size),
+            "bytes",
+        )
         .filter(lfs_object::Column::RepoId.eq(repo_id))
         .filter(lfs_object::Column::Uploaded.eq(true))
         .into_model::<Usage>()
