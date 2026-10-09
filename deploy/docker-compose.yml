@@ -40,8 +40,10 @@ services:
       - plombir-git-data:/data
       # Config file (optional — mount your plombir-git.toml here)
       # - ./plombir-git.toml:/app/plombir-git.toml:ro
-      # SSH host key (persist to avoid key change on restart)
-      # - ./ssh_host_key:/app/ssh_host_key:ro
+      # The image's default command keeps the SSH host key and the at-rest
+      # encryption key on this volume too (/data/ssh_host_key,
+      # /data/encryption_key), so neither changes when the container is
+      # recreated. Back them up with the rest of /data.
     # PLOMBIR_GIT_JWT_SECRET is required and is read from deploy/.env.
     # Optional SMTP settings can also be added to that file.
     env_file:

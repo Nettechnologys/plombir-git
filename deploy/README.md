@@ -348,6 +348,27 @@ deleted key file fail immediately with the recovery source named, rather than
 letting MFA, CI and mirror operations fail later. A blank
 `PLOMBIR_GIT_JWT_SECRET=` in `.env` counts as unset, not as "the empty secret".
 
+**Upgrading a quick-start stack (`docker-compose.yml`) started from an older
+image.** Older images ran without `--host-key`, so the server kept the at-rest
+key and the SSH host key in `/home/plombir-git/.ssh/` inside the container, not
+on the volume. Recreating the container (`docker compose up -d` after a `pull`
+or `build`) drops both, and the next start refuses the database because its key
+check no longer matches. Copy them onto the volume **before** you upgrade, while
+the old container is still running:
+
+```bash
+docker compose exec plombir-git sh -c '
+  cp -p /home/plombir-git/.ssh/encryption_key /data/encryption_key &&
+  cp -p /home/plombir-git/.ssh/id_ed25519 /data/ssh_host_key'
+```
+
+The current image passes `--host-key /data/ssh_host_key`, so the server finds
+both there from then on. If the old container is already gone, the key went
+with it, and the start refuses with a message naming the columns it can no
+longer open: those values (TOTP seeds, CI secrets, mirror, LDAP and SSO
+passwords) cannot be recovered by anyone and have to be cleared and re-entered. The `docker-compose.hostdir.yml` layout was
+never affected; its config pins `[server].host_key` under `/data`.
+
 If the encryption key itself leaks, move the database onto a new one with the
 server stopped. The `docker compose stop` below is not advisory: on a
 file-backed SQLite database the command refuses to start while a Plombir Git
@@ -390,7 +411,7 @@ loopback, and link-local SSRF checks remain active.
 ### Volumes
 | Path | Purpose |
 |------|---------|
-| `/data` | Repos, SQLite DB, logs (persistent) |
+| `/data` | Repos, SQLite DB, logs, the SSH host key (`ssh_host_key`) and the at-rest key (`encryption_key`) — all persistent |
 
 ### Runtime Binaries
 

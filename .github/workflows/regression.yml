@@ -909,6 +909,18 @@ jobs:
             exit 1
           fi
 
+          # The image's own state files must land on the volume, not in the
+          # container layer: a key kept in `$HOME/.ssh` is gone with the
+          # container, and the next start refuses the database it encrypted.
+          for state_file in /data/encryption_key /data/ssh_host_key; do
+            if ! docker exec plombir-git-smoke test -s "${state_file}"; then
+              echo "The default command left ${state_file} missing: the server" >&2
+              echo "keeps its keys outside the /data volume." >&2
+              docker logs plombir-git-smoke >&2 || true
+              exit 1
+            fi
+          done
+
           if ! curl -fsS http://127.0.0.1:18080/ | grep -qi '<!doctype html'; then
             echo "The server is healthy but / is not the frontend — check the" >&2
             echo "web/build copy in the Dockerfile's runtime stage." >&2
