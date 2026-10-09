@@ -8,16 +8,22 @@
 //! reads a `4xx` as "do not bother". The two cases have to be different
 //! answers.
 //!
+//! Since card_0d7c54cae647 the callback answers a browser with a redirect to
+//! the login page whatever happened, so the two answers are two `sso_error`
+//! codes: `provider_unavailable` for an outage, and the specific refusal the
+//! person can act on otherwise. The status split is still made — it decides
+//! the code and the log level.
+//!
 //! These drive the real `authorize → callback` round trip against a mock OIDC
 //! provider whose failure mode each test picks, because the classification has
 //! to hold on the path a browser actually walks. Every outage test is paired
-//! with the `400`s that must survive it — a provider that refuses the grant, a
-//! profile that identifies nobody — so a green `502` proves the split and not a
-//! handler that answers `502` to everything.
+//! with the refusals that must survive it — a provider that refuses the grant,
+//! a profile that identifies nobody — so a green `provider_unavailable` proves
+//! the split and not a handler that answers it to everything.
 
 use std::collections::HashMap;
 
-use crate::common::{build_test_app_state_with, setup_test_db, StateOverrides};
+use crate::common::{build_test_app_state_with, setup_test_db, SsoCallbackOutcome, StateOverrides};
 use axum::extract::{Form, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -244,7 +250,7 @@ impl Harness {
     }
 
     /// One full login attempt, exactly as a browser drives it.
-    async fn sign_in(&self) -> (StatusCode, String) {
+    async fn sign_in(&self) -> SsoCallbackOutcome {
         let authorize = self
             .client
             .get(format!("{}/api/v1/auth/sso/idp", self.base))
@@ -265,7 +271,7 @@ impl Harness {
             .send()
             .await
             .unwrap();
-        (callback.status(), callback.text().await.unwrap())
+        SsoCallbackOutcome::of(&callback)
     }
 }
 
@@ -283,31 +289,36 @@ impl Drop for Harness {
 /// login completes when the provider is healthy.
 #[tokio::test]
 async fn a_healthy_provider_still_signs_in() {
-    let (status, body) = Harness::start(Behaviour::Healthy).await.sign_in().await;
+    let outcome = Harness::start(Behaviour::Healthy).await.sign_in().await;
 
+    assert_eq!(outcome.status, StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(
-        status,
-        StatusCode::TEMPORARY_REDIRECT,
-        "the healthy round trip must still complete, got body: {body}"
+        outcome.refusal(),
+        None,
+        "the healthy round trip must still complete, went to: {}",
+        outcome.location
+    );
+    assert!(
+        outcome.session_issued,
+        "the healthy sign-in issued no session"
     );
 }
 
 /// The defect: the provider's own `500` was signed as the client's bad request.
+/// The browser now gets a redirect either way, so the split lives in the
+/// reason the login page explains: an outage, not something to fix.
 #[tokio::test]
 async fn a_userinfo_endpoint_that_answers_500_is_not_the_clients_fault() {
-    let (status, body) = Harness::start(Behaviour::UserinfoServerError)
+    let outcome = Harness::start(Behaviour::UserinfoServerError)
         .await
         .sign_in()
         .await;
 
-    assert_eq!(
-        status,
-        StatusCode::BAD_GATEWAY,
-        "a provider that failed to answer must not be reported as a bad request, got body: {body}"
-    );
+    outcome.assert_refused("/login", "provider_unavailable");
     assert!(
-        !body.contains("failed to fetch user info"),
-        "the operator's reason must stay in the log, not in the client's body: {body}"
+        !outcome.location.contains("user%20info") && !outcome.location.contains("user info"),
+        "the operator's reason must stay in the log, not in the redirect: {}",
+        outcome.location
     );
 }
 
@@ -315,70 +326,43 @@ async fn a_userinfo_endpoint_that_answers_500_is_not_the_clients_fault() {
 /// an HTTP status — the case a status-only classification would miss.
 #[tokio::test]
 async fn a_userinfo_endpoint_that_refuses_the_connection_is_not_the_clients_fault() {
-    let (status, body) = Harness::start(Behaviour::UserinfoUnreachable)
+    Harness::start(Behaviour::UserinfoUnreachable)
         .await
         .sign_in()
-        .await;
-
-    assert_eq!(
-        status,
-        StatusCode::BAD_GATEWAY,
-        "an unreachable provider must not be reported as a bad request, got body: {body}"
-    );
+        .await
+        .assert_refused("/login", "provider_unavailable");
 }
 
 /// The token exchange half of the same split.
 #[tokio::test]
 async fn a_token_endpoint_that_answers_500_is_not_the_clients_fault() {
-    let (status, body) = Harness::start(Behaviour::TokenServerError)
+    Harness::start(Behaviour::TokenServerError)
         .await
         .sign_in()
-        .await;
-
-    assert_eq!(
-        status,
-        StatusCode::BAD_GATEWAY,
-        "a failed token exchange against a broken provider is not a bad request, got body: {body}"
-    );
+        .await
+        .assert_refused("/login", "provider_unavailable");
 }
 
-/// The `400` that has to survive the change: a provider that *answered* and
-/// refused the grant is an expired or already-redeemed code, and starting the
-/// sign-in again is exactly the right remedy.
+/// The refusal that has to stay distinct from an outage: a provider that
+/// *answered* and refused the grant is an expired or already-redeemed code,
+/// and starting the sign-in again is exactly the right remedy.
 #[tokio::test]
-async fn a_provider_that_refuses_the_grant_is_still_a_400() {
-    let (status, body) = Harness::start(Behaviour::TokenRefusesGrant)
+async fn a_provider_that_refuses_the_grant_is_still_the_callers_to_fix() {
+    Harness::start(Behaviour::TokenRefusesGrant)
         .await
         .sign_in()
-        .await;
-
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "a refused authorization grant is the one thing here the caller can fix, got body: {body}"
-    );
-    assert!(
-        body.contains("start the sign-in again"),
-        "the refusal has to say what to do about it, got: {body}"
-    );
+        .await
+        .assert_refused("/login", "code_rejected");
 }
 
-/// The other `400` that has to survive: the provider answered fine, and its
-/// answer identifies nobody. Same handler, same call, opposite classification.
+/// The other refusal that has to stay distinct: the provider answered fine,
+/// and its answer identifies nobody. Same handler, same call, opposite
+/// classification.
 #[tokio::test]
-async fn a_profile_without_an_email_is_still_a_400() {
-    let (status, body) = Harness::start(Behaviour::UserinfoWithoutEmail)
+async fn a_profile_without_an_email_is_named_as_such() {
+    Harness::start(Behaviour::UserinfoWithoutEmail)
         .await
         .sign_in()
-        .await;
-
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "a profile that identifies nobody is the caller's to fix, got body: {body}"
-    );
-    assert!(
-        body.contains("no email address"),
-        "the refusal has to name the defect, got: {body}"
-    );
+        .await
+        .assert_refused("/login", "profile_no_email");
 }

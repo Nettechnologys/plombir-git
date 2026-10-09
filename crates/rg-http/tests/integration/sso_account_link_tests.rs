@@ -17,7 +17,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::common::{build_test_app_state_with, register_full, setup_test_db, StateOverrides};
+use crate::common::{
+    build_test_app_state_with, register_full, setup_test_db, SsoCallbackOutcome, StateOverrides,
+};
 use axum::extract::{Form, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -109,6 +111,7 @@ struct Callback {
     status: StatusCode,
     headers: HeaderMap,
     body: String,
+    outcome: SsoCallbackOutcome,
 }
 
 struct Harness {
@@ -215,10 +218,12 @@ impl Harness {
             .send()
             .await
             .unwrap();
+        let outcome = SsoCallbackOutcome::of(&response);
         Callback {
             status: response.status(),
             headers: response.headers().clone(),
             body: response.text().await.unwrap(),
+            outcome,
         }
     }
 
@@ -348,20 +353,14 @@ async fn a_first_sso_sign_in_never_enters_a_local_account_holding_its_address() 
 
     let response = app.sign_in().await;
 
-    assert_eq!(
-        response.status,
-        StatusCode::CONFLICT,
-        "body: {}",
-        response.body
-    );
-    let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
-    assert_eq!(body["error"]["code"], "CONFLICT", "{body}");
+    // The login page turns `link_required` into "sign in to that account and
+    // link <provider> under Settings → Security"; the provider travels along
+    // so the page can name it.
+    response.outcome.assert_refused("/login", "link_required");
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("link Corp IdP under Settings"),
-        "the refusal does not say how the owner gets in: {body}"
+        response.outcome.location.ends_with("&provider=idp"),
+        "the refusal does not name the provider to link: {}",
+        response.outcome.location
     );
     assert_nothing_attached(&app, &response, squatter_id).await;
 }
@@ -383,19 +382,12 @@ async fn an_unverified_address_on_a_closed_provider_does_not_say_whether_it_is_t
     });
     let free = app.sign_in().await;
 
-    assert_eq!(taken.status, StatusCode::FORBIDDEN, "body: {}", taken.body);
-    // Everything but the per-request id.
-    let answer = |response: &Callback| {
-        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
-        (
-            response.status,
-            body["error"]["code"].clone(),
-            body["error"]["message"].clone(),
-        )
-    };
+    taken
+        .outcome
+        .assert_refused("/login", "auto_provision_disabled");
     assert_eq!(
-        answer(&taken),
-        answer(&free),
+        (taken.status, &taken.outcome.location, &taken.body),
+        (free.status, &free.outcome.location, &free.body),
         "a closed provider answered a taken address differently from a free one"
     );
     assert_nothing_attached(&app, &taken, squatter_id).await;
@@ -410,12 +402,7 @@ async fn an_unverified_address_on_an_open_provider_does_not_enter_the_account_ei
 
     let response = app.sign_in().await;
 
-    assert_eq!(
-        response.status,
-        StatusCode::CONFLICT,
-        "body: {}",
-        response.body
-    );
+    response.outcome.assert_refused("/login", "link_required");
     assert_nothing_attached(&app, &response, squatter_id).await;
 }
 
@@ -541,12 +528,9 @@ async fn a_link_request_does_not_outlive_the_session_that_made_it() {
         .unwrap();
     let response = app.callback(&cookies).await;
 
-    assert_eq!(
-        response.status,
-        StatusCode::UNAUTHORIZED,
-        "body: {}",
-        response.body
-    );
+    response
+        .outcome
+        .assert_refused("/settings/security", "session_ended");
     assert!(app.link_of("victim-subject").await.is_none());
     assert_eq!(app.links_of_user(alice_id).await, 0);
     assert_eq!(app.link_journal_entries(alice_id).await, 0);
@@ -575,12 +559,9 @@ async fn a_forged_link_request_is_refused_rather_than_signed_in() {
         .collect();
     let response = app.callback(&forged).await;
 
-    assert_eq!(
-        response.status,
-        StatusCode::FORBIDDEN,
-        "body: {}",
-        response.body
-    );
+    response
+        .outcome
+        .assert_refused("/settings/security", "state_invalid");
     assert_eq!(issued_session(&response.headers), None);
     assert!(app.link_of("victim-subject").await.is_none());
     assert_eq!(app.links_of_user(alice_id).await, 0);
@@ -610,12 +591,9 @@ async fn an_identity_linked_to_another_account_stays_where_it_is() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let response = app.callback(&cookies).await;
 
-    assert_eq!(
-        response.status,
-        StatusCode::CONFLICT,
-        "body: {}",
-        response.body
-    );
+    response
+        .outcome
+        .assert_refused("/settings/security", "linked_elsewhere");
     assert_eq!(
         app.link_of("victim-subject").await.unwrap().user_id,
         bob_id,

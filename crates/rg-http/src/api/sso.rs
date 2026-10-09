@@ -228,10 +228,10 @@ enum LinkIntent {
     Invalid,
 }
 
-fn read_link_intent(headers: &HeaderMap, slug: &str, csrf_state: &str, secret: &str) -> LinkIntent {
-    use hmac::Mac;
-
-    let Some(raw) = headers
+/// The raw link-intent cookie, verified or not. Its presence alone says the
+/// round trip started on the security settings page.
+fn link_cookie_raw(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
@@ -242,7 +242,12 @@ fn read_link_intent(headers: &HeaderMap, slug: &str, csrf_state: &str, secret: &
                 .and_then(|rest| rest.strip_prefix('='))
         })
         .filter(|value| !value.is_empty())
-    else {
+}
+
+fn read_link_intent(headers: &HeaderMap, slug: &str, csrf_state: &str, secret: &str) -> LinkIntent {
+    use hmac::Mac;
+
+    let Some(raw) = link_cookie_raw(headers) else {
         return LinkIntent::Absent;
     };
 
@@ -696,7 +701,7 @@ async fn link_identity_to_requesting_account(
     user_info: &rg_core::auth::sso::SsoIdentity,
     requester: (i64, i64),
     headers: &HeaderMap,
-) -> Result<axum::response::Response, AppError> {
+) -> Result<axum::response::Response, SsoRefusal> {
     let (user_id, session_version) = requester;
     let db = &state.db;
 
@@ -708,16 +713,22 @@ async fn link_identity_to_requesting_account(
         .map_err(AppError::from)?
         .filter(|user| user.is_usable() && user.session_version == session_version)
         .ok_or_else(|| {
-            AppError::unauthorized(
-                "the session that asked for this link has ended; sign in and start linking again",
+            SsoRefusal::new(
+                SsoFailure::SessionEnded,
+                AppError::unauthorized(
+                    "the session that asked for this link has ended; sign in and start linking again",
+                ),
             )
         })?;
 
     let already_linked_elsewhere = || {
-        AppError::conflict(format!(
-            "this {} identity is already linked to another account",
-            provider.name
-        ))
+        SsoRefusal::new(
+            SsoFailure::LinkedElsewhere,
+            AppError::conflict(format!(
+                "this {} identity is already linked to another account",
+                provider.name
+            )),
+        )
     };
 
     if let Some(existing) = rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
@@ -736,7 +747,9 @@ async fn link_identity_to_requesting_account(
         return Ok(link_completed_redirect(&provider.slug));
     }
 
-    refuse_second_identity_from(state, user.id, provider).await?;
+    refuse_second_identity_from(state, user.id, provider)
+        .await
+        .map_err(|error| SsoRefusal::from_status(SsoFailure::ProviderAlreadyLinked, error))?;
 
     // Named before the link is written, per the rule in `access_audit`.
     let actor = grant_actor(state, user.id).await?;
@@ -750,7 +763,7 @@ async fn link_identity_to_requesting_account(
     )
     .await
     .map_err(AppError::from)?
-    .ok_or_else(sso_identity_link_changed)?;
+    .ok_or_else(|| SsoRefusal::new(SsoFailure::Retry, sso_identity_link_changed()))?;
     // `link` converges on whoever won a concurrent insert of this identity —
     // and the winner may be another account.
     if linked.user_id != user.id {
@@ -797,11 +810,14 @@ fn link_completed_redirect(slug: &str) -> axum::response::Response {
         ("state" = Option<String>, Query, description = "OAuth state parameter"),
     ),
     responses(
-        (status = 200, description = "Login successful", body = LoginResponse),
-        (status = 400, description = "Token exchange failed"),
-        (status = 403, description = "CSRF state mismatch"),
-        (status = 404, description = "SSO provider not found"),
-        (status = 409, description = "Identity link changed during callback"),
+        (status = 307, description = "Always a redirect, because a browser window is what follows it. \
+            Success: to `/dashboard` with the session cookie, to `/login?sso_mfa_required=1` for a second \
+            factor, or to `/settings/security?sso_linked=<slug>` after a link. Refusal: to `/login` (or \
+            `/settings/security` for a link) with `sso_error=<code>&provider=<slug>`, where `code` is one of \
+            `state_invalid`, `provider_unavailable`, `code_rejected`, `profile_no_id`, `profile_no_email`, \
+            `profile_bad_email`, `profile_unverified_email`, `profile_no_username`, `link_required`, \
+            `auto_provision_disabled`, `email_domain_not_allowed`, `email_not_verified`, `account_disabled`, `account_locked`, `linked_elsewhere`, \
+            `provider_already_linked`, `session_ended`, `retry`, `server_error`, `failed`."),
     ),
 )]
 pub async fn callback(
@@ -809,7 +825,168 @@ pub async fn callback(
     headers: HeaderMap,
     Path(slug): Path<String>,
     Query(query): Query<SsoCallbackQuery>,
-) -> Result<impl IntoResponse, AppError> {
+) -> axum::response::Response {
+    // The callback is a top-level navigation back from the provider's site:
+    // whatever it answers is what the browser window shows. A refusal is
+    // therefore a redirect to the page the round trip started from, carrying
+    // a machine code that page turns into a sentence — never the JSON error
+    // envelope, which nobody but a browser ever receives here
+    // (card_0d7c54cae647).
+    let started_from_settings = link_cookie_raw(&headers).is_some();
+    let page_slug = slug.clone();
+    match callback_inner(state, headers, slug, query).await {
+        Ok(response) => response,
+        Err(refusal) => refusal.redirect(&page_slug, started_from_settings),
+    }
+}
+
+/// Why a browser's SSO round trip was refused: the `sso_error` code the
+/// login page (or, for a link, the security settings page) explains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SsoFailure {
+    /// The CSRF state, PKCE verifier or link request did not verify — an
+    /// expired round trip, or one started in another window.
+    StateInvalid,
+    /// The provider is unknown, switched off, or did not answer.
+    ProviderUnavailable,
+    /// The provider refused to redeem the authorization code.
+    CodeRejected,
+    /// The provider's profile identifies nobody usable: no id, no or a
+    /// malformed address, an address it calls unconfirmed, no username.
+    Profile(rg_core::auth::sso::SsoIdentityDefect),
+    /// An account here already holds the address; it has to link the provider.
+    LinkRequired,
+    /// This provider may not create an account for this address; the code is
+    /// the rule's own stable label, so the page can say which rule refused.
+    ProvisioningRefused(rg_core::user::provisioning::ProvisioningRefusal),
+    AccountDisabled,
+    AccountLocked,
+    /// Linking: the identity belongs to another account.
+    LinkedElsewhere,
+    /// Linking: this account already has an identity from this provider.
+    ProviderAlreadyLinked,
+    /// Linking: the session that asked for the link has ended.
+    SessionEnded,
+    /// A concurrent sign-in changed the link mid-way; starting again works.
+    Retry,
+    /// The server could not finish; nothing the person did caused it.
+    ServerError,
+    /// A refusal no more specific code describes.
+    Failed,
+}
+
+impl SsoFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::StateInvalid => "state_invalid",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::CodeRejected => "code_rejected",
+            Self::Profile(defect) => match defect {
+                rg_core::auth::sso::SsoIdentityDefect::MissingProviderUserId => "profile_no_id",
+                rg_core::auth::sso::SsoIdentityDefect::MissingEmail => "profile_no_email",
+                rg_core::auth::sso::SsoIdentityDefect::MalformedEmail => "profile_bad_email",
+                rg_core::auth::sso::SsoIdentityDefect::UnverifiedEmail => {
+                    "profile_unverified_email"
+                }
+                rg_core::auth::sso::SsoIdentityDefect::UnusableUsername => "profile_no_username",
+            },
+            Self::LinkRequired => "link_required",
+            Self::ProvisioningRefused(refusal) => refusal.reason(),
+            Self::AccountDisabled => "account_disabled",
+            Self::AccountLocked => "account_locked",
+            Self::LinkedElsewhere => "linked_elsewhere",
+            Self::ProviderAlreadyLinked => "provider_already_linked",
+            Self::SessionEnded => "session_ended",
+            Self::Retry => "retry",
+            Self::ServerError => "server_error",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// A refused callback: the reason the page shows, and the error the server
+/// logs. `?` on an [`AppError`] gives it a reason from its status alone; the
+/// refusals a person can act on name theirs explicitly.
+struct SsoRefusal {
+    reason: SsoFailure,
+    error: AppError,
+}
+
+impl SsoRefusal {
+    fn new(reason: SsoFailure, error: AppError) -> Self {
+        Self { reason, error }
+    }
+
+    /// `reason` for a refusal of the request; a server or upstream failure
+    /// keeps the reason its status gives, so an outage is never explained to
+    /// the person as something they did.
+    fn from_status(reason: SsoFailure, error: AppError) -> Self {
+        if error.status().is_client_error() {
+            Self::new(reason, error)
+        } else {
+            Self::from(error)
+        }
+    }
+
+    fn redirect(self, slug: &str, started_from_settings: bool) -> axum::response::Response {
+        let Self { reason, error } = self;
+        if error.status().is_server_error() {
+            tracing::error!(
+                provider = %slug,
+                reason = reason.code(),
+                status = error.status().as_u16(),
+                error = %error,
+                "SSO callback failed"
+            );
+        } else {
+            tracing::warn!(
+                provider = %slug,
+                reason = reason.code(),
+                status = error.status().as_u16(),
+                error = %error,
+                "SSO callback refused"
+            );
+        }
+        let page = if started_from_settings {
+            "/settings/security"
+        } else {
+            "/login"
+        };
+        let target = format!(
+            "{page}?sso_error={}&provider={}",
+            reason.code(),
+            encode_query_component(slug)
+        );
+        let mut redirect = Redirect::temporary(&target).into_response();
+        clear_state_cookie(&mut redirect, SSO_STATE_COOKIE);
+        clear_state_cookie(&mut redirect, SSO_VERIFIER_COOKIE);
+        clear_state_cookie(&mut redirect, SSO_LINK_COOKIE);
+        redirect
+    }
+}
+
+impl From<AppError> for SsoRefusal {
+    fn from(error: AppError) -> Self {
+        let reason = match &error {
+            AppError::BadGateway(_) | AppError::Timeout(_) => SsoFailure::ProviderUnavailable,
+            AppError::ServiceUnavailable(_) | AppError::InternalError(_) => SsoFailure::ServerError,
+            AppError::Conflict(_) => SsoFailure::Retry,
+            _ => SsoFailure::Failed,
+        };
+        Self { reason, error }
+    }
+}
+
+async fn callback_inner(
+    state: AppState,
+    headers: HeaderMap,
+    slug: String,
+    query: SsoCallbackQuery,
+) -> Result<axum::response::Response, SsoRefusal> {
+    let state_invalid = |message: &'static str| {
+        SsoRefusal::new(SsoFailure::StateInvalid, AppError::forbidden(message))
+    };
+
     // ── CSRF state validation ────────────────────────────────────
     let expected_state = verify_state_cookie(&headers, SSO_STATE_COOKIE, &state.jwt_secret);
     let code_verifier = verify_state_cookie(&headers, SSO_VERIFIER_COOKIE, &state.jwt_secret);
@@ -824,21 +1001,21 @@ pub async fn callback(
                 expected,
                 returned
             );
-            return Err(AppError::forbidden("CSRF state mismatch — possible attack"));
+            return Err(state_invalid("CSRF state mismatch — possible attack"));
         }
         (Some(_), None) => {
             tracing::warn!("SSO CSRF: no expected state cookie found");
-            return Err(AppError::forbidden("missing CSRF state cookie"));
+            return Err(state_invalid("missing CSRF state cookie"));
         }
         (None, _) => {
             tracing::warn!("SSO callback without state parameter");
-            return Err(AppError::forbidden("missing CSRF state parameter"));
+            return Err(state_invalid("missing CSRF state parameter"));
         }
     }
 
     let code_verifier = code_verifier.ok_or_else(|| {
         tracing::warn!("SSO PKCE: no code verifier cookie found");
-        AppError::forbidden("missing PKCE code verifier cookie")
+        state_invalid("missing PKCE code verifier cookie")
     })?;
 
     // Read before anything is exchanged: a link request that does not verify
@@ -851,13 +1028,15 @@ pub async fn callback(
     );
     if link_intent == LinkIntent::Invalid {
         tracing::warn!(provider = %slug, "SSO link intent cookie did not verify");
-        return Err(AppError::forbidden(
+        return Err(state_invalid(
             "this provider link request is invalid or has expired; start linking again from your security settings",
         ));
     }
 
     // ── Get provider config ──────────────────────────────────────
-    let provider = resolve_usable_provider(&state, &slug).await?;
+    let provider = resolve_usable_provider(&state, &slug)
+        .await
+        .map_err(|error| SsoRefusal::from_status(SsoFailure::ProviderUnavailable, error))?;
 
     let base_url = get_api_base_url(&state, &headers)?;
     let redirect_url = format!("{}/auth/sso/{}/callback", base_url, slug);
@@ -886,14 +1065,23 @@ pub async fn callback(
                     error = %format!("{error:#}"),
                     "failed to exchange authorization code"
                 );
-                AppError::from(error)
+                SsoRefusal::from_status(SsoFailure::CodeRejected, AppError::from(error))
             })?;
 
     // ── Fetch user info ──────────────────────────────────────────
     let user_info =
         rg_core::auth::sso::oauth2_fetch_user_info(&config, &token_response.access_token)
             .await
-            .map_err(|error| sso_user_info_error(&provider.slug, error))?;
+            .map_err(|error| {
+                let defect = error
+                    .downcast_ref::<rg_core::auth::sso::SsoIdentityDefect>()
+                    .copied();
+                let refusal = sso_user_info_error(&provider.slug, error);
+                match defect {
+                    Some(defect) => SsoRefusal::new(SsoFailure::Profile(defect), refusal),
+                    None => SsoRefusal::from(refusal),
+                }
+            })?;
 
     // ── A link completes here, without signing anybody in ────────
     if let LinkIntent::Valid {
@@ -919,13 +1107,19 @@ pub async fn callback(
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::internal("user not found after creation"))?;
     if !user.is_usable() {
-        return Err(AppError::unauthorized("account is disabled"));
+        return Err(SsoRefusal::new(
+            SsoFailure::AccountDisabled,
+            AppError::unauthorized("account is disabled"),
+        ));
     }
     if user
         .locked_until
         .is_some_and(|locked_until| locked_until > chrono::Utc::now())
     {
-        return Err(AppError::unauthorized("account is temporarily locked"));
+        return Err(SsoRefusal::new(
+            SsoFailure::AccountLocked,
+            AppError::unauthorized("account is temporarily locked"),
+        ));
     }
 
     // Re-read MFA and session state through the conditional lifecycle
@@ -934,7 +1128,8 @@ pub async fn callback(
     let user = crate::api::users::finalized_login_user(
         user.id,
         rg_db::ops::user_ops::finalize_primary_login(&state.db, user.id).await,
-    )?;
+    )
+    .map_err(|error| SsoRefusal::from_status(SsoFailure::AccountDisabled, error))?;
 
     // ── Log successful login ─────────────────────────────────────
     // A login the audit trail never recorded is a login nobody can review
@@ -1148,7 +1343,7 @@ fn sso_provisioning_refused(
     provider: &rg_db::entities::sso_provider::Model,
     user_info: &rg_core::auth::sso::SsoIdentity,
     refusal: rg_core::user::provisioning::ProvisioningRefusal,
-) -> AppError {
+) -> SsoRefusal {
     crate::metrics::recorder::provisioning_refused(refusal.reason());
     tracing::warn!(
         provider = %provider.slug,
@@ -1156,11 +1351,14 @@ fn sso_provisioning_refused(
         reason = refusal.reason(),
         "SSO first login refused: this provider may not create accounts here"
     );
-    AppError::forbidden(format!(
-        "{}; if you already have an account here, sign in to it and link {} under Settings → Security",
-        refusal.message(),
-        provider.name
-    ))
+    SsoRefusal::new(
+        SsoFailure::ProvisioningRefused(refusal),
+        AppError::forbidden(format!(
+            "{}; if you already have an account here, sign in to it and link {} under Settings → Security",
+            refusal.message(),
+            provider.name
+        )),
+    )
 }
 
 /// The answer to a first sign-in whose address an existing account holds.
@@ -1173,16 +1371,19 @@ fn sso_provisioning_refused(
 fn sso_account_link_required(
     provider: &rg_db::entities::sso_provider::Model,
     user_info: &rg_core::auth::sso::SsoIdentity,
-) -> AppError {
+) -> SsoRefusal {
     tracing::info!(
         provider = %provider.slug,
         provider_username = %user_info.provider_username,
         "SSO first login refused: an existing account holds this address; it has to link the provider itself"
     );
-    AppError::conflict(format!(
-        "an account on this instance already uses this email address; sign in to that account and link {} under Settings → Security",
-        provider.name
-    ))
+    SsoRefusal::new(
+        SsoFailure::LinkRequired,
+        AppError::conflict(format!(
+            "an account on this instance already uses this email address; sign in to that account and link {} under Settings → Security",
+            provider.name
+        )),
+    )
 }
 
 fn sso_identity_link_changed() -> AppError {
@@ -1227,7 +1428,7 @@ async fn find_or_create_sso_user(
     provider: &rg_db::entities::sso_provider::Model,
     user_info: &rg_core::auth::sso::SsoIdentity,
     headers: &HeaderMap,
-) -> Result<i64, AppError> {
+) -> Result<i64, SsoRefusal> {
     let db = &state.db;
     let provider_slug = provider.slug.as_str();
 
@@ -1239,7 +1440,7 @@ async fn find_or_create_sso_user(
     .await
     .map_err(AppError::from)?
     {
-        return sign_in_through_link(db, oauth).await;
+        return Ok(sign_in_through_link(db, oauth).await?);
     }
 
     if rg_db::ops::user_ops::find_by_email(db, &user_info.email)
@@ -1258,7 +1459,7 @@ async fn find_or_create_sso_user(
         .await
         .map_err(AppError::from)?
         {
-            return sign_in_through_link(db, oauth).await;
+            return Ok(sign_in_through_link(db, oauth).await?);
         }
 
         // A provider that has not vouched for the address gets exactly the

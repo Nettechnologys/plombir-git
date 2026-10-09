@@ -238,6 +238,28 @@
       "email_required": "Email is required",
       "sent": "If that email exists, a reset link has been sent.",
       "failed": "Failed to request password reset"
+    },
+    "sso_error": {
+      "state_invalid": "Signing in with {provider} expired or was started in another window. Please try again.",
+      "provider_unavailable": "{provider} is not available right now. Try again later, or sign in another way.",
+      "code_rejected": "{provider} did not accept this sign-in, usually because it took too long. Please start again.",
+      "profile_no_id": "{provider} did not say which of its accounts you signed in with. Ask an administrator to check the provider's settings.",
+      "profile_no_email": "{provider} did not share your email address. Allow it to (on GitHub, the user:email permission) and try again.",
+      "profile_bad_email": "{provider} returned an email address that is not valid.",
+      "profile_unverified_email": "{provider} reports your email address as unconfirmed. Confirm it with {provider} and sign in again.",
+      "profile_no_username": "No username could be made from your {provider} profile. Ask an administrator to create an account for you.",
+      "link_required": "An account here already uses this email address. Sign in to that account and link {provider} under Settings → Security.",
+      "auto_provision_disabled": "{provider} cannot create new accounts here. If you already have an account, sign in to it and link {provider} under Settings → Security; otherwise ask an administrator to create one.",
+      "email_domain_not_allowed": "{provider} cannot create accounts here for your email domain. If you already have an account, sign in to it and link {provider} under Settings → Security; otherwise ask an administrator to create one.",
+      "email_not_verified": "{provider} creates accounts here only for confirmed addresses, and it did not confirm yours. Confirm it with {provider}, or sign in to an existing account and link {provider} under Settings → Security.",
+      "account_disabled": "This account is disabled.",
+      "account_locked": "This account is temporarily locked after too many failed attempts. Try again later.",
+      "linked_elsewhere": "This {provider} identity is already linked to another account.",
+      "provider_already_linked": "Your account is already linked to a {provider} identity. Unlink it first to link a different one.",
+      "session_ended": "Your session ended before the link finished. Sign in and start linking again.",
+      "retry": "Signing in with {provider} collided with another attempt. Please try again.",
+      "server_error": "Something went wrong on the server while signing in with {provider}. Please try again later.",
+      "failed": "Signing in with {provider} failed. Please try again."
     }
   },
   "dashboard": {

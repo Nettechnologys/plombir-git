@@ -14,6 +14,7 @@
   import { createT } from '$lib/i18n';
   import { auth, isPasskeySupported, type PublicSsoProvider } from '$lib/api/client.svelte';
   import { isUnavailable, optionalSection } from '$lib/optionalSection';
+  import { readSsoError, ssoErrorMessage, type SsoError } from '$lib/ssoError';
   import { goto } from '$app/navigation';
 
   const t = createT();
@@ -35,6 +36,17 @@
   );
   const passkeySupported = isPasskeySupported();
 
+  // A refused SSO round trip comes back here as `?sso_error=<code>&provider=`.
+  // The sentence is derived, not stored, so it follows a language switch and
+  // picks up the provider's display name once the list has loaded.
+  let ssoError = $state<SsoError | null>(null);
+  const ssoErrorText = $derived.by(() => {
+    if (!ssoError) return '';
+    const slug = ssoError.provider;
+    const name = knownSsoProviders.find((provider) => provider.slug === slug)?.name ?? (slug || 'SSO');
+    return ssoErrorMessage(t, ssoError.code, name);
+  });
+
   // Redirect if already logged in (prevents flash of login form for authenticated users)
   $effect(() => {
     if (isLoggedIn()) {
@@ -44,6 +56,11 @@
 
   $effect(() => {
     const params = new URLSearchParams(window.location.search);
+    const refused = readSsoError(window.location.search);
+    if (refused) {
+      ssoError = refused;
+      window.history.replaceState({}, '', '/login');
+    }
     // Two doors hand off here holding a challenge cookie and no session: the
     // SSO callback, and the password reset of an account with a second factor.
     if (params.get('sso_mfa_required') === '1' || params.get('mfa_required') === '1') {
@@ -138,6 +155,10 @@
       </svg>
       <h1>{t('auth.login.title')}</h1>
     </div>
+
+    {#if ssoErrorText}
+      <div class="error-banner" role="alert">{ssoErrorText}</div>
+    {/if}
 
     {#if localError}
       <div class="error-banner">{localError}</div>

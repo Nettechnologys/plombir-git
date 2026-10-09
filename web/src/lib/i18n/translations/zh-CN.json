@@ -238,6 +238,28 @@
       "email_required": "请输入邮箱",
       "sent": "如果该邮箱存在，重置链接已发送。",
       "failed": "申请密码重置失败"
+    },
+    "sso_error": {
+      "state_invalid": "使用 {provider} 登录已过期，或是在另一个窗口中发起的。请重试。",
+      "provider_unavailable": "{provider} 当前不可用。请稍后重试，或使用其他方式登录。",
+      "code_rejected": "{provider} 未接受此次登录，通常是因为耗时过长。请重新开始。",
+      "profile_no_id": "{provider} 未说明您登录的是哪个账户。请联系管理员检查该提供方的设置。",
+      "profile_no_email": "{provider} 未共享您的邮箱地址。请允许其共享（GitHub 上为 user:email 权限）后重试。",
+      "profile_bad_email": "{provider} 返回的邮箱地址无效。",
+      "profile_unverified_email": "{provider} 报告您的邮箱地址尚未确认。请在 {provider} 确认后重新登录。",
+      "profile_no_username": "无法根据您的 {provider} 资料生成用户名。请联系管理员为您创建账户。",
+      "link_required": "此处已有账户使用该邮箱地址。请登录该账户，并在“设置 → 安全”中关联 {provider}。",
+      "auto_provision_disabled": "{provider} 无法在此创建新账户。如果您已有账户，请登录后在“设置 → 安全”中关联 {provider}；否则请联系管理员为您创建账户。",
+      "email_domain_not_allowed": "{provider} 无法为您的邮箱域名在此创建账户。如果您已有账户，请登录后在“设置 → 安全”中关联 {provider}；否则请联系管理员为您创建账户。",
+      "email_not_verified": "{provider} 仅为已确认的地址在此创建账户，而它未确认您的地址。请在 {provider} 确认地址，或登录已有账户并在“设置 → 安全”中关联 {provider}。",
+      "account_disabled": "该账户已被停用。",
+      "account_locked": "由于失败次数过多，该账户已被暂时锁定。请稍后重试。",
+      "linked_elsewhere": "此 {provider} 身份已关联到另一个账户。",
+      "provider_already_linked": "您的账户已关联一个 {provider} 身份。如需关联其他身份，请先解除关联。",
+      "session_ended": "关联完成前您的会话已结束。请登录后重新开始关联。",
+      "retry": "使用 {provider} 登录时与另一次尝试冲突。请重试。",
+      "server_error": "使用 {provider} 登录时服务器出错。请稍后重试。",
+      "failed": "使用 {provider} 登录失败。请重试。"
     }
   },
   "dashboard": {

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::common::{build_test_app_state_with, setup_test_db, StateOverrides};
+use crate::common::{build_test_app_state_with, setup_test_db, SsoCallbackOutcome, StateOverrides};
 use axum::extract::{Form, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -232,20 +232,15 @@ async fn sso_logins_without_a_usable_email_are_refused_instead_of_merged() {
             .send()
             .await
             .unwrap();
-        (callback.status(), callback.text().await.unwrap())
+        SsoCallbackOutcome::of(&callback)
     };
 
     for expected_subject in 1..=2 {
-        let (status, body) = sign_in(client.clone(), base.clone()).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "a login the provider would not name must not succeed"
-        );
-        assert!(
-            body.contains("email"),
-            "the refusal has to say which field is missing, got: {body}"
-        );
+        // The refusal names the missing field, so the login page can say
+        // which permission the provider needs.
+        sign_in(client.clone(), base.clone())
+            .await
+            .assert_refused("/login", "profile_no_email");
         assert!(
             rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
                 &db,
@@ -276,12 +271,9 @@ async fn sso_logins_without_a_usable_email_are_refused_instead_of_merged() {
     // Third call: the provider does hand over an address, and reports it as
     // unconfirmed. That address is the key an existing local account would be
     // merged on, so an unconfirmed one does not get to nominate the owner.
-    let (status, body) = sign_in(client.clone(), base.clone()).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(
-        body.contains("unverified"),
-        "the refusal has to name the reason, got: {body}"
-    );
+    sign_in(client.clone(), base.clone())
+        .await
+        .assert_refused("/login", "profile_unverified_email");
     assert!(
         rg_db::ops::user_ops::find_by_email(&db, "claimed@example.com")
             .await
@@ -443,7 +435,7 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .send()
         .await
         .unwrap();
-    assert_eq!(missing_verifier.status(), StatusCode::FORBIDDEN);
+    SsoCallbackOutcome::of(&missing_verifier).assert_refused("/login", "state_invalid");
     assert_eq!(token_calls.load(Ordering::SeqCst), 1);
 
     let authorize_mismatch = client
@@ -464,7 +456,7 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .send()
         .await
         .unwrap();
-    assert_eq!(mismatch.status(), StatusCode::FORBIDDEN);
+    SsoCallbackOutcome::of(&mismatch).assert_refused("/login", "state_invalid");
     assert_eq!(token_calls.load(Ordering::SeqCst), 1);
 
     // The provider and identity are healthy, but account retirement wins inside
@@ -509,11 +501,7 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        lifecycle_loss.status(),
-        StatusCode::UNAUTHORIZED,
-        "SSO callback accepted an account whose retirement won after identity proof"
-    );
+    SsoCallbackOutcome::of(&lifecycle_loss).assert_refused("/login", "account_disabled");
     assert!(
         lifecycle_loss
             .headers()
@@ -857,13 +845,8 @@ async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_t
         .send()
         .await
         .unwrap();
-    let status = raced_callback.status();
-    let body = raced_callback.text().await.unwrap();
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(
-        body.contains("identity link changed; restart SSO"),
-        "the conflict must tell the person how to recover, got: {body}"
-    );
+    // The conflict tells the person how to recover: start again.
+    SsoCallbackOutcome::of(&raced_callback).assert_refused("/login", "retry");
     assert!(
         rg_db::ops::oauth_account_ops::find_by_provider_and_uid(&db, "oidc-journal", "subject-1",)
             .await
