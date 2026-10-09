@@ -3223,7 +3223,12 @@ esac
         .update(&db)
         .await
         .unwrap();
-        std::env::set_var("PLOMBIR_GIT_SERVER_CANARY", "server-process-only");
+        // Cargo sets this in every test process; it stands in for the database
+        // URL and the encryption key the server carries.
+        assert!(
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            "the canary must exist in the server process for the check to mean anything"
+        );
 
         runner.run().await.unwrap();
 
@@ -3244,7 +3249,7 @@ esac
             "a multi-line value must survive the trip through the environment: {env}"
         );
         for denied in [
-            "PLOMBIR_GIT_SERVER_CANARY=",
+            "CARGO_MANIFEST_DIR=",
             "LD_PRELOAD=",
             "DOCKER_HOST=",
             "GODEBUG=",

@@ -475,10 +475,15 @@ mod tests {
 
     #[tokio::test]
     async fn local_executor_injects_polled_variables_with_a_clean_environment() {
-        std::env::set_var("PLOMBIR_GIT_HOST_SECRET", "runner-host-only");
+        // Cargo sets this in every test process; it stands in for the runner
+        // token and whatever else the operator's shell exported.
+        assert!(
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            "the canary must exist in the runner process for the check to mean anything"
+        );
         let variables = vec![("RUNNER_MESSAGE".into(), "hello".into())];
         let (code, log) = run_job_local(
-            "test \"$RUNNER_MESSAGE\" = hello && test -z \"$PLOMBIR_GIT_HOST_SECRET\" && echo ok",
+            "test \"$RUNNER_MESSAGE\" = hello && test -z \"$CARGO_MANIFEST_DIR\" && echo ok",
             &variables,
             std::path::Path::new("."),
         )
@@ -518,7 +523,12 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::env::set_var("PLOMBIR_GIT_RUNNER_CANARY", "runner-host-only");
+        // Cargo sets this in every test process; it stands in for the runner
+        // token and whatever else the operator's shell exported.
+        assert!(
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            "the canary must exist in the runner process for the check to mean anything"
+        );
 
         let variables = vec![
             ("CI_JOB_TOKEN".to_string(), "job-token".to_string()),
@@ -551,7 +561,7 @@ esac
             "multi-line values must survive the trip: {env}"
         );
         for denied in [
-            "PLOMBIR_GIT_RUNNER_CANARY=",
+            "CARGO_MANIFEST_DIR=",
             "LD_PRELOAD=",
             "DOCKER_HOST=",
             "GODEBUG=",
