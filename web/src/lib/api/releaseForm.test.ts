@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import EditPage from '../../routes/[owner]/[repo]/releases/edit/[id]/+page.svelte';
 import { buildReleaseUpdatePayload, type ReleaseUpdateFormState } from './releaseForm';
 import { navigation, setTestPage } from '../test/app';
-import { releases, resetTestClient } from '../test/client';
+import { releases, resetTestClient, repos as viewerRepos } from '../test/client';
 import { element, input, renderComponent, submit, type RenderedComponent } from '../test/render';
 
 let rendered: RenderedComponent | undefined;
@@ -11,6 +11,8 @@ let rendered: RenderedComponent | undefined;
 beforeEach(() => {
 	vi.clearAllMocks();
 	resetTestClient();
+	// The write controls follow `viewer_permission` (card_3625a7b89abb).
+	viewerRepos.get.mockResolvedValue({ viewer_permission: 'write' });
 	setTestPage('/alice/demo/releases/edit/7', { owner: 'alice', repo: 'demo', id: '7' });
 	releases.get.mockResolvedValue({
 		tag_name: 'v2.0.0',

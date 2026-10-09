@@ -1,7 +1,14 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
-  import { ApiError, instance, releases, type AttestationReport, type ReleaseAsset } from '$lib/api/client.svelte';
+  import {
+    ApiError,
+    instance,
+    releases,
+    type AttestationReport,
+    type ReleaseAsset,
+  } from '$lib/api/client.svelte';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
   import {
     LatestRepositoryResourceRequestFence,
     type RepositoryResourceRequestClaim,
@@ -40,6 +47,10 @@
   let verifyingAssetId = $state<number | null>(null);
   let busyReleaseIds = $state<Set<number>>(new Set());
   let busyAssetIds = $state<Set<number>>(new Set());
+  // Creating, editing, uploading, signing and deleting are behind `RepoWrite`
+  // (card_3625a7b89abb); a reader used to be handed every one of them.
+  const permission = viewerPermission(() => owner, () => repo);
+  let canWrite = $derived(permission.canWrite);
   const releaseListRequests = new LatestRepositoryResourceRequestFence<number>();
   let routeGeneration = 0;
 
@@ -461,7 +472,7 @@
 </script>
 
 <svelte:head>
-  <title>Releases · {owner}/{repo} · Plombir Git</title>
+  <title>{t('releases.title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -469,7 +480,9 @@
 
   <div class="page-header">
     <h1>{t('releases.title')}</h1>
-    <a href={buildNewReleaseLink()} class="btn-primary">{t('releases.new')}</a>
+    {#if canWrite}
+      <a href={buildNewReleaseLink()} class="btn-primary">{t('releases.new')}</a>
+    {/if}
   </div>
 
   {#if error}
@@ -481,7 +494,9 @@
   {:else if releaseList.length === 0}
     <div class="empty">
       <p>{t('releases.no_releases')}</p>
-      <a href={buildNewReleaseLink()} class="btn-primary">{t('releases.new')}</a>
+      {#if canWrite}
+        <a href={buildNewReleaseLink()} class="btn-primary">{t('releases.new')}</a>
+      {/if}
     </div>
   {:else}
     <div class="release-list">
@@ -515,14 +530,16 @@
           <div class="asset-section" aria-label={t('releases.assets')}>
             <div class="asset-heading">
               <strong>{t('releases.assets')}</strong>
-              <label class="asset-upload" class:disabled={uploadingReleaseId !== null || isReleaseBusy(release.id)}>
-                {assetUploadLabel(release.id)}
-                <input
-                  type="file"
-                  onchange={(event) => handleAssetUpload(release.id, event)}
-                  disabled={uploadingReleaseId !== null || isReleaseBusy(release.id)}
-                />
-              </label>
+              {#if canWrite}
+                <label class="asset-upload" class:disabled={uploadingReleaseId !== null || isReleaseBusy(release.id)}>
+                  {assetUploadLabel(release.id)}
+                  <input
+                    type="file"
+                    onchange={(event) => handleAssetUpload(release.id, event)}
+                    disabled={uploadingReleaseId !== null || isReleaseBusy(release.id)}
+                  />
+                </label>
+              {/if}
             </div>
 
             {#if uploadingReleaseId === release.id}
@@ -588,7 +605,7 @@
                               ? t('releases.attestation.verifying')
                               : t('releases.attestation.verify')}
                           </button>
-                        {:else if attestationPresence[asset.id] !== 'unavailable'}
+                        {:else if attestationPresence[asset.id] !== 'unavailable' && canWrite}
                           <button
                             type="button"
                             class="attestation-sign"
@@ -627,7 +644,7 @@
                           {t('common.cancel')}
                         </button>
                       </div>
-                    {:else}
+                    {:else if canWrite}
                       <button
                         type="button"
                         class="asset-delete"
@@ -645,17 +662,19 @@
 
           <div class="release-actions">
             <a href={buildBrowseLink(release.tag_name)} class="action-link">{t('releases.browse_files')}</a>
-            <a href={buildEditReleaseLink(release.id)} class="action-link">{t('releases.edit')}</a>
+            {#if canWrite}
+              <a href={buildEditReleaseLink(release.id)} class="action-link">{t('releases.edit')}</a>
+            {/if}
 
-            {#if confirmDeleteId === release.id}
+            {#if canWrite && confirmDeleteId === release.id}
               <div class="delete-confirm">
-                <span>Are you sure?</span>
+                <span>{t('releases.delete_confirm')}</span>
                 <button class="btn-danger" onclick={() => handleDelete(release.id)} disabled={isReleaseBusy(release.id)}>
                   {deletingId === release.id ? '...' : t('common.delete')}
                 </button>
                 <button class="btn-secondary" onclick={cancelDelete}>{t('common.cancel')}</button>
               </div>
-            {:else}
+            {:else if canWrite}
               <button class="action-link danger" disabled={isReleaseBusy(release.id)} onclick={() => showConfirm(release.id)}>{t('releases.delete')}</button>
             {/if}
           </div>
@@ -670,15 +689,15 @@
           disabled={currentPage <= 1}
           onclick={() => changePage(currentPage - 1)}
         >
-          Previous
+          {t('common.previous')}
         </button>
-        <span class="page-info">Page {currentPage} of {totalPages}</span>
+        <span class="page-info">{t('releases.page_info', { page: currentPage, total: totalPages })}</span>
         <button
           class="btn-outline"
           disabled={currentPage >= totalPages}
           onclick={() => changePage(currentPage + 1)}
         >
-          Next
+          {t('common.next')}
         </button>
       </div>
     {/if}

@@ -3,13 +3,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SettingsPage from '../../routes/[owner]/[repo]/settings/labels/+page.svelte';
 import { buildLabelPayload, type LabelFormState } from './labelForm';
 import { setTestPage } from '../test/app';
-import { labels, resetTestClient } from '../test/client';
+import { labels, resetTestClient, repos as viewerRepos } from '../test/client';
 import { click, input, renderComponent, settle, type RenderedComponent } from '../test/render';
 
 let rendered: RenderedComponent | undefined;
 
 beforeEach(() => {
 	resetTestClient();
+	// The write controls follow `viewer_permission` (card_3625a7b89abb).
+	viewerRepos.get.mockResolvedValue({ viewer_permission: 'write' });
 	setTestPage('/alice/demo/settings/labels', { owner: 'alice', repo: 'demo' });
 	labels.list.mockResolvedValue([
 		{ id: 7, name: 'bug', color: '#ff0000', description: 'Something is broken' },

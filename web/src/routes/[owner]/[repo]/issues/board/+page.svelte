@@ -7,6 +7,9 @@
     LatestRepositoryRequestFence,
     LatestRepositoryResourceRequestFence,
   } from '$lib/asyncStateOwnership';
+  import { createT } from '$lib/i18n';
+
+  const t = createT();
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
@@ -147,7 +150,7 @@
         activeBoardId !== id ||
         !boardSelectionRequests.owns(claim, owner, repo, id)
       ) return;
-      if (board.board.id !== id) throw new Error('Board response identity mismatch');
+      if (board.board.id !== id) throw new Error(t('issue_board.identity_mismatch'));
       activeBoard = board;
     } catch (e: any) {
       if (
@@ -191,7 +194,7 @@
   }
 
   async function handleDeleteColumn(colId: number) {
-    if (!confirm('Delete this column and all its cards?')) return;
+    if (!confirm(t('issue_board.delete_column_confirm'))) return;
     const boardId = activeBoardId;
     if (boardId === null) return;
     await runBoardMutation(async (route) => {
@@ -344,7 +347,7 @@
 </script>
 
 <svelte:head>
-  <title>Board · {owner}/{repo} · Plombir Git</title>
+  <title>{t('issue_board.page_title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -355,19 +358,19 @@
   {/if}
 
   {#if loading}
-    <p class="loading-text">Loading…</p>
+    <p class="loading-text">{t('issue_board.loading')}</p>
   {:else if boardList.length === 0 && !showCreateBoard}
     <!-- Empty state -->
     <div class="empty-state">
       <div class="empty-icon">📋</div>
-      <h2>No boards yet</h2>
-      <p>Create your first project board to organize issues.</p>
+      <h2>{t('board.noBoards')}</h2>
+      <p>{t('issue_board.empty_hint')}</p>
       <button
         class="btn-primary"
         onclick={toggleCreateBoardForm}
         disabled={boardControlsBusy}
         aria-busy={boardControlsBusy}
-      >Create Board</button>
+      >{t('board.createBoard')}</button>
     </div>
   {:else}
     <!-- Board selector + controls -->
@@ -387,29 +390,29 @@
           onclick={toggleCreateBoardForm}
           disabled={boardControlsBusy}
           aria-busy={boardControlsBusy}
-        >+ Board</button>
+        >{t('issue_board.add_board')}</button>
       </div>
       <button
         class="btn-outline btn-sm"
         onclick={toggleAddColumnForm}
         disabled={boardControlsBusy || activeBoardId === null}
         aria-busy={boardControlsBusy}
-      >+ Column</button>
+      >{t('issue_board.add_column')}</button>
     </div>
 
     {#if showCreateBoard}
       <div class="inline-form">
         <input
           class="form-input"
-          placeholder="Board name"
+          placeholder={t('board.namePlaceholder')}
           bind:value={newBoardName}
           disabled={boardControlsBusy}
           onkeydown={(e) => e.key === 'Enter' && handleCreateBoard()}
         />
         <button class="btn-primary btn-sm" onclick={handleCreateBoard} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>
-          {boardControlsBusy ? '…' : 'Create'}
+          {boardControlsBusy ? '…' : t('common.create')}
         </button>
-        <button class="btn-ghost btn-sm" onclick={() => { showCreateBoard = false; newBoardName = ''; }}>Cancel</button>
+        <button class="btn-ghost btn-sm" onclick={() => { showCreateBoard = false; newBoardName = ''; }}>{t('common.cancel')}</button>
       </div>
     {/if}
 
@@ -417,19 +420,19 @@
       <div class="inline-form">
         <input
           class="form-input"
-          placeholder="Column name"
+          placeholder={t('board.colNamePlaceholder')}
           bind:value={newColumnName}
           disabled={boardControlsBusy}
           onkeydown={(e) => e.key === 'Enter' && handleAddColumn()}
         />
-        <button class="btn-primary btn-sm" onclick={handleAddColumn} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>Add</button>
-        <button class="btn-ghost btn-sm" onclick={() => { showAddColumn = false; newColumnName = ''; }}>Cancel</button>
+        <button class="btn-primary btn-sm" onclick={handleAddColumn} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.add')}</button>
+        <button class="btn-ghost btn-sm" onclick={() => { showAddColumn = false; newColumnName = ''; }}>{t('common.cancel')}</button>
       </div>
     {/if}
 
     <!-- Board columns -->
     {#if boardSelectionBusy}
-      <p class="loading-text board-selection-loading">Loading…</p>
+      <p class="loading-text board-selection-loading">{t('issue_board.loading')}</p>
     {:else if activeBoard?.columns}
       <div class="board-container">
         {#each activeBoard.columns as { column, cards } (column.id)}
@@ -449,7 +452,7 @@
                 <button
                   class="btn-ghost btn-xs"
                   onclick={() => handleDeleteColumn(column.id)}
-                  title="Delete column"
+                  title={t('issue_board.delete_column')}
                   disabled={boardControlsBusy}
                   aria-busy={boardControlsBusy}
                 >✕</button>
@@ -485,7 +488,7 @@
                   <button
                     class="card-delete"
                     onclick={() => handleDeleteCard(card.id)}
-                    title="Remove card"
+                    title={t('issue_board.remove_card')}
                     disabled={boardControlsBusy}
                     aria-busy={boardControlsBusy}
                   >✕</button>
@@ -498,19 +501,19 @@
                   <textarea
                     class="card-textarea"
                     rows="2"
-                    placeholder="Add a note…"
+                    placeholder={t('issue_board.note_placeholder')}
                     bind:value={newCardNote[column.id]}
                     disabled={boardControlsBusy}
                     onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleAddCard(column.id); } }}
                   ></textarea>
                   <div class="add-card-actions">
-                    <button class="btn-primary btn-xs" onclick={() => handleAddCard(column.id)} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>Add</button>
-                    <button class="btn-ghost btn-xs" onclick={() => showAddCard = { ...showAddCard, [column.id]: false }}>Cancel</button>
+                    <button class="btn-primary btn-xs" onclick={() => handleAddCard(column.id)} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.add')}</button>
+                    <button class="btn-ghost btn-xs" onclick={() => showAddCard = { ...showAddCard, [column.id]: false }}>{t('common.cancel')}</button>
                   </div>
                 </div>
               {:else}
                 <button class="add-card-btn" onclick={() => openAddCardForm(column.id)} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>
-                  + Add card
+                  {t('issue_board.add_card')}
                 </button>
               {/if}
             </div>

@@ -2,7 +2,8 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
-  import { releases, buildReleaseUpdatePayload } from '$lib/api/client.svelte';
+  import { releases, buildReleaseUpdatePayload, type RepoPermission } from '$lib/api/client.svelte';
+  import { canWriteRepo, loadViewerPermission } from '$lib/repoPermission';
   import {
     LatestRepositoryResourceRequestFence,
     type RepositoryResourceRequestClaim,
@@ -25,6 +26,9 @@
   let body = $state('');
   let isDraft = $state(false);
   let isPrerelease = $state(false);
+  // Editing a release is behind `RepoWrite` (card_3625a7b89abb).
+  let viewerPermission = $state<RepoPermission | null>(null);
+  let canWrite = $derived(canWriteRepo(viewerPermission));
   const releaseRequests = new LatestRepositoryResourceRequestFence<number>();
   let routeGeneration = 0;
 
@@ -53,6 +57,7 @@
     body = '';
     isDraft = false;
     isPrerelease = false;
+    viewerPermission = null;
   }
 
   function isCurrentRoute(
@@ -90,7 +95,10 @@
   ) {
     const claim = releaseRequests.begin(expectedOwner, expectedRepo, expectedReleaseId);
     try {
-      const release = await releases.get(expectedOwner, expectedRepo, expectedReleaseId);
+      const [release, permission] = await Promise.all([
+        releases.get(expectedOwner, expectedRepo, expectedReleaseId),
+        loadViewerPermission(expectedOwner, expectedRepo),
+      ]);
       if (
         !ownsReleaseClaim(
           claim,
@@ -100,6 +108,7 @@
           expectedRoute,
         )
       ) return;
+      viewerPermission = permission;
       tagName = release.tag_name || '';
       releaseTitle = release.title || '';
       body = release.body || '';
@@ -133,7 +142,7 @@
     if (submitting) return;
 
     if (!releaseTitle.trim()) {
-      error = 'Release title is required';
+      error = t('releases.release_title_required');
       return;
     }
 
@@ -169,7 +178,7 @@
 </script>
 
 <svelte:head>
-  <title>Edit Release · {owner}/{repo} · Plombir Git</title>
+  <title>{t('releases.edit_page_title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -181,7 +190,7 @@
 
   {#if notFound}
     <div class="empty">
-      <p>Invalid release id.</p>
+      <p>{t('releases.invalid_id')}</p>
       <a href={`/${owner}/${repo}/releases`} class="btn-primary">{t('releases.title')}</a>
     </div>
   {:else if error}
@@ -190,10 +199,12 @@
 
   {#if loading}
     <p class="loading-text">{t('common.loading')}</p>
+  {:else if !notFound && !error && !canWrite}
+    <p class="write-required">{t('repo.write_required')}</p>
   {:else if !notFound}
     <form class="release-form" onsubmit={handleSubmit}>
       <div class="form-group">
-        <label for="release-tag">Tag</label>
+        <label for="release-tag">{t('releases.tag')}</label>
         <input id="release-tag" type="text" value={tagName} disabled class="input" />
       </div>
 
@@ -252,6 +263,11 @@
   h1 {
     font-size: 24px;
     font-weight: 600;
+  }
+
+  .write-required {
+    padding: 24px 0;
+    color: var(--text-secondary);
   }
 
   .loading-text {

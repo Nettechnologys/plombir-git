@@ -2,19 +2,17 @@
   import { onDestroy } from 'svelte';
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import { repos } from '$lib/api/client.svelte';
+  import Modal from '$lib/components/Modal.svelte';
+  import {
+    buildRepoSettingsPatch,
+    repoSettingsFormState,
+    repos,
+    type RepoSettingsFormState,
+    type RepositoryDetail,
+  } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
-  import { getUser } from '$lib/stores/auth.svelte';
+  import { isRepoAdmin } from '$lib/repoPermission';
   import { createT } from '$lib/i18n';
-
-  interface Repository {
-    id: number;
-    name: string;
-    description: string | null;
-    is_private: boolean;
-    default_branch: string;
-    created_at: string;
-  }
 
   const t = createT();
 
@@ -23,9 +21,42 @@
   const owner = $derived($page.params.owner!);
   const repo = $derived($page.params.repo!);
   
-  let repository = $state<Repository | null>(null);
+  let repository = $state<RepositoryDetail | null>(null);
   let loading = $state(true);
   let error = $state('');
+
+  // Settings form (card_3625a7b89abb): repository administrators only — the
+  // field comes from the server, which still refuses everyone else.
+  let isAdmin = $derived(isRepoAdmin(repository?.viewer_permission));
+  let branchNames = $state<string[]>([]);
+  let form = $state<RepoSettingsFormState>({ name: '', description: '', isPrivate: false, defaultBranch: '' });
+  let saving = $state(false);
+  let saveError = $state('');
+  let saveNotice = $state('');
+  // The general form saves the description and the default branch; visibility
+  // and the name have their own confirmed actions below, so this patch never
+  // carries them.
+  let generalPatch = $derived(
+    repository
+      ? buildRepoSettingsPatch(repository, { ...form, name: repository.name, isPrivate: repository.is_private })
+      : {},
+  );
+  let generalChanged = $derived(Object.keys(generalPatch).length > 0);
+  let branchOptions = $derived(
+    repository && !branchNames.includes(repository.default_branch)
+      ? [repository.default_branch, ...branchNames]
+      : branchNames,
+  );
+
+  let visibilityOpen = $state(false);
+  let visibilityBusy = $state(false);
+  let visibilityError = $state('');
+
+  let renameTo = $state('');
+  let renameOpen = $state(false);
+  let renaming = $state(false);
+  let renameError = $state('');
+  let renameTarget = $derived(renameTo.trim());
   
   // Transfer state
   let newOwner = $state('');
@@ -53,6 +84,18 @@
     repository = null;
     loading = true;
     error = '';
+    branchNames = [];
+    form = { name: '', description: '', isPrivate: false, defaultBranch: '' };
+    saving = false;
+    saveError = '';
+    saveNotice = '';
+    visibilityOpen = false;
+    visibilityBusy = false;
+    visibilityError = '';
+    renameTo = '';
+    renameOpen = false;
+    renaming = false;
+    renameError = '';
     newOwner = '';
     transferring = false;
     transferError = '';
@@ -66,22 +109,130 @@
   function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
     return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
   }
+
+  function adopt(next: RepositoryDetail) {
+    repository = next;
+    form = repoSettingsFormState(next);
+    renameTo = next.name;
+  }
   
   async function loadRepository(expectedOwner: string, expectedRepo: string) {
     const claim = repositoryRequests.begin(expectedOwner, expectedRepo);
     try {
       loading = true;
       const response = await repos.get(expectedOwner, expectedRepo);
-      if (repositoryRequests.owns(claim, owner, repo)) {
-        repository = response;
-        error = '';
+      if (!repositoryRequests.owns(claim, owner, repo)) return;
+      adopt(response);
+      error = '';
+      if (isRepoAdmin(response.viewer_permission)) {
+        // Only a picker: the current default stays selectable even when the
+        // branch list cannot be read.
+        const branches = await Promise.resolve(repos.branches(expectedOwner, expectedRepo)).catch(() => []);
+        if (repositoryRequests.owns(claim, owner, repo)) {
+          branchNames = (branches ?? []).map((branch: { name: string }) => branch.name);
+        }
       }
     } catch (err: any) {
       if (repositoryRequests.owns(claim, owner, repo)) {
-        error = err.message || 'Failed to load repository';
+        error = err.message || t('settings.load_failed');
       }
     } finally {
       if (repositoryRequests.owns(claim, owner, repo)) loading = false;
+    }
+  }
+
+  async function handleSave(event: Event) {
+    event.preventDefault();
+    if (!repository || saving || !generalChanged) return;
+    const patch = generalPatch;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    saving = true;
+    saveError = '';
+    saveNotice = '';
+    try {
+      const updated = await repos.update(expectedOwner, expectedRepo, patch);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute) || !repository) return;
+      const next = { ...repository, ...updated };
+      repository = next;
+      form = { ...form, description: next.description ?? '', defaultBranch: next.default_branch };
+      saveNotice = t('settings.general_form.saved');
+    } catch (err: any) {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        saveError = err?.message || t('settings.general_form.save_failed');
+      }
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) saving = false;
+    }
+  }
+
+  function openVisibility() {
+    visibilityError = '';
+    visibilityOpen = true;
+  }
+
+  function closeVisibility() {
+    if (visibilityBusy) return;
+    visibilityOpen = false;
+    visibilityError = '';
+  }
+
+  async function confirmVisibility() {
+    if (!repository || visibilityBusy) return;
+    const makePrivate = !repository.is_private;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    visibilityBusy = true;
+    visibilityError = '';
+    try {
+      const updated = await repos.update(expectedOwner, expectedRepo, { is_private: makePrivate });
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute) || !repository) return;
+      repository = { ...repository, ...updated };
+      form = { ...form, isPrivate: repository.is_private };
+      visibilityOpen = false;
+    } catch (err: any) {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        visibilityError = err?.message || t('settings.visibility.failed');
+      }
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) visibilityBusy = false;
+    }
+  }
+
+  function openRename() {
+    if (!repository || !renameTarget || renameTarget === repository.name) return;
+    renameError = '';
+    renameOpen = true;
+  }
+
+  function closeRename() {
+    if (renaming) return;
+    renameOpen = false;
+    renameError = '';
+  }
+
+  async function confirmRename() {
+    const name = renameTarget;
+    if (!name || renaming) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    renaming = true;
+    renameError = '';
+    try {
+      const updated = await repos.update(expectedOwner, expectedRepo, { name });
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+      renameOpen = false;
+      // There is no redirect from the old name: the page moves with the repository.
+      await goto(`/${expectedOwner}/${updated?.name || name}/settings`);
+    } catch (err: any) {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        renameError = err?.message || t('settings.rename.failed');
+      }
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) renaming = false;
     }
   }
   
@@ -113,7 +264,7 @@
       }, 1500);
     } catch (err: any) {
       if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
-        transferError = err.message || 'Transfer failed';
+        transferError = err.message || t('settings.transfer.failed');
       }
     } finally {
       if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) transferring = false;
@@ -147,7 +298,7 @@
       goto('/dashboard');
     } catch (err: any) {
       if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
-        deleteError = err.message || 'Delete failed';
+        deleteError = err.message || t('settings.delete.failed');
       }
     } finally {
       if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) deleting = false;
@@ -166,6 +317,75 @@
     <div class="loading">{t('common.loading')}</div>
   {:else if error}
     <div class="error">{error}</div>
+  {:else if repository && isAdmin}
+    <!-- General settings -->
+    <section class="section">
+      <h2>{t('settings.repository_info.title', 'Repository Information')}</h2>
+      <form class="general-form" onsubmit={handleSave}>
+        <div class="form-group">
+          <label for="repo-description">{t('settings.repository_info.description', 'Description')}</label>
+          <textarea
+            id="repo-description"
+            rows="3"
+            maxlength="2000"
+            bind:value={form.description}
+            placeholder={t('settings.general_form.description_placeholder')}
+            disabled={saving}
+          ></textarea>
+        </div>
+        <div class="form-group">
+          <label for="repo-default-branch">{t('settings.general_form.default_branch')}</label>
+          <select id="repo-default-branch" bind:value={form.defaultBranch} disabled={saving}>
+            {#each branchOptions as branchName (branchName)}
+              <option value={branchName}>{branchName}</option>
+            {/each}
+          </select>
+          <p class="hint">{t('settings.general_form.default_branch_hint')}</p>
+        </div>
+        {#if saveError}
+          <div class="error-box save-error" role="alert">{saveError}</div>
+        {/if}
+        {#if saveNotice}
+          <div class="success-box" role="status">{saveNotice}</div>
+        {/if}
+        <button type="submit" class="btn btn-primary save-general" disabled={saving || !generalChanged}>
+          {saving ? t('common.saving') : t('settings.general_form.save')}
+        </button>
+      </form>
+    </section>
+
+    <!-- Visibility -->
+    <section class="section">
+      <h2>{t('settings.repository_info.visibility', 'Visibility')}</h2>
+      <p class="section-desc">
+        <span class="badge" class:private={repository.is_private}>
+          {repository.is_private ? t('settings.repository_info.private', 'Private') : t('settings.repository_info.public', 'Public')}
+        </span>
+        {repository.is_private ? t('settings.visibility.now_private') : t('settings.visibility.now_public')}
+      </p>
+      <button class="btn btn-warning toggle-visibility" onclick={openVisibility}>
+        {repository.is_private ? t('settings.visibility.make_public') : t('settings.visibility.make_private')}
+      </button>
+    </section>
+
+    <!-- Rename -->
+    <section class="section">
+      <h2>{t('settings.rename.title')}</h2>
+      <p class="section-desc">{t('settings.rename.desc')}</p>
+      <div class="form-group">
+        <label for="repo-rename">{t('settings.rename.new_name')}</label>
+        <div class="input-row">
+          <input id="repo-rename" type="text" bind:value={renameTo} disabled={renaming} />
+          <button
+            class="btn btn-warning open-rename"
+            onclick={openRename}
+            disabled={renaming || !renameTarget || renameTarget === repository.name}
+          >
+            {t('settings.rename.button')}
+          </button>
+        </div>
+      </div>
+    </section>
   {:else if repository}
     <!-- Repository Info -->
     <section class="section">
@@ -188,8 +408,11 @@
           </div>
         </div>
       </div>
+      <p class="section-desc admin-only-note">{t('settings.general_form.admin_only')}</p>
     </section>
-    
+  {/if}
+
+  {#if repository && isAdmin}
     <!-- Transfer Ownership -->
     <section class="section transfer-section">
       <h2>{t('settings.transfer.title')}</h2>
@@ -219,7 +442,7 @@
             disabled={transferring}
           />
           <button 
-            class="btn btn-warning"
+            class="btn btn-warning transfer-repo"
             onclick={handleTransfer}
             disabled={!newOwner.trim() || transferring}
           >
@@ -263,6 +486,41 @@
     </section>
   {/if}
 </div>
+
+{#if visibilityOpen && repository}
+  <Modal onclose={closeVisibility} labelledby="visibility-title">
+    <h2 id="visibility-title">
+      {repository.is_private ? t('settings.visibility.confirm_public_title') : t('settings.visibility.confirm_private_title')}
+    </h2>
+    <p>{repository.is_private ? t('settings.visibility.confirm_public_body') : t('settings.visibility.confirm_private_body')}</p>
+    {#if visibilityError}
+      <div class="error-box visibility-error" role="alert">{visibilityError}</div>
+    {/if}
+    <div class="modal-actions">
+      <button class="btn btn-warning confirm-visibility" onclick={confirmVisibility} disabled={visibilityBusy}>
+        {visibilityBusy ? t('common.saving') : repository.is_private ? t('settings.visibility.make_public') : t('settings.visibility.make_private')}
+      </button>
+      <button class="btn btn-secondary" onclick={closeVisibility} disabled={visibilityBusy} data-autofocus>{t('common.cancel')}</button>
+    </div>
+  </Modal>
+{/if}
+
+{#if renameOpen && repository}
+  <Modal onclose={closeRename} labelledby="rename-title">
+    <h2 id="rename-title">{t('settings.rename.confirm_title')}</h2>
+    <p>{t('settings.rename.confirm_body', { from: `${owner}/${repository.name}`, to: `${owner}/${renameTarget}` })}</p>
+    <p class="rename-warning">{t('settings.rename.no_redirect')}</p>
+    {#if renameError}
+      <div class="error-box rename-error" role="alert">{renameError}</div>
+    {/if}
+    <div class="modal-actions">
+      <button class="btn btn-warning confirm-rename" onclick={confirmRename} disabled={renaming}>
+        {renaming ? t('settings.rename.renaming') : t('settings.rename.button')}
+      </button>
+      <button class="btn btn-secondary" onclick={closeRename} disabled={renaming} data-autofocus>{t('common.cancel')}</button>
+    </div>
+  </Modal>
+{/if}
 
 <style>
   .settings-page {
@@ -467,5 +725,62 @@
   
   .error {
     color: var(--red, #ff4444);
+  }
+  textarea,
+  select {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.6rem 0.75rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    font-family: inherit;
+  }
+
+  .general-form .form-group:first-child {
+    margin-top: 0;
+  }
+
+  .hint {
+    margin: 0.4rem 0 0;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+  }
+
+  .general-form > .btn {
+    margin-top: 1.25rem;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    color: white;
+  }
+
+  .btn-secondary {
+    background: none;
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+  }
+
+  .section-desc .badge {
+    margin-right: 0.5rem;
+  }
+
+  .admin-only-note {
+    margin-top: 1.5rem;
+    margin-bottom: 0;
+  }
+
+  .rename-warning {
+    color: var(--red, #ff4444);
+    font-weight: 500;
+  }
+
+  .modal-actions {
+    display: flex;
+    gap: 0.75rem;
+    margin-top: 1rem;
   }
 </style>

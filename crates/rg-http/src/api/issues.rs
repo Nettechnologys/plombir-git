@@ -636,6 +636,7 @@ pub async fn update_issue(
         assignee_id,
         req.milestone_id,
         Some(&state.delivery_tracker),
+        Some(user_id),
     )
     .await
     {
@@ -1121,6 +1122,177 @@ pub async fn get_issue_labels(
             Ok(labels) => (StatusCode::OK, Json(serde_json::json!(labels))).into_response(),
             Err(e) => AppError::from(e).into_response(),
         },
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+/// Request body for editing a comment.
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct EditCommentRequest {
+    pub body: String,
+}
+
+/// The caller as a comment moderator: who they are, and whether they
+/// administer the repository the comment lives in.
+pub(crate) async fn comment_moderator(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    actor_id: i64,
+) -> Result<rg_core::issue::moderation::Moderator, AppError> {
+    Ok(rg_core::issue::moderation::Moderator {
+        actor_id,
+        administers: repo_access::administers(state, repo, actor_id).await?,
+    })
+}
+
+/// Edit an issue comment — its author, or a repository administrator
+/// (card_60961272e1ba).
+#[utoipa::path(
+    patch,
+    path = "/repos/{owner}/{name}/issues/comments/{comment_id}",
+    tag = "Issues",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("comment_id" = i64, Path, description = "comment id"),
+    ),
+    request_body = EditCommentRequest,
+    responses(
+        (status = 200, description = "Edited", body = serde_json::Value),
+        (status = 400, description = "Empty body", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Neither its author nor an administrator", body = serde_json::Value),
+        (status = 404, description = "No such comment in this repository", body = serde_json::Value),
+    ),
+)]
+pub async fn edit_comment(
+    State(state): State<AppState>,
+    Path((_, _, comment_id)): Path<(String, String, i64)>,
+    RepoAuthRead { repo, actor_id }: RepoAuthRead,
+    Json(req): Json<EditCommentRequest>,
+) -> impl IntoResponse {
+    let moderator = match comment_moderator(&state, &repo, actor_id).await {
+        Ok(moderator) => moderator,
+        Err(e) => return e.into_response(),
+    };
+    match rg_core::issue::moderation::edit_issue_comment(
+        &state.db, repo.id, comment_id, moderator, &req.body,
+    )
+    .await
+    {
+        Ok(comment) => (StatusCode::OK, Json(serde_json::json!(comment))).into_response(),
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+/// Delete an issue comment and its attachments — its author, or a repository
+/// administrator (card_60961272e1ba).
+#[utoipa::path(
+    delete,
+    path = "/repos/{owner}/{name}/issues/comments/{comment_id}",
+    tag = "Issues",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("comment_id" = i64, Path, description = "comment id"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Neither its author nor an administrator", body = serde_json::Value),
+        (status = 404, description = "No such comment in this repository", body = serde_json::Value),
+    ),
+)]
+pub async fn delete_comment(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((owner, name, comment_id)): Path<(String, String, i64)>,
+    RepoAuthRead { repo, actor_id }: RepoAuthRead,
+) -> impl IntoResponse {
+    let moderator = match comment_moderator(&state, &repo, actor_id).await {
+        Ok(moderator) => moderator,
+        Err(e) => return e.into_response(),
+    };
+    match rg_core::issue::moderation::delete_issue_comment(
+        &state.db,
+        state.blob_storage.as_ref(),
+        repo.id,
+        comment_id,
+        moderator,
+    )
+    .await
+    {
+        Ok(comment) => {
+            let actor =
+                rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, actor_id).await;
+            rg_core::audit::record(
+                &state.db,
+                &actor,
+                "issue_comment.delete",
+                Some("issue_comment"),
+                Some(comment.id),
+                Some(&format!("{owner}/{name}")),
+                Some(&headers),
+                Some(serde_json::json!({
+                    "issue_id": comment.issue_id,
+                    "author_id": comment.author_id,
+                })),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+/// Delete an issue with its comments, labels and attachments — repository
+/// administrators only (card_60961272e1ba).
+#[utoipa::path(
+    delete,
+    path = "/repos/{owner}/{name}/issues/{number}",
+    tag = "Issues",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("number" = i64, Path, description = "issue number"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Not a repository administrator", body = serde_json::Value),
+        (status = 404, description = "No such issue", body = serde_json::Value),
+    ),
+)]
+pub async fn delete_issue(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    repo_access::RepoAdmin { repo, actor_id }: repo_access::RepoAdmin,
+) -> impl IntoResponse {
+    match rg_core::issue::moderation::delete_issue(
+        &state.db,
+        state.blob_storage.as_ref(),
+        repo.id,
+        number,
+    )
+    .await
+    {
+        Ok(issue) => {
+            let actor =
+                rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, actor_id).await;
+            rg_core::audit::record(
+                &state.db,
+                &actor,
+                "issue.delete",
+                Some("issue"),
+                Some(issue.id),
+                Some(&format!("{owner}/{name}#{number}")),
+                Some(&headers),
+                Some(serde_json::json!({ "title": issue.title, "author_id": issue.author_id })),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

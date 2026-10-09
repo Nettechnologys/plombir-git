@@ -401,7 +401,7 @@ async fn create_repo(fx: &Fixture, token: &str, name: &str) {
         .client
         .post(format!("{}/api/v1/repos", fx.base))
         .bearer_auth(token)
-        .json(&serde_json::json!({"name": name, "is_private": true}))
+        .json(&serde_json::json!({"name": name, "is_private": true, "auto_init": true, "readme": "default"}))
         .send()
         .await
         .unwrap();
@@ -819,7 +819,10 @@ async fn seed_vault(
         .create_id(
             token,
             fx.url(VICTIM, VAULT, "/releases"),
-            serde_json::json!({"tag_name": "v1.0.0", "title": "scope sweep"}),
+            // Outside the `v*` protection seeded above: creating the release
+            // creates its tag, under the same rules a push meets
+            // (card_4d406b01b722).
+            serde_json::json!({"tag_name": "scope-1.0.0", "title": "scope sweep"}),
             "victim release",
         )
         .await;
@@ -924,6 +927,9 @@ fn coverage(tail: &str, ids: &Ids) -> Coverage {
             ("attachment_id", ids.comment_attachment),
         ]),
         "/issues/{number}/time/{id}" => probe(&[("id", ids.time_entry)]),
+        // Comment moderation (card_60961272e1ba): edit and delete.
+        "/issues/comments/{comment_id}" => probe(&[("comment_id", ids.issue_comment)]),
+        "/pulls/{number}/comments/{id}" => probe(&[("id", ids.review_comment)]),
 
         "/pulls/{number}/assets/{attachment_id}" => probe(&[("attachment_id", ids.pr_attachment)]),
         "/pulls/comments/{comment_id}/assets" => probe(&[("comment_id", ids.review_comment)]),
@@ -1041,6 +1047,9 @@ fn body_for(method: &str, tail: &str, ids: &Ids) -> Body {
         }
         "/pulls/{number}/comments/{id}/resolution" => {
             Body::Json(serde_json::json!({"resolved": true}))
+        }
+        "/issues/comments/{comment_id}" | "/pulls/{number}/comments/{id}" => {
+            Body::Json(serde_json::json!({"body": "probe"}))
         }
         "/pulls/{number}/comments/{id}/suggestion/apply" => {
             Body::Json(serde_json::json!({"comment_ids": [ids.review_comment]}))

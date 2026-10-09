@@ -122,9 +122,11 @@ async fn exercise_organization_update_contract(
     );
     assert_eq!(org.visibility, "private");
 
+    // Not `retiring{suffix}`: the account-retirement contract of the same run
+    // holds that name, and one owner name has one holder (card_8f3f821705f2).
     let retiring_org = rg_db::ops::org_ops::create_org(
         db,
-        &format!("retiring{suffix}"),
+        &format!("retiringorg{suffix}"),
         None,
         None,
         owner_id,
@@ -4583,4 +4585,129 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         .await
         .expect("verify smoke-test user cleanup")
         .is_none());
+}
+
+/// card_a673a3823085: relabelling neighbouring issues at the same moment must
+/// not fail.
+///
+/// `issue_label_ops::set_labels` is `DELETE … WHERE issue_id = ?` + `INSERT`
+/// in one transaction — the next-key/insert-intention pattern that deadlocked
+/// the MFA backup codes on InnoDB (card_d71c4875993c). Eight edits of eight
+/// adjacent issues, twelve rounds each: every one lands, and every issue ends
+/// up with exactly the labels its last edit set. On SQLite and PostgreSQL this
+/// holds trivially; MySQL is the backend it is here for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn neighbouring_issue_relabels_all_land() {
+    const EDITORS: usize = 8;
+    const ROUNDS: usize = 12;
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 8)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("relabel{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Relabel Smoke",
+    )
+    .await
+    .expect("create relabel owner");
+    let repo_name = format!("relabelrepo{suffix}");
+    let repo = rg_db::ops::repo_ops::create(&db, namespace_repo(owner.id, None, &repo_name))
+        .await
+        .expect("create relabel repository");
+    for label in ["red", "green", "blue"] {
+        rg_core::label::service::create_label(
+            &db,
+            &username,
+            &repo_name,
+            label.to_string(),
+            "#000000".to_string(),
+            None,
+        )
+        .await
+        .expect("create label");
+    }
+    let mut numbers = Vec::new();
+    for index in 0..EDITORS {
+        let issue = rg_core::issue::service::create_issue(
+            &db,
+            repo.id,
+            owner.id,
+            format!("issue {index}"),
+            None,
+            Some(vec!["red".to_string()]),
+            None,
+        )
+        .await
+        .expect("create issue");
+        numbers.push(issue.number);
+    }
+
+    let palettes: [&[&str]; 3] = [&["red"], &["green", "blue"], &["blue", "red", "green"]];
+    let edits = numbers.iter().map(|&number| {
+        let db = db.clone();
+        let username = username.clone();
+        let repo_name = repo_name.clone();
+        tokio::spawn(async move {
+            for round in 0..ROUNDS {
+                let labels = palettes[(round + number as usize) % palettes.len()]
+                    .iter()
+                    .map(|label| label.to_string())
+                    .collect();
+                rg_core::issue::service::update_issue(
+                    &db,
+                    &username,
+                    &repo_name,
+                    number,
+                    None,
+                    None,
+                    None,
+                    Some(labels),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|error| format!("issue {number}, round {round}: {error:#}"))?;
+            }
+            Ok::<_, String>(number)
+        })
+    });
+    let mut finished = Vec::new();
+    for edit in edits.collect::<Vec<_>>() {
+        finished.push(edit.await.expect("edit task panicked"));
+    }
+
+    for result in finished {
+        let number = result.unwrap_or_else(|error| panic!("a relabel failed: {error}"));
+        let issue = rg_core::issue::service::get_issue(&db, &username, &repo_name, number)
+            .await
+            .expect("reload issue");
+        let mut held: Vec<String> =
+            rg_db::ops::issue_label_ops::get_label_names_by_issue_ids(&db, &[issue.id])
+                .await
+                .expect("read issue labels")
+                .remove(&issue.id)
+                .unwrap_or_default();
+        held.sort();
+        let mut expected: Vec<String> = palettes[(ROUNDS - 1 + number as usize) % palettes.len()]
+            .iter()
+            .map(|label| label.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            held, expected,
+            "issue {number} holds the labels of its last edit"
+        );
+    }
 }

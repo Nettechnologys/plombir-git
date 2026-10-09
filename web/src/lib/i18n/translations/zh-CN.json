@@ -22,6 +22,7 @@
     "close": "关闭",
     "add": "添加",
     "retry": "重试",
+    "load_more": "加载更多",
     "previous": "上一页",
     "next": "下一页",
     "copy": "复制",
@@ -31,7 +32,11 @@
     "never": "从未",
     "source_code": "源代码",
     "source_code_at_commit": "本实例在提交 {commit} 的源代码",
-    "source_code_commit_unknown": "本实例的源代码（构建未记录提交）"
+    "source_code_commit_unknown": "本实例的源代码（构建未记录提交）",
+    "prev_arrow": "← 上一页",
+    "next_arrow": "下一页 →",
+    "page_info": "第 {page} 页，共 {total} 页",
+    "deleting": "正在删除..."
   },
   "nav": {
     "dashboard": "仪表板",
@@ -59,7 +64,10 @@
     "security": "安全",
     "ssh_keys": "SSH 密钥",
     "access_tokens": "访问令牌",
-    "agents": "智能体"
+    "agents": "智能体",
+    "home_label": "Plombir Git 首页",
+    "user_menu": "用户菜单",
+    "notification_settings": "通知设置"
   },
   "author": {
     "bot": "机器人",
@@ -152,7 +160,8 @@
     "footer": {
       "explore": "探索",
       "built_with": "用 Rust 和 SvelteKit 构建"
-    }
+    },
+    "load_failed": "加载仓库失败"
   },
   "auth": {
     "login": {
@@ -173,7 +182,16 @@
       "sso_unavailable": "无法加载单点登录选项。",
       "sso_retry": "重试",
       "sso_or": "或使用以下方式继续",
-      "sso_continue": "使用 {provider} 继续"
+      "sso_continue": "使用 {provider} 继续",
+      "passkey_sign_in": "使用通行密钥登录",
+      "forgot_password": "忘记密码？",
+      "passkey_username_first": "请先输入用户名，再使用通行密钥。",
+      "passkey_failed": "通行密钥登录失败",
+      "passwords_differ": "两次输入的新密码不一致。",
+      "password_change_required": "此密码由管理员设置。请设置您自己的密码以继续。",
+      "new_password": "新密码",
+      "confirm_password": "再次输入新密码",
+      "set_password": "设置密码并登录"
     },
     "register": {
       "title": "创建您的账号",
@@ -185,6 +203,41 @@
       "footer": "已有账号？{link}",
       "footer_link": "登录",
       "failed": "注册失败"
+    },
+    "back_to_login": "返回登录",
+    "password_rules": {
+      "min_length": "密码长度至少为 8 个字符",
+      "max_length": "密码长度不能超过 128 个字符",
+      "no_spaces": "密码不能包含空格",
+      "uppercase": "密码必须包含一个大写字母",
+      "lowercase": "密码必须包含一个小写字母",
+      "number": "密码必须包含一个数字",
+      "special": "密码必须包含一个特殊字符"
+    },
+    "reset_password": {
+      "title": "重置密码",
+      "subtitle": "请输入您的新密码",
+      "success": "密码重置成功！您现在已登录。",
+      "go_dashboard": "前往仪表板",
+      "invalid_link": "重置链接无效。请重新申请密码重置。",
+      "request_reset": "申请重置",
+      "new_password": "新密码",
+      "new_password_placeholder": "至少 8 个字符",
+      "confirm_password": "确认密码",
+      "confirm_placeholder": "再次输入密码",
+      "resetting": "重置中...",
+      "mismatch": "两次输入的密码不一致",
+      "failed": "重置密码失败"
+    },
+    "forgot_password": {
+      "title": "忘记密码",
+      "description": "输入您账号的邮箱以接收重置链接。",
+      "email": "邮箱",
+      "sending": "发送中...",
+      "submit": "发送重置链接",
+      "email_required": "请输入邮箱",
+      "sent": "如果该邮箱存在，重置链接已发送。",
+      "failed": "申请密码重置失败"
     }
   },
   "dashboard": {
@@ -229,7 +282,14 @@
     "mark_all_read": "全部标为已读",
     "mark_read": "标为已读",
     "empty": "暂无通知",
-    "hint": "实时更新已启用——新通知将即时显示。"
+    "hint": "实时更新已启用——新通知将即时显示。",
+    "reason": {
+      "review_requested": "请求评审",
+      "assigned": "已分配",
+      "mention": "被提及",
+      "ci_failed": "CI 失败",
+      "participating": "参与"
+    }
   },
   "orgs": {
     "title": "组织",
@@ -295,6 +355,43 @@
     }
   },
   "repo": {
+    "branches": {
+      "title": "分支",
+      "new": "新建分支",
+      "name": "分支名称",
+      "name_placeholder": "feature/my-change",
+      "from": "基于",
+      "from_hint": "分支、标签或提交 SHA。留空则使用默认分支。",
+      "create": "创建分支",
+      "creating": "正在创建…",
+      "created": "已创建分支 {name}。",
+      "create_failed": "无法创建分支。",
+      "load_failed": "无法加载分支。",
+      "empty": "此仓库还没有分支。",
+      "default": "默认",
+      "protected": "受保护",
+      "protected_hint": "此分支受分支保护规则约束，服务器会拒绝删除。",
+      "compare": "比较",
+      "delete": "删除",
+      "deleting": "正在删除…",
+      "delete_title": "删除分支",
+      "delete_confirm": "删除分支 {name}？仅由此分支指向的提交将变得不可达。",
+      "deleted": "已删除分支 {name}。",
+      "delete_failed": "无法删除分支。"
+    },
+    "tags": {
+      "title": "标签",
+      "empty": "此仓库还没有标签。",
+      "load_failed": "无法加载标签。",
+      "protected": "受保护",
+      "protected_hint": "此标签受标签保护规则约束，服务器会拒绝删除。",
+      "delete": "删除",
+      "deleting": "正在删除…",
+      "delete_title": "删除标签",
+      "delete_confirm": "删除标签 {name}？使用它的发布会保留记录，但失去该标签。",
+      "deleted": "已删除标签 {name}。",
+      "delete_failed": "无法删除标签。"
+    },
     "tabs": {
       "code": "代码",
       "network": "关系网",
@@ -517,7 +614,13 @@
       "online": "在线",
       "offline": "离线"
     },
-    "clone_url": "克隆 URL"
+    "clone_url": "克隆 URL",
+    "clone_https_label": "HTTPS 克隆",
+    "clone_ssh_label": "SSH 克隆",
+    "login_to_fork": "登录后即可复刻",
+    "login_to_star": "登录后即可收藏",
+    "login_to_watch": "登录后即可关注",
+    "write_required": "你需要此仓库的写入权限才能执行此操作。"
   },
   "issues": {
     "title": "问题",
@@ -572,7 +675,15 @@
     "unnamed_user": "用户 #{userId}",
     "milestone": "里程碑",
     "no_milestone": "无里程碑",
-    "save_links": "保存分配"
+    "save_links": "保存分配",
+    "delete": {
+      "title": "删除此问题",
+      "desc": "删除问题将同时删除其所有评论和附件。此操作无法撤销。",
+      "button": "删除问题",
+      "failed": "删除问题失败",
+      "confirm_title": "删除问题 #{number}？",
+      "confirm_body": "该问题及其评论和附件将对所有人删除。此操作无法撤销。"
+    }
   },
   "milestones": {
     "title": "里程碑",
@@ -616,7 +727,25 @@
       "description_placeholder": "描述您的变更...",
       "draft": "创建为草稿",
       "submit": "创建拉取请求",
-      "cancel": "取消"
+      "cancel": "取消",
+      "title_label": "标题",
+      "title_placeholder": "拉取请求标题",
+      "head_repository": "源仓库",
+      "your_fork": "（您的复刻）",
+      "forks_unavailable": "无法加载复刻列表，仅提供本仓库的分支。",
+      "fork_branches_unavailable": "无法加载该复刻的分支。",
+      "compare": "比较变更"
+    },
+    "compare": {
+      "title": "比较变更",
+      "base": "基准",
+      "head": "比较",
+      "create_pull": "创建拉取请求",
+      "commits": "提交：{count}",
+      "files_changed": "变更文件：{count}",
+      "nothing_to_compare": "{head} 没有 {base} 中不存在的提交。",
+      "invalid_spec": "比较地址必须以 base...head 的形式指定分支。",
+      "unavailable": "无法加载比较结果。"
     },
     "empty": "暂无 {state} 拉取请求。",
     "meta": "#{number} 由 {author} 于 {date} 创建",
@@ -635,6 +764,10 @@
       "approving": "批准中…"
     },
     "merge": {
+      "delete_head_branch": "合并后删除分支 {branch}",
+      "head_branch_deleted": "已删除分支 {branch}。",
+      "head_branch_kept": "分支 {branch} 已保留：{reason}",
+      "head_branch_kept_unknown": "未给出原因",
       "strategy": {
         "merge": "合并提交",
         "squash": "压缩并合并",
@@ -653,7 +786,8 @@
       "leave_queue": "退出队列",
       "queue_title": "仓库合并队列",
       "queue_position": "当前位于合并队列第 {position} 位",
-      "queue_waiting": "轮到此请求且保护规则满足后使用 {strategy} 合并。"
+      "queue_waiting": "轮到此请求且保护规则满足后使用 {strategy} 合并。",
+      "queue_entry": "#{position} · 拉取请求 #{number} · {title}"
     },
     "verdict": {
       "approved": "✓ 已批准",
@@ -737,7 +871,11 @@
       "applying_selected": "正在应用建议...",
       "apply": "应用建议",
       "applied": "建议已应用"
-    }
+    },
+    "page_title": "拉取请求 #{number}",
+    "opened_by_author": "由 {author} 于 {date} 创建",
+    "author_commented": "{author} 发表了评论",
+    "files_changed": "{count} 个文件"
   },
   "wiki": {
     "title": "Wiki",
@@ -762,7 +900,17 @@
     "history": "历史",
     "revisionMessage": "版本消息",
     "noMessage": "无消息",
-    "noRevisions": "暂无版本"
+    "noRevisions": "暂无版本",
+    "revision_number": "版本 #{id}",
+    "revision_short": "r{number}",
+    "delete_confirm": "删除此 Wiki 页面？此操作无法撤销。",
+    "restore_confirm": "恢复到版本 {version}？当前内容将保存为一个历史版本。",
+    "repo_wiki": "{repo} Wiki",
+    "last_edited": "最后编辑于 {date}",
+    "revision_history": "版本历史",
+    "loading_revisions": "加载中…",
+    "no_revisions_hint": "暂无版本。每次编辑都会保存一个版本。",
+    "restore_version": "恢复此版本"
   },
   "pipeline": {
     "status": {
@@ -811,7 +959,16 @@
     "artifact_delete_confirm": "删除 {name}？存储的文件将一并移除，且无法恢复。",
     "artifact_delete_failed": "无法删除 {name}：{reason}",
     "artifact_expires": "过期时间",
-    "artifact_expires_never": "永不过期"
+    "artifact_expires_never": "永不过期",
+    "page_title": "CI/CD",
+    "log": {
+      "load_failed": "加载日志失败：{error}",
+      "stream_failed": "实时日志连接失败",
+      "live": "实时",
+      "closed": "已关闭",
+      "title": "任务日志",
+      "empty": "（无日志输出）"
+    }
   },
   "errors": {
     "login_failed": "登录失败",
@@ -896,7 +1053,20 @@
       "verify": "验证",
       "verifying": "验证中…",
       "error": "无法校验来源：{error}"
-    }
+    },
+    "delete_confirm": "确定吗？",
+    "page_info": "第 {page} 页，共 {total} 页",
+    "new_page_title": "新发布",
+    "edit_page_title": "编辑发布",
+    "tag_name_required": "必须填写标签名称",
+    "release_title_required": "必须填写发布标题",
+    "existing_tags": "已有标签：",
+    "more_tags": "还有 {count} 个",
+    "target_tags": "标签",
+    "target_branches": "分支",
+    "select_tag": "-- 选择标签（可选）--",
+    "select_branch": "-- 选择分支（可选）--",
+    "invalid_id": "无效的发布 ID。"
   },
   "settings": {
     "title": "设置",
@@ -1126,7 +1296,8 @@
       "confirm": "转移仓库",
       "confirming": "转移中...",
       "success": "仓库转移成功。",
-      "warning": "这是永久性操作。请确保您有正确的新所有者。"
+      "warning": "这是永久性操作。请确保您有正确的新所有者。",
+      "failed": "转移失败"
     },
     "delete": {
       "title": "删除此仓库",
@@ -1135,7 +1306,106 @@
       "confirm_placeholder": "输入 owner/repository",
       "confirm_button": "删除此仓库",
       "confirming": "删除中...",
-      "success": "仓库已删除。"
+      "success": "仓库已删除。",
+      "failed": "删除失败"
+    },
+    "tag_protection": {
+      "title": "标签保护",
+      "desc": "通过 HTTP 和 SSH 阻止创建或更新与模式匹配的标签。",
+      "only_wildcard": "{wildcard} 是唯一的通配符。",
+      "create_title": "保护一个模式",
+      "edit_title": "编辑保护规则",
+      "pattern": "模式",
+      "pattern_hint": "（使用 {star} 作为通配符；不支持 {question}、字符类和 {plus}）",
+      "allowed_users": "允许推送此模式的用户",
+      "allowed_users_hint": "（以逗号分隔的用户名；留空表示任何人都不能推送此模式，包括所有者）",
+      "add": "添加保护",
+      "save": "保存更改",
+      "list_title": "受保护的模式",
+      "empty": "暂无受保护的标签模式。",
+      "allowed": "允许：{users}",
+      "nobody": "任何人都不能推送此模式",
+      "delete_confirm": "删除 {pattern} 的保护规则？"
+    },
+    "environments": {
+      "title": "环境",
+      "heading": "部署环境",
+      "desc": "要求指定的审核者批准后，任务才能部署到受保护的环境。",
+      "create": "创建环境",
+      "edit_title": "编辑环境",
+      "name": "名称",
+      "require_approval": "需要审批",
+      "required_approvals": "所需审批数",
+      "allowed_approvers": "允许的审批人",
+      "allowed_approvers_hint": "（以逗号分隔的用户名；留空表示由仓库管理员审批）",
+      "save": "保存更改",
+      "list_title": "已配置的环境",
+      "empty": "暂无已配置的环境。",
+      "approvals_required": "需要 {count} 个审批",
+      "unprotected": "未受保护",
+      "reviewers": "审核者：{users}",
+      "delete_confirm": "删除环境 {name}？"
+    },
+    "ci_secrets": {
+      "title": "CI 密钥",
+      "desc": "加密的仓库密钥会注入到任务中，并在保存的日志里被遮蔽。",
+      "add_title": "添加或替换密钥",
+      "name": "名称",
+      "value": "值",
+      "save": "保存密钥",
+      "list_title": "已配置的密钥",
+      "empty": "暂无已配置的密钥。",
+      "delete_confirm": "删除 {name}？"
+    },
+    "retention": {
+      "title": "CI 保留策略",
+      "desc": "控制新上传的产物和被访问过的缓存保留多长时间。过期的存储每小时回收一次。",
+      "loading": "加载中…",
+      "artifact_days": "产物保留时间（天）",
+      "cache_days": "缓存自最后一次访问起的保留时间（天）",
+      "save": "保存策略",
+      "cleanup": "立即清理过期存储",
+      "saved": "保留策略已保存。新上传的内容将使用更新后的保留时间。",
+      "cleaned": "已删除 {artifacts} 个产物和 {caches} 个缓存条目。",
+      "cleanup_failures": "{count} 项无法安全删除。"
+    },
+    "label_color_swatch": "颜色 {color}",
+    "confirm_delete_title": "确认删除",
+    "labels_load_failed": "加载标签失败",
+    "label_name_required": "标签名称不能为空",
+    "label_save_failed": "保存标签失败",
+    "label_delete_failed": "删除标签失败",
+    "load_failed": "加载仓库失败",
+    "general_form": {
+      "save": "保存更改",
+      "saved": "设置已保存。",
+      "save_failed": "保存设置失败",
+      "description_placeholder": "此仓库的简短描述",
+      "default_branch": "默认分支",
+      "default_branch_hint": "新的拉取请求以它为目标，克隆时会检出该分支。",
+      "admin_only": "只有仓库管理员可以更改这些设置。"
+    },
+    "visibility": {
+      "now_public": "任何人都可以查看和克隆此仓库，包括未登录的用户。",
+      "now_private": "只有所有者和被授予访问权限的人可以查看和克隆此仓库。",
+      "make_private": "设为私有",
+      "make_public": "设为公开",
+      "failed": "更改可见性失败",
+      "confirm_private_title": "将此仓库设为私有？",
+      "confirm_public_title": "将此仓库设为公开？",
+      "confirm_private_body": "所有没有访问权限的人（其他已登录用户和匿名访客）将立即失去对其代码、问题、拉取请求和发布的访问，之前分享的链接对他们也将失效。所有者和被授予访问权限的人仍可访问。",
+      "confirm_public_body": "任何人（包括未登录的用户）都将能够查看和克隆其代码，并阅读其问题、拉取请求和发布。请确认其历史记录中没有机密内容。"
+    },
+    "rename": {
+      "title": "重命名仓库",
+      "desc": "仓库会在新名称下保留其问题、拉取请求、发布和设置。",
+      "new_name": "新名称",
+      "button": "重命名",
+      "renaming": "重命名中...",
+      "failed": "重命名失败",
+      "confirm_title": "重命名此仓库？",
+      "confirm_body": "{from} 将变为 {to}。",
+      "no_redirect": "旧的网页链接和克隆地址将失效：旧名称不会重定向。所有克隆过它的人都需要将远程地址改为新的 URL。"
     }
   },
   "commit": {
@@ -1161,14 +1431,52 @@
       "is_admin": "站点管理员",
       "is_active": "活跃",
       "delete_confirm": "删除用户",
-      "delete_warning": "确定要删除用户 \"{username}\" 吗？此操作无法撤销。"
+      "delete_warning": "确定要删除用户 \"{username}\" 吗？此操作无法撤销。",
+      "temp_password_before": "用户",
+      "temp_password_after": "的临时密码——仅在此显示一次。请转交给该用户，首次登录时必须更换。",
+      "done": "完成",
+      "username_placeholder": "用户名",
+      "email_placeholder": "邮箱",
+      "display_name_placeholder": "显示名称（可选）",
+      "administrator": "管理员",
+      "creating": "正在创建...",
+      "create": "创建用户",
+      "new": "新建用户",
+      "columns": {
+        "username": "用户名",
+        "email": "邮箱",
+        "admin": "管理员",
+        "active": "已激活",
+        "provider": "认证来源",
+        "login": "登录",
+        "created": "创建时间"
+      },
+      "locked_until": "锁定至 {date}",
+      "locked": "已锁定",
+      "failed_attempts": "{count} 次失败",
+      "last_login": "上次登录 {date}",
+      "no_login": "没有已完成的登录记录",
+      "login_ok": "正常",
+      "working": "处理中...",
+      "unlock": "解锁",
+      "reset_password": "重置密码",
+      "reset_password_confirm": "要为 {username} 生成新密码吗？该用户的所有会话都将被登出。",
+      "display_name": "显示名称",
+      "bio": "简介"
     },
     "orgs": {
       "title": "组织管理",
       "desc": "查看和管理所有组织",
       "total": "组织总数",
       "delete_confirm": "删除组织",
-      "delete_warning": "确定要删除组织 \"{name}\" 吗？所有关联数据将丢失。"
+      "delete_warning": "确定要删除组织 \"{name}\" 吗？所有关联数据将丢失。",
+      "columns": {
+        "name": "名称",
+        "display_name": "显示名称",
+        "visibility": "可见性",
+        "owner": "所有者 ID",
+        "created": "创建时间"
+      }
     },
     "audit": {
       "title": "审计日志",
@@ -1185,7 +1493,15 @@
         "resource": "资源",
         "ip": "IP 地址",
         "details": "详情"
-      }
+      },
+      "resource_all": "{field}：全部",
+      "resource_types": {
+        "user": "用户",
+        "repo": "仓库",
+        "org": "组织"
+      },
+      "clear_filters": "清除筛选",
+      "empty": "没有找到审计记录。"
     },
     "runners": {
       "title": "Runner 管理",
@@ -1210,7 +1526,99 @@
       "repo_handoff": "管理员为每个 Runner 绑定一个仓库；其 Token 无法领取其他仓库的任务。",
       "open_admin": "打开 Runner 管理",
       "delete_confirm": "删除 Runner",
-      "delete_warning": "确定要删除 Runner \"{name}\" 吗？"
+      "delete_warning": "确定要删除 Runner \"{name}\" 吗？",
+      "repository_placeholder": "所有者/仓库",
+      "page_info": "第 {page} 页，共 {total} 页"
+    },
+    "settings": {
+      "title": "实例设置",
+      "desc": "实例维护与横幅配置",
+      "admin": "管理",
+      "save": "保存设置",
+      "maintenance": {
+        "title": "维护模式",
+        "enable": "启用维护模式（只读，阻止所有修改类请求）"
+      },
+      "banner": {
+        "title": "实例横幅",
+        "message": "横幅消息（留空则隐藏）",
+        "message_placeholder": "例如：今晚 2 点进行计划维护",
+        "type": "横幅类型",
+        "type_info": "信息（蓝色）",
+        "type_warning": "警告（黄色）",
+        "type_error": "错误（红色）"
+      },
+      "sso": {
+        "title": "单点登录提供方",
+        "loading": "正在加载单点登录提供方...",
+        "empty": "尚未配置单点登录提供方。",
+        "name_slug_required": "单点登录提供方的名称和 Slug 为必填项",
+        "delete_confirm": "确定要删除单点登录提供方 \"{name}\" 吗？",
+        "test_failed": "LDAP 连接测试失败",
+        "enabled": "已启用",
+        "disabled": "已禁用",
+        "creates_accounts": "自动创建账户",
+        "no_new_accounts": "不创建新账户",
+        "testing": "正在测试...",
+        "test": "测试连接",
+        "enable": "启用",
+        "disable": "禁用",
+        "edit_title": "编辑单点登录提供方",
+        "add_title": "添加单点登录提供方",
+        "name": "名称",
+        "slug": "Slug",
+        "oauth2_hint_before": "普通 OAuth2 仅识别",
+        "oauth2_hint_and": "和",
+        "oauth2_hint_after": "。其他提供方需要使用 OIDC 类型并填写发现 URL。",
+        "type": "类型",
+        "type_oauth2": "OAuth2（GitHub / GitLab）",
+        "type_oidc": "OIDC（发现 URL）",
+        "type_ldap": "LDAP",
+        "client_id": "客户端 ID",
+        "client_secret": "客户端密钥",
+        "keep_secret": "留空以保留现有密钥",
+        "discovery_url": "发现 URL",
+        "scopes": "作用域",
+        "icon_url": "图标 URL",
+        "ldap_host": "LDAP 主机",
+        "ldap_host_placeholder": "ldap.example.com（默认使用 LDAPS）",
+        "ldap_port": "LDAP 端口",
+        "ldap_bind_dn": "LDAP 绑定 DN",
+        "ldap_bind_password": "LDAP 绑定密码",
+        "keep_password": "留空以保留现有密码",
+        "ldap_base_dn": "LDAP 基础 DN",
+        "ldap_user_filter": "LDAP 用户过滤器",
+        "enable_provider": "启用此提供方",
+        "auto_provision": "首次登录时创建账户",
+        "auto_provision_hint": "关闭时，只有已将此提供方关联到自己账户的用户（设置 → 安全）才能通过它登录。对于公共身份提供方（GitHub、Google），保持开启会让任何在那里拥有账户的人获得一个账户。",
+        "allowed_domains": "允许的邮箱域名",
+        "allowed_domains_hint_before": "以逗号分隔。留空表示不限制域名。精确匹配——",
+        "allowed_domains_hint_middle": "不会放行",
+        "allowed_domains_hint_after": "。此项只限制谁会被创建账户；已关联此提供方的账户仍可继续登录。",
+        "update": "更新提供方",
+        "create": "创建提供方"
+      },
+      "login": {
+        "title": "登录尝试",
+        "matching": "{count} 条匹配事件",
+        "refresh": "刷新",
+        "filter_username": "按用户名筛选登录尝试",
+        "username": "用户名",
+        "filter_provider": "按提供方筛选登录尝试",
+        "provider_placeholder": "提供方（password、ldap...）",
+        "filter_status": "按状态筛选登录尝试",
+        "status_all": "全部结果",
+        "status_failure": "仅失败",
+        "status_success": "仅成功",
+        "start_time": "登录尝试开始时间",
+        "end_time": "登录尝试结束时间",
+        "apply": "应用",
+        "empty": "没有匹配的登录尝试。",
+        "success": "成功",
+        "failed": "失败",
+        "unknown_ip": "未知 IP",
+        "page_info": "第 {page} 页，共 {total} 页"
+      }
     }
   },
   "profile": {
@@ -1241,7 +1649,11 @@
     "editCard": "编辑卡片",
     "cardNote": "备注",
     "linkedIssue": "关联问题",
-    "noIssue": "无关联问题"
+    "noIssue": "无关联问题",
+    "page_title": "看板",
+    "move_card_up": "上移卡片",
+    "move_card_down": "下移卡片",
+    "identity_mismatch": "看板响应与请求的看板不一致"
   },
   "packages": {
     "upload": "上传包",
@@ -1260,7 +1672,23 @@
     "yanked": "已撤回",
     "yanked_hint": "该版本已撤回：安装器不再选择它，但它仍在列表中且可以恢复。",
     "yank_hint": "在不删除的情况下撤回该版本。可撤销，并记入审计日志。",
-    "delete_confirm": "删除 {name} {version}？此操作无法撤销 —— 如需可恢复地撤回，请改用撤回。"
+    "delete_confirm": "删除 {name} {version}？此操作无法撤销 —— 如需可恢复地撤回，请改用撤回。",
+    "page_info": "第 {page} 页，共 {total} 页",
+    "upload_form": {
+      "file_required": "必须选择包文件",
+      "back": "返回",
+      "name": "名称",
+      "name_placeholder": "包名称",
+      "homepage": "主页",
+      "repository_url": "仓库 URL",
+      "semver": "语义化版本（Semver）",
+      "uploading": "正在上传..."
+    },
+    "support": {
+      "generic_fallback": "通用回退",
+      "native_adapter": "原生适配器",
+      "option_generic_fallback": "{label}（通用回退）"
+    }
   },
   "runners": {
     "register": "注册 Runner",
@@ -1276,6 +1704,363 @@
     "delete": "删除"
   },
   "time_tracking": {
-    "title": "时间跟踪"
+    "title": "时间跟踪",
+    "minutes_short": "{minutes} 分钟",
+    "hours_short": "{hours} 小时",
+    "hours_minutes_short": "{hours} 小时 {minutes} 分钟",
+    "issues": "问题",
+    "loading": "加载中…",
+    "no_open_issues": "没有开放的问题。",
+    "select_hint": "← 选择一个问题以查看和记录时间",
+    "total": "合计：{total}",
+    "no_entries_for_issue": "此问题暂无时间记录。",
+    "duration_column": "时长",
+    "logged_column": "记录时间"
+  },
+  "agents": {
+    "title": "智能体",
+    "description": "为每个 AI 智能体单独创建一个机器人账户。它创建的问题、拉取请求和提交会带上它自己的名字，并注明您是其所有者；它没有密码，当您删除它或您的账户被停用时，它将立即停止工作。",
+    "howto": {
+      "create": "在下方创建一个智能体。",
+      "collaborator": "将它添加为每个需要它参与的仓库的协作者——这就是它的访问权限。",
+      "mint_before": "为它生成一个令牌（可选择限定仓库、MCP 工具，并禁止写入受保护分支），然后将 MCP 客户端指向",
+      "mint_with": "，并使用",
+      "mint_end": "。"
+    },
+    "load_failed": "加载智能体失败",
+    "tokens_load_failed": "加载令牌失败",
+    "username_required": "智能体需要一个用户名",
+    "created": "智能体 @{username} 已创建。请将它添加为需要它参与的仓库的协作者。",
+    "create_failed": "创建智能体失败",
+    "delete_confirm": "删除智能体 @{username}？它的令牌将失效，它的仓库也会被删除。",
+    "deleted": "智能体 @{username} 已删除",
+    "delete_failed": "删除智能体失败",
+    "token_name_required": "令牌名称为必填项",
+    "token_created": "令牌已创建。请立即复制，它不会再次显示。",
+    "token_create_failed": "创建令牌失败",
+    "token_revoke_confirm": "撤销 @{username} 的令牌“{name}”？",
+    "token_revoked": "令牌已撤销",
+    "token_revoke_failed": "撤销令牌失败",
+    "token_copied": "令牌已复制",
+    "create_title": "创建智能体",
+    "username": "用户名",
+    "display_name": "显示名称",
+    "display_name_placeholder": "代码审查助手",
+    "creating": "正在创建...",
+    "list_title": "您的智能体",
+    "empty": "暂无智能体。",
+    "disabled": "已停用",
+    "tokens": "令牌",
+    "deleting": "正在删除...",
+    "new_token_label": "新的智能体令牌",
+    "new_token": "新令牌",
+    "new_token_hint": "离开此页面前请复制该值。",
+    "token_name": "令牌名称",
+    "expires": "过期时间",
+    "repositories_hint": "仓库（owner/name，每行一个或用逗号分隔；留空 = 智能体可访问的所有仓库）",
+    "mcp_tools_hint": "MCP 工具（用逗号分隔；留空 = 普通令牌，填写后 = 只能通过 MCP 端点使用）",
+    "deny_protected_merge": "禁止写入受保护分支（不得合并、推送或提交到这些分支）",
+    "create_token": "创建令牌",
+    "no_tokens": "@{username} 暂无令牌。",
+    "table": {
+      "name": "名称",
+      "confined_to": "限定范围",
+      "last_used": "最后使用"
+    },
+    "narrowing": {
+      "repositories": "仓库：{list}",
+      "mcp_tools": "MCP 工具：{list}",
+      "none": "无",
+      "any": "任意",
+      "any_rest": "任意（允许 REST）",
+      "kept_off": "禁止写入受保护分支",
+      "may_write": "可写入受保护分支"
+    },
+    "revoking": "正在撤销...",
+    "revoke": "撤销"
+  },
+  "imports": {
+    "title": "导入",
+    "subtitle": "从 GitHub、GitLab、Gitea 或 Git 远程仓库迁移仓库及项目数据。",
+    "refresh": "刷新",
+    "load_failed": "加载导入任务失败",
+    "queued": "导入已加入队列",
+    "start_failed": "启动导入失败",
+    "delete_confirm": "取消并删除此导入任务？",
+    "deleted": "导入任务已删除",
+    "delete_failed": "删除导入任务失败",
+    "new_title": "新建导入",
+    "platform": "平台",
+    "source_url": "源仓库 URL",
+    "target_owner": "目标所有者",
+    "target_name": "目标仓库",
+    "target_name_placeholder": "根据源 URL 自动生成",
+    "auth_token": "源访问令牌",
+    "auth_token_placeholder": "私有仓库时可选填写",
+    "content": {
+      "title": "内容",
+      "repository": "仓库",
+      "issues": "问题",
+      "pull_requests": "拉取请求",
+      "wiki": "Wiki",
+      "releases": "发布",
+      "labels": "标签",
+      "milestones": "里程碑"
+    },
+    "starting": "正在启动...",
+    "start": "开始导入",
+    "tasks_title": "导入任务",
+    "loading": "正在加载导入任务...",
+    "empty": "暂无导入任务。",
+    "table": {
+      "source": "来源",
+      "target": "目标",
+      "status": "状态",
+      "progress": "进度",
+      "updated": "更新时间"
+    },
+    "deleting": "正在删除..."
+  },
+  "help": {
+    "title": "帮助",
+    "subtitle": "使用本 Plombir Git 实例的常用命令和入口。",
+    "clone_title": "克隆仓库",
+    "tokens_title": "使用访问令牌",
+    "tokens_body": "在安全设置中创建个人访问令牌，然后将其作为 API 请求的 Bearer 令牌，或作为 HTTPS Git 操作的密码使用。",
+    "tokens_link": "管理访问令牌",
+    "agent_title": "连接 AI 智能体",
+    "agent_body": "为智能体单独创建一个机器人账户：它以自己的名义、代表您执行操作，所用令牌可限定于特定仓库、MCP 工具和未受保护的分支。",
+    "agent_endpoint_before": "将 MCP 客户端指向本服务器上的",
+    "agent_endpoint_after": "，并使用机器人的令牌作为 Bearer 令牌。",
+    "agent_link": "管理智能体",
+    "find_title": "查找工作",
+    "find_explore": "探索仓库",
+    "find_search": "搜索代码和问题",
+    "find_imports": "导入仓库"
+  },
+  "account_security": {
+    "title": "安全",
+    "description": "管理网页登录和 Git/API 访问的账号保护措施。",
+    "status_unknown": "未知",
+    "status_enabled": "已启用",
+    "status_disabled": "未启用",
+    "status_none": "无",
+    "password_required": "请输入当前密码",
+    "mfa": {
+      "title": "多因素认证",
+      "description": "在密码登录后再输入一个基于时间的身份验证器代码。",
+      "state_unknown": "无法读取此账号的第二因素，因此本页无法判断 MFA 是否已开启。在这里重新设置可能会替换一个仍在使用的身份验证器，所以这里提供的是重新读取，而不是设置。",
+      "retry": "重新读取 MFA 状态",
+      "unused_codes": "个未使用的备用码",
+      "total_codes": "个备用码（总计）",
+      "current_password": "当前密码",
+      "working": "处理中...",
+      "regenerate": "重新生成备用码",
+      "regenerate_hint": "将生成一组新的 {count} 个备用码，并作废您当前所有未使用的备用码。",
+      "disabling": "停用中...",
+      "disable": "停用 MFA",
+      "not_enabled": "此账号尚未启用 MFA。",
+      "starting": "启动中...",
+      "set_up": "设置 MFA",
+      "setup_failed": "启动 MFA 设置失败",
+      "code_required": "请输入验证码",
+      "enabled_notice": "MFA 已启用。离开本页前请保存好您的备用码。",
+      "enable_failed": "启用 MFA 失败",
+      "disable_confirm": "要为您的账号停用多因素认证吗？",
+      "disabled_notice": "MFA 已停用",
+      "disable_failed": "停用 MFA 失败",
+      "regenerate_confirm": "要替换您的备用码吗？您当前所有未使用的备用码都将失效。",
+      "regenerated_notice": "已生成新的备用码。离开本页前请保存好它们——旧的备用码已失效。",
+      "regenerate_failed": "重新生成备用码失败"
+    },
+    "setup": {
+      "title": "扫描身份验证器二维码",
+      "qr_label": "身份验证器二维码",
+      "hint": "用身份验证器应用扫描二维码，然后输入六位数验证码。",
+      "code": "验证码",
+      "verifying": "验证中...",
+      "enable": "启用 MFA"
+    },
+    "backup": {
+      "label": "新的备用码",
+      "title": "备用码",
+      "description": "如果您无法使用身份验证器，每个备用码可使用一次。",
+      "copy": "复制备用码",
+      "copied": "备用码已复制"
+    },
+    "passkeys": {
+      "title": "通行密钥",
+      "description": "使用 Touch ID、Windows Hello 或安全密钥免密码登录。",
+      "active": "{count} 个已启用",
+      "unsupported": "此浏览器不支持通行密钥。",
+      "state_unknown": "无法读取此账号已注册的通行密钥，因此本节无法断定没有通行密钥。",
+      "retry": "重新读取通行密钥",
+      "added": "添加于 {date}",
+      "last_used": "上次使用于 {date}",
+      "remove": "移除",
+      "empty": "尚未注册通行密钥。",
+      "name": "通行密钥名称",
+      "name_placeholder": "例如 YubiKey、MacBook",
+      "waiting": "正在等待身份验证器...",
+      "add": "添加通行密钥",
+      "registered": "通行密钥已注册。",
+      "register_failed": "注册通行密钥失败",
+      "remove_confirm": "要移除此通行密钥吗？移除后将无法再用它登录。",
+      "removed": "通行密钥已移除。",
+      "remove_failed": "移除通行密钥失败"
+    },
+    "sso": {
+      "title": "已关联账号",
+      "description": "可以登录此账号的外部身份。",
+      "linked_count": "已关联 {count} 个",
+      "state_unknown": "无法读取此账号已关联的外部身份，因此本节无法断定没有关联。",
+      "retry": "重新读取已关联账号",
+      "linked_at": "关联于 {date}",
+      "provider_off": "该提供方已被停用",
+      "unlink": "取消关联",
+      "empty": "尚未关联任何外部账号。",
+      "link": "关联 {provider}",
+      "providers_unknown": "无法读取此账号可关联的提供方。",
+      "linked_notice": "提供方已关联。现在您可以通过它登录。",
+      "link_failed": "无法开始关联 {provider}",
+      "unlink_confirm": "要取消关联 {provider} 吗？在您从本页重新关联之前，将无法通过它登录。",
+      "unlinked": "已取消关联 {provider}。",
+      "unlink_failed": "取消关联提供方失败"
+    }
+  },
+  "access_tokens": {
+    "title": "访问令牌",
+    "description": "管理用于 HTTP 方式 Git 操作、API 客户端和自动化的个人令牌。",
+    "new_token_label": "新的访问令牌",
+    "new_token": "新令牌",
+    "copy_hint": "离开本页前请复制此值。",
+    "create_title": "创建令牌",
+    "name": "名称",
+    "name_placeholder": "CI 部署令牌",
+    "scopes": "权限范围",
+    "expires": "过期时间",
+    "creating": "创建中...",
+    "existing_title": "现有令牌",
+    "empty": "尚无个人访问令牌。",
+    "created": "创建时间",
+    "last_used": "上次使用",
+    "revoking": "吊销中...",
+    "revoke": "吊销",
+    "narrowing_repos": "仓库：{list}",
+    "narrowing_none": "无",
+    "narrowing_mcp": "仅限 MCP：{list}",
+    "narrowing_protected": "不可操作受保护分支",
+    "load_failed": "加载访问令牌失败",
+    "name_required": "请输入令牌名称",
+    "created_notice": "令牌已创建。请立即复制，它不会再次显示。",
+    "create_failed": "创建令牌失败",
+    "revoke_confirm": "要吊销令牌“{name}”吗？",
+    "revoked": "令牌已吊销",
+    "revoke_failed": "吊销令牌失败",
+    "copied": "令牌已复制"
+  },
+  "commit_detail": {
+    "page_title": "提交 {sha}",
+    "load_failed": "加载提交状态失败",
+    "loading": "正在加载提交状态...",
+    "error": "错误：{error}",
+    "just_now": "刚刚",
+    "minutes_ago": "{count} 分钟前",
+    "hours_ago": "{count} 小时前",
+    "days_ago": "{count} 天前",
+    "checks_passed": "所有检查均已通过",
+    "checks_failed": "部分检查失败",
+    "checks_errored": "部分检查出错",
+    "checks_pending": "检查进行中",
+    "status_unknown": "未知状态",
+    "gpg_unreachable_title": "GPG：无法连接签名检查",
+    "signature_unavailable": "签名状态不可用",
+    "gpg_title": "GPG：{status}",
+    "gpg_title_signer": "GPG：{status} · {signer}",
+    "signed": "已签名",
+    "signed_by": "签名者 {signer}",
+    "unsigned": "未签名",
+    "signature_unchecked": "无法检查签名",
+    "bad_signature": "签名无效",
+    "details_unavailable": "提交详情不可用",
+    "details_unavailable_hint": "无法加载提交详情。下方的状态检查可能仍然可用。",
+    "not_found": "未找到提交",
+    "not_found_hint": "提交日志中不包含所请求的提交。",
+    "checks_count": "{count} 项检查",
+    "status_checks": "状态检查",
+    "view_details": "查看详情 →"
+  },
+  "issue_board": {
+    "page_title": "看板",
+    "delete_column_confirm": "删除此列及其中的所有卡片？",
+    "identity_mismatch": "看板响应与请求的看板不一致",
+    "loading": "加载中…",
+    "empty_hint": "创建您的第一个项目看板来组织问题。",
+    "add_board": "+ 看板",
+    "add_column": "+ 列",
+    "delete_column": "删除列",
+    "remove_card": "移除卡片",
+    "note_placeholder": "添加备注…",
+    "add_card": "+ 添加卡片"
+  },
+  "comments": {
+    "edited": "已编辑",
+    "edit_label": "编辑评论",
+    "edit_failed": "保存评论失败",
+    "delete_failed": "删除评论失败",
+    "delete_title": "删除评论？",
+    "delete_confirm": "该评论及其附件将对所有人删除。此操作无法撤销。"
+  },
+  "notification_settings": {
+    "title": "通知设置",
+    "description": "选择哪些通知也发送到你的邮箱。",
+    "email_title": "邮件",
+    "load_failed": "加载通知设置失败",
+    "save_failed": "保存设置失败",
+    "saved": "已保存。",
+    "in_app_note": "通知始终会显示在应用内；这些开关只决定哪些通知会通过邮件发送。",
+    "category": {
+      "review_requested": {
+        "name": "评审请求",
+        "hint": "有人直接或通过 CODEOWNERS 请求你评审。"
+      },
+      "mention": {
+        "name": "提及",
+        "hint": "有人 @提及了你。"
+      },
+      "assigned": {
+        "name": "分配",
+        "hint": "有问题被分配给你。"
+      },
+      "ci_failed": {
+        "name": "CI 失败",
+        "hint": "你的拉取请求上的 CI 失败了。"
+      },
+      "participating": {
+        "name": "参与",
+        "hint": "你参与或关注的问题或拉取请求中有新动态。"
+      },
+      "ci_triggered": {
+        "name": "CI 已启动",
+        "hint": "推送在你拥有的仓库中启动了 CI。"
+      }
+    }
+  },
+  "subscription": {
+    "title": "通知",
+    "subscribe": "订阅",
+    "unsubscribe": "取消订阅",
+    "not_subscribed": "你不会收到此讨论的通知。",
+    "load_failed": "无法读取你的订阅状态",
+    "update_failed": "更改订阅失败",
+    "reason_other": "你正在接收通知（{reason}）。",
+    "reason": {
+      "author": "你正在接收通知，因为这是你创建的。",
+      "commented": "你正在接收通知，因为你发表过评论。",
+      "mention": "你正在接收通知，因为有人提及了你。",
+      "assigned": "你正在接收通知，因为它被分配给了你。",
+      "review_requested": "你正在接收通知，因为有人请求你评审。",
+      "manual": "你正在接收通知，因为你订阅了它。"
+    }
   }
 }

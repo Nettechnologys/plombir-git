@@ -27,8 +27,8 @@ use rg_core::blob_storage::BlobKey;
 use rg_db::sea_orm::{ColumnTrait, EntityTrait, NotSet, QueryFilter, Set};
 
 use crate::common::{
-    create_issue, create_repo, fault::spawn_test_app_for_fault_sweep, register_full,
-    spawn_test_app_with_state,
+    create_initialised_repo, create_issue, create_repo, fault::spawn_test_app_for_fault_sweep,
+    register_full, spawn_test_app_with_state,
 };
 
 async fn promote_user_to_admin(db: &rg_db::DatabaseConnection, user_id: i64) {
@@ -735,7 +735,7 @@ async fn deleting_an_account_keeps_what_it_uploaded_into_another_repository() {
     let (guest_token, guest_id) =
         register_full(&base, "ghost-guest", "ghost-guest@example.com").await;
 
-    let repo_id = create_repo(&base, &host_token, "shared").await;
+    let repo_id = create_initialised_repo(&base, &host_token, "shared").await;
     let added = client
         .post(format!(
             "{base}/api/v1/repos/ghost-host/shared/collaborators"

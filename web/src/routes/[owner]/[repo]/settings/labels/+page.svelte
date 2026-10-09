@@ -1,8 +1,10 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { labels, buildLabelPayload } from '$lib/api/client.svelte';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
+  import Modal from '$lib/components/Modal.svelte';
 
   interface Label {
     id: number;
@@ -37,24 +39,14 @@
   let deletingLabel = $state<Label | null>(null);
   let deleting = $state(false);
   let busyRows = $state<Set<string>>(new Set());
+  // Creating, editing and deleting labels is behind `RepoWrite`
+  // (card_3625a7b89abb); a reader sees the list without the controls.
+  const permission = viewerPermission(() => owner, () => repo);
+  let canWrite = $derived(permission.canWrite);
   const listRequests = new LatestRepositoryRequestFence();
   let routeGeneration = 0;
   let successTimer: ReturnType<typeof setTimeout> | undefined;
 
-  function closeCreateModalByKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      closeForm();
-    }
-  }
-
-  function closeDeleteModalByKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      cancelDelete();
-    }
-  }
-  
   const presetColors = [
     '#ff0000', '#00ff00', '#0000ff', '#ffff00',
     '#ff00ff', '#00ffff', '#ff8800', '#888888'
@@ -132,7 +124,7 @@
         error = '';
       }
     } catch (err: any) {
-      if (listRequests.owns(claim, owner, repo)) error = err.message || 'Failed to load labels';
+      if (listRequests.owns(claim, owner, repo)) error = err.message || t('settings.labels_load_failed');
     } finally {
       if (listRequests.owns(claim, owner, repo)) loading = false;
     }
@@ -165,7 +157,7 @@
   
   async function handleSave() {
     if (!formData.name.trim()) {
-      formError = 'Label name is required';
+      formError = t('settings.label_name_required');
       return;
     }
     const expectedOwner = owner;
@@ -195,7 +187,7 @@
       await loadLabels(expectedOwner, expectedRepo);
     } catch (err: any) {
       if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
-        formError = err.message || 'Failed to save label';
+        formError = err.message || t('settings.label_save_failed');
       }
     } finally {
       if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
@@ -231,7 +223,7 @@
       await loadLabels(expectedOwner, expectedRepo);
     } catch (err: any) {
       if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
-        error = err.message || 'Failed to delete label';
+        error = err.message || t('settings.label_delete_failed');
       }
     } finally {
       if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
@@ -243,12 +235,18 @@
   
 </script>
 
+<svelte:head>
+  <title>{t('settings.labels')} · {owner}/{repo} · Plombir Git</title>
+</svelte:head>
+
 <div class="labels-page">
   <div class="page-header">
     <h1>{t('settings.labels')}</h1>
-    <button class="btn btn-primary" onclick={openCreateForm}>
-      + {t('settings.new_label')}
-    </button>
+    {#if canWrite}
+      <button class="btn btn-primary" onclick={openCreateForm}>
+        + {t('settings.new_label')}
+      </button>
+    {/if}
   </div>
   
   {#if success}
@@ -261,15 +259,9 @@
   
   <!-- Create/Edit Form -->
   {#if showForm}
-    <div
-      class="form-overlay"
-      onclick={closeForm}
-      role="button"
-      tabindex="0"
-      onkeydown={closeCreateModalByKey}
-    >
-      <div class="form-modal" role="dialog" aria-modal="true" tabindex="-1">
-        <h2>{editingLabel ? t('settings.edit_label') : t('settings.new_label')}</h2>
+    <Modal onclose={closeForm} labelledby="label-form-title" width="500px" padding="2rem">
+      <div class="form-modal">
+        <h2 id="label-form-title">{editingLabel ? t('settings.edit_label') : t('settings.new_label')}</h2>
         
         {#if formError}
           <div class="error-box">{formError}</div>
@@ -299,7 +291,7 @@
                   style="background-color: {color}"
                   onclick={() => formData.color = color}
                   disabled={saving}
-                  aria-label="Color {color}"
+                  aria-label={t('settings.label_color_swatch', { color })}
                 ></button>
               {/each}
             </div>
@@ -334,45 +326,39 @@
         
         <div class="form-actions">
           <button class="btn btn-outline" onclick={closeForm} disabled={saving}>
-            Cancel
+            {t('common.cancel')}
           </button>
           <button class="btn btn-primary" onclick={handleSave} disabled={saving || isBusy(rowKey(editingLabel?.id ?? null))} aria-busy={saving}>
-            {saving ? 'Saving...' : (editingLabel ? t('settings.save_label') : t('settings.create_label'))}
+            {saving ? t('common.saving') : (editingLabel ? t('settings.save_label') : t('settings.create_label'))}
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   {/if}
   
   <!-- Delete Confirmation -->
   {#if deletingLabel}
-    <div
-      class="form-overlay"
-      onclick={cancelDelete}
-      role="button"
-      tabindex="0"
-      onkeydown={closeDeleteModalByKey}
-    >
-      <div class="form-modal" role="dialog" aria-modal="true" tabindex="-1">
-        <h2>Confirm Delete</h2>
+    <Modal onclose={cancelDelete} labelledby="label-delete-title" width="500px" padding="2rem">
+      <div class="form-modal">
+        <h2 id="label-delete-title">{t('settings.confirm_delete_title')}</h2>
         <p>{t('settings.confirm_delete_label')}</p>
         <p><strong>{deletingLabel.name}</strong></p>
         
         <div class="form-actions">
-          <button class="btn btn-outline" onclick={cancelDelete} disabled={deleting}>
-            Cancel
+          <button class="btn btn-outline" onclick={cancelDelete} disabled={deleting} data-autofocus>
+            {t('common.cancel')}
           </button>
           <button class="btn btn-danger" onclick={handleDelete} disabled={deleting}>
-            {deleting ? 'Deleting...' : 'Delete'}
+            {deleting ? t('common.deleting') : t('common.delete')}
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   {/if}
   
   <!-- Labels List -->
   {#if loading}
-    <div class="loading">Loading...</div>
+    <div class="loading">{t('common.loading')}</div>
   {:else if labelList.length === 0}
     <div class="empty-state">
       <p>{t('settings.no_labels')}</p>
@@ -390,14 +376,16 @@
               {/if}
             </div>
           </div>
-          <div class="label-actions">
-            <button class="btn-icon" onclick={() => openEditForm(label)} title="Edit" disabled={isBusy(rowKey(label.id))}>
-              ✏️
-            </button>
-            <button class="btn-icon" onclick={() => confirmDelete(label)} title="Delete" disabled={isBusy(rowKey(label.id))} aria-busy={isBusy(rowKey(label.id))}>
-              🗑️
-            </button>
-          </div>
+          {#if canWrite}
+            <div class="label-actions">
+              <button class="btn-icon" onclick={() => openEditForm(label)} title={t('common.edit')} disabled={isBusy(rowKey(label.id))}>
+                ✏️
+              </button>
+              <button class="btn-icon" onclick={() => confirmDelete(label)} title={t('common.delete')} disabled={isBusy(rowKey(label.id))} aria-busy={isBusy(rowKey(label.id))}>
+                🗑️
+              </button>
+            </div>
+          {/if}
         </div>
       {/each}
     </div>
@@ -485,31 +473,7 @@
     margin-bottom: 1rem;
   }
   
-  /* Form Overlay */
-  .form-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: rgba(0, 0, 0, 0.7);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-  }
-  
-  .form-modal {
-    background: var(--bg-primary);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 2rem;
-    max-width: 500px;
-    width: 90%;
-    max-height: 90vh;
-    overflow-y: auto;
-  }
-  
+  /* Modal content (the panel itself is lib/components/Modal.svelte) */
   .form-modal h2 {
     margin: 0 0 1.5rem 0;
     color: var(--text-primary);

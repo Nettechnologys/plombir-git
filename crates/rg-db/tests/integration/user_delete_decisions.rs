@@ -70,6 +70,12 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "card_dd3f86fde48e: an inbox row is meaningless without its recipient",
     ),
     (
+        "notification_settings",
+        "user_id",
+        "CASCADE",
+        "card_349c2b6a0d7c: the account's own mail choices",
+    ),
+    (
         "oauth_accounts",
         "user_id",
         "CASCADE",
@@ -136,6 +142,12 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "user_id",
         "CASCADE",
         "the account's own subscription",
+    ),
+    (
+        "thread_subscriptions",
+        "user_id",
+        "CASCADE",
+        "card_349c2b6a0d7c: the account's own subscription to an issue or pull request",
     ),
     (
         "repositories",
@@ -233,6 +245,14 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "NO FOREIGN KEY",
         "account deletion refuses while this account owns an organization; see \
          refuse_ownerships_this_deletion_may_not_cascade",
+    ),
+    (
+        "owner_names",
+        "owner_id",
+        "NO FOREIGN KEY",
+        "card_8f3f821705f2: the id of an account *or* an organization, told apart by `kind`, so no \
+         single foreign key can name its parent; the row is removed by the `AFTER DELETE` trigger \
+         on `users` (and on `organizations`) in the same statement as its holder",
     ),
     (
         "audit_log",

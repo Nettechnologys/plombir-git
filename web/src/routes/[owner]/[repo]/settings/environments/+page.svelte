@@ -2,6 +2,9 @@
   import { page } from '$app/stores';
   import { allowedUserLabel, ciEnvironments, parseStringList, type CiEnvironment } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
+  import { createT } from '$lib/i18n';
+
+  const t = createT();
 
   const owner = $derived($page.params.owner!); const repo = $derived($page.params.repo!);
   let items = $state<CiEnvironment[]>([]); let name = $state('production'); let isProtected = $state(true);
@@ -77,7 +80,7 @@
     }
   }
   async function remove(item: CiEnvironment) {
-    if (!confirm(`Delete environment ${item.name}?`)) return;
+    if (!confirm(t('settings.environments.delete_confirm', { name: item.name }))) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -93,17 +96,17 @@
     }
   }
 </script>
-<svelte:head><title>Environments · {owner}/{repo}</title></svelte:head>
+<svelte:head><title>{t('settings.environments.title')} · {owner}/{repo}</title></svelte:head>
 <div class="settings-page">
-  <header><h1>Deployment environments</h1><p>Require designated reviewers before jobs can deploy to protected environments.</p></header>
+  <header><h1>{t('settings.environments.heading')}</h1><p>{t('settings.environments.desc')}</p></header>
   {#if error}<div class="message" role="alert">{error}</div>{/if}
-  <section><h2>{editingId === null ? 'Create environment' : 'Edit environment'}</h2><form onsubmit={save}>
-    <label for="environment-name">Name</label><input id="environment-name" bind:value={name} maxlength="255" disabled={saving} required />
-    <label class="check"><input type="checkbox" bind:checked={isProtected} disabled={saving} /> Require approval</label>
-    <label for="required-approvals">Required approvals</label><input id="required-approvals" type="number" min="1" max="10" bind:value={required} disabled={saving} required />
-    <label for="approvers">Allowed approvers <span>(comma-separated usernames; empty means repository admins)</span></label><input id="approvers" bind:value={approvers} placeholder="alice, bob" disabled={saving} />
-    <div class="actions"><button class="btn btn-primary" disabled={saving} aria-busy={saving}>{editingId === null ? 'Create environment' : 'Save changes'}</button>{#if editingId !== null}<button type="button" class="btn" disabled={saving} onclick={resetForm}>Cancel</button>{/if}</div>
+  <section><h2>{editingId === null ? t('settings.environments.create') : t('settings.environments.edit_title')}</h2><form onsubmit={save}>
+    <label for="environment-name">{t('settings.environments.name')}</label><input id="environment-name" bind:value={name} maxlength="255" disabled={saving} required />
+    <label class="check"><input type="checkbox" bind:checked={isProtected} disabled={saving} /> {t('settings.environments.require_approval')}</label>
+    <label for="required-approvals">{t('settings.environments.required_approvals')}</label><input id="required-approvals" type="number" min="1" max="10" bind:value={required} disabled={saving} required />
+    <label for="approvers">{t('settings.environments.allowed_approvers')} <span>{t('settings.environments.allowed_approvers_hint')}</span></label><input id="approvers" bind:value={approvers} placeholder="alice, bob" disabled={saving} />
+    <div class="actions"><button class="btn btn-primary" disabled={saving} aria-busy={saving}>{editingId === null ? t('settings.environments.create') : t('settings.environments.save')}</button>{#if editingId !== null}<button type="button" class="btn" disabled={saving} onclick={resetForm}>{t('common.cancel')}</button>{/if}</div>
   </form></section>
-  <section><h2>Configured environments</h2>{#if items.length === 0}<p>No environments configured.</p>{:else}<div class="list">{#each items as item (item.id)}<article><div><strong>{item.name}</strong><p>{item.protected ? `${item.required_approvals} approval(s) required` : 'Unprotected'}{(item.allowed_approvers ?? []).length ? ` · reviewers: ${(item.allowed_approvers ?? []).map(allowedUserLabel).join(', ')}` : ''}</p></div><div class="actions"><button class="btn" disabled={isBusy(rowKey(item.id))} onclick={() => edit(item)}>Edit</button><button class="btn btn-danger" disabled={isBusy(rowKey(item.id))} aria-busy={isBusy(rowKey(item.id))} onclick={() => remove(item)}>Delete</button></div></article>{/each}</div>{/if}</section>
+  <section><h2>{t('settings.environments.list_title')}</h2>{#if items.length === 0}<p>{t('settings.environments.empty')}</p>{:else}<div class="list">{#each items as item (item.id)}<article><div><strong>{item.name}</strong><p>{item.protected ? t('settings.environments.approvals_required', { count: item.required_approvals }) : t('settings.environments.unprotected')}{(item.allowed_approvers ?? []).length ? ` · ${t('settings.environments.reviewers', { users: (item.allowed_approvers ?? []).map(allowedUserLabel).join(', ') })}` : ''}</p></div><div class="actions"><button class="btn" disabled={isBusy(rowKey(item.id))} onclick={() => edit(item)}>{t('common.edit')}</button><button class="btn btn-danger" disabled={isBusy(rowKey(item.id))} aria-busy={isBusy(rowKey(item.id))} onclick={() => remove(item)}>{t('common.delete')}</button></div></article>{/each}</div>{/if}</section>
 </div>
 <style>.settings-page{max-width:880px}header,section{margin-bottom:28px}header p,article p,label span{color:var(--text-secondary)}form{display:grid;gap:9px}input{padding:8px 10px}.check,.actions{display:flex;align-items:center;gap:8px}.check input{width:auto}.message{color:var(--red);padding:12px;border:1px solid var(--border);border-radius:var(--radius)}.list{display:grid;gap:10px}article{display:flex;align-items:center;justify-content:space-between;padding:14px;border:1px solid var(--border);border-radius:var(--radius)}article p{margin:4px 0 0;font-size:13px}</style>

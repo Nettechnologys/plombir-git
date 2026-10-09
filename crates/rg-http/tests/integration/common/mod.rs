@@ -25,6 +25,17 @@ impl rg_core::ci::CiTrigger for NoopCiEngine {
         false
     }
 
+    /// The same answer once more: no workflow files, so no manual-run form.
+    /// The trait's default fails loudly on purpose (an engine that forgot the
+    /// method), which made `GET /pipelines/workflow-dispatch` a `500` in every
+    /// test whose repository has a commit to read it at.
+    fn workflow_dispatch_schema(
+        &self,
+        _query: rg_core::ci::WorkflowDispatchSchemaQuery<'_>,
+    ) -> anyhow::Result<rg_core::ci::WorkflowDispatchSchema> {
+        Ok(rg_core::ci::WorkflowDispatchSchema::default())
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         _params: rg_core::ci::TriggerPipelineParams<'a>,
@@ -838,6 +849,26 @@ pub async fn create_repo(base: &str, token: &str, name: &str) -> i64 {
     resp.json::<serde_json::Value>().await.unwrap()["id"]
         .as_i64()
         .unwrap()
+}
+
+/// [`create_repo`], with a first commit on its default branch — what a release
+/// needs since creating one creates its tag at a commit (card_4d406b01b722).
+#[allow(dead_code)]
+pub async fn create_initialised_repo(base: &str, token: &str, name: &str) -> i64 {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"name": name, "auto_init": true, "readme": "default"}))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        status, 201,
+        "create_initialised_repo '{name}' failed: {body}"
+    );
+    body["id"].as_i64().unwrap()
 }
 
 /// Create an issue and return (id, number).

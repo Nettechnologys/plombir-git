@@ -1,10 +1,11 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
-  import { createT } from '$lib/i18n';
+  import { createT, formatDateTime } from '$lib/i18n';
   import { runners } from '$lib/api/client.svelte';
   import { isAdmin, isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
   import { untrack } from 'svelte';
+  import Modal from '$lib/components/Modal.svelte';
 
   const t = createT();
 
@@ -153,13 +154,6 @@
       loadRunners();
     }
   }
-
-  function closeDeleteDialogByKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      deleteTarget = null;
-    }
-  }
 </script>
 
 <svelte:head>
@@ -199,7 +193,7 @@
       </label>
       <label>
         <span>{t('admin.runners.repository')}</span>
-        <input type="text" bind:value={newRunnerRepository} placeholder="owner/repository" />
+        <input type="text" bind:value={newRunnerRepository} placeholder={t('admin.runners.repository_placeholder')} />
       </label>
       <div class="runner-label-field">
         <span id="runner-labels-label" class="field-label">{t('admin.runners.labels')}</span>
@@ -285,7 +279,7 @@
                 </div>
               </td>
               <td class="muted">{runner.version || '-'}</td>
-              <td class="muted">{runner.last_seen ? new Date(runner.last_seen).toLocaleString() : t('common.never')}</td>
+              <td class="muted">{runner.last_seen ? formatDateTime(runner.last_seen) : t('common.never')}</td>
               <td class="actions">
                 <button class="btn-danger" onclick={() => confirmDelete(runner)}>{t('common.delete')}</button>
               </td>
@@ -298,7 +292,7 @@
     {#if totalPages > 1}
       <div class="pagination">
         <button onclick={prevPage} disabled={page <= 1}>{t('common.previous')}</button>
-        <span>Page {page} of {totalPages}</span>
+        <span>{t('admin.runners.page_info', { page, total: totalPages })}</span>
         <button onclick={nextPage} disabled={page >= totalPages}>{t('common.next')}</button>
       </div>
     {/if}
@@ -306,31 +300,18 @@
 </div>
 
 {#if deleteTarget}
-  <div
-    class="modal-overlay"
-    onclick={() => deleteTarget = null}
-    role="button"
-    tabindex="0"
-    onkeydown={closeDeleteDialogByKey}
-  >
-    <div
-      class="modal"
-      role="dialog"
-      aria-modal="true"
-      tabindex="-1"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.stopPropagation()}
-    >
-      <h2>{t('admin.runners.delete_confirm')}</h2>
+  <Modal onclose={() => deleteTarget = null} labelledby="admin-runner-delete-title" width="420px">
+    <div class="modal">
+      <h2 id="admin-runner-delete-title">{t('admin.runners.delete_confirm')}</h2>
       <p>{t('admin.runners.delete_warning', { name: deleteTarget.name })}</p>
       <div class="modal-actions">
         <button class="btn-danger" onclick={handleDelete} disabled={deleting}>
           {deleting ? t('common.loading') : t('common.delete')}
         </button>
-        <button class="btn-secondary" onclick={() => deleteTarget = null}>{t('common.cancel')}</button>
+        <button class="btn-secondary" onclick={() => deleteTarget = null} data-autofocus>{t('common.cancel')}</button>
       </div>
     </div>
-  </div>
+  </Modal>
 {/if}
 
 <style>
@@ -377,8 +358,7 @@
   .btn-primary { background: var(--accent); border: 1px solid var(--accent); color: #fff; border-radius: 6px; padding: 0.5rem 0.9rem; cursor: pointer; font-weight: 600; }
   .btn-danger { background: rgba(248, 81, 73, 0.15); border: 1px solid #f85149; color: #f85149; border-radius: 4px; padding: 0.25rem 0.6rem; font-size: 0.8rem; cursor: pointer; }
   .btn-danger:hover { background: rgba(248, 81, 73, 0.25); }
-  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-  .modal { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; width: 420px; max-width: 90vw; }
+  /* The panel itself is lib/components/Modal.svelte; `.modal` scopes its content. */
   .modal p { color: var(--text-secondary); margin: 0 0 1rem; }
   .modal-actions { display: flex; gap: 0.75rem; justify-content: flex-end; margin-top: 1.25rem; }
 

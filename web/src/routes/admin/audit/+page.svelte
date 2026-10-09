@@ -5,6 +5,7 @@
   import { admin, type AuditLogEntry } from '$lib/api/client.svelte';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { untrack } from 'svelte';
+  import Modal from '$lib/components/Modal.svelte';
 
   const t = createT();
 
@@ -131,12 +132,6 @@
     detailError = '';
   }
 
-  function closeDetailByKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      closeDetail();
-    }
-  }
 
   function prevPage() {
     if (page > 0) { page--; loadLogs(); }
@@ -152,14 +147,19 @@
 
   function formatResourceType(rt: string | null): string {
     if (!rt) return '—';
+    // Looked up on every call, so the table follows a language switch.
     const map: Record<string, string> = {
-      user: 'User',
-      repo: 'Repository',
-      org: 'Organization',
+      user: t('admin.audit.resource_types.user'),
+      repo: t('admin.audit.resource_types.repo'),
+      org: t('admin.audit.resource_types.org'),
     };
     return map[rt] || rt;
   }
 </script>
+
+<svelte:head>
+  <title>{t('admin.audit.title')} · {t('admin.settings.admin')} · Plombir Git</title>
+</svelte:head>
 
 <div class="container">
   <div class="header">
@@ -176,13 +176,13 @@
       {/each}
     </select>
     <select bind:value={resourceFilter} onchange={applyFilter}>
-      <option value="">{t('admin.audit.fields.resource_type')}: All</option>
-      <option value="user">User</option>
-      <option value="repo">Repository</option>
-      <option value="org">Organization</option>
+      <option value="">{t('admin.audit.resource_all', { field: t('admin.audit.fields.resource_type') })}</option>
+      <option value="user">{t('admin.audit.resource_types.user')}</option>
+      <option value="repo">{t('admin.audit.resource_types.repo')}</option>
+      <option value="org">{t('admin.audit.resource_types.org')}</option>
     </select>
     {#if actionFilter || resourceFilter}
-      <button class="btn-sm" onclick={clearFilters}>Clear filters</button>
+      <button class="btn-sm" onclick={clearFilters}>{t('admin.audit.clear_filters')}</button>
     {/if}
   </div>
 
@@ -193,7 +193,7 @@
   {#if loading}
     <p class="loading">{t('common.loading')}</p>
   {:else if logs.length === 0}
-    <p class="empty">No audit records found.</p>
+    <p class="empty">{t('admin.audit.empty')}</p>
   {:else}
     <div class="table-wrap">
       <table class="audit-table">
@@ -251,25 +251,19 @@
     <!-- Pagination -->
     {#if totalPages > 1}
       <div class="pagination">
-        <button onclick={prevPage} disabled={page <= 0}>← Prev</button>
-        <span>Page {page + 1} of {totalPages}</span>
-        <button onclick={nextPage} disabled={page >= totalPages - 1}>Next →</button>
+        <button onclick={prevPage} disabled={page <= 0}>{t('common.prev_arrow')}</button>
+        <span>{t('common.page_info', { page: page + 1, total: totalPages })}</span>
+        <button onclick={nextPage} disabled={page >= totalPages - 1}>{t('common.next_arrow')}</button>
       </div>
     {/if}
   {/if}
 </div>
 
 <!-- Detail modal -->
-  {#if selectedLog}
-    <div
-      class="modal-overlay"
-      onclick={closeDetail}
-      role="button"
-      tabindex="0"
-      onkeydown={closeDetailByKey}
-    >
-      <div class="modal" role="dialog" aria-modal="true" tabindex="-1">
-      <h2>{t('admin.audit.detail_title', { id: selectedLog.id })}</h2>
+{#if selectedLog}
+  <Modal onclose={closeDetail} labelledby="admin-audit-detail-title" width="560px">
+    <div class="modal">
+      <h2 id="admin-audit-detail-title">{t('admin.audit.detail_title', { id: selectedLog.id })}</h2>
 
       <div class="detail-grid">
         <div class="detail-row">
@@ -320,7 +314,7 @@
         <button class="btn-secondary" onclick={closeDetail}>{t('common.cancel')}</button>
       </div>
     </div>
-  </div>
+  </Modal>
 {/if}
 
 <style>
@@ -441,25 +435,7 @@
   .btn-sm:hover { background: var(--bg-hover); }
 
   /* Modal */
-  .modal-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.7);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-  }
-  .modal {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 1.5rem;
-    width: 560px;
-    max-width: 90vw;
-    max-height: 80vh;
-    overflow-y: auto;
-  }
+  /* The panel itself is lib/components/Modal.svelte; `.modal` scopes its content. */
   .modal h2 { margin: 0 0 1rem; font-size: 1.1rem; }
 
   .detail-grid { margin-bottom: 1rem; }

@@ -3,7 +3,9 @@
   import { imports, type ImportTask, type StartImportPayload } from '$lib/api/client.svelte';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isLoggedIn, getUser } from '$lib/stores/auth.svelte';
-  import { formatDateTime } from '$lib/i18n';
+  import { createT, formatDateTime } from '$lib/i18n';
+
+  const t = createT();
 
   let taskList = $state<ImportTask[]>([]);
   let loading = $state(true);
@@ -102,7 +104,7 @@
       if (listRequests.owns(claim, activeAccountIdentity)) taskList = next;
     } catch (e: any) {
       if (listRequests.owns(claim, activeAccountIdentity)) {
-        error = e.message || 'Failed to load imports';
+        error = e.message || t('imports.load_failed');
       }
     } finally {
       if (listRequests.owns(claim, activeAccountIdentity)) loading = false;
@@ -145,11 +147,11 @@
       sourceUrl = '';
       targetName = '';
       authToken = '';
-      success = 'Import queued';
+      success = t('imports.queued');
       await loadImports(expectedIdentity);
     } catch (e: any) {
       if (isCurrentAccount(expectedIdentity, expectedGeneration)) {
-        error = e.message || 'Failed to start import';
+        error = e.message || t('imports.start_failed');
       }
     } finally {
       if (isCurrentAccount(expectedIdentity, expectedGeneration)) submitting = false;
@@ -157,7 +159,7 @@
   }
 
   async function deleteImport(id: number) {
-    if (!confirm('Cancel and delete this import task?')) return;
+    if (!confirm(t('imports.delete_confirm'))) return;
     if (!activeAccountIdentity || deletingImports.has(id)) return;
     const expectedIdentity = activeAccountIdentity;
     const expectedGeneration = accountGeneration;
@@ -174,10 +176,10 @@
       listRequests.begin(expectedIdentity);
       loading = false;
       taskList = taskList.filter((task) => task.id !== id);
-      success = 'Import deleted';
+      success = t('imports.deleted');
     } catch (e: any) {
       if (isCurrentAccount(expectedIdentity, expectedGeneration)) {
-        error = e.message || 'Failed to delete import';
+        error = e.message || t('imports.delete_failed');
       }
     } finally {
       if (isCurrentAccount(expectedIdentity, expectedGeneration)) {
@@ -194,16 +196,16 @@
 </script>
 
 <svelte:head>
-  <title>Imports · Plombir Git</title>
+  <title>{t('imports.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
   <div class="page-header">
     <div>
-      <h1>Imports</h1>
-      <p class="subtitle">Migrate repositories and project data from GitHub, GitLab, Gitea, or Git remotes.</p>
+      <h1>{t('imports.title')}</h1>
+      <p class="subtitle">{t('imports.subtitle')}</p>
     </div>
-    <button class="btn-secondary" type="button" onclick={refreshImports} disabled={loading}>Refresh</button>
+    <button class="btn-secondary" type="button" onclick={refreshImports} disabled={loading}>{t('imports.refresh')}</button>
   </div>
 
   {#if error}
@@ -214,10 +216,10 @@
   {/if}
 
   <section class="panel">
-    <h2>New import</h2>
+    <h2>{t('imports.new_title')}</h2>
     <form class="import-form" onsubmit={startImport}>
       <label>
-        Platform
+        {t('imports.platform')}
         <select bind:value={platform}>
           <option value="github">GitHub</option>
           <option value="gitlab">GitLab</option>
@@ -227,60 +229,60 @@
       </label>
 
       <label class="wide">
-        Source repository URL
+        {t('imports.source_url')}
         <input type="url" bind:value={sourceUrl} placeholder={sourcePlaceholder()} required />
       </label>
 
       <label>
-        Target owner
+        {t('imports.target_owner')}
         <input type="text" bind:value={targetOwner} required />
       </label>
 
       <label>
-        Target repository
-        <input type="text" bind:value={targetName} placeholder="Derived from source URL" />
+        {t('imports.target_name')}
+        <input type="text" bind:value={targetName} placeholder={t('imports.target_name_placeholder')} />
       </label>
 
       <label class="wide">
-        Source access token
-        <input type="password" bind:value={authToken} autocomplete="off" placeholder="Optional for private repositories" />
+        {t('imports.auth_token')}
+        <input type="password" bind:value={authToken} autocomplete="off" placeholder={t('imports.auth_token_placeholder')} />
       </label>
 
       <fieldset class="wide options">
-        <legend>Content</legend>
-        <label><input type="checkbox" bind:checked={importRepo} /> Repository</label>
-        <label><input type="checkbox" bind:checked={importIssues} disabled={!supportsMetadataImport()} /> Issues</label>
-        <label><input type="checkbox" bind:checked={importPullRequests} disabled={!supportsMetadataImport()} /> Pull requests</label>
-        <label><input type="checkbox" bind:checked={importWiki} disabled={!supportsMetadataImport()} /> Wiki</label>
-        <label><input type="checkbox" bind:checked={importReleases} disabled={!supportsMetadataImport()} /> Releases</label>
-        <label><input type="checkbox" bind:checked={importLabels} disabled={!supportsMetadataImport()} /> Labels</label>
-        <label><input type="checkbox" bind:checked={importMilestones} disabled={!supportsMetadataImport()} /> Milestones</label>
+        <legend>{t('imports.content.title')}</legend>
+        <label><input type="checkbox" bind:checked={importRepo} /> {t('imports.content.repository')}</label>
+        <label><input type="checkbox" bind:checked={importIssues} disabled={!supportsMetadataImport()} /> {t('imports.content.issues')}</label>
+        <label><input type="checkbox" bind:checked={importPullRequests} disabled={!supportsMetadataImport()} /> {t('imports.content.pull_requests')}</label>
+        <label><input type="checkbox" bind:checked={importWiki} disabled={!supportsMetadataImport()} /> {t('imports.content.wiki')}</label>
+        <label><input type="checkbox" bind:checked={importReleases} disabled={!supportsMetadataImport()} /> {t('imports.content.releases')}</label>
+        <label><input type="checkbox" bind:checked={importLabels} disabled={!supportsMetadataImport()} /> {t('imports.content.labels')}</label>
+        <label><input type="checkbox" bind:checked={importMilestones} disabled={!supportsMetadataImport()} /> {t('imports.content.milestones')}</label>
       </fieldset>
 
       <div class="actions wide">
         <button class="btn-primary" type="submit" disabled={submitting || !sourceUrl.trim() || !targetOwner.trim()}>
-          {submitting ? 'Starting...' : 'Start import'}
+          {submitting ? t('imports.starting') : t('imports.start')}
         </button>
       </div>
     </form>
   </section>
 
   <section class="panel">
-    <h2>Import tasks</h2>
+    <h2>{t('imports.tasks_title')}</h2>
     {#if loading}
-      <p class="muted">Loading imports...</p>
+      <p class="muted">{t('imports.loading')}</p>
     {:else if taskList.length === 0}
-      <p class="muted">No import tasks yet.</p>
+      <p class="muted">{t('imports.empty')}</p>
     {:else}
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Source</th>
-              <th>Target</th>
-              <th>Status</th>
-              <th>Progress</th>
-              <th>Updated</th>
+              <th>{t('imports.table.source')}</th>
+              <th>{t('imports.table.target')}</th>
+              <th>{t('imports.table.status')}</th>
+              <th>{t('imports.table.progress')}</th>
+              <th>{t('imports.table.updated')}</th>
               <th></th>
             </tr>
           </thead>
@@ -307,7 +309,7 @@
                 <td>{formatDateTime(task.updated_at || task.created_at)}</td>
                 <td class="row-actions">
                   <button class="btn-danger" type="button" disabled={deletingImports.has(task.id)} onclick={() => deleteImport(task.id)}>
-                    {deletingImports.has(task.id) ? 'Deleting...' : 'Delete'}
+                    {deletingImports.has(task.id) ? t('imports.deleting') : t('common.delete')}
                   </button>
                 </td>
               </tr>

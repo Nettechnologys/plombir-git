@@ -237,7 +237,16 @@ const ANCHORED: &[AnchoredFile] = &[
             // request in the URL — because `{number}` names a PR within the
             // repository, so anchoring to the repository alone would still let
             // a review of PR #7 be dismissed through the URL of PR #9.
-            ("id", &["review_in_pr", "require_suggestion_source"]),
+            // A review comment's id clears the same two checks through
+            // `review_comment_in_pr` — the moderation routes (card_60961272e1ba).
+            (
+                "id",
+                &[
+                    "review_in_pr",
+                    "require_suggestion_source",
+                    "review_comment_in_pr",
+                ],
+            ),
         ],
     ),
     (
@@ -578,7 +587,7 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// and finds the lock only by both. 132 since card_9f18b657580b:
 /// `api::admin::reset_user_password` takes a user id behind `InstanceAdmin`,
 /// whose scope is the whole instance — every account is its to reset.
-const CENSUS_TOTAL: usize = 132;
+const CENSUS_TOTAL: usize = 136;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

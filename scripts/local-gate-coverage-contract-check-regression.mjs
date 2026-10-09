@@ -97,8 +97,8 @@ runFixture(
   'the parsed graph preserves the clean-tree classification',
   null,
   0,
-  '13 job(s) in regression.yml — 4 mirrored by run-local-gates.mjs, 3 by the card verifier, '
-    + '1 excluded by design, 5 in CI only, 0 running nowhere',
+  '14 job(s) in regression.yml — 4 mirrored by run-local-gates.mjs, 3 by the card verifier, '
+    + '1 excluded by design, 6 in CI only, 0 running nowhere',
 );
 
 // card_6ed21f52b0aa: "runs in CI" is a claim the check proves against the

@@ -61,6 +61,7 @@ pub async fn load_receive_pack_policy(
     }
     let require_signed_refs = signed_commit_required_refs(&protection_rules);
     let fast_forward_only_refs = branch_protection_fast_forward_refs(&protection_rules);
+    let undeletable_refs = branch_protection_undeletable_refs(&protection_rules);
     rejected_refs.extend(branch_protection_rejected_refs(protection_rules, actor_id)?);
 
     let tag_protection_rules = protected_tag_ops::list_rules_by_repo(db, repo_id)
@@ -80,6 +81,7 @@ pub async fn load_receive_pack_policy(
         require_signed_refs,
         fast_forward_only_refs,
         foreign_locks,
+        undeletable_refs,
     })
 }
 
@@ -140,6 +142,29 @@ pub fn branch_protection_fast_forward_refs(
             )
         })
         .collect()
+}
+
+/// Protected branches no pusher may delete — the direct-push allow-list lets
+/// its members skip the pull request, not remove the branch the rule guards.
+/// The same answer the branches API gives, so `git push origin :main` and
+/// `DELETE /branches/main` cannot disagree (card_2060696224ff).
+pub fn branch_protection_undeletable_refs(
+    protections: &[protected_branch_ops::Rule],
+) -> Vec<(String, String)> {
+    protections
+        .iter()
+        .map(|rule| {
+            (
+                format!("refs/heads/{}", rule.protection.branch_name),
+                protected_branch_deletion_refusal(&rule.protection.branch_name),
+            )
+        })
+        .collect()
+}
+
+/// What a deleter of protected branch `branch` reads, over every door.
+pub fn protected_branch_deletion_refusal(branch: &str) -> String {
+    format!("protected branch '{branch}' cannot be deleted")
 }
 
 /// Whether `actor_id` is on the protection rule's direct-push allow-list.

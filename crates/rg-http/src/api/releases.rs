@@ -267,21 +267,33 @@ pub async fn create_release(
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, name));
 
-    match rg_core::release::service::create_release(
+    // The repository's own default branch, not a spelling of one: a
+    // repository on `master` has no `main` to tag (card_4d406b01b722).
+    let target = body
+        .target_commitish
+        .clone()
+        .filter(|target| !target.is_empty())
+        .unwrap_or_else(|| repo.default_branch.clone());
+    match rg_core::release::service::publish_release(
         &state.db,
+        &repo_path,
         repo.id,
         user_id,
         &body.tag_name,
         &body.title,
         body.body.as_deref(),
-        body.target_commitish.as_deref().unwrap_or("main"),
+        &target,
         body.is_draft.unwrap_or(false),
         body.is_prerelease.unwrap_or(false),
-        &repo_path,
     )
     .await
     {
-        Ok(release) => (StatusCode::CREATED, Json(serde_json::json!(release))).into_response(),
+        Ok((release, created_tag)) => {
+            if let Some(tag) = created_tag {
+                state.spawn_post_push_hooks(repo_path, owner, name, Some(user_id), vec![tag]);
+            }
+            (StatusCode::CREATED, Json(serde_json::json!(release))).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -333,8 +345,8 @@ pub async fn get_release(
 )]
 pub async fn update_release(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
-    RepoWrite { repo, .. }: RepoWrite,
+    Path((owner, name, id)): Path<(String, String, i64)>,
+    RepoWrite { repo, actor_id }: RepoWrite,
     Json(body): Json<UpdateReleaseRequest>,
 ) -> impl IntoResponse {
     // Write access to `owner/name` says nothing about where `id` points: the
@@ -343,6 +355,33 @@ pub async fn update_release(
         Ok(release) => release,
         Err(e) => return e.into_response(),
     };
+
+    // Publishing a draft is when its tag comes to exist — before the flag
+    // flips, so a refused tag leaves the release a draft (card_4d406b01b722).
+    if release.is_draft && body.is_draft == Some(false) {
+        for segment in [&owner, &name] {
+            if let Err(e) = rg_core::platform::validate_repo_path(segment) {
+                return AppError::bad_request(e.to_string()).into_response();
+            }
+        }
+        let repo_path = state.repo_root.join(format!("{owner}/{name}.git"));
+        match rg_core::release::service::ensure_release_tag(
+            &state.db,
+            &repo_path,
+            repo.id,
+            actor_id,
+            &release.tag_name,
+            &release.target_commitish,
+        )
+        .await
+        {
+            Ok(Some(tag)) => {
+                state.spawn_post_push_hooks(repo_path, owner, name, Some(actor_id), vec![tag])
+            }
+            Ok(None) => {}
+            Err(e) => return AppError::from(e).into_response(),
+        }
+    }
 
     match rg_core::release::service::update_release(
         &state.db,

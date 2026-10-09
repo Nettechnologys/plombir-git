@@ -354,6 +354,34 @@ pub async fn set_default_branch(db: &DatabaseConnection, id: i64, branch: &str) 
     Ok(updated.rows_affected == 1)
 }
 
+/// Write the description and visibility a repository administrator edits.
+///
+/// `None` leaves a field as it is; `Some(None)` clears the description.
+/// Returns whether a live row was updated — `false` means the repository was
+/// deleted underneath the caller.
+pub async fn update_settings(
+    db: &DatabaseConnection,
+    id: i64,
+    description: Option<Option<String>>,
+    is_private: Option<bool>,
+) -> Result<bool> {
+    let mut update =
+        RepoEntity::update_many().col_expr(repository::Column::UpdatedAt, Expr::value(Utc::now()));
+    if let Some(description) = description {
+        update = update.col_expr(repository::Column::Description, Expr::value(description));
+    }
+    if let Some(is_private) = is_private {
+        update = update.col_expr(repository::Column::IsPrivate, Expr::value(is_private));
+    }
+    let updated = update
+        .filter(repository::Column::Id.eq(id))
+        .filter(repository::Column::DeletedAt.is_null())
+        .exec(db)
+        .await
+        .context("db: update repository settings")?;
+    Ok(updated.rows_affected == 1)
+}
+
 /// Delete a repo by id.
 pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
     RepoEntity::delete_by_id(id)
@@ -552,16 +580,21 @@ pub async fn update_forks_count(db: &DatabaseConnection, id: i64) -> Result<()> 
     update_forks_count_after(db, id, std::future::ready(())).await
 }
 
-/// List all forks of a repo.
-pub async fn list_forks(
+/// Paginated forks of `origin_repo_id` that `viewer_id` may see — filtered
+/// before LIMIT/OFFSET by [`visible_to`], for the reason it gives. A fork is a
+/// repository of its own: read access to its parent says nothing about it
+/// (card_bb2ef2307588).
+pub async fn list_forks_visible_to(
     db: &DatabaseConnection,
     origin_repo_id: i64,
+    viewer_id: Option<i64>,
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<Repo>, i64)> {
     let base = RepoEntity::find()
         .filter(repository::Column::OriginRepoId.eq(Some(origin_repo_id)))
         .filter(repository::Column::DeletedAt.is_null())
+        .filter(visible_to(viewer_id))
         .order_by_asc(repository::Column::CreatedAt)
         .order_by_asc(repository::Column::Id);
     let total = base.clone().count(db).await.context("db: count forks")? as i64;
@@ -857,6 +890,7 @@ async fn write_repository_owner(
     repo_id: i64,
     owner_id: i64,
     org_id: Option<i64>,
+    name: &str,
 ) -> Result<Repo> {
     // This must be the first statement on SQLite: an UPDATE acquires its one
     // writer slot immediately. A SELECT followed by UPDATE leaves a lock-upgrade
@@ -866,6 +900,7 @@ async fn write_repository_owner(
     let updated = RepoEntity::update_many()
         .col_expr(repository::Column::OwnerId, Expr::value(owner_id))
         .col_expr(repository::Column::OrgId, Expr::value(org_id))
+        .col_expr(repository::Column::Name, Expr::value(name))
         .col_expr(repository::Column::UpdatedAt, Expr::value(Utc::now()))
         .filter(repository::Column::Id.eq(repo_id))
         .exec(transaction)
@@ -995,6 +1030,7 @@ pub async fn transfer_owner(
     source_namespace: &str,
     destination_namespace: &str,
     repo_name: &str,
+    destination_repo_name: &str,
 ) -> Result<TransferOwnerOutcome> {
     let transaction = db.begin().await.context("db: begin repository transfer")?;
 
@@ -1010,7 +1046,16 @@ pub async fn transfer_owner(
     // update and every trigger side effect.
     let sqlite = transaction.get_database_backend() == DatabaseBackend::Sqlite;
     let moved = if sqlite {
-        Some(write_repository_owner(&transaction, repo_id, owner_id, org_id).await?)
+        Some(
+            write_repository_owner(
+                &transaction,
+                repo_id,
+                owner_id,
+                org_id,
+                destination_repo_name,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -1050,11 +1095,21 @@ pub async fn transfer_owner(
     // already made the transfer durable.
     let moved = match moved {
         Some(moved) => moved,
-        None => write_repository_owner(&transaction, repo_id, owner_id, org_id).await?,
+        None => {
+            write_repository_owner(
+                &transaction,
+                repo_id,
+                owner_id,
+                org_id,
+                destination_repo_name,
+            )
+            .await?
+        }
     };
 
     let source_package_prefix = format!("packages/{source_namespace}/{repo_name}/");
-    let destination_package_prefix = format!("packages/{destination_namespace}/{repo_name}/");
+    let destination_package_prefix =
+        format!("packages/{destination_namespace}/{destination_repo_name}/");
     let registries = package_registry::Entity::find()
         .filter(package_registry::Column::RepoId.eq(repo_id))
         .all(&transaction)
@@ -1101,10 +1156,11 @@ pub async fn transfer_owner(
         .await?
     {
         let source_oci_prefix = format!("oci/{source_namespace}/{repo_name}/");
-        let destination_oci_prefix = format!("oci/{destination_namespace}/{repo_name}/");
+        let destination_oci_prefix =
+            format!("oci/{destination_namespace}/{destination_repo_name}/");
         let oci_repo_id = oci_repo.id;
         let mut active: oci_repository::ActiveModel = oci_repo.into();
-        active.namespace = Set(format!("{destination_namespace}/{repo_name}"));
+        active.namespace = Set(format!("{destination_namespace}/{destination_repo_name}"));
         active.owner_id = Set(owner_id);
         active.updated_at = Set(Utc::now());
         active.update(&transaction).await?;

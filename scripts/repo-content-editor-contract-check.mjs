@@ -97,8 +97,21 @@ if (
   failures.push('Edit page must redirect back to the saved branch after saving.');
 }
 
-if (!/let\s+branch\s*=\s*\$derived\(\$page\.url\.searchParams\.get\('ref'\)\s*\|\|\s*'main'\)/.test(newPage)) {
-  failures.push('New file page must initialize branch from the ref query parameter.');
+// Without `?ref=` both editor pages commit to the repository's own default
+// branch (read from the repository row), never to a literal `main` — which on
+// a `master` repository made "New file" commit to a branch that did not exist
+// and the edit page read the file at a ref that did not exist
+// (card_2e320f5287d7).
+for (const [label, source] of [['New file page', newPage], ['Edit page', editPage]]) {
+  if (!/let\s+branch\s*=\s*\$derived\(\$page\.url\.searchParams\.get\('ref'\)\s*\|\|\s*''\)/.test(source)) {
+    failures.push(`${label} must initialize branch from the ref query parameter.`);
+  }
+  if (/searchParams\.get\('ref'\)\s*\|\|\s*['"]main['"]/.test(source)) {
+    failures.push(`${label} must not fall back to a hardcoded main when no ref query is selected.`);
+  }
+  if (!/repos\.get\([\s\S]*default_branch/.test(source) || !/branch=\{targetBranch\}/.test(source)) {
+    failures.push(`${label} must hand the editor the repository default branch when no ref query is selected.`);
+  }
 }
 
 if (

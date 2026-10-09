@@ -25,6 +25,7 @@ mod mirror_sweep_queue_order;
 mod oauth_account_unlink_race;
 mod oauth_account_upsert_race;
 mod org_permission_predicate_errors;
+mod owner_name_race;
 mod pagination_total_order;
 mod passkey_counter_compare_and_swap;
 mod password_reset_token_single_use;

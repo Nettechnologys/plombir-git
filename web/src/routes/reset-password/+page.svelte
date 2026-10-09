@@ -4,6 +4,9 @@
   import { auth } from '$lib/api/client.svelte';
   import { setToken } from '$lib/api/client.svelte';
   import { fetchUser } from '$lib/stores/auth.svelte';
+  import { createT } from '$lib/i18n';
+
+  const t = createT();
 
   let token = $state('');
   let password = $state('');
@@ -18,8 +21,8 @@
 
   onMount(() => {
     const params = new URLSearchParams(window.location.search);
-    const t = params.get('token');
-    if (t) token = t;
+    const fromLink = params.get('token');
+    if (fromLink) token = fromLink;
   });
 
   async function handleSubmit(e: Event) {
@@ -27,7 +30,7 @@
     localError = '';
 
     if (password !== confirmPassword) {
-      localError = 'Passwords do not match';
+      localError = t('auth.reset_password.mismatch');
       return;
     }
 
@@ -52,44 +55,48 @@
       await fetchUser();
       success = true;
     } catch (e: any) {
-      localError = e.message || 'Failed to reset password';
+      localError = e.message || t('auth.reset_password.failed');
     } finally {
       loading = false;
     }
   }
 
   function validatePassword(value: string): string {
-    if (value.length < 8) return 'Password must be at least 8 characters';
-    if (value.length > 128) return 'Password must be at most 128 characters';
-    if (/\s/.test(value)) return 'Password must not contain spaces';
-    if (!/[A-Z]/.test(value)) return 'Password must contain an uppercase letter';
-    if (!/[a-z]/.test(value)) return 'Password must contain a lowercase letter';
-    if (!/[0-9]/.test(value)) return 'Password must contain a number';
-    if (!specialChars.test(value)) return 'Password must contain a special character';
+    if (value.length < 8) return t('auth.password_rules.min_length');
+    if (value.length > 128) return t('auth.password_rules.max_length');
+    if (/\s/.test(value)) return t('auth.password_rules.no_spaces');
+    if (!/[A-Z]/.test(value)) return t('auth.password_rules.uppercase');
+    if (!/[a-z]/.test(value)) return t('auth.password_rules.lowercase');
+    if (!/[0-9]/.test(value)) return t('auth.password_rules.number');
+    if (!specialChars.test(value)) return t('auth.password_rules.special');
     return '';
   }
 </script>
 
+<svelte:head>
+  <title>{t('auth.reset_password.title')} · Plombir Git</title>
+</svelte:head>
+
 <div class="reset-page">
   <div class="reset-card">
     <div class="reset-header">
-      <h1>Reset Password</h1>
-      <p class="subtitle">Enter your new password</p>
+      <h1>{t('auth.reset_password.title')}</h1>
+      <p class="subtitle">{t('auth.reset_password.subtitle')}</p>
     </div>
 
     {#if success}
       <div class="success-banner">
-        Password reset successful! You are now logged in.
+        {t('auth.reset_password.success')}
       </div>
       <a href="/dashboard" class="btn-secondary" style="display:block;text-align:center;margin-top:16px;">
-        Go to Dashboard
+        {t('auth.reset_password.go_dashboard')}
       </a>
     {:else if !token}
       <div class="error-banner">
-        Invalid reset link. Please request a new password reset.
+        {t('auth.reset_password.invalid_link')}
       </div>
       <a href="/forgot-password" class="btn-secondary" style="display:block;text-align:center;margin-top:16px;">
-        Request Reset
+        {t('auth.reset_password.request_reset')}
       </a>
     {:else}
       {#if localError}
@@ -98,7 +105,7 @@
 
       <form onsubmit={handleSubmit}>
         <label>
-          New Password
+          {t('auth.reset_password.new_password')}
           <input
             type="password"
             bind:value={password}
@@ -106,29 +113,29 @@
             minlength={8}
             maxlength={128}
             pattern={passwordPattern}
-            placeholder="At least 8 characters"
+            placeholder={t('auth.reset_password.new_password_placeholder')}
             autocomplete="new-password"
           />
         </label>
 
         <label>
-          Confirm Password
+          {t('auth.reset_password.confirm_password')}
           <input
             type="password"
             bind:value={confirmPassword}
             required
-            placeholder="Re-enter password"
+            placeholder={t('auth.reset_password.confirm_placeholder')}
             autocomplete="new-password"
           />
         </label>
 
         <button type="submit" class="btn-primary" disabled={loading}>
-          {loading ? 'Resetting...' : 'Reset Password'}
+          {loading ? t('auth.reset_password.resetting') : t('auth.reset_password.title')}
         </button>
       </form>
 
       <p class="footer">
-        <a href="/login">Back to Login</a>
+        <a href="/login">{t('auth.back_to_login')}</a>
       </p>
     {/if}
   </div>

@@ -159,7 +159,11 @@ const adminRunnersRegister = privileged(
     await context.navigate('/admin/runners');
     await context.fill('.form-grid input[type="text"]', context.fixture.runnerName, 0);
     await context.fill('.form-grid input[type="text"]', context.fixture.runnerRepository, 1);
-    await context.fill('.form-grid input[type="text"]', 'browser,sweep', 2);
+    // Labels are one input each now, added on demand.
+    await context.click('.form-grid .add-runner-label');
+    await context.click('.form-grid .add-runner-label');
+    await context.fill('#runner-label-0', 'browser');
+    await context.fill('#runner-label-1', 'sweep');
     await context.click('.form-grid .btn-primary');
     const rows = await context.fetchJson('/api/v1/admin/runners');
     const runner = rows.find((row) => row.name === context.fixture.runnerName);
@@ -511,9 +515,11 @@ async function seedRepositorySurface(context) {
     },
   });
 
+  // On the feature branch: `main` was just protected with `require_pr`, and
+  // that holds the contents API to a pull request as it holds `git push`.
   const disposableFile = await context.fetchJson(`${api}/contents/delete-me.txt`, {
     method: 'POST',
-    json: { branch: 'main', content: 'delete me', message: 'Seed disposable file' },
+    json: { branch: 'browser-feature', content: 'delete me', message: 'Seed disposable file' },
   });
   const featureLog = await context.fetchJson(`${api}/log?ref=browser-feature`);
   const commitSha = featureLog?.commits?.[0]?.sha;
@@ -558,13 +564,13 @@ const repoContentCreateAndSeed = privileged(
 
 const repoContentDelete = privileged(
   async (context) => {
-    await context.navigate(surfacePage(context, '/blob/delete-me.txt'));
+    await context.navigate(`${surfacePage(context, '/blob/delete-me.txt')}?ref=browser-feature`);
     await context.clickByText('.file-actions button', 'Delete');
     await context.fill('#delete-message', 'Delete disposable browser fixture');
     await context.click('.delete-actions button.btn-danger');
     await context.waitForPath(surfacePage(context));
   },
-  (context) => context.request(`${surfaceApi(context)}/contents/delete-me.txt?branch=main&message=denied&sha=${context.fixture.surfaceDisposableSha}`, {
+  (context) => context.request(`${surfaceApi(context)}/contents/delete-me.txt?branch=browser-feature&message=denied&sha=${context.fixture.surfaceDisposableSha}`, {
     method: 'DELETE',
   }),
 );
@@ -617,6 +623,20 @@ const repoIssues = privileged(
     await context.click('.comment-form button[type="submit"]');
     await context.waitForText('.comment', 'Browser-created comment');
     await context.click('.comment-form button.btn-close');
+
+    // What `repo-issue-moderation` edits and deletes next (card_60961272e1ba):
+    // the comment this scenario just created through the UI, and an issue of
+    // its own — `repo-time-tracking` still needs the browser-created one.
+    const comments = await context.fetchJson(`${surfaceApi(context)}/issues/${context.fixture.surfaceIssueNumber}/comments`);
+    const comment = comments?.find((row) => row.body === 'Browser-created comment');
+    if (!comment?.id) throw new Error('browser-created issue comment is absent from the list');
+    context.fixture.surfaceIssueCommentId = comment.id;
+    const disposable = await context.fetchJson(`${surfaceApi(context)}/issues`, {
+      method: 'POST',
+      json: { title: 'Disposable browser issue' },
+    });
+    if (!disposable?.number) throw new Error('disposable issue was not created');
+    context.fixture.disposableIssueNumber = disposable.number;
   },
   (context) => requestSequence(context, [
     [`${surfaceApi(context)}/issues`],
@@ -629,6 +649,33 @@ const repoIssues = privileged(
     [`${surfaceApi(context)}/collaborators`],
     [`${surfaceApi(context)}/issues/${context.fixture.surfaceIssueNumber}`, { method: 'PATCH', json: { state: 'closed' } }],
     [`${surfaceApi(context)}/issues/${context.fixture.surfaceIssueNumber}/comments`, { method: 'POST', json: { body: 'Denied comment' } }],
+  ]),
+);
+
+// card_60961272e1ba: a comment is edited and deleted by its author or a
+// repository administrator, and an issue is deleted by an administrator only.
+// The owner drives the real controls; the outsider sends the same requests
+// first, while the comment and the issue still exist.
+const repoIssueModeration = privileged(
+  async (context) => {
+    await context.navigate(surfacePage(context, `/issues/${context.fixture.surfaceIssueNumber}`));
+    await context.clickWithin('.comment', 'Browser-created comment', 'button.edit-comment', 'Edit');
+    await context.fill('.comment-edit-input', 'Browser-edited comment');
+    await context.click('.save-comment-edit');
+    await context.waitForText('.comment', 'Browser-edited comment');
+    await context.clickWithin('.comment', 'Browser-edited comment', 'button.delete-comment', 'Delete');
+    await context.click('[role="dialog"] .confirm-delete-comment');
+    await context.waitForTextAbsent('.issue-detail', 'Browser-edited comment');
+
+    await context.navigate(surfacePage(context, `/issues/${context.fixture.disposableIssueNumber}`));
+    await context.click('.delete-issue');
+    await context.click('[role="dialog"] .confirm-delete-issue');
+    await context.waitForPath(surfacePage(context, '/issues'));
+  },
+  (context) => requestSequence(context, [
+    [`${surfaceApi(context)}/issues/comments/${context.fixture.surfaceIssueCommentId}`, { method: 'PATCH', json: { body: 'Denied edit' } }],
+    [`${surfaceApi(context)}/issues/comments/${context.fixture.surfaceIssueCommentId}`, { method: 'DELETE' }],
+    [`${surfaceApi(context)}/issues/${context.fixture.disposableIssueNumber}`, { method: 'DELETE' }],
   ]),
 );
 
@@ -868,7 +915,8 @@ const repoPullCreate = privileged(
   async (context) => {
     await context.navigate(surfacePage(context, '/pulls'));
           await context.clickByText('.pulls-toolbar button', 'New Pull Request');
-    await context.select('.create-form select', 'browser-feature', 0);
+    // Index 1: the head-repository picker (fork pull requests) now comes first.
+    await context.select('.create-form select', 'browser-feature', 1);
     await context.fill('.create-form input[type="text"]', 'Browser surface pull request');
     await context.fill('.create-form textarea', 'Created through the live pull request form');
     await context.click('.create-form button[type="submit"]');
@@ -912,6 +960,10 @@ const repoPullDetail = privileged(
     await context.fill('.inline-comment-form textarea', 'Browser-created inline comment');
     await context.clickByText('.inline-comment-form button', 'Submit comment');
     await context.waitForText('.inline-thread', 'Browser-created inline comment');
+    const reviewComments = await context.fetchJson(`${surfaceApi(context)}/pulls/${context.fixture.surfacePullNumber}/comments`);
+    const inline = reviewComments?.find((row) => row.body === 'Browser-created inline comment');
+    if (!inline?.id) throw new Error('browser-created inline comment is absent from the list');
+    context.fixture.surfaceInlineCommentId = inline.id;
     await context.clickByText('.pr-tabs button', 'Reviews');
     await context.fill('.review-form textarea', 'Browser-created review');
     await context.clickByText('.review-form button', 'Submit Review');
@@ -941,6 +993,25 @@ const repoPullDetail = privileged(
     [`${surfaceApi(context)}/pulls/${context.fixture.surfacePullNumber}/auto-merge`, { method: 'DELETE' }],
     [`${surfaceApi(context)}/pulls/${context.fixture.surfacePullNumber}/merge-queue`, { method: 'PUT', json: { strategy: 'merge' } }],
     [`${surfaceApi(context)}/pulls/${context.fixture.surfacePullNumber}/merge-queue`, { method: 'DELETE' }],
+  ]),
+);
+
+// card_60961272e1ba: the review-comment twin of `repo-issue-moderation`, on the
+// inline comment `repo-pull-detail` created through the diff.
+const repoReviewCommentModeration = privileged(
+  async (context) => {
+    await context.navigate(surfacePage(context, `/pulls/${context.fixture.surfacePullNumber}`));
+    await context.clickWithin('.thread-comment', 'Browser-created inline comment', 'button.edit-comment', 'Edit');
+    await context.fill('.thread-comment .comment-edit-input', 'Browser-edited inline comment');
+    await context.click('.thread-comment .save-comment-edit');
+    await context.waitForText('.review-threads', 'Browser-edited inline comment');
+    await context.clickWithin('.thread-comment', 'Browser-edited inline comment', 'button.delete-comment', 'Delete');
+    await context.click('[role="dialog"] .confirm-delete-comment');
+    await context.waitForTextAbsent('.review-threads', 'Browser-edited inline comment');
+  },
+  (context) => requestSequence(context, [
+    [`${surfaceApi(context)}/pulls/${context.fixture.surfacePullNumber}/comments/${context.fixture.surfaceInlineCommentId}`, { method: 'PATCH', json: { body: 'Denied edit' } }],
+    [`${surfaceApi(context)}/pulls/${context.fixture.surfacePullNumber}/comments/${context.fixture.surfaceInlineCommentId}`, { method: 'DELETE' }],
   ]),
 );
 
@@ -1206,6 +1277,22 @@ const repoWebhooks = privileged(
   ]),
 );
 
+// card_3625a7b89abb: the general settings form, on the repository
+// `repo-transfer` moves away right after. Only the description changes, so the
+// repository keeps the name and visibility every later scenario relies on.
+const repoSettingsGeneral = privileged(
+  async (context) => {
+    await context.navigate(`/${context.ownerUsername}/${context.fixture.settingsRepository}/settings`);
+    await context.fill('#repo-description', 'Browser-edited description');
+    await context.click('.save-general');
+    await context.waitForText('.general-form', 'Settings saved.');
+  },
+  (context) => context.request(settingsApi(context), {
+    method: 'PATCH',
+    json: { description: 'Denied description' },
+  }),
+);
+
 const repoTransfer = privileged(
   async (context) => {
     await context.navigate(
@@ -1290,6 +1377,7 @@ export const UI_ACCESS_SWEEP_SCENARIOS = new Map([
   ['repo-watch', repoWatch],
   ['repo-fork', repoFork],
   ['repo-issues', repoIssues],
+  ['repo-issue-moderation', repoIssueModeration],
   ['repo-milestones', repoMilestones],
   ['repo-boards', repoBoards],
   ['repo-time-tracking', repoTimeTracking],
@@ -1298,6 +1386,7 @@ export const UI_ACCESS_SWEEP_SCENARIOS = new Map([
   ['repo-read-surface', repoReadSurface],
   ['repo-pull-create', repoPullCreate],
   ['repo-pull-detail', repoPullDetail],
+  ['repo-review-comment-moderation', repoReviewCommentModeration],
   ['repo-release-asset-delete', repoReleaseAssetDelete],
   ['admin-users-unlock', adminUsersUnlock],
   ['admin-users-update', adminUsersUpdate],
@@ -1322,6 +1411,7 @@ export const UI_ACCESS_SWEEP_SCENARIOS = new Map([
   ['repo-retention', repoRetention],
   ['repo-tag-protections', repoTagProtections],
   ['repo-webhooks', repoWebhooks],
+  ['repo-settings-general', repoSettingsGeneral],
   ['repo-transfer', repoTransfer],
   ['organization-admin', organizationAdmin],
 ]);

@@ -157,6 +157,27 @@ async fn review_in_pr(
     }
 }
 
+/// The review comment `comment_id`, if it is on pull request `number` of
+/// `repo_id` — the anchor the moderation routes call before anything else. The
+/// moderation service checks the same pairing again; this is the half the
+/// global-id guard can read in the handler.
+async fn review_comment_in_pr(
+    state: &AppState,
+    repo_id: i64,
+    number: i64,
+    comment_id: i64,
+) -> Result<rg_db::entities::review_comment::Model, AppError> {
+    let comment = rg_db::ops::review_comment_ops::find_by_id(&state.db, comment_id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("comment not found"))?;
+    match rg_db::ops::pull_request_ops::find_by_id(&state.db, comment.pr_id).await {
+        Ok(Some(pr)) if pr.repo_id == repo_id && pr.number == number => Ok(comment),
+        Ok(_) => Err(AppError::not_found("comment not found")),
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
 /// As with [`require_pr_manager`], authentication and repository read access
 /// are already proven by the handler's `RepoAuthRead`; this resolves the
 /// suggestion's source and checks write access on the *head* repository.
@@ -1263,6 +1284,12 @@ pub async fn request_reviewer(
             if let Err(error) = transaction.commit().await {
                 return AppError::from(error).into_response();
             }
+            rg_core::review::service::notify_review_requested(
+                &state.db,
+                pr.id,
+                request.reviewer_id,
+                actor_id,
+            );
             (
                 StatusCode::CREATED,
                 Json(RequestedReviewerResponse {
@@ -1409,4 +1436,112 @@ pub async fn set_thread_resolution(
 #[derive(Deserialize)]
 pub struct DismissReviewRequest {
     pub message: String,
+}
+/// Edit a review comment — its author, or a repository administrator
+/// (card_60961272e1ba).
+#[utoipa::path(
+    patch,
+    path = "/repos/{owner}/{name}/pulls/{number}/comments/{id}",
+    tag = "Pull Requests",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("number" = i64, Path, description = "pull request number"),
+        ("id" = i64, Path, description = "comment id"),
+    ),
+    request_body = crate::api::issues::EditCommentRequest,
+    responses(
+        (status = 200, description = "Edited", body = serde_json::Value),
+        (status = 400, description = "Empty body", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Neither its author nor an administrator", body = serde_json::Value),
+        (status = 404, description = "No such comment on this pull request", body = serde_json::Value),
+    ),
+)]
+pub async fn edit_review_comment(
+    State(state): State<AppState>,
+    Path((_, _, number, id)): Path<(String, String, i64, i64)>,
+    RepoAuthRead { repo, actor_id }: RepoAuthRead,
+    Json(req): Json<crate::api::issues::EditCommentRequest>,
+) -> impl IntoResponse {
+    let id = match review_comment_in_pr(&state, repo.id, number, id).await {
+        Ok(comment) => comment.id,
+        Err(e) => return e.into_response(),
+    };
+    let moderator = match crate::api::issues::comment_moderator(&state, &repo, actor_id).await {
+        Ok(moderator) => moderator,
+        Err(e) => return e.into_response(),
+    };
+    match rg_core::issue::moderation::edit_review_comment(
+        &state.db, repo.id, number, id, moderator, &req.body,
+    )
+    .await
+    {
+        Ok(comment) => (StatusCode::OK, Json(serde_json::json!(comment))).into_response(),
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+/// Delete a review comment and its attachments — its author, or a repository
+/// administrator. A comment others replied to is refused (card_60961272e1ba).
+#[utoipa::path(
+    delete,
+    path = "/repos/{owner}/{name}/pulls/{number}/comments/{id}",
+    tag = "Pull Requests",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("number" = i64, Path, description = "pull request number"),
+        ("id" = i64, Path, description = "comment id"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Neither its author nor an administrator", body = serde_json::Value),
+        (status = 404, description = "No such comment on this pull request", body = serde_json::Value),
+        (status = 409, description = "Others replied to it", body = serde_json::Value),
+    ),
+)]
+pub async fn delete_review_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number, id)): Path<(String, String, i64, i64)>,
+    RepoAuthRead { repo, actor_id }: RepoAuthRead,
+) -> impl IntoResponse {
+    let id = match review_comment_in_pr(&state, repo.id, number, id).await {
+        Ok(comment) => comment.id,
+        Err(e) => return e.into_response(),
+    };
+    let moderator = match crate::api::issues::comment_moderator(&state, &repo, actor_id).await {
+        Ok(moderator) => moderator,
+        Err(e) => return e.into_response(),
+    };
+    match rg_core::issue::moderation::delete_review_comment(
+        &state.db,
+        state.blob_storage.as_ref(),
+        repo.id,
+        number,
+        id,
+        moderator,
+    )
+    .await
+    {
+        Ok(comment) => {
+            let actor =
+                rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, actor_id).await;
+            rg_core::audit::record(
+                &state.db,
+                &actor,
+                "review_comment.delete",
+                Some("review_comment"),
+                Some(comment.id),
+                Some(&format!("{owner}/{name}!{number}")),
+                Some(&headers),
+                Some(serde_json::json!({ "pr_id": comment.pr_id, "author_id": comment.author_id })),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => AppError::from(e).into_response(),
+    }
 }

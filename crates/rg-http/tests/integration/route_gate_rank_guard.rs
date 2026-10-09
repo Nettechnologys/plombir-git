@@ -280,6 +280,31 @@ const SIGNED_OFF: &[(&str, &str, Rank, &str)] = &[
          caller to write access on that source repository, which can differ from the URL repository",
     ),
     (
+        "api::issues::edit_comment",
+        "RepoAdmin",
+        Rank::AuthRead,
+        "a comment's own author may edit it; anybody else is held to repository administration \
+         by `issue::moderation` through `repo_access::administers` (card_60961272e1ba)",
+    ),
+    (
+        "api::issues::delete_comment",
+        "RepoAdmin",
+        Rank::AuthRead,
+        "same widening as `edit_comment` — a comment is its author's or an administrator's",
+    ),
+    (
+        "api::reviews::edit_review_comment",
+        "RepoAdmin",
+        Rank::AuthRead,
+        "same widening as `issues::edit_comment`, for a review comment",
+    ),
+    (
+        "api::reviews::delete_review_comment",
+        "RepoAdmin",
+        Rank::AuthRead,
+        "same widening as `issues::delete_comment`, for a review comment",
+    ),
+    (
         "api::reviews::request_reviewer",
         "RepoWrite",
         Rank::AuthRead,

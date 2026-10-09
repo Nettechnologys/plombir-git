@@ -2,6 +2,21 @@
   import { page } from '$app/stores';
   import { allowedUserLabel, tagProtections, buildTagProtectionPayload, type TagProtection, type TagProtectionPayload } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
+  import { createT } from '$lib/i18n';
+
+  const t = createT();
+
+  // Split a translated sentence on its `{name}` slots so the slot values can be
+  // rendered as `<code>` while the words around them follow the translation.
+  function withCode(template: string, codes: Record<string, string>) {
+    return template
+      .split(/(\{\w+\})/)
+      .filter((part) => part !== '')
+      .map((part) => {
+        const slot = /^\{(\w+)\}$/.exec(part)?.[1];
+        return slot !== undefined && slot in codes ? { code: codes[slot] } : { text: part };
+      });
+  }
 
   const owner = $derived($page.params.owner!); const repo = $derived($page.params.repo!);
   let items = $state<TagProtection[]>([]); let error = $state(''); let editingId = $state<number | null>(null);
@@ -75,7 +90,7 @@
     }
   }
   async function remove(item: TagProtection) {
-    if (!confirm(`Delete protection for ${item.pattern}?`)) return;
+    if (!confirm(t('settings.tag_protection.delete_confirm', { pattern: item.pattern }))) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -93,17 +108,17 @@
     }
   }
 </script>
-<svelte:head><title>Tag protection · {owner}/{repo}</title></svelte:head>
+<svelte:head><title>{t('settings.tag_protection.title')} · {owner}/{repo}</title></svelte:head>
 <div class="settings-page">
-  <header><h1>Tag protection</h1><p>Block tag creation and updates matching a pattern over HTTP and SSH. <code>*</code> is the only wildcard.</p></header>
+  <header><h1>{t('settings.tag_protection.title')}</h1><p>{t('settings.tag_protection.desc')} {#each withCode(t('settings.tag_protection.only_wildcard'), { wildcard: '*' }) as part}{#if part.code !== undefined}<code>{part.code}</code>{:else}{part.text}{/if}{/each}</p></header>
   {#if error}<div class="message" role="alert">{error}</div>{/if}
-  <section><h2>{editingId === null ? 'Protect a pattern' : 'Edit protection'}</h2><form onsubmit={save}>
-    <label for="tag-pattern">Pattern <span>(use <code>*</code> as the wildcard; <code>?</code>, character classes, and <code>+</code> are not supported)</span></label>
+  <section><h2>{editingId === null ? t('settings.tag_protection.create_title') : t('settings.tag_protection.edit_title')}</h2><form onsubmit={save}>
+    <label for="tag-pattern">{t('settings.tag_protection.pattern')} <span>{#each withCode(t('settings.tag_protection.pattern_hint'), { star: '*', question: '?', plus: '+' }) as part}{#if part.code !== undefined}<code>{part.code}</code>{:else}{part.text}{/if}{/each}</span></label>
     <input id="tag-pattern" bind:value={form.pattern} maxlength="255" placeholder="v*" readonly={editingId !== null} disabled={saving} required />
-    <label for="tag-allowed-users">Users allowed to push this pattern <span>(comma-separated usernames; empty means the pattern is closed to everyone, including the owner)</span></label>
+    <label for="tag-allowed-users">{t('settings.tag_protection.allowed_users')} <span>{t('settings.tag_protection.allowed_users_hint')}</span></label>
     <input id="tag-allowed-users" bind:value={form.allowed_users} placeholder="alice, bob" disabled={saving} />
-    <div class="actions"><button class="btn btn-primary" disabled={saving} aria-busy={saving}>{editingId === null ? 'Add protection' : 'Save changes'}</button>{#if editingId !== null}<button type="button" class="btn" disabled={saving} onclick={resetForm}>Cancel</button>{/if}</div>
+    <div class="actions"><button class="btn btn-primary" disabled={saving} aria-busy={saving}>{editingId === null ? t('settings.tag_protection.add') : t('settings.tag_protection.save')}</button>{#if editingId !== null}<button type="button" class="btn" disabled={saving} onclick={resetForm}>{t('common.cancel')}</button>{/if}</div>
   </form></section>
-  <section><h2>Protected patterns</h2>{#if items.length === 0}<p>No protected tag patterns.</p>{:else}<div class="list">{#each items as item (item.id)}<article><div><code>{item.pattern}</code><p>{(item.allowed_users ?? []).length ? `allowed: ${(item.allowed_users ?? []).map(allowedUserLabel).join(', ')}` : 'nobody may push this pattern'}</p></div><div class="actions"><button class="btn" disabled={isBusy(rowKey(item.id))} onclick={() => edit(item)}>Edit</button><button class="btn btn-danger" disabled={isBusy(rowKey(item.id))} aria-busy={isBusy(rowKey(item.id))} onclick={() => remove(item)}>Delete</button></div></article>{/each}</div>{/if}</section>
+  <section><h2>{t('settings.tag_protection.list_title')}</h2>{#if items.length === 0}<p>{t('settings.tag_protection.empty')}</p>{:else}<div class="list">{#each items as item (item.id)}<article><div><code>{item.pattern}</code><p>{(item.allowed_users ?? []).length ? t('settings.tag_protection.allowed', { users: (item.allowed_users ?? []).map(allowedUserLabel).join(', ') }) : t('settings.tag_protection.nobody')}</p></div><div class="actions"><button class="btn" disabled={isBusy(rowKey(item.id))} onclick={() => edit(item)}>{t('common.edit')}</button><button class="btn btn-danger" disabled={isBusy(rowKey(item.id))} aria-busy={isBusy(rowKey(item.id))} onclick={() => remove(item)}>{t('common.delete')}</button></div></article>{/each}</div>{/if}</section>
 </div>
 <style>.settings-page{max-width:880px}header,section{margin-bottom:28px}header p,article p,label span{color:var(--text-secondary)}form{display:grid;gap:9px}input{padding:8px 10px}.actions{display:flex;align-items:center;gap:8px}.message{color:var(--red);padding:12px;border:1px solid var(--border);border-radius:var(--radius)}.list{display:grid;gap:10px}article{display:flex;align-items:center;justify-content:space-between;padding:14px;border:1px solid var(--border);border-radius:var(--radius)}article p{margin:4px 0 0;font-size:13px}</style>

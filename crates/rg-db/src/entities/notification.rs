@@ -21,6 +21,21 @@ pub struct Model {
     /// Whether the user has read this notification
     pub is_read: bool,
     pub created_at: DateTimeUtc,
+    /// Why this user got it: `review_requested`, `assigned`, `mention`,
+    /// `ci_failed`, `participating`; absent on a repository-watch row.
+    pub reason: Option<String>,
+    /// What it is about — `issue` or `pull_request` — with [`Self::subject_id`].
+    /// One unread row per subject and user: a later event in the same thread
+    /// updates it instead of stacking another.
+    pub subject_type: Option<String>,
+    pub subject_id: Option<i64>,
+    /// The page it opens, relative to the instance (`/owner/repo/issues/7`).
+    pub link: Option<String>,
+    /// When a later event last folded into this row.
+    pub updated_at: Option<DateTimeUtc>,
+    /// The mail dispatcher still owes the recipient a message for this row.
+    #[serde(skip)]
+    pub email_pending: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

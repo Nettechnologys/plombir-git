@@ -327,6 +327,11 @@ const WORKSPACE_SIGNED_OFF: &[(&str, &str)] = &[
         "filters watchers before delivery — the subject is each recipient, not the caller",
     ),
     (
+        "rg-core/src/notification/thread.rs",
+        "filters thread-notification recipients before delivery — the subject is each \
+         recipient, not the caller (card_349c2b6a0d7c)",
+    ),
+    (
         "rg-core/src/review/codeowners.rs",
         "filters CODEOWNERS candidates — the subject is each reviewer, not the caller",
     ),
@@ -346,6 +351,13 @@ const WORKSPACE_SIGNED_OFF: &[(&str, &str)] = &[
 /// because auto-merge and merge-queue call it without an extractor; the core
 /// mutation boundary must therefore re-read current write access itself.
 const WORKSPACE_FUNCTION_SIGNED_OFF: &[(&str, &str, &str)] = &[
+    (
+        "rg-core/src/repo/refs.rs",
+        "delete_merged_head_branch",
+        "deletes the head branch of a pull request a merge just consumed — in the head repository, \
+         which for a fork PR is not the one the request's path names and no extractor gated; the \
+         merging actor must be able to write there, so the core boundary asks",
+    ),
     (
         "rg-core/src/pull_request/service.rs",
         "merge_pr",

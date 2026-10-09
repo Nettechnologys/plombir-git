@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import WikiIndexPage from '../../routes/[owner]/[repo]/wiki/+page.svelte';
 import { navigation, setTestPage } from '../test/app';
-import { resetTestClient, wiki } from '../test/client';
+import { resetTestClient, wiki, repos as viewerRepos } from '../test/client';
 import {
 	click,
 	element,
@@ -37,6 +37,8 @@ let rendered: RenderedComponent | undefined;
 
 beforeEach(() => {
 	resetTestClient();
+	// The write controls follow `viewer_permission` (card_3625a7b89abb).
+	viewerRepos.get.mockResolvedValue({ viewer_permission: 'write' });
 	navigation.goto.mockReset();
 });
 

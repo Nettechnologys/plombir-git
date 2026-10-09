@@ -26,6 +26,8 @@ beforeEach(() => {
 		is_private: false,
 		default_branch: 'main',
 		created_at: '2026-08-30T00:00:00Z',
+		// Transfer and deletion are offered to repository administrators only.
+		viewer_permission: 'admin',
 	});
 	repos.transfer.mockResolvedValue(undefined);
 	repos.delete.mockResolvedValue(undefined);
@@ -45,7 +47,7 @@ async function renderSettings(): Promise<void> {
 
 async function transferTo(destinationOwner: string): Promise<void> {
 	await input(element<HTMLInputElement>(rendered!.container, '#new-owner'), destinationOwner);
-	await click(element(rendered!.container, '.btn-warning'));
+	await click(element(rendered!.container, '.transfer-repo'));
 }
 
 describe('repository settings resource lifetime', () => {

@@ -3,6 +3,9 @@
   import { bots, splitList, type Bot, type BotToken } from '$lib/api/client.svelte';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
+  import { createT, formatDate as formatLocaleDate } from '$lib/i18n';
+
+  const t = createT();
 
   let botList = $state<Bot[]>([]);
   let loading = $state(true);
@@ -50,7 +53,7 @@
       const next = await bots.list();
       if (botRequests.owns(claim, 'bots')) botList = next;
     } catch (err: any) {
-      if (botRequests.owns(claim, 'bots')) error = err.message || 'Failed to load agents';
+      if (botRequests.owns(claim, 'bots')) error = err.message || t('agents.load_failed');
     } finally {
       if (botRequests.owns(claim, 'bots')) loading = false;
     }
@@ -68,7 +71,7 @@
       const next = await bots.listTokens(username);
       if (ownsTokens(claim)) tokenList = next;
     } catch (err: any) {
-      if (ownsTokens(claim)) error = err.message || 'Failed to load tokens';
+      if (ownsTokens(claim)) error = err.message || t('agents.tokens_load_failed');
     } finally {
       if (ownsTokens(claim)) tokensLoading = false;
     }
@@ -78,7 +81,7 @@
     event.preventDefault();
     if (creatingBot) return;
     if (!botName.trim()) {
-      error = 'An agent needs a username';
+      error = t('agents.username_required');
       return;
     }
     try {
@@ -86,19 +89,19 @@
       error = '';
       success = '';
       const created = await bots.create(botName.trim(), botDisplayName.trim() || undefined);
-      success = `Agent @${created.username} created. Add it as a collaborator on the repositories it should work on.`;
+      success = t('agents.created', { username: created.username });
       botName = '';
       botDisplayName = '';
       await loadBots();
     } catch (err: any) {
-      error = err.message || 'Failed to create agent';
+      error = err.message || t('agents.create_failed');
     } finally {
       creatingBot = false;
     }
   }
 
   async function deleteBot(bot: Bot) {
-    if (!confirm(`Delete agent @${bot.username}? Its tokens stop working and its repositories are deleted.`)) return;
+    if (!confirm(t('agents.delete_confirm', { username: bot.username }))) return;
     const username = bot.username;
     if (busyBots.has(username)) return;
     busyBots = new Set(busyBots).add(username);
@@ -107,10 +110,10 @@
       success = '';
       await bots.delete(username);
       if (selected === username) closeTokens();
-      success = `Agent @${username} deleted`;
+      success = t('agents.deleted', { username });
       await loadBots();
     } catch (err: any) {
-      error = err.message || 'Failed to delete agent';
+      error = err.message || t('agents.delete_failed');
     } finally {
       const next = new Set(busyBots);
       next.delete(username);
@@ -146,7 +149,7 @@
     const username = selected;
     if (!username || mintingToken) return;
     if (!tokenName.trim()) {
-      error = 'Token name is required';
+      error = t('agents.token_name_required');
       return;
     }
     const repositories = splitList(tokenRepositories);
@@ -162,7 +165,7 @@
         deny_protected_merge: denyProtectedMerge,
       });
       newToken = created.token;
-      success = 'Token created. Copy it now; it will not be shown again.';
+      success = t('agents.token_created');
       tokenName = '';
       tokenExpires = '';
       tokenRepositories = '';
@@ -170,7 +173,7 @@
       denyProtectedMerge = true;
       await loadTokens(username);
     } catch (err: any) {
-      error = err.message || 'Failed to create token';
+      error = err.message || t('agents.token_create_failed');
     } finally {
       mintingToken = false;
     }
@@ -179,7 +182,7 @@
   async function revokeToken(token: BotToken) {
     const username = selected;
     if (!username) return;
-    if (!confirm(`Revoke token "${token.name}" of @${username}?`)) return;
+    if (!confirm(t('agents.token_revoke_confirm', { name: token.name, username }))) return;
     const tokenId = token.id;
     if (busyTokenIds.has(tokenId)) return;
     busyTokenIds = new Set(busyTokenIds).add(tokenId);
@@ -187,10 +190,10 @@
       error = '';
       success = '';
       await bots.deleteToken(username, tokenId);
-      success = 'Token revoked';
+      success = t('agents.token_revoked');
       await loadTokens(username);
     } catch (err: any) {
-      error = err.message || 'Failed to revoke token';
+      error = err.message || t('agents.token_revoke_failed');
     } finally {
       const next = new Set(busyTokenIds);
       next.delete(tokenId);
@@ -201,37 +204,33 @@
   async function copyNewToken() {
     if (!newToken) return;
     await navigator.clipboard.writeText(newToken);
-    success = 'Token copied';
+    success = t('agents.token_copied');
   }
 
   function formatDate(value?: string | null) {
-    if (!value) return 'Never';
+    if (!value) return t('common.never');
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return value;
-    return date.toLocaleDateString();
+    return formatLocaleDate(value);
   }
 </script>
 
 <svelte:head>
-  <title>Agents · Plombir Git</title>
+  <title>{t('agents.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container agents-page">
   <header class="page-header">
-    <h1>Agents</h1>
-    <p>
-      Give each AI agent a bot account of its own. Its issues, pull requests and commits carry its name and
-      yours as its owner; it has no password, and it stops working when you delete it or your account is disabled.
-    </p>
+    <h1>{t('agents.title')}</h1>
+    <p>{t('agents.description')}</p>
   </header>
 
   <section class="how-to">
     <ol>
-      <li>Create an agent below.</li>
-      <li>Add it as a collaborator on each repository it should work on — that is its access.</li>
+      <li>{t('agents.howto.create')}</li>
+      <li>{t('agents.howto.collaborator')}</li>
       <li>
-        Mint a token for it, optionally confined to repositories, MCP tools, and kept off protected branches,
-        then point an MCP client at <code>{mcpEndpoint}</code> with <code>Authorization: Bearer &lt;token&gt;</code>.
+        {t('agents.howto.mint_before')} <code>{mcpEndpoint}</code> {t('agents.howto.mint_with')} <code>Authorization: Bearer &lt;token&gt;</code>{t('agents.howto.mint_end')}
       </li>
     </ol>
   </section>
@@ -245,29 +244,29 @@
   {/if}
 
   <section class="section">
-    <h2>Create agent</h2>
+    <h2>{t('agents.create_title')}</h2>
     <form class="create-form" onsubmit={createBot}>
       <label>
-        Username
+        {t('agents.username')}
         <input bind:value={botName} placeholder="alice-agent" disabled={creatingBot} />
       </label>
       <label>
-        Display name
-        <input bind:value={botDisplayName} placeholder="Review assistant" disabled={creatingBot} />
+        {t('agents.display_name')}
+        <input bind:value={botDisplayName} placeholder={t('agents.display_name_placeholder')} disabled={creatingBot} />
       </label>
       <button type="submit" class="btn btn-primary create-bot" disabled={creatingBot || !botName.trim()}>
-        {creatingBot ? 'Creating...' : 'Create'}
+        {creatingBot ? t('agents.creating') : t('common.create')}
       </button>
     </form>
   </section>
 
   <section class="section">
-    <h2>Your agents</h2>
+    <h2>{t('agents.list_title')}</h2>
 
     {#if loading}
-      <p class="muted">Loading...</p>
+      <p class="muted">{t('common.loading')}</p>
     {:else if botList.length === 0}
-      <div class="empty-state">No agents yet.</div>
+      <div class="empty-state">{t('agents.empty')}</div>
     {:else}
       <ul class="bot-list">
         {#each botList as bot (bot.id)}
@@ -276,12 +275,12 @@
               <div>
                 <a href={`/${bot.username}`}><strong>@{bot.username}</strong></a>
                 {#if bot.display_name}<span class="muted"> · {bot.display_name}</span>{/if}
-                {#if !bot.is_active}<span class="muted"> · disabled</span>{/if}
-                <div class="muted small">Created {formatDate(bot.created_at)}</div>
+                {#if !bot.is_active}<span class="muted"> · {t('agents.disabled')}</span>{/if}
+                <div class="muted small">{t('common.created', { date: formatDate(bot.created_at) })}</div>
               </div>
               <div class="bot-actions">
                 <button type="button" class="btn manage-tokens" onclick={() => openTokens(bot)}>
-                  {selected === bot.username ? 'Close' : 'Tokens'}
+                  {selected === bot.username ? t('common.close') : t('agents.tokens')}
                 </button>
                 <button
                   type="button"
@@ -289,7 +288,7 @@
                   disabled={busyBots.has(bot.username)}
                   onclick={() => deleteBot(bot)}
                 >
-                  {busyBots.has(bot.username) ? 'Deleting...' : 'Delete'}
+                  {busyBots.has(bot.username) ? t('agents.deleting') : t('common.delete')}
                 </button>
               </div>
             </div>
@@ -297,55 +296,55 @@
             {#if selected === bot.username}
               <div class="token-panel">
                 {#if newToken}
-                  <section class="token-created" aria-label="New agent token">
+                  <section class="token-created" aria-label={t('agents.new_token_label')}>
                     <div>
-                      <strong>New token</strong>
-                      <p>Copy this value before leaving the page.</p>
+                      <strong>{t('agents.new_token')}</strong>
+                      <p>{t('agents.new_token_hint')}</p>
                     </div>
                     <code>{newToken}</code>
-                    <button type="button" class="btn btn-primary copy-token" onclick={copyNewToken}>Copy</button>
+                    <button type="button" class="btn btn-primary copy-token" onclick={copyNewToken}>{t('common.copy')}</button>
                   </section>
                 {/if}
 
                 <form class="token-form" onsubmit={mintToken}>
                   <label>
-                    Token name
+                    {t('agents.token_name')}
                     <input bind:value={tokenName} placeholder="claude-code" disabled={mintingToken} />
                   </label>
                   <label>
-                    Expires
+                    {t('agents.expires')}
                     <input type="date" bind:value={tokenExpires} disabled={mintingToken} />
                   </label>
                   <label class="wide">
-                    Repositories (owner/name, one per line or comma-separated; empty = every repository the agent can reach)
+                    {t('agents.repositories_hint')}
                     <textarea bind:value={tokenRepositories} rows="2" placeholder="alice/app" disabled={mintingToken}></textarea>
                   </label>
                   <label class="wide">
-                    MCP tools (comma-separated; empty = an ordinary token, set = usable only through the MCP endpoint)
+                    {t('agents.mcp_tools_hint')}
                     <input bind:value={tokenTools} placeholder="get_issue, create_issue, create_pr" disabled={mintingToken} />
                   </label>
                   <label class="checkbox wide">
                     <input type="checkbox" bind:checked={denyProtectedMerge} disabled={mintingToken} />
-                    Keep off protected branches (no merge, push or commit to them)
+                    {t('agents.deny_protected_merge')}
                   </label>
                   <button type="submit" class="btn btn-primary mint-token" disabled={mintingToken || !tokenName.trim()}>
-                    {mintingToken ? 'Creating...' : 'Create token'}
+                    {mintingToken ? t('agents.creating') : t('agents.create_token')}
                   </button>
                 </form>
 
                 {#if tokensLoading}
-                  <p class="muted">Loading...</p>
+                  <p class="muted">{t('common.loading')}</p>
                 {:else if tokenList.length === 0}
-                  <div class="empty-state">No tokens for @{bot.username} yet.</div>
+                  <div class="empty-state">{t('agents.no_tokens', { username: bot.username })}</div>
                 {:else}
                   <div class="table-wrap">
                     <table>
                       <thead>
                         <tr>
-                          <th>Name</th>
-                          <th>Confined to</th>
-                          <th>Last used</th>
-                          <th>Expires</th>
+                          <th>{t('agents.table.name')}</th>
+                          <th>{t('agents.table.confined_to')}</th>
+                          <th>{t('agents.table.last_used')}</th>
+                          <th>{t('agents.expires')}</th>
                           <th></th>
                         </tr>
                       </thead>
@@ -354,9 +353,9 @@
                           <tr>
                             <td>{token.name}</td>
                             <td class="narrowing">
-                              <div>Repositories: {token.repositories ? token.repositories.join(', ') || 'none' : 'any'}</div>
-                              <div>MCP tools: {token.mcp_tools ? token.mcp_tools.join(', ') : 'any (REST allowed)'}</div>
-                              <div>{token.deny_protected_merge ? 'Kept off protected branches' : 'May write to protected branches'}</div>
+                              <div>{t('agents.narrowing.repositories', { list: token.repositories ? token.repositories.join(', ') || t('agents.narrowing.none') : t('agents.narrowing.any') })}</div>
+                              <div>{t('agents.narrowing.mcp_tools', { list: token.mcp_tools ? token.mcp_tools.join(', ') : t('agents.narrowing.any_rest') })}</div>
+                              <div>{token.deny_protected_merge ? t('agents.narrowing.kept_off') : t('agents.narrowing.may_write')}</div>
                             </td>
                             <td>{formatDate(token.last_used_at)}</td>
                             <td>{formatDate(token.expires_at)}</td>
@@ -367,7 +366,7 @@
                                 disabled={busyTokenIds.has(token.id)}
                                 onclick={() => revokeToken(token)}
                               >
-                                {busyTokenIds.has(token.id) ? 'Revoking...' : 'Revoke'}
+                                {busyTokenIds.has(token.id) ? t('agents.revoking') : t('agents.revoke')}
                               </button>
                             </td>
                           </tr>

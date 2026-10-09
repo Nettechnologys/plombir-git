@@ -8,7 +8,7 @@ import {
   type MilestoneFormState,
 } from './milestoneForm';
 import { setTestPage } from '../test/app';
-import { milestones, resetTestClient } from '../test/client';
+import { milestones, resetTestClient, repos as viewerRepos } from '../test/client';
 import { button, click, element, input, renderComponent, submit, type RenderedComponent } from '../test/render';
 
 let rendered: RenderedComponent | undefined;
@@ -23,6 +23,8 @@ const milestone = {
 
 beforeEach(() => {
 	resetTestClient();
+	// The write controls follow `viewer_permission` (card_3625a7b89abb).
+	viewerRepos.get.mockResolvedValue({ viewer_permission: 'write' });
 	setTestPage('/alice/demo/milestones', { owner: 'alice', repo: 'demo' });
 	milestones.list.mockResolvedValue([milestone]);
 	milestones.get.mockResolvedValue(milestone);

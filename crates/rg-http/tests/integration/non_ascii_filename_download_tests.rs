@@ -12,7 +12,7 @@
 //! reading half: the name has to survive the client's `filename*=UTF-8''…`
 //! into storage before the download can spell it back.
 
-use crate::common::{create_repo, register_full, spawn_test_app};
+use crate::common::{create_initialised_repo, register_full, spawn_test_app};
 
 /// A name that is legal everywhere and representable in no ASCII header.
 const CYRILLIC: &str = "пакет-1.0.tgz";
@@ -45,7 +45,7 @@ fn content_disposition(response: &reqwest::Response) -> String {
 async fn a_non_ascii_package_file_can_be_downloaded_after_it_is_published() {
     let base = spawn_test_app().await;
     let (token, _) = register_full(&base, "cyrillic-pkg", "cyrillic-pkg@example.com").await;
-    create_repo(&base, &token, "goods").await;
+    create_initialised_repo(&base, &token, "goods").await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -100,7 +100,7 @@ async fn a_non_ascii_package_file_can_be_downloaded_after_it_is_published() {
 async fn a_non_ascii_release_asset_is_served_with_the_name_it_was_uploaded_under() {
     let base = spawn_test_app().await;
     let (token, _) = register_full(&base, "cyrillic-rel", "cyrillic-rel@example.com").await;
-    create_repo(&base, &token, "shipments").await;
+    create_initialised_repo(&base, &token, "shipments").await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -165,7 +165,7 @@ async fn a_non_ascii_release_asset_is_served_with_the_name_it_was_uploaded_under
 async fn a_release_asset_name_cannot_rewrite_the_header_around_it() {
     let base = spawn_test_app().await;
     let (token, _) = register_full(&base, "quoting-rel", "quoting-rel@example.com").await;
-    create_repo(&base, &token, "shipments").await;
+    create_initialised_repo(&base, &token, "shipments").await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -245,7 +245,7 @@ async fn a_release_asset_name_cannot_rewrite_the_header_around_it() {
 async fn a_plain_asset_name_may_contain_the_parameter_separator() {
     let base = spawn_test_app().await;
     let (token, _) = register_full(&base, "semicolon-rel", "semicolon-rel@example.com").await;
-    create_repo(&base, &token, "shipments").await;
+    create_initialised_repo(&base, &token, "shipments").await;
     let client = reqwest::Client::new();
 
     let resp = client

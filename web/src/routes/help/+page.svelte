@@ -1,15 +1,21 @@
+<script lang="ts">
+  import { createT } from '$lib/i18n';
+
+  const t = createT();
+</script>
+
 <svelte:head>
-  <title>Help - Plombir Git</title>
+  <title>{t('help.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="help-page">
   <header class="help-header">
-    <h1>Help</h1>
-    <p>Common commands and entry points for using this Plombir Git instance.</p>
+    <h1>{t('help.title')}</h1>
+    <p>{t('help.subtitle')}</p>
   </header>
 
   <section class="help-section">
-    <h2>Clone a repository</h2>
+    <h2>{t('help.clone_title')}</h2>
     <div class="command-list">
       <code>git clone http://localhost:8080/git/OWNER/REPO</code>
       <code>git clone ssh://git@localhost:2222/OWNER/REPO</code>
@@ -17,23 +23,23 @@
   </section>
 
   <section class="help-section">
-    <h2>Use access tokens</h2>
-    <p>Create a personal access token from security settings, then use it as a Bearer token for API requests or as the password for HTTPS Git operations.</p>
-    <a href="/settings/tokens" class="link-button">Manage access tokens</a>
+    <h2>{t('help.tokens_title')}</h2>
+    <p>{t('help.tokens_body')}</p>
+    <a href="/settings/tokens" class="link-button">{t('help.tokens_link')}</a>
   </section>
 
   <section class="help-section">
-    <h2>Connect an AI agent</h2>
-    <p>Give an agent a bot account of its own: it acts under its own name, on your behalf, with a token you can confine to repositories, MCP tools and unprotected branches. Point an MCP client at <code>/api/v1/mcp</code> on this server with the bot's token as a Bearer token.</p>
-    <a href="/settings/agents" class="link-button">Manage agents</a>
+    <h2>{t('help.agent_title')}</h2>
+    <p>{t('help.agent_body')} {t('help.agent_endpoint_before')} <code>/api/v1/mcp</code> {t('help.agent_endpoint_after')}</p>
+    <a href="/settings/agents" class="link-button">{t('help.agent_link')}</a>
   </section>
 
   <section class="help-section">
-    <h2>Find work</h2>
+    <h2>{t('help.find_title')}</h2>
     <div class="quick-links">
-      <a href="/explore">Explore repositories</a>
-      <a href="/search">Search code and issues</a>
-      <a href="/imports">Import repositories</a>
+      <a href="/explore">{t('help.find_explore')}</a>
+      <a href="/search">{t('help.find_search')}</a>
+      <a href="/imports">{t('help.find_imports')}</a>
     </div>
   </section>
 </div>

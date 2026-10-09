@@ -89,9 +89,13 @@ pub fn is_reserved_segment(name: &str) -> bool {
 /// name asks this instead: registration, organization creation, bots, and the
 /// SSO and LDAP paths that generate a name without a human seeing it.
 ///
-/// Exact match, like the two lookups it combines. Two concurrent creates of
-/// one name across the two tables can still both pass it: no constraint spans
-/// the tables, so this narrows the window to a race rather than closing it.
+/// Exact match, like the two lookups it combines. This is the friendly first
+/// answer, not the guarantee: two concurrent creates of one name across the
+/// two tables can both pass it. The guarantee is `owner_names`, the database's
+/// own unique key over both tables, written by triggers in the same statement
+/// as the row — the loser of that race fails its insert with an ordinary
+/// unique violation, which every door already answers as "taken"
+/// (`m20261009_000001_owner_names_unique`, card_8f3f821705f2).
 pub async fn owner_name_is_taken(
     db: &rg_db::DatabaseConnection,
     name: &str,
@@ -351,11 +355,25 @@ mod tests {
         rg_db::ops::user_ops::create_user(&db, "acme", "acme@example.invalid", "", "Acme")
             .await
             .expect("seed the account that shadows the organization");
+        // `owner_names` refuses that pair now (card_8f3f821705f2), so the
+        // database is put into the state an upgraded one with such a pair is
+        // in: the account holds the name in `owner_names`, the organization
+        // shares it in its own table and nowhere else.
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared("DELETE FROM owner_names WHERE name = 'acme'")
+            .await
+            .expect("release the name for the legacy seed");
         for org in ["acme", "lonely"] {
             rg_db::ops::org_ops::create_org(&db, org, None, None, founder.id, "public")
                 .await
                 .expect("seed an organization");
         }
+        db.execute_unprepared(
+            "UPDATE owner_names SET kind = 'user', \
+             owner_id = (SELECT id FROM users WHERE username = 'acme') WHERE name = 'acme'",
+        )
+        .await
+        .expect("give the name back to the account, as the backfill does");
 
         assert_eq!(
             rg_db::ops::org_ops::list_names_held_by_an_account_too(&db)

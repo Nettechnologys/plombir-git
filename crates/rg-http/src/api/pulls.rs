@@ -99,6 +99,11 @@ pub struct UpdatePrRequest {
 pub struct MergePrRequest {
     /// merge / squash / rebase
     pub strategy: String,
+    /// Delete the head branch once the merge has landed — kept, with the
+    /// reason in `head_branch_kept`, when a rule or another open pull request
+    /// needs it (card_2060696224ff).
+    #[serde(default)]
+    pub delete_head_branch: bool,
 }
 
 #[derive(Deserialize)]
@@ -229,56 +234,24 @@ pub async fn create_pr(
         repo: repo_model,
         actor_id: user_id,
     }: RepoAuthRead,
-    headers: HeaderMap,
-    grant: Option<Extension<TokenGrant>>,
-    Json(req): Json<CreatePrRequest>,
+    // The head names its own repository when it is a fork, and that one is
+    // gated by the extractor — read access to the base is not read access to a
+    // fork of it (card_bb2ef2307588).
+    repo_access::PullHead {
+        branch: head_branch,
+        fork: head_repo,
+        inner: Json(req),
+    }: repo_access::PullHead<Json<CreatePrRequest>>,
 ) -> impl IntoResponse {
     let repo_id = repo_model.id;
+    let head_repo_id = head_repo.map(|head_repo| head_repo.id);
 
     if req.head.trim().is_empty() || req.base.trim().is_empty() {
         return AppError::bad_request("head and base branches are required").into_response();
     };
 
-    // The route layer checks the base repository named in the path. A fork
-    // head names another repository in the body, so confine that name before
-    // resolving it. Treat an absent and a disallowed head alike: a narrowed
-    // token must not use the resolver as a repository-existence oracle.
-    if let (Some(Extension(grant)), Some((head_owner, _))) =
-        (grant.as_ref(), req.head.split_once(':'))
     {
-        if grant.is_repo_restricted() {
-            let head_repo = match rg_core::repo::service::find_repo_by_owner_name(
-                &state.db,
-                head_owner,
-                &repo_model.name,
-            )
-            .await
-            {
-                Ok(repo) => repo,
-                Err(error) => return AppError::from(error).into_response(),
-            };
-            if !head_repo
-                .as_ref()
-                .is_some_and(|head_repo| grant.admits_repository(head_repo.id))
-            {
-                return grant
-                    .deny(
-                        &headers,
-                        "this token may not access the pull request head repository",
-                        serde_json::json!({
-                            "reason": "repository_not_allowed",
-                            "action": "create_pr",
-                            "base_repo_id": repo_id,
-                        }),
-                    )
-                    .await
-                    .into_response();
-            }
-        }
-    }
-
-    match rg_core::pull_request::resolve_head_ref(&state.db, repo_id, &req.head).await {
-        Ok((head_branch, head_repo_id)) => {
+        {
             match rg_core::pull_request::create_pr(
                 &state.db,
                 &state.repo_root,
@@ -360,9 +333,6 @@ pub async fn create_pr(
                 Err(e) => AppError::from(e).into_response(),
             }
         }
-        // Same for `resolve_head_ref`: an unknown head owner or a head repo that
-        // is not a fork is a 400, a failed lookup behind either is not.
-        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -503,6 +473,76 @@ pub async fn get_diff(
     }
 }
 
+impl repo_access::HeadRefSource for repo_access::InQuery<CompareQuery> {
+    fn head_ref(&self) -> &str {
+        &self.0.head
+    }
+}
+
+impl repo_access::HeadRefSource for Json<CreatePrRequest> {
+    fn head_ref(&self) -> &str {
+        &self.0.head
+    }
+}
+
+/// Query of a branch comparison.
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct CompareQuery {
+    /// The branch a pull request would merge into.
+    pub base: String,
+    /// The branch it would bring: `branch`, or `owner:branch` of a fork.
+    pub head: String,
+}
+
+/// Compare two branches before opening a pull request.
+/// GET /api/v1/repos/:owner/:name/compare?base=&head=
+///
+/// The commits `head` adds since the merge base, and the diff a pull request
+/// would show. A fork head is gated on its own read access — the same gate
+/// its own pages pass through — and on the token's repository confinement:
+/// read access to the base says nothing about a fork (card_87f9b1c97489).
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/compare",
+    tag = "Pull Requests",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        CompareQuery,
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 400, description = "A branch does not exist, or the head is not a readable fork", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "The token may not read the head repository", body = serde_json::Value),
+        (status = 404, description = "Repository not found", body = serde_json::Value),
+    ),
+)]
+pub async fn compare(
+    State(state): State<AppState>,
+    RepoRead { repo: base_repo }: RepoRead,
+    repo_access::PullHead {
+        branch: head_branch,
+        fork: head_repo,
+        inner: repo_access::InQuery(query),
+    }: repo_access::PullHead<repo_access::InQuery<CompareQuery>>,
+) -> impl IntoResponse {
+    match rg_core::pull_request::compare_branches(
+        &state.db,
+        &state.repo_root,
+        &base_repo,
+        &query.base,
+        head_repo.as_ref(),
+        &head_branch,
+    )
+    .await
+    {
+        Ok(comparison) => (StatusCode::OK, Json(comparison)).into_response(),
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/repos/{owner}/{name}/pulls/{number}/merge",
@@ -614,7 +654,53 @@ pub async fn merge_pr(
         // REST, auto-merge, and merge-queue paths all count through one site.
         Ok(result) => {
             spawn_hooks_for_merge(&state, actor_id, result.base_ref_update.clone());
-            (StatusCode::OK, Json(result)).into_response()
+            let mut body = match serde_json::to_value(&result) {
+                Ok(body) => body,
+                Err(e) => return AppError::from(anyhow::Error::from(e)).into_response(),
+            };
+            if req.delete_head_branch {
+                // The merge has landed whatever happens here: a branch that
+                // must stay is reported beside the merge, never as its failure.
+                let (deleted, kept) = match rg_core::repo::refs::delete_merged_head_branch(
+                    &state.db,
+                    &state.repo_root,
+                    &pr,
+                    actor_id,
+                )
+                .await
+                {
+                    Ok((head_owner, head_repo, head_path, update)) => {
+                        state.spawn_post_push_hooks(
+                            head_path,
+                            head_owner,
+                            head_repo,
+                            Some(actor_id),
+                            vec![update],
+                        );
+                        (true, None)
+                    }
+                    Err(e) => match rg_core::error::client_facing_message(&e) {
+                        Some(reason) => (false, Some(reason)),
+                        None => {
+                            tracing::error!(
+                                error = %format!("{e:#}"),
+                                "deleting a merged head branch failed"
+                            );
+                            (
+                                false,
+                                Some("the head branch could not be deleted".to_string()),
+                            )
+                        }
+                    },
+                };
+                if let Some(fields) = body.as_object_mut() {
+                    fields.insert("head_branch_deleted".into(), deleted.into());
+                    if let Some(kept) = kept {
+                        fields.insert("head_branch_kept".into(), kept.into());
+                    }
+                }
+            }
+            (StatusCode::OK, Json(body)).into_response()
         }
         // Every way a merge fails used to be the client's fault: a closed PR, a
         // draft, a racing attempt and a merge conflict all answered 400 — as did

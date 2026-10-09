@@ -5,6 +5,9 @@ export { connectJobLogWebSocket, connectNotificationWebSocket } from './websocke
 export {
   repos,
   type CommitSignature,
+  type RepoPermission,
+  type RepoSettingsPatch,
+  type RepositoryDetail,
   type RepositoryFork,
   type RepoTreeEntry,
   type RepoTreeEntryKind,
@@ -43,7 +46,7 @@ export {
   type ReleaseUpdateFormState,
   type ReleaseUpdatePayload
 } from './releaseForm';
-export { issues, type Issue, type IssueUpdatePayload } from './issues';
+export { issues, type Issue, type IssueComment, type IssueUpdatePayload } from './issues';
 export { buildIssueLinksPayload, type IssueLinksFormState } from './issueForm';
 export { pulls, reviews } from './pulls';
 export { pipelines } from './pipelines';
@@ -52,7 +55,18 @@ export { wiki } from './wiki';
 export { collaborators, type Collaborator } from './collaborators';
 export { labels, type LabelPayload } from './labels';
 export { buildLabelPayload, type LabelFormState } from './labelForm';
-export { notifications } from './notifications';
+export {
+  notifications,
+  EMAIL_NOTIFICATION_KEYS,
+  type EmailNotificationKey,
+  type EmailNotificationSettings,
+  type NotificationReason,
+  type NotificationRow,
+  type NotificationSettings,
+  type SubscriptionReason,
+  type ThreadKind,
+  type ThreadSubscription,
+} from './notifications';
 export {
   orgs,
   type Organization,
@@ -80,6 +94,11 @@ export {
 } from './branchProtectionForm';
 export { mirrors, type MirrorPayload, type RepositoryMirror } from './mirrors';
 export { buildMirrorPayload, type MirrorFormState } from './mirrorForm';
+export {
+  buildRepoSettingsPatch,
+  repoSettingsFormState,
+  type RepoSettingsFormState,
+} from './repoSettingsForm';
 export { webhooks, type RepositoryWebhook, type WebhookDelivery, type WebhookPayload } from './webhooks';
 export { imports, type ImportTask, type StartImportPayload } from './imports';
 export {

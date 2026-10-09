@@ -15,7 +15,9 @@ use crate::common::fault::{
     fail_db_writes, spawn_test_app_with_faults, spawn_test_app_with_first_put_gate,
     spawn_test_app_with_two_put_gate, DbWrite,
 };
-use crate::common::{create_issue, create_repo, register_full, spawn_test_app_with_db};
+use crate::common::{
+    create_initialised_repo, create_issue, create_repo, register_full, spawn_test_app_with_db,
+};
 use flate2::{write::GzEncoder, Compression};
 use reqwest::multipart::{Form, Part};
 use sea_orm::{
@@ -2679,7 +2681,7 @@ async fn a_release_asset_whose_bytes_were_refused_leaves_no_row_behind() {
     let (base, db, faults) = spawn_test_app_with_faults().await;
     let client = reqwest::Client::new();
     let (token, _user_id) = register_full(&base, "asset_orphan", "asset_orphan@example.com").await;
-    create_repo(&base, &token, "orphan-asset").await;
+    create_initialised_repo(&base, &token, "orphan-asset").await;
     let release_id = create_release(&base, &token, "asset_orphan", "orphan-asset").await;
     let assets_url =
         format!("{base}/api/v1/repos/asset_orphan/orphan-asset/releases/{release_id}/assets");

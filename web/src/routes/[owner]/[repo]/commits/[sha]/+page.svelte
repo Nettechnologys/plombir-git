@@ -4,6 +4,9 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { isUnavailable, optionalSection } from '$lib/optionalSection';
+  import { createT, formatDate as formatCalendarDate } from '$lib/i18n';
+
+  const t = createT();
 
   // Svelte 5 runes
   let owner = $derived($page.params.owner!);
@@ -89,7 +92,7 @@
       }
     } catch (err: any) {
       if (commitRequests.owns(claim, owner, repo, sha)) {
-        error = err.message || 'Failed to load commit status';
+        error = err.message || t('commit_detail.load_failed');
         console.error('Error loading commit status:', err);
       }
     } finally {
@@ -114,16 +117,12 @@
     const diffHours = Math.floor(diffMins / 60);
     const diffDays = Math.floor(diffHours / 24);
 
-    if (diffMins < 1) return 'just now';
-    if (diffMins < 60) return `${diffMins} minutes ago`;
-    if (diffHours < 24) return `${diffHours} hours ago`;
-    if (diffDays < 7) return `${diffDays} days ago`;
+    if (diffMins < 1) return t('commit_detail.just_now');
+    if (diffMins < 60) return t('commit_detail.minutes_ago', { count: diffMins });
+    if (diffHours < 24) return t('commit_detail.hours_ago', { count: diffHours });
+    if (diffDays < 7) return t('commit_detail.days_ago', { count: diffDays });
 
-    return date.toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric'
-    });
+    return formatCalendarDate(dateStr);
   }
 
   function getStatusIcon(state: string): string {
@@ -138,11 +137,11 @@
 
   function getStatusText(state: string): string {
     switch (state) {
-      case 'success': return 'All checks passed';
-      case 'failure': return 'Some checks failed';
-      case 'error': return 'Some checks errored';
-      case 'pending': return 'Checks pending';
-      default: return 'Unknown status';
+      case 'success': return t('commit_detail.checks_passed');
+      case 'failure': return t('commit_detail.checks_failed');
+      case 'error': return t('commit_detail.checks_errored');
+      case 'pending': return t('commit_detail.checks_pending');
+      default: return t('commit_detail.status_unknown');
     }
   }
 
@@ -157,6 +156,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>{t('commit_detail.page_title', { sha: getShortSha(sha ?? '') })} · {owner}/{repo} · Plombir Git</title>
+</svelte:head>
+
 <div class="page-container">
   <RepoHeader {owner} {repo} activeTab="commits" />
 
@@ -164,12 +167,12 @@
   {#if loading}
     <div class="loading-container">
       <div class="spinner"></div>
-      <p>Loading commit status...</p>
+      <p>{t('commit_detail.loading')}</p>
     </div>
   {:else if error}
     <div class="error-container">
-      <p class="error-message">Error: {error}</p>
-      <button onclick={retryLoad}>Retry</button>
+      <p class="error-message">{t('commit_detail.error', { error })}</p>
+      <button onclick={retryLoad}>{t('common.retry')}</button>
     </div>
   {:else}
     {#if commitInfo}
@@ -193,25 +196,27 @@
             (card_61b29791d099).
           -->
           {#if signatureUnavailable}
-            <span class="gpg-badge unchecked" title="GPG: the signature check could not be reached">
-              <span class="gpg-icon">!</span> Signature status unavailable
+            <span class="gpg-badge unchecked" title={t('commit_detail.gpg_unreachable_title')}>
+              <span class="gpg-icon">!</span> {t('commit_detail.signature_unavailable')}
             </span>
           {:else if gpgSignature}
-            <span class="gpg-badge" class:verified={gpgSignature.verdict === 'valid'} class:unverified={gpgSignature.verdict === 'invalid'} class:unchecked={gpgSignature.verdict === 'undeterminable'} class:no-sig={gpgSignature.verdict === 'unsigned'} title="GPG: {gpgSignature.status}{gpgSignature.signer_name ? ' · ' + gpgSignature.signer_name : ''}">
+            <span class="gpg-badge" class:verified={gpgSignature.verdict === 'valid'} class:unverified={gpgSignature.verdict === 'invalid'} class:unchecked={gpgSignature.verdict === 'undeterminable'} class:no-sig={gpgSignature.verdict === 'unsigned'} title={gpgSignature.signer_name
+              ? t('commit_detail.gpg_title_signer', { status: gpgSignature.status, signer: gpgSignature.signer_name })
+              : t('commit_detail.gpg_title', { status: gpgSignature.status })}>
               {#if gpgSignature.verdict === 'valid'}
-                <span class="gpg-icon">✓</span> Signed
+                <span class="gpg-icon">✓</span> {t('commit_detail.signed')}
                 {#if gpgSignature.signer_name}
-                  <span class="gpg-signer">by {gpgSignature.signer_name}</span>
+                  <span class="gpg-signer">{t('commit_detail.signed_by', { signer: gpgSignature.signer_name })}</span>
                 {/if}
               {:else if gpgSignature.verdict === 'unsigned'}
-                <span class="gpg-icon">○</span> Unsigned
+                <span class="gpg-icon">○</span> {t('commit_detail.unsigned')}
               {:else if gpgSignature.verdict === 'undeterminable'}
-                <span class="gpg-icon">?</span> Signature could not be checked
+                <span class="gpg-icon">?</span> {t('commit_detail.signature_unchecked')}
                 {#if gpgSignature.signer_name}
-                  <span class="gpg-signer">by {gpgSignature.signer_name}</span>
+                  <span class="gpg-signer">{t('commit_detail.signed_by', { signer: gpgSignature.signer_name })}</span>
                 {/if}
               {:else}
-                <span class="gpg-icon">✗</span> Bad signature
+                <span class="gpg-icon">✗</span> {t('commit_detail.bad_signature')}
               {/if}
             </span>
           {/if}
@@ -219,14 +224,14 @@
       </div>
     {:else if commitInfoFailure === 'unavailable'}
       <div class="commit-info-state" role="alert">
-        <h1>Commit details unavailable</h1>
-        <p>Could not load commit details. Status checks below may still be available.</p>
-        <button onclick={retryLoad}>Retry</button>
+        <h1>{t('commit_detail.details_unavailable')}</h1>
+        <p>{t('commit_detail.details_unavailable_hint')}</p>
+        <button onclick={retryLoad}>{t('common.retry')}</button>
       </div>
     {:else if commitInfoFailure === 'not_found'}
       <div class="commit-info-state">
-        <h1>Commit not found</h1>
-        <p>The commit log did not contain the requested commit.</p>
+        <h1>{t('commit_detail.not_found')}</h1>
+        <p>{t('commit_detail.not_found_hint')}</p>
       </div>
     {/if}
 
@@ -238,18 +243,18 @@
         </div>
         <div class="status-content">
           <h2 class="status-title">{getStatusText(combinedStatus.state)}</h2>
-          <p class="status-count">{combinedStatus.total_count} checks</p>
+          <p class="status-count">{t('commit_detail.checks_count', { count: combinedStatus.total_count })}</p>
         </div>
       </div>
     {/if}
 
     <!-- Status Checks List -->
     <div class="status-checks">
-      <h3>Status Checks</h3>
+      <h3>{t('commit_detail.status_checks')}</h3>
 
       {#if statuses.length === 0}
         <div class="empty-state">
-          <p>No status checks reported yet.</p>
+          <p>{t('commit.no_status')}</p>
         </div>
       {:else}
         <div class="status-list">
@@ -263,10 +268,10 @@
                   <strong class="status-context">{status.context}</strong>
                   <span class="status-date">{formatDate(status.created_at)}</span>
                 </div>
-                <p class="status-description">{status.description || 'No description'}</p>
+                <p class="status-description">{status.description || t('common.no_description')}</p>
                 {#if status.target_url}
                   <a href={status.target_url} target="_blank" rel="noopener noreferrer" class="status-details-link">
-                    View Details →
+                    {t('commit_detail.view_details')}
                   </a>
                 {/if}
               </div>

@@ -5,6 +5,7 @@
   import { admin, type AdminOrg } from '$lib/api/client.svelte';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { untrack } from 'svelte';
+  import Modal from '$lib/components/Modal.svelte';
 
   const t = createT();
 
@@ -88,13 +89,11 @@
     if (page < totalPages) { page++; loadOrgs(); }
   }
 
-  function closeDeleteDialogByKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      showDeleteConfirm = false;
-    }
-  }
 </script>
+
+<svelte:head>
+  <title>{t('admin.orgs.title')} · {t('admin.settings.admin')} · Plombir Git</title>
+</svelte:head>
 
 <div class="container">
   <div class="header">
@@ -110,17 +109,17 @@
   {#if loading}
     <p class="loading">{t('common.loading')}</p>
   {:else if orgs.length === 0}
-    <p class="empty">{t('orgs.no_repos')}</p>
+    <p class="empty">{t('orgs.no_orgs')}</p>
   {:else}
     <div class="table-wrap">
       <table class="orgs-table">
         <thead>
           <tr>
-            <th>Name</th>
-            <th>Display Name</th>
-            <th>Visibility</th>
-            <th>Owner ID</th>
-            <th>Created</th>
+            <th>{t('admin.orgs.columns.name')}</th>
+            <th>{t('admin.orgs.columns.display_name')}</th>
+            <th>{t('admin.orgs.columns.visibility')}</th>
+            <th>{t('admin.orgs.columns.owner')}</th>
+            <th>{t('admin.orgs.columns.created')}</th>
             <th></th>
           </tr>
         </thead>
@@ -155,25 +154,19 @@
 
     {#if totalPages > 1}
       <div class="pagination">
-        <button onclick={prevPage} disabled={page <= 1}>← Prev</button>
-        <span>Page {page} of {totalPages}</span>
-        <button onclick={nextPage} disabled={page >= totalPages}>Next →</button>
+        <button onclick={prevPage} disabled={page <= 1}>{t('common.prev_arrow')}</button>
+        <span>{t('common.page_info', { page, total: totalPages })}</span>
+        <button onclick={nextPage} disabled={page >= totalPages}>{t('common.next_arrow')}</button>
       </div>
     {/if}
   {/if}
 </div>
 
 <!-- Delete confirm -->
-  {#if showDeleteConfirm && deleteTarget}
-    <div
-      class="modal-overlay"
-      onclick={() => showDeleteConfirm = false}
-      role="button"
-      tabindex="0"
-      onkeydown={closeDeleteDialogByKey}
-    >
-      <div class="modal" role="dialog" aria-modal="true" tabindex="-1">
-      <h2>{t('admin.orgs.delete_confirm')}</h2>
+{#if showDeleteConfirm && deleteTarget}
+  <Modal onclose={() => showDeleteConfirm = false} labelledby="admin-org-delete-title" width="420px">
+    <div class="modal">
+      <h2 id="admin-org-delete-title">{t('admin.orgs.delete_confirm')}</h2>
       <p>
         {t('admin.orgs.delete_warning', { name: deleteTarget.name })}
       </p>
@@ -184,10 +177,10 @@
         <button class="btn-danger" onclick={handleDelete} disabled={deleting}>
           {deleting ? t('common.loading') : t('common.delete')}
         </button>
-        <button class="btn-secondary" onclick={() => showDeleteConfirm = false}>{t('common.cancel')}</button>
+        <button class="btn-secondary" onclick={() => showDeleteConfirm = false} data-autofocus>{t('common.cancel')}</button>
       </div>
     </div>
-  </div>
+  </Modal>
 {/if}
 
 <style>
@@ -227,8 +220,7 @@
   .btn-danger:disabled { opacity: 0.6; cursor: not-allowed; }
 
   /* Modal */
-  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-  .modal { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; width: 420px; max-width: 90vw; }
+  /* The panel itself is lib/components/Modal.svelte; `.modal` scopes its content. */
   .modal h2 { margin: 0 0 1rem; font-size: 1.1rem; }
   .modal p { color: var(--text-secondary); margin: 0 0 1rem; }
   .modal-actions { display: flex; gap: 0.75rem; justify-content: flex-end; margin-top: 1.25rem; }

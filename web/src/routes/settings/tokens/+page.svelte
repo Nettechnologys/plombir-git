@@ -3,6 +3,9 @@
   import { tokens } from '$lib/api/client.svelte';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
+  import { createT, formatDate as formatLocaleDate } from '$lib/i18n';
+
+  const t = createT();
 
   interface AccessToken {
     id: number;
@@ -20,9 +23,13 @@
   // that is not narrowed.
   function narrowing(token: AccessToken): string {
     const parts: string[] = [];
-    if (token.repositories) parts.push(`repos: ${token.repositories.join(', ') || 'none'}`);
-    if (token.mcp_tools) parts.push(`MCP only: ${token.mcp_tools.join(', ')}`);
-    if (token.deny_protected_merge) parts.push('no protected branches');
+    if (token.repositories) {
+      parts.push(t('access_tokens.narrowing_repos', {
+        list: token.repositories.join(', ') || t('access_tokens.narrowing_none'),
+      }));
+    }
+    if (token.mcp_tools) parts.push(t('access_tokens.narrowing_mcp', { list: token.mcp_tools.join(', ') }));
+    if (token.deny_protected_merge) parts.push(t('access_tokens.narrowing_protected'));
     return parts.join(' · ');
   }
 
@@ -56,7 +63,7 @@
       if (listRequests.owns(claim, 'tokens')) tokenList = next;
     } catch (err: any) {
       if (listRequests.owns(claim, 'tokens')) {
-        error = err.message || 'Failed to load access tokens';
+        error = err.message || t('access_tokens.load_failed');
       }
     } finally {
       if (listRequests.owns(claim, 'tokens')) loading = false;
@@ -85,7 +92,7 @@
     event.preventDefault();
     if (creating) return;
     if (!name.trim()) {
-      error = 'Token name is required';
+      error = t('access_tokens.name_required');
       return;
     }
 
@@ -96,20 +103,20 @@
       newToken = '';
       const created = await tokens.create(name.trim(), scopes.trim() || 'repo', expiresAtIso());
       newToken = created.token;
-      success = 'Token created. Copy it now; it will not be shown again.';
+      success = t('access_tokens.created_notice');
       name = '';
       scopes = 'repo';
       expiresAt = '';
       await loadTokens();
     } catch (err: any) {
-      error = err.message || 'Failed to create token';
+      error = err.message || t('access_tokens.create_failed');
     } finally {
       creating = false;
     }
   }
 
   async function revokeToken(token: AccessToken) {
-    if (!confirm(`Revoke token "${token.name}"?`)) return;
+    if (!confirm(t('access_tokens.revoke_confirm', { name: token.name }))) return;
     const tokenId = token.id;
     if (!claimToken(tokenId)) return;
 
@@ -117,10 +124,10 @@
       error = '';
       success = '';
       await tokens.delete(tokenId);
-      success = 'Token revoked';
+      success = t('access_tokens.revoked');
       await loadTokens();
     } catch (err: any) {
-      error = err.message || 'Failed to revoke token';
+      error = err.message || t('access_tokens.revoke_failed');
     } finally {
       releaseToken(tokenId);
     }
@@ -129,26 +136,26 @@
   async function copyNewToken() {
     if (!newToken) return;
     await navigator.clipboard.writeText(newToken);
-    success = 'Token copied';
+    success = t('access_tokens.copied');
   }
 
   function formatDate(value?: string | null) {
-    if (!value) return 'Never';
+    if (!value) return t('common.never');
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return value;
-    return date.toLocaleDateString();
+    return formatLocaleDate(value);
   }
 </script>
 
 <svelte:head>
-  <title>Access Tokens · Plombir Git</title>
+  <title>{t('access_tokens.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container tokens-page">
   <header class="page-header">
     <div>
-      <h1>Access Tokens</h1>
-      <p>Manage personal tokens for Git over HTTP, API clients, and automation.</p>
+      <h1>{t('access_tokens.title')}</h1>
+      <p>{t('access_tokens.description')}</p>
     </div>
   </header>
 
@@ -161,54 +168,54 @@
   {/if}
 
   {#if newToken}
-    <section class="token-created" aria-label="New access token">
+    <section class="token-created" aria-label={t('access_tokens.new_token_label')}>
       <div>
-        <strong>New token</strong>
-        <p>Copy this value before leaving the page.</p>
+        <strong>{t('access_tokens.new_token')}</strong>
+        <p>{t('access_tokens.copy_hint')}</p>
       </div>
       <code>{newToken}</code>
-      <button type="button" class="btn btn-primary" onclick={copyNewToken}>Copy</button>
+      <button type="button" class="btn btn-primary" onclick={copyNewToken}>{t('common.copy')}</button>
     </section>
   {/if}
 
   <section class="section">
-    <h2>Create Token</h2>
+    <h2>{t('access_tokens.create_title')}</h2>
     <form class="create-form" onsubmit={createToken}>
       <label>
-        Name
-        <input bind:value={name} placeholder="CI deploy token" disabled={creating} />
+        {t('access_tokens.name')}
+        <input bind:value={name} placeholder={t('access_tokens.name_placeholder')} disabled={creating} />
       </label>
       <label>
-        Scopes
+        {t('access_tokens.scopes')}
         <input bind:value={scopes} placeholder="repo" disabled={creating} />
       </label>
       <label>
-        Expires
+        {t('access_tokens.expires')}
         <input type="date" bind:value={expiresAt} disabled={creating} />
       </label>
       <button type="submit" class="btn btn-primary" disabled={creating || !name.trim()}>
-        {creating ? 'Creating...' : 'Create'}
+        {creating ? t('access_tokens.creating') : t('common.create')}
       </button>
     </form>
   </section>
 
   <section class="section">
-    <h2>Existing Tokens</h2>
+    <h2>{t('access_tokens.existing_title')}</h2>
 
     {#if loading}
-      <p class="muted">Loading...</p>
+      <p class="muted">{t('common.loading')}</p>
     {:else if tokenList.length === 0}
-      <div class="empty-state">No personal access tokens yet.</div>
+      <div class="empty-state">{t('access_tokens.empty')}</div>
     {:else}
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Name</th>
-              <th>Scopes</th>
-              <th>Created</th>
-              <th>Last used</th>
-              <th>Expires</th>
+              <th>{t('access_tokens.name')}</th>
+              <th>{t('access_tokens.scopes')}</th>
+              <th>{t('access_tokens.created')}</th>
+              <th>{t('access_tokens.last_used')}</th>
+              <th>{t('access_tokens.expires')}</th>
               <th></th>
             </tr>
           </thead>
@@ -230,7 +237,7 @@
                     disabled={busyTokenIds.has(token.id)}
                     onclick={() => revokeToken(token)}
                   >
-                    {busyTokenIds.has(token.id) ? 'Revoking...' : 'Revoke'}
+                    {busyTokenIds.has(token.id) ? t('access_tokens.revoking') : t('access_tokens.revoke')}
                   </button>
                 </td>
               </tr>

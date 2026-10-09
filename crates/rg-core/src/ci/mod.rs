@@ -605,6 +605,7 @@ pub async fn publish_configuration_failure(
     tx.commit()
         .await
         .context("db: commit CI configuration failure graph")?;
+    crate::notification::thread::notify_ci_failed(params.db, pipeline_id);
     Ok(Some(pipeline_id))
 }
 

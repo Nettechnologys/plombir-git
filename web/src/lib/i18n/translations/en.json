@@ -20,6 +20,7 @@
     "close": "Close",
     "add": "Add",
     "retry": "Retry",
+    "load_more": "Load more",
     "previous": "Previous",
     "next": "Next",
     "copy": "Copy",
@@ -31,7 +32,11 @@
     "search": "Search",
     "source_code": "Source code",
     "source_code_at_commit": "Source code of this instance at commit {commit}",
-    "source_code_commit_unknown": "Source code of this instance (build commit not recorded)"
+    "source_code_commit_unknown": "Source code of this instance (build commit not recorded)",
+    "prev_arrow": "← Prev",
+    "next_arrow": "Next →",
+    "page_info": "Page {page} of {total}",
+    "deleting": "Deleting..."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -59,7 +64,10 @@
     "security": "Security",
     "ssh_keys": "SSH Keys",
     "access_tokens": "Access Tokens",
-    "agents": "Agents"
+    "agents": "Agents",
+    "home_label": "Plombir Git Home",
+    "user_menu": "User menu",
+    "notification_settings": "Notification settings"
   },
   "author": {
     "bot": "bot",
@@ -152,7 +160,8 @@
     "footer": {
       "explore": "Explore",
       "built_with": "Built with Rust and SvelteKit"
-    }
+    },
+    "load_failed": "Failed to load repositories"
   },
   "auth": {
     "login": {
@@ -173,7 +182,16 @@
       "sso_unavailable": "Single sign-on options could not be loaded.",
       "sso_retry": "Retry",
       "sso_or": "or continue with",
-      "sso_continue": "Continue with {provider}"
+      "sso_continue": "Continue with {provider}",
+      "passkey_sign_in": "Sign in with a passkey",
+      "forgot_password": "Forgot password?",
+      "passkey_username_first": "Enter your username first, then use your passkey.",
+      "passkey_failed": "Passkey login failed",
+      "passwords_differ": "The two new passwords differ.",
+      "password_change_required": "An administrator set this password. Choose your own to continue.",
+      "new_password": "New password",
+      "confirm_password": "Repeat the new password",
+      "set_password": "Set password and sign in"
     },
     "register": {
       "title": "Create your account",
@@ -185,6 +203,41 @@
       "footer": "Already have an account? {link}",
       "footer_link": "Sign in",
       "failed": "Registration failed"
+    },
+    "back_to_login": "Back to Login",
+    "password_rules": {
+      "min_length": "Password must be at least 8 characters",
+      "max_length": "Password must be at most 128 characters",
+      "no_spaces": "Password must not contain spaces",
+      "uppercase": "Password must contain an uppercase letter",
+      "lowercase": "Password must contain a lowercase letter",
+      "number": "Password must contain a number",
+      "special": "Password must contain a special character"
+    },
+    "reset_password": {
+      "title": "Reset Password",
+      "subtitle": "Enter your new password",
+      "success": "Password reset successful! You are now logged in.",
+      "go_dashboard": "Go to Dashboard",
+      "invalid_link": "Invalid reset link. Please request a new password reset.",
+      "request_reset": "Request Reset",
+      "new_password": "New Password",
+      "new_password_placeholder": "At least 8 characters",
+      "confirm_password": "Confirm Password",
+      "confirm_placeholder": "Re-enter password",
+      "resetting": "Resetting...",
+      "mismatch": "Passwords do not match",
+      "failed": "Failed to reset password"
+    },
+    "forgot_password": {
+      "title": "Forgot Password",
+      "description": "Enter your account email to receive a reset link.",
+      "email": "Email",
+      "sending": "Sending...",
+      "submit": "Send Reset Link",
+      "email_required": "Email is required",
+      "sent": "If that email exists, a reset link has been sent.",
+      "failed": "Failed to request password reset"
     }
   },
   "dashboard": {
@@ -229,7 +282,14 @@
     "mark_all_read": "Mark all read",
     "mark_read": "Mark read",
     "empty": "No notifications",
-    "hint": "Real-time updates are active — new notifications will appear instantly."
+    "hint": "Real-time updates are active — new notifications will appear instantly.",
+    "reason": {
+      "review_requested": "Review requested",
+      "assigned": "Assigned",
+      "mention": "Mentioned",
+      "ci_failed": "CI failed",
+      "participating": "Participating"
+    }
   },
   "orgs": {
     "title": "Organizations",
@@ -295,6 +355,43 @@
     }
   },
   "repo": {
+    "branches": {
+      "title": "Branches",
+      "new": "New branch",
+      "name": "Branch name",
+      "name_placeholder": "feature/my-change",
+      "from": "Create from",
+      "from_hint": "A branch, tag or commit SHA. Leave empty for the default branch.",
+      "create": "Create branch",
+      "creating": "Creating…",
+      "created": "Branch {name} created.",
+      "create_failed": "The branch could not be created.",
+      "load_failed": "Branches could not be loaded.",
+      "empty": "This repository has no branches yet.",
+      "default": "default",
+      "protected": "protected",
+      "protected_hint": "A branch protection rule covers this branch, so the server refuses to delete it.",
+      "compare": "Compare",
+      "delete": "Delete",
+      "deleting": "Deleting…",
+      "delete_title": "Delete branch",
+      "delete_confirm": "Delete branch {name}? Commits only this branch points to become unreachable.",
+      "deleted": "Branch {name} deleted.",
+      "delete_failed": "The branch could not be deleted."
+    },
+    "tags": {
+      "title": "Tags",
+      "empty": "This repository has no tags yet.",
+      "load_failed": "Tags could not be loaded.",
+      "protected": "protected",
+      "protected_hint": "A tag protection rule covers this tag, so the server refuses to delete it.",
+      "delete": "Delete",
+      "deleting": "Deleting…",
+      "delete_title": "Delete tag",
+      "delete_confirm": "Delete tag {name}? Releases that use it keep their record but lose the tag.",
+      "deleted": "Tag {name} deleted.",
+      "delete_failed": "The tag could not be deleted."
+    },
     "tabs": {
       "code": "Code",
       "network": "Network",
@@ -517,7 +614,13 @@
     "copy_clone_url": "Copy URL to clipboard",
     "download_zip": "Download ZIP",
     "clone_url": "Clone URL",
-    "select_branch": "Select branch"
+    "select_branch": "Select branch",
+    "clone_https_label": "HTTPS clone",
+    "clone_ssh_label": "SSH clone",
+    "login_to_fork": "Login to fork",
+    "login_to_star": "Login to star",
+    "login_to_watch": "Login to watch",
+    "write_required": "You need write access to this repository to do this."
   },
   "issues": {
     "title": "Issues",
@@ -572,7 +675,15 @@
     "unnamed_user": "User #{userId}",
     "milestone": "Milestone",
     "no_milestone": "No milestone",
-    "save_links": "Save assignment"
+    "save_links": "Save assignment",
+    "delete": {
+      "title": "Delete this issue",
+      "desc": "Deleting an issue removes it with all its comments and attachments. This cannot be undone.",
+      "button": "Delete issue",
+      "failed": "Deleting the issue failed",
+      "confirm_title": "Delete issue #{number}?",
+      "confirm_body": "The issue, its comments and its attachments are removed for everyone. This cannot be undone."
+    }
   },
   "milestones": {
     "title": "Milestones",
@@ -616,7 +727,25 @@
       "description_placeholder": "Describe your changes...",
       "draft": "Create as draft",
       "submit": "Create Pull Request",
-      "cancel": "Cancel"
+      "cancel": "Cancel",
+      "title_label": "Title",
+      "title_placeholder": "Pull request title",
+      "head_repository": "Head repository",
+      "your_fork": "(your fork)",
+      "forks_unavailable": "Forks could not be loaded; only this repository's branches are offered.",
+      "fork_branches_unavailable": "The fork's branches could not be loaded.",
+      "compare": "Compare changes"
+    },
+    "compare": {
+      "title": "Comparing changes",
+      "base": "base",
+      "head": "compare",
+      "create_pull": "Create pull request",
+      "commits": "Commits: {count}",
+      "files_changed": "Files changed: {count}",
+      "nothing_to_compare": "{head} has no commits that {base} does not.",
+      "invalid_spec": "This compare address must name branches as base...head.",
+      "unavailable": "The comparison could not be loaded."
     },
     "empty": "No {state} pull requests.",
     "meta": "#{number} opened {date} by {author}",
@@ -635,6 +764,10 @@
       "approving": "Approving…"
     },
     "merge": {
+      "delete_head_branch": "Delete branch {branch} after merge",
+      "head_branch_deleted": "Branch {branch} deleted.",
+      "head_branch_kept": "Branch {branch} was kept: {reason}",
+      "head_branch_kept_unknown": "no reason given",
       "strategy": {
         "merge": "Merge commit",
         "squash": "Squash and merge",
@@ -653,7 +786,8 @@
       "leave_queue": "Leave queue",
       "queue_title": "Repository merge queue",
       "queue_position": "Position {position} in the merge queue",
-      "queue_waiting": "Merge with {strategy} when this request reaches the head and protection rules pass."
+      "queue_waiting": "Merge with {strategy} when this request reaches the head and protection rules pass.",
+      "queue_entry": "#{position} · PR #{number} · {title}"
     },
     "verdict": {
       "approved": "✓ Approved",
@@ -737,7 +871,11 @@
       "applying_selected": "Applying suggestions...",
       "apply": "Apply suggestion",
       "applied": "Suggestion applied"
-    }
+    },
+    "page_title": "PR #{number}",
+    "opened_by_author": "opened {date} by {author}",
+    "author_commented": "{author} commented",
+    "files_changed": "{count} files"
   },
   "wiki": {
     "title": "Wiki",
@@ -762,7 +900,17 @@
     "history": "History",
     "revisionMessage": "Revision Message",
     "noMessage": "No message",
-    "noRevisions": "No revisions yet"
+    "noRevisions": "No revisions yet",
+    "revision_number": "Revision #{id}",
+    "revision_short": "r{number}",
+    "delete_confirm": "Delete this wiki page? This cannot be undone.",
+    "restore_confirm": "Restore version {version}? Current content will become a revision.",
+    "repo_wiki": "{repo} Wiki",
+    "last_edited": "Last edited {date}",
+    "revision_history": "Revision History",
+    "loading_revisions": "Loading…",
+    "no_revisions_hint": "No revisions yet. Revisions are saved on every edit.",
+    "restore_version": "Restore this version"
   },
   "pipeline": {
     "status": {
@@ -811,7 +959,16 @@
     "artifact_delete_confirm": "Delete {name}? The stored file is removed with it and cannot be recovered.",
     "artifact_delete_failed": "Could not delete {name}: {reason}",
     "artifact_expires": "Expires",
-    "artifact_expires_never": "No expiry"
+    "artifact_expires_never": "No expiry",
+    "page_title": "CI/CD",
+    "log": {
+      "load_failed": "Failed to load log: {error}",
+      "stream_failed": "Live log connection failed",
+      "live": "Live",
+      "closed": "Closed",
+      "title": "Job Log",
+      "empty": "(no log output)"
+    }
   },
   "errors": {
     "login_failed": "Login failed",
@@ -896,7 +1053,20 @@
       "verify": "Verify",
       "verifying": "Verifying…",
       "error": "Could not check provenance: {error}"
-    }
+    },
+    "delete_confirm": "Are you sure?",
+    "page_info": "Page {page} of {total}",
+    "new_page_title": "New Release",
+    "edit_page_title": "Edit Release",
+    "tag_name_required": "Tag name is required",
+    "release_title_required": "Release title is required",
+    "existing_tags": "Existing tags:",
+    "more_tags": "+{count} more",
+    "target_tags": "Tags",
+    "target_branches": "Branches",
+    "select_tag": "-- Select a tag (optional) --",
+    "select_branch": "-- Select a branch (optional) --",
+    "invalid_id": "Invalid release id."
   },
   "settings": {
     "title": "Settings",
@@ -1126,7 +1296,8 @@
       "confirm": "Transfer repository",
       "confirming": "Transferring...",
       "success": "Repository transferred successfully.",
-      "warning": "This is a permanent action. Make sure you have the correct new owner."
+      "warning": "This is a permanent action. Make sure you have the correct new owner.",
+      "failed": "Transfer failed"
     },
     "delete": {
       "title": "Delete this repository",
@@ -1135,7 +1306,106 @@
       "confirm_placeholder": "Type owner/repository",
       "confirm_button": "Delete this repository",
       "confirming": "Deleting...",
-      "success": "Repository deleted."
+      "success": "Repository deleted.",
+      "failed": "Delete failed"
+    },
+    "tag_protection": {
+      "title": "Tag protection",
+      "desc": "Block tag creation and updates matching a pattern over HTTP and SSH.",
+      "only_wildcard": "{wildcard} is the only wildcard.",
+      "create_title": "Protect a pattern",
+      "edit_title": "Edit protection",
+      "pattern": "Pattern",
+      "pattern_hint": "(use {star} as the wildcard; {question}, character classes, and {plus} are not supported)",
+      "allowed_users": "Users allowed to push this pattern",
+      "allowed_users_hint": "(comma-separated usernames; empty means the pattern is closed to everyone, including the owner)",
+      "add": "Add protection",
+      "save": "Save changes",
+      "list_title": "Protected patterns",
+      "empty": "No protected tag patterns.",
+      "allowed": "allowed: {users}",
+      "nobody": "nobody may push this pattern",
+      "delete_confirm": "Delete protection for {pattern}?"
+    },
+    "environments": {
+      "title": "Environments",
+      "heading": "Deployment environments",
+      "desc": "Require designated reviewers before jobs can deploy to protected environments.",
+      "create": "Create environment",
+      "edit_title": "Edit environment",
+      "name": "Name",
+      "require_approval": "Require approval",
+      "required_approvals": "Required approvals",
+      "allowed_approvers": "Allowed approvers",
+      "allowed_approvers_hint": "(comma-separated usernames; empty means repository admins)",
+      "save": "Save changes",
+      "list_title": "Configured environments",
+      "empty": "No environments configured.",
+      "approvals_required": "{count} approval(s) required",
+      "unprotected": "Unprotected",
+      "reviewers": "reviewers: {users}",
+      "delete_confirm": "Delete environment {name}?"
+    },
+    "ci_secrets": {
+      "title": "CI secrets",
+      "desc": "Encrypted repository secrets are injected into jobs and masked from stored logs.",
+      "add_title": "Add or replace a secret",
+      "name": "Name",
+      "value": "Value",
+      "save": "Save secret",
+      "list_title": "Configured secrets",
+      "empty": "No secrets configured.",
+      "delete_confirm": "Delete {name}?"
+    },
+    "retention": {
+      "title": "CI retention",
+      "desc": "Control how long newly uploaded artifacts and accessed caches remain available. Expired storage is reclaimed hourly.",
+      "loading": "Loading…",
+      "artifact_days": "Artifact retention (days)",
+      "cache_days": "Cache retention after last access (days)",
+      "save": "Save policy",
+      "cleanup": "Clean expired storage now",
+      "saved": "Retention policy saved. New uploads use the updated lifetime.",
+      "cleaned": "Deleted {artifacts} artifact(s) and {caches} cache entry(s).",
+      "cleanup_failures": "{count} item(s) could not be safely removed."
+    },
+    "label_color_swatch": "Color {color}",
+    "confirm_delete_title": "Confirm Delete",
+    "labels_load_failed": "Failed to load labels",
+    "label_name_required": "Label name is required",
+    "label_save_failed": "Failed to save label",
+    "label_delete_failed": "Failed to delete label",
+    "load_failed": "Failed to load the repository",
+    "general_form": {
+      "save": "Save changes",
+      "saved": "Settings saved.",
+      "save_failed": "Saving the settings failed",
+      "description_placeholder": "A short description of this repository",
+      "default_branch": "Default branch",
+      "default_branch_hint": "New pull requests target it and clones check it out.",
+      "admin_only": "Only repository administrators can change these settings."
+    },
+    "visibility": {
+      "now_public": "Anyone can see and clone this repository, including people who are not signed in.",
+      "now_private": "Only the owner and people given access to this repository can see and clone it.",
+      "make_private": "Make private",
+      "make_public": "Make public",
+      "failed": "Changing the visibility failed",
+      "confirm_private_title": "Make this repository private?",
+      "confirm_public_title": "Make this repository public?",
+      "confirm_private_body": "Everyone without access — other signed-in users and anonymous visitors — loses access to its code, issues, pull requests and releases at once, and links shared earlier stop working for them. The owner and people given access keep it.",
+      "confirm_public_body": "Anyone, including people who are not signed in, will be able to see and clone its code and read its issues, pull requests and releases. Make sure nothing in its history is secret."
+    },
+    "rename": {
+      "title": "Rename repository",
+      "desc": "The repository keeps its issues, pull requests, releases and settings under the new name.",
+      "new_name": "New name",
+      "button": "Rename",
+      "renaming": "Renaming...",
+      "failed": "Rename failed",
+      "confirm_title": "Rename this repository?",
+      "confirm_body": "{from} will become {to}.",
+      "no_redirect": "Old web links and clone URLs stop working: there is no redirect from the old name. Everyone who cloned it has to point their remote at the new URL."
     }
   },
   "commit": {
@@ -1161,14 +1431,52 @@
       "is_admin": "Site Admin",
       "is_active": "Active",
       "delete_confirm": "Delete User",
-      "delete_warning": "Are you sure you want to delete user \"{username}\"? This action cannot be undone."
+      "delete_warning": "Are you sure you want to delete user \"{username}\"? This action cannot be undone.",
+      "temp_password_before": "Temporary password for",
+      "temp_password_after": "— shown only now. Hand it over; it must be replaced at the first sign-in.",
+      "done": "Done",
+      "username_placeholder": "Username",
+      "email_placeholder": "Email",
+      "display_name_placeholder": "Display name (optional)",
+      "administrator": "Administrator",
+      "creating": "Creating...",
+      "create": "Create user",
+      "new": "New user",
+      "columns": {
+        "username": "Username",
+        "email": "Email",
+        "admin": "Admin",
+        "active": "Active",
+        "provider": "Provider",
+        "login": "Login",
+        "created": "Created"
+      },
+      "locked_until": "Locked until {date}",
+      "locked": "Locked",
+      "failed_attempts": "{count} failed",
+      "last_login": "Last login {date}",
+      "no_login": "No completed login recorded",
+      "login_ok": "OK",
+      "working": "Working...",
+      "unlock": "Unlock",
+      "reset_password": "Reset password",
+      "reset_password_confirm": "Give {username} a new password? Every session they have is signed out.",
+      "display_name": "Display Name",
+      "bio": "Bio"
     },
     "orgs": {
       "title": "Organization Management",
       "desc": "View and manage all organizations",
       "total": "organizations total",
       "delete_confirm": "Delete Organization",
-      "delete_warning": "Are you sure you want to delete organization \"{name}\"? All associated data will be lost."
+      "delete_warning": "Are you sure you want to delete organization \"{name}\"? All associated data will be lost.",
+      "columns": {
+        "name": "Name",
+        "display_name": "Display Name",
+        "visibility": "Visibility",
+        "owner": "Owner ID",
+        "created": "Created"
+      }
     },
     "audit": {
       "title": "Audit Log",
@@ -1185,7 +1493,15 @@
         "resource": "Resource",
         "ip": "IP Address",
         "details": "Details"
-      }
+      },
+      "resource_all": "{field}: All",
+      "resource_types": {
+        "user": "User",
+        "repo": "Repository",
+        "org": "Organization"
+      },
+      "clear_filters": "Clear filters",
+      "empty": "No audit records found."
     },
     "runners": {
       "title": "Runner Management",
@@ -1210,7 +1526,99 @@
       "repo_handoff": "Administrators register each runner for one repository; its token cannot claim jobs from another.",
       "open_admin": "Open runner management",
       "delete_confirm": "Delete Runner",
-      "delete_warning": "Are you sure you want to delete runner \"{name}\"?"
+      "delete_warning": "Are you sure you want to delete runner \"{name}\"?",
+      "repository_placeholder": "owner/repository",
+      "page_info": "Page {page} of {total}"
+    },
+    "settings": {
+      "title": "Instance Settings",
+      "desc": "Instance maintenance and banner configuration",
+      "admin": "Admin",
+      "save": "Save Settings",
+      "maintenance": {
+        "title": "Maintenance Mode",
+        "enable": "Enable maintenance mode (read-only, blocks all mutating requests)"
+      },
+      "banner": {
+        "title": "Instance Banner",
+        "message": "Banner Message (leave empty to hide)",
+        "message_placeholder": "e.g. Scheduled maintenance tonight at 2am",
+        "type": "Banner Type",
+        "type_info": "Info (blue)",
+        "type_warning": "Warning (yellow)",
+        "type_error": "Error (red)"
+      },
+      "sso": {
+        "title": "SSO Providers",
+        "loading": "Loading SSO providers...",
+        "empty": "No SSO providers configured.",
+        "name_slug_required": "SSO provider name and slug are required",
+        "delete_confirm": "Delete SSO provider \"{name}\"?",
+        "test_failed": "LDAP connection test failed",
+        "enabled": "Enabled",
+        "disabled": "Disabled",
+        "creates_accounts": "Creates accounts",
+        "no_new_accounts": "No new accounts",
+        "testing": "Testing...",
+        "test": "Test connection",
+        "enable": "Enable",
+        "disable": "Disable",
+        "edit_title": "Edit SSO Provider",
+        "add_title": "Add SSO Provider",
+        "name": "Name",
+        "slug": "Slug",
+        "oauth2_hint_before": "Plain OAuth2 recognises",
+        "oauth2_hint_and": "and",
+        "oauth2_hint_after": ". Anything else needs the OIDC type and a discovery URL.",
+        "type": "Type",
+        "type_oauth2": "OAuth2 (GitHub / GitLab)",
+        "type_oidc": "OIDC (discovery URL)",
+        "type_ldap": "LDAP",
+        "client_id": "Client ID",
+        "client_secret": "Client Secret",
+        "keep_secret": "Leave blank to keep existing secret",
+        "discovery_url": "Discovery URL",
+        "scopes": "Scopes",
+        "icon_url": "Icon URL",
+        "ldap_host": "LDAP Host",
+        "ldap_host_placeholder": "ldap.example.com (LDAPS by default)",
+        "ldap_port": "LDAP Port",
+        "ldap_bind_dn": "LDAP Bind DN",
+        "ldap_bind_password": "LDAP Bind Password",
+        "keep_password": "Leave blank to keep existing password",
+        "ldap_base_dn": "LDAP Base DN",
+        "ldap_user_filter": "LDAP User Filter",
+        "enable_provider": "Enable this provider",
+        "auto_provision": "Create accounts on first login",
+        "auto_provision_hint": "Off means only people who have linked this provider to their account (Settings → Security) can sign in through it. On a public identity provider (GitHub, Google) leaving it on hands an account to anyone with an account there.",
+        "allowed_domains": "Allowed email domains",
+        "allowed_domains_hint_before": "Comma-separated. Empty means no domain restriction. Exact match —",
+        "allowed_domains_hint_middle": "does not admit",
+        "allowed_domains_hint_after": ". Only limits who gets an account created; accounts already linked to this provider keep signing in.",
+        "update": "Update Provider",
+        "create": "Create Provider"
+      },
+      "login": {
+        "title": "Login Attempts",
+        "matching": "{count} matching events",
+        "refresh": "Refresh",
+        "filter_username": "Filter login attempts by username",
+        "username": "Username",
+        "filter_provider": "Filter login attempts by provider",
+        "provider_placeholder": "Provider (password, ldap...)",
+        "filter_status": "Filter login attempts by status",
+        "status_all": "All results",
+        "status_failure": "Failed only",
+        "status_success": "Successful only",
+        "start_time": "Login attempts start time",
+        "end_time": "Login attempts end time",
+        "apply": "Apply",
+        "empty": "No matching login attempts.",
+        "success": "Success",
+        "failed": "Failed",
+        "unknown_ip": "Unknown IP",
+        "page_info": "Page {page} of {total}"
+      }
     }
   },
   "profile": {
@@ -1241,7 +1649,11 @@
     "editCard": "Edit card",
     "cardNote": "Note",
     "linkedIssue": "Linked issue",
-    "noIssue": "No linked issue"
+    "noIssue": "No linked issue",
+    "page_title": "Board",
+    "move_card_up": "Move card up",
+    "move_card_down": "Move card down",
+    "identity_mismatch": "Board response identity mismatch"
   },
   "packages": {
     "upload": "Upload Package",
@@ -1260,7 +1672,23 @@
     "yanked": "Yanked",
     "yanked_hint": "This version is withdrawn: installers no longer select it, but it is still listed and can be restored.",
     "yank_hint": "Withdraw this version without deleting it. Reversible, and recorded in the audit log.",
-    "delete_confirm": "Delete {name} {version}? This cannot be undone — yank instead to withdraw it reversibly."
+    "delete_confirm": "Delete {name} {version}? This cannot be undone — yank instead to withdraw it reversibly.",
+    "page_info": "Page {page} of {total}",
+    "upload_form": {
+      "file_required": "Package file is required",
+      "back": "Back",
+      "name": "Name",
+      "name_placeholder": "Package name",
+      "homepage": "Homepage",
+      "repository_url": "Repository URL",
+      "semver": "Semver",
+      "uploading": "Uploading..."
+    },
+    "support": {
+      "generic_fallback": "Generic fallback",
+      "native_adapter": "Native adapter",
+      "option_generic_fallback": "{label} (Generic fallback)"
+    }
   },
   "runners": {
     "register": "Register Runner",
@@ -1276,6 +1704,363 @@
     "delete": "Delete"
   },
   "time_tracking": {
-    "title": "Time Tracking"
+    "title": "Time Tracking",
+    "minutes_short": "{minutes}m",
+    "hours_short": "{hours}h",
+    "hours_minutes_short": "{hours}h {minutes}m",
+    "issues": "Issues",
+    "loading": "Loading…",
+    "no_open_issues": "No open issues.",
+    "select_hint": "← Select an issue to view and log time",
+    "total": "Total: {total}",
+    "no_entries_for_issue": "No time entries for this issue yet.",
+    "duration_column": "Duration",
+    "logged_column": "Logged"
+  },
+  "agents": {
+    "title": "Agents",
+    "description": "Give each AI agent a bot account of its own. Its issues, pull requests and commits carry its name and yours as its owner; it has no password, and it stops working when you delete it or your account is disabled.",
+    "howto": {
+      "create": "Create an agent below.",
+      "collaborator": "Add it as a collaborator on each repository it should work on — that is its access.",
+      "mint_before": "Mint a token for it, optionally confined to repositories, MCP tools, and kept off protected branches, then point an MCP client at",
+      "mint_with": "with",
+      "mint_end": "."
+    },
+    "load_failed": "Failed to load agents",
+    "tokens_load_failed": "Failed to load tokens",
+    "username_required": "An agent needs a username",
+    "created": "Agent @{username} created. Add it as a collaborator on the repositories it should work on.",
+    "create_failed": "Failed to create agent",
+    "delete_confirm": "Delete agent @{username}? Its tokens stop working and its repositories are deleted.",
+    "deleted": "Agent @{username} deleted",
+    "delete_failed": "Failed to delete agent",
+    "token_name_required": "Token name is required",
+    "token_created": "Token created. Copy it now; it will not be shown again.",
+    "token_create_failed": "Failed to create token",
+    "token_revoke_confirm": "Revoke token \"{name}\" of @{username}?",
+    "token_revoked": "Token revoked",
+    "token_revoke_failed": "Failed to revoke token",
+    "token_copied": "Token copied",
+    "create_title": "Create agent",
+    "username": "Username",
+    "display_name": "Display name",
+    "display_name_placeholder": "Review assistant",
+    "creating": "Creating...",
+    "list_title": "Your agents",
+    "empty": "No agents yet.",
+    "disabled": "disabled",
+    "tokens": "Tokens",
+    "deleting": "Deleting...",
+    "new_token_label": "New agent token",
+    "new_token": "New token",
+    "new_token_hint": "Copy this value before leaving the page.",
+    "token_name": "Token name",
+    "expires": "Expires",
+    "repositories_hint": "Repositories (owner/name, one per line or comma-separated; empty = every repository the agent can reach)",
+    "mcp_tools_hint": "MCP tools (comma-separated; empty = an ordinary token, set = usable only through the MCP endpoint)",
+    "deny_protected_merge": "Keep off protected branches (no merge, push or commit to them)",
+    "create_token": "Create token",
+    "no_tokens": "No tokens for @{username} yet.",
+    "table": {
+      "name": "Name",
+      "confined_to": "Confined to",
+      "last_used": "Last used"
+    },
+    "narrowing": {
+      "repositories": "Repositories: {list}",
+      "mcp_tools": "MCP tools: {list}",
+      "none": "none",
+      "any": "any",
+      "any_rest": "any (REST allowed)",
+      "kept_off": "Kept off protected branches",
+      "may_write": "May write to protected branches"
+    },
+    "revoking": "Revoking...",
+    "revoke": "Revoke"
+  },
+  "imports": {
+    "title": "Imports",
+    "subtitle": "Migrate repositories and project data from GitHub, GitLab, Gitea, or Git remotes.",
+    "refresh": "Refresh",
+    "load_failed": "Failed to load imports",
+    "queued": "Import queued",
+    "start_failed": "Failed to start import",
+    "delete_confirm": "Cancel and delete this import task?",
+    "deleted": "Import deleted",
+    "delete_failed": "Failed to delete import",
+    "new_title": "New import",
+    "platform": "Platform",
+    "source_url": "Source repository URL",
+    "target_owner": "Target owner",
+    "target_name": "Target repository",
+    "target_name_placeholder": "Derived from source URL",
+    "auth_token": "Source access token",
+    "auth_token_placeholder": "Optional for private repositories",
+    "content": {
+      "title": "Content",
+      "repository": "Repository",
+      "issues": "Issues",
+      "pull_requests": "Pull requests",
+      "wiki": "Wiki",
+      "releases": "Releases",
+      "labels": "Labels",
+      "milestones": "Milestones"
+    },
+    "starting": "Starting...",
+    "start": "Start import",
+    "tasks_title": "Import tasks",
+    "loading": "Loading imports...",
+    "empty": "No import tasks yet.",
+    "table": {
+      "source": "Source",
+      "target": "Target",
+      "status": "Status",
+      "progress": "Progress",
+      "updated": "Updated"
+    },
+    "deleting": "Deleting..."
+  },
+  "help": {
+    "title": "Help",
+    "subtitle": "Common commands and entry points for using this Plombir Git instance.",
+    "clone_title": "Clone a repository",
+    "tokens_title": "Use access tokens",
+    "tokens_body": "Create a personal access token from security settings, then use it as a Bearer token for API requests or as the password for HTTPS Git operations.",
+    "tokens_link": "Manage access tokens",
+    "agent_title": "Connect an AI agent",
+    "agent_body": "Give an agent a bot account of its own: it acts under its own name, on your behalf, with a token you can confine to repositories, MCP tools and unprotected branches.",
+    "agent_endpoint_before": "Point an MCP client at",
+    "agent_endpoint_after": "on this server with the bot's token as a Bearer token.",
+    "agent_link": "Manage agents",
+    "find_title": "Find work",
+    "find_explore": "Explore repositories",
+    "find_search": "Search code and issues",
+    "find_imports": "Import repositories"
+  },
+  "account_security": {
+    "title": "Security",
+    "description": "Manage account protections for web login and Git/API access.",
+    "status_unknown": "Unknown",
+    "status_enabled": "Enabled",
+    "status_disabled": "Disabled",
+    "status_none": "None",
+    "password_required": "Current password is required",
+    "mfa": {
+      "title": "Multi-Factor Authentication",
+      "description": "Add a time-based authenticator code after password login.",
+      "state_unknown": "The second factor of this account could not be read, so this page cannot say whether MFA is on. Starting a new setup from here would replace an authenticator that may still be live, so the read is offered again instead.",
+      "retry": "Retry reading MFA state",
+      "unused_codes": "unused backup codes",
+      "total_codes": "total backup codes",
+      "current_password": "Current password",
+      "working": "Working...",
+      "regenerate": "Regenerate backup codes",
+      "regenerate_hint": "Issues a fresh set of {count} codes and revokes every unused one you have now.",
+      "disabling": "Disabling...",
+      "disable": "Disable MFA",
+      "not_enabled": "MFA is not enabled for this account.",
+      "starting": "Starting...",
+      "set_up": "Set up MFA",
+      "setup_failed": "Failed to start MFA setup",
+      "code_required": "Authentication code is required",
+      "enabled_notice": "MFA enabled. Save your backup codes before leaving this page.",
+      "enable_failed": "Failed to enable MFA",
+      "disable_confirm": "Disable multi-factor authentication for your account?",
+      "disabled_notice": "MFA disabled",
+      "disable_failed": "Failed to disable MFA",
+      "regenerate_confirm": "Replace your backup codes? Every unused code you have now stops working.",
+      "regenerated_notice": "New backup codes issued. Save them before leaving this page — the old ones no longer work.",
+      "regenerate_failed": "Failed to regenerate backup codes"
+    },
+    "setup": {
+      "title": "Scan Authenticator QR",
+      "qr_label": "Authenticator QR code",
+      "hint": "Scan the QR code with an authenticator app, then enter the six-digit code.",
+      "code": "Authentication code",
+      "verifying": "Verifying...",
+      "enable": "Enable MFA"
+    },
+    "backup": {
+      "label": "New backup codes",
+      "title": "Backup Codes",
+      "description": "Each code can be used once if you lose authenticator access.",
+      "copy": "Copy Codes",
+      "copied": "Backup codes copied"
+    },
+    "passkeys": {
+      "title": "Passkeys",
+      "description": "Sign in without a password using Touch ID, Windows Hello, or a security key.",
+      "active": "{count} active",
+      "unsupported": "This browser does not support passkeys.",
+      "state_unknown": "The passkeys registered on this account could not be read, so this section cannot say there are none.",
+      "retry": "Retry reading passkeys",
+      "added": "Added {date}",
+      "last_used": "Last used {date}",
+      "remove": "Remove",
+      "empty": "No passkeys registered yet.",
+      "name": "Passkey name",
+      "name_placeholder": "e.g. YubiKey, MacBook",
+      "waiting": "Waiting for authenticator...",
+      "add": "Add passkey",
+      "registered": "Passkey registered.",
+      "register_failed": "Failed to register passkey",
+      "remove_confirm": "Remove this passkey? You will no longer be able to sign in with it.",
+      "removed": "Passkey removed.",
+      "remove_failed": "Failed to remove passkey"
+    },
+    "sso": {
+      "title": "Linked accounts",
+      "description": "External identities that can sign in to this account.",
+      "linked_count": "{count} linked",
+      "state_unknown": "The external identities linked to this account could not be read, so this section cannot say there are none.",
+      "retry": "Retry reading linked accounts",
+      "linked_at": "Linked {date}",
+      "provider_off": "Provider is switched off",
+      "unlink": "Unlink",
+      "empty": "No external accounts are linked.",
+      "link": "Link {provider}",
+      "providers_unknown": "The providers this account could link could not be read.",
+      "linked_notice": "Provider linked. You can now sign in through it.",
+      "link_failed": "Failed to start linking {provider}",
+      "unlink_confirm": "Unlink {provider}? You will not be able to sign in through it until you link it again from this page.",
+      "unlinked": "{provider} unlinked.",
+      "unlink_failed": "Failed to unlink the provider"
+    }
+  },
+  "access_tokens": {
+    "title": "Access Tokens",
+    "description": "Manage personal tokens for Git over HTTP, API clients, and automation.",
+    "new_token_label": "New access token",
+    "new_token": "New token",
+    "copy_hint": "Copy this value before leaving the page.",
+    "create_title": "Create Token",
+    "name": "Name",
+    "name_placeholder": "CI deploy token",
+    "scopes": "Scopes",
+    "expires": "Expires",
+    "creating": "Creating...",
+    "existing_title": "Existing Tokens",
+    "empty": "No personal access tokens yet.",
+    "created": "Created",
+    "last_used": "Last used",
+    "revoking": "Revoking...",
+    "revoke": "Revoke",
+    "narrowing_repos": "repos: {list}",
+    "narrowing_none": "none",
+    "narrowing_mcp": "MCP only: {list}",
+    "narrowing_protected": "no protected branches",
+    "load_failed": "Failed to load access tokens",
+    "name_required": "Token name is required",
+    "created_notice": "Token created. Copy it now; it will not be shown again.",
+    "create_failed": "Failed to create token",
+    "revoke_confirm": "Revoke token \"{name}\"?",
+    "revoked": "Token revoked",
+    "revoke_failed": "Failed to revoke token",
+    "copied": "Token copied"
+  },
+  "commit_detail": {
+    "page_title": "Commit {sha}",
+    "load_failed": "Failed to load commit status",
+    "loading": "Loading commit status...",
+    "error": "Error: {error}",
+    "just_now": "just now",
+    "minutes_ago": "{count} minutes ago",
+    "hours_ago": "{count} hours ago",
+    "days_ago": "{count} days ago",
+    "checks_passed": "All checks passed",
+    "checks_failed": "Some checks failed",
+    "checks_errored": "Some checks errored",
+    "checks_pending": "Checks pending",
+    "status_unknown": "Unknown status",
+    "gpg_unreachable_title": "GPG: the signature check could not be reached",
+    "signature_unavailable": "Signature status unavailable",
+    "gpg_title": "GPG: {status}",
+    "gpg_title_signer": "GPG: {status} · {signer}",
+    "signed": "Signed",
+    "signed_by": "by {signer}",
+    "unsigned": "Unsigned",
+    "signature_unchecked": "Signature could not be checked",
+    "bad_signature": "Bad signature",
+    "details_unavailable": "Commit details unavailable",
+    "details_unavailable_hint": "Could not load commit details. Status checks below may still be available.",
+    "not_found": "Commit not found",
+    "not_found_hint": "The commit log did not contain the requested commit.",
+    "checks_count": "{count} checks",
+    "status_checks": "Status Checks",
+    "view_details": "View Details →"
+  },
+  "issue_board": {
+    "page_title": "Board",
+    "delete_column_confirm": "Delete this column and all its cards?",
+    "identity_mismatch": "Board response identity mismatch",
+    "loading": "Loading…",
+    "empty_hint": "Create your first project board to organize issues.",
+    "add_board": "+ Board",
+    "add_column": "+ Column",
+    "delete_column": "Delete column",
+    "remove_card": "Remove card",
+    "note_placeholder": "Add a note…",
+    "add_card": "+ Add card"
+  },
+  "comments": {
+    "edited": "edited",
+    "edit_label": "Edit comment",
+    "edit_failed": "Saving the comment failed",
+    "delete_failed": "Deleting the comment failed",
+    "delete_title": "Delete comment?",
+    "delete_confirm": "The comment and its attachments are removed for everyone. This cannot be undone."
+  },
+  "notification_settings": {
+    "title": "Notification settings",
+    "description": "Choose which notifications are also sent to your email address.",
+    "email_title": "Email",
+    "load_failed": "Failed to load notification settings",
+    "save_failed": "Saving the setting failed",
+    "saved": "Saved.",
+    "in_app_note": "Notifications always appear in the app; these switches only decide what is mailed.",
+    "category": {
+      "review_requested": {
+        "name": "Review requests",
+        "hint": "Someone asked for your review, directly or through CODEOWNERS."
+      },
+      "mention": {
+        "name": "Mentions",
+        "hint": "Someone @mentioned you."
+      },
+      "assigned": {
+        "name": "Assignments",
+        "hint": "An issue was assigned to you."
+      },
+      "ci_failed": {
+        "name": "Failed CI",
+        "hint": "CI failed on a pull request of yours."
+      },
+      "participating": {
+        "name": "Participating",
+        "hint": "Activity in an issue or pull request you take part in or follow."
+      },
+      "ci_triggered": {
+        "name": "CI started",
+        "hint": "A push started CI in a repository you own."
+      }
+    }
+  },
+  "subscription": {
+    "title": "Notifications",
+    "subscribe": "Subscribe",
+    "unsubscribe": "Unsubscribe",
+    "not_subscribed": "You're not receiving notifications for this thread.",
+    "load_failed": "Could not read your subscription",
+    "update_failed": "Changing the subscription failed",
+    "reason_other": "You're receiving notifications ({reason}).",
+    "reason": {
+      "author": "You're receiving notifications because you opened this.",
+      "commented": "You're receiving notifications because you commented.",
+      "mention": "You're receiving notifications because you were mentioned.",
+      "assigned": "You're receiving notifications because you were assigned.",
+      "review_requested": "You're receiving notifications because your review was requested.",
+      "manual": "You're receiving notifications because you subscribed."
+    }
   }
 }

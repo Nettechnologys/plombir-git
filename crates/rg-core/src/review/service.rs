@@ -142,6 +142,11 @@ pub async fn submit_review(
         ));
     }
 
+    let verb = match action {
+        ReviewAction::Approve => "approved these changes",
+        ReviewAction::RequestChanges => "requested changes",
+        ReviewAction::Comment | ReviewAction::Dismiss => "reviewed",
+    };
     let transaction = db.begin().await.context("db: begin review submission")?;
     let review = create_review_with_event(
         &transaction,
@@ -157,7 +162,63 @@ pub async fn submit_review(
         .commit()
         .await
         .context("db: commit review submission")?;
+
+    let mut event = crate::notification::thread::ThreadEvent::new(
+        crate::pull_request::service::pr_subject(&pr),
+        Some(reviewer_id),
+        verb,
+    )
+    .to_subscribers()
+    .actor_subscribes("commented");
+    if let Some(body) = review.body.as_deref() {
+        event = event.mentions_in(body);
+    }
+    crate::notification::thread::spawn(db, event);
     Ok(review)
+}
+
+/// Tell `reviewer_id` that their review of pull request `pr_id` was requested
+/// — by `requested_by_id` directly or through CODEOWNERS. Detached; the
+/// request itself is already committed.
+pub fn notify_review_requested(
+    db: &DatabaseConnection,
+    pr_id: i64,
+    reviewer_id: i64,
+    requested_by_id: i64,
+) {
+    let db = db.clone();
+    crate::task_tracker::delivery_tracker().spawn(async move {
+        let pr = match pull_request_ops::find_by_id(&db, pr_id).await {
+            Ok(Some(pr)) => pr,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    pr_id,
+                    reviewer_id,
+                    error = %format!("{error:#}"),
+                    "review request notification skipped: pull request lookup failed"
+                );
+                return;
+            }
+        };
+        let event = crate::notification::thread::ThreadEvent::new(
+            crate::pull_request::service::pr_subject(&pr),
+            Some(requested_by_id),
+            "requested a review",
+        )
+        .to(
+            reviewer_id,
+            crate::notification::thread::Reason::ReviewRequested,
+        );
+        if let Err(error) = crate::notification::thread::deliver(&db, &event).await {
+            tracing::warn!(
+                pr_id,
+                reviewer_id,
+                error = %format!("{error:#}"),
+                "review request notification was not delivered"
+            );
+        }
+    });
 }
 
 /// List all reviews for a PR.
@@ -377,6 +438,17 @@ pub async fn create_review_comment(
         .commit()
         .await
         .context("db: commit review comment creation")?;
+    crate::notification::thread::spawn(
+        db,
+        crate::notification::thread::ThreadEvent::new(
+            crate::pull_request::service::pr_subject(&pr),
+            Some(author_id),
+            "commented on the changes",
+        )
+        .mentions_in(comment.body.clone())
+        .to_subscribers()
+        .actor_subscribes("commented"),
+    );
     Ok(comment)
 }
 

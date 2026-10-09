@@ -1,4 +1,5 @@
 import { request, qs, type PaginatedResponse } from './_base.svelte';
+import { formatHeadRef } from '../pullHeadRef';
 
 export type DiffLine = {
   kind: 'meta' | 'context' | 'addition' | 'deletion';
@@ -23,6 +24,32 @@ export type PrDiff = {
   stats: { total_additions: number; total_deletions: number; files_changed: number };
 };
 
+/** One commit of a compare, in the shape `GET /log` already answers with. */
+export type CompareCommit = {
+  sha: string;
+  message: string;
+  author: string;
+  date: string;
+};
+
+/**
+ * `GET /repos/{owner}/{name}/compare?base=&head=` — not served by the backend
+ * yet (card_87f9b1c97489). `PrDiff` plus the commits reachable from head and not
+ * from base, oldest first, so the compare page renders the same diff the pull
+ * request will.
+ */
+export type CompareResult = PrDiff & {
+  commits: CompareCommit[];
+  total_commits?: number;
+  merge_base_sha?: string | null;
+};
+
+/** `POST /pulls/{n}/merge` 200: the merge result plus the head-branch report when deletion was asked for. */
+export type MergeOutcome = Record<string, unknown> & {
+  head_branch_deleted?: boolean;
+  head_branch_kept?: string;
+};
+
 export type MergeQueueEntry = {
   id: number;
   position: number;
@@ -43,17 +70,38 @@ export const pulls = {
   },
   get: (owner: string, repo: string, number: number) =>
     request<any>(`/repos/${owner}/${repo}/pulls/${number}`),
-  create: (owner: string, repo: string, data: { title: string; body?: string; head_branch: string; base_branch: string; draft?: boolean }) =>
+  /**
+   * Open a pull request. `head_owner` names the fork holding `head_branch`
+   * (card_87f9b1c97489); it is sent as `head: "<owner>:<branch>"`, the form
+   * `CreatePrRequest` resolves to a fork of this repository. Omitted, or equal
+   * to `owner`, the head is a branch of this repository and goes out bare.
+   */
+  create: (
+    owner: string,
+    repo: string,
+    data: { title: string; body?: string; head_branch: string; head_owner?: string | null; base_branch: string; draft?: boolean },
+  ) =>
     request<any>(`/repos/${owner}/${repo}/pulls`, {
       method: 'POST',
       body: JSON.stringify({
         title: data.title,
         body: data.body,
-        head: data.head_branch,
+        head: formatHeadRef({ owner: data.head_owner ?? null, branch: data.head_branch }, owner),
         base: data.base_branch,
         draft: data.draft ?? false,
       }),
     }),
+  /**
+   * What a pull request from `head` into `base` would contain, before it exists.
+   *
+   * `head` is a bare branch of this repository or `"<owner>:<branch>"` of one of
+   * its forks — the same form `create` sends. The answer is the PR diff shape
+   * (`PrDiff`) plus the commits `head` has that `base` does not.
+   */
+  compare: (owner: string, repo: string, base: string, head: string) =>
+    request<CompareResult>(
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare${qs({ base, head })}`,
+    ),
   update: (owner: string, repo: string, number: number, data: { title?: string; body?: string; state?: string; draft?: boolean }) =>
     request<any>(`/repos/${owner}/${repo}/pulls/${number}`, {
       method: 'PATCH',
@@ -61,10 +109,16 @@ export const pulls = {
     }),
   diff: (owner: string, repo: string, number: number) =>
     request<PrDiff>(`/repos/${owner}/${repo}/pulls/${number}/diff`),
-  merge: (owner: string, repo: string, number: number, strategy: string) =>
-    request<any>(`/repos/${owner}/${repo}/pulls/${number}/merge`, {
+  /**
+   * Merge. With `deleteHeadBranch` the server deletes the head branch once the
+   * merge has landed and reports it beside the merge: `head_branch_deleted`,
+   * and when the branch had to stay, the reason in `head_branch_kept`
+   * (card_2060696224ff). A kept branch is not a failed merge.
+   */
+  merge: (owner: string, repo: string, number: number, strategy: string, opts: { deleteHeadBranch?: boolean } = {}) =>
+    request<MergeOutcome>(`/repos/${owner}/${repo}/pulls/${number}/merge`, {
       method: 'POST',
-      body: JSON.stringify({ strategy }),
+      body: JSON.stringify({ strategy, delete_head_branch: opts.deleteHeadBranch ?? false }),
     }),
   enableAutoMerge: (owner: string, repo: string, number: number, strategy: string) =>
     request<{ status: 'disabled' | 'pending' | 'merged'; reason?: string; merge?: any }>(
@@ -155,6 +209,18 @@ export const reviews = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  /**
+   * Edit a review comment (card_60961272e1ba): its author or a repository
+   * administrator, 403 for anyone else. The answer is the comment row.
+   */
+  editComment: (owner: string, repo: string, number: number, commentId: number, body: string) =>
+    request<any>(`/repos/${owner}/${repo}/pulls/${number}/comments/${commentId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ body }),
+    }),
+  /** Same rule as `editComment`; 204, or 409 when others replied to it. */
+  deleteComment: (owner: string, repo: string, number: number, commentId: number) =>
+    request<void>(`/repos/${owner}/${repo}/pulls/${number}/comments/${commentId}`, { method: 'DELETE' }),
   setThreadResolved: (owner: string, repo: string, number: number, commentId: number, resolved: boolean) =>
     request<any>(`/repos/${owner}/${repo}/pulls/${number}/comments/${commentId}/resolution`, {
       method: 'PATCH',

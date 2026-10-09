@@ -244,6 +244,51 @@ jobs:
           PLOMBIR_GIT_BIN: ${{ github.workspace }}/target/debug/plombir-git
         run: scripts/git-protocol-e2e.sh
 
+  # The only check that an outsider is turned away at the *button*, not just at
+  # the route: two real accounts drive every write control of the UI in a
+  # headless Chrome against a throwaway server. It used to run nowhere, and
+  # rotted where nobody saw it — a fixture wrote to a branch its own setup had
+  # just protected (card_8f4c23e5e5b5).
+  ui-access-sweep:
+    name: Browser UI access sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev git curl
+
+      - name: Install Rust
+        run: rustup toolchain install --no-self-update
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build Plombir Git
+        run: cargo build -p rg-cli
+
+      # ubuntu-latest carries Google Chrome at the path the runner defaults to.
+      - name: Run the browser sweep
+        env:
+          PLOMBIR_GIT_BIN: ${{ github.workspace }}/target/debug/plombir-git
+          CHROME: /usr/bin/google-chrome
+        run: scripts/ui-access-sweep-e2e.sh
+
   postgres-smoke:
     name: PostgreSQL migration, CRUD and FTS smoke
     runs-on: ubuntu-latest

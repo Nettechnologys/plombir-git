@@ -1230,6 +1230,21 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
         // reach, only a failed SMTP round trip per push (card_60a80311d512).
         .filter(|owner_user| !owner_user.is_bot())
         {
+            // Every CI-triggering push used to mail the owner, unasked and with
+            // no way to stop it. It is a notification setting now, off unless
+            // chosen (card_349c2b6a0d7c).
+            match rg_db::ops::notification_setting_ops::get(params.db, owner_user.id).await {
+                Ok(settings) if settings.email_ci_triggered => {}
+                Ok(_) => return,
+                Err(error) => {
+                    tracing::warn!(
+                        user_id = owner_user.id,
+                        error = %format!("{error:#}"),
+                        "CI notification mail skipped: notification settings could not be read"
+                    );
+                    return;
+                }
+            }
             let subject = format!(
                 "[Plombir Git] CI pipeline #{} triggered for {}/{}",
                 pipeline_id, target.owner, target.name

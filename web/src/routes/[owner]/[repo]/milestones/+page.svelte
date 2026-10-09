@@ -9,6 +9,7 @@
     type Milestone,
     type MilestoneFormState,
   } from '$lib/api/client.svelte';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
   import {
     LatestRepositoryRequestFence,
     LatestRepositoryResourceRequestFence,
@@ -27,6 +28,10 @@
   let filter = $state<'all' | Milestone['state']>('open');
   let editingId = $state<number | null>(null);
   let form = $state<MilestoneFormState>(emptyForm());
+  // Creating, editing, closing and deleting milestones is behind `RepoWrite`
+  // (card_3625a7b89abb); a reader sees the list without the controls.
+  const permission = viewerPermission(() => owner, () => repo);
+  let canWrite = $derived(permission.canWrite);
   const milestoneListRequests = new LatestRepositoryRequestFence();
   const milestoneDetailRequests = new LatestRepositoryResourceRequestFence<number>();
   let routeGeneration = 0;
@@ -224,6 +229,7 @@
     <div class="error-banner">{error}</div>
   {/if}
 
+  {#if canWrite}
   <section class="editor">
     <h2>{editingId === null ? t('milestones.create') : t('milestones.edit')}</h2>
     <form onsubmit={saveMilestone}>
@@ -260,6 +266,7 @@
       </div>
     </form>
   </section>
+  {/if}
 
   {#if loading}
     <p class="loading">{t('common.loading')}</p>
@@ -285,13 +292,15 @@
                 : t('milestones.no_due_date')}
             </div>
           </div>
-          <div class="milestone-actions">
-            <button class="btn-outline" onclick={() => startEdit(milestone)} disabled={mutationBusy || editingLoading}>{t('common.edit')}</button>
-            <button class="btn-outline" onclick={() => toggleState(milestone)} disabled={mutationBusy || editingLoading}>
-              {milestone.state === 'open' ? t('milestones.close') : t('milestones.reopen')}
-            </button>
-            <button class="btn-danger" onclick={() => deleteMilestone(milestone)} disabled={mutationBusy || editingLoading}>{t('common.delete')}</button>
-          </div>
+          {#if canWrite}
+            <div class="milestone-actions">
+              <button class="btn-outline" onclick={() => startEdit(milestone)} disabled={mutationBusy || editingLoading}>{t('common.edit')}</button>
+              <button class="btn-outline" onclick={() => toggleState(milestone)} disabled={mutationBusy || editingLoading}>
+                {milestone.state === 'open' ? t('milestones.close') : t('milestones.reopen')}
+              </button>
+              <button class="btn-danger" onclick={() => deleteMilestone(milestone)} disabled={mutationBusy || editingLoading}>{t('common.delete')}</button>
+            </div>
+          {/if}
         </article>
       {/each}
     </div>

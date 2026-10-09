@@ -40,6 +40,9 @@ pub struct LogQuery {
     pub path: Option<String>,
     #[serde(default)]
     pub limit: Option<i64>,
+    /// Commits of the same walk to page past before the first one returned.
+    #[serde(default)]
+    pub skip: Option<u64>,
 }
 
 /// One entry of `GET /repos/{owner}/{name}/branches`.
@@ -57,6 +60,26 @@ pub struct BranchRef {
 
 const DEFAULT_COMMIT_LOG_LIMIT: i64 = 50;
 const MAX_COMMIT_LOG_LIMIT: i64 = 100;
+
+/// How far `GET /log?skip=` may page into one history.
+const MAX_COMMIT_LOG_SKIP: usize = 100_000;
+
+/// Whether `git_ref` is the branch `HEAD` names while that branch is unborn —
+/// the spelling of an empty repository's default branch.
+fn names_unborn_head(repo_path: &std::path::Path, git_ref: &str) -> bool {
+    let Ok(repo) = rg_git::repository::open(repo_path) else {
+        return false;
+    };
+    let Ok(Some(head)) = repo.head_name() else {
+        return false;
+    };
+    let head = head.as_bstr().to_string();
+    let branch = head.strip_prefix("refs/heads/").unwrap_or(&head);
+    (git_ref == branch || git_ref == head)
+        && repo
+            .try_find_reference(head.as_str())
+            .is_ok_and(|found| found.is_none())
+}
 
 fn commit_log_limit(limit: Option<i64>) -> Result<usize, AppError> {
     let limit = limit.unwrap_or(DEFAULT_COMMIT_LOG_LIMIT);
@@ -780,6 +803,7 @@ fn raw_file_headers(
         ("ref" = Option<String>, Query, description = "Git ref (branch/tag/sha, default: HEAD)"),
         ("path" = Option<String>, Query, description = "File path filter"),
         ("limit" = Option<i64>, Query, description = "Max number of commits (1-100, default 50)"),
+        ("skip" = Option<u64>, Query, description = "Commits of the same walk to page past (default 0)"),
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
@@ -819,14 +843,21 @@ pub async fn get_log(
     let git_ref = params.r#ref.clone().unwrap_or_else(|| "HEAD".to_string());
     let file_path = params.path.unwrap_or_default();
 
-    match get_commit_log(&repo_path, &git_ref, &file_path, limit) {
+    // Bounded like the page itself: a reader pages a screen at a time, and an
+    // unbounded skip would let one request walk a whole history for nothing.
+    let skip = params.skip.unwrap_or(0).min(MAX_COMMIT_LOG_SKIP as u64) as usize;
+
+    match get_commit_log(&repo_path, &git_ref, &file_path, skip, limit) {
         Ok(log) => (StatusCode::OK, Json(serde_json::json!({ "commits": log }))).into_response(),
         Err(e) => {
             // An unborn HEAD is the one rev-parse failure that means a healthy
             // empty history. Keep that response distinct from a missing ref
             // (typed 404), a HEAD that lost its branch (typed 409 naming both
             // sides) and a repository failure (sanitized 5xx).
-            if git_ref == "HEAD" {
+            // The branch an unborn `HEAD` names is the empty history too: a
+            // page that asks for the default branch by name must not see an
+            // error where `HEAD` sees "no commits yet" (card_2e320f5287d7).
+            if git_ref == "HEAD" || names_unborn_head(&repo_path, &git_ref) {
                 match classify_repo_emptiness(&repo_path) {
                     RepoEmptiness::Empty => {
                         return (
@@ -1429,12 +1460,24 @@ fn resolve_content_ref<'repo>(
     Err(anyhow::Error::new(rg_core::error::NotFound::new("ref")))
 }
 
+/// The history of `git_ref`, newest first: `limit` commits after the first
+/// `skip`, counting only the commits that change `path` when one is given.
+///
+/// "Changes `path`" is git's own default reading of `git log -- <path>`: a
+/// commit whose entry at `path` equals the entry in some parent (TREESAME to
+/// it) brought nothing to that path and is left out; a root commit counts when
+/// the path exists in it. `path` used to be accepted and ignored, so the latest
+/// commits of a subdirectory were the latest commits of the whole repository
+/// (card_2e320f5287d7). `skip` lets a reader page past the first screen of
+/// history the same walk produced.
 fn get_commit_log(
     repo_path: &std::path::Path,
     git_ref: &str,
-    _path: &str,
+    path: &str,
+    skip: usize,
     limit: usize,
 ) -> anyhow::Result<Vec<CommitEntry>> {
+    let path = path.trim_matches('/');
     let repo = rg_git::repository::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
@@ -1467,8 +1510,9 @@ fn get_commit_log(
             repo_path.display()
         )
     })?;
-    for (count, info) in walk_iter.enumerate() {
-        if count >= limit {
+    let mut matched = 0_usize;
+    for info in walk_iter {
+        if entries.len() >= limit {
             break;
         }
 
@@ -1498,6 +1542,21 @@ fn get_commit_log(
                 repo_path.display()
             )
         })?;
+
+        if !path.is_empty()
+            && !commit_changes_path(&repo, &commit, path).with_context(|| {
+                format!(
+                    "comparing '{path}' of commit '{commit_id}' with its parents in {}",
+                    repo_path.display()
+                )
+            })?
+        {
+            continue;
+        }
+        matched += 1;
+        if matched <= skip {
+            continue;
+        }
 
         let message = commit
             .message_raw()
@@ -1561,6 +1620,33 @@ fn get_commit_log(
     }
 
     Ok(entries)
+}
+
+/// Whether `commit` changes `path` — see [`get_commit_log`]: not TREESAME to
+/// any parent at that path, or a root commit that has it.
+fn commit_changes_path(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    path: &str,
+) -> anyhow::Result<bool> {
+    let entry_at = |commit: &gix::Commit<'_>| -> anyhow::Result<Option<gix::ObjectId>> {
+        Ok(commit
+            .tree()?
+            .lookup_entry_by_path(path)?
+            .map(|entry| entry.object_id()))
+    };
+    let own = entry_at(commit)?;
+    let mut parents = commit.parent_ids().peekable();
+    if parents.peek().is_none() {
+        return Ok(own.is_some());
+    }
+    for parent in parents {
+        let parent = repo.find_object(parent)?.try_into_commit()?;
+        if entry_at(&parent)? == own {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Enumerate the repository's branches, marking the one `HEAD` points at.
@@ -2021,6 +2107,211 @@ pub async fn delete_file(
     }
 }
 
+/// Request to create a branch.
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct CreateBranchRequest {
+    /// The new branch's name, without `refs/heads/`.
+    pub name: String,
+    /// What it starts from: a branch, a tag or a commit id. Default: the
+    /// repository's default branch.
+    #[serde(default)]
+    pub from: Option<String>,
+}
+
+/// A branch or tag a request created or deleted.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct RefChangeResponse {
+    /// The full ref name (`refs/heads/…` / `refs/tags/…`).
+    pub r#ref: String,
+    /// The commit the ref now names, or the value it held before a deletion.
+    pub sha: String,
+}
+
+/// Create a branch.
+/// POST /api/v1/repos/:owner/:name/branches
+///
+/// Held to the rules a `git push` of the same branch meets — branch
+/// protection, the token's narrowing, the server's own namespaces — and fires
+/// the same post-push automation (card_2060696224ff).
+#[utoipa::path(
+    post,
+    path = "/repos/{owner}/{name}/branches",
+    tag = "Repository Content",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+    ),
+    request_body = CreateBranchRequest,
+    responses(
+        (status = 201, description = "Created", body = RefChangeResponse),
+        (status = 400, description = "Invalid name, or `from` names no commit", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "A token kept off protected branches", body = serde_json::Value),
+        (status = 409, description = "The branch exists, or a push rule refuses it", body = serde_json::Value),
+    ),
+)]
+pub async fn create_branch(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+    RepoWrite {
+        repo: repo_model,
+        actor_id,
+    }: RepoWrite,
+    Json(req): Json<CreateBranchRequest>,
+) -> impl IntoResponse {
+    let repo_path = match ref_change_repo_path(&state, &owner, &repo) {
+        Ok(path) => path,
+        Err(e) => return e.into_response(),
+    };
+    let from = req
+        .from
+        .unwrap_or_else(|| repo_model.default_branch.clone());
+    match rg_core::repo::refs::create_branch(
+        &state.db,
+        &repo_path,
+        repo_model.id,
+        Some(actor_id),
+        &req.name,
+        &from,
+    )
+    .await
+    {
+        Ok(update) => {
+            let response = RefChangeResponse {
+                r#ref: update.refname.clone(),
+                sha: update.new_sha.clone(),
+            };
+            state.spawn_post_push_hooks(repo_path, owner, repo, Some(actor_id), vec![update]);
+            (StatusCode::CREATED, Json(response)).into_response()
+        }
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+/// Delete a branch.
+/// DELETE /api/v1/repos/:owner/:name/branches/:branch
+///
+/// The same rules as `git push origin :<branch>`: the default branch and a
+/// protected branch are refused, for every caller (card_2060696224ff). A
+/// branch name with `/` is sent percent-encoded as one path segment.
+#[utoipa::path(
+    delete,
+    path = "/repos/{owner}/{name}/branches/{branch}",
+    tag = "Repository Content",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("branch" = String, Path, description = "Branch name, percent-encoded"),
+    ),
+    responses(
+        (status = 200, description = "Deleted", body = RefChangeResponse),
+        (status = 400, description = "Invalid branch name", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "A token kept off protected branches", body = serde_json::Value),
+        (status = 404, description = "No such branch", body = serde_json::Value),
+        (status = 409, description = "Default or protected branch, or it moved meanwhile", body = serde_json::Value),
+    ),
+)]
+pub async fn delete_branch(
+    State(state): State<AppState>,
+    Path((owner, repo, branch)): Path<(String, String, String)>,
+    RepoWrite {
+        repo: repo_model,
+        actor_id,
+    }: RepoWrite,
+) -> impl IntoResponse {
+    let repo_path = match ref_change_repo_path(&state, &owner, &repo) {
+        Ok(path) => path,
+        Err(e) => return e.into_response(),
+    };
+    let deleted = rg_core::repo::refs::delete_branch(
+        &state.db,
+        &repo_path,
+        repo_model.id,
+        Some(actor_id),
+        &branch,
+    )
+    .await;
+    finish_ref_deletion(&state, repo_path, owner, repo, actor_id, deleted)
+}
+
+/// Delete a tag.
+/// DELETE /api/v1/repos/:owner/:name/tags/:tag
+///
+/// Tag protection applies as it does to `git push origin :refs/tags/<tag>`.
+#[utoipa::path(
+    delete,
+    path = "/repos/{owner}/{name}/tags/{tag}",
+    tag = "Repository Content",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("tag" = String, Path, description = "Tag name, percent-encoded"),
+    ),
+    responses(
+        (status = 200, description = "Deleted", body = RefChangeResponse),
+        (status = 400, description = "Invalid tag name", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "No such tag", body = serde_json::Value),
+        (status = 409, description = "Protected tag, or it moved meanwhile", body = serde_json::Value),
+    ),
+)]
+pub async fn delete_tag(
+    State(state): State<AppState>,
+    Path((owner, repo, tag)): Path<(String, String, String)>,
+    RepoWrite {
+        repo: repo_model,
+        actor_id,
+    }: RepoWrite,
+) -> impl IntoResponse {
+    let repo_path = match ref_change_repo_path(&state, &owner, &repo) {
+        Ok(path) => path,
+        Err(e) => return e.into_response(),
+    };
+    let deleted =
+        rg_core::repo::refs::delete_tag(&state.db, &repo_path, repo_model.id, Some(actor_id), &tag)
+            .await;
+    finish_ref_deletion(&state, repo_path, owner, repo, actor_id, deleted)
+}
+
+fn ref_change_repo_path(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+) -> Result<std::path::PathBuf, AppError> {
+    for segment in [owner, repo] {
+        if let Err(e) = rg_core::platform::validate_repo_path(segment) {
+            return Err(AppError::bad_request(e.to_string()));
+        }
+    }
+    let repo_path = state.repo_root.join(format!("{owner}/{repo}.git"));
+    crate::error::ensure_repository_storage(&repo_path).map_err(AppError::from)?;
+    Ok(repo_path)
+}
+
+fn finish_ref_deletion(
+    state: &AppState,
+    repo_path: std::path::PathBuf,
+    owner: String,
+    repo: String,
+    actor_id: i64,
+    deleted: anyhow::Result<rg_git::protocol::receive_pack::RefUpdate>,
+) -> axum::response::Response {
+    match deleted {
+        Ok(update) => {
+            let response = RefChangeResponse {
+                r#ref: update.refname.clone(),
+                sha: update.old_sha.clone(),
+            };
+            // `branch.deleted` / `tag.deleted`, and the cancellation of CI work
+            // whose ref is gone — what a `git push :<ref>` triggers.
+            state.spawn_post_push_hooks(repo_path, owner, repo, Some(actor_id), vec![update]);
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
 /// The all-zero object id git uses on the wire for "this ref had no value".
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
@@ -2084,7 +2375,8 @@ mod tests {
     use super::{
         classify_repo_emptiness, commit_log_limit, get_blob_content, get_commit_log,
         gpg_signature_from_output, head_without_branch_error, list_branch_refs, list_tag_names,
-        list_tree_entries, AppError, RepoEmptiness, SignatureVerdict, TreeEntryKind,
+        list_tree_entries, names_unborn_head, AppError, CommitEntry, RepoEmptiness,
+        SignatureVerdict, TreeEntryKind,
     };
 
     #[derive(Clone, Default)]
@@ -2687,7 +2979,7 @@ mod tests {
         )
         .expect("the parent commit must be a loose object");
 
-        let error = match get_commit_log(&repo_path, "HEAD", "", 50) {
+        let error = match get_commit_log(&repo_path, "HEAD", "", 0, 50) {
             Ok(_) => panic!("a reachable unreadable commit must fail the complete history read"),
             Err(error) => error,
         };
@@ -2738,6 +3030,115 @@ mod tests {
             "exactly the branch HEAD points at must be marked as default"
         );
         assert_eq!(branches.len(), 2, "every branch must still be listed");
+    }
+
+    /// A worktree with linear history on `main` — `docs/a.md`, `src/x.rs`,
+    /// `docs/b.md`, `src/y.rs`, in that order — plus a side branch merged back
+    /// that touches `docs/` only on its own side.
+    fn repository_with_history() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let git = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway must initialize");
+        git.run_or_bail(&["init", "-q", "-b", "main", work.to_str().unwrap()], None)
+            .unwrap();
+        for args in [
+            ["config", "user.name", "Repository content test"],
+            ["config", "user.email", "repo-content@example.com"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            git.run_or_bail(&args, Some(&work)).unwrap();
+        }
+        let commit = |file: &str| {
+            let path = work.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("{file}\n")).unwrap();
+            git.run_or_bail(&["add", file], Some(&work)).unwrap();
+            git.run_or_bail(&["commit", "-qm", file], Some(&work))
+                .unwrap();
+        };
+        for file in ["docs/a.md", "src/x.rs", "docs/b.md", "src/y.rs"] {
+            commit(file);
+        }
+        git.run_or_bail(&["checkout", "-qb", "side"], Some(&work))
+            .unwrap();
+        commit("docs/side.md");
+        git.run_or_bail(&["checkout", "-q", "main"], Some(&work))
+            .unwrap();
+        commit("src/z.rs");
+        git.run_or_bail(&["merge", "-q", "--no-edit", "side"], Some(&work))
+            .unwrap();
+        (dir, work)
+    }
+
+    fn messages(entries: &[CommitEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.message.as_str()).collect()
+    }
+
+    /// card_2e320f5287d7: `?path=` is honoured — only the commits that change
+    /// the path, the way `git log -- <path>` reads it — and `?skip=` pages
+    /// through the same walk.
+    #[test]
+    fn the_commit_log_follows_a_path_and_pages_with_skip() {
+        let (_dir, work) = repository_with_history();
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        let expected = |args: &[&str]| -> Vec<String> {
+            let mut argv = vec!["log", "--format=%s"];
+            argv.extend_from_slice(args);
+            git.run(&argv, Some(&work))
+                .unwrap()
+                .stdout_str()
+                .lines()
+                .filter(|line| !line.starts_with("Merge"))
+                .map(str::to_string)
+                .collect()
+        };
+
+        let docs = get_commit_log(&work, "HEAD", "docs", 0, 50).unwrap();
+        assert_eq!(
+            messages(&docs),
+            expected(&["--", "docs"]),
+            "the docs history must be git's"
+        );
+        assert!(
+            messages(&docs)
+                .iter()
+                .all(|message| message.starts_with("docs/")),
+            "{:?}",
+            messages(&docs)
+        );
+        let file = get_commit_log(&work, "HEAD", "src/x.rs", 0, 50).unwrap();
+        assert_eq!(messages(&file), vec!["src/x.rs"]);
+        assert!(get_commit_log(&work, "HEAD", "no/such/path", 0, 50)
+            .unwrap()
+            .is_empty());
+
+        let all = get_commit_log(&work, "HEAD", "", 0, 50).unwrap();
+        let first_page = get_commit_log(&work, "HEAD", "", 0, 3).unwrap();
+        let second_page = get_commit_log(&work, "HEAD", "", 3, 3).unwrap();
+        let rest = get_commit_log(&work, "HEAD", "", 6, 50).unwrap();
+        let paged: Vec<&str> = messages(&first_page)
+            .into_iter()
+            .chain(messages(&second_page))
+            .chain(messages(&rest))
+            .collect();
+        assert_eq!(paged, messages(&all), "pages must tile the one walk");
+        let docs_paged = get_commit_log(&work, "HEAD", "docs", 1, 1).unwrap();
+        assert_eq!(messages(&docs_paged), vec![messages(&docs)[1]]);
+    }
+
+    /// The unborn default branch, asked for by name, is the empty history `HEAD`
+    /// is — not "ref not found".
+    #[test]
+    fn the_unborn_default_branch_is_named_by_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("empty.git");
+        gix::init_bare(&repo_path).unwrap();
+        std::fs::write(repo_path.join("HEAD"), "ref: refs/heads/trunk\n").unwrap();
+        assert!(names_unborn_head(&repo_path, "trunk"));
+        assert!(names_unborn_head(&repo_path, "refs/heads/trunk"));
+        assert!(!names_unborn_head(&repo_path, "main"));
     }
 
     /// A detached `HEAD` is a legitimate repository state, not a failure: the

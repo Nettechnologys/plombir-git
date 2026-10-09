@@ -151,3 +151,143 @@ pub async fn delete_notification_for_user(
     model.delete(db).await.context("db: delete notification")?;
     Ok(true)
 }
+
+// ── Thread notifications (card_349c2b6a0d7c) ─────────────────────────────
+
+/// What one recipient is told about an issue or a pull request.
+pub struct ThreadNotification<'a> {
+    pub user_id: i64,
+    pub repo_id: i64,
+    pub subject_type: &'a str,
+    pub subject_id: i64,
+    pub reason: &'a str,
+    pub title: &'a str,
+    pub body: Option<&'a str>,
+    pub link: &'a str,
+    /// Owe the recipient a mail for this row.
+    pub email: bool,
+}
+
+/// The recipient's unread notification about this subject, if there is one.
+pub async fn find_unread_for_subject(
+    db: &DatabaseConnection,
+    user_id: i64,
+    subject_type: &str,
+    subject_id: i64,
+) -> Result<Option<notification::Model>> {
+    notification::Entity::find()
+        .filter(notification::Column::UserId.eq(user_id))
+        .filter(notification::Column::SubjectType.eq(subject_type))
+        .filter(notification::Column::SubjectId.eq(subject_id))
+        .filter(notification::Column::IsRead.eq(false))
+        .order_by_desc(notification::Column::Id)
+        .one(db)
+        .await
+        .context("db: find unread notification for subject")
+}
+
+/// Insert a thread notification.
+pub async fn create_for_subject(
+    db: &DatabaseConnection,
+    note: &ThreadNotification<'_>,
+) -> Result<notification::Model> {
+    let now = chrono::Utc::now();
+    notification::ActiveModel {
+        user_id: Set(note.user_id),
+        event_type: Set(note.subject_type.to_string()),
+        title: Set(note.title.to_string()),
+        body: Set(note.body.map(str::to_string)),
+        repo_id: Set(Some(note.repo_id)),
+        is_read: Set(false),
+        created_at: Set(now),
+        reason: Set(Some(note.reason.to_string())),
+        subject_type: Set(Some(note.subject_type.to_string())),
+        subject_id: Set(Some(note.subject_id)),
+        link: Set(Some(note.link.to_string())),
+        updated_at: Set(Some(now)),
+        email_pending: Set(note.email),
+        ..Default::default()
+    }
+    .insert(db)
+    .await
+    .context("db: create thread notification")
+}
+
+/// Fold a later event into an unread row: it moves to the top of the inbox
+/// with the newest title and body. `reason` replaces the stored one only when
+/// given — the caller keeps the stronger of the two. A pending mail stays
+/// pending; one more is owed only when `email` says so.
+pub async fn fold_into(
+    db: &DatabaseConnection,
+    id: i64,
+    note: &ThreadNotification<'_>,
+    reason: Option<&str>,
+) -> Result<bool> {
+    let now = chrono::Utc::now();
+    let mut update = notification::Entity::update_many()
+        .col_expr(notification::Column::Title, Expr::value(note.title))
+        .col_expr(
+            notification::Column::Body,
+            Expr::value(note.body.map(str::to_string)),
+        )
+        .col_expr(notification::Column::Link, Expr::value(note.link))
+        .col_expr(notification::Column::CreatedAt, Expr::value(now))
+        .col_expr(notification::Column::UpdatedAt, Expr::value(now));
+    if let Some(reason) = reason {
+        update = update.col_expr(notification::Column::Reason, Expr::value(reason));
+    }
+    if note.email {
+        update = update.col_expr(notification::Column::EmailPending, Expr::value(true));
+    }
+    let result = update
+        .filter(notification::Column::Id.eq(id))
+        .filter(notification::Column::IsRead.eq(false))
+        .exec(db)
+        .await
+        .context("db: fold event into notification")?;
+    Ok(result.rows_affected > 0)
+}
+
+/// Rows the mail dispatcher still owes a message for, grouped by recipient.
+pub async fn list_email_pending(
+    db: &DatabaseConnection,
+    limit: u64,
+) -> Result<Vec<notification::Model>> {
+    notification::Entity::find()
+        .filter(notification::Column::EmailPending.eq(true))
+        .order_by_asc(notification::Column::UserId)
+        .order_by_asc(notification::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("db: list notifications owed a mail")
+}
+
+/// The dispatcher has dealt with these rows.
+pub async fn clear_email_pending(db: &DatabaseConnection, ids: &[i64]) -> Result<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let result = notification::Entity::update_many()
+        .col_expr(notification::Column::EmailPending, Expr::value(false))
+        .filter(notification::Column::Id.is_in(ids.iter().copied()))
+        .exec(db)
+        .await
+        .context("db: clear pending notification mail")?;
+    Ok(result.rows_affected)
+}
+
+/// Remove every notification about a subject — the issue is gone.
+pub async fn delete_for_subject(
+    db: &DatabaseConnection,
+    subject_type: &str,
+    subject_id: i64,
+) -> Result<u64> {
+    let result = notification::Entity::delete_many()
+        .filter(notification::Column::SubjectType.eq(subject_type))
+        .filter(notification::Column::SubjectId.eq(subject_id))
+        .exec(db)
+        .await
+        .context("db: delete notifications for subject")?;
+    Ok(result.rows_affected)
+}

@@ -43,28 +43,34 @@ pub async fn replace_pending_registration(
     token_hash: &str,
     expires_at: DateTime<Utc>,
 ) -> Result<()> {
-    let transaction = db.begin().await.context("db: begin pending registration")?;
-    Entity::delete_many()
-        .filter(email_confirmation::Column::Purpose.eq(PURPOSE_REGISTRATION))
-        .filter(email_confirmation::Column::Email.eq(email))
-        .exec(&transaction)
-        .await
-        .context("db: drop the earlier pending registration")?;
-    insert(
-        &transaction,
-        PURPOSE_REGISTRATION,
-        email,
-        None,
-        Some(username),
-        Some(password_hash),
-        token_hash,
-        expires_at,
-    )
-    .await?;
-    transaction
-        .commit()
-        .await
-        .context("db: commit pending registration")
+    // Delete-then-insert on an indexed key: two of these for neighbouring
+    // addresses can deadlock on MySQL's next-key locks (1213), which is
+    // contention, not a failure of the registration (card_a673a3823085).
+    crate::contention::retry_transaction("record a pending registration", || async {
+        let transaction = db.begin().await.context("db: begin pending registration")?;
+        Entity::delete_many()
+            .filter(email_confirmation::Column::Purpose.eq(PURPOSE_REGISTRATION))
+            .filter(email_confirmation::Column::Email.eq(email))
+            .exec(&transaction)
+            .await
+            .context("db: drop the earlier pending registration")?;
+        insert(
+            &transaction,
+            PURPOSE_REGISTRATION,
+            email,
+            None,
+            Some(username),
+            Some(password_hash),
+            token_hash,
+            expires_at,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .context("db: commit pending registration")
+    })
+    .await
 }
 
 /// Record that `user_id` asked to move to `email`, replacing any earlier
@@ -76,28 +82,32 @@ pub async fn replace_pending_email_change(
     token_hash: &str,
     expires_at: DateTime<Utc>,
 ) -> Result<()> {
-    let transaction = db.begin().await.context("db: begin pending email change")?;
-    Entity::delete_many()
-        .filter(email_confirmation::Column::Purpose.eq(PURPOSE_EMAIL_CHANGE))
-        .filter(email_confirmation::Column::UserId.eq(user_id))
-        .exec(&transaction)
-        .await
-        .context("db: drop the earlier pending email change")?;
-    insert(
-        &transaction,
-        PURPOSE_EMAIL_CHANGE,
-        email,
-        Some(user_id),
-        None,
-        None,
-        token_hash,
-        expires_at,
-    )
-    .await?;
-    transaction
-        .commit()
-        .await
-        .context("db: commit pending email change")
+    // The same delete-then-insert as a registration, and the same retry.
+    crate::contention::retry_transaction("record a pending email change", || async {
+        let transaction = db.begin().await.context("db: begin pending email change")?;
+        Entity::delete_many()
+            .filter(email_confirmation::Column::Purpose.eq(PURPOSE_EMAIL_CHANGE))
+            .filter(email_confirmation::Column::UserId.eq(user_id))
+            .exec(&transaction)
+            .await
+            .context("db: drop the earlier pending email change")?;
+        insert(
+            &transaction,
+            PURPOSE_EMAIL_CHANGE,
+            email,
+            Some(user_id),
+            None,
+            None,
+            token_hash,
+            expires_at,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .context("db: commit pending email change")
+    })
+    .await
 }
 
 /// Record that a notice without a link went to `email`, so the cooldown sees

@@ -160,7 +160,70 @@ pub async fn create_issue(
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger issue.opened webhook");
     }
 
+    // The author follows their issue; whoever the text mentions is told.
+    // Watchers hear about every new issue, as they hear about pull requests.
+    crate::notification::thread::spawn(
+        db,
+        crate::notification::thread::ThreadEvent::new(
+            issue_subject(&issue),
+            Some(author_id),
+            "opened this issue",
+        )
+        .mentions_in(issue_text(&issue))
+        .actor_subscribes("author"),
+    );
+    spawn_notify_watchers_issue_opened(db, &issue, author_id).await;
+
     Ok(issue)
+}
+
+/// The issue as a notification subject.
+fn issue_subject(issue: &Issue) -> crate::notification::thread::Subject {
+    crate::notification::thread::Subject {
+        kind: crate::notification::thread::SubjectKind::Issue,
+        id: issue.id,
+        number: issue.number,
+        repo_id: issue.repo_id,
+        title: issue.title.clone(),
+    }
+}
+
+/// The text of an issue whose `@names` are mentions: its title and body.
+fn issue_text(issue: &Issue) -> String {
+    format!(
+        "{}\n{}",
+        issue.title,
+        issue.body.as_deref().unwrap_or_default()
+    )
+}
+
+/// Tell the repository's watchers that `issue` was opened.
+async fn spawn_notify_watchers_issue_opened(
+    db: &DatabaseConnection,
+    issue: &Issue,
+    author_id: i64,
+) {
+    let author_name =
+        crate::notification::best_effort_user_by_id(db, author_id, issue.repo_id, "issue", "actor")
+            .await
+            .map(|user| user.username)
+            .unwrap_or_default();
+    let body = if author_name.is_empty() {
+        format!("Issue #{} opened: {}", issue.number, issue.title)
+    } else {
+        format!("{author_name} opened: {}", issue.title)
+    };
+    crate::notification::spawn_notify_watchers(
+        db,
+        crate::task_tracker::delivery_tracker(),
+        crate::notification::WatchEvent {
+            repo_id: issue.repo_id,
+            author_name,
+            title: format!("Issue #{} opened", issue.number),
+            notification_type: "issue".to_string(),
+            body: Some(body),
+        },
+    );
 }
 
 /// Insert one issue under a freshly allocated repository-local number, with its
@@ -301,11 +364,22 @@ where
         // The issue and its canonical junction rows commit together.
         if let Some(ids) = label_ids.clone() {
             if let Err(error) = issue_label_ops::set_labels(&txn, issue.id, ids).await {
+                // A deadlock on the label junction's index is contention like
+                // any other here, and the retry allocates the number afresh in
+                // a new transaction (card_a673a3823085).
+                let retry = classify_anyhow(&error);
                 if let Err(rollback_error) = txn.rollback().await {
                     return Err(error).context(format!(
                         "issue labels failed and their transaction could not be rolled back: \
                          {rollback_error}"
                     ));
+                }
+                if retry.is_worthwhile() && budget.may_retry() {
+                    retry.wait(attempt).await;
+                    continue;
+                }
+                if retry.is_worthwhile() {
+                    return Err(error).context(budget.exhausted("label a new issue"));
                 }
                 return Err(error);
             }
@@ -439,8 +513,10 @@ pub async fn update_issue(
     assignee_id: Option<Option<i64>>,
     milestone_id: Option<Option<i64>>,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
+    actor_id: Option<i64>,
 ) -> Result<Issue> {
     let existing = get_issue(db, owner, repo_name, number).await?;
+    let previous_assignee = existing.assignee_id;
     let issue_id = existing.id;
     let issue_repo_id = existing.repo_id;
     let issue_milestone_id = existing.milestone_id;
@@ -487,16 +563,61 @@ pub async fn update_issue(
 
     active.updated_at = Set(Utc::now());
 
-    let txn = db.begin().await.context("db: begin transaction")?;
-    let updated = active.update(&txn).await.context("db: update issue")?;
-    if let Some(ids) = label_ids {
-        issue_label_ops::set_labels(&txn, issue_id, ids).await?;
-    }
-    txn.commit().await.context("db: commit transaction")?;
+    // The label junction is replaced by delete-then-insert on `issue_id`. On
+    // MySQL two edits of neighbouring issues take next-key locks on that index
+    // and the insert intentions of each wait on the other: one of them is
+    // chosen as a deadlock victim (1213) — the same gap pattern the backup
+    // codes had (card_d71c4875993c). A correct edit must not answer 5xx for
+    // it, so the whole transaction is retried (card_a673a3823085).
+    let updated = rg_db::contention::retry_transaction("update an issue", || {
+        let active = active.clone();
+        let label_ids = label_ids.clone();
+        async move {
+            let txn = db.begin().await.context("db: begin transaction")?;
+            let written: Result<Issue> = async {
+                let updated = active.update(&txn).await.context("db: update issue")?;
+                if let Some(ids) = label_ids {
+                    issue_label_ops::set_labels(&txn, issue_id, ids).await?;
+                }
+                Ok(updated)
+            }
+            .await;
+            match written {
+                Ok(updated) => {
+                    txn.commit().await.context("db: commit transaction")?;
+                    Ok(updated)
+                }
+                Err(error) => {
+                    if let Err(rollback_error) = txn.rollback().await {
+                        return Err(error).context(format!(
+                            "issue update failed and its transaction could not be rolled \
+                             back: {rollback_error}"
+                        ));
+                    }
+                    Err(error)
+                }
+            }
+        }
+    })
+    .await?;
 
     // FTS sync is handled by database triggers created in the migration chain.
 
     // Post-update side effects (non-fatal)
+    if let Some(assignee) = updated
+        .assignee_id
+        .filter(|id| Some(*id) != previous_assignee)
+    {
+        crate::notification::thread::spawn(
+            db,
+            crate::notification::thread::ThreadEvent::new(
+                issue_subject(&updated),
+                actor_id,
+                "assigned this issue",
+            )
+            .to(assignee, crate::notification::thread::Reason::Assigned),
+        );
+    }
     if let Some(ref s) = state {
         if was_open && s == "closed" {
             let close_payload = serde_json::json!({
@@ -585,6 +706,18 @@ pub async fn add_comment(
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger issue.comment webhook");
     }
 
+    crate::notification::thread::spawn(
+        db,
+        crate::notification::thread::ThreadEvent::new(
+            issue_subject(&issue),
+            Some(author_id),
+            "commented",
+        )
+        .mentions_in(comment.body.clone())
+        .to_subscribers()
+        .actor_subscribes("commented"),
+    );
+
     Ok(comment)
 }
 
@@ -599,19 +732,11 @@ pub async fn list_comments(
     issue_comment_ops::list_by_issue(db, issue.id).await
 }
 
-// `update_comment(db, comment_id, body)` and `delete_comment(db, comment_id)`
-// used to live here. Both were dead — no route, no caller anywhere in the
-// workspace — and both were shaped so that a scope could not be passed even if
-// a caller wanted to: the comment id is global, and neither signature had room
-// for the issue or the repository it belongs to.
-//
-// That is the same primitive `time_tracking::service::delete_time_entry(db, id)`
-// was before it became `delete_time_entry(db, issue_id, id)`, and the reason it
-// mattered there was not the primitive itself but the handler written to its
-// shape. Editing a comment is a feature this forge will grow eventually; when
-// it does, the signature has to carry `issue_id` and the body has to verify
-// `comment.issue_id` before touching the row — see `delete_time_entry` for the
-// shape, and `api::attachments` for the call-site anchoring that goes with it.
+// Editing and deleting a comment live in `super::moderation`, scoped by the
+// repository the comment's issue belongs to. The unscoped
+// `update_comment(db, comment_id, body)` / `delete_comment(db, comment_id)`
+// that used to sit here were removed for exactly that reason: a comment id is
+// global, and neither signature had room for the issue or the repository.
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 

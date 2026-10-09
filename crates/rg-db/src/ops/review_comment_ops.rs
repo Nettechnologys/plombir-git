@@ -34,3 +34,45 @@ pub async fn create<C: ConnectionTrait>(db: &C, model: ActiveModel) -> Result<Re
 pub async fn update<C: ConnectionTrait>(db: &C, model: ActiveModel) -> Result<ReviewComment> {
     model.update(db).await.context("db: update review comment")
 }
+
+/// Replace a review comment's body, stamping `updated_at`. `None` when the
+/// row is gone.
+pub async fn update_body(
+    db: &DatabaseConnection,
+    id: i64,
+    body: &str,
+) -> Result<Option<ReviewComment>> {
+    let updated = CommentEntity::update_many()
+        .col_expr(review_comment::Column::Body, sea_query::Expr::value(body))
+        .col_expr(
+            review_comment::Column::UpdatedAt,
+            sea_query::Expr::value(chrono::Utc::now()),
+        )
+        .filter(review_comment::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: edit review comment")?;
+    if updated.rows_affected == 0 {
+        return Ok(None);
+    }
+    find_by_id(db, id).await
+}
+
+/// Whether any comment replies to `id`.
+pub async fn has_replies(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    Ok(CommentEntity::find()
+        .filter(review_comment::Column::ReplyToId.eq(id))
+        .count(db)
+        .await
+        .context("db: count review comment replies")?
+        > 0)
+}
+
+/// Delete a review comment. `false` when it was already gone.
+pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let deleted = CommentEntity::delete_by_id(id)
+        .exec(db)
+        .await
+        .context("db: delete review comment")?;
+    Ok(deleted.rows_affected == 1)
+}

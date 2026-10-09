@@ -7,6 +7,9 @@ use rg_db::ops::notification_ops;
 
 use crate::repo::service::WatchState;
 
+pub mod mail;
+pub mod thread;
+
 /// Paginated list of notifications. Returns (data, total).
 pub async fn list_notifications_paginated(
     db: &DatabaseConnection,

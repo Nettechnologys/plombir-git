@@ -1294,6 +1294,11 @@ pub(crate) fn build_all_routes(
         .get(PublicFiltered, "/repos/explore", api::repos::explore)
         .get(PublicFiltered, "/repos/{owner}", api::repos::list_repos)
         .get(RepoRead, "/repos/{owner}/{name}", api::repos::get_repo)
+        .patch(
+            RepoAdmin,
+            "/repos/{owner}/{name}",
+            api::repos::update_repo_handler,
+        )
         .delete(
             RepoOwner,
             "/repos/{owner}/{name}",
@@ -1410,6 +1415,21 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/issues/{number}/comments",
             api::issues::add_comment,
         )
+        .patch(
+            RepoAdmin,
+            "/repos/{owner}/{name}/issues/comments/{comment_id}",
+            api::issues::edit_comment,
+        )
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/issues/comments/{comment_id}",
+            api::issues::delete_comment,
+        )
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/issues/{number}",
+            api::issues::delete_issue,
+        )
         // Attachments. Uploading or deleting one takes write access unless the
         // caller authored its target or uploaded it, so `RepoWrite` is the
         // level a stranger is measured against.
@@ -1520,6 +1540,11 @@ pub(crate) fn build_all_routes(
         )
         .get(
             RepoRead,
+            "/repos/{owner}/{name}/compare",
+            api::pulls::compare,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pulls/{number}/diff",
             api::pulls::get_diff,
         )
@@ -1591,6 +1616,16 @@ pub(crate) fn build_all_routes(
             RepoAuthRead,
             "/repos/{owner}/{name}/pulls/{number}/comments",
             api::reviews::create_review_comment,
+        )
+        .patch(
+            RepoAdmin,
+            "/repos/{owner}/{name}/pulls/{number}/comments/{id}",
+            api::reviews::edit_review_comment,
+        )
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/pulls/{number}/comments/{id}",
+            api::reviews::delete_review_comment,
         )
         .get(
             RepoRead,
@@ -1963,6 +1998,21 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/tags",
             api::repo_content::list_tags,
         )
+        .post(
+            RepoWrite,
+            "/repos/{owner}/{name}/branches",
+            api::repo_content::create_branch,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/branches/{branch}",
+            api::repo_content::delete_branch,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/tags/{tag}",
+            api::repo_content::delete_tag,
+        )
         .get(
             RepoRead,
             "/repos/{owner}/{name}/commits/{sha}/signature",
@@ -2174,6 +2224,46 @@ pub(crate) fn build_all_routes(
             User,
             "/notifications/{id}",
             api::notifications::delete_notification,
+        )
+        .get(
+            User,
+            "/users/me/notification-settings",
+            api::notifications::get_notification_settings,
+        )
+        .put(
+            User,
+            "/users/me/notification-settings",
+            api::notifications::update_notification_settings,
+        )
+        .get(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/issues/{number}/subscription",
+            api::notifications::get_issue_subscription,
+        )
+        .put(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/issues/{number}/subscription",
+            api::notifications::subscribe_issue,
+        )
+        .delete(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/issues/{number}/subscription",
+            api::notifications::unsubscribe_issue,
+        )
+        .get(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/pulls/{number}/subscription",
+            api::notifications::get_pull_subscription,
+        )
+        .put(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/pulls/{number}/subscription",
+            api::notifications::subscribe_pull,
+        )
+        .delete(
+            RepoAuthRead,
+            "/repos/{owner}/{name}/pulls/{number}/subscription",
+            api::notifications::unsubscribe_pull,
         )
         // ── Star / watch ───────────────────────────────────────────────────
         .put(

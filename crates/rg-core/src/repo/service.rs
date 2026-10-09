@@ -1640,13 +1640,18 @@ fn repository_transfer_blob_prefixes(
     source_namespace: &str,
     destination_namespace: &str,
     repo_name: &str,
+    destination_repo_name: &str,
 ) -> Result<Vec<TransferredBlobPrefix>> {
     ["packages", "lfs", "releases"]
         .into_iter()
         .map(|kind| {
             Ok(TransferredBlobPrefix {
                 source: BlobKey::from_segments([kind, source_namespace, repo_name])?,
-                destination: BlobKey::from_segments([kind, destination_namespace, repo_name])?,
+                destination: BlobKey::from_segments([
+                    kind,
+                    destination_namespace,
+                    destination_repo_name,
+                ])?,
             })
         })
         .collect()
@@ -3037,18 +3042,21 @@ pub struct ForkSummary {
     pub owner_name: String,
 }
 
-/// List forks of a repository.
+/// List the forks of a repository that `viewer_id` (`None` = anonymous) may
+/// read. Forks the viewer cannot read are neither listed nor counted.
 pub async fn list_forks(
     db: &DatabaseConnection,
     owner: &str,
     repo_name: &str,
+    viewer_id: Option<i64>,
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<ForkSummary>, i64)> {
     let repo = find_repo_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
-    let (forks, total) = repo_ops::list_forks(db, repo.id, offset, limit).await?;
+    let (forks, total) =
+        repo_ops::list_forks_visible_to(db, repo.id, viewer_id, offset, limit).await?;
     let owner_names = futures::future::join_all(
         forks
             .iter()
@@ -3130,11 +3138,179 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    rebind_repository_with_after_commit(
+        db,
+        Some(user_id),
+        owner,
+        repo_name,
+        new_owner,
+        repo_name,
+        repo_root,
+        blob_storage,
+        oci_storage,
+        after_commit,
+    )
+    .await
+}
+
+/// The settings a repository administrator edits in place.
+#[derive(Debug, Default)]
+pub struct RepoSettingsChange {
+    /// `Some(None)` clears the description.
+    pub description: Option<Option<String>>,
+    pub is_private: Option<bool>,
+    pub default_branch: Option<String>,
+}
+
+/// Apply [`RepoSettingsChange`] to `repo` (card_3625a7b89abb).
+///
+/// * The default branch has to exist, and it is moved where clients read it —
+///   `HEAD` of the bare repository, which is what `git clone` checks out — as
+///   well as in the row the UI reads. `HEAD` goes first: a row naming a branch
+///   the repository does not point at is the disagreement this function exists
+///   to prevent, and on a failed row write `HEAD` is put back.
+/// * A visibility change drops the cached access decisions of the repository,
+///   so making it private closes anonymous reads on the very next request.
+pub async fn update_repo_settings(
+    db: &DatabaseConnection,
+    repo_path: &std::path::Path,
+    repo: &rg_db::entities::repository::Model,
+    change: RepoSettingsChange,
+) -> Result<rg_db::entities::repository::Model> {
+    if let Some(Some(description)) = &change.description {
+        if description.chars().count() > MAX_REPO_DESCRIPTION_CHARS {
+            return Err(crate::error::invalid_request(format!(
+                "description is longer than {MAX_REPO_DESCRIPTION_CHARS} characters"
+            )));
+        }
+    }
+
+    if let Some(branch) = change
+        .default_branch
+        .as_deref()
+        .filter(|branch| *branch != repo.default_branch)
+    {
+        if rg_git::refname::validate_refname(&format!("refs/heads/{branch}")).is_err()
+            || try_get_branch_sha(repo_path, branch)?.is_none()
+        {
+            return Err(crate::error::invalid_request(format!(
+                "branch '{branch}' does not exist in this repository"
+            )));
+        }
+        let git = rg_git::repository::open(repo_path)
+            .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+        set_bare_repo_head_to_branch(&git, branch)?;
+        match repo_ops::set_default_branch(db, repo.id, branch).await {
+            Ok(true) => {}
+            outcome => {
+                if let Err(error) = set_bare_repo_head_to_branch(&git, &repo.default_branch) {
+                    tracing::warn!(
+                        repo_id = repo.id,
+                        error = %format!("{error:#}"),
+                        "the default branch change failed and HEAD could not be put back"
+                    );
+                }
+                return match outcome {
+                    Ok(_) => Err(crate::error::not_found("repository")),
+                    Err(error) => Err(error),
+                };
+            }
+        }
+    }
+
+    if change.description.is_some() || change.is_private.is_some() {
+        let description = change
+            .description
+            .map(|description| description.filter(|text| !text.trim().is_empty()));
+        if !repo_ops::update_settings(db, repo.id, description, change.is_private).await? {
+            return Err(crate::error::not_found("repository"));
+        }
+    }
+    if change
+        .is_private
+        .is_some_and(|private| private != repo.is_private)
+    {
+        invalidate_perm_cache_repo(db, repo.id);
+    }
+
+    repo_ops::find_by_id(db, repo.id)
+        .await?
+        .ok_or_else(|| crate::error::not_found("repository"))
+}
+
+/// The longest description a repository may carry.
+pub const MAX_REPO_DESCRIPTION_CHARS: usize = 2000;
+
+/// Rename a repository inside its namespace (card_3625a7b89abb).
+///
+/// A rename is a transfer to the same namespace under another name: every
+/// storage family keyed by `<owner>/<repo>` — the Git directory, the LFS,
+/// release and package blob prefixes, the OCI namespace, the legacy
+/// directories — moves through the very same journaled, crash-recoverable
+/// path a transfer takes, and the repository row keeps its id, so issues, pull
+/// requests, stars and every id-keyed row stay attached. Who may rename is the
+/// route's question (repository administrators); this function does not ask
+/// it again.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the same explicit storage domains a transfer receives, so a rename cannot move only one of them"
+)]
+pub async fn rename_repo(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo_name: &str,
+    new_name: &str,
+    repo_root: &std::path::Path,
+    blob_storage: &dyn BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
+) -> Result<rg_db::entities::repository::Model> {
+    crate::validate_repo_name(new_name)?;
+    if new_name == repo_name {
+        return find_repo_by_owner_name(db, owner, repo_name)
+            .await?
+            .ok_or_else(|| crate::error::not_found("repository"));
+    }
+    rebind_repository_with_after_commit(
+        db,
+        None,
+        owner,
+        repo_name,
+        owner,
+        new_name,
+        repo_root,
+        blob_storage,
+        oci_storage,
+        || async {},
+    )
+    .await
+}
+
+/// Move a repository to `new_owner/new_repo_name` — a transfer, a rename, or
+/// both. `required_owner` is the account that alone may do it, when the
+/// caller has not already decided that (a transfer: only the owner gives a
+/// repository away).
+#[allow(clippy::too_many_arguments)]
+async fn rebind_repository_with_after_commit<F, Fut>(
+    db: &DatabaseConnection,
+    required_owner: Option<i64>,
+    owner: &str,
+    repo_name: &str,
+    new_owner: &str,
+    new_repo_name: &str,
+    repo_root: &std::path::Path,
+    blob_storage: &dyn BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
+    after_commit: F,
+) -> Result<rg_db::entities::repository::Model>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let repo = find_repo_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))?;
 
-    if repo.owner_id != user_id {
+    if required_owner.is_some_and(|user_id| repo.owner_id != user_id) {
         return Err(crate::error::forbidden(
             "only the repository owner can transfer it",
         ));
@@ -3146,10 +3322,10 @@ where
         db,
         new_owner_id,
         new_org_id,
-        repo_name,
+        new_repo_name,
         // A transfer moves this row; it is not a second repository of that name.
         Some(repo.id),
-        &format!("repository '{repo_name}' already exists at destination"),
+        &format!("repository '{new_repo_name}' already exists at destination"),
     )
     .await?;
 
@@ -3157,9 +3333,10 @@ where
     // A malformed historical namespace must fail as one untouched transfer that
     // never claimed anything, not after the repository directory has already left
     // its owner.
-    let blob_prefixes = repository_transfer_blob_prefixes(owner, &new_owner_name, repo_name)?;
+    let blob_prefixes =
+        repository_transfer_blob_prefixes(owner, &new_owner_name, repo_name, new_repo_name)?;
     let old_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
-    let new_path = repo_root.join(format!("{}/{}.git", new_owner_name, repo_name));
+    let new_path = repo_root.join(format!("{}/{}.git", new_owner_name, new_repo_name));
 
     // From here to the ownership commit the bytes and the row disagree about
     // which namespace they are in, and the deletion of the source account or
@@ -3213,6 +3390,7 @@ where
         new_owner_id,
         new_org_id,
         &new_owner_name,
+        new_repo_name,
         blob_prefixes,
         blob_storage,
         oci_storage,
@@ -3273,6 +3451,7 @@ async fn move_repository_storage_and_commit(
     new_owner_id: i64,
     new_org_id: Option<i64>,
     new_owner_name: &str,
+    new_repo_name: &str,
     blob_prefixes: Vec<TransferredBlobPrefix>,
     blob_storage: &dyn BlobStorage,
     oci_storage: &crate::package_registry::oci::storage::OciStorage,
@@ -3286,12 +3465,12 @@ async fn move_repository_storage_and_commit(
     let legacy_paths = [
         (
             crate::lfs::service::lfs_root(repo_root, owner, repo_name),
-            crate::lfs::service::lfs_root(repo_root, new_owner_name, repo_name),
+            crate::lfs::service::lfs_root(repo_root, new_owner_name, new_repo_name),
             "legacy LFS directory",
         ),
         (
             crate::release::service::legacy_asset_root(repo_root, owner, repo_name),
-            crate::release::service::legacy_asset_root(repo_root, new_owner_name, repo_name),
+            crate::release::service::legacy_asset_root(repo_root, new_owner_name, new_repo_name),
             "legacy release asset directory",
         ),
     ];
@@ -3310,7 +3489,7 @@ async fn move_repository_storage_and_commit(
         owner,
         repo_name,
         new_owner_name,
-        repo_name,
+        new_repo_name,
     )?);
     deletion_recovery::open_move(
         blob_storage,
@@ -3328,6 +3507,7 @@ async fn move_repository_storage_and_commit(
         new_owner_id,
         new_org_id,
         new_owner_name,
+        new_repo_name,
         blob_prefixes,
         legacy_paths,
         blob_storage,
@@ -3356,6 +3536,7 @@ async fn move_journaled_repository_storage_and_commit(
     new_owner_id: i64,
     new_org_id: Option<i64>,
     new_owner_name: &str,
+    new_repo_name: &str,
     blob_prefixes: Vec<TransferredBlobPrefix>,
     legacy_paths: [(std::path::PathBuf, std::path::PathBuf, &'static str); 2],
     blob_storage: &dyn BlobStorage,
@@ -3399,7 +3580,7 @@ async fn move_journaled_repository_storage_and_commit(
     }
 
     let moved_oci = match oci_storage
-        .transfer_repository(owner, repo_name, new_owner_name, repo_name)
+        .transfer_repository(owner, repo_name, new_owner_name, new_repo_name)
         .await
     {
         Ok(moved) => moved,
@@ -3421,6 +3602,7 @@ async fn move_journaled_repository_storage_and_commit(
         owner,
         new_owner_name,
         repo_name,
+        new_repo_name,
     )
     .await;
     // Every refusal below has already had its ownership update rolled back, so
@@ -3475,7 +3657,7 @@ async fn move_journaled_repository_storage_and_commit(
             // words that check uses, not a server fault.
             if rg_db::is_unique_violation_anyhow(&error) {
                 crate::error::conflict(format!(
-                    "repository '{repo_name}' already exists at destination"
+                    "repository '{new_repo_name}' already exists at destination"
                 ))
             } else {
                 error
@@ -5989,10 +6171,13 @@ mod repository_deletion_tests {
 
     /// What it is supposed to equal: the source's live fork rows.
     async fn live_fork_count(db: &DatabaseConnection, repo_id: i64) -> i64 {
-        repo_ops::list_forks(db, repo_id, 0, 1024)
+        use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+        rg_db::entities::repository::Entity::find()
+            .filter(rg_db::entities::repository::Column::OriginRepoId.eq(Some(repo_id)))
+            .filter(rg_db::entities::repository::Column::DeletedAt.is_null())
+            .count(db)
             .await
-            .expect("count the live forks")
-            .1
+            .expect("count the live forks") as i64
     }
 
     /// One source repository and `forkers.len()` forks of it, each in its own

@@ -19,6 +19,14 @@ const NULL_SHA1: &str = "0000000000000000000000000000000000000000";
 /// [`crate::ref_advertisement::is_server_owned`].
 pub const SERVER_OWNED_NAMESPACE: &str = "server-owned namespace";
 
+/// What receive-pack advertises, over every transport: the SSH stream builds
+/// its advertisement here, and the HTTP `info/refs` answer takes this same
+/// string — two copies once drifted, and a stock client refused
+/// `git push origin :branch` over HTTP because only the SSH one said
+/// `delete-refs` (card_2060696224ff).
+pub const CAPABILITIES: &str =
+    "report-status report-status-v2 delete-refs side-band-64k agent=plombir-git/0.1";
+
 /// Hard ceiling for one incoming pack (1 GiB), shared by HTTP, SSH and direct
 /// library callers. The CLI indexer streams under this bound; the native gix
 /// path spools to disk under the same bound instead of retaining the pack in a
@@ -64,6 +72,11 @@ pub struct PushPolicy {
     /// LFS locks held by someone other than the pusher. A new commit that
     /// changes one of these paths refuses its ref.
     pub foreign_locks: Vec<ForeignLock>,
+    /// `(pattern, message)` pairs for refs no pusher may delete — protected
+    /// branches, whoever may push to them. The branch `HEAD` names is refused
+    /// on top of these, by receive-pack itself
+    /// ([`CURRENT_BRANCH_DELETION`]).
+    pub undeletable_refs: Vec<(String, String)>,
 }
 
 /// One path locked by another person, as [`PushPolicy::foreign_locks`] carries
@@ -212,13 +225,14 @@ where
     let ReceivedPush {
         updates: ref_updates,
         report,
+        refusal,
     } = process_push_with_rejections(repo_path, &mut reader, &policy, applied).await?;
     // Point of no return: the line above indexed the pack and wrote every
     // accepted ref. `send_response` is an ordinary network write and may fail
     // for reasons that have nothing to do with the push, so its error travels
     // *beside* the applied updates rather than through `?` — see
     // [`ReceivePackOutcome`].
-    let report_status = send_response(&mut writer, &ref_updates, report).await;
+    let report_status = send_response(&mut writer, &ref_updates, report, refusal.as_deref()).await;
     Ok(ReceivePackOutcome {
         ref_updates,
         report_status,
@@ -245,6 +259,7 @@ where
     let ReceivedPush {
         updates: ref_updates,
         report,
+        refusal,
     } = {
         let mut reader = BufReader::new(&mut *stream);
         process_push_with_rejections(repo_path, &mut reader, &policy, applied).await?
@@ -253,7 +268,7 @@ where
     // Point of no return crossed above, exactly as on the HTTP twin: the
     // report-status write is reported beside the applied updates instead of
     // taking them down with it (see [`ReceivePackOutcome`]).
-    let report_status = send_response(stream, &ref_updates, report).await;
+    let report_status = send_response(stream, &ref_updates, report, refusal.as_deref()).await;
     Ok(ReceivePackOutcome {
         ref_updates,
         report_status,
@@ -291,7 +306,7 @@ fn build_ref_advertisement(ref_list: &[(String, String)], _service: &str) -> Vec
     // - agent: server identification
     // NOTE: We do NOT advertise atomic (all-or-nothing ref updates) because
     // we process refs sequentially.
-    let caps = "report-status report-status-v2 side-band-64k agent=plombir-git/0.1";
+    let caps = CAPABILITIES;
 
     if let Some((sha, refname)) = ref_list.first() {
         let line = format!("{} {}\0{}", sha, refname, caps);
@@ -341,6 +356,312 @@ impl ReportRequest {
 struct ReceivedPush {
     updates: Vec<RefUpdate>,
     report: ReportRequest,
+    /// The reason the whole request was refused on the client's account, when
+    /// it was. Reported as `unpack <reason>` — the one line of report-status
+    /// that speaks for the push as a whole — and never as a server failure.
+    refusal: Option<String>,
+}
+
+/// The update commands of one push, as read off the wire.
+struct CommandList {
+    updates: Vec<RefUpdate>,
+    report: ReportRequest,
+    /// Whether the client follows the commands with a pack. Git sends none
+    /// when every command is a deletion, and reading for one then would wait
+    /// for bytes that never come — on SSH, until the stream budget runs out.
+    pack_follows: bool,
+    refusal: Option<String>,
+}
+
+/// A command line split into its three fields and the capabilities, before
+/// anything is decided about it. Bytes, not `str`: the line is only decoded
+/// once it is known to be a command, so a non-UTF-8 refname is the pusher's
+/// mistake to be told about rather than a decode failure of ours.
+fn split_command_line(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    match bytes.iter().position(|byte| *byte == 0) {
+        Some(nul) => (&bytes[..nul], &bytes[nul + 1..]),
+        None => (bytes, &[]),
+    }
+}
+
+/// Whether a raw command line asks to *write* an object: its second field is
+/// a non-null object id. Used where the line is not otherwise trusted — to
+/// know whether a pack follows the commands of a refused push.
+fn command_writes_an_object(command: &[u8]) -> bool {
+    command
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .nth(1)
+        .is_some_and(|new| new != NULL_SHA1.as_bytes())
+}
+
+/// Read the update commands up to their flush.
+///
+/// What the client sent wrong *as a whole* — more command bytes or more
+/// commands than the server accepts, a command that is not UTF-8, a frame
+/// that is not a pkt-line — is a [`CommandList::refusal`], not an `Err`: the
+/// client is told why in its report-status and the transport answers it as a
+/// delivered protocol response, logged at warn (card_9e8736a9de16). `Err` is
+/// left for the transport failing under us.
+async fn read_update_commands<R>(reader: &mut BufReader<R>) -> Result<CommandList>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut updates = Vec::new();
+    let mut negotiation_bytes = 0_usize;
+    let mut pack_follows = false;
+    // Capabilities ride on the first command line only.
+    let mut report = None;
+
+    loop {
+        let pkt = match read_pkt_line(reader).await {
+            Ok(pkt) => pkt,
+            Err(error) => {
+                let Some(refusal) = super::client_refusal(&error) else {
+                    return Err(error);
+                };
+                // A frame the pkt-line grammar does not allow: there is no
+                // telling where the next command starts, so nothing after it
+                // can be read — the report goes out and the request ends.
+                return Ok(CommandList {
+                    updates,
+                    report: report.unwrap_or_default(),
+                    pack_follows: false,
+                    refusal: Some(refusal.reason().to_string()),
+                });
+            }
+        };
+
+        // Delim/ResponseEnd are V2-only and shouldn't appear in V1 protocol
+        let bytes = match pkt {
+            PktLine::Flush => break,
+            PktLine::Delim | PktLine::ResponseEnd => continue,
+            PktLine::Data(bytes) => bytes,
+        };
+        let (command, capabilities) = split_command_line(&bytes);
+        if report.is_none() {
+            report = Some(ReportRequest::from_capabilities(&String::from_utf8_lossy(
+                capabilities,
+            )));
+        }
+        pack_follows |= command_writes_an_object(command);
+
+        let refusal = match checked_receive_negotiation_bytes(
+            negotiation_bytes,
+            bytes.len(),
+            super::MAX_NEGOTIATION_INPUT_BYTES,
+        ) {
+            Ok(total) => {
+                negotiation_bytes = total;
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        }
+        .or_else(|| {
+            (updates.len() >= super::MAX_NEGOTIATION_ENTRIES).then(|| {
+                format!(
+                    "receive-pack update list exceeds the configured {}-entry limit",
+                    super::MAX_NEGOTIATION_ENTRIES
+                )
+            })
+        });
+        if let Some(refusal) = refusal {
+            pack_follows |= skip_update_commands(reader).await?;
+            return Ok(CommandList {
+                updates,
+                report: report.unwrap_or_default(),
+                pack_follows,
+                refusal: Some(refusal),
+            });
+        }
+
+        // RefUpdate stores a String and every policy/hook downstream compares
+        // that exact spelling. Lossy decoding silently rewrote a non-UTF-8
+        // wire ref to U+FFFD and could therefore authorize one name before
+        // updating another — so the line is refused, never repaired.
+        let Ok(line) = std::str::from_utf8(command) else {
+            pack_follows |= skip_update_commands(reader).await?;
+            return Ok(CommandList {
+                updates,
+                report: report.unwrap_or_default(),
+                pack_follows,
+                refusal: Some("receive-pack update command must be valid UTF-8".to_string()),
+            });
+        };
+        if line.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        let old_sha = parts[0].to_string();
+        let new_sha = parts[1].to_string();
+        let refname = parts[2].to_string();
+
+        tracing::info!(
+            old = %old_sha,
+            new = %new_sha,
+            refname = %refname,
+            "Receive-pack: update command"
+        );
+
+        updates.push(checked_command(old_sha, new_sha, refname));
+    }
+
+    Ok(CommandList {
+        updates,
+        report: report.unwrap_or_default(),
+        pack_follows,
+        refusal: None,
+    })
+}
+
+/// One update command with the verdict nothing but its own text decides:
+/// well-formed object ids and refname, not a server-owned namespace, not a
+/// command that neither had nor wants a value.
+fn checked_command(old_sha: String, new_sha: String, refname: String) -> RefUpdate {
+    let invalid = validate_wire_object_id(&old_sha)
+        .and_then(|_| validate_wire_object_id(&new_sha))
+        .err()
+        .map(|error| error.to_string())
+        .or_else(|| {
+            validate_refname(&refname)
+                .err()
+                .map(|error| error.to_string())
+        })
+        // The server writes some of these for its own work and compares what
+        // it wrote on the way out (`update-ref <ref> <new> <old>`), and gives
+        // the others a meaning of its own (a pull request's pipeline ref,
+        // git's object replacement), so a client's write there is never
+        // wanted: git's own `receive.hideRefs` makes a hidden ref unwritable
+        // too (card_e62ac71c4768). Decided per ref, before any object is read,
+        // so the rest of the push is unaffected.
+        .or_else(|| {
+            crate::ref_advertisement::is_server_owned(&refname)
+                .then(|| SERVER_OWNED_NAMESPACE.to_string())
+        })
+        // A deletion names the value it removes; a command that neither had
+        // nor wants a value is not an update of anything.
+        .or_else(|| {
+            (old_sha == NULL_SHA1 && new_sha == NULL_SHA1)
+                .then(|| "a deletion must name the value it removes".to_string())
+        });
+    let (status, message) = match invalid {
+        Some(message) => ("error", message),
+        None => ("ok", String::new()),
+    };
+    RefUpdate {
+        old_sha,
+        new_sha,
+        refname,
+        status: status.to_string(),
+        message,
+    }
+}
+
+/// Read past the rest of a refused command list, keeping none of it, and say
+/// whether any of it asked for a pack.
+///
+/// The client writes its whole command list and then its pack before it reads
+/// a byte of the answer. A server that stopped reading at the refused line
+/// would leave it blocked on a full socket — the refusal it is owed would
+/// never reach it.
+async fn skip_update_commands<R>(reader: &mut BufReader<R>) -> Result<bool>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut pack_follows = false;
+    let mut skipped = 0_usize;
+    loop {
+        let pkt = match read_pkt_line(reader).await {
+            Ok(pkt) => pkt,
+            Err(error) if super::client_refusal(&error).is_none() => return Err(error),
+            // Unframed bytes: nothing more can be read in step with the client.
+            Err(_) => return Ok(false),
+        };
+        match pkt {
+            PktLine::Flush => return Ok(pack_follows),
+            PktLine::Delim | PktLine::ResponseEnd => {}
+            PktLine::Data(bytes) => {
+                skipped = skipped.saturating_add(bytes.len());
+                if skipped > MAX_PACK_INPUT_BYTES {
+                    // As much as a whole pack, and still commands: stop
+                    // reading on the client's behalf.
+                    return Ok(false);
+                }
+                pack_follows |= command_writes_an_object(split_command_line(&bytes).0);
+            }
+        }
+    }
+}
+
+/// The branch `HEAD` names, as `refs/heads/<name>`, or `None` for a detached
+/// or unreadable-as-symbolic `HEAD`.
+fn current_branch(repo_path: &Path) -> Result<Option<String>> {
+    let repo = crate::repository::open(repo_path).context("failed to open repository")?;
+    let head = repo.head_name().context("failed to read HEAD")?;
+    Ok(head.map(|name| name.as_bstr().to_string()))
+}
+
+/// The `ng` reason for deleting the branch `HEAD` names — stock git's
+/// `receive.denyDeleteCurrent`, which is on by default. Deleting it leaves the
+/// repository with an unborn `HEAD` next to a full history: `git clone` checks
+/// out nothing and every default-branch read answers "empty".
+pub const CURRENT_BRANCH_DELETION: &str = "refusing to delete the current branch";
+
+/// The `ng` reason for a deletion refused because `HEAD` could not be read.
+const CURRENT_BRANCH_UNKNOWN: &str = "deletion check could not run on the server";
+
+/// Apply the caller's refusals and the deletion rules to every command that
+/// is still `ok`.
+fn enforce_ref_rules(repo_path: &Path, updates: &mut [RefUpdate], policy: &PushPolicy) {
+    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+        if let Some((_, message)) = policy
+            .rejected_refs
+            .iter()
+            .find(|(pattern, _)| ref_matches_rejection_pattern(&update.refname, pattern))
+        {
+            update.status = "error".to_string();
+            update.message = message.clone();
+        }
+    }
+
+    let deletes = |update: &RefUpdate| update.status == "ok" && update.new_sha == NULL_SHA1;
+    if !updates.iter().any(deletes) {
+        return;
+    }
+    let current = current_branch(repo_path);
+    for update in updates.iter_mut().filter(|update| deletes(update)) {
+        if let Some((_, message)) = policy
+            .undeletable_refs
+            .iter()
+            .find(|(pattern, _)| ref_matches_rejection_pattern(&update.refname, pattern))
+        {
+            update.status = "error".to_string();
+            update.message = message.clone();
+            continue;
+        }
+        match &current {
+            Ok(Some(current)) if *current == update.refname => {
+                update.status = "error".to_string();
+                update.message = CURRENT_BRANCH_DELETION.to_string();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    refname = %update.refname,
+                    error = %format!("{error:#}"),
+                    "receive-pack could not read HEAD to check a deletion"
+                );
+                update.status = "error".to_string();
+                update.message = CURRENT_BRANCH_UNKNOWN.to_string();
+            }
+        }
+    }
 }
 
 /// Process the push: read update commands, packfile, and update refs.
@@ -358,190 +679,121 @@ async fn process_push_with_rejections<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut updates = Vec::new();
-    let mut negotiation_bytes = 0_usize;
-    // Capabilities ride on the first command line only.
-    let mut report = None;
+    let CommandList {
+        mut updates,
+        report,
+        pack_follows,
+        refusal,
+    } = read_update_commands(reader).await?;
 
-    // Read update commands using proper pkt-line parsing.
-    // Each line is: `old_sha new_sha refname[\0capabilities]`
-    // Terminated by a flush packet ("0000").
-    loop {
-        let pkt = read_pkt_line(reader).await?;
-
-        // Flush packet or EOF → end of update commands
-        // Delim/ResponseEnd are V2-only and shouldn't appear in V1 protocol
-        match pkt {
-            PktLine::Flush => break,
-            PktLine::Delim | PktLine::ResponseEnd => continue,
-            PktLine::Data(bytes) => {
-                negotiation_bytes = checked_receive_negotiation_bytes(
-                    negotiation_bytes,
-                    bytes.len(),
-                    super::MAX_NEGOTIATION_INPUT_BYTES,
-                )?;
-                // RefUpdate stores a String and every policy/hook downstream
-                // compares that exact spelling. Lossy decoding silently
-                // rewrote a non-UTF-8 wire ref to U+FFFD and could therefore
-                // authorize one name before updating another.
-                let line = std::str::from_utf8(&bytes)
-                    .context("receive-pack update command must be valid UTF-8")?;
-                let line = line.trim_end_matches('\n');
-
-                if line.is_empty() {
-                    continue;
-                }
-
-                if updates.len() >= super::MAX_NEGOTIATION_ENTRIES {
-                    bail!(
-                        "receive-pack update list exceeds the configured {}-entry limit",
-                        super::MAX_NEGOTIATION_ENTRIES
-                    );
-                }
-
-                // The first update line carries the capabilities after NUL.
-                let (clean_line, capabilities) = match line.split_once('\0') {
-                    Some((command, capabilities)) => (command, capabilities),
-                    None => (line, ""),
-                };
-                if report.is_none() {
-                    report = Some(ReportRequest::from_capabilities(capabilities));
-                }
-
-                let parts: Vec<&str> = clean_line.split_whitespace().collect();
-                if parts.len() < 3 {
-                    continue;
-                }
-
-                let old_sha = parts[0].to_string();
-                let new_sha = parts[1].to_string();
-                let refname = parts[2].to_string();
-
-                tracing::info!(
-                    old = %old_sha,
-                    new = %new_sha,
-                    refname = %refname,
-                    "Receive-pack: update command"
+    if let Some(reason) = refusal {
+        tracing::warn!(refusal = %reason, "git receive-pack request refused");
+        if pack_follows {
+            // Best effort: the refusal is already decided, and a client that
+            // stops sending is no reason to lose it.
+            if let Err(error) = drain_pack(reader).await {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "receive-pack stopped reading the pack of a refused push"
                 );
-
-                let invalid = validate_wire_object_id(&old_sha)
-                    .and_then(|_| validate_wire_object_id(&new_sha))
-                    .err()
-                    .map(|error| error.to_string())
-                    .or_else(|| {
-                        validate_refname(&refname)
-                            .err()
-                            .map(|error| error.to_string())
-                    })
-                    // The server writes some of these for its own work and
-                    // compares what it wrote on the way out (`update-ref <ref>
-                    // <new> <old>`), and gives the others a meaning of its own
-                    // (a pull request's pipeline ref, git's object
-                    // replacement), so a client's write there is never wanted:
-                    // git's own `receive.hideRefs` makes a hidden ref
-                    // unwritable too (card_e62ac71c4768). Decided per ref,
-                    // before any object is read, so the rest of the push is
-                    // unaffected.
-                    .or_else(|| {
-                        crate::ref_advertisement::is_server_owned(&refname)
-                            .then(|| SERVER_OWNED_NAMESPACE.to_string())
-                    });
-                if let Some(message) = invalid {
-                    updates.push(RefUpdate {
-                        old_sha,
-                        new_sha,
-                        refname,
-                        status: "error".to_string(),
-                        message,
-                    });
-                    continue;
-                }
-
-                // Skip null SHA (delete) for now.
-                if new_sha == NULL_SHA1 {
-                    updates.push(RefUpdate {
-                        old_sha,
-                        new_sha,
-                        refname,
-                        status: "error".to_string(),
-                        message: "deletion not supported".to_string(),
-                    });
-                    continue;
-                }
-
-                updates.push(RefUpdate {
-                    old_sha: old_sha.clone(),
-                    new_sha: new_sha.clone(),
-                    refname: refname.clone(),
-                    status: "ok".to_string(),
-                    message: String::new(),
-                });
             }
         }
-    }
-
-    let report = report.unwrap_or_default();
-    if updates.is_empty() {
-        return Ok(ReceivedPush { updates, report });
-    }
-
-    for update in &mut updates {
-        if update.status != "ok" {
-            continue;
-        }
-
-        if let Some((_, message)) = policy
-            .rejected_refs
-            .iter()
-            .find(|(pattern, _)| ref_matches_rejection_pattern(&update.refname, pattern))
-        {
+        for update in &mut updates {
             update.status = "error".to_string();
-            update.message = message.clone();
+            update.message = reason.clone();
+        }
+        return Ok(ReceivedPush {
+            updates,
+            report,
+            refusal: Some(reason),
+        });
+    }
+
+    if updates.is_empty() {
+        return Ok(ReceivedPush {
+            updates,
+            report,
+            refusal: None,
+        });
+    }
+
+    enforce_ref_rules(repo_path, &mut updates, policy);
+
+    let writes_objects = updates
+        .iter()
+        .any(|update| update.status == "ok" && update.new_sha != NULL_SHA1);
+    if !writes_objects {
+        // Nothing accepted needs the pack. Read it anyway when one is coming,
+        // so the client is never left writing into a socket nobody reads.
+        if pack_follows {
+            drain_pack(reader).await?;
+        }
+    } else {
+        // Receive the incoming pack and index it into the repository.
+        //
+        // Two implementations exist behind a flag (default: the git CLI):
+        //   * `index_pack_via_git`    — `git index-pack --fix-thin --stdin` (subprocess).
+        //   * `index_pack_native`     — `gix_pack::Bundle::write_to_directory` (in-process,
+        //     interrupt-driven). Opt-in PoC via `PLOMBIR_GIT_NATIVE_INDEX_PACK`, off by default.
+        //
+        // Both must resolve the thin-pack the same way: Plombir Git advertises the
+        // `thin-pack` capability, so clients send deltas whose base objects live in
+        // the repo but NOT in the pack. The CLI resolves them with `--fix-thin`; the
+        // native path passes the repo as the thin-pack base-object lookup. Omitting
+        // either fails with "missing delta base object".
+        if native_index_pack_enabled() {
+            index_pack_native(repo_path, reader).await?;
+        } else {
+            index_pack_via_git(repo_path, reader).await?;
         }
     }
 
-    if !updates.iter().any(|update| update.status == "ok") {
-        drain_pack(reader).await?;
-        return Ok(ReceivedPush { updates, report });
-    }
+    updates = check_and_write_refs(repo_path, updates, policy).await?;
 
-    // Receive the incoming pack and index it into the repository.
-    //
-    // Two implementations exist behind a flag (default: the git CLI):
-    //   * `index_pack_via_git`    — `git index-pack --fix-thin --stdin` (subprocess).
-    //   * `index_pack_native`     — `gix_pack::Bundle::write_to_directory` (in-process,
-    //     interrupt-driven). Opt-in PoC via `PLOMBIR_GIT_NATIVE_INDEX_PACK`, off by default.
-    //
-    // Both must resolve the thin-pack the same way: Plombir Git advertises the
-    // `thin-pack` capability, so clients send deltas whose base objects live in
-    // the repo but NOT in the pack. The CLI resolves them with `--fix-thin`; the
-    // native path passes the repo as the thin-pack base-object lookup. Omitting
-    // either fails with "missing delta base object".
-    if native_index_pack_enabled() {
-        index_pack_native(repo_path, reader).await?;
-    } else {
-        index_pack_via_git(repo_path, reader).await?;
-    }
+    // Point of no return crossed: the refs above are written and the caller's
+    // post-push hooks are owed. Everything after this line — the report-status
+    // write, the duplex drain — runs inside the transport's wall-clock budget,
+    // and an elapsed budget drops this future instead of letting it return, so
+    // the updates go into a sink that outlives the drop (card_ca431156e7df).
+    // No `.await` sits between the last `update_ref` and this call.
+    applied.record(&updates);
 
-    // Everything below reads the object database the pack just landed in, with
-    // git subprocesses and gix — synchronous work whose cost the push chooses,
-    // so it runs off the async workers. Connectivity goes first: the
-    // fast-forward and signature checks walk history from the new tip, which
-    // they can only do once the tip is known to be a complete object graph.
-    let repo = repo_path.to_path_buf();
-    let fast_forward_only = policy.fast_forward_only_refs.clone();
-    let signed = policy.require_signed_refs.clone();
-    updates = tokio::task::spawn_blocking(move || {
-        enforce_connectivity(&repo, &mut updates);
-        enforce_fast_forward_only(&repo, &mut updates, &fast_forward_only);
-        enforce_signed_commit_policies(&repo, &mut updates, &signed);
-        updates
+    Ok(ReceivedPush {
+        updates,
+        report,
+        refusal: None,
     })
-    .await
-    .context("receive-pack ref checks did not complete")?;
-    enforce_foreign_lfs_locks(repo_path, &mut updates, &policy.foreign_locks).await;
+}
 
-    // Update the refs
+/// The object checks and the ref writes of a push, once its objects are in
+/// the repository.
+///
+/// Connectivity goes first: the fast-forward and signature checks walk
+/// history from the new tip, which they can only do once the tip is known to
+/// be a complete object graph. A deletion writes no object and introduces no
+/// commit, so none of them concern it. Everything here reads the object
+/// database with git subprocesses and gix — synchronous work whose cost the
+/// push chooses, so it runs off the async workers.
+async fn check_and_write_refs(
+    repo_path: &Path,
+    mut updates: Vec<RefUpdate>,
+    policy: &PushPolicy,
+) -> Result<Vec<RefUpdate>> {
+    if updates.iter().any(writes_an_object) {
+        let repo = repo_path.to_path_buf();
+        let fast_forward_only = policy.fast_forward_only_refs.clone();
+        let signed = policy.require_signed_refs.clone();
+        updates = tokio::task::spawn_blocking(move || {
+            enforce_connectivity(&repo, &mut updates);
+            enforce_fast_forward_only(&repo, &mut updates, &fast_forward_only);
+            enforce_signed_commit_policies(&repo, &mut updates, &signed);
+            updates
+        })
+        .await
+        .context("receive-pack ref checks did not complete")?;
+        enforce_foreign_lfs_locks(repo_path, &mut updates, &policy.foreign_locks).await;
+    }
+
     for update in &mut updates {
         if update.status != "ok" {
             continue;
@@ -556,16 +808,30 @@ where
             }
         }
     }
+    Ok(updates)
+}
 
-    // Point of no return crossed: the refs above are written and the caller's
-    // post-push hooks are owed. Everything after this line — the report-status
-    // write, the duplex drain — runs inside the transport's wall-clock budget,
-    // and an elapsed budget drops this future instead of letting it return, so
-    // the updates go into a sink that outlives the drop (card_ca431156e7df).
-    // No `.await` sits between the last `update_ref` and this call.
-    applied.record(&updates);
-
-    Ok(ReceivedPush { updates, report })
+/// Move refs on the server's own behalf — the branches API, a merge's
+/// "delete head branch" — under exactly the rules a `git push` of the same
+/// commands meets: the caller's [`PushPolicy`], the deletion rules, and the
+/// object checks for anything the command points at. One function for every
+/// door, so `git push origin :main`, `DELETE /branches/main` and a merge
+/// cannot give three answers (card_2060696224ff).
+///
+/// The objects must already be in the repository: nothing here reads a pack.
+/// Each update comes back with its own status and message, as in the
+/// report-status a pusher reads; `Err` is a failure of the server's.
+pub async fn apply_server_ref_updates(
+    repo_path: &Path,
+    commands: Vec<(String, String, String)>,
+    policy: &PushPolicy,
+) -> Result<Vec<RefUpdate>> {
+    let mut updates: Vec<RefUpdate> = commands
+        .into_iter()
+        .map(|(old_sha, new_sha, refname)| checked_command(old_sha, new_sha, refname))
+        .collect();
+    enforce_ref_rules(repo_path, &mut updates, policy);
+    check_and_write_refs(repo_path, updates, policy).await
 }
 
 fn checked_receive_negotiation_bytes(
@@ -577,6 +843,14 @@ fn checked_receive_negotiation_bytes(
         .checked_add(frame_bytes)
         .filter(|size| *size <= max_bytes)
         .context("receive-pack negotiation exceeds the configured byte limit")
+}
+
+/// An accepted update that points its ref at an object — everything but a
+/// deletion. The checks that read the pushed objects (connectivity,
+/// fast-forward, signatures, LFS locks) concern only these: a deletion writes
+/// no object and introduces no commit.
+fn writes_an_object(update: &RefUpdate) -> bool {
+    update.status == "ok" && update.new_sha != NULL_SHA1
 }
 
 fn validate_wire_object_id(sha: &str) -> Result<()> {
@@ -869,7 +1143,7 @@ fn enforce_signed_commit_policies(
     updates: &mut [RefUpdate],
     patterns: &[String],
 ) {
-    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+    for update in updates.iter_mut().filter(|update| writes_an_object(update)) {
         match unsigned_commit_for_required_signature(
             repo_path,
             &update.old_sha,
@@ -936,7 +1210,7 @@ fn enforce_connectivity(repo_path: &Path, updates: &mut [RefUpdate]) {
             return;
         }
     };
-    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+    for update in updates.iter_mut().filter(|update| writes_an_object(update)) {
         let Ok(id) = gix::ObjectId::from_hex(update.new_sha.as_bytes()) else {
             update.status = "error".into();
             update.message = INCOMPLETE_PUSH.into();
@@ -975,7 +1249,7 @@ fn enforce_connectivity(repo_path: &Path, updates: &mut [RefUpdate]) {
 
     let tips: Vec<String> = updates
         .iter()
-        .filter(|update| update.status == "ok")
+        .filter(|update| writes_an_object(update))
         .map(|update| update.new_sha.clone())
         .collect();
     let mut incomplete: Vec<String> = Vec::new();
@@ -1058,7 +1332,7 @@ fn enforce_fast_forward_only(
     updates: &mut [RefUpdate],
     patterns: &[(String, String)],
 ) {
-    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+    for update in updates.iter_mut().filter(|update| writes_an_object(update)) {
         if update.old_sha == NULL_SHA1 {
             continue;
         }
@@ -1137,7 +1411,7 @@ async fn enforce_foreign_lfs_locks(
         return;
     }
     let locked = locked_paths(locks);
-    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+    for update in updates.iter_mut().filter(|update| writes_an_object(update)) {
         match first_locked_path_changed(repo_path, &update.new_sha, &locked).await {
             Ok(None) => {}
             Ok(Some(lock)) => {
@@ -1444,6 +1718,9 @@ fn update_ref(repo_path: &Path, refname: &str, old_sha: &str, new_sha: &str) -> 
     validate_wire_object_id(new_sha)?;
 
     let repo = crate::repository::open(repo_path).context("failed to open repository")?;
+    if new_sha == NULL_SHA1 {
+        return delete_ref(&repo, refname, old_sha);
+    }
     let object_id = gix::ObjectId::from_hex(new_sha.as_bytes())
         .map_err(|e| anyhow::anyhow!("invalid SHA: {}", e))?;
 
@@ -1460,6 +1737,29 @@ fn update_ref(repo_path: &Path, refname: &str, old_sha: &str, new_sha: &str) -> 
     repo.reference(refname, object_id, expected, "update via receive-pack")
         .map_err(|e| anyhow::anyhow!("failed to update ref {}: {}", refname, e))?;
 
+    Ok(())
+}
+
+/// Delete `refname` if it still holds `old_sha` — the same compare-and-swap an
+/// update gets, so a deletion racing another push removes nothing it did not
+/// see.
+fn delete_ref(repo: &gix::Repository, refname: &str, old_sha: &str) -> Result<()> {
+    use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
+
+    let old_object_id = gix::ObjectId::from_hex(old_sha.as_bytes())
+        .map_err(|e| anyhow::anyhow!("invalid old SHA: {}", e))?;
+    let name: gix::refs::FullName = refname
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("invalid refname {refname}: {e}"))?;
+    repo.edit_reference(RefEdit {
+        change: Change::Delete {
+            expected: PreviousValue::MustExistAndMatch(gix::refs::Target::Object(old_object_id)),
+            log: RefLog::AndReference,
+        },
+        name,
+        deref: false,
+    })
+    .map_err(|e| anyhow::anyhow!("failed to delete ref {}: {}", refname, e))?;
     Ok(())
 }
 
@@ -1486,8 +1786,15 @@ async fn send_response<W: AsyncWrite + Unpin>(
     writer: &mut W,
     results: &[RefUpdate],
     request: ReportRequest,
+    refusal: Option<&str>,
 ) -> Result<()> {
     if !request.report_status {
+        if let Some(reason) = refusal {
+            // No report to carry it, so the refusal goes out the way stock
+            // git ends a request it will not serve: an `ERR` packet, which
+            // the client prints as `remote error: <reason>`.
+            write_pkt_line(writer, &PktLine::text(&format!("ERR {reason}"))).await?;
+        }
         writer.flush().await?;
         tracing::info!("Receive-pack done; the client asked for no report-status");
         return Ok(());
@@ -1497,8 +1804,14 @@ async fn send_response<W: AsyncWrite + Unpin>(
     // These will be sent as band-1 sideband data in one shot.
     let mut report_buf: Vec<u8> = Vec::new();
 
-    // 1. unpack status (MUST be first)
-    write_pkt_line(&mut report_buf, &PktLine::text("unpack ok")).await?;
+    // 1. unpack status (MUST be first). A refused request is reported here:
+    // it is the line that speaks for the push as a whole, and a client that
+    // reads anything but `ok` fails every ref with the reason it names.
+    let unpack = match refusal {
+        Some(reason) => format!("unpack {reason}"),
+        None => "unpack ok".to_string(),
+    };
+    write_pkt_line(&mut report_buf, &PktLine::text(&unpack)).await?;
 
     // 2. per-ref update status
     for result in results {
@@ -2322,7 +2635,7 @@ mod wire_tests {
                 new_sha: "0".repeat(40),
                 refname: "refs/heads/bad".into(),
                 status: "error".into(),
-                message: "deletion not supported".into(),
+                message: "protected".into(),
             },
         ];
 
@@ -2334,6 +2647,7 @@ mod wire_tests {
                 report_status: true,
                 side_band_64k: true,
             },
+            None,
         )
         .await
         .unwrap();
@@ -2359,7 +2673,7 @@ mod wire_tests {
         );
         assert_eq!(
             read_pkt_line(&mut inner).await.unwrap(),
-            PktLine::text("ng refs/heads/bad deletion not supported")
+            PktLine::text("ng refs/heads/bad protected")
         );
         assert!(matches!(
             read_pkt_line(&mut inner).await.unwrap(),
@@ -2394,6 +2708,7 @@ mod wire_tests {
                 &mut out,
                 &results,
                 ReportRequest::from_capabilities(capabilities),
+                None,
             )
             .await
             .unwrap();
@@ -2451,11 +2766,13 @@ mod wire_tests {
 
     #[tokio::test]
     async fn process_push_handles_malformed_commands_without_spawning_indexer() {
-        // A garbage line (too few fields) is skipped; a deletion (null target)
-        // is reported as an error. With zero surviving `ok` updates, the pack is
-        // drained and no `git index-pack` is spawned — so this stays hermetic and
-        // must not panic on the hostile first line.
+        // A garbage line (too few fields) is skipped; a deletion of a ref that
+        // does not hold the named value is reported as an error. With zero
+        // surviving `ok` updates and nothing asking for a pack, no
+        // `git index-pack` is spawned — so this stays hermetic and must not
+        // panic on the hostile first line.
         let repo = tempfile::tempdir().unwrap();
+        gix::init_bare(repo.path()).unwrap();
 
         let mut stream = Vec::new();
         stream.extend_from_slice(&pkt(b"garbage-line-with-one-field\n"));
@@ -2477,7 +2794,13 @@ mod wire_tests {
         assert_eq!(updates.len(), 1, "only the deletion produces an update");
         assert_eq!(updates[0].refname, "refs/heads/gone");
         assert_eq!(updates[0].status, "error");
-        assert_eq!(updates[0].message, "deletion not supported");
+        assert!(
+            updates[0]
+                .message
+                .contains("failed to delete ref refs/heads/gone"),
+            "{}",
+            updates[0].message
+        );
     }
 
     #[tokio::test]
@@ -2523,26 +2846,59 @@ mod wire_tests {
         stream.extend_from_slice(b"0000");
         let mut reader = BufReader::new(Cursor::new(stream));
 
-        let error = process_push_with_rejections(
+        // The pusher's mistake, not a failure of ours: refused in the report
+        // the client reads, never an `Err` the transport answers with a 5xx
+        // (card_9e8736a9de16).
+        let received = process_push_with_rejections(
             repo.path(),
             &mut reader,
             &PushPolicy::default(),
             &AppliedRefUpdates::new(),
         )
         .await
-        .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("must be valid UTF-8"),
-            "{error:#}"
+        .expect("a non-UTF-8 command is refused, not failed");
+        assert_eq!(
+            received.refusal.as_deref(),
+            Some("receive-pack update command must be valid UTF-8")
         );
+        assert!(received.updates.is_empty(), "{:?}", received.updates);
     }
 
     #[tokio::test]
-    async fn process_push_propagates_error_on_non_hex_header() {
-        // A malformed pkt-line header in the command stream must surface as Err,
-        // never a panic (CWE-755).
+    async fn process_push_refuses_a_non_hex_header() {
+        // A malformed pkt-line header in the command stream is the client's
+        // framing error: refused in the report, never a panic (CWE-755) and
+        // never a server failure (card_9e8736a9de16).
         let repo = tempfile::tempdir().unwrap();
         let mut reader = BufReader::new(Cursor::new(Vec::from(b"zzzz".as_slice())));
+        let received = process_push_with_rejections(
+            repo.path(),
+            &mut reader,
+            &PushPolicy::default(),
+            &AppliedRefUpdates::new(),
+        )
+        .await
+        .expect("a framing error is refused, not failed");
+        let refusal = received.refusal.expect("the request must be refused");
+        assert!(refusal.starts_with("protocol error: "), "{refusal}");
+    }
+
+    /// The transport's own failure stays an `Err`: a read that breaks under
+    /// us is no refusal the client earned.
+    #[tokio::test]
+    async fn a_broken_transport_is_still_an_error() {
+        struct Broken;
+        impl tokio::io::AsyncRead for Broken {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("reset")))
+            }
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let mut reader = BufReader::new(Broken);
         let result = process_push_with_rejections(
             repo.path(),
             &mut reader,
@@ -2550,9 +2906,114 @@ mod wire_tests {
             &AppliedRefUpdates::new(),
         )
         .await;
-        assert!(
-            result.is_err(),
-            "non-hex header must surface as Err, got {result:?}"
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    /// card_9e8736a9de16: every whole-request refusal reaches the client in
+    /// the report it asked for, after the rest of its request was read — and
+    /// the refs read before the refusal are reported failed with the reason.
+    #[tokio::test]
+    async fn a_refused_request_is_answered_in_the_report_the_client_asked_for() {
+        let repo = tempfile::tempdir().unwrap();
+        let first = format!(
+            "{} {} refs/heads/ok\0report-status agent=git/2.43\n",
+            NULL_SHA1,
+            "a".repeat(40)
+        );
+        let mut bad = format!("{} {} refs/heads/", NULL_SHA1, "b".repeat(40)).into_bytes();
+        bad.extend_from_slice(&[0xff, b'\n']);
+        let mut request = pkt(first.as_bytes());
+        request.extend_from_slice(&pkt(&bad));
+        // A command after the refused one, which must be read past.
+        request.extend_from_slice(&pkt(format!(
+            "{} {} refs/heads/later\n",
+            NULL_SHA1,
+            "c".repeat(40)
+        )
+        .as_bytes()));
+        request.extend_from_slice(b"0000");
+        request.extend_from_slice(b"PACK-bytes-the-server-reads-past");
+
+        let mut response = Vec::new();
+        let outcome = handle_receive_pack_http_with_rejections(
+            repo.path(),
+            Cursor::new(request),
+            &mut response,
+            PushPolicy::default(),
+            &AppliedRefUpdates::new(),
+        )
+        .await
+        .expect("a refusal is a delivered response");
+        outcome
+            .report_status
+            .expect("the report reached the client");
+
+        let mut expected = pkt(b"unpack receive-pack update command must be valid UTF-8\n");
+        expected.extend_from_slice(&pkt(
+            b"ng refs/heads/ok receive-pack update command must be valid UTF-8\n",
+        ));
+        expected.extend_from_slice(b"0000");
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            String::from_utf8_lossy(&expected)
+        );
+        assert!(outcome
+            .ref_updates
+            .iter()
+            .all(|update| update.status == "error"));
+    }
+
+    /// A client that asked for no report still hears why: an `ERR` packet.
+    #[tokio::test]
+    async fn a_refusal_without_a_report_goes_out_as_an_err_packet() {
+        let mut out = Vec::new();
+        send_response(
+            &mut out,
+            &[],
+            ReportRequest::default(),
+            Some("receive-pack update command must be valid UTF-8"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            pkt(b"ERR receive-pack update command must be valid UTF-8\n")
+        );
+    }
+
+    /// The entry ceiling is a refusal too, and the commands past it are read,
+    /// not retained.
+    #[tokio::test]
+    async fn the_entry_ceiling_is_a_refusal() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut stream = Vec::new();
+        for index in 0..=crate::protocol::MAX_NEGOTIATION_ENTRIES {
+            let line = if index == 0 {
+                format!(
+                    "{} {} refs/heads/b{index}\0report-status\n",
+                    "c".repeat(40),
+                    NULL_SHA1
+                )
+            } else {
+                format!("{} {} refs/heads/b{index}\n", "c".repeat(40), NULL_SHA1)
+            };
+            stream.extend_from_slice(&pkt(line.as_bytes()));
+        }
+        stream.extend_from_slice(b"0000");
+        let mut reader = BufReader::new(Cursor::new(stream));
+        let received = process_push_with_rejections(
+            repo.path(),
+            &mut reader,
+            &PushPolicy::default(),
+            &AppliedRefUpdates::new(),
+        )
+        .await
+        .expect("the ceiling is refused, not failed");
+        let refusal = received.refusal.expect("the request must be refused");
+        assert!(refusal.contains("-entry limit"), "{refusal}");
+        assert_eq!(
+            received.updates.len(),
+            crate::protocol::MAX_NEGOTIATION_ENTRIES
         );
     }
 }
@@ -3315,5 +3776,138 @@ mod push_policy_tests {
         assert_eq!(refused.status, "error");
         assert_eq!(refused.message, "no rewrites on main");
         assert_eq!(branch(&served.bare, "main"), Some(ahead));
+    }
+    /// card_2060696224ff: `git push origin :feature` deletes the branch — with
+    /// no pack, because git sends none when every command is a deletion, so
+    /// receive-pack must not wait for one.
+    #[tokio::test]
+    async fn a_delete_only_push_removes_the_branch_without_waiting_for_a_pack() {
+        let served = Served::new();
+        git(&served.bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        served.publish(&served.base, "feature");
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, _server_write) = tokio::io::split(server);
+        let (_client_read, mut client_write) = tokio::io::split(client);
+        let command = format!(
+            "{} {NULL_SHA1} refs/heads/feature\0report-status delete-refs\n",
+            served.base
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, &pkt(command.as_bytes()))
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, b"0000")
+            .await
+            .unwrap();
+        // `client_write` stays open: a server that read on for a pack would
+        // wait here until the timeout below, as it did on SSH.
+
+        let mut reader = BufReader::new(server_read);
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            process_push_with_rejections(
+                &served.bare,
+                &mut reader,
+                &PushPolicy::default(),
+                &AppliedRefUpdates::new(),
+            ),
+        )
+        .await
+        .expect("a delete-only push must not wait for a pack")
+        .expect("the push runs to the end");
+
+        assert_eq!(
+            outcome(&received.updates, "refs/heads/feature").status,
+            "ok"
+        );
+        assert_eq!(branch(&served.bare, "feature"), None);
+        assert_eq!(branch(&served.bare, "main"), Some(served.base.clone()));
+        drop(client_write);
+    }
+
+    /// The branch `HEAD` names, a protected branch, and a branch that moved
+    /// since the client looked are all refused; nothing else in the push is.
+    #[tokio::test]
+    async fn deletions_follow_the_same_rules_for_every_pusher() {
+        let served = Served::new();
+        git(&served.bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let next = commit(&served.work, "next.txt", "next\n");
+        served.publish(&served.base, "release");
+        served.publish(&served.base, "stale");
+        served.publish(&next, "gone");
+        let policy = PushPolicy {
+            undeletable_refs: vec![(
+                "refs/heads/release".to_string(),
+                "protected branch 'release' cannot be deleted".to_string(),
+            )],
+            ..PushPolicy::default()
+        };
+
+        let updates = push(
+            &served.bare,
+            &[
+                (&served.base, NULL_SHA1, "refs/heads/main"),
+                (&served.base, NULL_SHA1, "refs/heads/release"),
+                (&next, NULL_SHA1, "refs/heads/stale"),
+                (&next, NULL_SHA1, "refs/heads/gone"),
+                (NULL_SHA1, NULL_SHA1, "refs/heads/nothing"),
+            ],
+            &policy,
+        )
+        .await;
+
+        let main = outcome(&updates, "refs/heads/main");
+        assert_eq!(main.status, "error");
+        assert_eq!(main.message, super::CURRENT_BRANCH_DELETION);
+        let release = outcome(&updates, "refs/heads/release");
+        assert_eq!(release.status, "error");
+        assert_eq!(
+            release.message,
+            "protected branch 'release' cannot be deleted"
+        );
+        let stale = outcome(&updates, "refs/heads/stale");
+        assert_eq!(stale.status, "error", "{stale:?}");
+        assert_eq!(outcome(&updates, "refs/heads/nothing").status, "error");
+        assert_eq!(outcome(&updates, "refs/heads/gone").status, "ok");
+
+        assert_eq!(branch(&served.bare, "main"), Some(served.base.clone()));
+        assert_eq!(branch(&served.bare, "release"), Some(served.base.clone()));
+        assert_eq!(branch(&served.bare, "stale"), Some(served.base.clone()));
+        assert_eq!(branch(&served.bare, "gone"), None);
+    }
+
+    /// A deletion next to an ordinary update: the pack is read for the update,
+    /// and the object checks it runs never judge the deletion.
+    #[tokio::test]
+    async fn a_deletion_rides_next_to_an_update() {
+        let served = Served::new();
+        git(&served.bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let next = commit(&served.work, "next.txt", "next\n");
+        served.deliver_objects(&next);
+        served.publish(&served.base, "old");
+        let policy = PushPolicy {
+            fast_forward_only_refs: vec![("refs/heads/*".to_string(), "no rewrite".to_string())],
+            require_signed_refs: vec!["refs/heads/old".to_string()],
+            ..PushPolicy::default()
+        };
+
+        let updates = push(
+            &served.bare,
+            &[
+                (&served.base, &next, "refs/heads/main"),
+                (&served.base, NULL_SHA1, "refs/heads/old"),
+            ],
+            &policy,
+        )
+        .await;
+
+        assert_eq!(outcome(&updates, "refs/heads/main").status, "ok");
+        assert_eq!(
+            outcome(&updates, "refs/heads/old").status,
+            "ok",
+            "{updates:?}"
+        );
+        assert_eq!(branch(&served.bare, "main"), Some(next));
+        assert_eq!(branch(&served.bare, "old"), None);
     }
 }

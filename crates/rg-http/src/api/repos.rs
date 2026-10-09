@@ -21,7 +21,8 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use crate::api::repo_access::{
-    NamespaceCreate, RepoAuthRead, RepoOwner, RepoRead, RepoWrite, TargetOwner, TargetOwnerOrSelf,
+    NamespaceCreate, RepoAdmin, RepoAuthRead, RepoOwner, RepoRead, RepoWrite, TargetOwner,
+    TargetOwnerOrSelf,
 };
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
@@ -97,6 +98,14 @@ pub struct RepoResponse {
     pub updated_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// What the signed-in caller may do here — `admin`, `write` or `read`;
+    /// absent for an anonymous reader. Only `GET /repos/{owner}/{name}`
+    /// carries it. It tells a client which actions to offer; every write is
+    /// still decided by its own route, and a scoped token may be refused what
+    /// its owner's level here allows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub viewer_permission: Option<&'static str>,
 }
 
 /// Public repository row as it appears in the explore listing.
@@ -409,8 +418,39 @@ pub async fn list_repos(
 )]
 /// GET /api/v1/repos/:owner/:name
 /// Gets a single repo, supporting both user and org owners.
-pub async fn get_repo(RepoRead { repo }: RepoRead) -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!(repo))).into_response()
+pub async fn get_repo(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    RepoRead { repo }: RepoRead,
+) -> impl IntoResponse {
+    let viewer_permission = match viewer_permission(&state, &headers, &repo).await {
+        Ok(permission) => permission,
+        Err(e) => return e.into_response(),
+    };
+    let mut body = serde_json::json!(repo);
+    if let (Some(permission), Some(fields)) = (viewer_permission, body.as_object_mut()) {
+        fields.insert("viewer_permission".into(), permission.into());
+    }
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// The caller's level on `repo`, for [`RepoResponse::viewer_permission`]:
+/// the gate module's own questions, asked once each.
+async fn viewer_permission(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    repo: &rg_db::entities::repository::Model,
+) -> Result<Option<&'static str>, AppError> {
+    let Some(actor_id) = super::auth::extract_user_id(headers, &state.jwt_secret) else {
+        return Ok(None);
+    };
+    if crate::api::repo_access::may_admin(state, repo, Some(actor_id)).await? {
+        return Ok(Some("admin"));
+    }
+    if crate::api::repo_access::may_write(state, repo, Some(actor_id)).await? {
+        return Ok(Some("write"));
+    }
+    Ok(Some("read"))
 }
 
 // ── Star/Watch/Delete handlers ───────────────────────────────────────────────
@@ -856,14 +896,20 @@ pub async fn fork_repo_handler(
 pub async fn list_forks_handler(
     State(state): State<AppState>,
     RepoRead { .. }: RepoRead,
+    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
     let pagination = params.clamp();
     let offset = pagination.offset();
     let limit = pagination.limit();
+    // A fork is a repository of its own: reading the parent is no licence to
+    // see a private fork of it (card_bb2ef2307588).
+    let viewer_id = extract_user_id(&headers, &state.jwt_secret);
 
-    match rg_core::repo::service::list_forks(&state.db, &owner, &name, offset, limit).await {
+    match rg_core::repo::service::list_forks(&state.db, &owner, &name, viewer_id, offset, limit)
+        .await
+    {
         Ok((forks, total)) => {
             let forks = forks.into_iter().map(ForkResponse::from).collect();
             (
@@ -977,6 +1023,129 @@ pub async fn transfer_repo_handler(
         // Unknown repository → 404, non-owner → 403, unknown destination owner or
         // a name already taken there → 400. The directory rename that moves the
         // repository on disk is ours and no longer masquerades as a bad request.
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+// ── Repository settings ───────────────────────────────────────────────
+
+/// The settings `PATCH /repos/{owner}/{name}` edits. An absent key leaves its
+/// setting alone.
+#[derive(serde::Deserialize, ToSchema)]
+pub struct UpdateRepoRequest {
+    /// `null` or `""` clears it.
+    #[serde(default, deserialize_with = "crate::api::clearable::double_option")]
+    #[schema(value_type = Option<String>)]
+    pub description: Option<Option<String>>,
+    #[serde(default)]
+    pub is_private: Option<bool>,
+    /// An existing branch; `HEAD` of the repository moves to it.
+    #[serde(default)]
+    pub default_branch: Option<String>,
+    /// A new name in the same namespace. Every storage keyed by
+    /// `<owner>/<name>` moves with it; the repository keeps its id.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// PATCH /api/v1/repos/:owner/:name
+///
+/// The repository's description, visibility, default branch and name
+/// (card_3625a7b89abb). Repository administrators only. A visibility change and
+/// a rename are written to the audit log.
+#[utoipa::path(
+    patch,
+    path = "/repos/{owner}/{name}",
+    tag = "Repositories",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+    ),
+    request_body = UpdateRepoRequest,
+    responses(
+        (status = 200, description = "Updated", body = serde_json::Value),
+        (status = 400, description = "Unknown branch, invalid name or description", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Forbidden", body = serde_json::Value),
+        (status = 404, description = "Repository not found", body = serde_json::Value),
+        (status = 409, description = "The namespace already holds a repository of that name", body = serde_json::Value),
+    ),
+)]
+pub async fn update_repo_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    Json(body): Json<UpdateRepoRequest>,
+) -> impl IntoResponse {
+    for segment in [&owner, &name] {
+        if let Err(e) = rg_core::platform::validate_repo_path(segment) {
+            return AppError::bad_request(e.to_string()).into_response();
+        }
+    }
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    let repo_path = state.repo_root.join(format!("{owner}/{name}.git"));
+    let was_private = repo.is_private;
+    let updated = match rg_core::repo::service::update_repo_settings(
+        &state.db,
+        &repo_path,
+        &repo,
+        rg_core::repo::service::RepoSettingsChange {
+            description: body.description,
+            is_private: body.is_private,
+            default_branch: body.default_branch,
+        },
+    )
+    .await
+    {
+        Ok(updated) => updated,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    if updated.is_private != was_private {
+        rg_core::audit::record(
+            &state.db,
+            &audit_actor,
+            "repo.visibility_change",
+            Some("repo"),
+            Some(updated.id),
+            Some(&format!("{owner}/{name}")),
+            Some(&headers),
+            Some(serde_json::json!({ "is_private": updated.is_private })),
+        )
+        .await;
+    }
+
+    let Some(new_name) = body.name.filter(|new_name| *new_name != name) else {
+        return (StatusCode::OK, Json(serde_json::json!(updated))).into_response();
+    };
+    match rg_core::repo::service::rename_repo(
+        &state.db,
+        &owner,
+        &name,
+        &new_name,
+        &state.repo_root,
+        state.blob_storage.as_ref(),
+        state.oci_storage.as_ref(),
+    )
+    .await
+    {
+        Ok(renamed) => {
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                "repo.rename",
+                Some("repo"),
+                Some(renamed.id),
+                Some(&format!("{owner}/{new_name}")),
+                Some(&headers),
+                Some(serde_json::json!({ "old_name": name, "new_name": new_name })),
+            )
+            .await;
+            (StatusCode::OK, Json(serde_json::json!(renamed))).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

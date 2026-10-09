@@ -106,17 +106,26 @@ pub async fn read_pkt_line<R: AsyncRead + Unpin>(reader: &mut R) -> Result<PktLi
         Err(e) => return Err(e.into()),
     }
 
-    let header_str = std::str::from_utf8(&header)?;
-    let len: usize = match u32::from_str_radix(header_str, 16) {
-        Ok(0) => return Ok(PktLine::Flush),
-        Ok(1) => return Ok(PktLine::Delim), // 0001 = delimiter
-        Ok(2) => return Ok(PktLine::ResponseEnd), // 0002 = response end
-        Ok(n) => n as usize,
-        Err(_) => bail!("invalid pkt-line header: {:?}", header),
+    // Every reader of this is the server reading a client, so a frame the
+    // grammar does not allow is the client's mistake: a refusal it is told
+    // about, not a failure of ours (card_9e8736a9de16). An I/O error stays
+    // what it is.
+    let malformed = |what: String| -> anyhow::Error {
+        crate::protocol::ClientRefusal::new(format!("protocol error: {what}")).into()
+    };
+    let len: usize = match std::str::from_utf8(&header)
+        .ok()
+        .map(|header_str| u32::from_str_radix(header_str, 16))
+    {
+        Some(Ok(0)) => return Ok(PktLine::Flush),
+        Some(Ok(1)) => return Ok(PktLine::Delim), // 0001 = delimiter
+        Some(Ok(2)) => return Ok(PktLine::ResponseEnd), // 0002 = response end
+        Some(Ok(n)) => n as usize,
+        _ => return Err(malformed(format!("invalid pkt-line header: {header:?}"))),
     };
 
     if len < 4 {
-        bail!("invalid pkt-line length: {}", len);
+        return Err(malformed(format!("invalid pkt-line length: {len}")));
     }
 
     let payload_len = len - 4;
@@ -284,6 +293,37 @@ mod tests {
         assert!(
             result.is_err(),
             "expected Err on truncated payload, got {result:?}"
+        );
+    }
+
+    /// card_9e8736a9de16: a frame the grammar does not allow is the client's
+    /// mistake — a [`crate::protocol::ClientRefusal`] the transports answer
+    /// as a delivered refusal — while a read that breaks under us is not.
+    #[tokio::test]
+    async fn a_malformed_frame_is_a_client_refusal_and_a_cut_read_is_not() {
+        for frame in [
+            b"zzzz".to_vec(),
+            vec![0xffu8, 0xfe, 0xfd, 0xfc],
+            b"0003".to_vec(),
+        ] {
+            let mut reader = BufReader::new(Cursor::new(frame.clone()));
+            let error = read_pkt_line(&mut reader).await.unwrap_err();
+            let refusal = crate::protocol::client_refusal(&error)
+                .unwrap_or_else(|| panic!("{frame:?} was not refused: {error:#}"));
+            assert!(
+                refusal.reason().starts_with("protocol error: "),
+                "{}",
+                refusal.reason()
+            );
+        }
+
+        let mut cut = Vec::from(b"0010".as_slice());
+        cut.extend_from_slice(b"short");
+        let mut reader = BufReader::new(Cursor::new(cut));
+        let error = read_pkt_line(&mut reader).await.unwrap_err();
+        assert!(
+            crate::protocol::client_refusal(&error).is_none(),
+            "a cut read was blamed on the client: {error:#}"
         );
     }
 

@@ -86,6 +86,8 @@ beforeEach(() => {
 		stars_count: 0,
 		is_private: false,
 		created_at: '2026-08-31T00:00:00Z',
+		// The write controls follow it (card_3625a7b89abb).
+		viewer_permission: 'write',
 	});
 });
 

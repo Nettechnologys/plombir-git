@@ -2,6 +2,9 @@
   import { page } from '$app/stores';
   import { ciRetention, type CiRetentionPolicy } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
+  import { createT } from '$lib/i18n';
+
+  const t = createT();
 
   const owner = $derived($page.params.owner!);
   const repo = $derived($page.params.repo!);
@@ -75,7 +78,7 @@
       const updated = await ciRetention.update(expectedOwner, expectedRepo, policy);
       if (policyRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
         fillPolicy(updated);
-        message = 'Retention policy saved. New uploads use the updated lifetime.';
+        message = t('settings.retention.saved');
         error = '';
       }
     } catch (e: any) {
@@ -98,7 +101,10 @@
       message = '';
       const result = await ciRetention.cleanup(expectedOwner, expectedRepo);
       if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
-        message = `Deleted ${result.artifacts_deleted} artifact(s) and ${result.caches_deleted} cache entry(s).${result.failures ? ` ${result.failures} item(s) could not be safely removed.` : ''}`;
+        message = t('settings.retention.cleaned', {
+          artifacts: result.artifacts_deleted,
+          caches: result.caches_deleted,
+        }) + (result.failures ? ` ${t('settings.retention.cleanup_failures', { count: result.failures })}` : '');
         error = '';
       }
     } catch (e: any) {
@@ -109,22 +115,22 @@
   }
 </script>
 
-<svelte:head><title>CI retention · {owner}/{repo}</title></svelte:head>
+<svelte:head><title>{t('settings.retention.title')} · {owner}/{repo}</title></svelte:head>
 <div class="settings-page">
-  <header><h1>CI retention</h1><p>Control how long newly uploaded artifacts and accessed caches remain available. Expired storage is reclaimed hourly.</p></header>
+  <header><h1>{t('settings.retention.title')}</h1><p>{t('settings.retention.desc')}</p></header>
   {#if error}<div class="message error" role="alert">{error}</div>{/if}
   {#if message}<div class="message" role="status">{message}</div>{/if}
   {#if loading}
-    <p>Loading…</p>
+    <p>{t('settings.retention.loading')}</p>
   {:else}
     <form onsubmit={save}>
-      <label for="artifact-days">Artifact retention (days)</label>
+      <label for="artifact-days">{t('settings.retention.artifact_days')}</label>
       <input id="artifact-days" type="number" min="1" max="3650" bind:value={artifactDays} disabled={busy} required />
-      <label for="cache-days">Cache retention after last access (days)</label>
+      <label for="cache-days">{t('settings.retention.cache_days')}</label>
       <input id="cache-days" type="number" min="1" max="3650" bind:value={cacheDays} disabled={busy} required />
       <div class="actions">
-        <button class="btn btn-primary" disabled={busy} aria-busy={busy}>Save policy</button>
-        <button type="button" class="btn" onclick={cleanup} disabled={busy} aria-busy={busy}>Clean expired storage now</button>
+        <button class="btn btn-primary" disabled={busy} aria-busy={busy}>{t('settings.retention.save')}</button>
+        <button type="button" class="btn" onclick={cleanup} disabled={busy} aria-busy={busy}>{t('settings.retention.cleanup')}</button>
       </div>
     </form>
   {/if}

@@ -1084,7 +1084,7 @@ fn build_info_refs(repo_path: &std::path::Path, service: &str) -> Result<String>
     let caps = if service == "git-upload-pack" {
         "multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=plombir-git/0.1"
     } else {
-        "report-status report-status-v2 side-band-64k agent=plombir-git/0.1"
+        rg_git::protocol::receive_pack::CAPABILITIES
     };
 
     if let Some((sha, refname)) = ref_list.first() {
@@ -2226,14 +2226,16 @@ mod tests {
     /// to choose — and a handler that fails there must still answer with the
     /// sanitized 500, exactly as the fully-buffered version did.
     ///
-    /// The failure is injected as a malformed pkt-line length, which
-    /// `read_want_have_split` rejects before anything is written back.
+    /// The failure is injected as a frame cut off mid-payload — the request
+    /// ends where the server still has bytes to read, which no client can be
+    /// told about. (A malformed frame is the client's mistake and answered as a
+    /// delivered refusal since card_9e8736a9de16.)
     #[tokio::test]
     async fn upload_pack_failing_before_any_output_is_a_sanitized_500() {
         let response = super::stream_upload_pack_response(
             super::UploadPackProtocol::V1,
             std::path::PathBuf::from("/nonexistent-repo.git"),
-            staged_request(b"zzzz").await,
+            staged_request(b"0010short").await,
             rg_core::git_sessions::global().try_acquire(None).unwrap(),
             30,
             30,
@@ -2376,6 +2378,98 @@ mod tests {
             let expected = pkt(&format!("ERR upload-pack: not our ref {absent}\n"));
             assert_eq!(body.as_ref(), expected.as_slice(), "{label}");
         }
+    }
+
+    /// card_9e8736a9de16, the sideways half: a frame the pkt-line grammar does
+    /// not allow is the client's mistake on upload-pack too — a delivered
+    /// `ERR`, never a `500`.
+    #[tokio::test]
+    async fn a_malformed_upload_pack_frame_is_a_delivered_err_packet() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let repo = scratch.path().join("empty.git");
+        gix::init_bare(&repo).expect("init bare");
+
+        for protocol in [super::UploadPackProtocol::V1, super::UploadPackProtocol::V2] {
+            let label = protocol.operation();
+            let response = super::stream_upload_pack_response(
+                protocol,
+                repo.clone(),
+                staged_request(b"zzzz").await,
+                rg_core::git_sessions::global().try_acquire(None).unwrap(),
+                30,
+                30,
+                "owner",
+                "repo",
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK, "{label}");
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .unwrap_or_else(|error| panic!("{label}: refusal body broke: {error}"))
+                .to_bytes();
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                body.contains("ERR protocol error: invalid pkt-line header"),
+                "{label}: {body}"
+            );
+        }
+    }
+
+    /// card_9e8736a9de16: a push whose command is not UTF-8 is the pusher's
+    /// mistake. The transport delivers the refusal in the report-status the
+    /// client asked for — `200`, the reason readable as `unpack <reason>` —
+    /// and logs it at warn, never the `ERROR` and `500` of a broken server.
+    #[tokio::test]
+    async fn a_refused_push_is_a_delivered_report_not_a_500() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let repo = scratch.path().join("served.git");
+        gix::init_bare(&repo).expect("init bare");
+        let mut command = format!("{} {} refs/heads/", "0".repeat(40), "a".repeat(40)).into_bytes();
+        command.extend_from_slice(&[0xff, 0, b'r']);
+        command.extend_from_slice(b"eport-status side-band-64k\n");
+        let mut request = format!("{:04x}", command.len() + 4).into_bytes();
+        request.extend_from_slice(&command);
+        request.extend_from_slice(b"0000");
+
+        let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
+        let reader_task = spawn_git_response_reader(buf_reader);
+        let outcome = rg_git::protocol::receive_pack::handle_receive_pack_http_with_rejections(
+            &repo,
+            std::io::Cursor::new(request),
+            &mut buf_writer,
+            rg_git::protocol::receive_pack::PushPolicy::default(),
+            &AppliedRefUpdates::new(),
+        )
+        .await
+        .expect("a refused push is a delivered response");
+        let (updates, (status, _, body)) =
+            finish_landed_receive_pack(outcome, buf_writer, reader_task).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(updates.iter().all(|update| update.status != "ok"));
+        let body = body.collect().await.expect("report body").to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("unpack receive-pack update command must be valid UTF-8"),
+            "{body}"
+        );
+        let rendered = logs.text();
+        assert!(!rendered.contains("ERROR"), "{rendered}");
+        assert!(
+            rendered.contains("git receive-pack request refused"),
+            "{rendered}"
+        );
     }
 
     /// A handler that legitimately produces nothing still answers 200 with an

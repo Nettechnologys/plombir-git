@@ -19,6 +19,7 @@ import {
 	instance,
 	releases as routeReleases,
 	resetTestClient,
+	repos as viewerRepos,
 } from '../test/client';
 import { click, element, renderComponent, settle, type RenderedComponent } from '../test/render';
 
@@ -152,6 +153,8 @@ describe('release asset upload transport', () => {
 
 beforeEach(() => {
 	resetTestClient();
+	// The write controls follow `viewer_permission` (card_3625a7b89abb).
+	viewerRepos.get.mockResolvedValue({ viewer_permission: 'write' });
 	setTestPage('/alice/demo/releases', { owner: 'alice', repo: 'demo' });
 	instance.get.mockResolvedValue({ attestation_enabled: false });
 	routeReleases.list.mockResolvedValue({

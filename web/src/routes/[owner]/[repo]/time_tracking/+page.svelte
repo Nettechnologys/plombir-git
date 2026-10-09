@@ -236,7 +236,7 @@
 
   async function handleDelete(id: number) {
     if (mutationBusy || !selectedIssue) return;
-    if (!confirm('Delete this time entry?')) return;
+    if (!confirm(t('repo.time_tracking.delete_confirm'))) return;
     const selection = {
       ...currentRoute(),
       issueNumber: selectedIssue.number,
@@ -258,15 +258,17 @@
   }
 
   function fmtMinutes(m: number): string {
-    if (m < 60) return `${m}m`;
+    if (m < 60) return t('time_tracking.minutes_short', { minutes: m });
     const h = Math.floor(m / 60);
     const rem = m % 60;
-    return rem > 0 ? `${h}h ${rem}m` : `${h}h`;
+    return rem > 0
+      ? t('time_tracking.hours_minutes_short', { hours: h, minutes: rem })
+      : t('time_tracking.hours_short', { hours: h });
   }
 </script>
 
 <svelte:head>
-  <title>Time Tracking · {owner}/{repo} · Plombir Git</title>
+  <title>{t('time_tracking.title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -284,12 +286,12 @@
     <!-- Issue list sidebar -->
     <aside class="issue-sidebar">
       <div class="sidebar-header">
-        <h3>Issues</h3>
+        <h3>{t('time_tracking.issues')}</h3>
       </div>
       {#if issueLoading}
-        <p class="sidebar-empty">Loading…</p>
+        <p class="sidebar-empty">{t('time_tracking.loading')}</p>
       {:else if issueList.length === 0}
-        <p class="sidebar-empty">No open issues.</p>
+        <p class="sidebar-empty">{t('time_tracking.no_open_issues')}</p>
       {:else}
         <nav class="issue-nav">
           {#each issueList as issue}
@@ -311,7 +313,7 @@
     <main class="main-panel">
       {#if !selectedIssue}
         <div class="select-hint">
-          <p>← Select an issue to view and log time</p>
+          <p>{t('time_tracking.select_hint')}</p>
         </div>
       {:else}
         <div class="issue-header">
@@ -335,7 +337,7 @@
           {:else if totalLoading}
             <div class="total-badge">{t('common.loading')}</div>
           {:else if totalFormatted}
-            <div class="total-badge">Total: {totalFormatted}</div>
+            <div class="total-badge">{t('time_tracking.total', { total: totalFormatted })}</div>
           {/if}
         </div>
 
@@ -344,16 +346,16 @@
           <h3>{t('repo.time_tracking.add_entry')}</h3>
           <div class="form-row">
             <div class="form-group">
-              <label for="tt-dur">Duration (hours)</label>
+              <label for="tt-dur">{t('repo.time_tracking.duration')}</label>
               <input id="tt-dur" type="number" min="0.25" step="0.25" bind:value={durationHours} disabled={mutationBusy} />
             </div>
             <div class="form-group flex-grow">
-              <label for="tt-desc">Note</label>
-              <input id="tt-desc" type="text" placeholder="(optional)" bind:value={description} disabled={mutationBusy} />
+              <label for="tt-desc">{t('repo.time_tracking.note')}</label>
+              <input id="tt-desc" type="text" placeholder={t('common.optional')} bind:value={description} disabled={mutationBusy} />
             </div>
             <div class="form-action">
               <button class="btn-primary" onclick={handleAdd} disabled={mutationBusy}>
-                {mutationBusy ? '…' : 'Add'}
+                {mutationBusy ? '…' : t('common.add')}
               </button>
             </div>
           </div>
@@ -361,16 +363,16 @@
 
         <!-- Entries table -->
         {#if entriesLoading}
-          <p class="loading-text">Loading…</p>
+          <p class="loading-text">{t('time_tracking.loading')}</p>
         {:else if entries.length === 0}
-          <div class="empty">No time entries for this issue yet.</div>
+          <div class="empty">{t('time_tracking.no_entries_for_issue')}</div>
         {:else}
           <table class="entries-table">
             <thead>
               <tr>
-                <th>Duration</th>
-                <th>Note</th>
-                <th>Logged</th>
+                <th>{t('time_tracking.duration_column')}</th>
+                <th>{t('repo.time_tracking.note')}</th>
+                <th>{t('time_tracking.logged_column')}</th>
                 <th></th>
               </tr>
             </thead>
@@ -381,7 +383,7 @@
                   <td class="note-cell">{entry.description || '—'}</td>
                   <td class="date-cell">{entry.created_at?.slice(0, 10) || ''}</td>
                   <td class="act-cell">
-                    <button class="btn-danger btn-sm" onclick={() => handleDelete(entry.id)} disabled={mutationBusy}>Delete</button>
+                    <button class="btn-danger btn-sm" onclick={() => handleDelete(entry.id)} disabled={mutationBusy}>{t('common.delete')}</button>
                   </td>
                 </tr>
               {/each}
@@ -391,10 +393,10 @@
           {#if totalPages > 1}
             <div class="pagination">
               <button class="btn-outline" disabled={mutationBusy || currentPage <= 1}
-                onclick={() => { currentPage--; loadEntries(); }}>Previous</button>
+                onclick={() => { currentPage--; loadEntries(); }}>{t('common.previous')}</button>
               <span>{currentPage} / {totalPages}</span>
               <button class="btn-outline" disabled={mutationBusy || currentPage >= totalPages}
-                onclick={() => { currentPage++; loadEntries(); }}>Next</button>
+                onclick={() => { currentPage++; loadEntries(); }}>{t('common.next')}</button>
             </div>
           {/if}
         {/if}

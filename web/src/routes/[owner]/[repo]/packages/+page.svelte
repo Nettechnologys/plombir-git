@@ -137,7 +137,7 @@
 </script>
 
 <svelte:head>
-  <title>Packages · {owner}/{repo} · Plombir Git</title>
+  <title>{t('packages.title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -229,7 +229,7 @@
         >
           {t('common.previous', 'Previous')}
         </button>
-        <span class="page-info">Page {currentPage} of {totalPages}</span>
+        <span class="page-info">{t('packages.page_info', { page: currentPage, total: totalPages })}</span>
         <button
           class="btn-outline"
           disabled={currentPage >= totalPages}

@@ -371,6 +371,7 @@ pub async fn request_codeowners(
                 .commit()
                 .await
                 .context("db: commit CODEOWNER reviewer request")?;
+            crate::review::service::notify_review_requested(db, pr_id, user.id, requested_by_id);
             requested.push(user.username);
         }
     }

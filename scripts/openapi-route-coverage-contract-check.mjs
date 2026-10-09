@@ -291,6 +291,21 @@ function baseParamType(type) {
   return head.split('::').at(-1);
 }
 
+/**
+ * The transport extractor a local carrier wraps.
+ *
+ * `PullHead<E>` resolves and gates a pull-request head the request names, and
+ * hands `E` back whole — so it consumes exactly what `E` consumes: a body for
+ * `PullHead<Json<_>>`, a query for `PullHead<InQuery<_>>`. `InQuery<T>` is the
+ * body-position spelling of axum's `Query<T>` (card_bb2ef2307588).
+ */
+function unwrapCarrier(type) {
+  let inner = type.trim();
+  const carried = /^(?:[\w:]*::)?PullHead\s*<([\s\S]+)>$/.exec(inner);
+  if (carried) inner = carried[1].trim();
+  return inner.replace(/^(?:[\w:]*::)?InQuery\s*</, 'Query<');
+}
+
 /** The `T` in an outer `Query<T>` extractor type. */
 function queryParamType(type) {
   const match = /(?:^|::)Query\s*<([\s\S]+)>$/.exec(type.trim());
@@ -311,8 +326,9 @@ function handlerInput(annotation) {
   const types = [];
   let queryType = null;
   for (const param of params) {
-    const type = rustParamType(param);
-    if (type === null) return null;
+    const raw = rustParamType(param);
+    if (raw === null) return null;
+    const type = unwrapCarrier(raw);
     types.push(baseParamType(type));
     queryType ??= queryParamType(type);
   }

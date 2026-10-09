@@ -9,8 +9,8 @@
 //!   GET    /repos/:o/:r/releases/assets/:asset_id — get asset metadata
 
 use crate::common::{
-    create_repo, register_user, setup_test_db, spawn_test_app, spawn_test_app_over_db_with,
-    StateOverrides,
+    create_initialised_repo, register_user, setup_test_db, spawn_test_app,
+    spawn_test_app_over_db_with, StateOverrides,
 };
 use sea_orm::{ConnectionTrait, Statement};
 use std::time::Duration;
@@ -23,7 +23,7 @@ async fn setup(suffix: &str) -> (String, String, String, String) {
     let owner = format!("reluser{suffix}");
     let token = register_user(&base, &owner, &format!("reluser{suffix}@example.com"), PW).await;
     let repo = format!("relrepo{suffix}");
-    create_repo(&base, &token, &repo).await;
+    create_initialised_repo(&base, &token, &repo).await;
     (base, token, owner, repo)
 }
 
@@ -355,7 +355,7 @@ async fn release_asset_metadata_is_routed_and_scoped_to_its_repository() {
     }
 
     let other_repo = format!("{repo}other");
-    create_repo(&base, &token, &other_repo).await;
+    create_initialised_repo(&base, &token, &other_repo).await;
     let foreign = client
         .get(format!(
             "{base}/api/v1/repos/{owner}/{other_repo}/releases/assets/{asset_id}"
@@ -394,7 +394,7 @@ async fn release_asset_downloads_keep_parallel_counts_and_type_delete_races() {
     let owner = "reldownloadrace".to_string();
     let token = register_user(&base, &owner, "reldownloadrace@example.com", PW).await;
     let repo = "reldownloadracerepo".to_string();
-    create_repo(&base, &token, &repo).await;
+    create_initialised_repo(&base, &token, &repo).await;
     let release = create_release(
         &base,
         &token,
@@ -559,5 +559,142 @@ async fn release_asset_upload_crosses_axum_default_and_gates_before_reading() {
         headers_only_asset_upload_status(&base, &missing_release_path, Some(&token), 1).await,
         404,
         "release scope must be checked without waiting for the upload body"
+    );
+}
+
+/// card_4d406b01b722: a release names a tag that exists in git.
+///
+/// * a new `tag_name` is created as a tag at `target_commitish` (a branch);
+/// * a tag that already exists is the release's tag, untouched;
+/// * a draft creates its tag when it is published, not before;
+/// * a target that names no commit is refused, and no row or tag is left;
+/// * tag protection refuses the release exactly as it refuses a push.
+#[tokio::test]
+async fn a_release_creates_the_tag_it_names() {
+    let (base, _db, repo_root) = crate::common::spawn_test_app_with_db_and_repo_root().await;
+    let token = register_user(&base, "reltag", "reltag@example.com", PW).await;
+    create_initialised_repo(&base, &token, "tagged").await;
+    let bare = repo_root.join("reltag/tagged.git");
+    let client = reqwest::Client::new();
+    let releases = format!("{base}/api/v1/repos/reltag/tagged/releases");
+    let tag_of = |tag: &str| {
+        let output = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    &format!("refs/tags/{tag}^{{commit}}"),
+                ],
+                Some(&bare),
+            )
+            .unwrap();
+        output
+            .success()
+            .then(|| output.stdout_str().trim().to_string())
+    };
+    let main = {
+        let output = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(&["rev-parse", "refs/heads/main"], Some(&bare))
+            .unwrap();
+        output.stdout_str().trim().to_string()
+    };
+    let create = |body: serde_json::Value| {
+        let client = client.clone();
+        let releases = releases.clone();
+        let token = token.clone();
+        async move {
+            let response = client
+                .post(releases)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            (status, body)
+        }
+    };
+
+    let (status, body) = create(
+        serde_json::json!({"tag_name": "first", "title": "First", "target_commitish": "main"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(
+        tag_of("first"),
+        Some(main.clone()),
+        "the release created no tag"
+    );
+
+    // No target at all: the repository's own default branch.
+    let (status, body) =
+        create(serde_json::json!({"tag_name": "defaulted", "title": "Defaulted"})).await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(tag_of("defaulted"), Some(main.clone()));
+
+    let (status, body) = create(
+        serde_json::json!({"tag_name": "nowhere", "title": "Nowhere", "target_commitish": "no-such-branch"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(tag_of("nowhere"), None);
+
+    // An existing tag is reused, whatever the target says.
+    let (status, body) = create(
+        serde_json::json!({"tag_name": "first-again", "title": "x", "target_commitish": "first"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = create(
+        serde_json::json!({"tag_name": "first", "title": "dup", "target_commitish": "main"}),
+    )
+    .await;
+    assert_eq!(status, 409, "a second release of one tag: {body}");
+
+    // A draft creates its tag on publication.
+    let (status, draft) =
+        create(serde_json::json!({"tag_name": "later", "title": "Later", "is_draft": true})).await;
+    assert_eq!(status, 201, "{draft}");
+    assert_eq!(tag_of("later"), None, "a draft created its tag up front");
+    let published = client
+        .patch(format!("{releases}/{}", draft["id"]))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"is_draft": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), 200);
+    assert_eq!(tag_of("later"), Some(main.clone()));
+
+    // Tag protection holds the release to what it holds a push to.
+    let protected = client
+        .post(format!("{base}/api/v1/repos/reltag/tagged/tags/protection"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"pattern": "v*"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(protected.status(), 201);
+    let (status, body) = create(serde_json::json!({"tag_name": "v9", "title": "Guarded"})).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(tag_of("v9"), None);
+    let listed: serde_json::Value = client
+        .get(&releases)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !listed.to_string().contains("\"v9\""),
+        "a refused release left its row: {listed}"
     );
 }

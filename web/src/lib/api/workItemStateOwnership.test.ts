@@ -130,7 +130,8 @@ beforeEach(() => {
 	milestones.list.mockResolvedValue([]);
 	milestones.get.mockResolvedValue(milestone(1, 'Current milestone'));
 	collaborators.list.mockResolvedValue([]);
-	repos.get.mockResolvedValue({ owner_id: 1, default_branch: 'main' });
+	// The write controls follow `viewer_permission` (card_3625a7b89abb).
+	repos.get.mockResolvedValue({ owner_id: 1, default_branch: 'main', viewer_permission: 'write' });
 	repos.branches.mockResolvedValue([
 		{ name: 'main', is_default: true },
 		{ name: 'feature', is_default: false },

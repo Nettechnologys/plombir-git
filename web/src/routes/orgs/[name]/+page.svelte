@@ -500,6 +500,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>{name} · {t('orgs.title')} · Plombir Git</title>
+</svelte:head>
+
 <div class="container">
   {#if loading}
     <p>{t('common.loading')}</p>

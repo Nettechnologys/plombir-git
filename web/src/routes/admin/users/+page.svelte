@@ -5,6 +5,7 @@
   import { admin, buildAdminUserPayload, type AdminUser } from '$lib/api/client.svelte';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { untrack } from 'svelte';
+  import Modal from '$lib/components/Modal.svelte';
 
   const t = createT();
 
@@ -181,7 +182,7 @@
   }
 
   async function handleResetPassword(user: AdminUser) {
-    if (!confirm(`Give ${user.username} a new password? Every session they have is signed out.`)) return;
+    if (!confirm(t('admin.users.reset_password_confirm', { username: user.username }))) return;
     const userId = user.id;
     if (!claimUser(userId)) return;
     try {
@@ -221,20 +222,11 @@
     if (page < totalPages) { page++; loadUsers(); }
   }
 
-  function closeEditByKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      closeEdit();
-    }
-  }
-
-  function closeDeleteByKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      showDeleteConfirm = false;
-    }
-  }
 </script>
+
+<svelte:head>
+  <title>{t('admin.users.title')} · {t('admin.settings.admin')} · Plombir Git</title>
+</svelte:head>
 
 <div class="container">
   <div class="header">
@@ -250,29 +242,29 @@
   {#if issuedPassword}
     <div class="issued-password" role="status">
       <p>
-        Temporary password for <strong>{issuedPassword.username}</strong> — shown only now.
-        Hand it over; it must be replaced at the first sign-in.
+        {t('admin.users.temp_password_before')} <strong>{issuedPassword.username}</strong>
+        {t('admin.users.temp_password_after')}
       </p>
       <code class="temporary-password">{issuedPassword.password}</code>
-      <button class="btn-sm" onclick={() => (issuedPassword = null)}>Done</button>
+      <button class="btn-sm" onclick={() => (issuedPassword = null)}>{t('admin.users.done')}</button>
     </div>
   {/if}
 
   <div class="create-user">
     {#if showCreate}
       <form class="create-user-form" onsubmit={handleCreate}>
-        <input id="admin-new-username" type="text" placeholder="Username" bind:value={newUsername} required autocomplete="off" />
-        <input id="admin-new-email" type="email" placeholder="Email" bind:value={newEmail} required autocomplete="off" />
-        <input type="text" placeholder="Display name (optional)" bind:value={newDisplayName} />
+        <input id="admin-new-username" type="text" placeholder={t('admin.users.username_placeholder')} bind:value={newUsername} required autocomplete="off" />
+        <input id="admin-new-email" type="email" placeholder={t('admin.users.email_placeholder')} bind:value={newEmail} required autocomplete="off" />
+        <input type="text" placeholder={t('admin.users.display_name_placeholder')} bind:value={newDisplayName} />
         <label class="checkbox-label">
           <input type="checkbox" bind:checked={newIsAdmin} />
-          Administrator
+          {t('admin.users.administrator')}
         </label>
-        <button type="submit" class="btn-sm" disabled={creating}>{creating ? 'Creating...' : 'Create user'}</button>
+        <button type="submit" class="btn-sm" disabled={creating}>{creating ? t('admin.users.creating') : t('admin.users.create')}</button>
         <button type="button" class="btn-sm" onclick={() => (showCreate = false)}>{t('common.cancel', 'Cancel')}</button>
       </form>
     {:else}
-      <button class="btn-sm open-create-user" onclick={() => (showCreate = true)}>New user</button>
+      <button class="btn-sm open-create-user" onclick={() => (showCreate = true)}>{t('admin.users.new')}</button>
     {/if}
   </div>
 
@@ -283,13 +275,13 @@
       <table class="users-table">
         <thead>
           <tr>
-            <th>Username</th>
-            <th>Email</th>
-            <th>Admin</th>
-            <th>Active</th>
-            <th>Provider</th>
-            <th>Login</th>
-            <th>Created</th>
+            <th>{t('admin.users.columns.username')}</th>
+            <th>{t('admin.users.columns.email')}</th>
+            <th>{t('admin.users.columns.admin')}</th>
+            <th>{t('admin.users.columns.active')}</th>
+            <th>{t('admin.users.columns.provider')}</th>
+            <th>{t('admin.users.columns.login')}</th>
+            <th>{t('admin.users.columns.created')}</th>
             <th></th>
           </tr>
         </thead>
@@ -311,23 +303,23 @@
               <td><span class="badge">{u.auth_provider}</span></td>
               <td class="login-state">
                 {#if isLocked(u)}
-                  <span class="badge locked" title={`Locked until ${formatDate(u.locked_until || '')}`}>Locked</span>
+                  <span class="badge locked" title={t('admin.users.locked_until', { date: formatDate(u.locked_until || '') })}>{t('admin.users.locked')}</span>
                 {:else if u.login_attempts > 0}
-                  <span class="badge warning">{u.login_attempts} failed</span>
+                  <span class="badge warning">{t('admin.users.failed_attempts', { count: u.login_attempts })}</span>
                 {:else}
-                  <span class="badge active" title={u.last_login_at ? `Last login ${formatDate(u.last_login_at)}` : 'No completed login recorded'}>OK</span>
+                  <span class="badge active" title={u.last_login_at ? t('admin.users.last_login', { date: formatDate(u.last_login_at) }) : t('admin.users.no_login')}>{t('admin.users.login_ok')}</span>
                 {/if}
               </td>
               <td class="date">{formatDate(u.created_at)}</td>
               <td class="actions">
                 {#if isLocked(u) || u.login_attempts > 0}
                   <button class="btn-sm" disabled={isUserBusy(u.id)} onclick={() => handleUnlock(u)}>
-                    {isUserBusy(u.id) ? 'Working...' : 'Unlock'}
+                    {isUserBusy(u.id) ? t('admin.users.working') : t('admin.users.unlock')}
                   </button>
                 {/if}
                 <button class="btn-sm" disabled={isUserBusy(u.id)} onclick={() => openEdit(u)}>{t('common.edit')}</button>
                 {#if u.auth_provider === 'local' && u.id !== getUser()?.id}
-                  <button class="btn-sm reset-password" disabled={isUserBusy(u.id)} onclick={() => handleResetPassword(u)}>Reset password</button>
+                  <button class="btn-sm reset-password" disabled={isUserBusy(u.id)} onclick={() => handleResetPassword(u)}>{t('admin.users.reset_password')}</button>
                 {/if}
                 {#if u.id !== getUser()?.id}
                   <button class="btn-danger" disabled={isUserBusy(u.id)} onclick={() => confirmDelete(u)}>{t('common.delete')}</button>
@@ -342,9 +334,9 @@
     <!-- Pagination -->
     {#if totalPages > 1}
       <div class="pagination">
-        <button onclick={prevPage} disabled={page <= 1}>← Prev</button>
-        <span>Page {page} of {totalPages}</span>
-        <button onclick={nextPage} disabled={page >= totalPages}>Next →</button>
+        <button onclick={prevPage} disabled={page <= 1}>{t('common.prev_arrow')}</button>
+        <span>{t('common.page_info', { page, total: totalPages })}</span>
+        <button onclick={nextPage} disabled={page >= totalPages}>{t('common.next_arrow')}</button>
       </div>
     {/if}
   {/if}
@@ -352,27 +344,21 @@
 
 <!-- Edit modal -->
 {#if selectedUser}
-  <div
-    class="modal-overlay"
-    onclick={closeEdit}
-    role="button"
-    tabindex="0"
-    onkeydown={closeEditByKey}
-  >
-    <div class="modal" role="dialog" aria-modal="true" tabindex="-1">
-      <h2>{t('admin.users.edit', { username: selectedUser.username })}</h2>
+  <Modal onclose={closeEdit} labelledby="admin-user-edit-title">
+    <div class="modal">
+      <h2 id="admin-user-edit-title">{t('admin.users.edit', { username: selectedUser.username })}</h2>
 
       {#if error}
         <div class="error">{error}</div>
       {/if}
 
       <div class="form-group">
-        <label for="admin-user-display-name">Display Name</label>
+        <label for="admin-user-display-name">{t('admin.users.display_name')}</label>
         <input id="admin-user-display-name" type="text" bind:value={editDisplayName} />
       </div>
 
       <div class="form-group">
-        <label for="admin-user-bio">Bio</label>
+        <label for="admin-user-bio">{t('admin.users.bio')}</label>
         <textarea id="admin-user-bio" bind:value={editBio} rows="3"></textarea>
       </div>
 
@@ -394,20 +380,14 @@
         <button class="btn-secondary" onclick={closeEdit}>{t('common.cancel')}</button>
       </div>
     </div>
-  </div>
-  {/if}
+  </Modal>
+{/if}
 
 <!-- Delete confirm modal -->
 {#if showDeleteConfirm && deleteTarget}
-  <div
-    class="modal-overlay"
-    onclick={() => showDeleteConfirm = false}
-    role="button"
-    tabindex="0"
-    onkeydown={closeDeleteByKey}
-  >
-    <div class="modal" role="dialog" aria-modal="true" tabindex="-1">
-      <h2>{t('admin.users.delete_confirm')}</h2>
+  <Modal onclose={() => showDeleteConfirm = false} labelledby="admin-user-delete-title">
+    <div class="modal">
+      <h2 id="admin-user-delete-title">{t('admin.users.delete_confirm')}</h2>
       <p>
         {t('admin.users.delete_warning', { username: deleteTarget.username })}
       </p>
@@ -418,10 +398,10 @@
         <button class="btn-danger" onclick={handleDelete} disabled={saving || isUserBusy(deleteTarget.id)}>
           {saving ? t('common.loading') : t('common.delete')}
         </button>
-        <button class="btn-secondary" onclick={() => showDeleteConfirm = false}>{t('common.cancel')}</button>
+        <button class="btn-secondary" onclick={() => showDeleteConfirm = false} data-autofocus>{t('common.cancel')}</button>
       </div>
     </div>
-  </div>
+  </Modal>
 {/if}
 
 <style>
@@ -488,8 +468,7 @@
   .btn-danger:hover { background: rgba(248, 81, 73, 0.25); }
 
   /* Modal */
-  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-  .modal { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; width: 480px; max-width: 90vw; }
+  /* The panel itself is lib/components/Modal.svelte; `.modal` scopes its content. */
   .modal h2 { margin: 0 0 1rem; font-size: 1.1rem; }
   .modal p { color: var(--text-secondary); margin: 0 0 1rem; }
   .form-group { margin-bottom: 1rem; }

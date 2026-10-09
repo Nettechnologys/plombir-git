@@ -14,6 +14,9 @@
     type PublicSsoProvider,
     type SsoLink,
   } from '$lib/api/client.svelte';
+  import { createT, formatDate } from '$lib/i18n';
+
+  const t = createT();
 
   let loading = $state(true);
   let saving = $state(false);
@@ -76,7 +79,7 @@
     }
     // Where the provider's callback lands after `linkSsoProvider` below.
     if (new URLSearchParams(window.location.search).has('sso_linked')) {
-      success = 'Provider linked. You can now sign in through it.';
+      success = t('account_security.sso.linked_notice');
     }
     loadSecurity();
   });
@@ -158,7 +161,7 @@
       const { authorize_url } = await auth.linkSso(provider.slug);
       window.location.assign(authorize_url);
     } catch (err: any) {
-      error = err.message || `Failed to start linking ${provider.name}`;
+      error = err.message || t('account_security.sso.link_failed', { provider: provider.name });
       ssoBusy = false;
     }
   }
@@ -174,16 +177,16 @@
       const next = await passkeys.register(passkeyName.trim());
       if (passkeyRequests.owns(claim, 'passkeys')) passkeyList = next;
       passkeyName = '';
-      success = 'Passkey registered.';
+      success = t('account_security.passkeys.registered');
     } catch (err: any) {
-      error = err.message || 'Failed to register passkey';
+      error = err.message || t('account_security.passkeys.register_failed');
     } finally {
       passkeyBusy = false;
     }
   }
 
   async function removePasskey(id: number) {
-    if (!confirm('Remove this passkey? You will no longer be able to sign in with it.')) return;
+    if (!confirm(t('account_security.passkeys.remove_confirm'))) return;
     if (passkeyBusy) return;
     const claim = passkeyRequests.begin('passkeys');
     try {
@@ -194,22 +197,16 @@
       if (passkeyRequests.owns(claim, 'passkeys') && passkeyList !== UNKNOWN) {
         passkeyList = passkeyList.filter((p) => p.id !== id);
       }
-      success = 'Passkey removed.';
+      success = t('account_security.passkeys.removed');
     } catch (err: any) {
-      error = err.message || 'Failed to remove passkey';
+      error = err.message || t('account_security.passkeys.remove_failed');
     } finally {
       passkeyBusy = false;
     }
   }
 
   async function unlinkSsoProvider(link: SsoLink) {
-    if (
-      !confirm(
-        `Unlink ${link.name}? You will not be able to sign in through it until you link it ` +
-          'again from this page.',
-      )
-    )
-      return;
+    if (!confirm(t('account_security.sso.unlink_confirm', { provider: link.name }))) return;
     if (ssoBusy) return;
     const claim = ssoRequests.begin('sso-links');
     try {
@@ -220,9 +217,9 @@
       if (ssoRequests.owns(claim, 'sso-links') && ssoLinks !== UNKNOWN) {
         ssoLinks = ssoLinks.filter((entry) => entry.slug !== link.slug);
       }
-      success = `${link.name} unlinked.`;
+      success = t('account_security.sso.unlinked', { provider: link.name });
     } catch (err: any) {
-      error = err.message || 'Failed to unlink the provider';
+      error = err.message || t('account_security.sso.unlink_failed');
     } finally {
       ssoBusy = false;
     }
@@ -237,7 +234,7 @@
       newBackupCodes = [];
       setup = await mfa.setup();
     } catch (err: any) {
-      error = err.message || 'Failed to start MFA setup';
+      error = err.message || t('account_security.mfa.setup_failed');
     } finally {
       saving = false;
     }
@@ -247,7 +244,7 @@
     event.preventDefault();
     if (saving) return;
     if (!verificationCode.trim()) {
-      error = 'Authentication code is required';
+      error = t('account_security.mfa.code_required');
       return;
     }
 
@@ -259,10 +256,10 @@
       newBackupCodes = result.backup_codes;
       setup = null;
       verificationCode = '';
-      success = 'MFA enabled. Save your backup codes before leaving this page.';
+      success = t('account_security.mfa.enabled_notice');
       await loadSecurity();
     } catch (err: any) {
-      error = err.message || 'Failed to enable MFA';
+      error = err.message || t('account_security.mfa.enable_failed');
     } finally {
       saving = false;
     }
@@ -272,10 +269,10 @@
     event.preventDefault();
     if (saving) return;
     if (!disablePassword) {
-      error = 'Current password is required';
+      error = t('account_security.password_required');
       return;
     }
-    if (!confirm('Disable multi-factor authentication for your account?')) return;
+    if (!confirm(t('account_security.mfa.disable_confirm'))) return;
 
     try {
       saving = true;
@@ -285,10 +282,10 @@
       disablePassword = '';
       newBackupCodes = [];
       setup = null;
-      success = 'MFA disabled';
+      success = t('account_security.mfa.disabled_notice');
       await loadSecurity();
     } catch (err: any) {
-      error = err.message || 'Failed to disable MFA';
+      error = err.message || t('account_security.mfa.disable_failed');
     } finally {
       saving = false;
     }
@@ -298,10 +295,10 @@
     event.preventDefault();
     if (saving) return;
     if (!regeneratePassword) {
-      error = 'Current password is required';
+      error = t('account_security.password_required');
       return;
     }
-    if (!confirm('Replace your backup codes? Every unused code you have now stops working.')) return;
+    if (!confirm(t('account_security.mfa.regenerate_confirm'))) return;
 
     try {
       saving = true;
@@ -310,10 +307,10 @@
       const result = await mfa.regenerateBackup(regeneratePassword);
       regeneratePassword = '';
       newBackupCodes = result.backup_codes;
-      success = 'New backup codes issued. Save them before leaving this page — the old ones no longer work.';
+      success = t('account_security.mfa.regenerated_notice');
       await loadSecurity();
     } catch (err: any) {
-      error = err.message || 'Failed to regenerate backup codes';
+      error = err.message || t('account_security.mfa.regenerate_failed');
     } finally {
       saving = false;
     }
@@ -322,19 +319,19 @@
   async function copyBackupCodes() {
     if (newBackupCodes.length === 0) return;
     await navigator.clipboard.writeText(newBackupCodes.join('\n'));
-    success = 'Backup codes copied';
+    success = t('account_security.backup.copied');
   }
 </script>
 
 <svelte:head>
-  <title>Security · Plombir Git</title>
+  <title>{t('account_security.title')} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container security-page">
   <header class="page-header">
     <div>
-      <h1>Security</h1>
-      <p>Manage account protections for web login and Git/API access.</p>
+      <h1>{t('account_security.title')}</h1>
+      <p>{t('account_security.description')}</p>
     </div>
   </header>
 
@@ -349,40 +346,40 @@
   <section class="section">
     <div class="section-heading">
       <div>
-        <h2>Multi-Factor Authentication</h2>
-        <p>Add a time-based authenticator code after password login.</p>
+        <h2>{t('account_security.mfa.title')}</h2>
+        <p>{t('account_security.mfa.description')}</p>
       </div>
       <span class:enabled={mfaEnabled} class:unknown={mfaStateUnknown} class="status">
-        {mfaStateUnknown ? 'Unknown' : mfaEnabled ? 'Enabled' : 'Disabled'}
+        {mfaStateUnknown
+          ? t('account_security.status_unknown')
+          : mfaEnabled
+            ? t('account_security.status_enabled')
+            : t('account_security.status_disabled')}
       </span>
     </div>
 
     {#if loading}
-      <p class="muted">Loading...</p>
+      <p class="muted">{t('common.loading')}</p>
     {:else if mfaStateUnknown}
-      <p class="muted state-unknown">
-        The second factor of this account could not be read, so this page cannot say whether MFA is
-        on. Starting a new setup from here would replace an authenticator that may still be live, so
-        the read is offered again instead.
-      </p>
+      <p class="muted state-unknown">{t('account_security.mfa.state_unknown')}</p>
       <button type="button" class="btn btn-secondary" onclick={loadBackupStatus} disabled={saving}>
-        Retry reading MFA state
+        {t('account_security.mfa.retry')}
       </button>
     {:else if mfaEnabled}
       <div class="summary-grid">
         <div>
           <strong>{backupCodes?.unused ?? 0}</strong>
-          <span>unused backup codes</span>
+          <span>{t('account_security.mfa.unused_codes')}</span>
         </div>
         <div>
           <strong>{backupCodes?.total ?? 0}</strong>
-          <span>total backup codes</span>
+          <span>{t('account_security.mfa.total_codes')}</span>
         </div>
       </div>
 
       <form class="disable-form" onsubmit={regenerateBackupCodes}>
         <label>
-          Current password
+          {t('account_security.mfa.current_password')}
           <input
             type="password"
             bind:value={regeneratePassword}
@@ -391,26 +388,26 @@
           />
         </label>
         <button type="submit" class="btn btn-secondary" disabled={saving || !regeneratePassword}>
-          {saving ? 'Working...' : 'Regenerate backup codes'}
+          {saving ? t('account_security.mfa.working') : t('account_security.mfa.regenerate')}
         </button>
       </form>
       <p class="muted">
-        Issues a fresh set of {backupCodes?.total ?? 0} codes and revokes every unused one you have now.
+        {t('account_security.mfa.regenerate_hint', { count: backupCodes?.total ?? 0 })}
       </p>
 
       <form class="disable-form" onsubmit={disableMfa}>
         <label>
-          Current password
+          {t('account_security.mfa.current_password')}
           <input type="password" bind:value={disablePassword} autocomplete="current-password" disabled={saving} />
         </label>
         <button type="submit" class="btn btn-danger" disabled={saving || !disablePassword}>
-          {saving ? 'Disabling...' : 'Disable MFA'}
+          {saving ? t('account_security.mfa.disabling') : t('account_security.mfa.disable')}
         </button>
       </form>
     {:else}
-      <p class="muted">MFA is not enabled for this account.</p>
+      <p class="muted">{t('account_security.mfa.not_enabled')}</p>
       <button type="button" class="btn btn-primary" onclick={startSetup} disabled={saving}>
-        {saving ? 'Starting...' : 'Set up MFA'}
+        {saving ? t('account_security.mfa.starting') : t('account_security.mfa.set_up')}
       </button>
     {/if}
   </section>
@@ -418,30 +415,29 @@
   <section class="section">
     <div class="section-heading">
       <div>
-        <h2>Passkeys</h2>
-        <p>Sign in without a password using Touch ID, Windows Hello, or a security key.</p>
+        <h2>{t('account_security.passkeys.title')}</h2>
+        <p>{t('account_security.passkeys.description')}</p>
       </div>
       <span class:enabled={knownPasskeys.length > 0} class:unknown={passkeyListUnknown} class="status">
         {#if passkeyListUnknown}
-          Unknown
+          {t('account_security.status_unknown')}
         {:else}
-          {knownPasskeys.length > 0 ? `${knownPasskeys.length} active` : 'None'}
+          {knownPasskeys.length > 0
+            ? t('account_security.passkeys.active', { count: knownPasskeys.length })
+            : t('account_security.status_none')}
         {/if}
       </span>
     </div>
 
     {#if !passkeySupported}
-      <p class="muted">This browser does not support passkeys.</p>
+      <p class="muted">{t('account_security.passkeys.unsupported')}</p>
     {:else}
       {#if loading}
-        <p class="muted">Loading...</p>
+        <p class="muted">{t('common.loading')}</p>
       {:else if passkeyListUnknown}
-        <p class="muted state-unknown">
-          The passkeys registered on this account could not be read, so this section cannot say
-          there are none.
-        </p>
+        <p class="muted state-unknown">{t('account_security.passkeys.state_unknown')}</p>
         <button type="button" class="btn btn-secondary" onclick={loadPasskeyList} disabled={passkeyBusy}>
-          Retry reading passkeys
+          {t('account_security.passkeys.retry')}
         </button>
       {:else if knownPasskeys.length > 0}
         <ul class="passkey-list">
@@ -450,8 +446,8 @@
               <div>
                 <strong>{key.name}</strong>
                 <span class="muted">
-                  Added {new Date(key.created_at).toLocaleDateString()}
-                  {#if key.last_used_at}· Last used {new Date(key.last_used_at).toLocaleDateString()}{/if}
+                  {t('account_security.passkeys.added', { date: formatDate(key.created_at) })}
+                  {#if key.last_used_at}· {t('account_security.passkeys.last_used', { date: formatDate(key.last_used_at) })}{/if}
                 </span>
               </div>
               <button
@@ -460,27 +456,27 @@
                 onclick={() => removePasskey(key.id)}
                 disabled={passkeyBusy}
               >
-                Remove
+                {t('account_security.passkeys.remove')}
               </button>
             </li>
           {/each}
         </ul>
       {:else}
-        <p class="muted">No passkeys registered yet.</p>
+        <p class="muted">{t('account_security.passkeys.empty')}</p>
       {/if}
 
       <form class="passkey-form" onsubmit={addPasskey}>
         <label>
-          Passkey name
+          {t('account_security.passkeys.name')}
           <input
             type="text"
             bind:value={passkeyName}
-            placeholder="e.g. YubiKey, MacBook"
+            placeholder={t('account_security.passkeys.name_placeholder')}
             disabled={passkeyBusy}
           />
         </label>
         <button type="submit" class="btn btn-primary" disabled={passkeyBusy}>
-          {passkeyBusy ? 'Waiting for authenticator...' : 'Add passkey'}
+          {passkeyBusy ? t('account_security.passkeys.waiting') : t('account_security.passkeys.add')}
         </button>
       </form>
     {/if}
@@ -489,27 +485,26 @@
   <section class="section">
     <div class="section-heading">
       <div>
-        <h2>Linked accounts</h2>
-        <p>External identities that can sign in to this account.</p>
+        <h2>{t('account_security.sso.title')}</h2>
+        <p>{t('account_security.sso.description')}</p>
       </div>
       <span class:enabled={knownSsoLinks.length > 0} class:unknown={ssoLinksUnknown} class="status">
         {#if ssoLinksUnknown}
-          Unknown
+          {t('account_security.status_unknown')}
         {:else}
-          {knownSsoLinks.length > 0 ? `${knownSsoLinks.length} linked` : 'None'}
+          {knownSsoLinks.length > 0
+            ? t('account_security.sso.linked_count', { count: knownSsoLinks.length })
+            : t('account_security.status_none')}
         {/if}
       </span>
     </div>
 
     {#if loading}
-      <p class="muted">Loading...</p>
+      <p class="muted">{t('common.loading')}</p>
     {:else if ssoLinksUnknown}
-      <p class="muted state-unknown">
-        The external identities linked to this account could not be read, so this section cannot say
-        there are none.
-      </p>
+      <p class="muted state-unknown">{t('account_security.sso.state_unknown')}</p>
       <button type="button" class="btn btn-secondary" onclick={loadSsoLinks} disabled={ssoBusy}>
-        Retry reading linked accounts
+        {t('account_security.sso.retry')}
       </button>
     {:else if knownSsoLinks.length > 0}
       <ul class="passkey-list">
@@ -519,8 +514,8 @@
               <strong>{link.name}</strong>
               <span class="muted">
                 {link.provider_username || link.email}
-                · Linked {new Date(link.linked_at).toLocaleDateString()}
-                {#if !link.provider_enabled}· Provider is switched off{/if}
+                · {t('account_security.sso.linked_at', { date: formatDate(link.linked_at) })}
+                {#if !link.provider_enabled}· {t('account_security.sso.provider_off')}{/if}
               </span>
             </div>
             <button
@@ -529,13 +524,13 @@
               onclick={() => unlinkSsoProvider(link)}
               disabled={ssoBusy}
             >
-              Unlink
+              {t('account_security.sso.unlink')}
             </button>
           </li>
         {/each}
       </ul>
     {:else}
-      <p class="muted">No external accounts are linked.</p>
+      <p class="muted">{t('account_security.sso.empty')}</p>
     {/if}
 
     {#if !loading && linkableProviders.length > 0}
@@ -547,30 +542,30 @@
             onclick={() => linkSsoProvider(provider)}
             disabled={ssoBusy}
           >
-            Link {provider.name}
+            {t('account_security.sso.link', { provider: provider.name })}
           </button>
         {/each}
       </div>
     {:else if !loading && ssoProviders === UNKNOWN}
-      <p class="muted state-unknown">The providers this account could link could not be read.</p>
+      <p class="muted state-unknown">{t('account_security.sso.providers_unknown')}</p>
     {/if}
   </section>
 
   {#if setup}
     <section class="section setup-section">
-      <h2>Scan Authenticator QR</h2>
+      <h2>{t('account_security.setup.title')}</h2>
       <div class="setup-grid">
-        <div class="qr" aria-label="Authenticator QR code">{@html setup.qr_svg}</div>
+        <div class="qr" aria-label={t('account_security.setup.qr_label')}>{@html setup.qr_svg}</div>
         <div>
-          <p class="muted">Scan the QR code with an authenticator app, then enter the six-digit code.</p>
+          <p class="muted">{t('account_security.setup.hint')}</p>
           <code>{setup.secret}</code>
           <form class="enable-form" onsubmit={enableMfa}>
             <label>
-              Authentication code
+              {t('account_security.setup.code')}
               <input inputmode="numeric" autocomplete="one-time-code" bind:value={verificationCode} disabled={saving} />
             </label>
             <button type="submit" class="btn btn-primary" disabled={saving || !verificationCode.trim()}>
-              {saving ? 'Verifying...' : 'Enable MFA'}
+              {saving ? t('account_security.setup.verifying') : t('account_security.setup.enable')}
             </button>
           </form>
         </div>
@@ -579,13 +574,13 @@
   {/if}
 
   {#if newBackupCodes.length > 0}
-    <section class="section backup-section" aria-label="New backup codes">
+    <section class="section backup-section" aria-label={t('account_security.backup.label')}>
       <div class="section-heading">
         <div>
-          <h2>Backup Codes</h2>
-          <p>Each code can be used once if you lose authenticator access.</p>
+          <h2>{t('account_security.backup.title')}</h2>
+          <p>{t('account_security.backup.description')}</p>
         </div>
-        <button type="button" class="btn btn-secondary" onclick={copyBackupCodes}>Copy Codes</button>
+        <button type="button" class="btn btn-secondary" onclick={copyBackupCodes}>{t('account_security.backup.copy')}</button>
       </div>
       <div class="code-grid">
         {#each newBackupCodes as code}

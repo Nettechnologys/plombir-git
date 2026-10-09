@@ -3,7 +3,12 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
+  import Modal from '$lib/components/Modal.svelte';
+  import ThreadSubscription from '$lib/components/ThreadSubscription.svelte';
   import { pulls, reviews } from '$lib/api/client.svelte';
+  import { getUser } from '$lib/stores/auth.svelte';
+  import { canModifyComment, isEdited } from '$lib/commentState';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { optionalSection, sectionOr } from '$lib/optionalSection';
   import type { DiffLine, MergeQueueEntry, PrDiff } from '$lib/api/pulls';
@@ -42,6 +47,11 @@
   let activeTab = $state('conversation');
   let mergeStrategy = $state('merge');
   let merging = $state(false);
+  // Off by default: deleting someone's branch is opt-in per merge. The server
+  // reports the outcome beside the merge — a kept branch is not a failed merge
+  // (card_2060696224ff).
+  let deleteHeadBranch = $state(false);
+  let headBranchOutcome = $state<{ deleted: boolean; branch: string; reason: string } | null>(null);
   let managingAutoMerge = $state(false);
   let managingMergeQueue = $state(false);
   let autoMergeReason = $state('');
@@ -77,6 +87,18 @@
   let approvingCi = $state(false);
   const pullRequests = new LatestRepositoryResourceRequestFence<number>();
   let routeGeneration = 0;
+  // Review comment edit/delete (card_60961272e1ba): offered to the comment's
+  // author and to repository administrators, the two the server lets through.
+  // A pull request itself has no delete route on purpose.
+  const permission = viewerPermission(() => owner, () => repo);
+  let viewer = $derived(getUser());
+  let editingCommentId = $state<number | null>(null);
+  let editDraft = $state('');
+  let editBusy = $state(false);
+  let editError = $state('');
+  let pendingCommentDelete = $state<any | null>(null);
+  let commentDeleteBusy = $state(false);
+  let commentDeleteError = $state('');
   // A pipeline runs under the *base* repository's id and is handed that
   // repository's CI secrets, so `trigger_pull_request_ci` refuses a fork head
   // until a maintainer has vouched for this exact commit. Both halves matter:
@@ -107,6 +129,8 @@
     selectedSuggestionIds = [];
     activeTab = 'conversation';
     mergeStrategy = 'merge';
+    deleteHeadBranch = false;
+    headBranchOutcome = null;
     autoMergeReason = '';
     reviewBody = '';
     reviewVerdict = 'comment';
@@ -130,10 +154,83 @@
     managingAutoMerge = false;
     managingMergeQueue = false;
     dismissingReviewId = null;
+    editingCommentId = null;
+    editDraft = '';
+    editBusy = false;
+    editError = '';
+    pendingCommentDelete = null;
+    commentDeleteBusy = false;
+    commentDeleteError = '';
     error = '';
     loading = true;
     void loadPR(expectedOwner, expectedRepo, expectedNumber, routeGeneration);
   });
+
+  function startEdit(comment: any) {
+    editingCommentId = comment.id;
+    editDraft = comment.body ?? '';
+    editError = '';
+  }
+
+  function cancelEdit() {
+    if (editBusy) return;
+    editingCommentId = null;
+    editDraft = '';
+    editError = '';
+  }
+
+  async function saveEdit(comment: any) {
+    const body = editDraft;
+    if (!body.trim() || editBusy) return;
+    const route = currentRoute();
+    editBusy = true;
+    editError = '';
+    try {
+      const updated = await reviews.editComment(route.owner, route.repo, route.number, comment.id, body);
+      if (!isCurrentRoute(route)) return;
+      reviewComments = reviewComments.map((candidate) =>
+        candidate.id === comment.id ? { ...candidate, ...updated } : candidate,
+      );
+      editingCommentId = null;
+      editDraft = '';
+    } catch (e: any) {
+      if (isCurrentRoute(route)) editError = e?.message || t('comments.edit_failed');
+    } finally {
+      if (isCurrentRoute(route)) editBusy = false;
+    }
+  }
+
+  function askDeleteComment(comment: any) {
+    pendingCommentDelete = comment;
+    commentDeleteError = '';
+  }
+
+  function closeDeleteComment() {
+    if (commentDeleteBusy) return;
+    pendingCommentDelete = null;
+    commentDeleteError = '';
+  }
+
+  async function confirmDeleteComment() {
+    const comment = pendingCommentDelete;
+    if (!comment || commentDeleteBusy) return;
+    const route = currentRoute();
+    commentDeleteBusy = true;
+    commentDeleteError = '';
+    try {
+      await reviews.deleteComment(route.owner, route.repo, route.number, comment.id);
+      if (!isCurrentRoute(route)) return;
+      reviewComments = reviewComments.filter((candidate) => candidate.id !== comment.id);
+      selectedSuggestionIds = selectedSuggestionIds.filter((id) => id !== comment.id);
+      if (editingCommentId === comment.id) editingCommentId = null;
+      pendingCommentDelete = null;
+    } catch (e: any) {
+      // 409: others replied to it — the server says so, and the dialog shows it.
+      if (isCurrentRoute(route)) commentDeleteError = e?.message || t('comments.delete_failed');
+    } finally {
+      if (isCurrentRoute(route)) commentDeleteBusy = false;
+    }
+  }
 
   type PullRoute = Readonly<{
     owner: string;
@@ -389,12 +486,22 @@
 
   async function handleMerge() {
     const strategy = mergeStrategy;
+    const deleteBranch = deleteHeadBranch;
+    const branch = pr?.head_branch ?? '';
     await runMutation(
       async (route) => {
-        await pulls.merge(route.owner, route.repo, route.number, strategy);
-        if (isCurrentRoute(route)) {
-          await loadPR(route.owner, route.repo, route.number, route.generation);
-        }
+        const outcome = await pulls.merge(route.owner, route.repo, route.number, strategy, {
+          deleteHeadBranch: deleteBranch,
+        });
+        if (!isCurrentRoute(route)) return;
+        headBranchOutcome = deleteBranch
+          ? {
+              deleted: outcome?.head_branch_deleted === true,
+              branch,
+              reason: outcome?.head_branch_kept ?? '',
+            }
+          : null;
+        await loadPR(route.owner, route.repo, route.number, route.generation);
       },
       (busy) => merging = busy,
     );
@@ -493,10 +600,17 @@
     });
   }
 
+
+  // A translated sentence split at `{author}`, so the author's name keeps its
+  // own markup (and bot badge) wherever the language puts the name.
+  function aroundAuthor(sentence: string): [string, string] {
+    const [before, after = ''] = sentence.split('{author}');
+    return [before, after];
+  }
 </script>
 
 <svelte:head>
-  <title>PR #{number} · {owner}/{repo} · Plombir Git</title>
+  <title>{t('pulls.page_title', { number })} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -532,7 +646,7 @@
           </span>
           {#if pr.is_draft}<span class="draft-badge">{t('pulls.draft')}</span>{/if}
           <span class="text-secondary">
-            opened {formatDate(pr.created_at)} by <strong>{pr.author || t('common.unknown')}</strong><BotBadge owner={pr.author_bot_owner} />
+            {aroundAuthor(t('pulls.opened_by_author', { date: formatDate(pr.created_at) }))[0]}<strong>{pr.author || t('common.unknown')}</strong><BotBadge owner={pr.author_bot_owner} />{aroundAuthor(t('pulls.opened_by_author', { date: formatDate(pr.created_at) }))[1]}
           </span>
           <span class="branch-pair">
             <span class="branch-label">{pr.head_branch}</span>
@@ -550,7 +664,7 @@
       {#if pr.body}
         <div class="pr-body">
           <div class="comment-header">
-            <strong>{pr.author || t('common.unknown')}</strong><BotBadge owner={pr.author_bot_owner} /> commented
+            {aroundAuthor(t('pulls.author_commented'))[0]}<strong>{pr.author || t('common.unknown')}</strong><BotBadge owner={pr.author_bot_owner} />{aroundAuthor(t('pulls.author_commented'))[1]}
           </div>
           <div class="comment-body">{pr.body}</div>
         </div>
@@ -574,6 +688,7 @@
       <!-- Conversation tab -->
       {#if activeTab === 'conversation'}
         <div class="conversation">
+          <ThreadSubscription {owner} {repo} kind="pulls" {number} />
           <section class="reviewers-box">
             <h3>{t('pulls.reviewers.title')}</h3>
             {#if requestedReviewers.length === 0}
@@ -610,6 +725,19 @@
               <button class="btn-secondary ci-approve" onclick={approveForkCi} disabled={mutationBusy || approvingCi}>
                 {approvingCi ? t('pulls.fork_ci.approving') : t('pulls.fork_ci.approve')}
               </button>
+            </div>
+          {/if}
+
+          {#if headBranchOutcome}
+            <div class="head-branch-outcome" class:kept={!headBranchOutcome.deleted} role="status">
+              {#if headBranchOutcome.deleted}
+                {t('pulls.merge.head_branch_deleted', { branch: headBranchOutcome.branch })}
+              {:else}
+                {t('pulls.merge.head_branch_kept', {
+                  branch: headBranchOutcome.branch,
+                  reason: headBranchOutcome.reason || t('pulls.merge.head_branch_kept_unknown'),
+                })}
+              {/if}
             </div>
           {/if}
 
@@ -656,13 +784,17 @@
                     {managingMergeQueue ? t('pulls.merge.joining_queue') : t('pulls.merge.join_queue')}
                   </button>
                 </div>
+                <label class="delete-head-option">
+                  <input type="checkbox" class="delete-head-branch" bind:checked={deleteHeadBranch} disabled={mutationBusy || merging} />
+                  <span>{t('pulls.merge.delete_head_branch', { branch: pr.head_branch })}</span>
+                </label>
               {/if}
             </div>
             {#if mergeQueue.length > 0}
               <div class="queue-summary">
                 <strong>{t('pulls.merge.queue_title')}</strong>
                 {#each mergeQueue.slice(0, 5) as entry (entry.id)}
-                  <span>#{entry.position} · PR #{entry.pr_number} · {entry.title}</span>
+                  <span>{t('pulls.merge.queue_entry', { position: entry.position, number: entry.pr_number, title: entry.title })}</span>
                 {/each}
               </div>
             {/if}
@@ -743,7 +875,7 @@
                     <code>{comment.path}{comment.line ? `:${comment.start_line && comment.start_line !== comment.line ? `${comment.start_line}-${comment.line}` : comment.line}` : ''}</code>
                     <span>{comment.resolved_at ? t('pulls.threads.resolved') : t('pulls.threads.open')}</span>
                   </header>
-                  <div class="thread-comment">{comment.body}</div>
+                  {@render reviewComment(comment, false)}
                   <AttachmentPanel {owner} {repo} target="pulls/comments" targetId={comment.id} />
                   {#if comment.suggestion !== null && comment.suggestion !== undefined}
                     <div class="suggestion-block">
@@ -773,7 +905,7 @@
                     </div>
                   {/if}
                   {#each repliesFor(comment.id) as reply (reply.id)}
-                    <div class="thread-comment reply">{reply.body}</div>
+                    {@render reviewComment(reply, true)}
                     <AttachmentPanel {owner} {repo} target="pulls/comments" targetId={reply.id} />
                   {/each}
                   <footer>
@@ -797,7 +929,7 @@
         <div class="diff-view">
           {#if diffData && diffData.files_changed.length > 0}
             <div class="diff-summary">
-              <strong>{diffData.stats.files_changed} files</strong>
+              <strong>{t('pulls.files_changed', { count: diffData.stats.files_changed })}</strong>
               <span class="addition-text">+{diffData.stats.total_additions}</span>
               <span class="deletion-text">−{diffData.stats.total_deletions}</span>
             </div>
@@ -823,7 +955,7 @@
                     </div>
                     {#each lineComments as comment (comment.id)}
                       <div class="inline-thread" class:resolved={Boolean(comment.resolved_at)}>
-                        <div>{comment.body}</div>
+                        <div>{comment.body}{#if isEdited(comment)} <span class="edited-marker">{t('comments.edited')}</span>{/if}</div>
                         {#if comment.suggestion !== null && comment.suggestion !== undefined}
                           <div class="suggestion-block">
                             {#if comment.suggestion === ''}
@@ -841,7 +973,7 @@
                           </div>
                         {/if}
                         {#each repliesFor(comment.id) as reply (reply.id)}
-                          <div class="inline-reply">{reply.body}</div>
+                          <div class="inline-reply">{reply.body}{#if isEdited(reply)} <span class="edited-marker">{t('comments.edited')}</span>{/if}</div>
                         {/each}
                         <button class="btn-link" disabled={mutationBusy || resolvingCommentId === comment.id} onclick={() => setThreadResolved(comment, !comment.resolved_at)}>
                           {comment.resolved_at ? t('pulls.threads.reopen') : t('pulls.threads.resolve')}
@@ -909,6 +1041,50 @@
     </div>
   {/if}
 </div>
+
+{#snippet reviewComment(comment: any, isReply: boolean)}
+  <div class="thread-comment" class:reply={isReply} data-review-comment={comment.id}>
+    {#if editingCommentId === comment.id}
+      <textarea class="comment-edit-input" bind:value={editDraft} rows="3" disabled={editBusy} aria-label={t('comments.edit_label')}></textarea>
+      {#if editError}
+        <div class="error-banner comment-edit-error" role="alert">{editError}</div>
+      {/if}
+      <div class="comment-edit-actions">
+        <button class="btn-primary save-comment-edit" onclick={() => saveEdit(comment)} disabled={editBusy || !editDraft.trim()}>
+          {editBusy ? t('common.saving') : t('common.save')}
+        </button>
+        <button class="btn-secondary cancel-comment-edit" onclick={cancelEdit} disabled={editBusy}>{t('common.cancel')}</button>
+      </div>
+    {:else}
+      <div class="thread-comment-body">{comment.body}</div>
+      <div class="thread-comment-meta">
+        {#if isEdited(comment)}
+          <span class="edited-marker">{t('comments.edited')}</span>
+        {/if}
+        {#if canModifyComment(comment, viewer, permission.current)}
+          <button class="btn-link edit-comment" onclick={() => startEdit(comment)} disabled={editBusy}>{t('common.edit')}</button>
+          <button class="btn-link danger delete-comment" onclick={() => askDeleteComment(comment)}>{t('common.delete')}</button>
+        {/if}
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
+{#if pendingCommentDelete}
+  <Modal onclose={closeDeleteComment} labelledby="delete-review-comment-title">
+    <h2 id="delete-review-comment-title">{t('comments.delete_title')}</h2>
+    <p>{t('comments.delete_confirm')}</p>
+    {#if commentDeleteError}
+      <div class="error-banner comment-delete-error" role="alert">{commentDeleteError}</div>
+    {/if}
+    <div class="comment-edit-actions">
+      <button class="btn-danger confirm-delete-comment" onclick={confirmDeleteComment} disabled={commentDeleteBusy}>
+        {commentDeleteBusy ? t('common.deleting') : t('common.delete')}
+      </button>
+      <button class="btn-secondary" onclick={closeDeleteComment} disabled={commentDeleteBusy} data-autofocus>{t('common.cancel')}</button>
+    </div>
+  </Modal>
+{/if}
 
 <style>
   .pr-detail { max-width: 1200px; }
@@ -1041,6 +1217,11 @@
     gap: 8px;
   }
 
+  .delete-head-option { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 13px; }
+  .delete-head-option input { width: auto; }
+  .head-branch-outcome { padding: 8px 12px; margin: 12px 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-secondary); font-size: 13px; }
+  .head-branch-outcome.kept { border-color: var(--yellow, var(--border)); }
+
   .merge-select {
     padding: 6px 10px;
     font-size: 13px;
@@ -1156,4 +1337,9 @@
   }
   .btn-primary:hover { background: var(--green); }
   .btn-primary:disabled { opacity: 0.5; }
+  .thread-comment-meta { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 12px; }
+  .edited-marker { color: var(--text-muted); font-size: 12px; }
+  .comment-edit-input { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-primary); color: var(--text-primary); font-family: inherit; }
+  .comment-edit-actions { display: flex; gap: 8px; margin-top: 8px; }
+  .btn-link.danger { color: var(--red); }
 </style>

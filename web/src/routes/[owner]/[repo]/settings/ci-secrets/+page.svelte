@@ -2,6 +2,9 @@
   import { page } from '$app/stores';
   import { ciSecrets, type CiSecret } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
+  import { createT, formatDateTime } from '$lib/i18n';
+
+  const t = createT();
 
   const owner = $derived($page.params.owner!); const repo = $derived($page.params.repo!);
   let items = $state<CiSecret[]>([]); let name = $state(''); let value = $state(''); let error = $state(''); let saving = $state(false);
@@ -71,7 +74,7 @@
   }
 
   async function remove(item: CiSecret) {
-    if (!confirm(`Delete ${item.name}?`)) return;
+    if (!confirm(t('settings.ci_secrets.delete_confirm', { name: item.name }))) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -87,6 +90,6 @@
     }
   }
 </script>
-<svelte:head><title>CI secrets · {owner}/{repo}</title></svelte:head>
-<div class="settings-page"><header><h1>CI secrets</h1><p>Encrypted repository secrets are injected into jobs and masked from stored logs.</p></header>{#if error}<div class="message" role="alert">{error}</div>{/if}<section><h2>Add or replace a secret</h2><form onsubmit={save}><label for="secret-name">Name</label><input id="secret-name" bind:value={name} pattern="[A-Z_][A-Z0-9_]*" maxlength="100" placeholder="DEPLOY_TOKEN" disabled={saving} required /><label for="secret-value">Value</label><input id="secret-value" type="password" bind:value={value} minlength="4" maxlength="65536" disabled={saving} required /><button class="btn btn-primary" disabled={saving} aria-busy={saving}>Save secret</button></form></section><section><h2>Configured secrets</h2>{#if items.length === 0}<p>No secrets configured.</p>{:else}<div class="list">{#each items as item (item.name)}<article><div><strong>{item.name}</strong><small>Updated {new Date(item.updated_at).toLocaleString()}</small></div><button class="btn btn-danger" disabled={isBusy(rowKey(item.name))} aria-busy={isBusy(rowKey(item.name))} onclick={() => remove(item)}>Delete</button></article>{/each}</div>{/if}</section></div>
+<svelte:head><title>{t('settings.ci_secrets.title')} · {owner}/{repo}</title></svelte:head>
+<div class="settings-page"><header><h1>{t('settings.ci_secrets.title')}</h1><p>{t('settings.ci_secrets.desc')}</p></header>{#if error}<div class="message" role="alert">{error}</div>{/if}<section><h2>{t('settings.ci_secrets.add_title')}</h2><form onsubmit={save}><label for="secret-name">{t('settings.ci_secrets.name')}</label><input id="secret-name" bind:value={name} pattern="[A-Z_][A-Z0-9_]*" maxlength="100" placeholder="DEPLOY_TOKEN" disabled={saving} required /><label for="secret-value">{t('settings.ci_secrets.value')}</label><input id="secret-value" type="password" bind:value={value} minlength="4" maxlength="65536" disabled={saving} required /><button class="btn btn-primary" disabled={saving} aria-busy={saving}>{t('settings.ci_secrets.save')}</button></form></section><section><h2>{t('settings.ci_secrets.list_title')}</h2>{#if items.length === 0}<p>{t('settings.ci_secrets.empty')}</p>{:else}<div class="list">{#each items as item (item.name)}<article><div><strong>{item.name}</strong><small>{t('common.updated', { date: formatDateTime(item.updated_at) })}</small></div><button class="btn btn-danger" disabled={isBusy(rowKey(item.name))} aria-busy={isBusy(rowKey(item.name))} onclick={() => remove(item)}>{t('common.delete')}</button></article>{/each}</div>{/if}</section></div>
 <style>.settings-page{max-width:880px}header,section{margin-bottom:28px}header p,small{color:var(--text-secondary)}form{display:grid;gap:9px}input{padding:8px 10px}.message{color:var(--red);padding:12px;border:1px solid var(--border);border-radius:var(--radius)}.list{display:grid;gap:10px}article{display:flex;align-items:center;justify-content:space-between;padding:14px;border:1px solid var(--border);border-radius:var(--radius)}small{display:block;margin-top:5px}</style>

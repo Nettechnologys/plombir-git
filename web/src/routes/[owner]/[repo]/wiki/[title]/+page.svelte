@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { wiki } from '$lib/api/client.svelte';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
   import { renderMarkdown } from '$lib/utils/markdown';
@@ -26,6 +27,10 @@
   let viewingRevision = $state<any | null>(null);
   let requestedRevisionId = $state<number | null>(null);
   let pageMutationBusy = $state(false);
+  // Editing, restoring and deleting a page is behind `RepoWrite`
+  // (card_3625a7b89abb); a reader keeps the page, its contents and its history.
+  const permission = viewerPermission(() => owner, () => repo);
+  let canWrite = $derived(permission.canWrite);
   const pageRequests = new LatestRepositoryResourceRequestFence<string>();
   const historyRequests = new LatestRepositoryResourceRequestFence<string>();
   const revisionRequests = new LatestRepositoryResourceRequestFence<string>();
@@ -135,7 +140,7 @@
   }
 
   async function handleDelete() {
-    if (!confirm('Delete this wiki page? This cannot be undone.')) return;
+    if (!confirm(t('wiki.delete_confirm'))) return;
     if (pageMutationBusy) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
@@ -221,7 +226,7 @@
   }
 
   async function restoreRevision(rev: any) {
-    if (!confirm(`Restore version ${rev.version}? Current content will become a revision.`)) return;
+    if (!confirm(t('wiki.restore_confirm', { version: rev.version }))) return;
     if (pageMutationBusy) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
@@ -247,7 +252,7 @@
 </script>
 
 <svelte:head>
-  <title>{title} · {owner}/{repo} Wiki · Plombir Git</title>
+  <title>{title} · {t('wiki.repo_wiki', { repo: `${owner}/${repo}` })} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -299,37 +304,41 @@
           <h1>{title}</h1>
           <div class="header-actions">
             {#if wikiPage.updated_at}
-              <span class="text-secondary text-sm">Last edited {formatDate(wikiPage.updated_at)}</span>
+              <span class="text-secondary text-sm">{t('wiki.last_edited', { date: formatDate(wikiPage.updated_at) })}</span>
             {/if}
-            <button class="btn-outline" onclick={toggleHistory} class:active={showHistory} disabled={pageMutationBusy}>History</button>
-            <button class="btn-outline" onclick={startEditing} disabled={pageMutationBusy}>{t('wiki.edit')}</button>
-            <button class="btn-outline btn-danger" onclick={handleDelete} disabled={pageMutationBusy}>{t('wiki.delete', 'Delete')}</button>
+            <button class="btn-outline" onclick={toggleHistory} class:active={showHistory} disabled={pageMutationBusy}>{t('wiki.history')}</button>
+            {#if canWrite}
+              <button class="btn-outline" onclick={startEditing} disabled={pageMutationBusy}>{t('wiki.edit')}</button>
+              <button class="btn-outline btn-danger" onclick={handleDelete} disabled={pageMutationBusy}>{t('wiki.delete', 'Delete')}</button>
+            {/if}
           </div>
         </div>
 
         {#if showHistory}
           <div class="history-panel">
-            <h3>Revision History</h3>
+            <h3>{t('wiki.revision_history')}</h3>
             {#if historyLoading}
-              <p class="text-secondary">Loading…</p>
+              <p class="text-secondary">{t('wiki.loading_revisions')}</p>
             {:else if revisions.length === 0}
-              <p class="text-secondary">No revisions yet. Revisions are saved on every edit.</p>
+              <p class="text-secondary">{t('wiki.no_revisions_hint')}</p>
             {:else}
               <div class="revision-list">
                 {#each revisions as rev}
                   <div class="revision-item" class:expanded={viewingRevision?.id === rev.id}>
                     <button class="revision-header" onclick={() => viewRevision(rev)}>
                       <span class="rev-version">v{rev.version}</span>
-                      <span class="rev-msg">{rev.message || 'No message'}</span>
+                      <span class="rev-msg">{rev.message || t('wiki.noMessage')}</span>
                       <span class="rev-date">{formatDate(rev.created_at)}</span>
                       <span class="rev-arrow">{viewingRevision?.id === rev.id ? '▲' : '▼'}</span>
                     </button>
                     {#if viewingRevision?.id === rev.id}
                       <div class="revision-content">
                         <pre class="rev-preview">{viewingRevision.content}</pre>
-                        <button class="btn-primary btn-sm" onclick={() => restoreRevision(rev)} disabled={pageMutationBusy}>
-                          Restore this version
-                        </button>
+                        {#if canWrite}
+                          <button class="btn-primary btn-sm" onclick={() => restoreRevision(rev)} disabled={pageMutationBusy}>
+                            {t('wiki.restore_version')}
+                          </button>
+                        {/if}
                       </div>
                     {/if}
                   </div>
@@ -337,7 +346,7 @@
               </div>
             {/if}
           </div>
-        {:else if editing}
+        {:else if editing && canWrite}
           <div class="edit-area">
             <textarea bind:value={editContent} rows="20"></textarea>
             <div class="form-actions">

@@ -292,6 +292,23 @@ where
     })
 }
 
+/// How many open pull requests take `head_branch` of `source_repo_id` as
+/// their head — fork PRs included. A branch some open PR still reads must not
+/// be deleted on another PR's merge.
+pub async fn count_open_with_head(
+    db: &DatabaseConnection,
+    source_repo_id: i64,
+    head_branch: &str,
+) -> Result<u64> {
+    PrEntity::find()
+        .filter(head_repository_condition(source_repo_id))
+        .filter(pull_request::Column::HeadBranch.eq(head_branch))
+        .filter(pull_request::Column::State.eq("open"))
+        .count(db)
+        .await
+        .context("db: count open PRs on a head branch")
+}
+
 /// Advance PR heads only while they still point at the commit that was used
 /// to prepare a server-side update. This prevents a later DB write from
 /// overwriting a newer concurrent push notification.
@@ -349,6 +366,28 @@ pub async fn list_open_for_head_commit(
         .all(db)
         .await
         .context("db: list open PRs for head commit")
+}
+
+/// Open pull requests whose head is `commit_sha` and that a pipeline of
+/// `repo_id` speaks for: the ones whose head lives in it, and the ones it is
+/// the base of — a fork's pull request is tested in the repository it targets.
+pub async fn list_open_for_pipeline_commit(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    commit_sha: &str,
+) -> Result<Vec<PullRequest>> {
+    PrEntity::find()
+        .filter(
+            Condition::any()
+                .add(head_repository_condition(repo_id))
+                .add(pull_request::Column::RepoId.eq(repo_id)),
+        )
+        .filter(pull_request::Column::HeadSha.eq(commit_sha))
+        .filter(pull_request::Column::State.eq("open"))
+        .order_by_asc(pull_request::Column::Id)
+        .all(db)
+        .await
+        .context("db: list open PRs for a pipeline commit")
 }
 
 /// Atomically claim an auto-merge so concurrent approval/CI/push events cannot

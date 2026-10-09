@@ -255,10 +255,15 @@ async fn fork_pages_partition_forks_created_in_one_instant() {
     let mut walked = Vec::new();
     let mut total = 0;
     for page in 0..TIED_ROWS as u64 {
-        let (rows, count) =
-            rg_db::ops::repo_ops::list_forks(&db, origin.id, page * PER_PAGE, PER_PAGE)
-                .await
-                .expect("walk a page of forks");
+        let (rows, count) = rg_db::ops::repo_ops::list_forks_visible_to(
+            &db,
+            origin.id,
+            None,
+            page * PER_PAGE,
+            PER_PAGE,
+        )
+        .await
+        .expect("walk a page of forks");
         total = count;
         walked.extend(rows.into_iter().map(|row| row.id));
     }

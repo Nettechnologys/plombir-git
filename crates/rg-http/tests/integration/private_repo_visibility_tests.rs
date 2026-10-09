@@ -27,6 +27,8 @@ async fn create_repo_with_visibility(base: &str, token: &str, name: &str, privat
             "name": name,
             "description": "top secret plans",
             "is_private": private,
+            "auto_init": true,
+            "readme": "default",
         }))
         .send()
         .await

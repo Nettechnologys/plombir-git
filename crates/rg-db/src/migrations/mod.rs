@@ -138,6 +138,8 @@ pub mod m20261007_000001_create_lfs_locks;
 pub mod m20261007_000002_add_lfs_last_claimed_at;
 pub mod m20261007_000003_issue_comments_reference_their_issue;
 pub mod m20261008_000001_account_self_service;
+pub mod m20261009_000001_owner_names_unique;
+pub mod m20261009_000002_notification_routing;
 
 use sea_orm_migration::prelude::*;
 
@@ -366,6 +368,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261007_000002_add_lfs_last_claimed_at::Migration),
             Box::new(m20261007_000003_issue_comments_reference_their_issue::Migration),
             Box::new(m20261008_000001_account_self_service::Migration),
+            Box::new(m20261009_000001_owner_names_unique::Migration),
+            Box::new(m20261009_000002_notification_routing::Migration),
         ]
     }
 }

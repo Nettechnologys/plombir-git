@@ -107,6 +107,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>{t('wiki.history')} · {title} · {owner}/{repo} · Plombir Git</title>
+</svelte:head>
+
 <RepoHeader {owner} {repo} activeTab="wiki" />
 
 <div class="content">
@@ -121,14 +125,14 @@
   </div>
 
   {#if loading}
-    <div class="loading">{t('common.loading')}...</div>
+    <div class="loading">{t('common.loading')}</div>
   {:else if error}
     <div class="error">{error}</div>
   {:else}
     {#if viewingRev && currentRev}
       <div class="revision-detail">
         <div class="rev-meta">
-          <h3>Revision #{currentRev.id}</h3>
+          <h3>{t('wiki.revision_number', { id: currentRev.id })}</h3>
           <p class="rev-info">
             {formatDate(currentRev.created_at)}
             {#if currentRev.message}
@@ -157,7 +161,7 @@
           <tbody>
             {#each revisions as rev, i}
               <tr>
-                <td class="rev-id">r{revisions.length - i}</td>
+                <td class="rev-id">{t('wiki.revision_short', { number: revisions.length - i })}</td>
                 <td class="rev-msg">
                   {rev.message || t('wiki.noMessage')}
                 </td>

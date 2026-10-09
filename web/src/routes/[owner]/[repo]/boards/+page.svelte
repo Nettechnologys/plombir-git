@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
+  import Modal from '$lib/components/Modal.svelte';
   import {
     boards,
     buildBoardCardUpdatePayload,
@@ -172,7 +173,7 @@
         selectedBoardId !== board.id ||
         !boardSelectionRequests.owns(claim, owner, repo, board.id)
       ) return;
-      if (b.board.id !== board.id) throw new Error('Board response identity mismatch');
+      if (b.board.id !== board.id) throw new Error(t('board.identity_mismatch'));
       activeBoard = b.board;
       columns = normalizeColumns(b);
     } catch (e: any) {
@@ -405,7 +406,7 @@
     if (!isCurrentRoute(route) || activeBoard?.id !== boardId) return;
     const b = await boards.get(route.owner, route.repo, boardId);
     if (!isCurrentRoute(route) || activeBoard?.id !== boardId) return;
-    if (b.board.id !== boardId) throw new Error('Board response identity mismatch');
+    if (b.board.id !== boardId) throw new Error(t('board.identity_mismatch'));
     activeBoard = b.board;
     columns = normalizeColumns(b);
   }
@@ -439,7 +440,7 @@
 </script>
 
 <svelte:head>
-  <title>Board · {owner}/{repo} · Plombir Git</title>
+  <title>{t('board.page_title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -462,15 +463,9 @@
   {/if}
 
   {#if showCreate}
-    <div class="modal-overlay-wrap">
-      <button
-        class="modal-overlay"
-        type="button"
-        aria-label={t('common.close')}
-        onclick={closeCreateModal}
-      ></button>
+    <Modal onclose={closeCreateModal} labelledby="board-create-title" width="400px" padding="20px">
       <div class="modal">
-        <h3>{t('board.createBoard')}</h3>
+        <h3 id="board-create-title">{t('board.createBoard')}</h3>
         <input class="input" type="text" bind:value={newBoardName} placeholder={t('board.namePlaceholder')} disabled={boardControlsBusy} />
         <input class="input" type="text" bind:value={newBoardDesc} placeholder={t('board.descPlaceholder')} disabled={boardControlsBusy} />
         <div class="modal-actions">
@@ -478,19 +473,13 @@
           <button class="btn btn-primary" onclick={createBoard} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.create')}</button>
         </div>
       </div>
-    </div>
+    </Modal>
   {/if}
 
   {#if editingCard}
-    <div class="modal-overlay-wrap">
-      <button
-        class="modal-overlay"
-        type="button"
-        aria-label={t('common.close')}
-        onclick={() => (editingCard = null)}
-      ></button>
+    <Modal onclose={() => (editingCard = null)} labelledby="board-card-edit-title" width="400px" padding="20px">
       <div class="modal">
-        <h3>{t('board.editCard')}</h3>
+        <h3 id="board-card-edit-title">{t('board.editCard')}</h3>
         <label class="modal-field">
           {t('board.cardNote')}
           <textarea class="input" rows="4" bind:value={cardForm.note}></textarea>
@@ -514,7 +503,7 @@
           <button class="btn btn-primary" onclick={saveCard} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.save')}</button>
         </div>
       </div>
-    </div>
+    </Modal>
   {/if}
 
   {#if loading}
@@ -624,14 +613,14 @@
                           disabled={boardControlsBusy || cardIndex === 0}
                           aria-busy={boardControlsBusy}
                           onclick={() => reorderCard(col, card.id, cardIndex - 1)}
-                          title="Move card up"
+                          title={t('board.move_card_up')}
                         >↑</button>
                         <button
                           class="btn-icon btn-icon-sm"
                           disabled={boardControlsBusy || cardIndex === (col.cards || []).length - 1}
                           aria-busy={boardControlsBusy}
                           onclick={() => reorderCard(col, card.id, cardIndex + 1)}
-                          title="Move card down"
+                          title={t('board.move_card_down')}
                         >↓</button>
                         <button class="btn-icon btn-icon-sm" onclick={() => startEditCard(card)} title={t('common.edit')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>✎</button>
                         <button class="btn-icon btn-icon-sm" onclick={() => deleteCard(card.id, col.id)} title={t('common.delete')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>&times;</button>
@@ -716,38 +705,7 @@
   .add-card-btn:hover { background:var(--bg-tertiary, #e5e7eb); }
 
   /* Modal */
-  .modal-overlay-wrap {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 100;
-  }
-
-  .modal-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.3);
-    border: none;
-    padding: 0;
-    margin: 0;
-    z-index: 99;
-    cursor: default;
-  }
-  .modal {
-    position: relative;
-    z-index: 101;
-    background:var(--bg-primary, #fff);
-    padding:20px;
-    border-radius:12px;
-    min-width:300px;
-    max-width:400px;
-    box-shadow:0 4px 24px rgba(0,0,0,0.15);
-  }
+  /* The panel, backdrop and focus handling are lib/components/Modal.svelte. */
   .modal-actions { display:flex; gap:8px; margin-top:12px; justify-content:flex-end; }
   .modal-field { display:flex; flex-direction:column; gap:4px; margin-top:10px; color:var(--text-secondary, #666); font-size:12px; }
   .modal-field textarea { resize:vertical; }

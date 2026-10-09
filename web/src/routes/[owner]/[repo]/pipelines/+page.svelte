@@ -3,6 +3,7 @@
   import { onDestroy } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import PipelineBadge from '$lib/components/PipelineBadge.svelte';
+  import Modal from '$lib/components/Modal.svelte';
   import { artifacts, connectJobLogWebSocket, pipelines, repos } from '$lib/api/client.svelte';
   import type { CiArtifact } from '$lib/api/artifacts';
   import type { WorkflowDispatchInput } from '$lib/api/pipelines';
@@ -555,7 +556,7 @@
         || !isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)
       ) return;
       disconnectJobLogSocket();
-      logContent = 'Failed to load log: ' + e.message;
+      logContent = t('pipeline.log.load_failed', { error: e.message });
       logStreamStatus = 'error';
       showLogPanel = true;
     }
@@ -600,7 +601,7 @@
       () => {
         if (!ownsJobIntent(claim, expectedOwner, expectedRepo, pipelineId, jobId, expectedRoute, expectedSelection)) return;
         logStreamStatus = 'error';
-        logStreamError = 'Live log connection failed';
+        logStreamError = t('pipeline.log.stream_failed');
       },
     );
   }
@@ -710,16 +711,10 @@
     }
   }
 
-  function closeLogByKey(e: KeyboardEvent) {
-    if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      closeLog();
-    }
-  }
 </script>
 
 <svelte:head>
-  <title>CI/CD · {owner}/{repo} · Plombir Git</title>
+  <title>{t('pipeline.page_title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -980,36 +975,23 @@
 
 <!-- Log Viewer Modal -->
 {#if showLogPanel}
-  <div class="log-overlay-wrap">
-    <button
-      type="button"
-      class="log-overlay"
-      onclick={closeLog}
-      aria-label={t('common.cancel')}
-    ></button>
-    <div
-      class="log-modal"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="pipeline-log-title"
-      tabindex="-1"
-      onkeydown={closeLogByKey}
-    >
+  <Modal onclose={closeLog} labelledby="pipeline-log-title" width="800px" padding="0">
+    <div class="log-modal">
       <div class="log-header">
         <div>
-          <strong id="pipeline-log-title">{selectedJob?.name || 'Job Log'}</strong>
+          <strong id="pipeline-log-title">{selectedJob?.name || t('pipeline.log.title')}</strong>
           {#if selectedJob}
             <PipelineBadge status={selectedJob.status} />
           {/if}
           {#if logStreamStatus === 'connected'}
-            <span class="log-live connected">Live</span>
+            <span class="log-live connected">{t('pipeline.log.live')}</span>
           {:else if logStreamStatus === 'closed'}
-            <span class="log-live">Closed</span>
+            <span class="log-live">{t('pipeline.log.closed')}</span>
           {:else if logStreamStatus === 'error'}
-            <span class="log-live error">{logStreamError || 'Offline'}</span>
+            <span class="log-live error">{logStreamError || t('common.offline')}</span>
           {/if}
         </div>
-        <button class="btn-close" onclick={closeLog}>✕</button>
+        <button class="btn-close" onclick={closeLog} aria-label={t('common.close')}>✕</button>
       </div>
       {#if selectedJob?.if_condition}
         <div class="log-condition">
@@ -1017,9 +999,9 @@
           <code>{selectedJob.if_condition}</code>
         </div>
       {/if}
-      <pre class="log-content" bind:this={logContentEl}><code>{logContent || '(no log output)'}</code></pre>
+      <pre class="log-content" bind:this={logContentEl}><code>{logContent || t('pipeline.log.empty')}</code></pre>
     </div>
-  </div>
+  </Modal>
 {/if}
 
 <style>
@@ -1230,38 +1212,11 @@
   @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
   /* ── Log Viewer Modal ── */
-  .log-overlay-wrap {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 40px;
-  }
-
-  .log-overlay {
-    position: absolute;
-    inset: 0;
-    z-index: 1;
-    background: rgba(0,0,0,0.5);
-    border: none;
-    margin: 0;
-    padding: 0;
-    cursor: default;
-  }
+  /* The panel, backdrop and focus handling are lib/components/Modal.svelte. */
   .log-modal {
-    position: relative;
-    z-index: 2;
-    background: var(--bg-primary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    width: 100%;
-    max-width: 800px;
     max-height: 80vh;
     display: flex;
     flex-direction: column;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.2);
   }
   .log-header {
     display: flex;

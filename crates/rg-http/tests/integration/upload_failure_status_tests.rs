@@ -16,7 +16,9 @@
 
 use reqwest::multipart::{Form, Part};
 
-use crate::common::{create_issue, create_repo, register_full, spawn_test_app_with_oci_root};
+use crate::common::{
+    create_initialised_repo, create_issue, create_repo, register_full, spawn_test_app_with_oci_root,
+};
 
 async fn create_release(base: &str, token: &str, owner: &str, repo: &str) -> i64 {
     let client = reqwest::Client::new();
@@ -40,7 +42,7 @@ async fn release_asset_upload_separates_a_bad_request_from_a_broken_blob_store()
     let (base, repo_root, _oci_root) = spawn_test_app_with_oci_root().await;
     let client = reqwest::Client::new();
     let (token, _user_id) = register_full(&base, "asset_blame", "asset_blame@example.com").await;
-    create_repo(&base, &token, "blamed-release").await;
+    create_initialised_repo(&base, &token, "blamed-release").await;
     let release_id = create_release(&base, &token, "asset_blame", "blamed-release").await;
     let assets_url =
         format!("{base}/api/v1/repos/asset_blame/blamed-release/releases/{release_id}/assets");

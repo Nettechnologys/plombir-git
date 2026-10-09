@@ -178,8 +178,34 @@ pub async fn create_pr(
         &pr.title,
         "opened",
     );
+    // The author follows their pull request; whoever its text mentions is told.
+    crate::notification::thread::spawn(
+        db,
+        crate::notification::thread::ThreadEvent::new(
+            pr_subject(&pr),
+            Some(author_id),
+            "opened this pull request",
+        )
+        .mentions_in(format!(
+            "{}\n{}",
+            pr.title,
+            pr.body.as_deref().unwrap_or_default()
+        ))
+        .actor_subscribes("author"),
+    );
 
     Ok(pr)
+}
+
+/// The pull request as a notification subject.
+pub(crate) fn pr_subject(pr: &PullRequest) -> crate::notification::thread::Subject {
+    crate::notification::thread::Subject {
+        kind: crate::notification::thread::SubjectKind::PullRequest,
+        id: pr.id,
+        number: pr.number,
+        repo_id: pr.repo_id,
+        title: pr.title.clone(),
+    }
 }
 
 /// Insert one pull request under a freshly allocated repository-local number.
@@ -1053,6 +1079,174 @@ fn compute_cross_repo_diff(
         head_branch: pr.head_branch.clone(),
         stats,
         files_changed: files,
+    })
+}
+
+/// One commit of a comparison, in the shape the commit log answers with.
+#[derive(Debug, serde::Serialize)]
+pub struct ComparedCommit {
+    pub sha: String,
+    pub message: String,
+    pub author: String,
+    /// RFC 3339.
+    pub date: String,
+}
+
+/// What a pull request from a head branch into `base` would bring, before it
+/// exists: the commits the head adds since the merge base, and the diff the
+/// pull request would show (card_87f9b1c97489).
+#[derive(Debug, serde::Serialize)]
+pub struct Comparison {
+    #[serde(flatten)]
+    pub diff: PrDiff,
+    pub merge_base_sha: String,
+    /// Oldest first, at most [`MAX_COMPARED_COMMITS`].
+    pub commits: Vec<ComparedCommit>,
+    /// Every commit the head adds, including those past the cap.
+    pub total_commits: usize,
+}
+
+/// How many commits a comparison lists. The count is reported in full.
+pub const MAX_COMPARED_COMMITS: usize = 250;
+
+/// Compare `base` of `base_repo` with `head_branch` of `head_repo` — the base
+/// repository itself when `None`, or a fork of it, as [`resolve_head_ref`]
+/// resolves a pull request's `<owner>:<branch>` head.
+///
+/// The caller has already decided the head repository is readable: a fork is
+/// a repository of its own, and read access to the base says nothing about
+/// it. Nothing here re-checks that.
+pub async fn compare_branches(
+    db: &DatabaseConnection,
+    repo_root: &std::path::Path,
+    base_repo: &repo_entity::Model,
+    base: &str,
+    head_repo: Option<&repo_entity::Model>,
+    head_branch: &str,
+) -> Result<Comparison> {
+    let base_namespace = repository_namespace(db, base_repo).await?;
+    let base_path = repo_root.join(format!("{base_namespace}/{}.git", base_repo.name));
+    let head_branch = head_branch.to_string();
+    let missing_branch = |side: &str, branch: &str| {
+        crate::error::invalid_request(format!("{side} branch '{branch}' does not exist"))
+    };
+    for (side, branch) in [("base", base), ("head", head_branch.as_str())] {
+        if rg_git::refname::validate_refname(&format!("refs/heads/{branch}")).is_err() {
+            return Err(missing_branch(side, branch));
+        }
+    }
+    if crate::repo::service::try_get_branch_sha(&base_path, base)?.is_none() {
+        return Err(missing_branch("base", base));
+    }
+
+    let Some(head_repo) = head_repo.filter(|head_repo| head_repo.id != base_repo.id) else {
+        if crate::repo::service::try_get_branch_sha(&base_path, &head_branch)?.is_none() {
+            return Err(missing_branch("head", &head_branch));
+        }
+        let base = base.to_string();
+        return tokio::task::spawn_blocking(move || {
+            let head_rev = format!("refs/heads/{head_branch}");
+            compare_in(&base_path, &base, &head_branch, &head_rev)
+        })
+        .await?;
+    };
+
+    let head_namespace = repository_namespace(db, head_repo).await?;
+    let fork_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
+    let base = base.to_string();
+    crate::blocking::run_blocking_git("fetching and comparing a fork branch", move || {
+        if crate::repo::service::try_get_branch_sha(&fork_path, &head_branch)?.is_none() {
+            return Err(crate::error::invalid_request(format!(
+                "head branch '{head_branch}' does not exist"
+            )));
+        }
+        let local_ref = scratch_fork_ref();
+        let compared = (|| {
+            let git = rg_git::cli_gateway::global_gateway()
+                .as_ref()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            run_fork_fetch(
+                git,
+                &fork_path,
+                &format!("refs/heads/{head_branch}"),
+                &local_ref,
+                &base_path,
+            )?
+            .ensure_success()
+            .context("failed to fetch the head branch to compare")?;
+            compare_in(&base_path, &base, &head_branch, &local_ref)
+        })();
+        // In the same phase as the fetch, however the comparison went.
+        discard_fork_ref(&base_path, &local_ref);
+        compared
+    })
+    .await
+}
+
+/// The comparison of `refs/heads/<base>` with `head_rev`, both in
+/// `repo_path`: the same merge base, numstat and patch a pull request's diff
+/// reads, plus the commits between.
+fn compare_in(
+    repo_path: &std::path::Path,
+    base: &str,
+    head_branch: &str,
+    head_rev: &str,
+) -> Result<Comparison> {
+    let (old_rev, new_rev) =
+        plombir_git_diff_revs(repo_path, &format!("refs/heads/{base}"), head_rev)?;
+    let (mut files, stats) = gix_diff_numstat(repo_path, old_rev.clone(), new_rev.clone())?;
+    let patch_text = plombir_git_patch_text(repo_path, &old_rev, &new_rev)?;
+    attach_patches(&mut files, &patch_text);
+
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+    let head_id = gix::ObjectId::from_hex(new_rev.as_bytes())?;
+    let base_id = gix::ObjectId::from_hex(old_rev.as_bytes())?;
+    let walk = repo
+        .rev_walk([head_id])
+        .with_hidden([base_id])
+        .all()
+        .context("starting the comparison walk")?;
+    let mut commits = Vec::new();
+    let mut total_commits = 0_usize;
+    for info in walk {
+        let info = info.context("walking the compared commits")?;
+        total_commits += 1;
+        if commits.len() >= MAX_COMPARED_COMMITS {
+            continue;
+        }
+        let commit = info.object().context("reading a compared commit")?;
+        let author = commit
+            .author()
+            .context("reading a compared commit's author")?;
+        let date = chrono::DateTime::from_timestamp(author.seconds(), 0)
+            .map(|date| date.to_rfc3339())
+            .unwrap_or_default();
+        commits.push(ComparedCommit {
+            sha: info.id.to_string(),
+            message: commit
+                .message_raw_sloppy()
+                .to_string()
+                .trim_end()
+                .to_string(),
+            author: author.name.to_string(),
+            date,
+        });
+    }
+    // The walk is newest first; a comparison reads oldest first, like the
+    // pull request it previews.
+    commits.reverse();
+
+    Ok(Comparison {
+        diff: PrDiff {
+            base_branch: base.to_string(),
+            head_branch: head_branch.to_string(),
+            files_changed: files,
+            stats,
+        },
+        merge_base_sha: old_rev,
+        commits,
+        total_commits,
     })
 }
 

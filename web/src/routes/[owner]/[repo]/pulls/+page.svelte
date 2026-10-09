@@ -1,8 +1,12 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import { untrack } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
   import { pulls, repos } from '$lib/api/client.svelte';
+  import type { RepositoryFork } from '$lib/api/repos';
+  import { getUser } from '$lib/stores/auth.svelte';
+  import { compareHref, parseHeadRef } from '$lib/pullHeadRef';
   import {
     LatestRepositoryRequestFence,
     LatestRepositoryResourceRequestFence,
@@ -21,7 +25,10 @@
   let newTitle = $state('');
   let newBody = $state('');
   let newHead = $state('');
-  let newBase = $state('main');
+  // Filled from the branch list's default marker once it loads (or from the
+  // compare page's `?base=`): a literal `main` sat in the select on a
+  // repository without such a branch and was sent as the base.
+  let newBase = $state('');
   let newDraft = $state(false);
   let branches = $state<any[]>([]);
   let branchesLoading = $state(false);
@@ -31,6 +38,47 @@
   const pullListRequests = new LatestRepositoryResourceRequestFence<string>();
   const branchRequests = new LatestRepositoryRequestFence();
   let routeGeneration = 0;
+
+  // The head of a pull request may live in a fork (card_87f9b1c97489). The
+  // server reads `head: "<fork owner>:<branch>"`, looks the fork up as
+  // `<fork owner>/<this repo's name>` and accepts it only when it is a direct
+  // fork of this repository — exactly what `GET /forks` lists, so that list,
+  // narrowed to forks that kept the name, is the set of heads worth offering.
+  // `''` names this repository itself.
+  const FORK_PAGE_SIZE = 100;
+  const MAX_FORK_PAGES = 10;
+  let headRepoOwner = $state('');
+  let forks = $state<RepositoryFork[]>([]);
+  let forksError = $state('');
+  // A head owner the URL asked for that the fork list did not (yet) name.
+  let requestedHeadOwner = $state('');
+  let headBranches = $state<any[]>([]);
+  let headBranchesLoading = $state(false);
+  let headBranchesError = $state('');
+  const forkRequests = new LatestRepositoryRequestFence();
+  const headBranchRequests = new LatestRepositoryResourceRequestFence<string>();
+
+  let headIsFork = $derived(headRepoOwner !== '' && headRepoOwner !== owner);
+  let headBranchOptions = $derived(headIsFork ? headBranches : branches);
+  let headBranchesBusy = $derived(headIsFork ? headBranchesLoading : branchesLoading);
+  let headRepoOptions = $derived.by(() => {
+    const me = getUser()?.username ?? '';
+    const owners = forks.map((fork) => fork.owner_name);
+    if (requestedHeadOwner && requestedHeadOwner !== owner && !owners.includes(requestedHeadOwner)) {
+      owners.push(requestedHeadOwner);
+    }
+    // The caller's own forks first: they are the ones a person opening a pull
+    // request from the UI almost always means.
+    return [...new Set(owners)]
+      .filter((name) => name && name !== owner)
+      .sort((a, b) => Number(b === me) - Number(a === me))
+      .map((name) => ({ owner: name, mine: name === me }));
+  });
+  let compareLink = $derived(
+    newHead && newBase
+      ? compareHref(owner, repo, newBase, { owner: headIsFork ? headRepoOwner : null, branch: newHead })
+      : '',
+  );
 
   $effect(() => {
     const expectedOwner = owner;
@@ -45,14 +93,111 @@
     newTitle = '';
     newBody = '';
     newHead = '';
-    newBase = 'main';
+    newBase = '';
     newDraft = false;
     templateLoaded = false;
     creating = false;
     error = '';
+    headRepoOwner = '';
+    forks = [];
+    forksError = '';
+    requestedHeadOwner = '';
+    headBranches = [];
+    headBranchesLoading = false;
+    headBranchesError = '';
+    headBranchRequests.begin(expectedOwner, expectedRepo, '');
     void loadPRs(expectedOwner, expectedRepo, 'open', routeGeneration);
     void loadBranches(expectedOwner, expectedRepo, routeGeneration);
+    void loadForks(expectedOwner, expectedRepo, routeGeneration);
+    // `?new=1&base=…&head=…` — the compare page's "Create pull request" lands
+    // here with the form to open. Read once per route, not tracked: the query
+    // is an instruction, not state this page mirrors.
+    untrack(() => applyCreatePrefill(expectedOwner, expectedRepo, routeGeneration));
   });
+
+  function applyCreatePrefill(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
+    const query = $page.url.searchParams;
+    if (query.get('new') !== '1') return;
+    const base = query.get('base');
+    const head = parseHeadRef(query.get('head') ?? '');
+    if (base) newBase = base;
+    if (head.owner && head.owner !== expectedOwner) {
+      requestedHeadOwner = head.owner;
+      headRepoOwner = head.owner;
+      void loadHeadBranches(head.owner, expectedOwner, expectedRepo, expectedRoute);
+    }
+    newHead = head.branch;
+    void openCreate();
+  }
+
+  async function loadForks(
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedRoute = routeGeneration,
+  ) {
+    if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+    const claim = forkRequests.begin(expectedOwner, expectedRepo);
+    const current = () =>
+      forkRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute);
+    forksError = '';
+    try {
+      const found: RepositoryFork[] = [];
+      for (let pageNumber = 1; pageNumber <= MAX_FORK_PAGES; pageNumber += 1) {
+        const response = await repos.forks(expectedOwner, expectedRepo, pageNumber, FORK_PAGE_SIZE);
+        if (!current()) return;
+        const rows = response?.data ?? [];
+        found.push(...rows);
+        if (rows.length === 0 || pageNumber >= (response?.pagination?.total_pages ?? 1)) break;
+      }
+      forks = found.filter((fork) => fork.name === expectedRepo && !fork.deleted_at);
+    } catch (e: any) {
+      if (current()) {
+        forks = [];
+        forksError = e?.message || t('pulls.create_form.forks_unavailable');
+      }
+    }
+  }
+
+  async function loadHeadBranches(
+    forkOwner: string,
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedRoute = routeGeneration,
+  ) {
+    if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+    const claim = headBranchRequests.begin(expectedOwner, expectedRepo, forkOwner);
+    const current = () =>
+      headBranchRequests.owns(claim, owner, repo, headRepoOwner) &&
+      isCurrentRoute(expectedOwner, expectedRepo, expectedRoute);
+    headBranches = [];
+    headBranchesLoading = true;
+    headBranchesError = '';
+    try {
+      const next = await repos.branches(forkOwner, expectedRepo);
+      if (current()) headBranches = next ?? [];
+    } catch (e: any) {
+      if (current()) {
+        headBranches = [];
+        headBranchesError = e?.message || t('pulls.create_form.fork_branches_unavailable');
+      }
+    } finally {
+      if (current()) headBranchesLoading = false;
+    }
+  }
+
+  function selectHeadRepo(nextOwner: string) {
+    if (nextOwner === headRepoOwner) return;
+    headRepoOwner = nextOwner;
+    newHead = '';
+    if (nextOwner && nextOwner !== owner) {
+      void loadHeadBranches(nextOwner, owner, repo, routeGeneration);
+    } else {
+      headBranchRequests.begin(owner, repo, '');
+      headBranches = [];
+      headBranchesLoading = false;
+      headBranchesError = '';
+    }
+  }
 
   function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
     return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
@@ -116,6 +261,10 @@
       ) {
         branches = nextBranches;
         branchesError = '';
+        const listed: any[] = nextBranches ?? [];
+        if (!listed.some((b) => b.name === newBase)) {
+          newBase = listed.find((b) => b.is_default)?.name ?? listed[0]?.name ?? '';
+        }
       }
     } catch (e: any) {
       if (
@@ -149,6 +298,7 @@
         title: newTitle,
         body: newBody || undefined,
         head_branch: newHead,
+        head_owner: headIsFork ? headRepoOwner : null,
         base_branch: newBase,
         draft: newDraft,
       });
@@ -188,7 +338,7 @@
 </script>
 
 <svelte:head>
-  <title>Pull Requests · {owner}/{repo} · Plombir Git</title>
+  <title>{t('pulls.title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -240,12 +390,50 @@
         </div>
       {/if}
       <form onsubmit={handleCreate}>
+        <div class="head-repo-row">
+          <label>
+            {t('pulls.create_form.head_repository')}
+            <select
+              class="head-repo-select"
+              value={headRepoOwner}
+              onchange={(event) => selectHeadRepo(event.currentTarget.value)}
+              disabled={creating}
+            >
+              <option value="">{owner}/{repo}</option>
+              {#each headRepoOptions as option (option.owner)}
+                <option value={option.owner}>
+                  {option.owner}/{repo}{option.mine ? ` ${t('pulls.create_form.your_fork')}` : ''}
+                </option>
+              {/each}
+            </select>
+          </label>
+          {#if forksError}
+            <span class="forks-note" role="status">{t('pulls.create_form.forks_unavailable')}</span>
+          {/if}
+        </div>
+        {#if headIsFork && headBranchesError}
+          <div class="error-banner branch-load-error head-branch-error" role="alert">
+            <span>{t('pulls.create_form.fork_branches_unavailable')}</span>
+            <button
+              type="button"
+              class="btn-secondary"
+              onclick={() => loadHeadBranches(headRepoOwner, owner, repo, routeGeneration)}
+              disabled={headBranchesLoading}
+            >
+              {t('common.retry')}
+            </button>
+          </div>
+        {/if}
         <div class="branch-row">
           <label>
             {t('pulls.create_form.from')}
-            <select bind:value={newHead} required disabled={creating || branchesLoading || !!branchesError}>
+            <select
+              bind:value={newHead}
+              required
+              disabled={creating || headBranchesBusy || (headIsFork ? !!headBranchesError : !!branchesError)}
+            >
               <option value="" disabled selected>{t('pulls.create_form.select_branch')}</option>
-              {#each branches as b}
+              {#each headBranchOptions as b}
                 <option value={b.name}>{b.name}</option>
               {/each}
             </select>
@@ -260,9 +448,12 @@
             </select>
           </label>
         </div>
+        {#if compareLink}
+          <a class="compare-link" href={compareLink}>{t('pulls.create_form.compare')}</a>
+        {/if}
         <label>
-          {t('pulls.create_form.description')}
-          <input type="text" bind:value={newTitle} required placeholder={t('pulls.create_form.description_placeholder')} disabled={creating} />
+          {t('pulls.create_form.title_label')}
+          <input type="text" bind:value={newTitle} required placeholder={t('pulls.create_form.title_placeholder')} disabled={creating} />
         </label>
         <label>
           {t('pulls.create_form.description')} <span class="optional">{t('pulls.create_form.description_hint')}</span>
@@ -273,7 +464,11 @@
           <span>{t('pulls.create_form.draft')}</span>
         </label>
         <div class="form-actions">
-          <button type="submit" class="btn-primary" disabled={creating || branchesLoading || !!branchesError || !newHead}>{t('pulls.create_form.submit')}</button>
+          <button
+            type="submit"
+            class="btn-primary"
+            disabled={creating || branchesLoading || !!branchesError || headBranchesBusy || (headIsFork && !!headBranchesError) || !newHead}
+          >{t('pulls.create_form.submit')}</button>
           <button type="button" class="btn-secondary" onclick={() => showCreate = false}>{t('pulls.create_form.cancel')}</button>
         </div>
       </form>
@@ -301,7 +496,7 @@
               {#if pr.is_draft}<span class="draft-badge">{t('pulls.draft')}</span>{/if}
             </div>
             <div class="pr-meta">
-              #{pr.number} opened {formatDate(pr.created_at)} by {pr.author || t('common.unknown')}<BotBadge owner={pr.author_bot_owner} link={false} />
+              {t('pulls.meta', { number: pr.number, date: formatDate(pr.created_at), author: pr.author || t('common.unknown') })}<BotBadge owner={pr.author_bot_owner} link={false} />
               <span class="branch-label">{pr.head_branch}</span> → <span class="branch-label">{pr.base_branch}</span>
             </div>
           </div>
@@ -379,6 +574,15 @@
     gap: 12px;
   }
   .arrow { font-size: 20px; color: var(--text-muted); margin-bottom: 8px; }
+
+  .head-repo-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .forks-note { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; }
+  .compare-link { align-self: flex-start; font-size: 13px; }
 
   .form-actions { display: flex; gap: 8px; margin-top: 8px; }
 .empty { text-align: center; padding: 48px; color: var(--text-secondary); }

@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { notifications, connectNotificationWebSocket } from '$lib/api/client.svelte';
+  import { goto } from '$app/navigation';
+  import { notifications, connectNotificationWebSocket, type NotificationRow } from '$lib/api/client.svelte';
   import { getUser, isLoggedIn } from '$lib/stores/auth.svelte';
-  import { createT, formatDateTime } from '$lib/i18n';
+  import { createT, formatDateTime, formatTranslationFallback } from '$lib/i18n';
 
   const t = createT();
 
-  let notifs = $state<any[]>([]);
+  let notifs = $state<NotificationRow[]>([]);
   let unreadCount = $state(0);
   let loading = $state(true);
   let loadError = $state('');
@@ -78,6 +79,34 @@
     }
   }
 
+  // card_349c2b6a0d7c: a row now says where it points (`link`, a path inside
+  // this app) and why it reached the reader (`reason`). Only an app-relative
+  // path is followed; anything else stays plain text.
+  function internalLink(notif: NotificationRow): string | null {
+    const link = notif.link;
+    return typeof link === 'string' && link.startsWith('/') && !link.startsWith('//') ? link : null;
+  }
+
+  function reasonLabel(reason: string): string {
+    return t(`notifications.reason.${reason}`, undefined, formatTranslationFallback(reason));
+  }
+
+  async function openNotification(event: MouseEvent, notif: NotificationRow) {
+    const link = internalLink(notif);
+    if (!link) return;
+    // A modified click keeps the browser's own behaviour (new tab, etc.).
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    if (!notif.is_read) {
+      try {
+        await notifications.markRead(notif.id);
+      } catch (e) {
+        console.error('Failed to mark as read:', e);
+      }
+    }
+    await goto(link);
+  }
+
   function eventIcon(type: string): string {
     switch (type) {
       case 'push': return '📦';
@@ -124,6 +153,10 @@
   });
 </script>
 
+<svelte:head>
+  <title>{t('notifications.title')} · Plombir Git</title>
+</svelte:head>
+
 <div class="container">
   <div class="header">
     <h1>{t('notifications.title')} {unreadCount > 0 ? `(${unreadCount})` : ''}</h1>
@@ -158,12 +191,21 @@
     <div class="notif-list">
       {#each notifs as notif}
         <div class="notif-item" class:unread={!notif.is_read}>
-          <div class="notif-icon">{eventIcon(notif.event_type)}</div>
+          <div class="notif-icon">{eventIcon(notif.subject_type ?? notif.event_type)}</div>
           <div class="notif-content">
-            <div class="notif-title">{notif.title}</div>
+            <div class="notif-title">
+              {#if internalLink(notif)}
+                <a class="notif-link" href={internalLink(notif)} onclick={(event) => openNotification(event, notif)}>{notif.title}</a>
+              {:else}
+                {notif.title}
+              {/if}
+            </div>
             {#if notif.body}<div class="notif-body">{notif.body}</div>{/if}
             <div class="notif-meta">
               <span class="notif-type">{notif.event_type}</span>
+              {#if notif.reason}
+                <span class="notif-reason">{reasonLabel(notif.reason)}</span>
+              {/if}
               <span class="notif-time">{formatDateTime(notif.created_at)}</span>
             </div>
           </div>
@@ -209,5 +251,8 @@
   .notif-meta { display: flex; gap: 0.75rem; margin-top: 0.3rem; font-size: 0.8rem; }
   .notif-type { color: var(--accent); text-transform: uppercase; font-size: 0.7rem; font-weight: 600; }
   .notif-time { color: var(--text-secondary); }
+  .notif-reason { color: var(--text-secondary); font-size: 0.75rem; padding: 0 0.4rem; border: 1px solid var(--border); border-radius: 10px; }
+  .notif-link { color: inherit; text-decoration: none; }
+  .notif-link:hover { text-decoration: underline; }
   .notif-actions { flex-shrink: 0; }
 </style>

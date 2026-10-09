@@ -100,6 +100,150 @@ pub async fn create_release(
     Ok(release)
 }
 
+/// Make sure the tag a release names exists in git, creating it at
+/// `target_commitish` when it does not (card_4d406b01b722).
+///
+/// An existing tag is the release's tag, whatever the target says — the
+/// target only says where a *new* tag goes. A new one is a lightweight tag
+/// moved under the same rules a `git push` of it meets
+/// ([`crate::repo::refs::create_tag`]): tag protection, the token's narrowing,
+/// the server's own namespaces. A target that names no commit is the
+/// caller's mistake ([`crate::error::InvalidRequest`]).
+///
+/// Returns the ref update when a tag was created, for the post-push hooks.
+pub async fn ensure_release_tag(
+    db: &DatabaseConnection,
+    repo_path: &Path,
+    repo_id: i64,
+    actor_id: i64,
+    tag_name: &str,
+    target_commitish: &str,
+) -> Result<Option<rg_git::protocol::receive_pack::RefUpdate>> {
+    let refname = format!("refs/tags/{tag_name}");
+    if rg_git::refname::validate_refname(&refname).is_err() {
+        return Err(crate::error::invalid_request(format!(
+            "'{tag_name}' is not a valid tag name"
+        )));
+    }
+    if crate::repo::refs::ref_value(repo_path, &refname)?.is_some() {
+        return Ok(None);
+    }
+    crate::repo::refs::create_tag(
+        db,
+        repo_path,
+        repo_id,
+        Some(actor_id),
+        tag_name,
+        target_commitish,
+    )
+    .await
+    .map(Some)
+}
+
+/// Create a release the way a person does: its tag exists in git when the
+/// release is published, or the release is refused (card_4d406b01b722).
+///
+/// * The tag already exists → the release is recorded against it.
+/// * It does not → a non-draft release creates it at `target_commitish`; a
+///   draft only checks that the target names a commit and creates the tag when
+///   it is published ([`ensure_release_tag`] from the update path), as forges
+///   do, so an abandoned draft leaves no tag behind.
+///
+/// A tag created here and then orphaned by a release row that would not
+/// insert is removed again, best effort. The created tag's ref update comes
+/// back for the caller's post-push hooks (`tag.created`, CI on tags).
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_release(
+    db: &DatabaseConnection,
+    repo_path: &Path,
+    repo_id: i64,
+    author_id: i64,
+    tag_name: &str,
+    title: &str,
+    body: Option<&str>,
+    target_commitish: &str,
+    is_draft: bool,
+    is_prerelease: bool,
+) -> Result<(Release, Option<rg_git::protocol::receive_pack::RefUpdate>)> {
+    if tag_name.is_empty() {
+        return Err(crate::error::invalid_request("tag_name cannot be empty"));
+    }
+    if title.is_empty() {
+        return Err(crate::error::invalid_request("title cannot be empty"));
+    }
+    // A refused release must not have created a tag first.
+    if rg_db::ops::release_ops::find_by_repo_and_tag(db, repo_id, tag_name)
+        .await?
+        .is_some()
+    {
+        return Err(crate::error::conflict(format!(
+            "release with tag '{tag_name}' already exists"
+        )));
+    }
+
+    let created = if is_draft {
+        let refname = format!("refs/tags/{tag_name}");
+        if rg_git::refname::validate_refname(&refname).is_err() {
+            return Err(crate::error::invalid_request(format!(
+                "'{tag_name}' is not a valid tag name"
+            )));
+        }
+        if crate::repo::refs::ref_value(repo_path, &refname)?.is_none() {
+            crate::repo::refs::resolve_commit(repo_path, target_commitish)?;
+        }
+        None
+    } else {
+        ensure_release_tag(
+            db,
+            repo_path,
+            repo_id,
+            author_id,
+            tag_name,
+            target_commitish,
+        )
+        .await?
+    };
+
+    match create_release(
+        db,
+        repo_id,
+        author_id,
+        tag_name,
+        title,
+        body,
+        target_commitish,
+        is_draft,
+        is_prerelease,
+        repo_path,
+    )
+    .await
+    {
+        Ok(release) => Ok((release, created)),
+        Err(error) => {
+            if let Some(tag) = &created {
+                if let Err(undo) = crate::repo::refs::change_ref(
+                    db,
+                    repo_path,
+                    repo_id,
+                    Some(author_id),
+                    &tag.refname,
+                    &tag.new_sha,
+                    crate::repo::refs::NULL_SHA,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        tag = %tag.refname,
+                        error = %format!("{undo:#}"),
+                        "a release that failed to record left the tag it created behind"
+                    );
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 /// List releases for a repository.
 pub async fn list_releases(
     db: &DatabaseConnection,

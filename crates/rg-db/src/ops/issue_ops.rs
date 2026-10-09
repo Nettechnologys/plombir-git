@@ -103,6 +103,16 @@ where
     Ok(max.map(|m| m.number + 1).unwrap_or(1))
 }
 
+/// Delete an issue row; its comments, labels and the rest of what hangs off
+/// it go with it by foreign key. `false` when it was already gone.
+pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let deleted = IssueEntity::delete_by_id(id)
+        .exec(db)
+        .await
+        .context("db: delete issue")?;
+    Ok(deleted.rows_affected == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

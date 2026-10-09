@@ -18,7 +18,7 @@
 //! attacker's *own* release, so a green run proves the gate revokes foreign
 //! access rather than that the fixture is broken.
 
-use crate::common::{create_repo, register_user, spawn_test_app};
+use crate::common::{create_initialised_repo, register_user, spawn_test_app};
 
 const PW: &str = "Qz7$wRtm";
 
@@ -26,7 +26,7 @@ async fn create_private_repo(base: &str, token: &str, name: &str) {
     let resp = reqwest::Client::new()
         .post(format!("{base}/api/v1/repos"))
         .bearer_auth(token)
-        .json(&serde_json::json!({"name": name, "is_private": true}))
+        .json(&serde_json::json!({"name": name, "is_private": true, "auto_init": true, "readme": "default"}))
         .send()
         .await
         .unwrap();
@@ -94,7 +94,7 @@ async fn setup(
     )
     .await;
     let attacker_repo = format!("relattackerrepo{suffix}");
-    create_repo(&base, &attacker_token, &attacker_repo).await;
+    create_initialised_repo(&base, &attacker_token, &attacker_repo).await;
     let attacker_release = create_release(
         &base,
         &attacker_token,

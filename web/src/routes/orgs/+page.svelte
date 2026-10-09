@@ -91,6 +91,10 @@
   onMount(loadOrgs);
 </script>
 
+<svelte:head>
+  <title>{t('orgs.title')} · Plombir Git</title>
+</svelte:head>
+
 <div class="container">
   <div class="page-header">
     <div>

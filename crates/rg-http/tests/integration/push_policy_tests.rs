@@ -644,3 +644,227 @@ async fn force_push_protection_refuses_rewrites_and_admits_fast_forwards() {
     }
     drop(root);
 }
+
+async fn api(
+    method: reqwest::Method,
+    url: String,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    let mut request = reqwest::Client::new()
+        .request(method, url)
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or(serde_json::json!(text)),
+    )
+}
+
+fn ref_value(bare: &Path, refname: &str) -> Option<String> {
+    let outcome = git(bare, "server", &["rev-parse", "--verify", "-q", refname]);
+    outcome.success.then(|| outcome.output.trim().to_string())
+}
+
+/// card_2060696224ff: a branch is deleted by `git push origin :<branch>` and
+/// by `DELETE /branches/<branch>` under one set of rules — the default branch
+/// and a protected branch are refused by both doors, an ordinary branch goes
+/// through both — and the API creates branches and deletes tags the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn branches_and_tags_are_deleted_under_the_same_rules_over_git_and_the_api() {
+    const OWNER: &str = "refdel_owner";
+    const REPO: &str = "refdel";
+    let (base, _db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (session, _) = register_full(&base, OWNER, "refdel_owner@example.com").await;
+    let pat = pat_for(&base, &session).await;
+    create_initialised_repo(&base, &session, REPO).await;
+    let bare = repo_root.join(format!("{OWNER}/{REPO}.git"));
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    let base_for_git = base.clone();
+    let pat_for_git = pat.clone();
+    let work = on_machine(move || {
+        let work = checkout(&root_path, &base_for_git, OWNER, &pat_for_git, OWNER, REPO);
+        commit(&work, OWNER, "topic.txt", "topic\n");
+        git_ok(
+            &work,
+            OWNER,
+            &[
+                "push",
+                "-q",
+                "origin",
+                "HEAD:refs/heads/over-git",
+                "HEAD:refs/heads/release",
+                "HEAD:refs/heads/over-api",
+                "HEAD:refs/tags/v1",
+                "HEAD:refs/tags/old",
+            ],
+        );
+        work
+    })
+    .await;
+    let repo_api = format!("{base}/api/v1/repos/{OWNER}/{REPO}");
+    let (status, body) = api(
+        reqwest::Method::POST,
+        format!("{repo_api}/branches/protection"),
+        &session,
+        Some(serde_json::json!({ "branch_name": "release" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+
+    // Over git: the default branch and the protected one are refused, the
+    // ordinary branch is deleted — with no pack sent, as git sends none.
+    let pushed = {
+        let work = work.clone();
+        on_machine(move || {
+            git(
+                &work,
+                OWNER,
+                &["push", "origin", ":main", ":release", ":over-git"],
+            )
+        })
+        .await
+    };
+    assert!(!pushed.success, "{}", pushed.output);
+    assert!(
+        pushed
+            .output
+            .contains("refusing to delete the current branch"),
+        "{}",
+        pushed.output
+    );
+    assert!(
+        pushed
+            .output
+            .contains("protected branch 'release' cannot be deleted"),
+        "{}",
+        pushed.output
+    );
+    assert_eq!(
+        ref_value(&bare, "refs/heads/over-git"),
+        None,
+        "{}",
+        pushed.output
+    );
+    assert!(ref_value(&bare, "refs/heads/main").is_some());
+    assert!(ref_value(&bare, "refs/heads/release").is_some());
+
+    // Over the API: the same answers.
+    for (branch, expected) in [("main", 409), ("release", 409), ("missing", 404)] {
+        let (status, body) = api(
+            reqwest::Method::DELETE,
+            format!("{repo_api}/branches/{branch}"),
+            &session,
+            None,
+        )
+        .await;
+        assert_eq!(status, expected, "{branch}: {body}");
+    }
+    let (status, body) = api(
+        reqwest::Method::DELETE,
+        format!("{repo_api}/branches/over-api"),
+        &session,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ref"], "refs/heads/over-api");
+    assert_eq!(ref_value(&bare, "refs/heads/over-api"), None);
+
+    // Creation: from a branch, a name that exists, a start that does not.
+    let main_sha = ref_value(&bare, "refs/heads/main").unwrap();
+    let (status, body) = api(
+        reqwest::Method::POST,
+        format!("{repo_api}/branches"),
+        &session,
+        Some(serde_json::json!({ "name": "feature/new", "from": "main" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["sha"], main_sha.as_str());
+    assert_eq!(ref_value(&bare, "refs/heads/feature/new"), Some(main_sha));
+    let (status, body) = api(
+        reqwest::Method::POST,
+        format!("{repo_api}/branches"),
+        &session,
+        Some(serde_json::json!({ "name": "feature/new" })),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    let (status, body) = api(
+        reqwest::Method::POST,
+        format!("{repo_api}/branches"),
+        &session,
+        Some(serde_json::json!({ "name": "elsewhere", "from": "no-such-ref" })),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    // A creation the push rules refuse: a branch that may only be reached
+    // through a pull request, which the owner is not exempt from.
+    let (status, body) = api(
+        reqwest::Method::POST,
+        format!("{repo_api}/branches/protection"),
+        &session,
+        Some(serde_json::json!({ "branch_name": "guarded", "require_pr": true })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = api(
+        reqwest::Method::POST,
+        format!("{repo_api}/branches"),
+        &session,
+        Some(serde_json::json!({ "name": "guarded" })),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body.to_string().contains("open a pull request instead"),
+        "{body}"
+    );
+    assert_eq!(ref_value(&bare, "refs/heads/guarded"), None);
+
+    // A slash-bearing name travels as one percent-encoded segment.
+    let (status, body) = api(
+        reqwest::Method::DELETE,
+        format!("{repo_api}/branches/feature%2Fnew"),
+        &session,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ref_value(&bare, "refs/heads/feature/new"), None);
+
+    // Tags: deleted by the API, refused once a protection rule covers them.
+    let (status, body) = api(
+        reqwest::Method::DELETE,
+        format!("{repo_api}/tags/old"),
+        &session,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ref_value(&bare, "refs/tags/old"), None);
+    let (status, body) = api(
+        reqwest::Method::POST,
+        format!("{repo_api}/tags/protection"),
+        &session,
+        Some(serde_json::json!({ "pattern": "v*" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = api(
+        reqwest::Method::DELETE,
+        format!("{repo_api}/tags/v1"),
+        &session,
+        None,
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(ref_value(&bare, "refs/tags/v1").is_some());
+}

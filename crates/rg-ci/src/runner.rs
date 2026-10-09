@@ -431,7 +431,10 @@ impl PipelineRunner {
             // between two of them (card_944be22fcd3c).
             let log = format!("runner could not prepare the workspace: {error:#}");
             match pipeline_ops::fail_pipeline_chain(&self.db, self.pipeline_id, &log).await {
-                Ok(true) => rg_core::metrics_hook::record_ci_pipeline_finished("failed"),
+                Ok(true) => {
+                    rg_core::metrics_hook::record_ci_pipeline_finished("failed");
+                    rg_core::notification::thread::notify_ci_failed(&self.db, self.pipeline_id);
+                }
                 Ok(false) => {}
                 Err(update_error) => {
                     tracing::error!(pipeline_id = self.pipeline_id, %update_error, "failed to mark pipeline failed after workspace error");
@@ -545,6 +548,9 @@ impl PipelineRunner {
         // else settled (a cancel that raced the last stage) is their outcome,
         // not a second one.
         rg_core::metrics_hook::record_ci_pipeline_finished(pipeline_status);
+        if pipeline_failed {
+            rg_core::notification::thread::notify_ci_failed(&self.db, self.pipeline_id);
+        }
 
         if pipeline_status == "success" {
             self.run_success_followups().await?;

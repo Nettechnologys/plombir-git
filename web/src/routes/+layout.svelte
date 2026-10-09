@@ -83,7 +83,7 @@ import { withBackendBase } from '$lib/api/_base';
       {#if isAuthReady()}
         {@render children()}
       {:else}
-        <div class="loading">Loading...</div>
+        <div class="loading">{t('common.loading')}</div>
       {/if}
     </main>
   </Layout>

@@ -6,7 +6,9 @@
 //! `<script src>` from running a file served as `text/javascript`, and
 //! `script-src 'self'` lets it in.
 
-use crate::common::{create_issue, create_repo, register_user, spawn_test_app};
+use crate::common::{
+    create_initialised_repo, create_issue, create_repo, register_user, spawn_test_app,
+};
 
 const PASSWORD: &str = "Qz7$wRtm";
 
@@ -38,7 +40,7 @@ async fn a_js_release_asset_is_served_as_bytes() {
     let client = reqwest::Client::new();
     let owner = "jsasset";
     let token = register_user(&base, owner, "jsasset@example.com", PASSWORD).await;
-    create_repo(&base, &token, "repo").await;
+    create_initialised_repo(&base, &token, "repo").await;
     let release: serde_json::Value = client
         .post(format!("{base}/api/v1/repos/{owner}/repo/releases"))
         .bearer_auth(&token)

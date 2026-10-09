@@ -226,6 +226,18 @@ const FALLS_OVER: &[(&str, &str)] = &[];
 /// entries run in the order listed, after every other route in the pass.
 const RUN_LAST: &[(&str, &str)] = &[
     (
+        "DELETE /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}",
+        "deletes the seeded issue comment the comment-attachment routes address",
+    ),
+    (
+        "DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}",
+        "deletes the seeded review comment the review-comment-attachment routes address",
+    ),
+    (
+        "DELETE /api/v1/repos/{owner}/{name}/issues/{number}",
+        "deletes the seeded issue every issue route addresses",
+    ),
+    (
         "POST /api/v1/repos/{owner}/{name}/transfer",
         "moves the repository out from under the fixture",
     ),
@@ -417,16 +429,6 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
     (
         "GET /api/v1/imports/{id}",
         "no repository import is seeded",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/blob/{*path}",
-        "the fixture's repositories are created through the API and have no commits, so no path \
-         resolves in them",
-    ),
-    (
-        "GET /api/v1/repos/{owner}/{name}/raw/{*path}",
-        "the same gate as the blob route over the same empty repositories, so no path resolves; \
-         `lfs_file_view_tests` drives it against committed files and a private repository",
     ),
     (
         "GET /api/v1/repos/{owner}/{name}/mirror",
@@ -851,7 +853,11 @@ async fn create_repo(fx: &Fixture, name: &str, private: bool) -> i64 {
         .client
         .post(format!("{}/api/v1/repos", fx.base))
         .bearer_auth(&fx.owner_token)
-        .json(&serde_json::json!({"name": name, "is_private": private}))
+        // With a first commit: a release creates its tag at one
+        // (card_4d406b01b722), and a branch is created from one.
+        .json(&serde_json::json!({
+            "name": name, "is_private": private, "auto_init": true, "readme": "default"
+        }))
         .send()
         .await
         .unwrap();
@@ -1136,6 +1142,10 @@ struct RepoSeed {
     /// column takes its cards with it, and the card route is registered after
     /// it.
     doomed_board_column_id: String,
+    /// A branch and a tag that exist only to be deleted by
+    /// `DELETE /branches/{branch}` and `DELETE /tags/{tag}`.
+    doomed_branch: String,
+    doomed_tag: String,
     board_card_id: String,
     /// The board `DELETE /boards/{id}` is pointed at — see the note above.
     doomed_board_id: String,
@@ -1199,6 +1209,8 @@ impl RepoSeed {
             board_id: absent(),
             board_column_id: absent(),
             doomed_board_column_id: absent(),
+            doomed_branch: absent(),
+            doomed_tag: absent(),
             board_card_id: absent(),
             doomed_board_id: absent(),
             hook_id: absent(),
@@ -1480,6 +1492,22 @@ async fn seed_repo_rows(
     // registered ahead of `DELETE /releases/assets/{asset_id}` and would take
     // the asset with it.
     let doomed_release_id = id_of(release("v2.0.0").await);
+    // A tag outside the `v*` protection seeded below — creating its release
+    // creates it in git (card_4d406b01b722) — and a branch, both there only to
+    // be deleted (card_2060696224ff).
+    let doomed_tag = "sweep-doomed-tag".to_string();
+    release("sweep-doomed-tag").await;
+    let doomed_branch = "sweep-doomed-branch".to_string();
+    json_of(created("doomed branch")(
+        fx.client
+            .post(format!("{prefix}/branches"))
+            .bearer_auth(&fx.owner_token)
+            .json(&serde_json::json!({"name": doomed_branch}))
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
     let asset = json_of(created("release asset")(
         fx.client
             .post(format!("{prefix}/releases/{release_id}/assets"))
@@ -1785,6 +1813,8 @@ async fn seed_repo_rows(
         board_id,
         board_column_id,
         doomed_board_column_id,
+        doomed_branch,
+        doomed_tag,
         board_card_id: id_of(board_card),
         doomed_board_id,
         hook_id: id_of(hook),
@@ -1974,6 +2004,10 @@ fn fill(fact: &RouteFact, repo: &RepoSeed, globals: &GlobalSeed, org: &str) -> S
             "bot" if deletes && path.ends_with("/users/bots/{bot}") => &globals.doomed_bot,
             "bot" => &globals.bot,
             "col_id" if deletes => &repo.doomed_board_column_id,
+            "branch" => &repo.doomed_branch,
+            // The repository's git tags, not the npm dist-tag of the package
+            // routes, which spell their placeholder the same.
+            "tag" if !path.contains("/packages/") => &repo.doomed_tag,
             "col_id" => &repo.board_column_id,
             "card_id" => &repo.board_card_id,
             "pipeline_id" => &repo.pipeline_id,
@@ -2107,6 +2141,9 @@ fn access_body(fact: &RouteFact) -> serde_json::Value {
             serde_json::json!({"comment_ids": []})
         }
         "rg_http::api::reviews::request_reviewer" => serde_json::json!({"username": OWNER}),
+        "rg_http::api::issues::edit_comment" | "rg_http::api::reviews::edit_review_comment" => {
+            serde_json::json!({"body": "route access sweep"})
+        }
         _ => serde_json::json!({}),
     }
 }

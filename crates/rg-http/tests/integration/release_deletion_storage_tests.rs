@@ -5,7 +5,7 @@
 use serde_json::Value;
 
 use crate::common::{
-    create_repo,
+    create_initialised_repo,
     fault::{fail_db_writes, spawn_test_app_for_fault_sweep, DbWrite},
     register_full,
 };
@@ -78,7 +78,7 @@ async fn asset_delete_failure_preserves_metadata_and_a_retry_removes_every_repre
     let owner = "asset-delete";
     let repo = "releases";
     let (token, _) = register_full(&app.base, owner, "asset-delete@example.com").await;
-    create_repo(&app.base, &token, repo).await;
+    create_initialised_repo(&app.base, &token, repo).await;
     let release_id = create_release(&app.base, &token, owner, repo).await;
     let asset_id = upload_asset(
         &app.base,
@@ -159,7 +159,7 @@ async fn asset_metadata_failure_restores_the_staged_blob() {
     let owner = "asset-db-fault";
     let repo = "releases";
     let (token, _) = register_full(&app.base, owner, "asset-db-fault@example.com").await;
-    create_repo(&app.base, &token, repo).await;
+    create_initialised_repo(&app.base, &token, repo).await;
     let release_id = create_release(&app.base, &token, owner, repo).await;
     let asset_id = upload_asset(
         &app.base,
@@ -199,7 +199,7 @@ async fn asset_tombstone_cleanup_failure_is_not_reported_as_a_completed_delete()
     let owner = "asset-cleanup-fault";
     let repo = "releases";
     let (token, _) = register_full(&app.base, owner, "asset-cleanup-fault@example.com").await;
-    create_repo(&app.base, &token, repo).await;
+    create_initialised_repo(&app.base, &token, repo).await;
     let release_id = create_release(&app.base, &token, owner, repo).await;
     let asset_id = upload_asset(
         &app.base,
@@ -257,7 +257,7 @@ async fn release_delete_retires_every_asset_row_and_blob() {
     let owner = "release-delete";
     let repo = "releases";
     let (token, _) = register_full(&app.base, owner, "release-delete@example.com").await;
-    create_repo(&app.base, &token, repo).await;
+    create_initialised_repo(&app.base, &token, repo).await;
     let release_id = create_release(&app.base, &token, owner, repo).await;
     let first = upload_asset(
         &app.base, &token, owner, repo, release_id, "one.bin", b"one",
@@ -319,7 +319,7 @@ async fn release_metadata_failure_restores_all_asset_blobs() {
     let owner = "release-db-fault";
     let repo = "releases";
     let (token, _) = register_full(&app.base, owner, "release-db-fault@example.com").await;
-    create_repo(&app.base, &token, repo).await;
+    create_initialised_repo(&app.base, &token, repo).await;
     let release_id = create_release(&app.base, &token, owner, repo).await;
     let first = upload_asset(
         &app.base, &token, owner, repo, release_id, "one.bin", b"one",

@@ -6,7 +6,7 @@
 //!   POST /repos/:o/:r/releases/assets/:id/attestation/verify  — verify
 
 use crate::common::{
-    build_test_app_state, create_repo, register_user, setup_test_db, spawn_test_app,
+    build_test_app_state, create_initialised_repo, register_user, setup_test_db, spawn_test_app,
     spawn_test_app_over_db_with, StateOverrides, TEST_ENCRYPTION_KEY,
 };
 use sea_orm::{ConnectionTrait, Statement};
@@ -51,7 +51,7 @@ async fn sign_get_verify_round_trip() {
     let owner = "attuser".to_string();
     let token = register_user(&base, &owner, "attuser@example.com", PW).await;
     let repo = "attrepo".to_string();
-    create_repo(&base, &token, &repo).await;
+    create_initialised_repo(&base, &token, &repo).await;
     let release_id = create_release(&base, &token, &owner, &repo).await;
     let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
     let client = reqwest::Client::new();
@@ -115,7 +115,7 @@ async fn signing_an_asset_deleted_after_the_scoped_read_is_404() {
     let owner = "attrace".to_string();
     let token = register_user(&base, &owner, "attrace@example.com", PW).await;
     let repo = "attracerepo".to_string();
-    create_repo(&base, &token, &repo).await;
+    create_initialised_repo(&base, &token, &repo).await;
     let release_id = create_release(&base, &token, &owner, &repo).await;
     let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
 
@@ -192,7 +192,7 @@ async fn a_rotated_jwt_secret_leaves_earlier_attestations_verifiable() {
     let owner = "rotuser".to_string();
     let token = register_user(&base, &owner, "rotuser@example.com", PW).await;
     let repo = "rotrepo".to_string();
-    create_repo(&base, &token, &repo).await;
+    create_initialised_repo(&base, &token, &repo).await;
     let release_id = create_release(&base, &token, &owner, &repo).await;
     let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
 
@@ -299,7 +299,7 @@ async fn an_uncheckable_envelope_is_undeterminable_and_a_wrong_digest_is_a_misma
     let owner = "preduser".to_string();
     let token = register_user(&base, &owner, "preduser@example.com", PW).await;
     let repo = "predrepo".to_string();
-    create_repo(&base, &token, &repo).await;
+    create_initialised_repo(&base, &token, &repo).await;
     let release_id = create_release(&base, &token, &owner, &repo).await;
     let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
     // SHA-256 of the uploaded body, shared with the round-trip test's vector.
@@ -415,7 +415,7 @@ async fn an_attestation_stored_under_the_former_type_still_verifies() {
     let owner = "legacyatt".to_string();
     let token = register_user(&base, &owner, "legacyatt@example.com", PW).await;
     let repo = "legacyattrepo".to_string();
-    create_repo(&base, &token, &repo).await;
+    create_initialised_repo(&base, &token, &repo).await;
     let release_id = create_release(&base, &token, &owner, &repo).await;
     let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
 
@@ -465,7 +465,7 @@ async fn verify_without_attestation_is_404() {
     let owner = "attuser2".to_string();
     let token = register_user(&base, &owner, "attuser2@example.com", PW).await;
     let repo = "attrepo2".to_string();
-    create_repo(&base, &token, &repo).await;
+    create_initialised_repo(&base, &token, &repo).await;
     let release_id = create_release(&base, &token, &owner, &repo).await;
     let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
     let client = reqwest::Client::new();
@@ -562,7 +562,7 @@ async fn disabled_endpoints_return_404() {
     let owner = "attuser3".to_string();
     let token = register_user(&base, &owner, "attuser3@example.com", PW).await;
     let repo = "attrepo3".to_string();
-    create_repo(&base, &token, &repo).await;
+    create_initialised_repo(&base, &token, &repo).await;
     let release_id = create_release(&base, &token, &owner, &repo).await;
     let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
     let client = reqwest::Client::new();

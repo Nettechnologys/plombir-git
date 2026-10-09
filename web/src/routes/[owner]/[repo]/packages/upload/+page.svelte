@@ -63,7 +63,7 @@
     event.preventDefault();
     if (uploading) return;
     if (!packageFile) {
-      error = 'Package file is required';
+      error = t('packages.upload_form.file_required');
       return;
     }
 
@@ -126,7 +126,7 @@
 
   <div class="page-header">
     <h1>{t('packages.upload')}</h1>
-    <a href={`/${owner}/${repo}/packages`} class="btn-secondary">Back</a>
+    <a href={`/${owner}/${repo}/packages`} class="btn-secondary">{t('packages.upload_form.back')}</a>
   </div>
 
   {#if error}
@@ -160,8 +160,8 @@
       </div>
 
     <div class="form-group">
-      <label for="name">Name</label>
-      <input id="name" type="text" bind:value={packageName} class="input" placeholder="Package name" />
+      <label for="name">{t('packages.upload_form.name')}</label>
+      <input id="name" type="text" bind:value={packageName} class="input" placeholder={t('packages.upload_form.name_placeholder')} />
     </div>
 
       <div class="form-group">
@@ -175,23 +175,23 @@
       </div>
 
       <div class="form-group">
-        <label for="homepage">Homepage</label>
+        <label for="homepage">{t('packages.upload_form.homepage')}</label>
         <input id="homepage" type="text" bind:value={homepage} class="input" />
       </div>
 
       <div class="form-group">
-        <label for="repository-url">Repository URL</label>
+        <label for="repository-url">{t('packages.upload_form.repository_url')}</label>
         <input id="repository-url" type="text" bind:value={repositoryUrl} class="input" />
       </div>
 
       <div class="form-group">
-        <label for="semver">Semver</label>
+        <label for="semver">{t('packages.upload_form.semver')}</label>
         <input id="semver" type="text" bind:value={semver} class="input" />
       </div>
 
       <div class="form-actions">
         <button type="submit" class="btn-primary" disabled={uploading || !packageFile}>
-          {uploading ? 'Uploading...' : t('packages.upload')}
+          {uploading ? t('packages.upload_form.uploading') : t('packages.upload')}
         </button>
       </div>
   </form>

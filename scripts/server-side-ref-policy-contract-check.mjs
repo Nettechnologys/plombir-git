@@ -63,6 +63,7 @@ const GIX_REF_METHODS = new Map([
 const CLASSIFIED_MOVERS = new Map(
   [
     ['crates/rg-git/src/protocol/receive_pack.rs', 'update_ref', 'gix:reference', 'canonical_receive_pack'],
+    ['crates/rg-git/src/protocol/receive_pack.rs', 'delete_ref', 'gix:edit_reference', 'canonical_receive_pack'],
     ['crates/rg-core/src/repo/service.rs', 'auto_init_repo', 'git:push', 'repository_initialization'],
     ['crates/rg-core/src/repo/service.rs', 'push_branch_with_lease', 'git:push', 'leased_server_side_publish'],
     ['crates/rg-core/src/repo/service.rs', 'set_bare_repo_head_to_branch', 'gix:edit_reference', 'head_metadata'],

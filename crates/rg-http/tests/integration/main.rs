@@ -25,7 +25,11 @@ mod access_grant_audit_guard;
 mod account_self_service_tests;
 mod agent_accounts_tests;
 mod client_address_tests;
+mod comment_moderation_tests;
 mod common;
+mod compare_and_fork_head_tests;
+mod notification_routing_tests;
+mod repo_settings_tests;
 
 mod account_deletion_serialized_grant_tests;
 mod account_deletion_storage_tests;

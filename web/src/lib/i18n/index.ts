@@ -1,8 +1,10 @@
-import { writable, derived, get } from 'svelte/store';
+import { writable, derived } from 'svelte/store';
 import en from './translations/en.json';
 import zhCN from './translations/zh-CN.json';
+import { activeLocale, setActiveLocale, type Locale } from './locale.svelte';
 
-export type Locale = 'en' | 'zh-CN';
+export type { Locale };
+export { activeLocale };
 
 type TranslationCatalog = typeof en;
 
@@ -22,8 +24,17 @@ function detectLocale(): Locale {
 }
 
 // Create locale store
+//
+// The store stays for `$locale` readers (the switcher), but it is a mirror: the
+// value `t()` reads is the `$state` rune in `locale.svelte.ts`, and both are
+// written together here so they can never disagree.
 function createLocaleStore() {
-  const { subscribe, set, update } = writable<Locale>('en');
+  const { subscribe, set } = writable<Locale>(activeLocale());
+
+  function apply(locale: Locale) {
+    setActiveLocale(locale);
+    set(locale);
+  }
 
   return {
     subscribe,
@@ -31,11 +42,10 @@ function createLocaleStore() {
       if (typeof window !== 'undefined') {
         localStorage.setItem('locale', locale);
       }
-      set(locale);
+      apply(locale);
     },
     init: () => {
-      const detected = detectLocale();
-      set(detected);
+      apply(detectLocale());
     },
   };
 }
@@ -79,10 +89,16 @@ type Translator = {
   (key: string, params: TranslationParams | undefined, fallback: string): string;
 };
 
+// Reads the `$state` locale, so any template, `$derived` or `$effect` that
+// calls `t()` re-runs when the language is switched.
+function activeCatalog(): TranslationCatalog {
+  return translations[activeLocale()];
+}
+
 function resolveTranslation(
   key: string,
   options?: TranslationOptions,
-  catalog: TranslationCatalog = get(currentTranslations),
+  catalog: TranslationCatalog = activeCatalog(),
   dynamicFallback?: string,
 ): string {
   const value = getNestedValue(catalog, key);
@@ -106,22 +122,22 @@ export function t(key: string, options?: TranslationOptions, dynamicFallback?: s
 }
 
 // Reactive t() for Svelte components
-// Returns a plain function (not a store) for easy usage in both script and template
+// Returns a plain function (not a store) for easy usage in both script and
+// template. It looks the catalog up on every call, so a template expression
+// that calls it follows a language switch; a value computed once at the top of
+// a `<script>` does not — wrap such values in `$derived` or a function.
 export function createT() {
   const translate: Translator = (
     key: string,
     options?: TranslationOptions,
     dynamicFallback?: string,
-  ): string => {
-    const translations = get(currentTranslations);
-    return resolveTranslation(key, options, translations, dynamicFallback);
-  };
+  ): string => resolveTranslation(key, options, activeCatalog(), dynamicFallback);
   return translate;
 }
 
 // Date formatting with locale
 export function formatDate(dateStr: string, options?: Intl.DateTimeFormatOptions): string {
-  const $locale = get(locale);
+  const $locale = activeLocale();
   const date = new Date(dateStr);
   const defaultOptions: Intl.DateTimeFormatOptions = {
     year: 'numeric',
@@ -132,7 +148,7 @@ export function formatDate(dateStr: string, options?: Intl.DateTimeFormatOptions
 }
 
 export function formatDateTime(dateStr: string): string {
-  const $locale = get(locale);
+  const $locale = activeLocale();
   const date = new Date(dateStr);
   return date.toLocaleString($locale === 'zh-CN' ? 'zh-CN' : 'en-US', {
     year: 'numeric',

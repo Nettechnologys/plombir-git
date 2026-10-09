@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { wiki } from '$lib/api/client.svelte';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
 
@@ -17,6 +18,9 @@
   let newTitle = $state('');
   let newContent = $state('');
   let createBusy = $state(false);
+  // Creating a page is behind `RepoWrite` (card_3625a7b89abb).
+  const permission = viewerPermission(() => owner, () => repo);
+  let canWrite = $derived(permission.canWrite);
   const listRequests = new LatestRepositoryRequestFence();
   const createRequests = new LatestRepositoryRequestFence();
   let routeGeneration = 0;
@@ -91,7 +95,7 @@
 </script>
 
 <svelte:head>
-  <title>Wiki · {owner}/{repo} · Plombir Git</title>
+  <title>{t('wiki.title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -99,10 +103,12 @@
 
   <div class="toolbar">
     <h2>{t('wiki.pages')}</h2>
-    <button class="btn-primary" onclick={() => showCreate = !showCreate}>{t('wiki.new')}</button>
+    {#if canWrite}
+      <button class="btn-primary" onclick={() => showCreate = !showCreate}>{t('wiki.new')}</button>
+    {/if}
   </div>
 
-  {#if showCreate}
+  {#if showCreate && canWrite}
     <div class="create-form">
       <form onsubmit={handleCreate}>
         <label>

@@ -11,6 +11,9 @@
     type LoginAttemptEntry,
     type SsoProviderPayload,
   } from '$lib/api/client.svelte';
+  import { createT, formatDateTime } from '$lib/i18n';
+
+  const t = createT();
 
   // Three unrelated surfaces used to share one `loading`/`error` pair and one
   // composite initial `Promise.all`. That made every late response an owner of
@@ -259,7 +262,7 @@
   async function saveSsoProvider() {
     if (ssoSaving) return;
     if (!ssoForm.name.trim() || !ssoForm.slug.trim()) {
-      ssoError = 'SSO provider name and slug are required';
+      ssoError = t('admin.settings.sso.name_slug_required');
       return;
     }
 
@@ -313,7 +316,7 @@
 
   async function deleteSsoProvider(provider: AdminSsoProvider) {
     if (isSsoBusy(provider.id)) return;
-    if (!confirm(`Delete SSO provider "${provider.name}"?`)) return;
+    if (!confirm(t('admin.settings.sso.delete_confirm', { name: provider.name }))) return;
     if (!claimSsoProvider(provider.id)) return;
     ssoError = '';
     try {
@@ -341,7 +344,7 @@
       ssoTestResult = result;
     } catch (e: any) {
       if (!ssoTestRequests.owns(claim, provider.id)) return;
-      ssoTestResult = { ok: false, message: e.message || 'LDAP connection test failed' };
+      ssoTestResult = { ok: false, message: e.message || t('admin.settings.sso.test_failed') };
     } finally {
       if (ssoTestRequests.owns(claim, provider.id)) testingSsoId = null;
       releaseSsoProvider(provider.id);
@@ -402,58 +405,58 @@
   }
 
   function formatLoginTime(value: string) {
-    return new Date(value).toLocaleString();
+    return formatDateTime(value);
   }
 
 </script>
 
 <svelte:head>
-  <title>Instance Settings · Admin · Plombir Git</title>
+  <title>{t('admin.settings.title')} · {t('admin.settings.admin')} · Plombir Git</title>
 </svelte:head>
 
 <div class="settings-page">
-  <h1>Instance Settings</h1>
+  <h1>{t('admin.settings.title')}</h1>
 
   {#if settingsError}
     <div class="error-banner">{settingsError}</div>
   {/if}
 
   {#if settingsLoading}
-    <p class="text-secondary">Loading...</p>
+    <p class="text-secondary">{t('common.loading')}</p>
   {:else}
     <div class="section">
-      <h2>Maintenance Mode</h2>
+      <h2>{t('admin.settings.maintenance.title')}</h2>
       <div class="toggle-row">
         <input id="admin-maintenance-mode" type="checkbox" bind:checked={maintenanceMode} />
-        <label for="admin-maintenance-mode">Enable maintenance mode (read-only, blocks all mutating requests)</label>
+        <label for="admin-maintenance-mode">{t('admin.settings.maintenance.enable')}</label>
       </div>
     </div>
 
     <div class="section">
-      <h2>Instance Banner</h2>
+      <h2>{t('admin.settings.banner.title')}</h2>
       <div class="form-group">
-        <label for="admin-banner-message">Banner Message (leave empty to hide)</label>
-        <input id="admin-banner-message" type="text" bind:value={bannerMessage} placeholder="e.g. Scheduled maintenance tonight at 2am" />
+        <label for="admin-banner-message">{t('admin.settings.banner.message')}</label>
+        <input id="admin-banner-message" type="text" bind:value={bannerMessage} placeholder={t('admin.settings.banner.message_placeholder')} />
       </div>
       <div class="form-group">
-        <label for="admin-banner-type">Banner Type</label>
+        <label for="admin-banner-type">{t('admin.settings.banner.type')}</label>
         <select id="admin-banner-type" bind:value={bannerType}>
-          <option value="info">Info (blue)</option>
-          <option value="warning">Warning (yellow)</option>
-          <option value="error">Error (red)</option>
+          <option value="info">{t('admin.settings.banner.type_info')}</option>
+          <option value="warning">{t('admin.settings.banner.type_warning')}</option>
+          <option value="error">{t('admin.settings.banner.type_error')}</option>
         </select>
       </div>
     </div>
 
     <div class="actions">
       <button class="btn-primary" onclick={saveSettings} disabled={saving} aria-busy={saving}>
-        {saving ? 'Saving...' : 'Save Settings'}
+        {saving ? t('common.saving') : t('admin.settings.save')}
       </button>
     </div>
   {/if}
 
   <div class="section">
-    <h2>SSO Providers</h2>
+    <h2>{t('admin.settings.sso.title')}</h2>
     {#if ssoError}
       <div class="error-banner">{ssoError}</div>
     {/if}
@@ -469,9 +472,9 @@
       genuinely nothing to show yet.
     -->
     {#if ssoLoading && ssoProviders.length === 0}
-      <p class="text-secondary">Loading SSO providers...</p>
+      <p class="text-secondary">{t('admin.settings.sso.loading')}</p>
     {:else if ssoProviders.length === 0}
-      <p class="text-secondary">No SSO providers configured.</p>
+      <p class="text-secondary">{t('admin.settings.sso.empty')}</p>
     {:else}
       <div class="provider-list">
         {#each ssoProviders as provider (provider.id)}
@@ -481,21 +484,21 @@
               <div class="provider-meta">
                 <span>{provider.slug}</span>
                 <span>{provider.provider_type}</span>
-                <span class:enabled={provider.enabled}>{provider.enabled ? 'Enabled' : 'Disabled'}</span>
-                <span>{provider.auto_provision ? 'Creates accounts' : 'No new accounts'}</span>
+                <span class:enabled={provider.enabled}>{provider.enabled ? t('admin.settings.sso.enabled') : t('admin.settings.sso.disabled')}</span>
+                <span>{provider.auto_provision ? t('admin.settings.sso.creates_accounts') : t('admin.settings.sso.no_new_accounts')}</span>
               </div>
             </div>
             <div class="provider-actions">
               {#if provider.provider_type === 'ldap'}
                 <button class="btn-secondary" type="button" disabled={isSsoBusy(provider.id)} aria-busy={isSsoBusy(provider.id)} onclick={() => testSsoProvider(provider)}>
-                  {testingSsoId === provider.id ? 'Testing...' : 'Test connection'}
+                  {testingSsoId === provider.id ? t('admin.settings.sso.testing') : t('admin.settings.sso.test')}
                 </button>
               {/if}
               <button class="btn-secondary" type="button" disabled={isSsoBusy(provider.id)} aria-busy={isSsoBusy(provider.id)} onclick={() => toggleSsoProvider(provider)}>
-                {provider.enabled ? 'Disable' : 'Enable'}
+                {provider.enabled ? t('admin.settings.sso.disable') : t('admin.settings.sso.enable')}
               </button>
-              <button class="btn-secondary" type="button" disabled={isSsoBusy(provider.id)} aria-busy={isSsoBusy(provider.id)} onclick={() => editSsoProvider(provider)}>Edit</button>
-              <button class="btn-danger" type="button" disabled={isSsoBusy(provider.id)} aria-busy={isSsoBusy(provider.id)} onclick={() => deleteSsoProvider(provider)}>Delete</button>
+              <button class="btn-secondary" type="button" disabled={isSsoBusy(provider.id)} aria-busy={isSsoBusy(provider.id)} onclick={() => editSsoProvider(provider)}>{t('common.edit')}</button>
+              <button class="btn-danger" type="button" disabled={isSsoBusy(provider.id)} aria-busy={isSsoBusy(provider.id)} onclick={() => deleteSsoProvider(provider)}>{t('common.delete')}</button>
             </div>
           </div>
         {/each}
@@ -503,14 +506,14 @@
     {/if}
 
     <div class="sso-form">
-      <h3>{editingSsoId ? 'Edit SSO Provider' : 'Add SSO Provider'}</h3>
+      <h3>{editingSsoId ? t('admin.settings.sso.edit_title') : t('admin.settings.sso.add_title')}</h3>
       <div class="form-grid">
         <div class="form-group">
-          <label for="sso-name">Name</label>
+          <label for="sso-name">{t('admin.settings.sso.name')}</label>
           <input id="sso-name" type="text" bind:value={ssoForm.name} placeholder="Google Workspace" />
         </div>
         <div class="form-group">
-          <label for="sso-slug">Slug</label>
+          <label for="sso-slug">{t('admin.settings.sso.slug')}</label>
           <input id="sso-slug" type="text" bind:value={ssoForm.slug} placeholder={ssoSlugPlaceholder} />
           {#if ssoForm.provider_type === 'oauth2'}
             <!--
@@ -518,11 +521,11 @@
               step, so the endpoints come from the built-in table and nothing
               else. Saying which slugs it holds beats finding out from a 400.
             -->
-            <p class="field-hint">Plain OAuth2 recognises <code>github</code> and <code>gitlab</code>. Anything else needs the OIDC type and a discovery URL.</p>
+            <p class="field-hint">{t('admin.settings.sso.oauth2_hint_before')} <code>github</code> {t('admin.settings.sso.oauth2_hint_and')} <code>gitlab</code>{t('admin.settings.sso.oauth2_hint_after')}</p>
           {/if}
         </div>
         <div class="form-group">
-          <label for="sso-type">Type</label>
+          <label for="sso-type">{t('admin.settings.sso.type')}</label>
           <!--
             `oidc` is a distinct type on the backend, not a synonym of
             `oauth2`: only `oidc` reads `discovery_url`, while `oauth2`
@@ -532,92 +535,87 @@
             and a self-hosted IdP was unreachable from this form entirely.
           -->
           <select id="sso-type" bind:value={ssoForm.provider_type}>
-            <option value="oauth2">OAuth2 (GitHub / GitLab)</option>
-            <option value="oidc">OIDC (discovery URL)</option>
-            <option value="ldap">LDAP</option>
+            <option value="oauth2">{t('admin.settings.sso.type_oauth2')}</option>
+            <option value="oidc">{t('admin.settings.sso.type_oidc')}</option>
+            <option value="ldap">{t('admin.settings.sso.type_ldap')}</option>
           </select>
         </div>
         {#if ssoForm.provider_type !== 'ldap'}
           <div class="form-group">
-            <label for="sso-client-id">Client ID</label>
+            <label for="sso-client-id">{t('admin.settings.sso.client_id')}</label>
             <input id="sso-client-id" type="text" bind:value={ssoForm.client_id} />
           </div>
           <div class="form-group">
-            <label for="sso-client-secret">Client Secret</label>
-            <input id="sso-client-secret" type="password" bind:value={ssoForm.client_secret} placeholder={editingSsoId ? 'Leave blank to keep existing secret' : ''} />
+            <label for="sso-client-secret">{t('admin.settings.sso.client_secret')}</label>
+            <input id="sso-client-secret" type="password" bind:value={ssoForm.client_secret} placeholder={editingSsoId ? t('admin.settings.sso.keep_secret') : ''} />
           </div>
         {/if}
         {#if ssoForm.provider_type === 'oidc'}
           <div class="form-group">
-            <label for="sso-discovery-url">Discovery URL</label>
+            <label for="sso-discovery-url">{t('admin.settings.sso.discovery_url')}</label>
             <input id="sso-discovery-url" type="url" bind:value={ssoForm.discovery_url} placeholder="https://idp.example.com/.well-known/openid-configuration" />
           </div>
         {/if}
         {#if ssoForm.provider_type !== 'ldap'}
           <div class="form-group">
-            <label for="sso-scopes">Scopes</label>
+            <label for="sso-scopes">{t('admin.settings.sso.scopes')}</label>
             <input id="sso-scopes" type="text" bind:value={ssoForm.scopes} />
           </div>
         {/if}
         <div class="form-group">
-          <label for="sso-icon-url">Icon URL</label>
+          <label for="sso-icon-url">{t('admin.settings.sso.icon_url')}</label>
           <input id="sso-icon-url" type="url" bind:value={ssoForm.icon_url} />
         </div>
         {#if ssoForm.provider_type === 'ldap'}
           <div class="form-group">
-            <label for="sso-ldap-host">LDAP Host</label>
-            <input id="sso-ldap-host" type="text" bind:value={ssoForm.ldap_host} placeholder="ldap.example.com (LDAPS by default)" />
+            <label for="sso-ldap-host">{t('admin.settings.sso.ldap_host')}</label>
+            <input id="sso-ldap-host" type="text" bind:value={ssoForm.ldap_host} placeholder={t('admin.settings.sso.ldap_host_placeholder')} />
           </div>
           <div class="form-group">
-            <label for="sso-ldap-port">LDAP Port</label>
+            <label for="sso-ldap-port">{t('admin.settings.sso.ldap_port')}</label>
             <input id="sso-ldap-port" type="number" min="1" bind:value={ssoForm.ldap_port} />
           </div>
           <div class="form-group">
-            <label for="sso-ldap-bind-dn">LDAP Bind DN</label>
+            <label for="sso-ldap-bind-dn">{t('admin.settings.sso.ldap_bind_dn')}</label>
             <input id="sso-ldap-bind-dn" type="text" bind:value={ssoForm.ldap_bind_dn} />
           </div>
           <div class="form-group">
-            <label for="sso-ldap-bind-password">LDAP Bind Password</label>
-            <input id="sso-ldap-bind-password" type="password" bind:value={ssoForm.ldap_bind_password} placeholder={editingSsoId ? 'Leave blank to keep existing password' : ''} />
+            <label for="sso-ldap-bind-password">{t('admin.settings.sso.ldap_bind_password')}</label>
+            <input id="sso-ldap-bind-password" type="password" bind:value={ssoForm.ldap_bind_password} placeholder={editingSsoId ? t('admin.settings.sso.keep_password') : ''} />
           </div>
           <div class="form-group">
-            <label for="sso-ldap-base-dn">LDAP Base DN</label>
+            <label for="sso-ldap-base-dn">{t('admin.settings.sso.ldap_base_dn')}</label>
             <input id="sso-ldap-base-dn" type="text" bind:value={ssoForm.ldap_base_dn} />
           </div>
           <div class="form-group">
-            <label for="sso-ldap-filter">LDAP User Filter</label>
+            <label for="sso-ldap-filter">{t('admin.settings.sso.ldap_user_filter')}</label>
             <input id="sso-ldap-filter" type="text" bind:value={ssoForm.ldap_user_filter} placeholder={'(uid={username})'} />
           </div>
         {/if}
       </div>
       <div class="toggle-row">
         <input id="sso-enabled" type="checkbox" bind:checked={ssoForm.enabled} />
-        <label for="sso-enabled">Enable this provider</label>
+        <label for="sso-enabled">{t('admin.settings.sso.enable_provider')}</label>
       </div>
       <div class="toggle-row">
         <input id="sso-auto-provision" type="checkbox" bind:checked={ssoForm.auto_provision} />
-        <label for="sso-auto-provision">Create accounts on first login</label>
+        <label for="sso-auto-provision">{t('admin.settings.sso.auto_provision')}</label>
       </div>
-      <p class="field-hint">
-        Off means only people who have linked this provider to their account (Settings → Security)
-        can sign in through it. On a public identity provider (GitHub, Google) leaving it on hands an account to anyone
-        with an account there.
-      </p>
+      <p class="field-hint">{t('admin.settings.sso.auto_provision_hint')}</p>
       <div class="form-group">
-        <label for="sso-allowed-domains">Allowed email domains</label>
+        <label for="sso-allowed-domains">{t('admin.settings.sso.allowed_domains')}</label>
         <input id="sso-allowed-domains" type="text" bind:value={ssoForm.allowed_email_domains} placeholder="example.com, partner.org" />
         <p class="field-hint">
-          Comma-separated. Empty means no domain restriction. Exact match — <code>example.com</code>
-          does not admit <code>mail.example.com</code>. Only limits who gets an account created;
-          accounts already linked to this provider keep signing in.
+          {t('admin.settings.sso.allowed_domains_hint_before')} <code>example.com</code>
+          {t('admin.settings.sso.allowed_domains_hint_middle')} <code>mail.example.com</code>{t('admin.settings.sso.allowed_domains_hint_after')}
         </p>
       </div>
       <div class="inline-actions">
         <button class="btn-primary" type="button" onclick={saveSsoProvider} disabled={ssoSaving} aria-busy={ssoSaving}>
-          {ssoSaving ? 'Saving...' : editingSsoId ? 'Update Provider' : 'Create Provider'}
+          {ssoSaving ? t('common.saving') : editingSsoId ? t('admin.settings.sso.update') : t('admin.settings.sso.create')}
         </button>
         {#if editingSsoId}
-          <button class="btn-secondary" type="button" onclick={resetSsoForm}>Cancel</button>
+          <button class="btn-secondary" type="button" onclick={resetSsoForm}>{t('common.cancel')}</button>
         {/if}
       </div>
     </div>
@@ -626,48 +624,48 @@
   <div class="section">
     <div class="section-heading">
       <div>
-        <h2>Login Attempts</h2>
-        <span class="text-secondary">{loginAttemptsTotal} matching events</span>
+        <h2>{t('admin.settings.login.title')}</h2>
+        <span class="text-secondary">{t('admin.settings.login.matching', { count: loginAttemptsTotal })}</span>
       </div>
       <button class="btn-secondary" type="button" disabled={loginAttemptsLoading} aria-busy={loginAttemptsLoading} onclick={() => loadLoginAttempts(loginAttemptsPage)}>
-        {loginAttemptsLoading ? 'Loading...' : 'Refresh'}
+        {loginAttemptsLoading ? t('common.loading') : t('admin.settings.login.refresh')}
       </button>
     </div>
     {#if loginAttemptsError}
       <div class="error-banner">{loginAttemptsError}</div>
     {/if}
     <div class="login-filters">
-      <input aria-label="Filter login attempts by username" placeholder="Username" bind:value={loginUsernameFilter} />
-      <input aria-label="Filter login attempts by provider" placeholder="Provider (password, ldap...)" bind:value={loginProviderFilter} />
-      <select aria-label="Filter login attempts by status" bind:value={loginStatusFilter}>
-        <option value="all">All results</option>
-        <option value="failure">Failed only</option>
-        <option value="success">Successful only</option>
+      <input aria-label={t('admin.settings.login.filter_username')} placeholder={t('admin.settings.login.username')} bind:value={loginUsernameFilter} />
+      <input aria-label={t('admin.settings.login.filter_provider')} placeholder={t('admin.settings.login.provider_placeholder')} bind:value={loginProviderFilter} />
+      <select aria-label={t('admin.settings.login.filter_status')} bind:value={loginStatusFilter}>
+        <option value="all">{t('admin.settings.login.status_all')}</option>
+        <option value="failure">{t('admin.settings.login.status_failure')}</option>
+        <option value="success">{t('admin.settings.login.status_success')}</option>
       </select>
-      <input aria-label="Login attempts start time" type="datetime-local" bind:value={loginStartTime} />
-      <input aria-label="Login attempts end time" type="datetime-local" bind:value={loginEndTime} />
-      <button class="btn-secondary" type="button" disabled={loginAttemptsLoading} onclick={() => loadLoginAttempts(1)}>Apply</button>
+      <input aria-label={t('admin.settings.login.start_time')} type="datetime-local" bind:value={loginStartTime} />
+      <input aria-label={t('admin.settings.login.end_time')} type="datetime-local" bind:value={loginEndTime} />
+      <button class="btn-secondary" type="button" disabled={loginAttemptsLoading} onclick={() => loadLoginAttempts(1)}>{t('admin.settings.login.apply')}</button>
     </div>
     {#if loginAttempts.length === 0}
-      <p class="text-secondary">No matching login attempts.</p>
+      <p class="text-secondary">{t('admin.settings.login.empty')}</p>
     {:else}
       <div class="login-attempt-list">
         {#each loginAttempts as attempt (attempt.id)}
           <div class="login-attempt-row">
-            <span class="attempt-status" class:success={attempt.success}>{attempt.success ? 'Success' : 'Failed'}</span>
+            <span class="attempt-status" class:success={attempt.success}>{attempt.success ? t('admin.settings.login.success') : t('admin.settings.login.failed')}</span>
             <div class="attempt-identity">
               <strong>{attempt.username}</strong>
               <span>{attempt.auth_provider}{attempt.failure_reason ? ` · ${attempt.failure_reason}` : ''}</span>
             </div>
-            <span title={attempt.user_agent || ''}>{attempt.ip_address || 'Unknown IP'}</span>
+            <span title={attempt.user_agent || ''}>{attempt.ip_address || t('admin.settings.login.unknown_ip')}</span>
             <time datetime={attempt.created_at}>{formatLoginTime(attempt.created_at)}</time>
           </div>
         {/each}
       </div>
       <div class="login-pagination">
-        <button class="btn-secondary" type="button" disabled={loginAttemptsLoading || loginAttemptsPage <= 1} onclick={() => loadLoginAttempts(loginAttemptsPage - 1)}>Previous</button>
-        <span>Page {loginAttemptsPage} of {loginAttemptsPages}</span>
-        <button class="btn-secondary" type="button" disabled={loginAttemptsLoading || loginAttemptsPage >= loginAttemptsPages} onclick={() => loadLoginAttempts(loginAttemptsPage + 1)}>Next</button>
+        <button class="btn-secondary" type="button" disabled={loginAttemptsLoading || loginAttemptsPage <= 1} onclick={() => loadLoginAttempts(loginAttemptsPage - 1)}>{t('common.previous')}</button>
+        <span>{t('admin.settings.login.page_info', { page: loginAttemptsPage, total: loginAttemptsPages })}</span>
+        <button class="btn-secondary" type="button" disabled={loginAttemptsLoading || loginAttemptsPage >= loginAttemptsPages} onclick={() => loadLoginAttempts(loginAttemptsPage + 1)}>{t('common.next')}</button>
       </div>
     {/if}
   </div>

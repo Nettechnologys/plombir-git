@@ -2,7 +2,7 @@
   import { page } from '$app/stores';
   import { mirrors, buildMirrorPayload, type RepositoryMirror } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
-  import { createT } from '$lib/i18n';
+  import { createT, formatDateTime } from '$lib/i18n';
 
   const t = createT();
   const owner = $derived($page.params.owner!);
@@ -172,9 +172,13 @@
   }
 
   function formatDate(value: string | null) {
-    return value ? new Date(value).toLocaleString() : t('common.never');
+    return value ? formatDateTime(value) : t('common.never');
   }
 </script>
+
+<svelte:head>
+  <title>{t('settings.mirror.title')} · {owner}/{repo} · Plombir Git</title>
+</svelte:head>
 
 <div class="mirror-page">
   <div class="page-header">

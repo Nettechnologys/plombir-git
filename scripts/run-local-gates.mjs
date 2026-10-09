@@ -100,6 +100,13 @@ export const CARGO_JOBS = new Map([
     },
   ],
   [
+    'ui-access-sweep',
+    {
+      ciOnly: 'drives every write control in a headless Chrome against a built Plombir Git and '
+        + 'its built frontend; needs the binary, Chrome and ports bound.',
+    },
+  ],
+  [
     'postgres-smoke',
     { ciOnly: 'needs a live PostgreSQL; the workflow gets one from a service container.' },
   ],

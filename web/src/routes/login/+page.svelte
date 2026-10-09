@@ -103,14 +103,14 @@
   async function handlePasskeyLogin() {
     localError = '';
     if (!username.trim()) {
-      localError = 'Enter your username first, then use your passkey.';
+      localError = t('auth.login.passkey_username_first');
       return;
     }
     const ok = await loginWithPasskey(username);
     if (ok) {
       window.location.href = '/dashboard';
     } else {
-      localError = getAuthError() || 'Passkey login failed';
+      localError = getAuthError() || t('auth.login.passkey_failed');
     }
   }
 
@@ -214,7 +214,7 @@
               <circle cx="5" cy="10" r="3" />
               <path d="M12 8h9M18 8v4M15 8v2" />
             </svg>
-            Sign in with a passkey
+            {t('auth.login.passkey_sign_in')}
           </button>
         {/if}
       </form>
@@ -247,7 +247,7 @@
       {t('auth.login.footer', { link: '' })}
       <a href="/register">{t('auth.login.footer_link')}</a>
       <span class="separator">·</span>
-      <a href="/forgot-password">Forgot password?</a>
+      <a href="/forgot-password">{t('auth.login.forgot_password')}</a>
     </p>
   </div>
 </div>

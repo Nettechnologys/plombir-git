@@ -9,7 +9,7 @@
     type BranchProtectionRule
   } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
-  import { createT } from '$lib/i18n';
+  import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
   const owner = $derived($page.params.owner!);
@@ -222,6 +222,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>{t('settings.branch_protection.title')} · {owner}/{repo} · Plombir Git</title>
+</svelte:head>
+
 <div class="branch-protection-page">
   <div class="page-header">
     <div>
@@ -384,7 +388,7 @@
                     {#if rule.require_signed_commits}<span>{t('settings.branch_protection.signed_commits_required', 'Signed commits required')}</span>{/if}
                   </div>
                 </td>
-                <td>{new Date(rule.updated_at).toLocaleDateString()}</td>
+                <td>{formatDate(rule.updated_at)}</td>
                 <td class="actions">
                   <button class="btn btn-outline" onclick={() => editRule(rule)} disabled={isBusy(rowKey(rule.id))}>
                     {t('common.edit')}

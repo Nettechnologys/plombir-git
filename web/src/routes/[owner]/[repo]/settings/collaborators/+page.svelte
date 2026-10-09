@@ -2,7 +2,7 @@
   import { page } from '$app/stores';
   import { collaborators, type Collaborator } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
-  import { createT } from '$lib/i18n';
+  import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
   const owner = $derived($page.params.owner!);
@@ -29,11 +29,13 @@
     });
   }
 
-  const permissionOptions = [
+  // `$derived`, not a plain constant: labels computed once at mount would stay
+  // in the language the page opened in after a switch (card_0d18cf31d13b).
+  const permissionOptions = $derived([
     { value: 'read', label: t('orgs.permission.read') },
     { value: 'write', label: t('orgs.permission.write') },
     { value: 'admin', label: t('orgs.permission.admin') }
-  ];
+  ]);
 
   $effect(() => {
     const expectedOwner = owner;
@@ -188,6 +190,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>{t('settings.collaborators.title')} · {owner}/{repo} · Plombir Git</title>
+</svelte:head>
+
 <div class="collaborators-page">
   <div class="page-header">
     <div>
@@ -267,7 +273,7 @@
                     {/each}
                   </select>
                 </td>
-                <td>{new Date(collaborator.created_at).toLocaleDateString()}</td>
+                <td>{formatDate(collaborator.created_at)}</td>
                 <td class="actions">
                   <button
                     class="btn btn-outline"

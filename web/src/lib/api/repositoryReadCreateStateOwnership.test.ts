@@ -42,6 +42,8 @@ function repository(name: string) {
 		stars_count: 0,
 		is_private: false,
 		created_at: timestamp,
+		// The write controls follow it (card_3625a7b89abb).
+		viewer_permission: 'write',
 	};
 }
 

@@ -376,6 +376,27 @@ pub(crate) async fn require_admin(
     Ok((repo, actor_id))
 }
 
+/// Whether `actor_id` administers `repo` — the second half of a row-level
+/// rule whose first half the domain decides ("is it yours").
+///
+/// For routes where an authenticated reader may act on rows they authored and
+/// an administrator on everybody's: editing or deleting a comment
+/// (card_60961272e1ba). The rule stays [`check_admin_for`]'s; a refusal is
+/// `false`, a failure of the check itself stays an error.
+pub(crate) async fn administers(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    actor_id: i64,
+) -> Result<bool, AppError> {
+    match check_admin_for(state, repo, Some(actor_id)).await {
+        Ok(()) => Ok(true),
+        Err(AppError::Forbidden(_) | AppError::Unauthorized(_) | AppError::NotFound(_)) => {
+            Ok(false)
+        }
+        Err(other) => Err(other),
+    }
+}
+
 /// Require the repository's owner — not merely someone with write or admin
 /// rights on it.
 ///
@@ -1164,5 +1185,142 @@ impl<A: RepoAnchor> FromRequestParts<AppState> for AnchoredWrite<A> {
             repo,
             actor_id,
         })
+    }
+}
+
+/// The pull-request head a request names in its body or query, other than the
+/// repository in its path.
+pub trait HeadRefSource {
+    /// `branch` of the path's repository, or `owner:branch` of a fork of it.
+    fn head_ref(&self) -> &str;
+}
+
+/// A query string, as a body-position extractor — what [`PullHead`] wraps for
+/// a `GET` that names its head in the query.
+pub struct InQuery<T>(pub T);
+
+impl<T> FromRequest<AppState> for InQuery<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+        let (mut parts, _body) = req.into_parts();
+        let axum::extract::Query(query) =
+            axum::extract::Query::<T>::from_request_parts(&mut parts, state)
+                .await
+                .map_err(|rejection| AppError::bad_request(rejection.body_text()))?;
+        Ok(Self(query))
+    }
+}
+
+/// A pull-request head, resolved and gated: the branch, and the fork it lives
+/// in when it is not the path's repository.
+///
+/// The route layer judges the repository in the path. A `<owner>:<branch>`
+/// head names a second repository, and a fork is a repository of its own —
+/// a collaborator of a private parent is not a reader of somebody's private
+/// fork of it. So the fork passes [`check_read`], the very gate its own pages
+/// pass, for every caller, and a token's repository confinement on top. An
+/// unreadable fork answers exactly like one that does not exist: `400`, so the
+/// gate is no existence oracle (card_bb2ef2307588).
+///
+/// `E` is the extractor carrying the head — `Json<_>` or `Query<_>` — and is
+/// handed back whole. Being a body extractor, it must be the *last* argument.
+pub struct PullHead<E> {
+    pub branch: String,
+    pub fork: Option<rg_db::entities::repository::Model>,
+    pub inner: E,
+}
+
+impl<E> FromRequest<AppState> for PullHead<E>
+where
+    E: FromRequest<AppState> + HeadRefSource + Send,
+    E::Rejection: std::fmt::Display,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+        let (mut parts, body) = req.into_parts();
+        let (owner, name) = route_repo(&mut parts, state).await?;
+        let base = resolve_repo(state, &owner, &name).await?;
+        let headers = parts.headers.clone();
+        let parts_path = parts.uri.path().to_string();
+        let grant = parts
+            .extensions
+            .get::<crate::agent_scope::TokenGrant>()
+            .cloned();
+        let inner = E::from_request(Request::from_parts(parts, body), state)
+            .await
+            .map_err(|rejection| AppError::bad_request(rejection.to_string()))?;
+
+        let head_ref = inner.head_ref().to_string();
+        // A token confined to repositories is asked first, by name, before the
+        // head is resolved: an absent and a disallowed head read alike, so the
+        // resolver is no existence oracle for it.
+        if let (Some(grant), Some((head_owner, _))) = (
+            grant.as_ref().filter(|grant| grant.is_repo_restricted()),
+            head_ref.split_once(':'),
+        ) {
+            let named =
+                rg_core::repo::service::find_repo_by_owner_name(&state.db, head_owner, &base.name)
+                    .await?;
+            if !named.is_some_and(|named| grant.admits_repository(named.id)) {
+                return Err(grant
+                    .deny(
+                        &headers,
+                        "this token may not access the pull request head repository",
+                        serde_json::json!({
+                            "reason": "repository_not_allowed",
+                            "path": parts_path,
+                            "base_repo_id": base.id,
+                        }),
+                    )
+                    .await);
+            }
+        }
+        let (branch, fork_id) =
+            rg_core::pull_request::resolve_head_ref(&state.db, base.id, &head_ref).await?;
+        let Some(fork_id) = fork_id else {
+            return Ok(Self {
+                branch,
+                fork: None,
+                inner,
+            });
+        };
+        let absent = || {
+            AppError::from(rg_core::error::invalid_request(format!(
+                "no repository found for head owner '{}'",
+                head_ref.split_once(':').map_or("", |(owner, _)| owner)
+            )))
+        };
+        let fork = rg_db::ops::repo_ops::find_by_id(&state.db, fork_id)
+            .await?
+            .ok_or_else(absent)?;
+        if let Some(grant) = grant.filter(|grant| !grant.admits_repository(fork.id)) {
+            return Err(grant
+                .deny(
+                    &headers,
+                    "this token may not access the pull request head repository",
+                    serde_json::json!({
+                        "reason": "repository_not_allowed",
+                        "base_repo_id": base.id,
+                        "head_repo_id": fork.id,
+                    }),
+                )
+                .await);
+        }
+        match check_read(state, &headers, &fork).await {
+            Ok(()) => Ok(Self {
+                branch,
+                fork: Some(fork),
+                inner,
+            }),
+            Err(AppError::NotFound(_) | AppError::Forbidden(_) | AppError::Unauthorized(_)) => {
+                Err(absent())
+            }
+            Err(other) => Err(other),
+        }
     }
 }

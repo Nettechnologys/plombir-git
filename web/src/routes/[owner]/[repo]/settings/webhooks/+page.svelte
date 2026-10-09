@@ -355,6 +355,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>{t('settings.webhooks.title')} · {owner}/{repo} · Plombir Git</title>
+</svelte:head>
+
 <div class="webhooks-page">
   <div class="page-header">
     <div>

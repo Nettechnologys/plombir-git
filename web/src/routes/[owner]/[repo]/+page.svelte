@@ -10,6 +10,7 @@
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
+  const RECENT_COMMITS = 5;
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
@@ -117,7 +118,9 @@
       const [treeData, branchData, logData, repoData] = await Promise.all([
         repos.tree(expectedOwner, expectedRepo, expectedRef || undefined, expectedPath || undefined),
         repos.branches(expectedOwner, expectedRepo),
-        repos.log(expectedOwner, expectedRepo, expectedRef || undefined, expectedPath || undefined),
+        // The page shows five commits; asking for the server's default 50
+        // walked and serialized ten times the history it renders.
+        repos.log(expectedOwner, expectedRepo, expectedRef || undefined, expectedPath || undefined, RECENT_COMMITS),
         repos.get(expectedOwner, expectedRepo),
       ]);
       if (!dataRequests.owns(claim, owner, repo, repositoryViewIdentity(queryRef, queryPath))) return;
@@ -125,7 +128,7 @@
       const nextEntries = treeData.entries || [];
       entries = nextEntries;
       branches = branchData || [];
-      commits = (logData.commits || []).slice(0, 5);
+      commits = (logData.commits || []).slice(0, RECENT_COMMITS);
       repoInfo = repoData;
 
       // Load README when at root
@@ -252,7 +255,7 @@
   {/if}
 
   {#if loading}
-    <p class="text-secondary">Loading...</p>
+    <p class="text-secondary">{t('common.loading')}</p>
   {:else if !error && commits.length === 0 && entries.length === 0}
     <!-- Empty repository — setup guidance.
          Guarded on `error` because a failed load leaves `entries` and
@@ -344,6 +347,12 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
       </div>
 
       <div class="toolbar-actions">
+        <a href={`/${owner}/${repo}/branches`} class="btn-outline btn-sm branches-link">
+          {t('repo.branches.title')}
+        </a>
+        <a href={`/${owner}/${repo}/tags`} class="btn-outline btn-sm tags-link">
+          {t('repo.tags.title')}
+        </a>
         <a href={`/${owner}/${repo}/new`} class="btn-outline btn-sm">
           ➕ {t('repo.new_file', 'New file')}
         </a>

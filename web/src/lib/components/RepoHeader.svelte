@@ -325,7 +325,7 @@
   }
 
   function getForkTitle() {
-    if (!isLoggedIn()) return 'Login to fork';
+    if (!isLoggedIn()) return t('repo.login_to_fork');
     if (isOwnRepo) return t('repo.fork_own_repo');
     return forking ? t('repo.forking') : t('repo.fork');
   }
@@ -344,7 +344,7 @@
   }
 
   function getStarLabel() {
-    if (!isLoggedIn()) return 'Login to star';
+    if (!isLoggedIn()) return t('repo.login_to_star');
     if (starred === UNKNOWN) return t('repo.star_state_unavailable');
     return starred ? t('repo.unstar') : t('repo.star');
   }
@@ -407,8 +407,8 @@
         onclick={cycleWatch}
         disabled={!isLoggedIn() || watchBusy}
         aria-busy={watchBusy}
-        title={isLoggedIn() ? getWatchLabel() : 'Login to watch'}
-        aria-label={isLoggedIn() ? getWatchLabel() : 'Login to watch'}
+        title={isLoggedIn() ? getWatchLabel() : t('repo.login_to_watch')}
+        aria-label={isLoggedIn() ? getWatchLabel() : t('repo.login_to_watch')}
       >
         <span class="watch-icon" aria-hidden="true">👁</span>
         <span class="label">{getWatchLabel()}</span>
@@ -463,7 +463,7 @@
                 onclick={() => cloneTab = 'http'}
                 role="tab"
                 aria-selected={cloneTab === 'http'}
-                aria-label="HTTPS clone"
+                aria-label={t('repo.clone_https_label')}
               >HTTPS</button>
               <button
                 class="clone-tab"
@@ -471,7 +471,7 @@
                 onclick={() => cloneTab = 'ssh'}
                 role="tab"
                 aria-selected={cloneTab === 'ssh'}
-                aria-label="SSH clone"
+                aria-label={t('repo.clone_ssh_label')}
               >SSH</button>
             </div>
 

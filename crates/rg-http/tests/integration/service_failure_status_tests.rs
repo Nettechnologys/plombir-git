@@ -18,7 +18,7 @@
 //! succeed and only the operation under test fails. Closing the pool would fail
 //! authentication first and the assertions would pass unfixed.
 
-use crate::common::{create_repo, register_full, spawn_test_app_with_db};
+use crate::common::{create_initialised_repo, register_full, spawn_test_app_with_db};
 use sea_orm::ConnectionTrait;
 
 /// The failure half: a broken write must be a 5xx carrying no internal detail.
@@ -48,7 +48,7 @@ async fn app_with_repo(prefix: &str) -> (String, sea_orm::DatabaseConnection, St
         &format!("{prefix}@example.com"),
     )
     .await;
-    let repo_id = create_repo(&base, &token, &format!("{prefix}-repo")).await;
+    let repo_id = create_initialised_repo(&base, &token, &format!("{prefix}-repo")).await;
     (base, db, token, repo_id)
 }
 

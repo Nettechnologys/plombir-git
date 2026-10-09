@@ -2,7 +2,8 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
-  import { releases, repos } from '$lib/api/client.svelte';
+  import { releases, repos, type RepoPermission } from '$lib/api/client.svelte';
+  import { canWriteRepo, loadViewerPermission } from '$lib/repoPermission';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
 
@@ -24,6 +25,10 @@
   let submitting = $state(false);
   let error = $state('');
   let selectedTargetType = $state<'branch' | 'tag'>('tag');
+  // Creating a release is behind `RepoWrite` (card_3625a7b89abb): a reader
+  // gets a sentence saying so instead of a form that can only end in 403.
+  let viewerPermission = $state<RepoPermission | null>(null);
+  let canWrite = $derived(canWriteRepo(viewerPermission));
   const metadataRequests = new LatestRepositoryRequestFence();
   let routeGeneration = 0;
 
@@ -51,6 +56,7 @@
     submitting = false;
     error = '';
     selectedTargetType = 'tag';
+    viewerPermission = null;
   }
 
   async function loadBranchesAndTags(
@@ -61,14 +67,16 @@
     const claim = metadataRequests.begin(expectedOwner, expectedRepo);
     loading = true;
     try {
-      const [branchList, tagList] = await Promise.all([
+      const [branchList, tagList, permission] = await Promise.all([
         repos.branches(expectedOwner, expectedRepo),
-        repos.tags(expectedOwner, expectedRepo)
+        repos.tags(expectedOwner, expectedRepo),
+        loadViewerPermission(expectedOwner, expectedRepo),
       ]);
       if (
         !metadataRequests.owns(claim, owner, repo) ||
         !isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
       ) return;
+      viewerPermission = permission;
       branches = branchList.map(b => b.name);
       tags = tagList.map(t => t.name);
     } catch (e: any) {
@@ -89,12 +97,12 @@
     if (submitting) return;
 
     if (!tagName.trim()) {
-      error = 'Tag name is required';
+      error = t('releases.tag_name_required');
       return;
     }
 
     if (!releaseTitle.trim()) {
-      error = 'Release title is required';
+      error = t('releases.release_title_required');
       return;
     }
 
@@ -125,7 +133,7 @@
 </script>
 
 <svelte:head>
-  <title>New Release · {owner}/{repo} · Plombir Git</title>
+  <title>{t('releases.new_page_title')} · {owner}/{repo} · Plombir Git</title>
 </svelte:head>
 
 <div class="page-container">
@@ -141,6 +149,8 @@
 
   {#if loading}
     <p class="loading-text">{t('common.loading')}</p>
+  {:else if !canWrite}
+    <p class="write-required">{t('repo.write_required')}</p>
   {:else}
     <form class="release-form" onsubmit={handleSubmit}>
       <div class="form-group">
@@ -155,7 +165,7 @@
         />
         {#if tags.length > 0}
           <div class="tag-hints">
-            <span class="hint-label">Existing tags:</span>
+            <span class="hint-label">{t('releases.existing_tags')}</span>
             {#each tags.slice(0, 10) as tag}
               <button
                 type="button"
@@ -166,7 +176,7 @@
               </button>
             {/each}
             {#if tags.length > 10}
-              <span class="hint-more">+{tags.length - 10} more</span>
+              <span class="hint-more">{t('releases.more_tags', { count: tags.length - 10 })}</span>
             {/if}
           </div>
         {/if}
@@ -204,7 +214,7 @@
             class:active={selectedTargetType === 'tag'}
             onclick={() => selectedTargetType = 'tag'}
           >
-            Tags
+            {t('releases.target_tags')}
           </button>
           <button
             type="button"
@@ -212,19 +222,19 @@
             class:active={selectedTargetType === 'branch'}
             onclick={() => selectedTargetType = 'branch'}
           >
-            Branches
+            {t('releases.target_branches')}
           </button>
         </div>
 
         <select id="target-commitish" bind:value={targetCommitish} class="select">
 
         {#if selectedTargetType === 'tag'}
-          <option value="">-- Select a tag (optional) --</option>
+          <option value="">{t('releases.select_tag')}</option>
           {#each tags as tag}
             <option value={tag}>{tag}</option>
           {/each}
         {:else}
-          <option value="">-- Select a branch (optional) --</option>
+          <option value="">{t('releases.select_branch')}</option>
           {#each branches as branch}
             <option value={branch}>{branch}</option>
           {/each}
@@ -266,7 +276,12 @@
     font-size: 24px;
     font-weight: 600;
   }
-.loading-text {
+.write-required {
+    padding: 24px 0;
+    color: var(--text-secondary);
+  }
+
+  .loading-text {
     color: var(--text-secondary);
     text-align: center;
     padding: 48px;

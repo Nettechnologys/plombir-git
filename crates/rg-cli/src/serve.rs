@@ -1515,6 +1515,18 @@ pub(crate) async fn run_serve(
             signing_secret: resolved_auth_secrets.jwt_secret.clone(),
         });
 
+    // Notification mail, batched per person (card_349c2b6a0d7c). Without SMTP
+    // the rows are still written — the inbox is the notification — and nothing
+    // waits to mail them.
+    let _notification_mail_handle = smtp_config.clone().map(|smtp| {
+        rg_core::notification::mail::spawn_dispatcher(
+            db.clone(),
+            smtp,
+            resolved_external_url.clone(),
+            Some(shutdown_rx.clone()),
+        )
+    });
+
     let mirror_encryption_key = resolved_auth_secrets.encryption_key.clone();
     let post_push_context = rg_core::push_hooks::PostPushContext {
         repo_root: repo_root.clone(),

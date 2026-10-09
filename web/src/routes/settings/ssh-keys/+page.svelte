@@ -2,7 +2,7 @@
   import { goto } from '$app/navigation';
   import { sshKeys, type SshKey } from '$lib/api/client.svelte';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
-  import { t } from '$lib/i18n';
+  import { formatDate as formatLocaleDate, t } from '$lib/i18n';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
 
   let keys = $state<SshKey[]>([]);
@@ -101,7 +101,7 @@
   function formatDate(value?: string | null) {
     if (!value) return t('ssh_keys.never');
     const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString();
+    return Number.isNaN(date.getTime()) ? value : formatLocaleDate(value);
   }
 </script>
 

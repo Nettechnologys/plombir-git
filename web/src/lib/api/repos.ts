@@ -43,6 +43,12 @@ interface FileOperationResponse {
 type BranchRefResponse = { name: string; is_default: boolean };
 type TagRefResponse = string;
 
+/** `RefChangeResponse` in `repo_content.rs`: the full ref and the commit it names (or named, for a deletion). */
+export interface RefChange {
+  ref: string;
+  sha: string;
+}
+
 export interface Stargazer {
   user_id: number;
   username: string;
@@ -95,6 +101,40 @@ export interface CommitSignature {
   status: string;
 }
 
+/**
+ * What the signed-in caller may do in a repository, as `GET /repos/{owner}/{name}`
+ * reports it (`RepoResponse::viewer_permission`); absent for an anonymous
+ * reader. It decides which actions a page offers — every write is still
+ * decided by its own route.
+ */
+export type RepoPermission = 'admin' | 'write' | 'read';
+
+export interface RepositoryDetail {
+  id: number;
+  owner_id: number;
+  name: string;
+  description: string | null;
+  is_private: boolean;
+  default_branch: string;
+  stars_count: number;
+  forks_count: number;
+  created_at: string;
+  viewer_permission?: RepoPermission;
+}
+
+/**
+ * `PATCH /repos/{owner}/{name}` (card_3625a7b89abb), repository administrators
+ * only. Every key is optional and only the ones present change; `description:
+ * null` clears it. 400 unknown branch / invalid name / description too long,
+ * 409 the name is taken in this namespace.
+ */
+export interface RepoSettingsPatch {
+  description?: string | null;
+  is_private?: boolean;
+  default_branch?: string;
+  name?: string;
+}
+
 function normalizeTagRef(tag: TagRefResponse): { name: string } {
   return { name: tag };
 }
@@ -109,17 +149,13 @@ export const repos = {
       `/repos/explore${qs({ page, per_page: perPage })}`
     ),
   get: (owner: string, name: string) =>
-    request<{
-      id: number;
-      owner_id: number;
-      name: string;
-      description: string | null;
-      is_private: boolean;
-      default_branch: string;
-      stars_count: number;
-      forks_count: number;
-      created_at: string;
-    }>(`/repos/${owner}/${name}`),
+    request<RepositoryDetail>(`/repos/${owner}/${name}`),
+  /** The answer is the updated row; after a rename it carries the new `name`. */
+  update: (owner: string, name: string, patch: RepoSettingsPatch) =>
+    request<RepositoryDetail>(`/repos/${owner}/${name}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
   create: (opts: {
     name: string;
     description?: string;
@@ -181,13 +217,40 @@ export const repos = {
     })}`, {
       method: 'DELETE',
     }),
-  log: (owner: string, repo: string, ref?: string, path?: string) => {
-    return request<{ commits: { sha: string; message: string; author: string; date: string }[] }>(`/repos/${owner}/${repo}/log${qs({ ref, path })}`);
+  /**
+   * `ref` omitted walks the server's HEAD — the repository's own default
+   * branch, whatever it is called. `limit` is 1..=100 server-side (default 50);
+   * the endpoint has no offset, so a caller pages by passing the last SHA it
+   * holds as `ref` (see the commits page).
+   */
+  log: (owner: string, repo: string, ref?: string, path?: string, limit?: number, skip?: number) => {
+    return request<{ commits: { sha: string; message: string; author: string; date: string }[] }>(`/repos/${owner}/${repo}/log${qs({ ref, path, limit, skip: skip || undefined })}`);
   },
   branches: (owner: string, repo: string) =>
     request<BranchRefResponse[]>(`/repos/${owner}/${repo}/branches`),
   tags: (owner: string, repo: string) =>
     request<TagRefResponse[]>(`/repos/${owner}/${repo}/tags`).then((tags) => tags.map(normalizeTagRef)),
+  /**
+   * Create a branch (card_2060696224ff). `from` is a branch, tag or SHA; the
+   * server uses the default branch when it is left out. Held to the same rules
+   * as a `git push` of that branch: 400 bad name / unresolvable `from`, 403 a
+   * token kept off protected branches, 409 exists or a push rule refuses it.
+   */
+  createBranch: (owner: string, repo: string, data: { name: string; from?: string }) =>
+    request<RefChange>(`/repos/${owner}/${repo}/branches`, {
+      method: 'POST',
+      body: JSON.stringify(data.from ? { name: data.name, from: data.from } : { name: data.name }),
+    }),
+  /**
+   * Delete a branch. The name travels as ONE path segment, so `feature/x` is
+   * sent as `feature%2Fx`. 404 no such branch; 409 the default or a protected
+   * branch, or it moved meanwhile.
+   */
+  deleteBranch: (owner: string, repo: string, branch: string) =>
+    request<RefChange>(`/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}`, { method: 'DELETE' }),
+  /** Delete a tag, encoded as one segment like `deleteBranch`. 409 a protected tag. */
+  deleteTag: (owner: string, repo: string, tag: string) =>
+    request<RefChange>(`/repos/${owner}/${repo}/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' }),
   commitSignature: (owner: string, repo: string, sha: string) =>
     request<CommitSignature>(`/repos/${owner}/${repo}/commits/${sha}/signature`),
   star: (owner: string, repo: string) =>

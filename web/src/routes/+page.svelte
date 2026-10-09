@@ -26,7 +26,7 @@
         repoList = r.data;
       }
     } catch (e: any) {
-      error = e.message || 'Failed to load repositories';
+      error = e.message || t('home.load_failed');
     } finally {
       loading = false;
     }
@@ -185,7 +185,7 @@
         {#if error}
           <div class="error-banner">
             <p>{error}</p>
-            <button onclick={loadRepos}>Retry</button>
+            <button onclick={loadRepos}>{t('common.retry')}</button>
           </div>
         {/if}
 

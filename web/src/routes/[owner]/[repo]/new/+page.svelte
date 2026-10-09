@@ -10,8 +10,35 @@
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
   let path = $derived($page.url.searchParams.get('path') || '');
-  let branch = $derived($page.url.searchParams.get('ref') || 'main');
-  let editorKey = $derived(JSON.stringify([owner, repo, path, branch]));
+  let branch = $derived($page.url.searchParams.get('ref') || '');
+  // Without `?ref=` the file is read at the server's HEAD and committed to
+  // the repository's own default branch. Both pages used to fall back to a
+  // literal `main`: on a repository whose default is `master` the edit page
+  // could not read the file and "New file" committed to a branch that did
+  // not exist (card_2e320f5287d7, sideways).
+  let defaultBranch = $state<string | null>(null);
+  let targetBranch = $derived(branch || defaultBranch || '');
+  let branchResolved = $derived(Boolean(branch) || defaultBranch !== null);
+
+  $effect(() => {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    if (branch) return;
+    defaultBranch = null;
+    let current = true;
+    void (async () => {
+      try {
+        const info = await repos.get(expectedOwner, expectedRepo);
+        if (current) defaultBranch = info?.default_branch || '';
+      } catch {
+        // The editor still opens; its branch field is required, so the
+        // author names the branch instead of the page guessing one.
+        if (current) defaultBranch = '';
+      }
+    })();
+    return () => { current = false; };
+  });
+  let editorKey = $derived(JSON.stringify([owner, repo, path, branch, targetBranch]));
   let routeGeneration = 0;
 
   $effect(() => {
@@ -67,13 +94,17 @@
 </svelte:head>
 
 {#key editorKey}
-  <FileEditor
-    {owner}
-    {repo}
-    mode="create"
-    initialPath={path}
-    branch={branch}
-    cancelHref={repoHref(branch)}
-    onSave={saveFile}
-  />
+  {#if branchResolved}
+    <FileEditor
+      {owner}
+      {repo}
+      mode="create"
+      initialPath={path}
+      branch={targetBranch}
+      cancelHref={repoHref(branch)}
+      onSave={saveFile}
+    />
+  {:else}
+    <div class="loading">{t('common.loading')}</div>
+  {/if}
 {/key}

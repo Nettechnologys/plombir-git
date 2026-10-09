@@ -68,6 +68,20 @@ export interface Issue {
   closed_at: string | null;
 }
 
+/** A comment as `GET /issues/{number}/comments` lists it. */
+export interface IssueComment {
+  id: number;
+  issue_id: number;
+  author_id: number;
+  /** Absent on the row an edit answers with; the listing carries it. */
+  author?: string | null;
+  author_bot_owner?: string | null;
+  body: string;
+  created_at: string;
+  /** Later than `created_at` once the comment was edited. */
+  updated_at: string;
+}
+
 export interface IssueUpdatePayload {
   title?: string;
   body?: string;
@@ -133,4 +147,24 @@ export const issues = {
       method: 'POST',
       body: JSON.stringify({ body }),
     }),
+  /**
+   * Edit a comment (card_60961272e1ba): its author or a repository
+   * administrator, 403 for anyone else. The answer is the comment row — it
+   * carries no `author` name, so a caller merges it over the one it shows.
+   */
+  editComment: (owner: string, repo: string, commentId: number, body: string) =>
+    request<IssueComment>(`/repos/${owner}/${repo}/issues/comments/${commentId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ body }),
+    }),
+  /** Same rule as `editComment`; 204. */
+  deleteComment: (owner: string, repo: string, commentId: number) =>
+    request<void>(`/repos/${owner}/${repo}/issues/comments/${commentId}`, { method: 'DELETE' }),
+  /**
+   * Delete the issue with its comments and attachments; repository
+   * administrators only (403 otherwise), 204. Pull requests have no such
+   * route on purpose.
+   */
+  delete: (owner: string, repo: string, number: number) =>
+    request<void>(`/repos/${owner}/${repo}/issues/${number}`, { method: 'DELETE' }),
 };

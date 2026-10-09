@@ -116,6 +116,8 @@ let rendered: RenderedComponent | undefined;
 
 beforeEach(() => {
 	resetTestClient();
+	// The write controls follow `viewer_permission` (card_3625a7b89abb).
+	repos.get.mockResolvedValue({ viewer_permission: 'write' });
 	vi.stubGlobal('confirm', vi.fn(() => true));
 });
 

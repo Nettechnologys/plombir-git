@@ -111,6 +111,60 @@ pub async fn send_html_notification(
     send_notification_email(config, to, title, &html_body).await
 }
 
+/// Send one notification mail: one entry per notification that piled up for
+/// the recipient, each with its link, and a footer that says where these mails
+/// are turned off.
+pub async fn send_digest(
+    config: &SmtpConfig,
+    to: &str,
+    mail: &crate::notification::mail::Digest,
+) -> Result<()> {
+    let entries: String = mail
+        .entries
+        .iter()
+        .map(|entry| {
+            let title = match entry.url.as_deref() {
+                Some(url) => format!(
+                    r#"<a href="{}" style="color: #4f46e5; text-decoration: none;">{}</a>"#,
+                    html_escape(url),
+                    html_escape(&entry.title)
+                ),
+                None => html_escape(&entry.title),
+            };
+            let body = entry
+                .body
+                .as_deref()
+                .map(|body| {
+                    format!(
+                        r#"<div style="color: #4b5563;">{}</div>"#,
+                        html_escape(body)
+                    )
+                })
+                .unwrap_or_default();
+            format!(r#"<li style="margin-bottom: 12px;"><strong>{title}</strong>{body}</li>"#)
+        })
+        .collect();
+    let footer = match mail.settings_url.as_deref() {
+        Some(url) => format!(
+            r#"You received this email because of your notification settings: <a href="{}" style="color: #9ca3af;">change what is mailed to you</a>."#,
+            html_escape(url)
+        ),
+        None => "You received this email because of your notification settings on Plombir Git \
+                 (Settings → Notifications)."
+            .to_string(),
+    };
+    let html_body = format!(
+        r#"<html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f6f8fa; margin: 0; padding: 20px;">
+<div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 8px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+  <ul style="padding-left: 18px; margin: 0;">{entries}</ul>
+  <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 20px 0;" />
+  <p style="color: #9ca3af; font-size: 12px;">{footer}</p>
+</div>
+</body></html>"#
+    );
+    send_notification_email(config, to, &mail.subject, &html_body).await
+}
+
 /// Simple HTML entity escaping.
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
