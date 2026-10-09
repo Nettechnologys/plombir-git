@@ -358,17 +358,11 @@ pub async fn login_with_configured_auth(
     source: Option<std::net::IpAddr>,
 ) -> Result<LoginOutcome> {
     let existing = find_login_user(db, username_or_email).await?;
-    if existing.as_ref().is_some_and(|user| {
-        user.locked_until
-            .is_some_and(|locked_until| locked_until > Utc::now())
-    }) {
-        bail!("account is temporarily locked");
-    }
-    match existing.as_ref().map(|user| user.auth_provider.as_str()) {
-        Some("local") => Ok(LoginOutcome {
+    let outcome = match existing.as_ref().map(|user| user.auth_provider.as_str()) {
+        Some("local") => LoginOutcome {
             user: verify_local_login(db, username_or_email, plaintext_password, source).await?,
             method: LoginMethod::Password,
-        }),
+        },
         Some("ldap") | None => {
             login_via_ldap(
                 db,
@@ -379,7 +373,7 @@ pub async fn login_with_configured_auth(
                 ldap_transport_policy,
                 source,
             )
-            .await
+            .await?
         }
         Some(_) => {
             // Account exists but authenticates through a provider no password
@@ -388,7 +382,25 @@ pub async fn login_with_configured_auth(
             password::burn_dummy_verification(plaintext_password, source).await?;
             bail!("invalid credentials")
         }
+    };
+
+    // Load-bearing order, and a load-bearing text. The lock is read only now,
+    // *after* the provider above has verified the password: read before the
+    // hash it answered "this account exists and is locked" to anyone willing to
+    // spend five requests, and `card_b2fa2c6311a7` closed the timing half of
+    // that oracle with `verify_password_or_dummy` while this half stayed open
+    // (Low finding, security audit). `AccountLocked` displays the uniform
+    // `invalid credentials`, so the client cannot tell the lock from a wrong
+    // password; the strike already recorded is what keeps the lock counting,
+    // and a correct password does not extend it.
+    if let Some(locked_until) = outcome
+        .user
+        .locked_until
+        .filter(|locked_until| *locked_until > Utc::now())
+    {
+        return Err(crate::auth::lockout::AccountLocked { locked_until }.into());
     }
+    Ok(outcome)
 }
 
 async fn find_login_user(
@@ -2025,6 +2037,99 @@ mod tests {
             password::dummy_verification_burns(),
             1,
             "an unknown login that never reaches LDAP bind must burn exactly one dummy verification"
+        );
+    }
+
+    /// A correct password must not slip past the brute-force lock, and its
+    /// refusal must not be distinguishable from a wrong password.
+    ///
+    /// The lock used to be read before the Argon2 verification, so this call
+    /// never reached `verify_local_login` at all: the service answered
+    /// "account is temporarily locked" in its own words, which named a real,
+    /// locked account to anyone willing to send five requests (Low finding,
+    /// security audit). Now the password is verified first — the same order the
+    /// SSH and registry doors get from `settle_password_attempt` — and the
+    /// refusal is [`AccountLocked`], whose display is the uniform text.
+    #[tokio::test]
+    async fn a_locked_account_refuses_a_correct_password_after_verifying_it() {
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = user_ops::create_user(
+            &db,
+            "locked-owner",
+            "locked-owner@example.com",
+            "the-right-password",
+            "Locked Owner",
+        )
+        .await
+        .unwrap();
+        for _ in 0..crate::auth::lockout::MAX_FAILED_PASSWORD_ATTEMPTS {
+            user_ops::record_failed_login(
+                &db,
+                user.id,
+                crate::auth::lockout::MAX_FAILED_PASSWORD_ATTEMPTS,
+            )
+            .await
+            .unwrap();
+        }
+
+        let locked = match login_with_configured_auth(
+            &db,
+            "locked-owner",
+            "the-right-password",
+            "encryption-key",
+            &crate::auth::ldap::LdapTransportPolicy::default(),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("a locked account must be refused, however right the password is"),
+            Err(error) => error,
+        };
+        // The typed variant is deliberately not asserted: whether a locked
+        // account surfaces as `AccountLocked` or as the plain
+        // invalid-credentials error depends on which gate noticed first, and
+        // no caller may branch on it — the text below is the whole contract,
+        // because it is everything a client sees.
+        assert_eq!(
+            locked.to_string(),
+            "invalid credentials",
+            "the lock must not be worded apart from a wrong password"
+        );
+        assert!(
+            user_ops::find_by_id(&db, user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .locked_until
+                .is_some(),
+            "a correct password must not clear or extend the lock"
+        );
+
+        let wrong = match login_with_configured_auth(
+            &db,
+            "locked-owner",
+            "not-the-password",
+            "encryption-key",
+            &crate::auth::ldap::LdapTransportPolicy::default(),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("a wrong password must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            wrong.to_string(),
+            locked.to_string(),
+            "a wrong password and a locked account must read the same"
         );
     }
 

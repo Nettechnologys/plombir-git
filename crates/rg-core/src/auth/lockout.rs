@@ -71,10 +71,9 @@ pub enum PasswordAttempt {
     ///
     /// Kept apart from `Rejected` on purpose. It is only ever reached by a
     /// caller who already presented the correct password, so naming the reason
-    /// out loud discloses nothing a guesser could use — the same reason
-    /// `POST /users/login` may answer "account is temporarily locked" in words
-    /// — and the account's owner otherwise has no way to learn why the password
-    /// that works in the browser stopped working here.
+    /// out loud discloses nothing a guesser could use, and the account's owner
+    /// otherwise has no way to learn why the password that works in the browser
+    /// stopped working here.
     SecondFactorRequired,
     /// The password was right, and it is one an administrator chose: a new
     /// account, or a reset handed over by hand. It opens nothing until its
@@ -88,6 +87,28 @@ pub enum PasswordAttempt {
     /// become one); it is for the server's log only — a client that could tell
     /// the two rejections apart would be told which usernames are real.
     Rejected { locked: bool },
+}
+
+/// A correct password refused because the account is inside its brute-force
+/// lock, for a door that reads `locked_until` itself.
+///
+/// The web login resolves its account provider in several branches, so unlike
+/// the two doors that finish through [`settle_password_attempt`] it reads the
+/// lock where the row is at hand — but it must read it *after* the Argon2
+/// verification, which is what this type is returned from. Reading it before
+/// the hash let five requests against a candidate name answer "this account
+/// exists, and it is locked" without ever presenting a password.
+///
+/// [`Display`](std::fmt::Display) is the uniform rejection on purpose. A caller
+/// must not be able to word the lock differently from a wrong password: that
+/// difference is the oracle this type removes. `locked_until` travels with it
+/// for the server-side login log, where the distinction between "wrong
+/// password" and "right password, locked account" belongs.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid credentials")]
+pub struct AccountLocked {
+    /// The moment the lock lifts, for the caller's own log/audit path.
+    pub locked_until: chrono::DateTime<Utc>,
 }
 
 /// Where an attempt came from, for the login log.

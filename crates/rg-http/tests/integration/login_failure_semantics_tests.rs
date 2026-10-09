@@ -15,7 +15,7 @@
 //! this file drives it over real HTTP: an account that owes a second factor is
 //! never handed a session by the password alone, a database the endpoint could
 //! not read is a retryable server error rather than a session or a `401`, and
-//! the three genuine credential verdicts still answer `401`.
+//! every genuine credential verdict still answers `401` with one text.
 
 use crate::common::{register_full, spawn_test_app_with_db};
 use sea_orm::ConnectionTrait as _;
@@ -134,8 +134,11 @@ async fn a_login_that_cannot_reach_the_database_issues_no_session() {
 /// with and treats everything else as its own failure. That makes the list of
 /// verdicts a contract with `rg_core::user::service`, and a message renamed
 /// over there would turn a mistyped password into a `500` for every account on
-/// the instance. Each of the three is driven here so the rename cannot land
-/// quietly.
+/// the instance. Each verdict is driven here so the rename cannot land quietly
+/// — including the one that is no longer a string: a correct password on a
+/// locked account travels as `AccountLocked`, whose display is the same
+/// `invalid credentials` a mistyped password gets, and the lock must not be
+/// readable from the response.
 #[tokio::test]
 async fn every_credential_verdict_is_still_the_callers_401() {
     let (base, db) = spawn_test_app_with_db().await;
@@ -143,13 +146,14 @@ async fn every_credential_verdict_is_still_the_callers_401() {
     let (_token, disabled_id) = register_full(&base, "verdictoff", "verdictoff@example.com").await;
     let (_token, locked_id) = register_full(&base, "verdictlock", "verdictlock@example.com").await;
 
+    let wrong = attempt_login_with(&base, "verdictwrong", "not-the-password").await;
     assert_eq!(
-        attempt_login_with(&base, "verdictwrong", "not-the-password")
-            .await
-            .status(),
+        wrong.status(),
         401,
         "a mistyped password is the caller's problem, not a server error"
     );
+    let wrong_body: serde_json::Value = wrong.json().await.expect("wrong-password body");
+    assert_eq!(wrong_body["error"]["message"], "invalid credentials");
     assert!(
         attempt_login(&base, "verdictwrong")
             .await
@@ -178,9 +182,15 @@ async fn every_credential_verdict_is_still_the_callers_401() {
         .await
         .expect("advance the brute-force counter");
     }
+    let locked = attempt_login(&base, "verdictlock").await;
     assert_eq!(
-        attempt_login(&base, "verdictlock").await.status(),
+        locked.status(),
         401,
         "a locked account is a verdict too, however correct the password is"
+    );
+    let locked_body: serde_json::Value = locked.json().await.expect("locked-account body");
+    assert_eq!(
+        locked_body["error"]["message"], wrong_body["error"]["message"],
+        "the lock answered a text a wrong password never produces"
     );
 }
