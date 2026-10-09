@@ -28,6 +28,10 @@
 //      text is the subject.
 //   3. The observability compose has no Grafana admin-password fallback, and
 //      `deploy/.env.example` ships none to copy.
+//   4. Prometheus does not expose its lifecycle API: `--web.enable-lifecycle`
+//      and `--web.enable-admin-api` let a POST to the port quit or reconfigure
+//      the server, and the loopback binding is an accident of whoever starts
+//      the stack, not a guarantee for the process itself.
 
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -184,6 +188,23 @@ if (grafanaPassword === undefined) {
   );
 }
 
+// ── Prometheus life cycle ───────────────────────────────────────────────────
+const prometheusCommand = observability?.services?.prometheus?.command;
+const commandWords = Array.isArray(prometheusCommand)
+  ? prometheusCommand.map(String)
+  : typeof prometheusCommand === 'string'
+    ? [prometheusCommand]
+    : [];
+for (const word of commandWords) {
+  const [flag] = word.split('=');
+  if (flag === '--web.enable-lifecycle' || flag === '--web.enable-admin-api') {
+    failures.push(
+      `deploy/docker-compose.observability.yml: prometheus runs with \`${flag}\` — anyone who reaches the port `
+        + 'can reload the configuration or shut the server down; restart the container instead',
+    );
+  }
+}
+
 if (failures.length > 0) {
   console.error('❌ deploy exposure contract failed:');
   for (const failure of failures) console.error(`  - ${failure}`);
@@ -192,5 +213,6 @@ if (failures.length > 0) {
 
 console.log(
   `✅ deploy exposure contract: ${mappingsRead} published ports across ${composeFiles.length} compose files are loopback `
-    + `or public on purpose; the secrets are distinct; Grafana has no default password`,
+    + `or public on purpose; the secrets are distinct; Grafana has no default password; `
+    + `Prometheus exposes no lifecycle API`,
 );
