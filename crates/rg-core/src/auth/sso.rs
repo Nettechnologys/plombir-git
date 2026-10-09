@@ -361,11 +361,11 @@ pub async fn oauth2_authorize_url(config: &SsoProviderConfig) -> Result<(String,
     let url = format!(
         "{}?client_id={}&redirect_uri={}&scope={}&state={}&response_type=code&code_challenge={}&code_challenge_method=S256",
         base_url,
-        url_encode(&config.client_id),
-        url_encode(&config.redirect_url),
-        url_encode(&scopes),
-        url_encode(&csrf_state),
-        url_encode(&code_challenge),
+        urlencoding::encode(&config.client_id),
+        urlencoding::encode(&config.redirect_url),
+        urlencoding::encode(&scopes),
+        urlencoding::encode(&csrf_state),
+        urlencoding::encode(&code_challenge),
     );
 
     Ok((url, csrf_state, code_verifier))
@@ -835,24 +835,6 @@ fn pkce_s256_challenge(code_verifier: &str) -> String {
 }
 
 // ── URL helpers ──────────────────────────────────────────────────
-
-/// Minimal percent-encoding for OAuth2 query parameters.
-fn url_encode(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '.' | '_' | '~' => c.to_string(),
-            ' ' => "%20".to_string(),
-            other => {
-                let bytes = other.to_string().into_bytes();
-                bytes
-                    .iter()
-                    .map(|b| format!("%{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join("")
-            }
-        })
-        .collect()
-}
 
 // ── Default endpoints ────────────────────────────────────────────
 

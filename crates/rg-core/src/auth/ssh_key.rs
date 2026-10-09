@@ -59,8 +59,8 @@ pub fn fingerprint_from_openssh(pubkey: &str) -> Result<String> {
     // SHA-256 hash
     let digest = sha256(&raw);
 
-    // base64url without padding (standard SSH fingerprint format)
-    let encoded = base64_encode_nopad(&digest);
+    // Standard-alphabet base64 without padding: the OpenSSH fingerprint format.
+    let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest);
     Ok(format!("SHA256:{}", encoded))
 }
 
@@ -72,25 +72,6 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     let result = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);
-    out
-}
-
-fn base64_encode_nopad(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        out.push(CHARS[((b0 >> 2) & 0x3f) as usize] as char);
-        out.push(CHARS[(((b0 << 4) | (b1 >> 4)) & 0x3f) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(CHARS[(((b1 << 2) | (b2 >> 6)) & 0x3f) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(CHARS[(b2 & 0x3f) as usize] as char);
-        }
-    }
     out
 }
 
