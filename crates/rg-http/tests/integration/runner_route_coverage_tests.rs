@@ -1,7 +1,7 @@
 //! Every path `rg-runner` builds must be a route this server mounts
 //! (card_66eead51bb23).
 //!
-//! `crates/rg-runner/src/api.rs` spells twelve `/api/v1/runners/...` URLs out
+//! `crates/rg-runner/src/api.rs` spells thirteen `/api/v1/runners/...` URLs out
 //! as format strings, in a crate that cannot see the route table. Nothing compared
 //! them with [`rg_http::routes`] — the agreement was held by eye, and the server
 //! tests that touch these endpoints (`runner_auth_tests`, `admin_runner_tests`)
@@ -36,12 +36,13 @@
 //!
 //! ## Why the answer is read off the server
 //!
-//! Five of the calls are fire-and-forget by design — `send_heartbeat`,
-//! `start_job`, `upload_log`, `finish_job` and `deregister_runner` return `()`
-//! and only log — and `restore_cache` turns `404` into `Ok(false)`, "there is no
-//! cache for this key", which is precisely the answer an unmounted path would
-//! produce. Reading each function's own error prose would therefore be blind on
-//! six of them. The recording layer below sees every request whatever the client
+//! Four of the calls are fire-and-forget by design — `send_heartbeat`,
+//! `upload_log`, `finish_job` and `deregister_runner` return `()` and only log —
+//! `restore_cache` turns `404` into `Ok(false)`, "there is no cache for this
+//! key", and `start_job` / `job_liveness` read `404` as "this job is no longer
+//! yours" (card_a0377b61860e) — each precisely the answer an unmounted path
+//! would produce. Reading each function's own result would therefore be blind
+//! on seven of them. The recording layer below sees every request whatever the client
 //! makes of it.
 
 use std::collections::BTreeSet;
@@ -138,9 +139,9 @@ struct RouteExpectation {
 
 /// Every route this sweep drives, spelled the way `routes.rs` spells it.
 ///
-/// `rg-runner` assembles all twelve URLs out of ids at runtime, so the probes
+/// `rg-runner` assembles all thirteen URLs out of ids at runtime, so the probes
 /// prove the path without any test source ever naming it. `docs/ui-inventory.json`
-/// reads test sources, so all twelve read there as routes nothing touches — and
+/// reads test sources, so all thirteen read there as routes nothing touches — and
 /// for `POST .../jobs/{job_id}/log` and `PUT .../jobs/{job_id}/artifacts/staging`
 /// there was no other test to fall back on (card_d482cf7e098e).
 ///
@@ -148,7 +149,7 @@ struct RouteExpectation {
 /// holds every recorded request to the row that claims it, so a probe pointed at
 /// another route — or a route renamed on either side — fails here instead of
 /// quietly changing what the artefact claims.
-const ROUTE_EXPECTATIONS: [RouteExpectation; 12] = [
+const ROUTE_EXPECTATIONS: [RouteExpectation; 13] = [
     RouteExpectation {
         probe: "register_runner",
         method: "POST",
@@ -168,6 +169,11 @@ const ROUTE_EXPECTATIONS: [RouteExpectation; 12] = [
         probe: "start_job",
         method: "POST",
         route: "/api/v1/runners/{id}/jobs/{job_id}/start",
+    },
+    RouteExpectation {
+        probe: "job_liveness",
+        method: "GET",
+        route: "/api/v1/runners/{id}/jobs/{job_id}/status",
     },
     RouteExpectation {
         probe: "upload_log",
@@ -309,7 +315,7 @@ fn templates_declared_in_runner_source() -> BTreeSet<String> {
 
 /// Drive one call and hand back what the server saw it ask for.
 ///
-/// The client's own return value is deliberately dropped: five of the calls
+/// The client's own return value is deliberately dropped: seven of the calls
 /// cannot report a routing failure through it (see the module header).
 async fn probe<F, T>(recorder: &Recorder, name: &str, call: F) -> Vec<Seen>
 where
@@ -442,6 +448,13 @@ async fn every_runner_api_call_addresses_a_route_this_server_mounts() {
         "start_job",
         probe(&recorder, "start_job", async {
             rg_runner::api::start_job(&client, &base, runner_id, job_id, token).await
+        })
+        .await,
+    );
+    record_probe(
+        "job_liveness",
+        probe(&recorder, "job_liveness", async {
+            rg_runner::api::job_liveness(&client, &base, runner_id, job_id, token).await
         })
         .await,
     );

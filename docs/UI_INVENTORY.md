@@ -23,7 +23,7 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 406 |
+| Роутов в роутере (с объявленным `Access`) | 408 |
 | Из них достижимы из браузера | 282 (69%) |
 | Layout-модулей | 2 |
 | Страниц | 69 |
@@ -41,12 +41,12 @@
 | `RepoRead` | 106 | 68 | 4 | 0 |
 | `RepoWrite` | 85 | 66 | 13 | 2 |
 | `User` | 51 | 40 | 6 | 0 |
-| `RepoAdmin` | 38 | 38 | 0 | 0 |
+| `RepoAdmin` | 39 | 38 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
 | `InstanceAdmin` | 25 | 21 | 0 | 0 |
 | `RepoAuthRead` | 18 | 18 | 1 | 0 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
-| `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
+| `Foreign:RUNNER_AUTH_LAYER` | 12 | 0 | 0 | 0 |
 | `OrgAdmin` | 8 | 8 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
 | `OrgRead` | 5 | 4 | 0 | 0 |
@@ -1267,6 +1267,7 @@
 | GET | `/api/v1/repos/{owner}/{name}/labels/{id}` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/issue_config/validate` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/issues/{number}/labels` | `RepoRead` | rust |
+| DELETE | `/api/v1/repos/{owner}/{name}/pulls/{number}` | `RepoAdmin` | **—** |
 | GET | `/api/v1/repos/{owner}/{name}/pulls/{number}/reviews/{id}` | `RepoRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/lfs/objects/batch` | `Foreign:api/lfs.rs` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/lfs/objects/{oid}` | `Foreign:api/lfs.rs` | rust+smoke |
@@ -1320,6 +1321,7 @@
 | POST | `/api/v1/runners/{id}/deregister` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/poll` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/start` | `Foreign:RUNNER_AUTH_LAYER` | rust |
+| GET | `/api/v1/runners/{id}/jobs/{job_id}/status` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/log` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/{job_id}/workspace` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/{job_id}/cache` | `Foreign:RUNNER_AUTH_LAYER` | rust+smoke |

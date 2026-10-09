@@ -25,15 +25,22 @@ const JOB_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// canceled as soon as execution completes, so no detached task can keep a
 /// settled job alive. The callback seam keeps the timing contract directly
 /// testable without a real 30-second wait.
+///
+/// The heartbeat is also how a cancellation reaches the work. It answers
+/// whether the job is still this runner's to run; the first `false` drops the
+/// execution future — which kills a local job's whole process tree — and comes
+/// back as `None`. Before, the answer was only logged: a canceled deploy kept
+/// running to its timeout, up to a day, and a `cancel-in-progress` group had
+/// two of them going at once (card_a0377b61860e).
 async fn with_job_heartbeat<T, Execution, Heartbeat, HeartbeatFuture>(
     execution: Execution,
     interval: std::time::Duration,
     mut heartbeat: Heartbeat,
-) -> T
+) -> Option<T>
 where
     Execution: std::future::Future<Output = T>,
     Heartbeat: FnMut() -> HeartbeatFuture,
-    HeartbeatFuture: std::future::Future<Output = ()>,
+    HeartbeatFuture: std::future::Future<Output = bool>,
 {
     let heartbeat_loop = async move {
         let mut ticker = tokio::time::interval(interval);
@@ -43,15 +50,21 @@ where
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            heartbeat().await;
+            if !heartbeat().await {
+                return;
+            }
         }
     };
 
     tokio::pin!(execution);
     tokio::pin!(heartbeat_loop);
     tokio::select! {
-        output = &mut execution => output,
-        () = &mut heartbeat_loop => unreachable!("job heartbeat loop is infinite"),
+        // A job that finished in the same instant its cancellation was noticed
+        // keeps its output; whether that output may still be published is
+        // asked again by the caller.
+        biased;
+        output = &mut execution => Some(output),
+        () = &mut heartbeat_loop => None,
     }
 }
 
@@ -149,6 +162,10 @@ pub struct PipelineRunner {
     /// timeout tests use an isolated daemon/client fixture without mutating the
     /// process-wide `PATH` seen by the rest of the test binary.
     docker_program: std::path::PathBuf,
+    /// How often a running job refreshes its liveness — and, with the same
+    /// read, learns whether it was canceled. [`JOB_HEARTBEAT_INTERVAL`] in
+    /// production; a test shortens it rather than waiting half a minute.
+    job_heartbeat_interval: std::time::Duration,
 }
 
 impl PipelineRunner {
@@ -182,6 +199,7 @@ impl PipelineRunner {
             runner_labels: rg_core::ci::default_runner_labels(),
             shutdown: None,
             docker_program: "docker".into(),
+            job_heartbeat_interval: JOB_HEARTBEAT_INTERVAL,
         }
     }
 
@@ -220,6 +238,7 @@ impl PipelineRunner {
             runner_labels: rg_core::ci::default_runner_labels(),
             shutdown: None,
             docker_program: "docker".into(),
+            job_heartbeat_interval: JOB_HEARTBEAT_INTERVAL,
         }
     }
 
@@ -293,6 +312,12 @@ impl PipelineRunner {
     #[cfg(test)]
     fn set_docker_program(&mut self, program: impl Into<std::path::PathBuf>) {
         self.docker_program = program.into();
+    }
+
+    /// Shorten the liveness period so a test can watch a cancellation land.
+    #[cfg(test)]
+    fn set_job_heartbeat_interval(&mut self, interval: std::time::Duration) {
+        self.job_heartbeat_interval = interval;
     }
 
     /// Build every Docker client with the same drop contract.
@@ -696,7 +721,10 @@ impl PipelineRunner {
                     self.hand_job_back(job).await;
                     return Ok(StageOutcome::Interrupted);
                 }
-                failed = self.run_and_record_job(job) => failed?,
+                failed = self.run_and_record_job(job) => match failed? {
+                    Some(failed) => failed,
+                    None => return Ok(StageOutcome::Settled),
+                },
             };
             if job_failed {
                 stage_failed = true;
@@ -745,7 +773,14 @@ impl PipelineRunner {
     /// ([`pipeline_ops::finish_embedded_job`]), and a failure aborts the
     /// pipeline pass instead: the graph is left exactly as the transaction
     /// found it, which is the state the next pass can resume from.
-    async fn run_and_record_job(&self, job: &rg_db::entities::pipeline_job::Model) -> Result<bool> {
+    ///
+    /// `None` when the job stopped being this runner's before it finished (see
+    /// [`Self::run_job`]): nothing is written, and the caller stops the stage
+    /// rather than carrying on under a graph somebody else settled.
+    async fn run_and_record_job(
+        &self,
+        job: &rg_db::entities::pipeline_job::Model,
+    ) -> Result<Option<bool>> {
         let execution_started = std::time::Instant::now();
         let job_result = self
             .run_job(
@@ -762,7 +797,15 @@ impl PipelineRunner {
             .await;
 
         let (status, exit_code, log, stage_failed) = match job_result {
-            Ok((exit_code, log)) => (
+            Ok(None) => {
+                tracing::info!(
+                    job_id = job.id,
+                    pipeline_id = self.pipeline_id,
+                    "job was settled behind the runner's back — execution stopped, nothing recorded"
+                );
+                return Ok(None);
+            }
+            Ok(Some((exit_code, log))) => (
                 if exit_code == 0 { "success" } else { "failed" },
                 exit_code,
                 log,
@@ -800,7 +843,7 @@ impl PipelineRunner {
             );
             // The stage's own status is settled too (the cascade is
             // whole-graph), so this must not push the stage to `failed`.
-            return Ok(false);
+            return Ok(Some(false));
         }
 
         // Post-commit, and only post-commit. The embedded runner is the only
@@ -810,7 +853,7 @@ impl PipelineRunner {
         // (card_e309fbb5a3fd). Counted only on the write that landed, for the
         // same reason the pipeline outcome is.
         rg_core::metrics_hook::record_ci_job_finished(status, Some(execution_started.elapsed()));
-        Ok(stage_failed)
+        Ok(Some(stage_failed))
     }
 
     /// After a successful pipeline, evaluate auto-merges and the merge queue
@@ -867,7 +910,10 @@ impl PipelineRunner {
     /// - If `image` is provided but Docker is NOT available: **fail** (no silent fallback).
     /// - Otherwise: `sh -c <script>` (with timeout).
     ///
-    /// Returns (exit_code, stdout+stderr output).
+    /// Returns (exit_code, stdout+stderr output), or `None` when the job stopped
+    /// being this runner's to run — settled before it started, or canceled (or
+    /// reclaimed) while it ran. Nothing was published for it then, and nothing
+    /// may be recorded: the server has already answered for that job.
     #[allow(clippy::too_many_arguments)]
     async fn run_job(
         &self,
@@ -880,7 +926,7 @@ impl PipelineRunner {
         artifacts: Option<&str>,
         timeout_seconds: Option<i64>,
         tags: Option<&str>,
-    ) -> Result<(i32, String)> {
+    ) -> Result<Option<(i32, String)>> {
         // Asked before the row is marked running, and before a token or a cache
         // is spent on it: a job whose labels this runner does not carry is not
         // a job this runner may run at all.
@@ -919,9 +965,20 @@ impl PipelineRunner {
 
         let job_start = chrono::Utc::now().naive_utc();
 
-        // Mark job as running
-        if let Err(e) = pipeline_ops::start_job_if_active(&self.db, job_id, Some(job_start)).await {
-            tracing::error!(job_id, error = %format!("{e:#}"), "Failed to update job status to running");
+        // Mark job as running. Both other answers used to be passed over: a
+        // job canceled between the stage snapshot and this line ran anyway, and
+        // a start that never landed left the row `pending` under a job that was
+        // executing — which the liveness check below now reads, correctly, as
+        // "not this runner's to run".
+        if !pipeline_ops::start_job_if_active(&self.db, job_id, Some(job_start))
+            .await
+            .with_context(|| format!("failed to mark CI job {job_id} running"))?
+        {
+            tracing::info!(
+                job_id,
+                "job settled before the runner started it — not running it"
+            );
+            return Ok(None);
         }
 
         tracing::info!(job_id, "Running job");
@@ -1036,22 +1093,71 @@ impl PipelineRunner {
                 exec_future.await
             }
         };
-        let result = with_job_heartbeat(execution, JOB_HEARTBEAT_INTERVAL, || async {
+        let result = with_job_heartbeat(execution, self.job_heartbeat_interval, || async {
             match pipeline_ops::touch_running_job(&self.db, job_id).await {
-                Ok(true) => {}
-                Ok(false) => tracing::debug!(
-                    job_id,
-                    "job heartbeat skipped because execution is no longer running"
-                ),
-                Err(error) => tracing::warn!(
-                    job_id,
-                    error = %format!("{error:#}"),
-                    "failed to refresh embedded job heartbeat"
-                ),
+                Ok(true) => true,
+                Ok(false) => {
+                    tracing::info!(
+                        job_id,
+                        "job is no longer running on the server (canceled or reclaimed) — \
+                         stopping its execution"
+                    );
+                    false
+                }
+                // Unknown is not "canceled": a database hiccup must not kill a
+                // healthy build. The next tick asks again.
+                Err(error) => {
+                    tracing::warn!(
+                        job_id,
+                        error = %format!("{error:#}"),
+                        "failed to refresh embedded job heartbeat"
+                    );
+                    true
+                }
             }
         })
         .await;
-        if let (Ok((0, _)), Some((key, paths))) = (&result, &cache) {
+        let Some(result) = result else {
+            // Dropping the execution killed a local job's process tree; a
+            // container is daemon-owned and has to be removed by name.
+            if image.is_some() {
+                self.remove_job_container(job_id).await;
+            }
+            return Ok(None);
+        };
+        // A cancellation that landed after the last heartbeat is still a
+        // cancellation: a canceled run must not save the cache the next run
+        // restores, nor publish an artifact under the name a real run uses.
+        // Asked only where it matters — before a success publishes anything.
+        let mut publish = matches!(result, Ok((0, _)));
+        if publish && (cache.is_some() || artifacts.is_some()) {
+            match pipeline_ops::touch_running_job(&self.db, job_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(
+                        job_id,
+                        "job settled while it ran — its cache and artifacts are not published"
+                    );
+                    return Ok(None);
+                }
+                // Publication cannot be taken back, so an unanswered question
+                // is a no: the job keeps its result, it just ships nothing.
+                Err(error) => {
+                    tracing::warn!(
+                        job_id,
+                        error = %format!("{error:#}"),
+                        "could not confirm the job is still running; its cache and artifacts are \
+                         not published"
+                    );
+                    cache_notices.push(format!(
+                        "CI cache and artifacts were not published: the server could not confirm \
+                         this job was still running: {error:#}"
+                    ));
+                    publish = false;
+                }
+            }
+        }
+        if let (true, Some((key, paths))) = (publish, &cache) {
             if let Err(error) = self.save_cache(key, paths).await {
                 tracing::warn!(job_id, error = %format!("{error:#}"), "CI cache save failed; job remains successful");
                 cache_notices.push(format!(
@@ -1068,7 +1174,7 @@ impl PipelineRunner {
         // ran and its exit code is the answer — but unlike the cache, an
         // artifact nobody can find is the *point* of the job, so the notice has
         // to reach the person reading the log rather than only the server's.
-        if let Ok((0, _)) = &result {
+        if publish {
             match artifact_spec(artifacts) {
                 Ok(Some((name, paths))) => {
                     if let Err(error) = self.publish_artifact(job_id, &name, &paths).await {
@@ -1100,10 +1206,10 @@ impl PipelineRunner {
         }
         result.map(|(code, log)| {
             let log = append_job_notices(log, &cache_notices);
-            (
+            Some((
                 code,
                 rg_core::auth::encryption::mask_values(&log, &secret_values),
-            )
+            ))
         })
     }
 
@@ -2216,11 +2322,52 @@ mod tests {
                             .send(())
                             .expect("execution must still be waiting for heartbeat");
                     }
+                    true
                 }
             })
             .await;
 
-        assert_eq!(output, 42);
+        assert_eq!(output, Some(42));
+    }
+
+    /// The first heartbeat that says "not ours any more" ends the execution —
+    /// dropped, not awaited — and the caller is told so.
+    #[tokio::test]
+    async fn a_heartbeat_that_disowns_the_job_drops_its_execution() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let execution = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        };
+        let mut beats = 0;
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            with_job_heartbeat(execution, std::time::Duration::from_millis(1), || {
+                beats += 1;
+                let still_ours = beats < 3;
+                async move { still_ours }
+            }),
+        )
+        .await
+        .expect("a disowned job must not keep its execution waiting");
+
+        assert_eq!(output, None);
+        assert_eq!(
+            beats, 3,
+            "the loop must stop at the first `false`, not before"
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the execution future outlived the disowning heartbeat"
+        );
     }
 
     #[test]
@@ -3394,6 +3541,262 @@ esac
                 .is_empty(),
             "an `assigned`/`running` row survived the stop path"
         );
+    }
+
+    /// A one-job pipeline whose job declares both a cache and an artifact over
+    /// `out/`, so a run that publishes anything leaves a trace in both places.
+    async fn publishing_job(
+        temp: &std::path::Path,
+        slug: &str,
+        script: &str,
+    ) -> (
+        PipelineRunner,
+        rg_db::DatabaseConnection,
+        rg_db::entities::pipeline_job::Model,
+        i64,
+    ) {
+        let (db, repo, repo_path, commit_sha, user_id) = repo_with_one_commit(temp, slug).await;
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            &commit_sha,
+            "refs/heads/main",
+            "manual",
+            Some(user_id),
+        )
+        .await
+        .unwrap();
+        let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "deploy", 0)
+            .await
+            .unwrap();
+        let job = rg_db::ops::pipeline_ops::create_job(
+            &db,
+            stage.id,
+            "deploy",
+            script,
+            None,
+            None,
+            None,
+            Some("deploy-cache"),
+            Some(r#"["out"]"#),
+            Some(r#"{"name":"bundle","paths":["out"]}"#),
+            false,
+            Some(600),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        (runner, db, job, pipeline.id)
+    }
+
+    /// Neither half of a canceled job's output reached the places a real run's
+    /// output is found: no cache archive for the next run to restore, no
+    /// artifact row under the name a green run publishes.
+    async fn assert_nothing_published(
+        db: &rg_db::DatabaseConnection,
+        pipeline_id: i64,
+        cache_dir: &std::path::Path,
+    ) {
+        assert_eq!(
+            cache_dir_leftovers(cache_dir),
+            Vec::<String>::new(),
+            "a canceled job saved its cache"
+        );
+        assert!(
+            rg_db::ops::artifact_ops::list_by_pipeline(db, pipeline_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a canceled job published its artifact"
+        );
+    }
+
+    /// card_a0377b61860e: a cancel has to stop the work, not only the row.
+    ///
+    /// The cancellation used to be a database write the executor never read:
+    /// the heartbeat logged "no longer running" at debug and kept polling, so a
+    /// canceled deploy ran to its timeout (a day by default) and then saved its
+    /// cache and published its artifact. The job here sleeps a minute and the
+    /// liveness period is shortened to a fifth of a second, so a runner that
+    /// stops on cancellation is done long before the bound below and one that
+    /// does not is caught by it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_canceled_job_stops_within_a_heartbeat_and_publishes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let shell_pid_file = temp.path().join("deploy-shell.pid");
+        let child_pid_file = temp.path().join("deploy-child.pid");
+        let _pid_cleanup = RecordedPidCleanup(vec![shell_pid_file.clone(), child_pid_file.clone()]);
+        let script = format!(
+            "mkdir -p out && echo built > out/bundle.txt; \
+             printf '%s\\n' \"$$\" > '{}'; sleep 60 & child=$!; \
+             printf '%s\\n' \"$child\" > '{}'; wait \"$child\"",
+            shell_pid_file.display(),
+            child_pid_file.display()
+        );
+        let (mut runner, db, job, pipeline_id) =
+            publishing_job(temp.path(), "cancel-running", &script).await;
+        runner.set_job_heartbeat_interval(std::time::Duration::from_millis(200));
+        let cache_dir = runner.cache_archive_dir();
+        let execution = tokio::spawn(async move { runner.run().await });
+
+        await_job_status(&db, job.id, "running").await;
+        // Both PIDs are on disk before the cancel, so "the process stopped"
+        // below is about this run and not about a script that never started.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !child_pid_file.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job never started its sleep"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            rg_db::ops::pipeline_ops::cancel_pipeline_chain(&db, pipeline_id)
+                .await
+                .unwrap()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(20), execution)
+            .await
+            .expect("the runner sat through the canceled job's `sleep 60`")
+            .expect("runner task panicked")
+            .expect("a canceled pipeline is not a runner error");
+
+        assert_process_stops(recorded_pid(&shell_pid_file), "canceled job shell").await;
+        assert_process_stops(recorded_pid(&child_pid_file), "canceled job descendant").await;
+        let canceled = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            canceled.status, "canceled",
+            "the runner rewrote the cancellation"
+        );
+        assert_nothing_published(&db, pipeline_id, &cache_dir).await;
+    }
+
+    /// The other half of the same defect: a job whose script finishes `0` after
+    /// the cancel landed but before any heartbeat asked. Execution is over, so
+    /// there is nothing left to kill — but saving its cache and publishing its
+    /// artifact would still ship a canceled run's output. The heartbeat is set
+    /// to an hour so only the check before publication can see the cancel.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_job_canceled_while_it_ran_publishes_nothing_even_when_it_exits_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let release = temp.path().join("release");
+        let script = format!(
+            "mkdir -p out && echo built > out/bundle.txt; \
+             while [ ! -e '{}' ]; do sleep 0.02; done",
+            release.display()
+        );
+        let (mut runner, db, job, pipeline_id) =
+            publishing_job(temp.path(), "cancel-then-exit", &script).await;
+        runner.set_job_heartbeat_interval(std::time::Duration::from_secs(3600));
+        let cache_dir = runner.cache_archive_dir();
+        let execution = tokio::spawn(async move { runner.run().await });
+
+        await_job_status(&db, job.id, "running").await;
+        assert!(
+            rg_db::ops::pipeline_ops::cancel_pipeline_chain(&db, pipeline_id)
+                .await
+                .unwrap()
+        );
+        std::fs::write(&release, b"go").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(60), execution)
+            .await
+            .expect("the runner must return once the script exits")
+            .expect("runner task panicked")
+            .expect("a canceled pipeline is not a runner error");
+
+        assert_eq!(
+            rg_db::ops::pipeline_ops::get_job(&db, job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "canceled"
+        );
+        assert_nothing_published(&db, pipeline_id, &cache_dir).await;
+    }
+
+    /// Baseline for the two tests above: the same job, left alone, does publish
+    /// both. Without it, "nothing was published" would also be satisfied by a
+    /// fixture whose cache or artifact declaration never worked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_publishing_fixture_publishes_when_nobody_cancels() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, db, job, pipeline_id) = publishing_job(
+            temp.path(),
+            "uncanceled",
+            "mkdir -p out && echo built > out/bundle.txt",
+        )
+        .await;
+        runner.set_job_heartbeat_interval(std::time::Duration::from_millis(200));
+        let cache_dir = runner.cache_archive_dir();
+        runner.run().await.unwrap();
+
+        let finished = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.status, "success", "{:?}", finished.log);
+        assert!(
+            !cache_dir_leftovers(&cache_dir).is_empty(),
+            "the fixture's cache declaration saved nothing"
+        );
+        assert_eq!(
+            rg_db::ops::artifact_ops::list_by_pipeline(&db, pipeline_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the fixture's artifact declaration published nothing"
+        );
+    }
+
+    /// A job canceled between the stage snapshot and its start is not run at
+    /// all. `start_job_if_active` already answered `false` for it; the runner
+    /// used to carry on regardless.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_job_canceled_before_it_started_is_not_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("ran");
+        let (runner, db, job, pipeline_id) = publishing_job(
+            temp.path(),
+            "cancel-before-start",
+            &format!("touch '{}'", marker.display()),
+        )
+        .await;
+        assert!(
+            rg_db::ops::pipeline_ops::cancel_pipeline_chain(&db, pipeline_id)
+                .await
+                .unwrap()
+        );
+
+        let outcome = runner
+            .run_job(
+                job.id,
+                &job.script,
+                None,
+                None,
+                job.cache_key.as_deref(),
+                job.cache_paths.as_deref(),
+                job.artifacts.as_deref(),
+                job.timeout_seconds,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, None, "a canceled job was executed");
+        assert!(!marker.exists(), "a canceled job's script ran");
     }
 
     #[tokio::test]

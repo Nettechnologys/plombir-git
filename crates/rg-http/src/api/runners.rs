@@ -68,6 +68,18 @@ pub struct HeartbeatResponse {
     server_time: String,
 }
 
+/// What the server holds about a job its runner is executing.
+#[derive(Serialize, ToSchema)]
+pub struct RunnerJobStatusResponse {
+    job_id: i64,
+    /// The job row's status, verbatim.
+    status: String,
+    /// Whether the job is still work this runner should be doing. `false`
+    /// means it was canceled or otherwise settled behind the runner's back,
+    /// and the runner should stop executing it and publish nothing.
+    active: bool,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct PollJobResponse {
     job_id: i64,
@@ -891,6 +903,50 @@ pub async fn start_job(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
 
+/// GET /api/v1/runners/:id/jobs/:job_id/status
+/// Whether the job a runner is executing is still its to run.
+///
+/// Cancellation is a write on the server; the work it is meant to stop runs on
+/// another machine. Before this route the runner had no way to hear about it
+/// while a job executed — `start` was its last question — so a canceled deploy
+/// ran on to its timeout, and a `concurrency: cancel-in-progress` group had the
+/// old run and its replacement going at once (card_a0377b61860e). The runner
+/// asks here on a period while the job runs, and once more before it publishes
+/// a cache or an artifact.
+///
+/// A job that is not this runner's answers `404`, exactly as an unknown id
+/// does — see [`assigned_job`].
+#[utoipa::path(
+    get,
+    path = "/runners/{id}/jobs/{job_id}/status",
+    tag = "Runners",
+    params(
+        ("id" = i64, Path, description = "Runner ID"),
+        ("job_id" = i64, Path, description = "Job ID, which must be assigned to this runner"),
+    ),
+    responses(
+        (status = 200, description = "The job's current status", body = RunnerJobStatusResponse),
+        (status = 404, description = "Job not found", body = serde_json::Value),
+    ),
+)]
+pub async fn job_status(
+    State(state): State<AppState>,
+    Path((runner_id, job_id)): Path<(i64, i64)>,
+) -> impl IntoResponse {
+    match assigned_job(&state, runner_id, job_id).await {
+        Ok(job) => (
+            StatusCode::OK,
+            Json(RunnerJobStatusResponse {
+                job_id,
+                active: rg_db::ops::pipeline_ops::is_active_pipeline_work(&job.status),
+                status: job.status,
+            }),
+        )
+            .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 /// POST /api/v1/runners/:id/jobs/:job_id/log
 /// Upload job log (streaming or batch).
 #[utoipa::path(
@@ -1320,6 +1376,7 @@ async fn stage_cache_archive(
         (status = 204, description = "Cache entry stored"),
         (status = 400, description = "Job has no cache configuration, bad x-cache-key, or empty archive", body = serde_json::Value),
         (status = 404, description = "Job, stage or pipeline not found", body = serde_json::Value),
+        (status = 409, description = "The job is no longer active (canceled or settled); nothing was stored", body = serde_json::Value),
         (status = 413, description = "Cache archive exceeds 1 GiB", body = serde_json::Value),
     ),
 )]
@@ -1333,6 +1390,11 @@ pub async fn upload_cache(
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
+    // The next run restores what this one stores, so a canceled run must not
+    // be the one that stores it.
+    if let Err(error) = refuse_settled_job(runner_id, &job) {
+        return error.into_response();
+    }
     if job.cache_key.is_none() {
         return AppError::bad_request("job has no cache configuration").into_response();
     }
@@ -1421,6 +1483,42 @@ pub(crate) async fn assigned_job(
         Some(job) if job.runner_id == Some(runner_id) => Ok(job),
         _ => Err(AppError::not_found("job not found")),
     }
+}
+
+/// [`assigned_job`], for a call that *publishes* something on the job's behalf.
+///
+/// A cache entry or an artifact outlives the job that made it: the next run
+/// restores the cache, and whoever downloads `bundle` gets the artifact. A job
+/// that was canceled while it ran must not ship either — a canceled deploy's
+/// build is exactly the output nobody asked for (card_a0377b61860e). The
+/// runner is told `409`, the same answer `start` gives a job that settled
+/// before it began, and a runner older than the job-status route is held to it
+/// here whether or not it asks first.
+pub(crate) async fn assigned_active_job(
+    state: &AppState,
+    runner_id: i64,
+    job_id: i64,
+) -> Result<rg_db::entities::pipeline_job::Model, AppError> {
+    let job = assigned_job(state, runner_id, job_id).await?;
+    refuse_settled_job(runner_id, &job)?;
+    Ok(job)
+}
+
+/// The half of [`assigned_active_job`] for a handler that already holds the job.
+fn refuse_settled_job(
+    runner_id: i64,
+    job: &rg_db::entities::pipeline_job::Model,
+) -> Result<(), AppError> {
+    if rg_db::ops::pipeline_ops::is_active_pipeline_work(&job.status) {
+        return Ok(());
+    }
+    tracing::info!(
+        runner_id,
+        job_id = job.id,
+        status = %job.status,
+        "refused to publish output for a job that is no longer active"
+    );
+    Err(AppError::conflict("job is no longer active"))
 }
 
 async fn assigned_job_repo(

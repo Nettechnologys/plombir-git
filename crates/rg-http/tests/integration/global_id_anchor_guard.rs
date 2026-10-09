@@ -268,7 +268,9 @@ const ANCHORED: &[AnchoredFile] = &[
             ("pipeline_id", &["pipeline_in_repo"]),
             // The upload and staging routes are runner routes: the job must
             // belong to the runner whose token the middleware already checked.
-            ("job_id", &["assigned_job"]),
+            // They go through the variant that also refuses a job that is no
+            // longer active — it calls `assigned_job` first (card_a0377b61860e).
+            ("job_id", &["assigned_job", "assigned_active_job"]),
         ],
     ),
     (
@@ -586,8 +588,11 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// `rg_core::lfs::locks::unlock` receives the gated repository's id beside it
 /// and finds the lock only by both. 132 since card_9f18b657580b:
 /// `api::admin::reset_user_password` takes a user id behind `InstanceAdmin`,
-/// whose scope is the whole instance — every account is its to reset.
-const CENSUS_TOTAL: usize = 136;
+/// whose scope is the whole instance — every account is its to reset. 138
+/// since card_a0377b61860e: `api::runners::job_status` takes the runner id —
+/// anchored by the route layer like every runner route — and a job id, which
+/// it reads only through `assigned_job`.
+const CENSUS_TOTAL: usize = 138;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

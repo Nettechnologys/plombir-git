@@ -32,4 +32,4 @@ pub use commands::{cmd_register, cmd_run, RegisterCommand, RunCommand};
 /// to the pool, and only `rg-http` has the router and the database to observe
 /// that. Driving it from a real signal would take the test binary down with the
 /// runner, so the signal is a parameter — `cmd_run` supplies the real one.
-pub use commands::run_jobs_until_shutdown;
+pub use commands::{run_jobs_until_shutdown, run_jobs_until_shutdown_checking_every};

@@ -188,6 +188,7 @@ pub struct UploadArtifactResponse {
         (status = 201, description = "Artifact staged", body = StageArtifactResponse),
         (status = 400, description = "Empty archive", body = serde_json::Value),
         (status = 404, description = "Job not found", body = serde_json::Value),
+        (status = 409, description = "The job is no longer active (canceled or settled); nothing was staged", body = serde_json::Value),
         (status = 413, description = "Artifact archive exceeds 1 GiB"),
     ),
 )]
@@ -196,7 +197,7 @@ pub async fn stage_artifact(
     Path((runner_id, job_id)): Path<(i64, i64)>,
     body: axum::body::Body,
 ) -> impl IntoResponse {
-    if let Err(error) = crate::api::runners::assigned_job(&state, runner_id, job_id).await {
+    if let Err(error) = crate::api::runners::assigned_active_job(&state, runner_id, job_id).await {
         return error.into_response();
     }
 
@@ -416,6 +417,7 @@ async fn discard_stale_staging(directory: &FsPath) {
         (status = 400, description = "Invalid artifact metadata", body = serde_json::Value),
         (status = 413, description = "Artifact metadata exceeds 64 KiB"),
         (status = 404, description = "Job not found", body = serde_json::Value),
+        (status = 409, description = "The job is no longer active (canceled or settled); nothing was published", body = serde_json::Value),
     ),
 )]
 pub async fn upload_artifact(
@@ -427,7 +429,9 @@ pub async fn upload_artifact(
     // so a job that is not this runner's is answered exactly as an unknown id is
     // — see `api::runners::assigned_job` for why the two must not be tellable
     // apart.
-    let job = match crate::api::runners::assigned_job(&state, runner_id, job_id).await {
+    // A canceled job's output is not published under the name a real run uses
+    // (card_a0377b61860e) — see `assigned_active_job`.
+    let job = match crate::api::runners::assigned_active_job(&state, runner_id, job_id).await {
         Ok(job) => job,
         Err(error) => return error.into_response(),
     };

@@ -1532,6 +1532,14 @@
       ]
     },
     {
+      "method": "DELETE",
+      "url": "/api/v1/repos/{owner}/{name}/pulls/{number}",
+      "access": "RepoAdmin",
+      "handler": "api::pulls::delete_pr",
+      "testedIn": [],
+      "reachedFromUi": false
+    },
+    {
       "method": "GET",
       "url": "/api/v1/repos/{owner}/{name}/pulls/{number}/assets",
       "access": "RepoRead",
@@ -4368,6 +4376,16 @@
       "url": "/api/v1/runners/{id}/jobs/{job_id}/start",
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::runners::start_job",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/runners/{id}/jobs/{job_id}/status",
+      "access": "Foreign:RUNNER_AUTH_LAYER",
+      "handler": "api::runners::job_status",
       "testedIn": [
         "rust"
       ],

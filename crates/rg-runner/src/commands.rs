@@ -4,8 +4,9 @@
 use anyhow::{Context, Result};
 
 use crate::api::{
-    deregister_runner, download_workspace, finish_job, poll_job, publish_artifact, register_runner,
-    restore_cache, save_cache, send_heartbeat, stage_artifact, start_job, upload_log,
+    deregister_runner, download_workspace, finish_job, job_liveness, poll_job, publish_artifact,
+    register_runner, restore_cache, save_cache, send_heartbeat, stage_artifact, start_job,
+    upload_log, JobLiveness, JobStart,
 };
 use crate::config::{
     config_not_persisted_warning, load_config, resolve_auth_token, resolve_runner, save_config,
@@ -593,6 +594,52 @@ async fn shutdown_requested() {
     ctrl_c_requested().await;
 }
 
+/// How often a running job asks the server whether it is still this runner's
+/// to run. Half the runner heartbeat: a canceled job stops within this period,
+/// and the question is one indexed read.
+const JOB_LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Drive `execution` while asking, every `interval`, whether the job is still
+/// this runner's. The first [`JobLiveness::Disowned`] drops the execution —
+/// `run_job_local` kills its process tree on drop — and comes back as `None`.
+/// [`JobLiveness::Unknown`] is not a cancellation: a server that is restarting
+/// must not kill every build in flight.
+///
+/// Before this the runner never asked: a cancellation was a write on the
+/// server that the work it was meant to stop could not see, so a canceled
+/// deploy ran to its timeout and then published its cache (card_a0377b61860e).
+async fn while_job_is_owned<T, Ask, AskFuture>(
+    execution: impl std::future::Future<Output = T>,
+    interval: std::time::Duration,
+    mut ask: Ask,
+) -> Option<T>
+where
+    Ask: FnMut() -> AskFuture,
+    AskFuture: std::future::Future<Output = JobLiveness>,
+{
+    let watch = async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The immediate first tick: `start` has just answered for this job.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if ask().await == JobLiveness::Disowned {
+                return;
+            }
+        }
+    };
+    tokio::pin!(execution);
+    tokio::pin!(watch);
+    tokio::select! {
+        // A job that finished in the same instant is kept; whether its output
+        // may still be published is asked again before publishing.
+        biased;
+        output = &mut execution => Some(output),
+        () = &mut watch => None,
+    }
+}
+
 /// Poll for jobs and execute them until `shutdown` resolves, then hand the work
 /// back and leave the pool.
 ///
@@ -613,6 +660,28 @@ pub async fn run_jobs_until_shutdown(
     runner_id: i64,
     token: String,
     shutdown: impl std::future::Future<Output = ()>,
+) {
+    run_jobs_until_shutdown_checking_every(
+        client,
+        server,
+        runner_id,
+        token,
+        shutdown,
+        JOB_LIVENESS_INTERVAL,
+    )
+    .await;
+}
+
+/// [`run_jobs_until_shutdown`] with the period a running job asks whether it
+/// was canceled as a parameter — the half that proves a cancellation stops the
+/// work lives in `rg-http`, and fifteen seconds per case is not a test budget.
+pub async fn run_jobs_until_shutdown_checking_every(
+    client: reqwest::Client,
+    server: String,
+    runner_id: i64,
+    token: String,
+    shutdown: impl std::future::Future<Output = ()>,
+    liveness_interval: std::time::Duration,
 ) {
     // Heartbeat task (every 30s).
     let heartbeat = tokio::spawn({
@@ -651,8 +720,19 @@ pub async fn run_jobs_until_shutdown(
                         job.image.as_deref().unwrap_or("local")
                     );
 
-                    // Start
-                    start_job(&client, server, runner_id, job.job_id, token).await;
+                    // Start — and stop right here if the server says the job is
+                    // no longer this runner's: canceled between the poll and
+                    // now, usually. Nothing was downloaded and the runner was
+                    // never marked busy, so there is nothing to undo.
+                    if start_job(&client, server, runner_id, job.job_id, token).await
+                        == JobStart::Refused
+                    {
+                        println!(
+                            "  ✗ job #{} is no longer active on the server — skipped",
+                            job.job_id
+                        );
+                        return;
+                    }
 
                     let workspace =
                         match download_workspace(&client, server, runner_id, job.job_id, token)
@@ -719,22 +799,67 @@ pub async fn run_jobs_until_shutdown(
                         }
                     };
                     let timeout_seconds = resolve_polled_timeout(job.job_id, job.timeout);
-                    let (exit_code, log) = match tokio::time::timeout(
-                        std::time::Duration::from_secs(timeout_seconds),
-                        execution,
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            if job.image.is_some() {
-                                remove_job_container(job.job_id).await;
+                    let bounded = async {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(timeout_seconds),
+                            execution,
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                if job.image.is_some() {
+                                    remove_job_container(job.job_id).await;
+                                }
+                                (-1, format!("Job timed out after {timeout_seconds} seconds"))
                             }
-                            (-1, format!("Job timed out after {timeout_seconds} seconds"))
                         }
                     };
+                    let owned = while_job_is_owned(bounded, liveness_interval, || {
+                        job_liveness(&client, server, runner_id, job.job_id, token)
+                    })
+                    .await;
 
                     forget_live_container(live_container);
+
+                    // A finished script is asked once more before anything it
+                    // built is published: a cancellation that landed after the
+                    // last check is still one, and a canceled run's cache is
+                    // what the next run would restore. The server refuses those
+                    // uploads too; asking first spares packing and sending them.
+                    let declares_output = cache.is_some() || job.artifact_name.is_some();
+                    let owned = match owned {
+                        Some((0, _))
+                            if declares_output
+                                && job_liveness(&client, server, runner_id, job.job_id, token)
+                                    .await
+                                    == JobLiveness::Disowned =>
+                        {
+                            None
+                        }
+                        owned => owned,
+                    };
+                    let Some((exit_code, log)) = owned else {
+                        // Dropping the execution killed a local job's process
+                        // tree; a container is daemon-owned and goes by name.
+                        if job.image.is_some() {
+                            remove_job_container(job.job_id).await;
+                        }
+                        // The server already settled the job, so this report
+                        // is answered `409` — and the same transaction puts
+                        // this runner back to `online`, which is what it is
+                        // still sent for.
+                        finish_job(&client, server, runner_id, job.job_id, token, "failure", -1)
+                            .await;
+                        if let Err(error) = tokio::fs::remove_dir_all(&workspace).await {
+                            tracing::warn!(job_id = job.job_id, %error, "failed to clean runner workspace");
+                        }
+                        println!(
+                            "  ✗ job #{} was canceled on the server — stopped, nothing published",
+                            job.job_id
+                        );
+                        return;
+                    };
 
                     let mut log = log;
                     if exit_code == 0 {

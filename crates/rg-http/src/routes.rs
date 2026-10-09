@@ -2684,6 +2684,12 @@ pub(crate) fn build_all_routes(
             api::runners::start_job,
             &runner_auth,
         )
+        .get_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/jobs/{job_id}/status",
+            api::runners::job_status,
+            &runner_auth,
+        )
         .post_with(
             RUNNER_TOKEN,
             "/runners/{id}/jobs/{job_id}/log",

@@ -293,21 +293,170 @@ pub async fn deregister_runner(
     send_report(request, DEREGISTER_REPORT, runner_id, None).await;
 }
 
-/// Notify the server that job execution has started.
+/// Whether an answer from the server says the job is no longer this runner's.
+///
+/// `409` is the server settling it (canceled, or finished by somebody else);
+/// `404` is a job no longer assigned here — reclaimed and handed to another
+/// runner, or gone with its repository; `401` / `403` / `410` are a runner the
+/// server no longer recognises, whose jobs an admin deletion already handed
+/// back. In every one of them carrying on executes work whose result the
+/// server will refuse, while somebody else may already be running it.
+fn disowns_the_job(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 404 | 409 | 410)
+}
+
+/// What the server said to [`start_job`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobStart {
+    /// The job is `running` on this runner.
+    Started,
+    /// The server refused: the job settled (a cancellation, usually) or is no
+    /// longer this runner's. It must not be executed.
+    Refused,
+    /// No answer that decides it — a transport error or a `5xx`. Executing is
+    /// still right: a start that did not land leaves the job `assigned`, which
+    /// the finish report settles as well, and the liveness check that runs
+    /// beside the job is what notices a cancellation.
+    Unconfirmed,
+}
+
+/// Notify the server that job execution has started, and hear whether it may.
+///
+/// The server already answered `409` to a job that settled before its runner
+/// picked it up, but this call was fire-and-forget and the runner executed the
+/// job anyway — a canceled deploy ran to completion (card_a0377b61860e).
 pub async fn start_job(
     client: &reqwest::Client,
     server: &str,
     runner_id: i64,
     job_id: i64,
     token: &str,
-) {
+) -> JobStart {
     let request = client
         .post(format!(
             "{}/api/v1/runners/{}/jobs/{}/start",
             server, runner_id, job_id
         ))
         .header("Authorization", format!("Bearer {}", token));
-    send_report(request, START_JOB_REPORT, runner_id, Some(job_id)).await;
+    match request.send().await {
+        Ok(response) if response.status().is_success() => JobStart::Started,
+        Ok(response) if disowns_the_job(response.status()) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::info!(
+                runner_id,
+                job_id,
+                "the server refused to start the job ({status}: {}); not executing it",
+                body_excerpt(&body)
+            );
+            JobStart::Refused
+        }
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            warn_report_lost(
+                START_JOB_REPORT,
+                runner_id,
+                Some(job_id),
+                &SendFailure {
+                    detail: format!("server answered {status}: {}", body_excerpt(&body)),
+                    retryable: status.is_server_error(),
+                },
+            );
+            JobStart::Unconfirmed
+        }
+        Err(error) => {
+            warn_report_lost(
+                START_JOB_REPORT,
+                runner_id,
+                Some(job_id),
+                &SendFailure {
+                    detail: format!("transport error: {}", error_chain(&error)),
+                    retryable: true,
+                },
+            );
+            JobStart::Unconfirmed
+        }
+    }
+}
+
+/// Whether the job this runner is executing is still its to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobLiveness {
+    /// Still active work on this runner.
+    Active,
+    /// Canceled, settled, or no longer this runner's: stop executing it and
+    /// publish nothing for it.
+    Disowned,
+    /// No deciding answer. Not a cancellation — a server restarting must not
+    /// kill every build in flight; the next check asks again.
+    Unknown,
+}
+
+/// Per-request timeout for [`job_liveness`]: the same reasoning, and the same
+/// number, as the heartbeat's.
+const JOB_STATUS_TIMEOUT: std::time::Duration = HEARTBEAT_TIMEOUT;
+
+#[derive(serde::Deserialize)]
+struct JobStatusBody {
+    active: bool,
+}
+
+/// Ask the server whether `job_id` is still this runner's to run.
+///
+/// Asked on a period while the job executes and once more before its cache or
+/// artifact is published — the only way a cancellation, which is a write on the
+/// server, reaches work running on another machine (card_a0377b61860e).
+pub async fn job_liveness(
+    client: &reqwest::Client,
+    server: &str,
+    runner_id: i64,
+    job_id: i64,
+    token: &str,
+) -> JobLiveness {
+    let request = client
+        .get(format!(
+            "{}/api/v1/runners/{}/jobs/{}/status",
+            server, runner_id, job_id
+        ))
+        .header("Authorization", format!("Bearer {}", token))
+        .timeout(JOB_STATUS_TIMEOUT);
+    match request.send().await {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<JobStatusBody>().await {
+                Ok(JobStatusBody { active: true }) => JobLiveness::Active,
+                Ok(JobStatusBody { active: false }) => JobLiveness::Disowned,
+                Err(error) => {
+                    tracing::warn!(
+                        runner_id,
+                        job_id,
+                        "job status answer could not be read: {}; carrying on",
+                        error_chain(&error)
+                    );
+                    JobLiveness::Unknown
+                }
+            }
+        }
+        Ok(response) if disowns_the_job(response.status()) => JobLiveness::Disowned,
+        Ok(response) => {
+            tracing::warn!(
+                runner_id,
+                job_id,
+                "job status check answered {}; carrying on",
+                response.status()
+            );
+            JobLiveness::Unknown
+        }
+        Err(error) => {
+            tracing::warn!(
+                runner_id,
+                job_id,
+                "job status check failed: {}; carrying on",
+                error_chain(&error)
+            );
+            JobLiveness::Unknown
+        }
+    }
 }
 
 /// The most one log upload may carry.
@@ -880,8 +1029,32 @@ pub async fn finish_job(
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .json(&payload);
-        let Some(failure) = describe_send_failure(request).await else {
-            return;
+        let failure = match request.send().await {
+            Ok(response) if response.status().is_success() => return,
+            // The server had already settled the job — canceled while it ran,
+            // most often. The report still landed where it matters: the same
+            // transaction put this runner back to `online`. Warning that the
+            // job "stays running forever" would be the opposite of the truth.
+            Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => {
+                tracing::info!(
+                    runner_id,
+                    job_id,
+                    "the server had already settled this job; its result was not applied"
+                );
+                return;
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                SendFailure {
+                    detail: format!("server answered {status}: {}", body_excerpt(&body)),
+                    retryable: status.is_server_error(),
+                }
+            }
+            Err(error) => SendFailure {
+                detail: format!("transport error: {}", error_chain(&error)),
+                retryable: true,
+            },
         };
         if !failure.retryable || attempt == FINISH_JOB_ATTEMPTS {
             warn_report_lost(FINISH_JOB_REPORT, runner_id, Some(job_id), &failure);
@@ -910,9 +1083,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        body_excerpt, error_chain, finish_job, pack_cache_archive, send_heartbeat, start_job,
-        trim_log_for_upload, unpack_archive_from_file, upload_log, FINISH_JOB_ATTEMPTS,
-        LOG_UPLOAD_MAX_BYTES, MAX_LOGGED_BODY,
+        body_excerpt, error_chain, finish_job, job_liveness, pack_cache_archive, send_heartbeat,
+        start_job, trim_log_for_upload, unpack_archive_from_file, upload_log, JobLiveness,
+        JobStart, FINISH_JOB_ATTEMPTS, LOG_UPLOAD_MAX_BYTES, MAX_LOGGED_BODY,
     };
 
     /// The cache half of `executor`'s
@@ -1255,20 +1428,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_job_reports_a_rejected_start_and_stays_silent_on_success() {
-        let rejecting = spawn_fake_server("401 Unauthorized", "runner token expired").await;
+    async fn start_job_reports_an_unconfirmed_start_and_stays_silent_on_success() {
+        let failing = spawn_fake_server("500 Internal Server Error", "database restarting").await;
         let (logs, _guard) = capture_logs();
-        start_job(&reqwest::Client::new(), &rejecting.url, 3, 9, "token").await;
+        assert_eq!(
+            start_job(&reqwest::Client::new(), &failing.url, 3, 9, "token").await,
+            JobStart::Unconfirmed
+        );
         let rejected = logs.text();
         assert!(rejected.contains("runner_id=3"), "{rejected}");
         assert!(rejected.contains("job_id=9"), "{rejected}");
-        assert!(rejected.contains("runner token expired"), "{rejected}");
+        assert!(rejected.contains("database restarting"), "{rejected}");
         assert!(rejected.contains("stays pending"), "{rejected}");
 
         let accepting = spawn_fake_server("200 OK", "").await;
         let (logs, _guard) = capture_logs();
-        start_job(&reqwest::Client::new(), &accepting.url, 3, 9, "token").await;
+        assert_eq!(
+            start_job(&reqwest::Client::new(), &accepting.url, 3, 9, "token").await,
+            JobStart::Started
+        );
         assert_eq!(logs.text(), "");
+    }
+
+    /// card_a0377b61860e: the server's "this job is no longer yours" is an
+    /// instruction not to run it, not a lost report to log and ignore.
+    #[tokio::test]
+    async fn start_job_is_refused_for_a_job_the_server_disowns() {
+        for (status_line, body) in [
+            ("409 Conflict", "job is no longer active"),
+            ("404 Not Found", "job not found"),
+            ("401 Unauthorized", "invalid runner token"),
+        ] {
+            let server = spawn_fake_server(status_line, body).await;
+            assert_eq!(
+                start_job(&reqwest::Client::new(), &server.url, 3, 9, "token").await,
+                JobStart::Refused,
+                "{status_line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn job_liveness_reads_the_answer_and_never_mistakes_an_outage_for_a_cancel() {
+        let client = reqwest::Client::new();
+        for (status_line, body, expected) in [
+            (
+                "200 OK",
+                r#"{"job_id":9,"status":"running","active":true}"#,
+                JobLiveness::Active,
+            ),
+            (
+                "200 OK",
+                r#"{"job_id":9,"status":"canceled","active":false}"#,
+                JobLiveness::Disowned,
+            ),
+            ("404 Not Found", "job not found", JobLiveness::Disowned),
+            (
+                "409 Conflict",
+                "job is no longer active",
+                JobLiveness::Disowned,
+            ),
+            ("503 Service Unavailable", "busy", JobLiveness::Unknown),
+            ("200 OK", "not json", JobLiveness::Unknown),
+        ] {
+            let server = spawn_fake_server(status_line, body).await;
+            assert_eq!(
+                job_liveness(&client, &server.url, 3, 9, "token").await,
+                expected,
+                "{status_line} {body}"
+            );
+        }
+        let refusing = refusing_server_url().await;
+        assert_eq!(
+            job_liveness(&client, &refusing, 3, 9, "token").await,
+            JobLiveness::Unknown
+        );
+    }
+
+    /// A `409` from `finish` is the server having settled the job already — the
+    /// runner's own cancel path ends here on purpose — and the same transaction
+    /// put the runner back to `online`. It is neither retried nor reported as a
+    /// job stuck `running`.
+    #[tokio::test]
+    async fn finish_job_takes_a_conflict_as_already_settled() {
+        let server = spawn_fake_server("409 Conflict", "job already settled").await;
+        let (logs, _guard) = capture_logs();
+
+        finish_job(
+            &reqwest::Client::new(),
+            &server.url,
+            4,
+            77,
+            "token",
+            "failure",
+            -1,
+        )
+        .await;
+
+        assert_eq!(server.requests(), 1);
+        assert_eq!(
+            logs.text(),
+            "",
+            "a settled job was reported as a lost finish"
+        );
     }
 
     #[tokio::test]
