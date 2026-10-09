@@ -765,11 +765,11 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.repository_info.description | :359 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web+browser |
-| i18n:settings.transfer.confirming | :508 | `POST /api/v1/repos/{owner}/{name}/transfer` | `RepoOwner` | rust+web+browser |
-| i18n:settings.delete.confirming | :542 | `DELETE /api/v1/repos/{owner}/{name}` | `RepoOwner` | rust+web |
-| i18n:common.saving | :564 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web |
-| i18n:settings.rename.renaming | :581 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web |
+| i18n:settings.repository_info.description | :377 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web+browser |
+| i18n:settings.transfer.confirm | :578 | `POST /api/v1/repos/{owner}/{name}/transfer` | `RepoOwner` | rust+web+browser |
+| i18n:settings.delete.confirm_button | :592 | `DELETE /api/v1/repos/{owner}/{name}` | `RepoOwner` | rust+web |
+| i18n:common.saving | :610 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web |
+| i18n:settings.rename.renaming | :627 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/storage` | `RepoRead` | rust+web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | web |

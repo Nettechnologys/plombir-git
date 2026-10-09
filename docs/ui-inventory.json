@@ -18211,7 +18211,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.repository_info.description",
-          "line": 359,
+          "line": 377,
           "via": null,
           "href": null,
           "handler": "handleSave",
@@ -18239,7 +18239,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 362,
+          "line": 380,
           "via": null,
           "href": null,
           "handler": null,
@@ -18249,7 +18249,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 373,
+          "line": 391,
           "via": null,
           "href": null,
           "handler": null,
@@ -18259,7 +18259,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 386,
+          "line": 404,
           "via": null,
           "href": null,
           "handler": null,
@@ -18269,7 +18269,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.visibility.make_public",
-          "line": 401,
+          "line": 419,
           "via": null,
           "href": null,
           "handler": "openVisibility",
@@ -18279,7 +18279,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.rename.button",
-          "line": 414,
+          "line": 432,
           "via": null,
           "href": null,
           "handler": "openRename",
@@ -18289,7 +18289,27 @@
         {
           "tag": "button",
           "label": "i18n:settings.transfer.confirming",
-          "line": 508,
+          "line": 526,
+          "via": null,
+          "href": null,
+          "handler": "askTransfer",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.delete.confirming",
+          "line": 560,
+          "via": null,
+          "href": null,
+          "handler": "askDelete",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.transfer.confirm",
+          "line": 578,
           "via": null,
           "href": null,
           "handler": "handleTransfer",
@@ -18317,8 +18337,18 @@
         },
         {
           "tag": "button",
-          "label": "i18n:settings.delete.confirming",
-          "line": 542,
+          "label": "i18n:common.cancel",
+          "line": 581,
+          "via": null,
+          "href": null,
+          "handler": "() => (transferConfirmOpen = false)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.delete.confirm_button",
+          "line": 592,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -18343,7 +18373,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 531,
+          "line": 595,
           "via": null,
           "href": null,
           "handler": "() => (deleteConfirmOpen = false)",
@@ -18353,7 +18383,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 564,
+          "line": 610,
           "via": null,
           "href": null,
           "handler": "confirmVisibility",
@@ -18377,7 +18407,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 567,
+          "line": 613,
           "via": null,
           "href": null,
           "handler": "closeVisibility",
@@ -18387,7 +18417,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.rename.renaming",
-          "line": 581,
+          "line": 627,
           "via": null,
           "href": null,
           "handler": "confirmRename",
@@ -18411,7 +18441,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 584,
+          "line": 630,
           "via": null,
           "href": null,
           "handler": "closeRename",
