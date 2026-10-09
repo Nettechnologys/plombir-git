@@ -716,7 +716,8 @@ pub(crate) const DEFAULT_MIRROR_ENABLED: bool = true;
 pub(crate) const DEFAULT_MIRROR_ALLOW_INSECURE_HTTP: bool = false;
 /// `[mirror].max_clone_size_mb`: bytes one mirror sync may write before it is
 /// killed. Generous for ordinary heavyweight repositories; 0 disables it.
-pub(crate) const DEFAULT_MIRROR_MAX_CLONE_MB: u64 = rg_core::mirror::transport::DEFAULT_MAX_CLONE_MB;
+pub(crate) const DEFAULT_MIRROR_MAX_CLONE_MB: u64 =
+    rg_core::mirror::transport::DEFAULT_MAX_CLONE_MB;
 /// `[imports].max_clone_size_mb`; see [`DEFAULT_MIRROR_MAX_CLONE_MB`].
 pub(crate) const DEFAULT_IMPORTS_MAX_CLONE_MB: u64 = rg_core::import::trust::DEFAULT_MAX_CLONE_MB;
 
@@ -725,7 +726,7 @@ pub(crate) const DEFAULT_IMPORTS_MAX_CLONE_MB: u64 = rg_core::import::trust::DEF
 fn resolve_max_clone_bytes(section: &str, max_mb: u64) -> anyhow::Result<u64> {
     max_mb.checked_mul(1024 * 1024).ok_or_else(|| {
         anyhow::anyhow!(
-            "config `{section}.max_clone_size_mb` is too large to convert to bytes: {max_mb}"
+            "config `[{section}].max_clone_size_mb` is too large to convert to bytes: {max_mb}"
         )
     })
 }
@@ -742,8 +743,10 @@ pub(crate) fn resolve_mirror_transport_policy(
         cfg.and_then(|config| config.mirror.max_clone_size_mb)
             .unwrap_or(DEFAULT_MIRROR_MAX_CLONE_MB),
     )?;
-    Ok(rg_core::mirror::transport::MirrorTransportPolicy::new(allow_insecure_http)
-        .with_max_clone_bytes(max_clone_bytes))
+    Ok(
+        rg_core::mirror::transport::MirrorTransportPolicy::new(allow_insecure_http)
+            .with_max_clone_bytes(max_clone_bytes),
+    )
 }
 
 /// Resolve the process-wide outbound webhook transport policy.
@@ -810,11 +813,9 @@ pub(crate) fn resolve_import_transport_policy(
         cfg.and_then(|config| config.imports.max_clone_size_mb)
             .unwrap_or(DEFAULT_IMPORTS_MAX_CLONE_MB),
     )?;
-    Ok(
-        rg_core::import::trust::ImportTransportPolicy::parse(values)
-            .context("invalid config `[imports].allow_insecure_http_origins`")?
-            .with_max_clone_bytes(max_clone_bytes),
-    )
+    Ok(rg_core::import::trust::ImportTransportPolicy::parse(values)
+        .context("invalid config `[imports].allow_insecure_http_origins`")?
+        .with_max_clone_bytes(max_clone_bytes))
 }
 
 /// Parse exact origins on which custom OIDC traffic may cross plaintext HTTP.
@@ -3165,9 +3166,13 @@ mod tests {
             super::DEFAULT_IMPORTS_MAX_CLONE_MB * 1024 * 1024
         );
 
-        let overflow: ConfigFile =
-            toml::from_str(&format!("[mirror]\nmax_clone_size_mb = {}\n", u64::MAX))
-                .expect("parse config");
+        // TOML integers stop at i64::MAX, which is already far past what a
+        // megabyte count can turn into bytes.
+        let overflow: ConfigFile = toml::from_str(&format!(
+            "[mirror]\nmax_clone_size_mb = {}\n",
+            i64::MAX as u64
+        ))
+        .expect("parse config");
         let error = super::resolve_mirror_transport_policy(Some(&overflow))
             .expect_err("a megabyte count that cannot fit bytes must fail");
         assert!(format!("{error:#}").contains("[mirror].max_clone_size_mb"));

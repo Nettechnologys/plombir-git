@@ -1028,7 +1028,7 @@ mod disk_budget_tests {
         let destination = dir.path().join("clone");
         let script = format!(
             "mkdir -p '{dest}'; i=0; while :; do i=$((i + 1)); \
-             dd if=/dev/zero of='{dest}/blob-$i' bs=65536 count=4 2>/dev/null; done",
+             dd if=/dev/zero of='{dest}/blob-'$i bs=65536 count=4 2>/dev/null; done",
             dest = destination.display()
         );
         let mut command = std::process::Command::new("sh");
