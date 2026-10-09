@@ -362,78 +362,198 @@ pub async fn deliver(db: &DatabaseConnection, event: &ThreadEvent) -> Result<Del
         recipients.remove(&actor_id);
     }
 
+    let recipients: Vec<(i64, Reason)> = recipients.into_iter().collect();
+    let text = DeliveryText {
+        title: &title,
+        link: &link,
+        actor: actor_name.as_deref(),
+    };
     let mut delivered = Delivered::default();
-    for (user_id, reason) in recipients {
-        let Some(user) =
-            super::best_effort_user_by_id(db, user_id, subject.repo_id, subject_type, "recipient")
-                .await
-        else {
-            continue;
-        };
-        if !user.is_active || user.deleted_at.is_some() {
-            continue;
-        }
-        match crate::repo::service::can_read_repo(db, &repo, Some(user_id)).await {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(error) => {
-                // Fail closed, as the watch fan-out does: an unanswered read
-                // check must not become a delivered notification.
-                tracing::warn!(
-                    user_id,
-                    repo_id = subject.repo_id,
-                    error = %format!("{error:#}"),
-                    "thread notification recipient skipped: read check failed"
-                );
-                continue;
-            }
-        }
-        let body = describe(event, reason, actor_name.as_deref());
-        let settings = notification_setting_ops::get(db, user_id).await?;
-        let email = reason.mailed(&settings) && !user.is_bot() && !user.email.trim().is_empty();
-        let note = notification_ops::ThreadNotification {
-            user_id,
-            repo_id: subject.repo_id,
-            subject_type,
-            subject_id: subject.id,
-            reason: reason.as_str(),
-            title: &title,
-            body: Some(&body),
-            link: &link,
-            email,
-        };
-        let folded =
-            match notification_ops::find_unread_for_subject(db, user_id, subject_type, subject.id)
-                .await?
-            {
-                Some(existing) => {
-                    let stronger = existing
-                        .reason
-                        .as_deref()
-                        .and_then(Reason::parse)
-                        .is_none_or(|held| reason > held);
-                    notification_ops::fold_into(
-                        db,
-                        existing.id,
-                        &note,
-                        stronger.then_some(reason.as_str()),
-                    )
-                    .await?
-                }
-                None => false,
-            };
-        if !folded {
-            notification_ops::create_for_subject(db, &note).await?;
-        }
-        delivered.notified.push((user_id, reason));
-        if email {
-            delivered.mailed.push(user_id);
-        }
+    for page in recipients.chunks(THREAD_FANOUT_PAGE) {
+        deliver_page(db, &repo, event, page, &text, &mut delivered).await?;
     }
     if !delivered.mailed.is_empty() {
         super::mail::wake();
     }
     Ok(delivered)
+}
+
+/// How many recipients one page of [`deliver`] handles.
+///
+/// A page costs the same handful of statements however many people are on it —
+/// one user query, one read check, one settings query, one unread lookup, and
+/// one transaction holding a few grouped updates and one insert. It used to be
+/// five queries and a write transaction of its own per recipient, so a comment
+/// on a thread with a hundred subscribers took SQLite's write lock a hundred
+/// times (card_ae49267ffd93). Fourteen bound values per inserted row keep a
+/// page well inside every backend's parameter ceiling.
+const THREAD_FANOUT_PAGE: usize = 500;
+
+/// What every recipient of one event reads, whatever their reason.
+struct DeliveryText<'a> {
+    title: &'a str,
+    link: &'a str,
+    actor: Option<&'a str>,
+}
+
+/// Rows that one grouped update folds the event into: everyone in a group is
+/// told the same thing for the same reason, and mailed or not alike.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FoldGroup {
+    reason: Reason,
+    /// The stored reason is weaker and is replaced.
+    stronger: bool,
+    email: bool,
+}
+
+/// Deliver `event` to one page of its recipients, in recipient order.
+async fn deliver_page(
+    db: &DatabaseConnection,
+    repo: &rg_db::entities::repository::Model,
+    event: &ThreadEvent,
+    page: &[(i64, Reason)],
+    text: &DeliveryText<'_>,
+    delivered: &mut Delivered,
+) -> Result<()> {
+    use sea_orm::TransactionTrait;
+
+    let subject = &event.subject;
+    let subject_type = subject.kind.as_str();
+    let ids: Vec<i64> = page.iter().map(|&(user_id, _)| user_id).collect();
+    let users = match rg_db::ops::user_ops::find_by_ids(db, &ids).await {
+        Ok(users) => users,
+        Err(error) => {
+            // The event has committed and stays done; this page is what is lost,
+            // and the log says how much of it.
+            tracing::warn!(
+                repo_id = subject.repo_id,
+                subject_type,
+                subject_id = subject.id,
+                skipped = ids.len(),
+                error = %format!("{error:#}"),
+                "thread notification recipients skipped: user lookup failed"
+            );
+            return Ok(());
+        }
+    };
+    let users: std::collections::HashMap<i64, rg_db::entities::user::Model> = users
+        .into_iter()
+        .filter(|user| user.is_active && user.deleted_at.is_none())
+        .map(|user| (user.id, user))
+        .collect();
+    let active: Vec<i64> = ids
+        .iter()
+        .copied()
+        .filter(|user_id| users.contains_key(user_id))
+        .collect();
+    let readers = match crate::repo::service::readers_among(db, repo, &active).await {
+        Ok(readers) => readers,
+        Err(error) => {
+            // Fail closed, as the watch fan-out does: an unanswered read check
+            // must not become a delivered notification.
+            tracing::warn!(
+                repo_id = subject.repo_id,
+                subject_type,
+                subject_id = subject.id,
+                skipped = active.len(),
+                error = %format!("{error:#}"),
+                "thread notification recipients skipped: read check failed"
+            );
+            return Ok(());
+        }
+    };
+    let recipients: Vec<(&rg_db::entities::user::Model, Reason)> = page
+        .iter()
+        .filter(|(user_id, _)| readers.contains(user_id))
+        .filter_map(|(user_id, reason)| users.get(user_id).map(|user| (user, *reason)))
+        .collect();
+    if recipients.is_empty() {
+        return Ok(());
+    }
+    let recipient_ids: Vec<i64> = recipients.iter().map(|(user, _)| user.id).collect();
+    let settings = notification_setting_ops::get_many(db, &recipient_ids).await?;
+    let unread = notification_ops::find_unread_for_subject_among(
+        db,
+        &recipient_ids,
+        subject_type,
+        subject.id,
+    )
+    .await?;
+
+    let bodies: BTreeMap<Reason, String> = recipients
+        .iter()
+        .map(|&(_, reason)| (reason, describe(event, reason, text.actor)))
+        .collect();
+    let note = |user_id: i64, reason: Reason, email: bool| notification_ops::ThreadNotification {
+        user_id,
+        repo_id: subject.repo_id,
+        subject_type,
+        subject_id: subject.id,
+        reason: reason.as_str(),
+        title: text.title,
+        body: bodies.get(&reason).map(String::as_str),
+        link: text.link,
+        email,
+    };
+
+    let mut folds: BTreeMap<FoldGroup, Vec<i64>> = BTreeMap::new();
+    let mut inserts = Vec::new();
+    let mut outcome = Vec::with_capacity(recipients.len());
+    for &(user, reason) in &recipients {
+        let email = settings
+            .get(&user.id)
+            .is_some_and(|settings| reason.mailed(settings))
+            && !user.is_bot()
+            && !user.email.trim().is_empty();
+        match unread.get(&user.id) {
+            Some(existing) => {
+                let stronger = existing
+                    .reason
+                    .as_deref()
+                    .and_then(Reason::parse)
+                    .is_none_or(|held| reason > held);
+                folds
+                    .entry(FoldGroup {
+                        reason,
+                        stronger,
+                        email,
+                    })
+                    .or_default()
+                    .push(existing.id);
+            }
+            None => inserts.push(note(user.id, reason, email)),
+        }
+        outcome.push((user.id, reason, email));
+    }
+
+    let transaction = db.begin().await?;
+    for (group, row_ids) in &folds {
+        let folded_note = note(0, group.reason, group.email);
+        let folded = notification_ops::fold_many(
+            &transaction,
+            row_ids,
+            &folded_note,
+            group.stronger.then_some(group.reason.as_str()),
+        )
+        .await?;
+        if usize::try_from(folded).unwrap_or(usize::MAX) < row_ids.len() {
+            // Read between the lookup and the update: that recipient's row is
+            // done with, and this event needs a row of its own.
+            for user_id in notification_ops::read_among(&transaction, row_ids).await? {
+                inserts.push(note(user_id, group.reason, group.email));
+            }
+        }
+    }
+    notification_ops::create_for_subjects(&transaction, &inserts).await?;
+    transaction.commit().await?;
+
+    for (user_id, reason, email) in outcome {
+        delivered.notified.push((user_id, reason));
+        if email {
+            delivered.mailed.push(user_id);
+        }
+    }
+    Ok(())
 }
 
 /// The line a recipient reads under the title.
@@ -565,5 +685,187 @@ mod tests {
     fn a_long_list_is_capped() {
         let text: String = (0..80).map(|i| format!("@user{i} ")).collect();
         assert_eq!(mentioned_usernames(&text).len(), super::MENTION_LIMIT);
+    }
+
+    struct ThreadCost {
+        statements: usize,
+        notified: usize,
+        mailed: usize,
+        rows: usize,
+        folded_titles: usize,
+    }
+
+    /// Statements one comment on an issue of a private repository sends to its
+    /// `subscribers` (collaborators, every other one holding an unread row about
+    /// the issue already, the first one declining mail), plus one subscriber who lost
+    /// access.
+    async fn thread_cost(subscribers: usize) -> ThreadCost {
+        use super::{deliver, Reason, Subject, SubjectKind, ThreadEvent};
+        use rg_db::ops::notification_ops::{self, ThreadNotification};
+        use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const SUBJECT_ID: i64 = 77;
+        let mut db = crate::test_support::migrated_memory_database().await;
+        let owner = rg_db::ops::user_ops::create_user(&db, "thr-owner", "thr-owner@x.test", "", "")
+            .await
+            .expect("create owner");
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(owner.id),
+                name: Set("threaded".to_string()),
+                is_private: Set(true),
+                default_branch: Set("main".to_string()),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create repo");
+        let subscribe = |user_id: i64| {
+            let db = db.clone();
+            async move {
+                rg_db::ops::thread_subscription_ops::set(
+                    &db, user_id, repo.id, "issue", SUBJECT_ID, true,
+                )
+                .await
+                .expect("subscribe");
+            }
+        };
+        for index in 0..subscribers {
+            let user = rg_db::ops::user_ops::create_user(
+                &db,
+                &format!("thr-{index}"),
+                &format!("thr-{index}@x.test"),
+                "",
+                "",
+            )
+            .await
+            .expect("create subscriber");
+            rg_db::ops::repo_collaborator_ops::create(
+                &db,
+                rg_db::entities::repo_collaborator::ActiveModel {
+                    repo_id: Set(repo.id),
+                    user_id: Set(user.id),
+                    permission: Set("read".to_string()),
+                    created_at: Set(now),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("add collaborator");
+            subscribe(user.id).await;
+            if index % 2 == 1 {
+                notification_ops::create_for_subjects(
+                    &db,
+                    &[ThreadNotification {
+                        user_id: user.id,
+                        repo_id: repo.id,
+                        subject_type: "issue",
+                        subject_id: SUBJECT_ID,
+                        reason: "participating",
+                        title: "an earlier event",
+                        body: None,
+                        link: "/thr-owner/threaded/issues/1",
+                        email: false,
+                    }],
+                )
+                .await
+                .expect("seed an unread row");
+            }
+            if index == 0 {
+                let mut settings =
+                    rg_db::entities::notification_setting::Model::defaults_for(user.id);
+                settings.email_participating = false;
+                rg_db::ops::notification_setting_ops::put(&db, settings)
+                    .await
+                    .expect("decline mail");
+            }
+        }
+        let outsider = rg_db::ops::user_ops::create_user(&db, "thr-out", "thr-out@x.test", "", "")
+            .await
+            .expect("create outsider");
+        subscribe(outsider.id).await;
+
+        let statements = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&statements);
+        db.set_metric_callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let event = ThreadEvent::new(
+            Subject {
+                kind: SubjectKind::Issue,
+                id: SUBJECT_ID,
+                number: 1,
+                repo_id: repo.id,
+                title: "Busy thread".to_string(),
+            },
+            Some(owner.id),
+            "commented",
+        )
+        .to_subscribers();
+        let delivered = deliver(&db, &event).await.expect("deliver");
+        let statements = statements.load(Ordering::SeqCst);
+
+        assert!(delivered
+            .notified
+            .iter()
+            .all(|&(user_id, reason)| user_id != outsider.id && reason == Reason::Participating));
+        let rows = rg_db::entities::notification::Entity::find()
+            .count(&db)
+            .await
+            .expect("count notifications") as usize;
+        let folded_titles = rg_db::entities::notification::Entity::find()
+            .filter(rg_db::entities::notification::Column::Title.contains("Busy thread"))
+            .count(&db)
+            .await
+            .expect("count updated rows") as usize;
+        ThreadCost {
+            statements,
+            notified: delivered.notified.len(),
+            mailed: delivered.mailed.len(),
+            rows,
+            folded_titles,
+        }
+    }
+
+    /// card_ae49267ffd93: every recipient of a thread event used to cost a user
+    /// lookup, a read check, a settings read, an unread lookup and its own write
+    /// — a comment on a thread with a hundred subscribers took the SQLite write
+    /// lock a hundred times. A page is now a fixed handful of statements, and
+    /// the outcome is the same: everyone who may read is told once, an unread
+    /// row is folded into rather than doubled, mail follows the settings, and
+    /// the subscriber who lost access hears nothing.
+    #[tokio::test]
+    async fn a_thread_event_costs_the_same_statements_for_three_subscribers_or_forty() {
+        let few = thread_cost(3).await;
+        let many = thread_cost(40).await;
+        for (subscribers, cost) in [(3, &few), (40, &many)] {
+            assert_eq!(cost.notified, subscribers);
+            assert_eq!(
+                cost.rows, subscribers,
+                "an unread row was doubled, not folded"
+            );
+            assert_eq!(
+                cost.folded_titles, subscribers,
+                "a row does not carry the event"
+            );
+            assert_eq!(
+                cost.mailed,
+                subscribers - 1,
+                "mail does not follow the settings"
+            );
+        }
+        assert_eq!(
+            few.statements, many.statements,
+            "an event for 3 subscribers sent {} statements, for 40 sent {}",
+            few.statements, many.statements
+        );
     }
 }

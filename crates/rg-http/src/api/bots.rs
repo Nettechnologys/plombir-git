@@ -153,20 +153,43 @@ pub(crate) async fn resolve_narrowing(
     })
 }
 
-/// `owner/name` of a repository as it is called now.
-async fn repository_full_name(
+/// `owner/name` of every live repository among `ids`, as it is called now —
+/// three queries however many repositories and owners there are. It was a
+/// repository lookup and an owner lookup per repository of every token in a
+/// listing (card_ae49267ffd93).
+async fn repository_full_names(
     state: &AppState,
-    repository: &rg_db::entities::repository::Model,
-) -> anyhow::Result<Option<String>> {
-    let owner = match repository.org_id {
-        Some(org_id) => rg_db::ops::org_ops::get_org(&state.db, org_id)
+    ids: &[i64],
+) -> anyhow::Result<std::collections::HashMap<i64, String>> {
+    let repositories = rg_db::ops::repo_ops::find_by_ids(&state.db, ids).await?;
+    let org_ids: Vec<i64> = repositories.iter().filter_map(|repo| repo.org_id).collect();
+    let user_ids: Vec<i64> = repositories
+        .iter()
+        .filter(|repo| repo.org_id.is_none())
+        .map(|repo| repo.owner_id)
+        .collect();
+    let orgs: std::collections::HashMap<i64, String> =
+        rg_db::ops::org_ops::get_orgs_by_ids(&state.db, &org_ids)
             .await?
-            .map(|org| org.name),
-        None => rg_db::ops::user_ops::find_by_id(&state.db, repository.owner_id)
+            .into_iter()
+            .map(|org| (org.id, org.name))
+            .collect();
+    let users: std::collections::HashMap<i64, String> =
+        rg_db::ops::user_ops::find_by_ids(&state.db, &user_ids)
             .await?
-            .map(|user| user.username),
-    };
-    Ok(owner.map(|owner| format!("{owner}/{}", repository.name)))
+            .into_iter()
+            .map(|user| (user.id, user.username))
+            .collect();
+    Ok(repositories
+        .into_iter()
+        .filter_map(|repo| {
+            let owner = match repo.org_id {
+                Some(org_id) => orgs.get(&org_id),
+                None => users.get(&repo.owner_id),
+            }?;
+            Some((repo.id, format!("{owner}/{}", repo.name)))
+        })
+        .collect())
 }
 
 /// The narrowing of each of `tokens`, keyed by token id, for a listing.
@@ -182,24 +205,21 @@ pub(crate) async fn narrowing_responses(
     let by_token = rg_db::ops::token_ops::repository_ids_by_token(&state.db, &restricted)
         .await
         .map_err(AppError::from)?;
+    let mut repository_ids: Vec<i64> = by_token.values().flatten().copied().collect();
+    repository_ids.sort_unstable();
+    repository_ids.dedup();
+    let full_names = repository_full_names(state, &repository_ids)
+        .await
+        .map_err(AppError::from)?;
     let mut responses = std::collections::HashMap::new();
     for token in tokens {
         let repositories = if token.repo_restricted {
-            let mut names = Vec::new();
-            for id in by_token.get(&token.id).into_iter().flatten() {
-                let Some(repository) = rg_db::ops::repo_ops::find_by_id(&state.db, *id)
-                    .await
-                    .map_err(AppError::from)?
-                else {
-                    continue;
-                };
-                if let Some(name) = repository_full_name(state, &repository)
-                    .await
-                    .map_err(AppError::from)?
-                {
-                    names.push(name);
-                }
-            }
+            let mut names: Vec<String> = by_token
+                .get(&token.id)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| full_names.get(id).cloned())
+                .collect();
             names.sort();
             Some(names)
         } else {

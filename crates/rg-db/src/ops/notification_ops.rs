@@ -210,31 +210,51 @@ pub struct ThreadNotification<'a> {
     pub email: bool,
 }
 
-/// The recipient's unread notification about this subject, if there is one.
-pub async fn find_unread_for_subject(
-    db: &DatabaseConnection,
-    user_id: i64,
+/// The newest unread notification about this subject for each of `user_ids`,
+/// keyed by recipient — one query for a page of a thread's recipients.
+///
+/// The thread fan-out used to ask this once per recipient, which on a thread
+/// with a hundred subscribers was a hundred queries for every comment
+/// (card_ae49267ffd93). The caller bounds the page.
+pub async fn find_unread_for_subject_among(
+    db: &impl ConnectionTrait,
+    user_ids: &[i64],
     subject_type: &str,
     subject_id: i64,
-) -> Result<Option<notification::Model>> {
-    notification::Entity::find()
-        .filter(notification::Column::UserId.eq(user_id))
+) -> Result<std::collections::HashMap<i64, notification::Model>> {
+    let mut newest = std::collections::HashMap::new();
+    if user_ids.is_empty() {
+        return Ok(newest);
+    }
+    let rows = notification::Entity::find()
+        .filter(notification::Column::UserId.is_in(user_ids.iter().copied()))
         .filter(notification::Column::SubjectType.eq(subject_type))
         .filter(notification::Column::SubjectId.eq(subject_id))
         .filter(notification::Column::IsRead.eq(false))
         .order_by_desc(notification::Column::Id)
-        .one(db)
+        .all(db)
         .await
-        .context("db: find unread notification for subject")
+        .context("db: find unread notifications for subject")?;
+    for row in rows {
+        newest.entry(row.user_id).or_insert(row);
+    }
+    Ok(newest)
 }
 
-/// Insert a thread notification.
-pub async fn create_for_subject(
-    db: &DatabaseConnection,
-    note: &ThreadNotification<'_>,
-) -> Result<notification::Model> {
+/// Insert a page of thread notifications in one statement.
+///
+/// One multi-row `INSERT` is one write, where a row at a time took SQLite's
+/// write lock once per recipient. Fourteen bound values per row: the caller
+/// bounds the page well inside SQLite's 32 766 and PostgreSQL's 65 535.
+pub async fn create_for_subjects(
+    db: &impl ConnectionTrait,
+    notes: &[ThreadNotification<'_>],
+) -> Result<u64> {
+    if notes.is_empty() {
+        return Ok(0);
+    }
     let now = chrono::Utc::now();
-    notification::ActiveModel {
+    let rows = notes.iter().map(|note| notification::ActiveModel {
         user_id: Set(note.user_id),
         event_type: Set(note.subject_type.to_string()),
         title: Set(note.title.to_string()),
@@ -249,22 +269,32 @@ pub async fn create_for_subject(
         updated_at: Set(Some(now)),
         email_pending: Set(note.email),
         ..Default::default()
-    }
-    .insert(db)
-    .await
-    .context("db: create thread notification")
+    });
+    notification::Entity::insert_many(rows)
+        .exec_without_returning(db)
+        .await
+        .context("db: create thread notifications")
 }
 
-/// Fold a later event into an unread row: it moves to the top of the inbox
-/// with the newest title and body. `reason` replaces the stored one only when
-/// given — the caller keeps the stronger of the two. A pending mail stays
-/// pending; one more is owed only when `email` says so.
-pub async fn fold_into(
-    db: &DatabaseConnection,
-    id: i64,
+/// Fold a later event into the unread rows `ids`: they move to the top of the
+/// inbox with the newest title and body. Every row gets the same text, so the
+/// caller groups recipients by what the event says to them; `note.user_id` is
+/// not read. `reason` replaces the stored one only when given — the caller
+/// keeps the stronger of the two. A pending mail stays pending; one more is
+/// owed only when `note.email` says so.
+///
+/// Returns how many rows were updated. A row read between the caller's lookup
+/// and this statement is left alone, so the count can fall short of
+/// `ids.len()`; [`read_among`] names whose rows those were.
+pub async fn fold_many(
+    db: &impl ConnectionTrait,
+    ids: &[i64],
     note: &ThreadNotification<'_>,
     reason: Option<&str>,
-) -> Result<bool> {
+) -> Result<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
     let now = chrono::Utc::now();
     let mut update = notification::Entity::update_many()
         .col_expr(notification::Column::Title, Expr::value(note.title))
@@ -282,12 +312,28 @@ pub async fn fold_into(
         update = update.col_expr(notification::Column::EmailPending, Expr::value(true));
     }
     let result = update
-        .filter(notification::Column::Id.eq(id))
+        .filter(notification::Column::Id.is_in(ids.iter().copied()))
         .filter(notification::Column::IsRead.eq(false))
         .exec(db)
         .await
-        .context("db: fold event into notification")?;
-    Ok(result.rows_affected > 0)
+        .context("db: fold event into notifications")?;
+    Ok(result.rows_affected)
+}
+
+/// The recipients whose rows among `ids` have been read.
+pub async fn read_among(db: &impl ConnectionTrait, ids: &[i64]) -> Result<Vec<i64>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    notification::Entity::find()
+        .select_only()
+        .column(notification::Column::UserId)
+        .filter(notification::Column::Id.is_in(ids.iter().copied()))
+        .filter(notification::Column::IsRead.eq(true))
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: find read notifications")
 }
 
 /// Rows the mail dispatcher still owes a message for, grouped by recipient.

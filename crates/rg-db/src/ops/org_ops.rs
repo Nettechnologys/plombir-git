@@ -44,6 +44,21 @@ pub async fn get_org(db: &DatabaseConnection, id: i64) -> Result<Option<organiza
         .context("db: get org")
 }
 
+/// The organizations among `ids`, in one query.
+pub async fn get_orgs_by_ids(
+    db: &DatabaseConnection,
+    ids: &[i64],
+) -> Result<Vec<organization::Model>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    organization::Entity::find()
+        .filter(organization::Column::Id.is_in(ids.iter().copied()))
+        .all(db)
+        .await
+        .context("db: get orgs by id")
+}
+
 /// Get an organization by name.
 /// Organization names an account holds too, sorted.
 ///

@@ -37,6 +37,20 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Repo>
         .context("db: find repo by id")
 }
 
+/// The live repositories among `ids`, in one query. An id that matches
+/// nothing, or a soft-deleted repository, is simply absent.
+pub async fn find_by_ids(db: &DatabaseConnection, ids: &[i64]) -> Result<Vec<Repo>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    RepoEntity::find()
+        .filter(repository::Column::Id.is_in(ids.iter().copied()))
+        .filter(repository::Column::DeletedAt.is_null())
+        .all(db)
+        .await
+        .context("db: find repos by id")
+}
+
 /// Find a repo in a user's **personal** namespace — `owner_id` *and* no
 /// organization. Excludes soft-deleted repos.
 ///
