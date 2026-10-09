@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import LfsStoragePage from '../../routes/[owner]/[repo]/settings/lfs-storage/+page.svelte';
 import { setTestPage } from '../test/app';
 import { lfsStorage, resetTestClient } from '../test/client';
-import { button, renderComponent, settle, type RenderedComponent } from '../test/render';
+import { answerConfirm, button, renderComponent, settle, type RenderedComponent } from '../test/render';
 
 // card_9e4dd3f8330c: the repository settings show how much the LFS store
 // holds, and let an administrator find and remove objects nothing needs.
@@ -23,7 +23,6 @@ async function open() {
 
 beforeEach(() => {
 	resetTestClient();
-	vi.spyOn(window, 'confirm').mockReturnValue(true);
 	lfsStorage.usage.mockResolvedValue({ object_count: 2, total_bytes: 3 * 1024 * 1024 });
 	lfsStorage.objects.mockResolvedValue({
 		objects: [object('a', 1024 * 1024), object('b', 2 * 1024 * 1024)],
@@ -60,7 +59,8 @@ describe('LFS storage settings tab', () => {
 		button(page, 'Remove selected').dispatchEvent(new MouseEvent('click', { bubbles: true }));
 		await settle();
 
-		expect(window.confirm).toHaveBeenCalled();
+		expect(lfsStorage.prune).not.toHaveBeenCalled();
+		expect(await answerConfirm()).toContain('Remove 1 LFS objects');
 		expect(lfsStorage.prune).toHaveBeenCalledWith('alice', 'demo', [orphan.oid]);
 		expect(page.querySelector('.outcome')?.textContent).toContain('Removed 1 objects.');
 		expect(page.querySelectorAll('.orphan-list li')).toHaveLength(0);
@@ -79,6 +79,7 @@ describe('LFS storage settings tab', () => {
 		await settle();
 		button(page, 'Remove selected').dispatchEvent(new MouseEvent('click', { bubbles: true }));
 		await settle();
+		await answerConfirm();
 
 		expect(page.querySelector('.kept')?.textContent).toContain("a ref's history points at it");
 		expect(page.querySelectorAll('.orphan-list li')).toHaveLength(1);
@@ -110,6 +111,7 @@ describe('LFS storage settings tab, one object', () => {
 			new MouseEvent('click', { bubbles: true }),
 		);
 		await settle();
+		await answerConfirm();
 
 		expect(lfsStorage.prune).toHaveBeenCalledWith('alice', 'demo', [listed.oid]);
 		expect(page.querySelector('.kept')?.textContent).toContain('uploaded too recently');

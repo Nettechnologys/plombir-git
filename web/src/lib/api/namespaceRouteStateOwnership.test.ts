@@ -6,6 +6,7 @@ import { fetchUser, logout } from '../stores/auth.svelte';
 import { setTestPage } from '../test/app';
 import { auth, orgs, repos, resetTestClient } from '../test/client';
 import {
+	answerConfirm,
 	button,
 	click,
 	element,
@@ -63,7 +64,6 @@ let rendered: RenderedComponent | undefined;
 
 beforeEach(async () => {
 	resetTestClient();
-	vi.stubGlobal('confirm', vi.fn(() => true));
 	auth.me.mockResolvedValue({
 		id: 1,
 		username: 'alice',
@@ -256,11 +256,13 @@ describe('namespace route state ownership', () => {
 		rendered = await renderComponent(OrganizationPage);
 
 		await click(memberDeleteButton(rendered.container, 'bob'));
+		await answerConfirm();
 		setTestPage('/orgs/beta', { name: 'beta' });
 		await settle();
 		setTestPage('/orgs/acme', { name: 'acme' });
 		await settle();
 		await click(memberDeleteButton(rendered.container, 'bob'));
+		await answerConfirm();
 		const currentButton = memberDeleteButton(rendered.container, 'bob');
 		expect(currentButton.disabled).toBe(true);
 

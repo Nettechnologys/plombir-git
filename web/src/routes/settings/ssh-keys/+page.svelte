@@ -4,6 +4,9 @@
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { formatDate as formatLocaleDate, t } from '$lib/i18n';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
+  const confirmer = createConfirmer();
 
   let keys = $state<SshKey[]>([]);
   let loading = $state(true);
@@ -81,7 +84,11 @@
   }
 
   async function deleteKey(key: SshKey) {
-    if (!confirm(t('ssh_keys.delete_confirm', { title: key.title }))) return;
+    if (!(await confirmer.ask({
+      title: t('ssh_keys.delete_confirm_title'),
+      message: t('ssh_keys.delete_confirm', { title: key.title }),
+      confirmLabel: t('ssh_keys.delete'),
+    }))) return;
     const keyId = key.id;
     if (!claimKey(keyId)) return;
 
@@ -186,6 +193,8 @@
     {/if}
   </section>
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .ssh-keys-page { max-width: 880px; }

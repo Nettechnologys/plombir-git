@@ -15,8 +15,11 @@
   import { createT, formatDate } from '$lib/i18n';
   import { viewerPermission } from '$lib/viewerPermission.svelte';
   import { getUser } from '$lib/stores/auth.svelte';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
@@ -314,7 +317,11 @@
   async function deleteArtifact(artifact: CiArtifact) {
     // Irreversible and it takes the bytes with it, so the confirmation names
     // the artifact rather than asking a generic "are you sure".
-    if (!confirm(t('pipeline.artifact_delete_confirm', { name: artifact.name }))) return;
+    if (!(await confirmer.ask({
+      title: t('pipeline.artifact_delete'),
+      message: t('pipeline.artifact_delete_confirm', { name: artifact.name }),
+      confirmLabel: t('pipeline.artifact_delete'),
+    }))) return;
     if (
       deletingArtifactId !== null
       || downloadingArtifactId === artifact.id
@@ -1015,6 +1022,8 @@
     </div>
   </Modal>
 {/if}
+
+<ConfirmModal {confirmer} />
 
 <style>
 .empty { text-align: center; padding: 48px; color: var(--text-secondary); }

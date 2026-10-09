@@ -16,6 +16,7 @@ import { setAuthReady } from '../test/authSession.svelte';
 import { getBanner } from '../stores/instance.svelte';
 import { admin, resetTestClient } from '../test/client';
 import {
+	answerConfirm,
 	button,
 	change,
 	click,
@@ -103,14 +104,11 @@ function rowButton(container: ParentNode, name: string, label: string): HTMLButt
 }
 
 let rendered: RenderedComponent | undefined;
-let confirmed: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
 	resetTestClient();
 	setAuthReady(true);
 	setTestPage('/admin/settings', {});
-	confirmed = vi.fn(() => true);
-	vi.stubGlobal('confirm', confirmed);
 });
 
 afterEach(async () => {
@@ -236,6 +234,7 @@ describe('instance settings async state ownership', () => {
 
 		await click(rowButton(rendered.container, 'keycloak', 'Disable'));
 		await click(rowButton(rendered.container, 'removed-provider', 'Delete'));
+		expect(await answerConfirm()).toContain('removed-provider');
 		expect(admin.deleteSsoProvider).toHaveBeenCalledWith(2);
 		expect(admin.listSsoProviders).toHaveBeenCalledTimes(3);
 
@@ -319,7 +318,7 @@ describe('instance settings async state ownership', () => {
 		await click(rowButton(rendered.container, 'corp-ldap', 'Delete'));
 		expect(admin.updateSsoProvider).not.toHaveBeenCalled();
 		expect(admin.deleteSsoProvider).not.toHaveBeenCalled();
-		expect(confirmed).not.toHaveBeenCalled();
+		expect(document.querySelector('[role="dialog"]')).toBeNull();
 		expect(element<HTMLInputElement>(rendered.container, '#sso-name').value).toBe('');
 
 		pendingTest.resolve({ ok: true, message: 'corp-ldap reachable' });

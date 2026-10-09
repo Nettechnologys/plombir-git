@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import LfsLocksPage from '../../routes/[owner]/[repo]/settings/lfs-locks/+page.svelte';
 import { setTestPage } from '../test/app';
 import { ApiError, lfsLocks, resetTestClient } from '../test/client';
-import { button, renderComponent, settle, type RenderedComponent } from '../test/render';
+import { answerConfirm, button, renderComponent, settle, type RenderedComponent } from '../test/render';
 
 // card_8062fa65ca75: the repository settings list the files locked with
 // `git lfs lock`, and an administrator can take a lock off.
@@ -23,7 +23,6 @@ async function open() {
 
 beforeEach(() => {
 	resetTestClient();
-	vi.spyOn(window, 'confirm').mockReturnValue(true);
 });
 
 afterEach(async () => {
@@ -60,7 +59,8 @@ describe('LFS locks settings tab', () => {
 		button(page, 'Force unlock').dispatchEvent(new MouseEvent('click', { bubbles: true }));
 		await settle();
 
-		expect(window.confirm).toHaveBeenCalled();
+		expect(lfsLocks.forceUnlock).not.toHaveBeenCalled();
+		expect(await answerConfirm()).toContain('maps/castle.level');
 		expect(lfsLocks.forceUnlock).toHaveBeenCalledWith('alice', 'demo', '7');
 		expect(page.querySelector('tbody')).toBeNull();
 		expect(page.textContent).toContain('Unlocked maps/castle.level.');
@@ -78,6 +78,7 @@ describe('LFS locks settings tab', () => {
 		const page = await open();
 		button(page, 'Force unlock').dispatchEvent(new MouseEvent('click', { bubbles: true }));
 		await settle();
+		await answerConfirm();
 
 		expect(page.querySelector('[role="alert"]')?.textContent).toContain(
 			'repository admin access required',

@@ -3,8 +3,11 @@
   import { allowedUserLabel, tagProtections, buildTagProtectionPayload, type TagProtection, type TagProtectionPayload } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   // Split a translated sentence on its `{name}` slots so the slot values can be
   // rendered as `<code>` while the words around them follow the translation.
@@ -90,7 +93,11 @@
     }
   }
   async function remove(item: TagProtection) {
-    if (!confirm(t('settings.tag_protection.delete_confirm', { pattern: item.pattern }))) return;
+    if (!(await confirmer.ask({
+      title: t('settings.tag_protection.delete_confirm_title'),
+      message: t('settings.tag_protection.delete_confirm', { pattern: item.pattern }),
+      confirmLabel: t('common.delete'),
+    }))) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -121,4 +128,7 @@
   </form></section>
   <section><h2>{t('settings.tag_protection.list_title')}</h2>{#if items.length === 0}<p>{t('settings.tag_protection.empty')}</p>{:else}<div class="list">{#each items as item (item.id)}<article><div><code>{item.pattern}</code><p>{(item.allowed_users ?? []).length ? t('settings.tag_protection.allowed', { users: (item.allowed_users ?? []).map(allowedUserLabel).join(', ') }) : t('settings.tag_protection.nobody')}</p></div><div class="actions"><button class="btn" disabled={isBusy(rowKey(item.id))} onclick={() => edit(item)}>{t('common.edit')}</button><button class="btn btn-danger" disabled={isBusy(rowKey(item.id))} aria-busy={isBusy(rowKey(item.id))} onclick={() => remove(item)}>{t('common.delete')}</button></div></article>{/each}</div>{/if}</section>
 </div>
+
+<ConfirmModal {confirmer} />
+
 <style>.settings-page{max-width:880px}header,section{margin-bottom:28px}header p,article p,label span{color:var(--text-secondary)}form{display:grid;gap:9px}input{padding:8px 10px}.actions{display:flex;align-items:center;gap:8px}.message{color:var(--red);padding:12px;border:1px solid var(--border);border-radius:var(--radius)}.list{display:grid;gap:10px}article{display:flex;align-items:center;justify-content:space-between;padding:14px;border:1px solid var(--border);border-radius:var(--radius)}article p{margin:4px 0 0;font-size:13px}</style>

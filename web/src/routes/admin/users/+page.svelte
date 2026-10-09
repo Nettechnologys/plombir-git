@@ -6,8 +6,11 @@
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { untrack } from 'svelte';
   import Modal from '$lib/components/Modal.svelte';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   let users = $state<AdminUser[]>([]);
   let page = $state(1);
@@ -182,7 +185,11 @@
   }
 
   async function handleResetPassword(user: AdminUser) {
-    if (!confirm(t('admin.users.reset_password_confirm', { username: user.username }))) return;
+    if (!(await confirmer.ask({
+      title: t('admin.users.reset_password'),
+      message: t('admin.users.reset_password_confirm', { username: user.username }),
+      confirmLabel: t('admin.users.reset_password'),
+    }))) return;
     const userId = user.id;
     if (!claimUser(userId)) return;
     try {
@@ -403,6 +410,8 @@
     </div>
   </Modal>
 {/if}
+
+<ConfirmModal {confirmer} />
 
 <style>
   .issued-password {

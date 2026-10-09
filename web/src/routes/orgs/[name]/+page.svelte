@@ -18,8 +18,11 @@
   } from '$lib/api/client.svelte';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
   import { getUser } from '$lib/stores/auth.svelte';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
   let name = $derived($page.params.name!);
 
   let org = $state<Organization | null>(null);
@@ -286,7 +289,11 @@
   }
 
   async function deleteOrganization() {
-    if (busyAction !== null || !org || !confirm(t('orgs.delete_confirm', { name: org.name }))) {
+    if (busyAction !== null || !org || !(await confirmer.ask({
+      title: t('orgs.delete_organization'),
+      message: t('orgs.delete_confirm', { name: org.name }),
+      confirmLabel: t('orgs.delete_organization'),
+    }))) {
       return;
     }
     const expectedName = name;
@@ -334,7 +341,11 @@
   async function removeOrganizationMember(member: OrganizationMember) {
     if (
       busyAction !== null ||
-      !confirm(t('orgs.remove_member_confirm', { user: memberName(member) }))
+      !(await confirmer.ask({
+        title: t('orgs.remove_member_confirm_title'),
+        message: t('orgs.remove_member_confirm', { user: memberName(member) }),
+        confirmLabel: t('common.remove'),
+      }))
     ) {
       return;
     }
@@ -375,7 +386,11 @@
   }
 
   async function deleteTeam(team: OrganizationTeam) {
-    if (busyAction !== null || !confirm(t('orgs.delete_team_confirm', { name: team.name }))) {
+    if (busyAction !== null || !(await confirmer.ask({
+      title: t('orgs.delete_team_confirm_title'),
+      message: t('orgs.delete_team_confirm', { name: team.name }),
+      confirmLabel: t('common.delete'),
+    }))) {
       return;
     }
     const expectedName = name;
@@ -455,7 +470,11 @@
   async function removeTeamMember(teamId: number, member: TeamMember) {
     if (
       busyAction !== null ||
-      !confirm(t('orgs.remove_team_member_confirm', { user: memberName(member) }))
+      !(await confirmer.ask({
+        title: t('orgs.remove_team_member_confirm_title'),
+        message: t('orgs.remove_team_member_confirm', { user: memberName(member) }),
+        confirmLabel: t('common.remove'),
+      }))
     ) {
       return;
     }
@@ -753,6 +772,8 @@
     </div>
   {/if}
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .org-header,

@@ -17,6 +17,7 @@ import { adoptConfirmedSession, forgetDeletedAccount } from '../stores/auth.svel
 import { setTestPage } from '../test/app';
 import { admin, auth, resetTestClient } from '../test/client';
 import {
+	answerConfirm,
 	button,
 	click,
 	element,
@@ -42,7 +43,6 @@ let rendered: RenderedComponent | undefined;
 
 beforeEach(() => {
 	resetTestClient();
-	vi.stubGlobal('confirm', vi.fn(() => true));
 	auth.me.mockResolvedValue(me);
 });
 
@@ -134,6 +134,8 @@ describe('profile and account settings', () => {
 		const page = await openProfile();
 		await input(element<HTMLInputElement>(page, '.delete-form input'), 'Old-pass1');
 		await submit(element<HTMLFormElement>(page, 'form.delete-form'));
+		expect(auth.deleteAccount).not.toHaveBeenCalled();
+		expect(await answerConfirm()).toContain('every repository it owns');
 		expect(auth.deleteAccount).toHaveBeenCalledWith({ password: 'Old-pass1' });
 		expect(forgetDeletedAccount).toHaveBeenCalled();
 	});
@@ -145,6 +147,7 @@ describe('profile and account settings', () => {
 		expect(page.querySelector('.password-form')).toBeNull();
 		await input(element<HTMLInputElement>(page, '.delete-form input'), 'alice');
 		await submit(element<HTMLFormElement>(page, 'form.delete-form'));
+		await answerConfirm();
 		expect(auth.deleteAccount).toHaveBeenCalledWith({ confirm_username: 'alice' });
 	});
 });
@@ -207,6 +210,7 @@ describe('admin user provisioning', () => {
 		const resets = rendered.container.querySelectorAll('.reset-password');
 		expect(resets).toHaveLength(1);
 		await click(resets[0]);
+		expect(await answerConfirm()).toContain('bob');
 		expect(admin.resetUserPassword).toHaveBeenCalledWith(2);
 		expect(element(rendered.container, '.temporary-password').textContent).toBe(
 			'zyxwv-TSRQP-98765-kjhgf',

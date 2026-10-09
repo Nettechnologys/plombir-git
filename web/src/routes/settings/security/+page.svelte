@@ -17,8 +17,11 @@
   } from '$lib/api/client.svelte';
   import { createT, formatDate } from '$lib/i18n';
   import { readSsoError, ssoErrorMessage, type SsoError } from '$lib/ssoError';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   let loading = $state(true);
   let saving = $state(false);
@@ -199,7 +202,11 @@
   }
 
   async function removePasskey(id: number) {
-    if (!confirm(t('account_security.passkeys.remove_confirm'))) return;
+    if (!(await confirmer.ask({
+      title: t('account_security.passkeys.remove_confirm_title'),
+      message: t('account_security.passkeys.remove_confirm'),
+      confirmLabel: t('account_security.passkeys.remove'),
+    }))) return;
     if (passkeyBusy) return;
     const claim = passkeyRequests.begin('passkeys');
     try {
@@ -219,7 +226,11 @@
   }
 
   async function unlinkSsoProvider(link: SsoLink) {
-    if (!confirm(t('account_security.sso.unlink_confirm', { provider: link.name }))) return;
+    if (!(await confirmer.ask({
+      title: t('account_security.sso.unlink_confirm_title'),
+      message: t('account_security.sso.unlink_confirm', { provider: link.name }),
+      confirmLabel: t('account_security.sso.unlink'),
+    }))) return;
     if (ssoBusy) return;
     const claim = ssoRequests.begin('sso-links');
     try {
@@ -285,7 +296,11 @@
       error = t('account_security.password_required');
       return;
     }
-    if (!confirm(t('account_security.mfa.disable_confirm'))) return;
+    if (!(await confirmer.ask({
+      title: t('account_security.mfa.disable'),
+      message: t('account_security.mfa.disable_confirm'),
+      confirmLabel: t('account_security.mfa.disable'),
+    }))) return;
 
     try {
       saving = true;
@@ -311,7 +326,11 @@
       error = t('account_security.password_required');
       return;
     }
-    if (!confirm(t('account_security.mfa.regenerate_confirm'))) return;
+    if (!(await confirmer.ask({
+      title: t('account_security.mfa.regenerate'),
+      message: t('account_security.mfa.regenerate_confirm'),
+      confirmLabel: t('account_security.mfa.regenerate'),
+    }))) return;
 
     try {
       saving = true;
@@ -607,6 +626,8 @@
     </section>
   {/if}
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .security-page {

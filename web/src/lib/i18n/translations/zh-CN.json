@@ -9,6 +9,7 @@
     "create": "创建",
     "submit": "提交",
     "delete": "删除",
+    "remove": "移除",
     "loading": "加载中...",
     "error": "错误",
     "success": "成功",
@@ -100,6 +101,7 @@
     "title_required": "请输入密钥标题。",
     "key_required": "请粘贴 SSH 公钥。",
     "delete_confirm": "删除 SSH 密钥“{title}”？",
+    "delete_confirm_title": "删除 SSH 密钥",
     "load_failed": "加载 SSH 密钥失败",
     "add_failed": "添加 SSH 密钥失败",
     "delete_failed": "删除 SSH 密钥失败"
@@ -352,8 +354,11 @@
     "delete_organization": "删除组织",
     "delete_confirm": "删除组织 {name} 及其所有仓库？此操作无法撤销。",
     "delete_team_confirm": "删除团队 {name}？此操作无法撤销。",
+    "delete_team_confirm_title": "删除团队",
     "remove_member_confirm": "将 {user} 移出该组织？",
+    "remove_member_confirm_title": "移除成员",
     "remove_team_member_confirm": "将 {user} 移出该团队？",
+    "remove_team_member_confirm_title": "移除团队成员",
     "view_team_members": "查看成员",
     "hide_team_members": "隐藏成员",
     "team_members": "团队成员",
@@ -624,6 +629,7 @@
       "date": "日期",
       "total_hours": "总计：{hours} 小时",
       "delete_confirm": "删除此时间条目？",
+      "delete_confirm_title": "删除时间记录",
       "no_entries": "暂无时间条目。",
       "total_unavailable": "无法加载工时总计。"
     },
@@ -729,7 +735,8 @@
     "no_due_date": "无截止日期",
     "close": "关闭",
     "reopen": "重新打开",
-    "delete_confirm": "删除里程碑 {title}？"
+    "delete_confirm": "删除里程碑 {title}？",
+    "delete_confirm_title": "删除里程碑"
   },
   "pulls": {
     "title": "拉取请求",
@@ -1147,6 +1154,7 @@
       "remove": "删除",
       "remove_selected": "删除所选",
       "remove_confirm": "删除 {count} 个 LFS 对象？此操作无法撤销。",
+      "remove_confirm_title": "移除 LFS 对象",
       "removed": "已删除 {deleted} 个对象。",
       "kept": "保留 {oid}：{reason}",
       "remove_failed": "删除对象失败：{message}"
@@ -1165,6 +1173,7 @@
       "created": "部署密钥已添加。",
       "deleted": "部署密钥已移除。",
       "delete_confirm": "移除部署密钥 {title}？",
+      "delete_confirm_title": "移除部署密钥",
       "load_failed": "加载部署密钥失败",
       "create_failed": "添加部署密钥失败",
       "delete_failed": "移除部署密钥失败"
@@ -1217,6 +1226,7 @@
       "updated": "Webhook 已更新。",
       "deleted": "Webhook 已删除。",
       "delete_confirm": "删除 Webhook {url}？",
+      "delete_confirm_title": "删除 Webhook",
       "url_required": "请输入 Payload URL。",
       "events_required": "请至少选择一个事件。",
       "load_failed": "加载 Webhooks 失败",
@@ -1272,6 +1282,7 @@
       "updated": "分支保护规则已更新。",
       "deleted": "分支保护规则已删除。",
       "delete_confirm": "删除 {branch} 的保护规则？",
+      "delete_confirm_title": "删除分支保护",
       "branch_required": "请输入分支名。",
       "load_failed": "加载分支保护规则失败",
       "save_failed": "保存分支保护规则失败",
@@ -1299,6 +1310,7 @@
       "updated": "权限已更新。",
       "removed": "协作者已移除。",
       "remove_confirm": "从此仓库移除 {user}？",
+      "remove_confirm_title": "移除协作者",
       "unnamed_user": "用户 #{userId}",
       "user_id_required": "请输入有效的数字用户 ID。",
       "user_required": "请输入用户名、邮箱或数字用户 ID。",
@@ -1359,7 +1371,8 @@
       "empty": "暂无受保护的标签模式。",
       "allowed": "允许：{users}",
       "nobody": "任何人都不能推送此模式",
-      "delete_confirm": "删除 {pattern} 的保护规则？"
+      "delete_confirm": "删除 {pattern} 的保护规则？",
+      "delete_confirm_title": "删除标签保护"
     },
     "environments": {
       "title": "环境",
@@ -1378,7 +1391,8 @@
       "approvals_required": "需要 {count} 个审批",
       "unprotected": "未受保护",
       "reviewers": "审核者：{users}",
-      "delete_confirm": "删除环境 {name}？"
+      "delete_confirm": "删除环境 {name}？",
+      "delete_confirm_title": "删除环境"
     },
     "ci_secrets": {
       "title": "CI 密钥",
@@ -1389,7 +1403,8 @@
       "save": "保存密钥",
       "list_title": "已配置的密钥",
       "empty": "暂无已配置的密钥。",
-      "delete_confirm": "删除 {name}？"
+      "delete_confirm": "删除 {name}？",
+      "delete_confirm_title": "删除 CI 密钥"
     },
     "retention": {
       "title": "CI 保留策略",
@@ -1592,6 +1607,7 @@
         "empty": "尚未配置单点登录提供方。",
         "name_slug_required": "单点登录提供方的名称和 Slug 为必填项",
         "delete_confirm": "确定要删除单点登录提供方 \"{name}\" 吗？",
+        "delete_confirm_title": "删除 SSO 提供方",
         "test_failed": "LDAP 连接测试失败",
         "enabled": "已启用",
         "disabled": "已禁用",
@@ -1771,12 +1787,14 @@
     "created": "智能体 @{username} 已创建。请将它添加为需要它参与的仓库的协作者。",
     "create_failed": "创建智能体失败",
     "delete_confirm": "删除智能体 @{username}？它的令牌将失效，它的仓库也会被删除。",
+    "delete_confirm_title": "删除代理",
     "deleted": "智能体 @{username} 已删除",
     "delete_failed": "删除智能体失败",
     "token_name_required": "令牌名称为必填项",
     "token_created": "令牌已创建。请立即复制，它不会再次显示。",
     "token_create_failed": "创建令牌失败",
     "token_revoke_confirm": "撤销 @{username} 的令牌“{name}”？",
+    "token_revoke_confirm_title": "撤销代理令牌",
     "token_revoked": "令牌已撤销",
     "token_revoke_failed": "撤销令牌失败",
     "token_copied": "令牌已复制",
@@ -1825,6 +1843,7 @@
     "queued": "导入已加入队列",
     "start_failed": "启动导入失败",
     "delete_confirm": "取消并删除此导入任务？",
+    "delete_confirm_title": "删除导入任务",
     "deleted": "导入任务已删除",
     "delete_failed": "删除导入任务失败",
     "new_title": "新建导入",
@@ -1944,6 +1963,7 @@
       "registered": "通行密钥已注册。",
       "register_failed": "注册通行密钥失败",
       "remove_confirm": "要移除此通行密钥吗？移除后将无法再用它登录。",
+      "remove_confirm_title": "移除通行密钥",
       "removed": "通行密钥已移除。",
       "remove_failed": "移除通行密钥失败"
     },
@@ -1962,6 +1982,7 @@
       "linked_notice": "提供方已关联。现在您可以通过它登录。",
       "link_failed": "无法开始关联 {provider}",
       "unlink_confirm": "要取消关联 {provider} 吗？在您从本页重新关联之前，将无法通过它登录。",
+      "unlink_confirm_title": "解除登录提供方关联",
       "unlinked": "已取消关联 {provider}。",
       "unlink_failed": "取消关联提供方失败"
     }
@@ -1993,6 +2014,7 @@
     "created_notice": "令牌已创建。请立即复制，它不会再次显示。",
     "create_failed": "创建令牌失败",
     "revoke_confirm": "要吊销令牌“{name}”吗？",
+    "revoke_confirm_title": "撤销访问令牌",
     "revoked": "令牌已吊销",
     "revoke_failed": "吊销令牌失败",
     "copied": "令牌已复制"

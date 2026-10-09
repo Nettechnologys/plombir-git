@@ -55,7 +55,6 @@ let rendered: RenderedComponent | undefined;
 beforeEach(() => {
 	resetTestClient();
 	setTestPage('/alice/demo/settings', { owner: 'alice', repo: 'demo' });
-	vi.stubGlobal('confirm', vi.fn(() => true));
 });
 
 afterEach(async () => {

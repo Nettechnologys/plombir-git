@@ -119,7 +119,6 @@ let rendered: RenderedComponent | undefined;
 beforeEach(() => {
 	resetTestClient();
 	setTestPage('/alice/demo/issues', { owner: 'alice', repo: 'demo' });
-	vi.stubGlobal('confirm', vi.fn(() => true));
 
 	issues.list.mockResolvedValue({ data: [], pagination: pagination() });
 	issues.templates.mockResolvedValue([]);

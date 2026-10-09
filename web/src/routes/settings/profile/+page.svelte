@@ -9,8 +9,11 @@
   } from '$lib/stores/auth.svelte';
   import { createT } from '$lib/i18n';
   import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from '$lib/passwordPolicy';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   let me = $state<Me | null>(null);
   let loadError = $state('');
@@ -162,7 +165,11 @@
   async function deleteAccount(e: Event) {
     e.preventDefault();
     if (!me) return;
-    if (!confirm(t('settings.profile.delete_confirm', 'Delete this account and every repository it owns? This cannot be undone.'))) {
+    if (!(await confirmer.ask({
+      title: t('settings.profile.delete', 'Delete account'),
+      message: t('settings.profile.delete_confirm', 'Delete this account and every repository it owns? This cannot be undone.'),
+      confirmLabel: t('settings.profile.delete_button', 'Delete my account'),
+    }))) {
       return;
     }
     deleteBusy = true;
@@ -334,6 +341,8 @@
     </section>
   {/if}
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .hint {

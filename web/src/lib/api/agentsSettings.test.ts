@@ -12,6 +12,12 @@ import BotBadge from '../components/BotBadge.svelte';
 import { setTestPage } from '../test/app';
 import { bots, resetTestClient, splitList } from '../test/client';
 import {
+	expectEscapeClosesAndRestoresFocus,
+	expectModalSurvivesInteraction,
+	openModalFrom,
+} from '../test/modalContract';
+import {
+	answerConfirm,
 	check,
 	click,
 	element,
@@ -49,7 +55,6 @@ let rendered: RenderedComponent | undefined;
 beforeEach(() => {
 	resetTestClient();
 	setTestPage('/settings/agents', {});
-	vi.stubGlobal('confirm', vi.fn(() => true));
 	bots.list.mockResolvedValue([bot(2, 'alice-agent')]);
 	bots.listTokens.mockResolvedValue([botToken(5, 'claude-code')]);
 });
@@ -124,7 +129,8 @@ describe('agents settings', () => {
 		bots.deleteToken.mockResolvedValue(undefined);
 		await openTokens();
 		await click(element(rendered!.container, '.revoke-token'));
-		await settle();
+		expect(bots.deleteToken).not.toHaveBeenCalled();
+		await answerConfirm();
 		expect(bots.deleteToken).toHaveBeenCalledWith('alice-agent', 5);
 	});
 
@@ -132,15 +138,30 @@ describe('agents settings', () => {
 		bots.delete.mockResolvedValue(undefined);
 		rendered = await renderComponent(AgentsPage);
 		await click(element(rendered.container, '.delete-bot'));
-		await settle();
+		expect(bots.delete).not.toHaveBeenCalled();
+		expect(await answerConfirm()).toContain('@alice-agent');
 		expect(bots.delete).toHaveBeenCalledWith('alice-agent');
 		expect(bots.list).toHaveBeenCalledTimes(2);
 	});
 
 	it('keeps an agent when deletion is not confirmed', async () => {
-		vi.stubGlobal('confirm', vi.fn(() => false));
 		rendered = await renderComponent(AgentsPage);
 		await click(element(rendered.container, '.delete-bot'));
+		await answerConfirm(false);
+		expect(rendered.container.querySelector('[role="dialog"]')).toBeNull();
+		expect(bots.delete).not.toHaveBeenCalled();
+	});
+
+	// card_4c186d530f59: the confirmation is the page's own dialog, so it names
+	// the agent, starts on Cancel and closes on Escape without deleting.
+	it('asks in a modal that starts on Cancel and closes on Escape', async () => {
+		rendered = await renderComponent(AgentsPage);
+		const opener = element<HTMLButtonElement>(rendered.container, '.delete-bot');
+		const dialog = await openModalFrom(rendered.container, opener);
+		expect(dialog.querySelector('h2')?.textContent).toBe('Delete agent');
+		expect(document.activeElement).toBe(element(dialog, '.confirm-modal-cancel'));
+		await expectModalSurvivesInteraction(rendered.container, element(dialog, 'h2'));
+		await expectEscapeClosesAndRestoresFocus(rendered.container, opener);
 		expect(bots.delete).not.toHaveBeenCalled();
 	});
 });

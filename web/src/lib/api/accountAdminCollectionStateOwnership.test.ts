@@ -131,7 +131,6 @@ let rendered: RenderedComponent | undefined;
 beforeEach(() => {
 	resetTestClient();
 	setTestPage('/settings/tokens', {});
-	vi.stubGlobal('confirm', vi.fn(() => true));
 });
 
 afterEach(async () => {

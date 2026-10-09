@@ -19,14 +19,13 @@ import {
 	passkeys,
 	resetTestClient,
 } from '../test/client';
-import { button, click, renderComponent, type RenderedComponent } from '../test/render';
+import { answerConfirm, button, click, renderComponent, type RenderedComponent } from '../test/render';
 
 let rendered: RenderedComponent | undefined;
 
 beforeEach(async () => {
 	vi.clearAllMocks();
 	resetTestClient();
-	vi.stubGlobal('confirm', vi.fn(() => true));
 	routeAuth.me.mockResolvedValue({
 		id: 1,
 		username: 'alice',
@@ -84,6 +83,7 @@ describe('linked SSO identity production wiring', () => {
 		expect(rendered.container.textContent).toContain('Provider is switched off');
 
 		await click(button(rendered.container, 'Unlink'));
+		expect(await answerConfirm()).toContain('Corporate SSO');
 		expect(routeAuth.unlinkSso).toHaveBeenCalledWith('corp');
 		expect(
 			Array.from(rendered.container.querySelectorAll('button')).some(

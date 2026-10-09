@@ -9,6 +9,7 @@
     "create": "Create",
     "submit": "Submit",
     "delete": "Delete",
+    "remove": "Remove",
     "loading": "Loading...",
     "error": "Error",
     "success": "Success",
@@ -100,6 +101,7 @@
     "title_required": "Enter a title for this key.",
     "key_required": "Paste an SSH public key.",
     "delete_confirm": "Delete SSH key \"{title}\"?",
+    "delete_confirm_title": "Delete SSH key",
     "load_failed": "Failed to load SSH keys",
     "add_failed": "Failed to add SSH key",
     "delete_failed": "Failed to delete SSH key"
@@ -352,8 +354,11 @@
     "delete_organization": "Delete organization",
     "delete_confirm": "Delete organization {name} and all of its repositories? This cannot be undone.",
     "delete_team_confirm": "Delete team {name}? This cannot be undone.",
+    "delete_team_confirm_title": "Delete team",
     "remove_member_confirm": "Remove {user} from this organization?",
+    "remove_member_confirm_title": "Remove member",
     "remove_team_member_confirm": "Remove {user} from this team?",
+    "remove_team_member_confirm_title": "Remove team member",
     "view_team_members": "View members",
     "hide_team_members": "Hide members",
     "team_members": "Team members",
@@ -605,6 +610,7 @@
       "date": "Date",
       "total_hours": "Total: {hours} hours",
       "delete_confirm": "Delete this time entry?",
+      "delete_confirm_title": "Delete time entry",
       "no_entries": "No time entries yet.",
       "total_unavailable": "The time total could not be loaded."
     },
@@ -729,7 +735,8 @@
     "no_due_date": "No due date",
     "close": "Close",
     "reopen": "Reopen",
-    "delete_confirm": "Delete milestone {title}?"
+    "delete_confirm": "Delete milestone {title}?",
+    "delete_confirm_title": "Delete milestone"
   },
   "pulls": {
     "title": "Pull Requests",
@@ -1147,6 +1154,7 @@
       "remove": "Remove",
       "remove_selected": "Remove selected",
       "remove_confirm": "Remove {count} LFS objects? This cannot be undone.",
+      "remove_confirm_title": "Remove LFS objects",
       "removed": "Removed {deleted} objects.",
       "kept": "Kept {oid}: {reason}",
       "remove_failed": "Failed to remove objects: {message}"
@@ -1165,6 +1173,7 @@
       "created": "Deploy key added.",
       "deleted": "Deploy key removed.",
       "delete_confirm": "Remove deploy key {title}?",
+      "delete_confirm_title": "Remove deploy key",
       "load_failed": "Failed to load deploy keys",
       "create_failed": "Failed to add deploy key",
       "delete_failed": "Failed to remove deploy key"
@@ -1217,6 +1226,7 @@
       "updated": "Webhook updated.",
       "deleted": "Webhook deleted.",
       "delete_confirm": "Delete webhook {url}?",
+      "delete_confirm_title": "Delete webhook",
       "url_required": "Enter a payload URL.",
       "events_required": "Select at least one event.",
       "load_failed": "Failed to load webhooks",
@@ -1272,6 +1282,7 @@
       "updated": "Branch protection rule updated.",
       "deleted": "Branch protection rule deleted.",
       "delete_confirm": "Delete protection for {branch}?",
+      "delete_confirm_title": "Delete branch protection",
       "branch_required": "Enter a branch name.",
       "load_failed": "Failed to load branch protection rules",
       "save_failed": "Failed to save branch protection rule",
@@ -1299,6 +1310,7 @@
       "updated": "Permission updated.",
       "removed": "Collaborator removed.",
       "remove_confirm": "Remove {user} from this repository?",
+      "remove_confirm_title": "Remove collaborator",
       "unnamed_user": "User #{userId}",
       "user_id_required": "Enter a valid numeric user ID.",
       "user_required": "Enter a username, email, or numeric user ID.",
@@ -1359,7 +1371,8 @@
       "empty": "No protected tag patterns.",
       "allowed": "allowed: {users}",
       "nobody": "nobody may push this pattern",
-      "delete_confirm": "Delete protection for {pattern}?"
+      "delete_confirm": "Delete protection for {pattern}?",
+      "delete_confirm_title": "Delete tag protection"
     },
     "environments": {
       "title": "Environments",
@@ -1378,7 +1391,8 @@
       "approvals_required": "{count} approval(s) required",
       "unprotected": "Unprotected",
       "reviewers": "reviewers: {users}",
-      "delete_confirm": "Delete environment {name}?"
+      "delete_confirm": "Delete environment {name}?",
+      "delete_confirm_title": "Delete environment"
     },
     "ci_secrets": {
       "title": "CI secrets",
@@ -1389,7 +1403,8 @@
       "save": "Save secret",
       "list_title": "Configured secrets",
       "empty": "No secrets configured.",
-      "delete_confirm": "Delete {name}?"
+      "delete_confirm": "Delete {name}?",
+      "delete_confirm_title": "Delete CI secret"
     },
     "retention": {
       "title": "CI retention",
@@ -1592,6 +1607,7 @@
         "empty": "No SSO providers configured.",
         "name_slug_required": "SSO provider name and slug are required",
         "delete_confirm": "Delete SSO provider \"{name}\"?",
+        "delete_confirm_title": "Delete SSO provider",
         "test_failed": "LDAP connection test failed",
         "enabled": "Enabled",
         "disabled": "Disabled",
@@ -1771,12 +1787,14 @@
     "created": "Agent @{username} created. Add it as a collaborator on the repositories it should work on.",
     "create_failed": "Failed to create agent",
     "delete_confirm": "Delete agent @{username}? Its tokens stop working and its repositories are deleted.",
+    "delete_confirm_title": "Delete agent",
     "deleted": "Agent @{username} deleted",
     "delete_failed": "Failed to delete agent",
     "token_name_required": "Token name is required",
     "token_created": "Token created. Copy it now; it will not be shown again.",
     "token_create_failed": "Failed to create token",
     "token_revoke_confirm": "Revoke token \"{name}\" of @{username}?",
+    "token_revoke_confirm_title": "Revoke agent token",
     "token_revoked": "Token revoked",
     "token_revoke_failed": "Failed to revoke token",
     "token_copied": "Token copied",
@@ -1825,6 +1843,7 @@
     "queued": "Import queued",
     "start_failed": "Failed to start import",
     "delete_confirm": "Cancel and delete this import task?",
+    "delete_confirm_title": "Delete import task",
     "deleted": "Import deleted",
     "delete_failed": "Failed to delete import",
     "new_title": "New import",
@@ -1944,6 +1963,7 @@
       "registered": "Passkey registered.",
       "register_failed": "Failed to register passkey",
       "remove_confirm": "Remove this passkey? You will no longer be able to sign in with it.",
+      "remove_confirm_title": "Remove passkey",
       "removed": "Passkey removed.",
       "remove_failed": "Failed to remove passkey"
     },
@@ -1962,6 +1982,7 @@
       "linked_notice": "Provider linked. You can now sign in through it.",
       "link_failed": "Failed to start linking {provider}",
       "unlink_confirm": "Unlink {provider}? You will not be able to sign in through it until you link it again from this page.",
+      "unlink_confirm_title": "Unlink sign-in provider",
       "unlinked": "{provider} unlinked.",
       "unlink_failed": "Failed to unlink the provider"
     }
@@ -1993,6 +2014,7 @@
     "created_notice": "Token created. Copy it now; it will not be shown again.",
     "create_failed": "Failed to create token",
     "revoke_confirm": "Revoke token \"{name}\"?",
+    "revoke_confirm_title": "Revoke access token",
     "revoked": "Token revoked",
     "revoke_failed": "Failed to revoke token",
     "copied": "Token copied"

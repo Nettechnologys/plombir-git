@@ -3,8 +3,11 @@
   import { deployKeys, type DeployKey } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
   const owner = $derived($page.params.owner!);
   const repo = $derived($page.params.repo!);
 
@@ -124,7 +127,11 @@
   }
 
   async function removeKey(key: DeployKey) {
-    if (!confirm(t('settings.deploy_keys.delete_confirm', { title: key.title }))) return;
+    if (!(await confirmer.ask({
+      title: t('settings.deploy_keys.delete_confirm_title'),
+      message: t('settings.deploy_keys.delete_confirm', { title: key.title }),
+      confirmLabel: t('common.remove'),
+    }))) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -202,6 +209,8 @@
     {/if}
   </section>
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .deploy-keys-page { max-width: 880px; }

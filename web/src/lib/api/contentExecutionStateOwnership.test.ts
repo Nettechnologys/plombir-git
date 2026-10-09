@@ -20,6 +20,7 @@ import {
 	wiki,
 } from '../test/client';
 import {
+	answerConfirm,
 	button,
 	click,
 	element,
@@ -118,7 +119,6 @@ beforeEach(() => {
 	resetTestClient();
 	// The write controls follow `viewer_permission` (card_3625a7b89abb).
 	repos.get.mockResolvedValue({ viewer_permission: 'write' });
-	vi.stubGlobal('confirm', vi.fn(() => true));
 });
 
 afterEach(async () => {
@@ -420,6 +420,7 @@ describe('repository content and execution state ownership', () => {
 		rendered = await renderComponent(ImportsPage);
 
 		await click(button(rendered.container, 'Delete'));
+		await answerConfirm();
 		await click(button(rendered.container, 'Refresh'));
 		removal.resolve();
 		await settle();

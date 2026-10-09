@@ -12,8 +12,11 @@
     type SsoProviderPayload,
   } from '$lib/api/client.svelte';
   import { createT, formatDateTime } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   // Three unrelated surfaces used to share one `loading`/`error` pair and one
   // composite initial `Promise.all`. That made every late response an owner of
@@ -316,7 +319,11 @@
 
   async function deleteSsoProvider(provider: AdminSsoProvider) {
     if (isSsoBusy(provider.id)) return;
-    if (!confirm(t('admin.settings.sso.delete_confirm', { name: provider.name }))) return;
+    if (!(await confirmer.ask({
+      title: t('admin.settings.sso.delete_confirm_title'),
+      message: t('admin.settings.sso.delete_confirm', { name: provider.name }),
+      confirmLabel: t('common.delete'),
+    }))) return;
     if (!claimSsoProvider(provider.id)) return;
     ssoError = '';
     try {
@@ -670,6 +677,8 @@
     {/if}
   </div>
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .settings-page { max-width: 700px; margin: 0 auto; padding: 24px; }

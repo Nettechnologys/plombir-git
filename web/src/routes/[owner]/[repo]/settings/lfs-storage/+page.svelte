@@ -8,8 +8,11 @@
   } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDateTime } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
   const owner = $derived($page.params.owner!);
   const repo = $derived($page.params.repo!);
 
@@ -129,7 +132,11 @@
    */
   async function remove(oids: string[]) {
     if (removing || oids.length === 0) return;
-    if (!confirm(t('settings.lfs_storage.remove_confirm', { count: oids.length }))) return;
+    if (!(await confirmer.ask({
+      title: t('settings.lfs_storage.remove_confirm_title'),
+      message: t('settings.lfs_storage.remove_confirm', { count: oids.length }),
+      confirmLabel: t('settings.lfs_storage.remove'),
+    }))) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -259,6 +266,8 @@
     {/if}
   </section>
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .lfs-storage-page { max-width: 880px; }

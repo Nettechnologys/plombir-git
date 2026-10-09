@@ -7,8 +7,11 @@
     reloadDeliveriesAfterRedelivery,
     webhookDeliveryOutcome,
   } from '$lib/api/webhookDelivery';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
   const owner = $derived($page.params.owner!);
   const repo = $derived($page.params.repo!);
 
@@ -203,7 +206,11 @@
   }
 
   async function removeWebhook(hook: RepositoryWebhook) {
-    if (!confirm(t('settings.webhooks.delete_confirm', { url: hook.url }))) return;
+    if (!(await confirmer.ask({
+      title: t('settings.webhooks.delete_confirm_title'),
+      message: t('settings.webhooks.delete_confirm', { url: hook.url }),
+      confirmLabel: t('common.delete'),
+    }))) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -556,6 +563,8 @@
     </section>
   {/if}
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .webhooks-page {

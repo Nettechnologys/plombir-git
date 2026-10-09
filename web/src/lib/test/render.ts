@@ -77,3 +77,21 @@ export async function submit(form: HTMLFormElement): Promise<void> {
 	form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
 	await settle();
 }
+
+/**
+ * Answers the page's `ConfirmModal` (card_4c186d530f59): checks that a
+ * confirmation is open and names what it asks about, then presses the action
+ * (default) or Cancel. Returns the dialog's message so a test can pin it.
+ */
+export async function answerConfirm(
+	accept = true,
+	root: ParentNode = document.body,
+): Promise<string> {
+	const dialog = root.querySelector<HTMLElement>('[role="dialog"]');
+	if (!dialog?.querySelector('.confirm-modal-accept')) {
+		throw new Error('No confirmation dialog is open');
+	}
+	const message = element(dialog, '.confirm-modal-message').textContent?.trim() ?? '';
+	await click(element(dialog, accept ? '.confirm-modal-accept' : '.confirm-modal-cancel'));
+	return message;
+}

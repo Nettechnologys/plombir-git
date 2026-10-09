@@ -6,6 +6,7 @@ import { fetchUser, logout } from '../stores/auth.svelte';
 import { setTestPage } from '../test/app';
 import { auth, orgs, repos, resetTestClient } from '../test/client';
 import {
+	answerConfirm,
 	button,
 	click,
 	element,
@@ -39,7 +40,6 @@ const teams = [
 beforeEach(async () => {
 	resetTestClient();
 	setTestPage('/orgs/acme', { name: 'acme' });
-	vi.stubGlobal('confirm', vi.fn(() => true));
 	auth.me.mockResolvedValue({
 		id: 1,
 		username: 'alice',
@@ -119,6 +119,7 @@ describe('organization management', () => {
 			row.textContent?.includes('bob'),
 		)!;
 		await click(element(bobRow, '.btn-danger'));
+		expect(await answerConfirm()).toContain('bob');
 		expect(orgs.removeMember).toHaveBeenCalledWith('acme', 2);
 
 		await click(button(teamSection, 'View members'));
@@ -129,12 +130,16 @@ describe('organization management', () => {
 		expect(orgs.addTeamMember).toHaveBeenCalledWith('acme', 5, 'dave', 'member');
 
 		await click(element(teamSection, '.team-members .item .btn-danger'));
+		await answerConfirm();
 		expect(orgs.removeTeamMember).toHaveBeenCalledWith('acme', 5, 2);
 
 		await click(element(teamSection, '.managed-item > .item-row .btn-danger'));
+		await answerConfirm();
 		expect(orgs.deleteTeam).toHaveBeenCalledWith('acme', 5);
 
 		await click(element(rendered.container, '.header-actions .btn-danger'));
+		expect(orgs.delete).not.toHaveBeenCalled();
+		expect(await answerConfirm()).toContain('Delete organization');
 		expect(orgs.delete).toHaveBeenCalledWith('acme');
 	});
 });

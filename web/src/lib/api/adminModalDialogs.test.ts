@@ -33,7 +33,6 @@ let rendered: RenderedComponent | undefined;
 beforeEach(() => {
 	resetTestClient();
 	setTestPage('/admin', {});
-	vi.stubGlobal('confirm', vi.fn(() => true));
 });
 
 afterEach(async () => {

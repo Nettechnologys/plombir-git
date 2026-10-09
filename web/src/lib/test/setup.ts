@@ -1,4 +1,4 @@
-import { vi } from 'vitest';
+import { beforeEach, vi } from 'vitest';
 
 vi.mock('$app/stores', async () => {
 	const { pageStore } = await import('$lib/test/app');
@@ -27,3 +27,12 @@ vi.mock('$app/environment', () => ({
 }));
 
 vi.mock('$lib/api/client.svelte', async () => import('$lib/test/client'));
+
+// Pages confirm irreversible actions in their own `ConfirmModal`, never in a
+// native dialog (card_4c186d530f59): a browser that suppresses dialogs answers
+// `false` without showing anything. Any `window.confirm()` fails the test.
+beforeEach(() => {
+	window.confirm = () => {
+		throw new Error('window.confirm() was called; confirm through ConfirmModal');
+	};
+});

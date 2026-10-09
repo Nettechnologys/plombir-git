@@ -3,8 +3,11 @@
   import { allowedUserLabel, ciEnvironments, parseStringList, type CiEnvironment } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   const owner = $derived($page.params.owner!); const repo = $derived($page.params.repo!);
   let items = $state<CiEnvironment[]>([]); let name = $state('production'); let isProtected = $state(true);
@@ -80,7 +83,11 @@
     }
   }
   async function remove(item: CiEnvironment) {
-    if (!confirm(t('settings.environments.delete_confirm', { name: item.name }))) return;
+    if (!(await confirmer.ask({
+      title: t('settings.environments.delete_confirm_title'),
+      message: t('settings.environments.delete_confirm', { name: item.name }),
+      confirmLabel: t('common.delete'),
+    }))) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -109,4 +116,7 @@
   </form></section>
   <section><h2>{t('settings.environments.list_title')}</h2>{#if items.length === 0}<p>{t('settings.environments.empty')}</p>{:else}<div class="list">{#each items as item (item.id)}<article><div><strong>{item.name}</strong><p>{item.protected ? t('settings.environments.approvals_required', { count: item.required_approvals }) : t('settings.environments.unprotected')}{(item.allowed_approvers ?? []).length ? ` · ${t('settings.environments.reviewers', { users: (item.allowed_approvers ?? []).map(allowedUserLabel).join(', ') })}` : ''}</p></div><div class="actions"><button class="btn" disabled={isBusy(rowKey(item.id))} onclick={() => edit(item)}>{t('common.edit')}</button><button class="btn btn-danger" disabled={isBusy(rowKey(item.id))} aria-busy={isBusy(rowKey(item.id))} onclick={() => remove(item)}>{t('common.delete')}</button></div></article>{/each}</div>{/if}</section>
 </div>
+
+<ConfirmModal {confirmer} />
+
 <style>.settings-page{max-width:880px}header,section{margin-bottom:28px}header p,article p,label span{color:var(--text-secondary)}form{display:grid;gap:9px}input{padding:8px 10px}.check,.actions{display:flex;align-items:center;gap:8px}.check input{width:auto}.message{color:var(--red);padding:12px;border:1px solid var(--border);border-radius:var(--radius)}.list{display:grid;gap:10px}article{display:flex;align-items:center;justify-content:space-between;padding:14px;border:1px solid var(--border);border-radius:var(--radius)}article p{margin:4px 0 0;font-size:13px}</style>

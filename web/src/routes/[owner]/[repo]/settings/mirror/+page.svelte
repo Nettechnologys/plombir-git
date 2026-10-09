@@ -3,8 +3,11 @@
   import { mirrors, buildMirrorPayload, type RepositoryMirror } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDateTime } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
   const owner = $derived($page.params.owner!);
   const repo = $derived($page.params.repo!);
 
@@ -147,7 +150,11 @@
   }
 
   async function removeMirror() {
-    if (isBusy() || !mirror || !confirm(t('settings.mirror.delete_confirm'))) return;
+    if (isBusy() || !mirror || !(await confirmer.ask({
+      title: t('settings.mirror.delete'),
+      message: t('settings.mirror.delete_confirm'),
+      confirmLabel: t('settings.mirror.delete'),
+    }))) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -280,6 +287,8 @@
     {/if}
   {/if}
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .mirror-page {

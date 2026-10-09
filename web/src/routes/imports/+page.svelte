@@ -4,8 +4,11 @@
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isLoggedIn, getUser } from '$lib/stores/auth.svelte';
   import { createT, formatDateTime } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   let taskList = $state<ImportTask[]>([]);
   let loading = $state(true);
@@ -159,7 +162,11 @@
   }
 
   async function deleteImport(id: number) {
-    if (!confirm(t('imports.delete_confirm'))) return;
+    if (!(await confirmer.ask({
+      title: t('imports.delete_confirm_title'),
+      message: t('imports.delete_confirm'),
+      confirmLabel: t('common.delete'),
+    }))) return;
     if (!activeAccountIdentity || deletingImports.has(id)) return;
     const expectedIdentity = activeAccountIdentity;
     const expectedGeneration = accountGeneration;
@@ -320,6 +327,8 @@
     {/if}
   </section>
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .page-header {

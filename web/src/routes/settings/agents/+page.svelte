@@ -5,8 +5,11 @@
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
   import { createT, formatDate as formatLocaleDate } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   let botList = $state<Bot[]>([]);
   let loading = $state(true);
@@ -102,7 +105,11 @@
   }
 
   async function deleteBot(bot: Bot) {
-    if (!confirm(t('agents.delete_confirm', { username: bot.username }))) return;
+    if (!(await confirmer.ask({
+      title: t('agents.delete_confirm_title'),
+      message: t('agents.delete_confirm', { username: bot.username }),
+      confirmLabel: t('common.delete'),
+    }))) return;
     const username = bot.username;
     if (busyBots.has(username)) return;
     busyBots = new Set(busyBots).add(username);
@@ -183,7 +190,11 @@
   async function revokeToken(token: BotToken) {
     const username = selected;
     if (!username) return;
-    if (!confirm(t('agents.token_revoke_confirm', { name: token.name, username }))) return;
+    if (!(await confirmer.ask({
+      title: t('agents.token_revoke_confirm_title'),
+      message: t('agents.token_revoke_confirm', { name: token.name, username }),
+      confirmLabel: t('agents.revoke'),
+    }))) return;
     const tokenId = token.id;
     if (busyTokenIds.has(tokenId)) return;
     busyTokenIds = new Set(busyTokenIds).add(tokenId);
@@ -384,6 +395,8 @@
     {/if}
   </section>
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .agents-page {

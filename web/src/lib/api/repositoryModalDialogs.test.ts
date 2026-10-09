@@ -33,7 +33,6 @@ let rendered: RenderedComponent | undefined;
 
 beforeEach(() => {
 	resetTestClient();
-	vi.stubGlobal('confirm', vi.fn(() => true));
 	auth.me.mockResolvedValue({ id: 1, username: 'alice', email: 'alice@example.com', is_admin: false });
 	// The write controls follow `viewer_permission` (card_3625a7b89abb).
 	repos.get.mockResolvedValue({ default_branch: 'main', viewer_permission: 'write' });

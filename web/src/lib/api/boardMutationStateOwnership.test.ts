@@ -88,7 +88,6 @@ let rendered: RenderedComponent | undefined;
 
 beforeEach(async () => {
 	resetTestClient();
-	vi.stubGlobal('confirm', vi.fn(() => true));
 	setTestPage('/alice/demo/boards', { owner: 'alice', repo: 'demo' });
 	auth.me.mockResolvedValue({
 		id: 1,

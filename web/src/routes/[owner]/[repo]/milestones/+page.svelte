@@ -15,8 +15,11 @@
     LatestRepositoryResourceRequestFence,
   } from '$lib/asyncStateOwnership';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
   const owner = $derived($page.params.owner!);
   const repo = $derived($page.params.repo!);
 
@@ -187,7 +190,11 @@
   }
 
   async function deleteMilestone(milestone: Milestone) {
-    if (mutationBusy || !confirm(t('milestones.delete_confirm', { title: milestone.title }))) return;
+    if (mutationBusy || !(await confirmer.ask({
+      title: t('milestones.delete_confirm_title'),
+      message: t('milestones.delete_confirm', { title: milestone.title }),
+      confirmLabel: t('common.delete'),
+    }))) return;
 
     const route = currentRoute();
     milestoneListRequests.begin(route.owner, route.repo);
@@ -306,6 +313,8 @@
     </div>
   {/if}
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 20px; }

@@ -10,8 +10,11 @@
   } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
   const owner = $derived($page.params.owner!);
   const repo = $derived($page.params.repo!);
 
@@ -197,7 +200,11 @@
   }
 
   async function deleteRule(rule: BranchProtectionRule) {
-    if (!confirm(t('settings.branch_protection.delete_confirm', { branch: rule.branch_name }))) return;
+    if (!(await confirmer.ask({
+      title: t('settings.branch_protection.delete_confirm_title'),
+      message: t('settings.branch_protection.delete_confirm', { branch: rule.branch_name }),
+      confirmLabel: t('common.delete'),
+    }))) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -405,6 +412,8 @@
     {/if}
   </section>
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .branch-protection-page {

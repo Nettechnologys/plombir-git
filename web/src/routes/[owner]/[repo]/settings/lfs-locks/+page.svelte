@@ -3,8 +3,11 @@
   import { lfsLocks, type LfsLock } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDateTime } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
   const owner = $derived($page.params.owner!);
   const repo = $derived($page.params.repo!);
 
@@ -65,7 +68,11 @@
 
   async function forceUnlock(lock: LfsLock) {
     if (unlockingId !== null) return;
-    if (!confirm(t('settings.lfs_locks.force_confirm', { path: lock.path, owner: lock.owner.name }))) return;
+    if (!(await confirmer.ask({
+      title: t('settings.lfs_locks.force_unlock'),
+      message: t('settings.lfs_locks.force_confirm', { path: lock.path, owner: lock.owner.name }),
+      confirmLabel: t('settings.lfs_locks.force_unlock'),
+    }))) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -138,6 +145,8 @@
     {/if}
   {/if}
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .lfs-locks-page { max-width: 880px; }

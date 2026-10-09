@@ -3,8 +3,11 @@
   import { collaborators, type Collaborator } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
   const owner = $derived($page.params.owner!);
   const repo = $derived($page.params.repo!);
 
@@ -165,7 +168,11 @@
   }
 
   async function removeCollaborator(collaborator: Collaborator) {
-    if (!confirm(t('settings.collaborators.remove_confirm', { user: collaboratorName(collaborator) })))
+    if (!(await confirmer.ask({
+      title: t('settings.collaborators.remove_confirm_title'),
+      message: t('settings.collaborators.remove_confirm', { user: collaboratorName(collaborator) }),
+      confirmLabel: t('common.remove'),
+    })))
       return;
     const expectedOwner = owner;
     const expectedRepo = repo;
@@ -300,6 +307,8 @@
     {/if}
   </section>
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .collaborators-page {

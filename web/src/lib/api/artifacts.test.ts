@@ -20,7 +20,7 @@ import {
 	repos as routeRepos,
 	resetTestClient,
 } from '../test/client';
-import { click, element, renderComponent, type RenderedComponent } from '../test/render';
+import { answerConfirm, click, element, renderComponent, type RenderedComponent } from '../test/render';
 import { artifacts } from './artifacts';
 
 let rendered: RenderedComponent | undefined;
@@ -103,7 +103,6 @@ describe('CI artifact client transport', () => {
 
 describe('CI artifact production wiring', () => {
 	it('renders authenticated download and confirmed destructive deletion', async () => {
-		vi.stubGlobal('confirm', vi.fn(() => true));
 		rendered = await renderComponent(PipelinesPage);
 
 		expect(routeArtifacts.list).toHaveBeenCalledWith('alice', 'demo', 7);
@@ -112,9 +111,8 @@ describe('CI artifact production wiring', () => {
 		expect(routeArtifacts.download).toHaveBeenCalledWith(11, 'build-report');
 
 		await click(element(rendered.container, '.artifact-delete'));
-		expect(globalThis.confirm).toHaveBeenCalledWith(
-			expect.stringContaining('build-report'),
-		);
+		expect(routeArtifacts.remove).not.toHaveBeenCalled();
+		expect(await answerConfirm()).toContain('build-report');
 		expect(routeArtifacts.remove).toHaveBeenCalledWith(11);
 		expect(rendered.container.querySelector('.artifact-row')).toBeNull();
 	});

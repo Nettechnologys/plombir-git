@@ -6,8 +6,11 @@
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
   import { renderMarkdown } from '$lib/utils/markdown';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
@@ -140,7 +143,11 @@
   }
 
   async function handleDelete() {
-    if (!confirm(t('wiki.delete_confirm'))) return;
+    if (!(await confirmer.ask({
+      title: t('wiki.delete'),
+      message: t('wiki.delete_confirm'),
+      confirmLabel: t('wiki.delete'),
+    }))) return;
     if (pageMutationBusy) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
@@ -226,7 +233,12 @@
   }
 
   async function restoreRevision(rev: any) {
-    if (!confirm(t('wiki.restore_confirm', { version: rev.version }))) return;
+    if (!(await confirmer.ask({
+      title: t('wiki.restore_version'),
+      message: t('wiki.restore_confirm', { version: rev.version }),
+      confirmLabel: t('wiki.restore_version'),
+      tone: 'primary',
+    }))) return;
     if (pageMutationBusy) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
@@ -369,6 +381,8 @@
     <div class="empty"><p>{t('wiki.not_found', 'Page not found')}</p></div>
   {/if}
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
 .empty { text-align: center; padding: 48px; color: var(--text-secondary); }

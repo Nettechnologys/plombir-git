@@ -8,8 +8,11 @@
   } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
   import { viewerPermission } from '$lib/viewerPermission.svelte';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
@@ -240,7 +243,11 @@
 
   async function handleDelete(id: number) {
     if (mutationBusy || !selectedIssue) return;
-    if (!confirm(t('repo.time_tracking.delete_confirm'))) return;
+    if (!(await confirmer.ask({
+      title: t('repo.time_tracking.delete_confirm_title'),
+      message: t('repo.time_tracking.delete_confirm'),
+      confirmLabel: t('common.delete'),
+    }))) return;
     const selection = {
       ...currentRoute(),
       issueNumber: selectedIssue.number,
@@ -410,6 +417,8 @@
     </div>
   </div>
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
 

@@ -5,8 +5,11 @@
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
   import { createT, formatDate as formatLocaleDate } from '$lib/i18n';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   interface AccessToken {
     id: number;
@@ -117,7 +120,11 @@
   }
 
   async function revokeToken(token: AccessToken) {
-    if (!confirm(t('access_tokens.revoke_confirm', { name: token.name }))) return;
+    if (!(await confirmer.ask({
+      title: t('access_tokens.revoke_confirm_title'),
+      message: t('access_tokens.revoke_confirm', { name: token.name }),
+      confirmLabel: t('access_tokens.revoke'),
+    }))) return;
     const tokenId = token.id;
     if (!claimToken(tokenId)) return;
 
@@ -249,6 +256,8 @@
     {/if}
   </section>
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .tokens-page {

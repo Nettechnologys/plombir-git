@@ -6081,7 +6081,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 457,
+          "line": 464,
           "via": null,
           "href": null,
           "handler": "openCreateModal",
@@ -6091,7 +6091,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 479,
+          "line": 486,
           "via": null,
           "href": null,
           "handler": "closeCreateModal",
@@ -6101,7 +6101,7 @@
         {
           "tag": "button",
           "label": "i18n:common.create",
-          "line": 480,
+          "line": 487,
           "via": null,
           "href": null,
           "handler": "createBoard",
@@ -6148,7 +6148,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 492,
+          "line": 499,
           "via": null,
           "href": null,
           "handler": null,
@@ -6158,7 +6158,7 @@
         {
           "tag": "select",
           "label": "# #",
-          "line": 496,
+          "line": 503,
           "via": null,
           "href": null,
           "handler": null,
@@ -6168,7 +6168,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 509,
+          "line": 516,
           "via": null,
           "href": null,
           "handler": "() => (editingCard = null)",
@@ -6178,7 +6178,7 @@
         {
           "tag": "button",
           "label": "i18n:common.save",
-          "line": 510,
+          "line": 517,
           "via": null,
           "href": null,
           "handler": "saveCard",
@@ -6220,7 +6220,7 @@
         {
           "tag": "button",
           "label": "&times;",
-          "line": 537,
+          "line": 544,
           "via": null,
           "href": null,
           "handler": "(e) => { e.stopPropagation(); deleteBoard(b.id); }",
@@ -6263,7 +6263,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 567,
+          "line": 574,
           "via": null,
           "href": null,
           "handler": "startEditBoard",
@@ -6273,7 +6273,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 568,
+          "line": 575,
           "via": null,
           "href": null,
           "handler": "openAddColumnForm",
@@ -6283,7 +6283,7 @@
         {
           "tag": "button",
           "label": "i18n:common.save",
-          "line": 579,
+          "line": 586,
           "via": null,
           "href": null,
           "handler": "saveBoard",
@@ -6311,7 +6311,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 580,
+          "line": 587,
           "via": null,
           "href": null,
           "handler": "() => (showEditBoard = false)",
@@ -6321,7 +6321,7 @@
         {
           "tag": "button",
           "label": "i18n:common.add",
-          "line": 587,
+          "line": 594,
           "via": null,
           "href": null,
           "handler": "addColumn",
@@ -6331,7 +6331,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 588,
+          "line": 595,
           "via": null,
           "href": null,
           "handler": "() => (showAddCol = false)",
@@ -6341,7 +6341,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 606,
+          "line": 613,
           "via": null,
           "href": null,
           "handler": "() => saveColumn(col)",
@@ -6351,7 +6351,7 @@
         {
           "tag": "button",
           "label": "×",
-          "line": 607,
+          "line": 614,
           "via": null,
           "href": null,
           "handler": "() => (editingColumnId = null)",
@@ -6361,7 +6361,7 @@
         {
           "tag": "button",
           "label": "✎",
-          "line": 611,
+          "line": 618,
           "via": null,
           "href": null,
           "handler": "() => startEditColumn(col)",
@@ -6371,7 +6371,7 @@
         {
           "tag": "button",
           "label": "&times;",
-          "line": 616,
+          "line": 623,
           "via": null,
           "href": null,
           "handler": "() => deleteColumn(col.id)",
@@ -6400,7 +6400,7 @@
         {
           "tag": "button",
           "label": "↑",
-          "line": 627,
+          "line": 634,
           "via": null,
           "href": null,
           "handler": "() => reorderCard(col, card.id, cardIndex - 1)",
@@ -6439,7 +6439,7 @@
         {
           "tag": "button",
           "label": "↓",
-          "line": 634,
+          "line": 641,
           "via": null,
           "href": null,
           "handler": "() => reorderCard(col, card.id, cardIndex + 1)",
@@ -6482,7 +6482,7 @@
         {
           "tag": "button",
           "label": "✎",
-          "line": 641,
+          "line": 648,
           "via": null,
           "href": null,
           "handler": "() => startEditCard(card)",
@@ -6492,7 +6492,7 @@
         {
           "tag": "button",
           "label": "&times;",
-          "line": 642,
+          "line": 649,
           "via": null,
           "href": null,
           "handler": "() => deleteCard(card.id, col.id)",
@@ -6521,7 +6521,7 @@
         {
           "tag": "a",
           "label": "#",
-          "line": 647,
+          "line": 654,
           "via": null,
           "href": "`/${owner}/${repo}/issues/${card.issue.number}`",
           "handler": null,
@@ -6531,7 +6531,7 @@
         {
           "tag": "select",
           "label": "i18n:board.moveTo",
-          "line": 653,
+          "line": 660,
           "via": null,
           "href": null,
           "handler": "(e) => moveCard(card.id, col.id, parseInt((e.target as HTMLSelectElement).value)",
@@ -6574,7 +6574,7 @@
         {
           "tag": "button",
           "label": "i18n:common.add",
-          "line": 672,
+          "line": 679,
           "via": null,
           "href": null,
           "handler": "() => addCard(col.id)",
@@ -6603,7 +6603,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 673,
+          "line": 680,
           "via": null,
           "href": null,
           "handler": "() => { showAddCard = null; newCardTitle = ''; }",
@@ -6613,7 +6613,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 676,
+          "line": 683,
           "via": null,
           "href": null,
           "handler": "() => openAddCardForm(col.id)",
@@ -6852,6 +6852,26 @@
           "via": "Modal",
           "href": null,
           "handler": "onclose",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
           "calls": [],
           "unresolved": true
         }
@@ -10568,7 +10588,7 @@
         {
           "tag": "select",
           "label": "i18n:milestones.open",
-          "line": 221,
+          "line": 228,
           "via": null,
           "href": null,
           "handler": null,
@@ -10578,7 +10598,7 @@
         {
           "tag": "form",
           "label": "i18n:milestones.name",
-          "line": 235,
+          "line": 242,
           "via": null,
           "href": null,
           "handler": "saveMilestone",
@@ -10643,7 +10663,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 248,
+          "line": 255,
           "via": null,
           "href": null,
           "handler": null,
@@ -10653,7 +10673,7 @@
         {
           "tag": "select",
           "label": "i18n:milestones.open",
-          "line": 252,
+          "line": 259,
           "via": null,
           "href": null,
           "handler": null,
@@ -10663,7 +10683,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 258,
+          "line": 265,
           "via": null,
           "href": null,
           "handler": null,
@@ -10673,7 +10693,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 262,
+          "line": 269,
           "via": null,
           "href": null,
           "handler": "startCreate",
@@ -10683,7 +10703,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 297,
+          "line": 304,
           "via": null,
           "href": null,
           "handler": "() => startEdit(milestone)",
@@ -10712,7 +10732,7 @@
         {
           "tag": "button",
           "label": "i18n:milestones.close",
-          "line": 298,
+          "line": 305,
           "via": null,
           "href": null,
           "handler": "() => toggleState(milestone)",
@@ -10751,7 +10771,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 301,
+          "line": 308,
           "via": null,
           "href": null,
           "handler": "() => deleteMilestone(milestone)",
@@ -11004,6 +11024,26 @@
           "handler": null,
           "calls": [],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": [
@@ -12942,7 +12982,7 @@
         {
           "tag": "form",
           "label": "updateTriggerRef(event.currentTarget.value)} onchange= place",
-          "line": 732,
+          "line": 739,
           "via": null,
           "href": null,
           "handler": "handleTrigger",
@@ -13025,7 +13065,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 761,
+          "line": 768,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.checked ? 'true' : 'f",
@@ -13035,7 +13075,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 770,
+          "line": 777,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.value)",
@@ -13045,7 +13085,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.starting",
-          "line": 798,
+          "line": 805,
           "via": null,
           "href": null,
           "handler": null,
@@ -13055,7 +13095,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.retry",
-          "line": 861,
+          "line": 868,
           "via": null,
           "href": null,
           "handler": "() => handleRetry(selectedPipeline.id)",
@@ -13122,7 +13162,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.cancel",
-          "line": 864,
+          "line": 871,
           "via": null,
           "href": null,
           "handler": "() => handleCancel(selectedPipeline.id)",
@@ -13146,7 +13186,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.play_manual",
-          "line": 924,
+          "line": 931,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handlePlay(job.id); }",
@@ -13198,7 +13238,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.approval_recorded",
-          "line": 927,
+          "line": 934,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handleApprove(job.id); }",
@@ -13250,7 +13290,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_downloading",
-          "line": 963,
+          "line": 970,
           "via": null,
           "href": null,
           "handler": "() => downloadArtifact(artifact)",
@@ -13275,7 +13315,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_deleting",
-          "line": 969,
+          "line": 976,
           "via": null,
           "href": null,
           "handler": "() => deleteArtifact(artifact)",
@@ -13300,7 +13340,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 1006,
+          "line": 1013,
           "via": null,
           "href": null,
           "handler": "closeLog",
@@ -13529,6 +13569,26 @@
           "via": "Modal",
           "href": null,
           "handler": "onclose",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
           "calls": [],
           "unresolved": true
         }
@@ -18516,7 +18576,7 @@
         {
           "tag": "form",
           "label": ")} removeRequiredStatusCheck(index)} disabled= aria-label= )",
-          "line": 247,
+          "line": 254,
           "via": null,
           "href": null,
           "handler": "saveRule",
@@ -18580,7 +18640,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 260,
+          "line": 267,
           "via": null,
           "href": null,
           "handler": null,
@@ -18590,7 +18650,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 265,
+          "line": 272,
           "via": null,
           "href": null,
           "handler": null,
@@ -18600,7 +18660,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 270,
+          "line": 277,
           "via": null,
           "href": null,
           "handler": null,
@@ -18610,7 +18670,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 275,
+          "line": 282,
           "via": null,
           "href": null,
           "handler": null,
@@ -18620,7 +18680,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 280,
+          "line": 287,
           "via": null,
           "href": null,
           "handler": null,
@@ -18630,7 +18690,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.branch_protection.replace_required_checks",
-          "line": 290,
+          "line": 297,
           "via": null,
           "href": null,
           "handler": "replaceUnreadableStatusChecks",
@@ -18640,7 +18700,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 318,
+          "line": 325,
           "via": null,
           "href": null,
           "handler": "() => removeRequiredStatusCheck(index)",
@@ -18650,7 +18710,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.branch_protection.add_required_check",
-          "line": 330,
+          "line": 337,
           "via": null,
           "href": null,
           "handler": "addRequiredStatusCheck",
@@ -18660,7 +18720,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 349,
+          "line": 356,
           "via": null,
           "href": null,
           "handler": "resetForm",
@@ -18670,7 +18730,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 353,
+          "line": 360,
           "via": null,
           "href": null,
           "handler": null,
@@ -18680,7 +18740,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 393,
+          "line": 400,
           "via": null,
           "href": null,
           "handler": "() => editRule(rule)",
@@ -18690,7 +18750,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 396,
+          "line": 403,
           "via": null,
           "href": null,
           "handler": "() => deleteRule(rule)",
@@ -18728,6 +18788,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -18740,7 +18820,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.ci_secrets.name",
-          "line": 94,
+          "line": 101,
           "via": null,
           "href": null,
           "handler": "save",
@@ -18787,7 +18867,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.ci_secrets.save",
-          "line": 94,
+          "line": 101,
           "via": null,
           "href": null,
           "handler": null,
@@ -18797,7 +18877,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 94,
+          "line": 101,
           "via": null,
           "href": null,
           "handler": "() => remove(item)",
@@ -18836,6 +18916,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -18848,7 +18948,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.collaborators.user_identifier",
-          "line": 215,
+          "line": 222,
           "via": null,
           "href": null,
           "handler": "handleAdd",
@@ -18896,7 +18996,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 229,
+          "line": 236,
           "via": null,
           "href": null,
           "handler": null,
@@ -18906,7 +19006,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.collaborators.adding",
-          "line": 236,
+          "line": 243,
           "via": null,
           "href": null,
           "handler": null,
@@ -18916,7 +19016,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 270,
+          "line": 277,
           "via": null,
           "href": null,
           "handler": null,
@@ -18926,7 +19026,7 @@
         {
           "tag": "button",
           "label": "i18n:common.save",
-          "line": 278,
+          "line": 285,
           "via": null,
           "href": null,
           "handler": "() => savePermission(collaborator)",
@@ -18969,7 +19069,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 286,
+          "line": 293,
           "via": null,
           "href": null,
           "handler": "() => removeCollaborator(collaborator)",
@@ -19008,6 +19108,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -19020,7 +19140,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.deploy_keys.name",
-          "line": 167,
+          "line": 174,
           "via": null,
           "href": null,
           "handler": "addKey",
@@ -19067,7 +19187,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 171,
+          "line": 178,
           "via": null,
           "href": null,
           "handler": null,
@@ -19077,7 +19197,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 172,
+          "line": 179,
           "via": null,
           "href": null,
           "handler": null,
@@ -19087,7 +19207,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 173,
+          "line": 180,
           "via": null,
           "href": null,
           "handler": null,
@@ -19097,7 +19217,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 192,
+          "line": 199,
           "via": null,
           "href": null,
           "handler": "() => removeKey(key)",
@@ -19135,6 +19255,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -19147,7 +19287,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.environments.name",
-          "line": 103,
+          "line": 110,
           "via": null,
           "href": null,
           "handler": "save",
@@ -19211,7 +19351,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 105,
+          "line": 112,
           "via": null,
           "href": null,
           "handler": null,
@@ -19221,7 +19361,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.environments.create",
-          "line": 108,
+          "line": 115,
           "via": null,
           "href": null,
           "handler": null,
@@ -19231,7 +19371,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 108,
+          "line": 115,
           "via": null,
           "href": null,
           "handler": "resetForm",
@@ -19241,7 +19381,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 110,
+          "line": 117,
           "via": null,
           "href": null,
           "handler": "() => edit(item)",
@@ -19251,7 +19391,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 110,
+          "line": 117,
           "via": null,
           "href": null,
           "handler": "() => remove(item)",
@@ -19290,6 +19430,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -19498,7 +19658,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.lfs_locks.force_unlock",
-          "line": 122,
+          "line": 129,
           "via": null,
           "href": null,
           "handler": "() => forceUnlock(lock)",
@@ -19523,7 +19683,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.lfs_locks.more",
-          "line": 135,
+          "line": 142,
           "via": null,
           "href": null,
           "handler": "loadMore",
@@ -19545,6 +19705,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -19557,7 +19737,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.lfs_storage.scanning",
-          "line": 180,
+          "line": 187,
           "via": null,
           "href": null,
           "handler": "findOrphans",
@@ -19585,7 +19765,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 194,
+          "line": 201,
           "via": null,
           "href": null,
           "handler": "(event) => toggle(object.oid, (event.currentTarget as HTMLInputElement).checked)",
@@ -19595,7 +19775,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.lfs_storage.remove_selected",
-          "line": 206,
+          "line": 213,
           "via": null,
           "href": null,
           "handler": "removeSelected",
@@ -19645,7 +19825,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.lfs_storage.remove",
-          "line": 243,
+          "line": 250,
           "via": null,
           "href": null,
           "handler": "() => remove([object.oid])",
@@ -19707,7 +19887,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.lfs_storage.more",
-          "line": 255,
+          "line": 262,
           "via": null,
           "href": null,
           "handler": "loadMore",
@@ -19740,6 +19920,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -19752,7 +19952,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.mirror.url",
-          "line": 204,
+          "line": 211,
           "via": null,
           "href": null,
           "handler": "saveMirror",
@@ -19791,7 +19991,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 228,
+          "line": 235,
           "via": null,
           "href": null,
           "handler": null,
@@ -19801,7 +20001,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 241,
+          "line": 248,
           "via": null,
           "href": null,
           "handler": null,
@@ -19811,7 +20011,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 245,
+          "line": 252,
           "via": null,
           "href": null,
           "handler": "syncMirror",
@@ -19849,7 +20049,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 248,
+          "line": 255,
           "via": null,
           "href": null,
           "handler": "removeMirror",
@@ -19870,6 +20070,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -19993,7 +20213,7 @@
         {
           "tag": "form",
           "label": ") as part}",
-          "line": 115,
+          "line": 122,
           "via": null,
           "href": null,
           "handler": "save",
@@ -20058,7 +20278,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.tag_protection.add",
-          "line": 120,
+          "line": 127,
           "via": null,
           "href": null,
           "handler": null,
@@ -20068,7 +20288,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 120,
+          "line": 127,
           "via": null,
           "href": null,
           "handler": "resetForm",
@@ -20078,7 +20298,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 122,
+          "line": 129,
           "via": null,
           "href": null,
           "handler": "() => edit(item)",
@@ -20088,7 +20308,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 122,
+          "line": 129,
           "via": null,
           "href": null,
           "handler": "() => remove(item)",
@@ -20127,6 +20347,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -20139,7 +20379,7 @@
         {
           "tag": "form",
           "label": "application/json application/x-www-form-urlencoded toggleEve",
-          "line": 380,
+          "line": 387,
           "via": null,
           "href": null,
           "handler": "createWebhook",
@@ -20186,7 +20426,7 @@
         {
           "tag": "select",
           "label": "application/json application/x-www-form-urlencoded",
-          "line": 389,
+          "line": 396,
           "via": null,
           "href": null,
           "handler": null,
@@ -20196,7 +20436,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 405,
+          "line": 412,
           "via": null,
           "href": null,
           "handler": "(e) => toggleEvent(event, e.currentTarget.checked)",
@@ -20206,7 +20446,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 417,
+          "line": 424,
           "via": null,
           "href": null,
           "handler": null,
@@ -20216,7 +20456,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 422,
+          "line": 429,
           "via": null,
           "href": null,
           "handler": null,
@@ -20226,7 +20466,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 448,
+          "line": 455,
           "via": null,
           "href": null,
           "handler": "(e) => setActive(hook, e.currentTarget.checked)",
@@ -20269,7 +20509,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.webhooks.hide_deliveries",
-          "line": 457,
+          "line": 464,
           "via": null,
           "href": null,
           "handler": "() => selectedHook?.id === hook.id ? closeDeliveries() : openDeliveries(hook)",
@@ -20316,7 +20556,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 468,
+          "line": 475,
           "via": null,
           "href": null,
           "handler": "() => removeWebhook(hook)",
@@ -20359,7 +20599,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 486,
+          "line": 493,
           "via": null,
           "href": null,
           "handler": "refreshDeliveries",
@@ -20384,7 +20624,7 @@
         {
           "tag": "button",
           "label": "i18n:common.close",
-          "line": 494,
+          "line": 501,
           "via": null,
           "href": null,
           "handler": "closeDeliveries",
@@ -20394,7 +20634,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.webhooks.redelivering",
-          "line": 521,
+          "line": 528,
           "via": null,
           "href": null,
           "handler": "() => redeliverDelivery(delivery)",
@@ -20433,6 +20673,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -20794,7 +21054,7 @@
         {
           "tag": "button",
           "label": "#",
-          "line": 302,
+          "line": 309,
           "via": null,
           "href": null,
           "handler": "() => selectIssue(issue)",
@@ -20841,7 +21101,7 @@
         {
           "tag": "a",
           "label": "#",
-          "line": 325,
+          "line": 332,
           "via": null,
           "href": "`/${owner}/${repo}/issues/${selectedIssue.number}`",
           "handler": null,
@@ -20851,7 +21111,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 332,
+          "line": 339,
           "via": null,
           "href": null,
           "handler": "() => loadTotal()",
@@ -20876,7 +21136,7 @@
         {
           "tag": "button",
           "label": "i18n:common.add",
-          "line": 362,
+          "line": 369,
           "via": null,
           "href": null,
           "handler": "handleAdd",
@@ -20933,7 +21193,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 392,
+          "line": 399,
           "via": null,
           "href": null,
           "handler": "() => handleDelete(entry.id)",
@@ -20990,7 +21250,7 @@
         {
           "tag": "button",
           "label": "i18n:common.previous",
-          "line": 401,
+          "line": 408,
           "via": null,
           "href": null,
           "handler": "() => { currentPage--; loadEntries(); }",
@@ -21015,7 +21275,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next",
-          "line": 404,
+          "line": 411,
           "via": null,
           "href": null,
           "handler": "() => { currentPage++; loadEntries(); }",
@@ -21251,6 +21511,26 @@
           "handler": null,
           "calls": [],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": [
@@ -21627,7 +21907,7 @@
         {
           "tag": "a",
           "label": "📄",
-          "line": 275,
+          "line": 287,
           "via": null,
           "href": "`/${owner}/${repo}/wiki/${encodeURIComponent(p.title)}`",
           "handler": null,
@@ -21637,7 +21917,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 288,
+          "line": 300,
           "via": null,
           "href": null,
           "handler": "() => scrollToHeading(heading.id)",
@@ -21647,7 +21927,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.history",
-          "line": 309,
+          "line": 321,
           "via": null,
           "href": null,
           "handler": "toggleHistory",
@@ -21676,7 +21956,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.edit",
-          "line": 311,
+          "line": 323,
           "via": null,
           "href": null,
           "handler": "startEditing",
@@ -21686,7 +21966,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.delete",
-          "line": 312,
+          "line": 324,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -21714,7 +21994,7 @@
         {
           "tag": "button",
           "label": "v",
-          "line": 328,
+          "line": 340,
           "via": null,
           "href": null,
           "handler": "() => viewRevision(rev)",
@@ -21743,7 +22023,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.restore_version",
-          "line": 338,
+          "line": 350,
           "via": null,
           "href": null,
           "handler": "() => restoreRevision(rev)",
@@ -21795,7 +22075,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 351,
+          "line": 363,
           "via": null,
           "href": null,
           "handler": null,
@@ -21805,7 +22085,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.save",
-          "line": 353,
+          "line": 365,
           "via": null,
           "href": null,
           "handler": "handleSave",
@@ -21865,7 +22145,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.cancel",
-          "line": 354,
+          "line": 366,
           "via": null,
           "href": null,
           "handler": "() => editing = false",
@@ -21875,7 +22155,7 @@
         {
           "tag": "a",
           "label": "←",
-          "line": 364,
+          "line": 376,
           "via": null,
           "href": "`/${owner}/${repo}/wiki`",
           "handler": null,
@@ -22096,6 +22376,26 @@
           "handler": null,
           "calls": [],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": [
@@ -23069,7 +23369,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 430,
+          "line": 437,
           "via": null,
           "href": null,
           "handler": null,
@@ -23079,7 +23379,7 @@
         {
           "tag": "select",
           "label": "i18n:admin.settings.banner.type_info",
-          "line": 443,
+          "line": 450,
           "via": null,
           "href": null,
           "handler": null,
@@ -23089,7 +23389,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 452,
+          "line": 459,
           "via": null,
           "href": null,
           "handler": "saveSettings",
@@ -23119,7 +23419,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.settings.sso.testing",
-          "line": 493,
+          "line": 500,
           "via": null,
           "href": null,
           "handler": "() => testSsoProvider(provider)",
@@ -23149,7 +23449,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.settings.sso.disable",
-          "line": 497,
+          "line": 504,
           "via": null,
           "href": null,
           "handler": "() => toggleSsoProvider(provider)",
@@ -23198,7 +23498,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 500,
+          "line": 507,
           "via": null,
           "href": null,
           "handler": "() => editSsoProvider(provider)",
@@ -23208,7 +23508,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 501,
+          "line": 508,
           "via": null,
           "href": null,
           "handler": "() => deleteSsoProvider(provider)",
@@ -23257,7 +23557,7 @@
         {
           "tag": "select",
           "label": "i18n:admin.settings.sso.type_oauth2",
-          "line": 537,
+          "line": 544,
           "via": null,
           "href": null,
           "handler": null,
@@ -23267,7 +23567,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 597,
+          "line": 604,
           "via": null,
           "href": null,
           "handler": null,
@@ -23277,7 +23577,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 601,
+          "line": 608,
           "via": null,
           "href": null,
           "handler": null,
@@ -23287,7 +23587,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 614,
+          "line": 621,
           "via": null,
           "href": null,
           "handler": "saveSsoProvider",
@@ -23350,7 +23650,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 618,
+          "line": 625,
           "via": null,
           "href": null,
           "handler": "resetSsoForm",
@@ -23360,7 +23660,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 630,
+          "line": 637,
           "via": null,
           "href": null,
           "handler": "() => loadLoginAttempts(loginAttemptsPage)",
@@ -23390,7 +23690,7 @@
         {
           "tag": "select",
           "label": "i18n:admin.settings.login.status_all",
-          "line": 640,
+          "line": 647,
           "via": null,
           "href": null,
           "handler": null,
@@ -23400,7 +23700,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.settings.login.apply",
-          "line": 647,
+          "line": 654,
           "via": null,
           "href": null,
           "handler": "() => loadLoginAttempts(1)",
@@ -23426,7 +23726,7 @@
         {
           "tag": "button",
           "label": "i18n:common.previous",
-          "line": 666,
+          "line": 673,
           "via": null,
           "href": null,
           "handler": "() => loadLoginAttempts(loginAttemptsPage - 1)",
@@ -23452,7 +23752,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next",
-          "line": 668,
+          "line": 675,
           "via": null,
           "href": null,
           "handler": "() => loadLoginAttempts(loginAttemptsPage + 1)",
@@ -23474,6 +23774,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": [
@@ -23506,7 +23826,7 @@
         {
           "tag": "a",
           "label": "←",
-          "line": 233,
+          "line": 240,
           "via": null,
           "href": "/admin",
           "handler": null,
@@ -23516,7 +23836,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.users.done",
-          "line": 249,
+          "line": 256,
           "via": null,
           "href": null,
           "handler": "() => (issuedPassword = null)",
@@ -23526,7 +23846,7 @@
         {
           "tag": "form",
           "label": "(showCreate = false)}>",
-          "line": 255,
+          "line": 262,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -23574,7 +23894,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 260,
+          "line": 267,
           "via": null,
           "href": null,
           "handler": null,
@@ -23584,7 +23904,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.users.creating",
-          "line": 263,
+          "line": 270,
           "via": null,
           "href": null,
           "handler": null,
@@ -23594,7 +23914,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 264,
+          "line": 271,
           "via": null,
           "href": null,
           "handler": "() => (showCreate = false)",
@@ -23604,7 +23924,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.users.new",
-          "line": 267,
+          "line": 274,
           "via": null,
           "href": null,
           "handler": "() => (showCreate = true)",
@@ -23614,7 +23934,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.users.working",
-          "line": 316,
+          "line": 323,
           "via": null,
           "href": null,
           "handler": "() => handleUnlock(u)",
@@ -23662,7 +23982,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 320,
+          "line": 327,
           "via": null,
           "href": null,
           "handler": "() => openEdit(u)",
@@ -23672,7 +23992,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.users.reset_password",
-          "line": 322,
+          "line": 329,
           "via": null,
           "href": null,
           "handler": "() => handleResetPassword(u)",
@@ -23702,7 +24022,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 325,
+          "line": 332,
           "via": null,
           "href": null,
           "handler": "() => confirmDelete(u)",
@@ -23712,7 +24032,7 @@
         {
           "tag": "button",
           "label": "i18n:common.prev_arrow",
-          "line": 337,
+          "line": 344,
           "via": null,
           "href": null,
           "handler": "prevPage",
@@ -23737,7 +24057,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next_arrow",
-          "line": 339,
+          "line": 346,
           "via": null,
           "href": null,
           "handler": "nextPage",
@@ -23762,7 +24082,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 362,
+          "line": 369,
           "via": null,
           "href": null,
           "handler": null,
@@ -23772,7 +24092,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 367,
+          "line": 374,
           "via": null,
           "href": null,
           "handler": null,
@@ -23782,7 +24102,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 371,
+          "line": 378,
           "via": null,
           "href": null,
           "handler": null,
@@ -23792,7 +24112,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 377,
+          "line": 384,
           "via": null,
           "href": null,
           "handler": "handleSave",
@@ -23840,7 +24160,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 380,
+          "line": 387,
           "via": null,
           "href": null,
           "handler": "closeEdit",
@@ -23850,7 +24170,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 398,
+          "line": 405,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -23898,7 +24218,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 401,
+          "line": 408,
           "via": null,
           "href": null,
           "handler": "() => showDeleteConfirm = false",
@@ -23922,6 +24242,26 @@
           "via": "Modal",
           "href": null,
           "handler": "onclose",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
           "calls": [],
           "unresolved": true
         }
@@ -24376,7 +24716,7 @@
         {
           "tag": "button",
           "label": "i18n:imports.refresh",
-          "line": 208,
+          "line": 215,
           "via": null,
           "href": null,
           "handler": "refreshImports",
@@ -24401,7 +24741,7 @@
         {
           "tag": "form",
           "label": "GitHub GitLab Gitea Git",
-          "line": 220,
+          "line": 227,
           "via": null,
           "href": null,
           "handler": "startImport",
@@ -24440,7 +24780,7 @@
         {
           "tag": "select",
           "label": "GitHub GitLab Gitea Git",
-          "line": 223,
+          "line": 230,
           "via": null,
           "href": null,
           "handler": null,
@@ -24450,7 +24790,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 253,
+          "line": 260,
           "via": null,
           "href": null,
           "handler": null,
@@ -24460,7 +24800,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 254,
+          "line": 261,
           "via": null,
           "href": null,
           "handler": null,
@@ -24470,7 +24810,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 255,
+          "line": 262,
           "via": null,
           "href": null,
           "handler": null,
@@ -24480,7 +24820,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 256,
+          "line": 263,
           "via": null,
           "href": null,
           "handler": null,
@@ -24490,7 +24830,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 257,
+          "line": 264,
           "via": null,
           "href": null,
           "handler": null,
@@ -24500,7 +24840,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 258,
+          "line": 265,
           "via": null,
           "href": null,
           "handler": null,
@@ -24510,7 +24850,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 259,
+          "line": 266,
           "via": null,
           "href": null,
           "handler": null,
@@ -24520,7 +24860,7 @@
         {
           "tag": "button",
           "label": "i18n:imports.starting",
-          "line": 263,
+          "line": 270,
           "via": null,
           "href": null,
           "handler": null,
@@ -24530,7 +24870,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 295,
+          "line": 302,
           "via": null,
           "href": "task.source_url",
           "handler": null,
@@ -24540,7 +24880,7 @@
         {
           "tag": "a",
           "label": "/",
-          "line": 301,
+          "line": 308,
           "via": null,
           "href": "taskHref(task)",
           "handler": null,
@@ -24550,7 +24890,7 @@
         {
           "tag": "button",
           "label": "i18n:imports.deleting",
-          "line": 311,
+          "line": 318,
           "via": null,
           "href": null,
           "handler": "() => deleteImport(task.id)",
@@ -24571,6 +24911,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -25025,7 +25385,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 524,
+          "line": 543,
           "via": null,
           "href": null,
           "handler": "startEditingOrganization",
@@ -25035,7 +25395,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 527,
+          "line": 546,
           "via": null,
           "href": null,
           "handler": "deleteOrganization",
@@ -25065,7 +25425,7 @@
         {
           "tag": "form",
           "label": "editingOrg = false} disabled= >",
-          "line": 535,
+          "line": 554,
           "via": null,
           "href": null,
           "handler": "saveOrganization",
@@ -25095,7 +25455,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.visibility_public",
-          "line": 544,
+          "line": 563,
           "via": null,
           "href": null,
           "handler": null,
@@ -25105,7 +25465,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 551,
+          "line": 570,
           "via": null,
           "href": null,
           "handler": null,
@@ -25115,7 +25475,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 555,
+          "line": 574,
           "via": null,
           "href": null,
           "handler": null,
@@ -25125,7 +25485,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 558,
+          "line": 577,
           "via": null,
           "href": null,
           "handler": "() => editingOrg = false",
@@ -25135,7 +25495,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 581,
+          "line": 600,
           "via": null,
           "href": null,
           "handler": null,
@@ -25145,7 +25505,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 584,
+          "line": 603,
           "via": null,
           "href": null,
           "handler": "createOrgRepo",
@@ -25185,7 +25545,7 @@
         {
           "tag": "a",
           "label": "i18n:orgs.create_repo_advanced",
-          "line": 597,
+          "line": 616,
           "via": null,
           "href": "`/dashboard?owner=${encodeURIComponent(org.name)}`",
           "handler": null,
@@ -25195,7 +25555,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 605,
+          "line": 624,
           "via": null,
           "href": "`/${org.name}/${repo.name}`",
           "handler": null,
@@ -25205,7 +25565,7 @@
         {
           "tag": "form",
           "label": "i18n:orgs.new_team",
-          "line": 620,
+          "line": 639,
           "via": null,
           "href": null,
           "handler": "createTeam",
@@ -25247,7 +25607,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.permission.read",
-          "line": 622,
+          "line": 641,
           "via": null,
           "href": null,
           "handler": null,
@@ -25257,7 +25617,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 627,
+          "line": 646,
           "via": null,
           "href": null,
           "handler": null,
@@ -25267,7 +25627,7 @@
         {
           "tag": "button",
           "label": "i18n:orgs.hide_team_members",
-          "line": 645,
+          "line": 664,
           "via": null,
           "href": null,
           "handler": "() => toggleTeamMembers(team.id)",
@@ -25292,7 +25652,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.delete')}",
-          "line": 649,
+          "line": 668,
           "via": null,
           "href": null,
           "handler": "() => deleteTeam(team)",
@@ -25336,7 +25696,7 @@
         {
           "tag": "form",
           "label": "` ? t('common.loading') : t('common.add')}",
-          "line": 660,
+          "line": 679,
           "via": null,
           "href": null,
           "handler": "(event) => addTeamMember(event, team.id)",
@@ -25379,7 +25739,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 667,
+          "line": 686,
           "via": null,
           "href": null,
           "handler": null,
@@ -25389,7 +25749,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.add')}",
-          "line": 671,
+          "line": 690,
           "via": null,
           "href": null,
           "handler": null,
@@ -25399,7 +25759,7 @@
         {
           "tag": "button",
           "label": "-$ ` ? t('common.loading') : t('common.delete')}",
-          "line": 688,
+          "line": 707,
           "via": null,
           "href": null,
           "handler": "() => removeTeamMember(team.id, teamMember)",
@@ -25442,7 +25802,7 @@
         {
           "tag": "form",
           "label": "i18n:orgs.member_placeholder",
-          "line": 713,
+          "line": 732,
           "via": null,
           "href": null,
           "handler": "addOrganizationMember",
@@ -25486,7 +25846,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 720,
+          "line": 739,
           "via": null,
           "href": null,
           "handler": null,
@@ -25496,7 +25856,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 725,
+          "line": 744,
           "via": null,
           "href": null,
           "handler": null,
@@ -25506,7 +25866,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.delete')}",
-          "line": 739,
+          "line": 758,
           "via": null,
           "href": null,
           "handler": "() => removeOrganizationMember(member)",
@@ -25546,6 +25906,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": [
@@ -25787,7 +26167,7 @@
         {
           "tag": "form",
           "label": "i18n:agents.username",
-          "line": 249,
+          "line": 260,
           "via": null,
           "href": null,
           "handler": "createBot",
@@ -25826,7 +26206,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.creating",
-          "line": 258,
+          "line": 269,
           "via": null,
           "href": null,
           "handler": null,
@@ -25836,7 +26216,7 @@
         {
           "tag": "a",
           "label": "@",
-          "line": 277,
+          "line": 288,
           "via": null,
           "href": "`/${bot.username}`",
           "handler": null,
@@ -25846,7 +26226,7 @@
         {
           "tag": "button",
           "label": "i18n:common.close",
-          "line": 283,
+          "line": 294,
           "via": null,
           "href": null,
           "handler": "() => openTokens(bot)",
@@ -25871,7 +26251,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.deleting",
-          "line": 286,
+          "line": 297,
           "via": null,
           "href": null,
           "handler": "() => deleteBot(bot)",
@@ -25910,7 +26290,7 @@
         {
           "tag": "button",
           "label": "i18n:common.copy",
-          "line": 306,
+          "line": 317,
           "via": null,
           "href": null,
           "handler": "copyNewToken",
@@ -25920,7 +26300,7 @@
         {
           "tag": "form",
           "label": "i18n:agents.token_name",
-          "line": 310,
+          "line": 321,
           "via": null,
           "href": null,
           "handler": "mintToken",
@@ -25959,7 +26339,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 321,
+          "line": 332,
           "via": null,
           "href": null,
           "handler": null,
@@ -25969,7 +26349,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 328,
+          "line": 339,
           "via": null,
           "href": null,
           "handler": null,
@@ -25979,7 +26359,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.creating",
-          "line": 331,
+          "line": 342,
           "via": null,
           "href": null,
           "handler": null,
@@ -25989,7 +26369,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.revoking",
-          "line": 364,
+          "line": 375,
           "via": null,
           "href": null,
           "handler": "() => revokeToken(token)",
@@ -26023,6 +26403,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -26082,7 +26482,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.retry",
-          "line": 196,
+          "line": 203,
           "via": null,
           "href": null,
           "handler": "load",
@@ -26108,7 +26508,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.profile.display_name",
-          "line": 203,
+          "line": 210,
           "via": null,
           "href": null,
           "handler": "saveProfile",
@@ -26133,7 +26533,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 210,
+          "line": 217,
           "via": null,
           "href": null,
           "handler": null,
@@ -26143,7 +26543,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.save",
-          "line": 214,
+          "line": 221,
           "via": null,
           "href": null,
           "handler": null,
@@ -26153,7 +26553,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 228,
+          "line": 235,
           "via": null,
           "href": null,
           "handler": "uploadAvatar",
@@ -26178,7 +26578,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.remove_avatar",
-          "line": 237,
+          "line": 244,
           "via": null,
           "href": null,
           "handler": "removeAvatar",
@@ -26203,7 +26603,7 @@
         {
           "tag": "form",
           "label": ")}",
-          "line": 249,
+          "line": 256,
           "via": null,
           "href": null,
           "handler": "changePassword",
@@ -26228,7 +26628,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.change_password",
-          "line": 273,
+          "line": 280,
           "via": null,
           "href": null,
           "handler": null,
@@ -26238,7 +26638,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.profile.new_email",
-          "line": 282,
+          "line": 289,
           "via": null,
           "href": null,
           "handler": "changeEmail",
@@ -26263,7 +26663,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.send_confirmation",
-          "line": 293,
+          "line": 300,
           "via": null,
           "href": null,
           "handler": null,
@@ -26273,7 +26673,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.profile.delete_password",
-          "line": 317,
+          "line": 324,
           "via": null,
           "href": null,
           "handler": "deleteAccount",
@@ -26298,12 +26698,32 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.delete_button",
-          "line": 330,
+          "line": 337,
           "via": null,
           "href": null,
           "handler": null,
           "calls": [],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -26316,7 +26736,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.retry",
-          "line": 382,
+          "line": 401,
           "via": null,
           "href": null,
           "handler": "loadBackupStatus",
@@ -26341,7 +26761,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.mfa.current_password",
-          "line": 397,
+          "line": 416,
           "via": null,
           "href": null,
           "handler": "regenerateBackupCodes",
@@ -26421,7 +26841,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.working",
-          "line": 407,
+          "line": 426,
           "via": null,
           "href": null,
           "handler": null,
@@ -26431,7 +26851,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.mfa.current_password",
-          "line": 415,
+          "line": 434,
           "via": null,
           "href": null,
           "handler": "disableMfa",
@@ -26511,7 +26931,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.disabling",
-          "line": 420,
+          "line": 439,
           "via": null,
           "href": null,
           "handler": null,
@@ -26521,7 +26941,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.starting",
-          "line": 426,
+          "line": 445,
           "via": null,
           "href": null,
           "handler": "startSetup",
@@ -26546,7 +26966,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.retry",
-          "line": 456,
+          "line": 475,
           "via": null,
           "href": null,
           "handler": "loadPasskeyList",
@@ -26571,7 +26991,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.remove",
-          "line": 470,
+          "line": 489,
           "via": null,
           "href": null,
           "handler": "() => removePasskey(key.id)",
@@ -26595,7 +27015,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.passkeys.name",
-          "line": 485,
+          "line": 504,
           "via": null,
           "href": null,
           "handler": "addPasskey",
@@ -26605,7 +27025,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.waiting",
-          "line": 495,
+          "line": 514,
           "via": null,
           "href": null,
           "handler": null,
@@ -26615,7 +27035,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.retry",
-          "line": 523,
+          "line": 542,
           "via": null,
           "href": null,
           "handler": "loadSsoLinks",
@@ -26640,7 +27060,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.unlink",
-          "line": 538,
+          "line": 557,
           "via": null,
           "href": null,
           "handler": "() => unlinkSsoProvider(link)",
@@ -26665,7 +27085,7 @@
         {
           "tag": "button",
           "label": ")}",
-          "line": 556,
+          "line": 575,
           "via": null,
           "href": null,
           "handler": "() => linkSsoProvider(provider)",
@@ -26690,7 +27110,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.setup.code",
-          "line": 579,
+          "line": 598,
           "via": null,
           "href": null,
           "handler": "enableMfa",
@@ -26770,7 +27190,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.setup.verifying",
-          "line": 584,
+          "line": 603,
           "via": null,
           "href": null,
           "handler": null,
@@ -26780,10 +27200,30 @@
         {
           "tag": "button",
           "label": "i18n:account_security.backup.copy",
-          "line": 600,
+          "line": 619,
           "via": null,
           "href": null,
           "handler": "copyBackupCodes",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
           "calls": [],
           "unresolved": true
         }
@@ -26798,7 +27238,7 @@
         {
           "tag": "form",
           "label": "i18n:ssh_keys.name",
-          "line": 123,
+          "line": 130,
           "via": null,
           "href": null,
           "handler": "addKey",
@@ -26838,7 +27278,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 134,
+          "line": 141,
           "via": null,
           "href": null,
           "handler": null,
@@ -26848,7 +27288,7 @@
         {
           "tag": "button",
           "label": "i18n:ssh_keys.adding",
-          "line": 144,
+          "line": 151,
           "via": null,
           "href": null,
           "handler": null,
@@ -26858,7 +27298,7 @@
         {
           "tag": "button",
           "label": "i18n:ssh_keys.deleting",
-          "line": 175,
+          "line": 182,
           "via": null,
           "href": null,
           "handler": "() => deleteKey(key)",
@@ -26892,6 +27332,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []
@@ -26904,7 +27364,7 @@
         {
           "tag": "button",
           "label": "i18n:common.copy",
-          "line": 178,
+          "line": 185,
           "via": null,
           "href": null,
           "handler": "copyNewToken",
@@ -26914,7 +27374,7 @@
         {
           "tag": "form",
           "label": "i18n:access_tokens.name",
-          "line": 184,
+          "line": 191,
           "via": null,
           "href": null,
           "handler": "createToken",
@@ -26953,7 +27413,7 @@
         {
           "tag": "button",
           "label": "i18n:access_tokens.creating",
-          "line": 197,
+          "line": 204,
           "via": null,
           "href": null,
           "handler": null,
@@ -26963,7 +27423,7 @@
         {
           "tag": "button",
           "label": "i18n:access_tokens.revoking",
-          "line": 235,
+          "line": 242,
           "via": null,
           "href": null,
           "handler": "() => revokeToken(token)",
@@ -26997,6 +27457,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": []

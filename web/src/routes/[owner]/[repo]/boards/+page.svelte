@@ -23,8 +23,11 @@
   } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
   import { viewerPermission } from '$lib/viewerPermission.svelte';
+  import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
+  const confirmer = createConfirmer();
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
@@ -215,7 +218,11 @@
   }
 
   async function deleteBoard(id: number) {
-    if (!confirm(t('board.confirmDelete'))) return;
+    if (!(await confirmer.ask({
+      title: t('board.deleteBoard'),
+      message: t('board.confirmDelete'),
+      confirmLabel: t('common.delete'),
+    }))) return;
     await runBoardMutation(async (route) => {
       await boards.delete(route.owner, route.repo, id);
       if (!isCurrentRoute(route)) return;
@@ -685,6 +692,8 @@
     </div>
   {/if}
 </div>
+
+<ConfirmModal {confirmer} />
 
 <style>
   .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }

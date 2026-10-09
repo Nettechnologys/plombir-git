@@ -6,6 +6,7 @@ import RetentionSettingsPage from '../../routes/[owner]/[repo]/settings/retentio
 import { setTestPage } from '../test/app';
 import { ciRetention, mirrors, repos, resetTestClient } from '../test/client';
 import {
+	answerConfirm,
 	click,
 	element,
 	input,
@@ -62,7 +63,6 @@ let rendered: RenderedComponent | undefined;
 beforeEach(() => {
 	resetTestClient();
 	setTestPage('/alice/demo/settings', { owner: 'alice', repo: 'demo' });
-	vi.stubGlobal('confirm', vi.fn(() => true));
 });
 
 afterEach(async () => {
@@ -157,7 +157,10 @@ describe('repository settings singleton state ownership', () => {
 		await revisit('settings/mirror');
 		const remove = element<HTMLButtonElement>(rendered.container, '.mirror-form .btn-danger');
 		await click(remove);
+		await answerConfirm();
+		// The second press finds the removal in flight and asks nothing.
 		await click(remove);
+		expect(rendered.container.querySelector('[role="dialog"]')).toBeNull();
 		expect(mirrors.remove).toHaveBeenCalledOnce();
 
 		removal.resolve();
