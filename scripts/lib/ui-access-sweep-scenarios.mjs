@@ -940,6 +940,18 @@ const repoPullCreate = privileged(
       json: { path: 'feature.txt', line: 1, body: 'Seeded review thread' },
     });
     context.fixture.surfaceReviewCommentId = comment.id;
+    // What `repo-pull-delete` deletes (card_ee4f318c50f1): a pull request of
+    // its own, so the one every other scenario reads stays.
+    await context.fetchJson(`${surfaceApi(context)}/branches`, {
+      method: 'POST',
+      json: { name: 'browser-doomed', from: 'browser-feature' },
+    });
+    const doomed = await context.fetchJson(`${surfaceApi(context)}/pulls`, {
+      method: 'POST',
+      json: { title: 'Disposable browser pull request', head_branch: 'browser-doomed', base_branch: 'main' },
+    });
+    if (!doomed?.number) throw new Error('disposable pull request was not created');
+    context.fixture.disposablePullNumber = doomed.number;
   },
   (context) => requestSequence(context, [
     [`${surfaceApi(context)}/pulls`],
@@ -1022,6 +1034,21 @@ const repoReviewCommentModeration = privileged(
   (context) => requestSequence(context, [
     [`${surfaceApi(context)}/pulls/${context.fixture.surfacePullNumber}/comments/${context.fixture.surfaceInlineCommentId}`, { method: 'PATCH', json: { body: 'Denied edit' } }],
     [`${surfaceApi(context)}/pulls/${context.fixture.surfacePullNumber}/comments/${context.fixture.surfaceInlineCommentId}`, { method: 'DELETE' }],
+  ]),
+);
+
+// card_ee4f318c50f1: a repository administrator deletes an unmerged pull
+// request from its page; the outsider sends the same request first, while the
+// pull request still exists.
+const repoPullDelete = privileged(
+  async (context) => {
+    await context.navigate(surfacePage(context, `/pulls/${context.fixture.disposablePullNumber}`));
+    await context.click('.delete-pr');
+    await context.click('[role="dialog"] .confirm-delete-pr');
+    await context.waitForPath(surfacePage(context, '/pulls'));
+  },
+  (context) => requestSequence(context, [
+    [`${surfaceApi(context)}/pulls/${context.fixture.disposablePullNumber}`, { method: 'DELETE' }],
   ]),
 );
 
@@ -1399,6 +1426,7 @@ export const UI_ACCESS_SWEEP_SCENARIOS = new Map([
   ['repo-pull-create', repoPullCreate],
   ['repo-pull-detail', repoPullDetail],
   ['repo-review-comment-moderation', repoReviewCommentModeration],
+  ['repo-pull-delete', repoPullDelete],
   ['repo-release-asset-delete', repoReleaseAssetDelete],
   ['admin-users-unlock', adminUsersUnlock],
   ['admin-users-update', adminUsersUpdate],

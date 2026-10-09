@@ -32,7 +32,7 @@ import PullRequestPage from '../../routes/[owner]/[repo]/pulls/[number]/+page.sv
 import { isEdited } from '../commentState';
 import { ApiError } from './error';
 import { issues } from './issues';
-import { reviews } from './pulls';
+import { pulls, reviews } from './pulls';
 import { navigation, setTestPage } from '../test/app';
 import { openModalFrom } from '../test/modalContract';
 import {
@@ -97,6 +97,7 @@ beforeEach(() => {
 	routeIssues.delete.mockImplementation(issues.delete);
 	routeReviews.editComment.mockImplementation(reviews.editComment);
 	routeReviews.deleteComment.mockImplementation(reviews.deleteComment);
+	routePulls.delete.mockImplementation(pulls.delete);
 });
 
 afterEach(async () => {
@@ -395,6 +396,53 @@ describe('pull request review comments', () => {
 
 		expect(requestTo('/repos/alice/demo/pulls/7/comments/32', 'DELETE')).toBeTruthy();
 		expect(rendered.container.querySelector('[data-review-comment="32"]')).toBeNull();
+	});
+
+	// card_ee4f318c50f1: the pull request itself, administrators only, never a
+	// merged one.
+	it('offers the pull request deletion to an administrator only', async () => {
+		rendered = await renderComponent(PullRequestPage);
+		expect(rendered.container.querySelector('.delete-pr')).toBeNull();
+		await rendered.destroy();
+
+		permission('admin');
+		rendered = await renderComponent(PullRequestPage);
+		expect(rendered.container.querySelector('.delete-pr')).not.toBeNull();
+	});
+
+	it('does not offer to delete a merged pull request', async () => {
+		permission('admin');
+		routePulls.get.mockResolvedValue({ ...(await routePulls.get()), state: 'merged' });
+		rendered = await renderComponent(PullRequestPage);
+		expect(rendered.container.querySelector('.delete-pr')).toBeNull();
+	});
+
+	it('deletes the pull request through a confirm dialog and returns to the list', async () => {
+		viewer.user = CAROL;
+		permission('admin');
+		rendered = await renderComponent(PullRequestPage);
+
+		const dialog = await openModalFrom(document.body, element(rendered.container, '.delete-pr'));
+		expect(dialog.textContent).toContain('#7');
+		expect(requestTo('/repos/alice/demo/pulls/7', 'DELETE')).toBeFalsy();
+		await click(element(dialog, '.confirm-delete-pr'));
+
+		expect(requestTo('/repos/alice/demo/pulls/7', 'DELETE')).toBeTruthy();
+		expect(navigation.goto).toHaveBeenCalledWith('/alice/demo/pulls');
+	});
+
+	it('keeps the pull request dialog open with the server refusal', async () => {
+		permission('admin');
+		routePulls.delete.mockRejectedValue(
+			new ApiError('a merged pull request is the record of commits in its base branch and cannot be deleted', 409),
+		);
+		rendered = await renderComponent(PullRequestPage);
+
+		await click(element(rendered.container, '.delete-pr'));
+		await click(element(document.body, '[role="dialog"] .confirm-delete-pr'));
+
+		expect(element(document.body, '[role="dialog"] .pr-delete-error').textContent).toContain('cannot be deleted');
+		expect(navigation.goto).not.toHaveBeenCalledWith('/alice/demo/pulls');
 	});
 
 	it('keeps the dialog open with the server message when others replied', async () => {

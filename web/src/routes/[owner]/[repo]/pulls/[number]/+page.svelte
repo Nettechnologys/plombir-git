@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
@@ -89,8 +90,12 @@
   let routeGeneration = 0;
   // Review comment edit/delete (card_60961272e1ba): offered to the comment's
   // author and to repository administrators, the two the server lets through.
-  // A pull request itself has no delete route on purpose.
+  // The pull request itself is deleted by an administrator, unless it is
+  // merged (card_ee4f318c50f1).
   const permission = viewerPermission(() => owner, () => repo);
+  let prDeleteOpen = $state(false);
+  let prDeleteBusy = $state(false);
+  let prDeleteError = $state('');
   let viewer = $derived(getUser());
   // Reviews and review comments are `RepoAuthRead`: any signed-in reader may
   // leave one. Everything else that changes the pull request — draft state,
@@ -235,6 +240,30 @@
       if (isCurrentRoute(route)) commentDeleteError = e?.message || t('comments.delete_failed');
     } finally {
       if (isCurrentRoute(route)) commentDeleteBusy = false;
+    }
+  }
+
+  function closeDeletePr() {
+    if (prDeleteBusy) return;
+    prDeleteOpen = false;
+    prDeleteError = '';
+  }
+
+  async function confirmDeletePr() {
+    if (prDeleteBusy) return;
+    const route = currentRoute();
+    prDeleteBusy = true;
+    prDeleteError = '';
+    try {
+      await pulls.delete(route.owner, route.repo, route.number);
+      if (!isCurrentRoute(route)) return;
+      prDeleteOpen = false;
+      await goto(`/${route.owner}/${route.repo}/pulls`);
+    } catch (e: any) {
+      // 409: merged meanwhile, or being merged by the queue — the server says which.
+      if (isCurrentRoute(route)) prDeleteError = e?.message || t('pulls.delete.failed');
+    } finally {
+      if (isCurrentRoute(route)) prDeleteBusy = false;
     }
   }
 
@@ -1058,6 +1087,16 @@
           </button>
         </div>
       {/if}
+
+      {#if permission.isAdmin && pr.state !== 'merged' && pr.state !== 'merging'}
+        <section class="pr-danger">
+          <h2>{t('pulls.delete.title')}</h2>
+          <p class="text-secondary">{t('pulls.delete.desc')}</p>
+          <button type="button" class="btn-danger delete-pr" onclick={() => { prDeleteOpen = true; prDeleteError = ''; }}>
+            {t('pulls.delete.button')}
+          </button>
+        </section>
+      {/if}
     </div>
   {/if}
 </div>
@@ -1106,8 +1145,31 @@
   </Modal>
 {/if}
 
+{#if prDeleteOpen && pr}
+  <Modal onclose={closeDeletePr} labelledby="delete-pr-title">
+    <h2 id="delete-pr-title">{t('pulls.delete.confirm_title', { number: pr.number })}</h2>
+    <p>{t('pulls.delete.confirm_body')}</p>
+    {#if prDeleteError}
+      <div class="error-banner pr-delete-error" role="alert">{prDeleteError}</div>
+    {/if}
+    <div class="comment-edit-actions">
+      <button class="btn-danger confirm-delete-pr" onclick={confirmDeletePr} disabled={prDeleteBusy}>
+        {prDeleteBusy ? t('common.deleting') : t('pulls.delete.button')}
+      </button>
+      <button class="btn-secondary" onclick={closeDeletePr} disabled={prDeleteBusy} data-autofocus>{t('common.cancel')}</button>
+    </div>
+  </Modal>
+{/if}
+
 <style>
   .pr-detail { max-width: 1200px; }
+  .pr-danger {
+    margin-top: 32px;
+    padding: 16px;
+    border: 1px solid var(--red, #f85149);
+    border-radius: var(--radius);
+  }
+  .pr-danger h2 { font-size: 16px; margin: 0 0 8px; }
 
   .partial-banner {
     display: flex;

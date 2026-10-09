@@ -109,6 +109,14 @@ function declaredModifiers(source) {
 // Plombir Git's own package API — publish, list, get, versions, yank, download —
 // IS documented; only the client-dictated spellings are exempt.
 const UNDOCUMENTED = new Map([
+  [
+    'api::repo_content::delete_branch_named_protection',
+    'DELETE /branches/{branch} for the branch named `protection`, which the rule collection\'s literal segment shadows (card_c9749ef51139); documented as that route — a client built from the spec sends exactly this path',
+  ],
+  [
+    'api::repo_content::delete_tag_named_protection',
+    'DELETE /tags/{tag} for the tag named `protection`, which the rule collection\'s literal segment shadows (card_c9749ef51139); documented as that route — a client built from the spec sends exactly this path',
+  ],
   ['api::packages::cargo_index_config', 'Cargo sparse index (RFC 2789) — layout fixed by cargo'],
   ['api::packages::cargo_sparse_index', 'Cargo sparse index (RFC 2789) — layout fixed by cargo'],
   ['api::packages::cargo_publish_new', 'Cargo write API — the verb, URL and length-prefixed body are fixed by cargo'],

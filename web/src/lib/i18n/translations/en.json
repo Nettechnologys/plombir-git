@@ -739,6 +739,14 @@
     "delete_confirm_title": "Delete milestone"
   },
   "pulls": {
+    "delete": {
+      "title": "Delete this pull request",
+      "desc": "Deleting a pull request removes it with its reviews, comments, timeline and attachments, and cancels its CI. A merged pull request cannot be deleted. This cannot be undone.",
+      "button": "Delete pull request",
+      "failed": "Deleting the pull request failed",
+      "confirm_title": "Delete pull request #{number}?",
+      "confirm_body": "The pull request, its reviews, comments and attachments are removed for everyone, and its running CI is cancelled. This cannot be undone."
+    },
     "title": "Pull Requests",
     "tabs": {
       "conversation": "Conversation",

@@ -739,6 +739,14 @@
     "delete_confirm_title": "删除里程碑"
   },
   "pulls": {
+    "delete": {
+      "title": "删除此拉取请求",
+      "desc": "删除拉取请求会同时删除其评审、评论、时间线和附件，并取消其 CI。已合并的拉取请求无法删除。此操作无法撤销。",
+      "button": "删除拉取请求",
+      "failed": "删除拉取请求失败",
+      "confirm_title": "删除拉取请求 #{number}？",
+      "confirm_body": "拉取请求及其评审、评论和附件将对所有人删除，正在运行的 CI 将被取消。此操作无法撤销。"
+    },
     "title": "拉取请求",
     "tabs": {
       "conversation": "对话",

@@ -115,6 +115,12 @@ export const pulls = {
    * and when the branch had to stay, the reason in `head_branch_kept`
    * (card_2060696224ff). A kept branch is not a failed merge.
    */
+  /**
+   * Delete an open or closed pull request — repository administrators only
+   * (card_ee4f318c50f1). A merged one, or one the queue is merging, is `409`.
+   */
+  delete: (owner: string, repo: string, number: number) =>
+    request<void>(`/repos/${owner}/${repo}/pulls/${number}`, { method: 'DELETE' }),
   merge: (owner: string, repo: string, number: number, strategy: string, opts: { deleteHeadBranch?: boolean } = {}) =>
     request<MergeOutcome>(`/repos/${owner}/${repo}/pulls/${number}/merge`, {
       method: 'POST',
