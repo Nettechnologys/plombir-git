@@ -594,6 +594,11 @@ rm -f .env.bak
 
 # View logs
 docker compose -f docker-compose.observability.yml logs -f
+
+# Apply an edited prometheus.yml / alerts.yml. Prometheus runs without
+# --web.enable-lifecycle (its reload/quit endpoints have no authentication),
+# so reload by restarting the container:
+docker compose -f docker-compose.observability.yml restart prometheus
 ```
 
 Prometheus scrapes the app at `plombir-git:8080` through the shared Docker
@@ -749,9 +754,11 @@ The main dashboard (`plombir-git-main`) includes:
 
 ### Environment Variables
 ```bash
-# Grafana admin
+# Grafana admin, read from deploy/.env. The password has no default — the
+# stack refuses to start without one. Generate it, do not invent it:
+#   sed -i.bak "s/^GRAFANA_ADMIN_PASSWORD=.*/GRAFANA_ADMIN_PASSWORD=$(openssl rand -hex 16)/" .env
 GRAFANA_ADMIN_USER=admin
-GRAFANA_ADMIN_PASSWORD=your-secure-password
+GRAFANA_ADMIN_PASSWORD=<output of: openssl rand -hex 16>
 
 # Alertmanager (set in alertmanager.yml)
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
