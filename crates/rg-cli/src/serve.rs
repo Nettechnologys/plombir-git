@@ -1511,10 +1511,20 @@ pub(crate) async fn run_serve(
         std::sync::Arc::new(ci_engine);
     let instance_settings = rg_core::instance::InstanceSettingsCache::default();
 
+    // Steady background writers queue on their own pool (card_bb685235de6f).
+    let db_write = rg_db::open_write_pool(
+        &resolved_db_url,
+        resolved_db_connect_timeout,
+        resolved_db_idle_timeout,
+        &db,
+    )
+    .await
+    .map_err(|e| dbconn::annotate_db_open_error(e, &resolved_db_url))?;
     let http_config = rg_http::HttpServerConfig {
         listen_addr: resolved_http_addr,
         repo_root: repo_root.clone(),
         db: db.clone(),
+        db_write: Some(db_write),
         jwt_secret: resolved_auth_secrets.jwt_secret.clone(),
         encryption_key: resolved_auth_secrets.encryption_key.clone(),
         instance_key,

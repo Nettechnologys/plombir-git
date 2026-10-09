@@ -79,6 +79,13 @@ pub struct AppState {
     /// mutating process-global cwd or env.
     pub spa_build_dir: Arc<PathBuf>,
     pub db: DatabaseConnection,
+    /// The pool steady background writers queue on (card_bb685235de6f): on a
+    /// file-backed SQLite instance a separate pool of one connection, so the
+    /// CI log queue and the runner heartbeat wait for it in the pool's queue
+    /// rather than in SQLite's busy handler on a connection a reader needs.
+    /// Elsewhere it is `db` itself. See [`rg_db::open_write_pool`] for what
+    /// may and may not be moved onto it.
+    pub db_write: DatabaseConnection,
     /// Secret that signs and verifies session JWTs, PAT-derived tokens, CI job
     /// tokens and the short-lived sealed states (passkey ceremonies, SSO).
     pub jwt_secret: Arc<String>,
@@ -341,6 +348,9 @@ pub struct HttpServerConfig {
     pub repo_root: PathBuf,
     /// Database connection.
     pub db: DatabaseConnection,
+    /// The pool steady background writers queue on — see
+    /// [`rg_db::open_write_pool`]. `None` writes through `db`.
+    pub db_write: Option<DatabaseConnection>,
     /// JWT secret key. Signing only — see [`AppState::encryption_key`] for the
     /// key that opens data at rest.
     pub jwt_secret: String,
@@ -580,8 +590,10 @@ async fn run_with_listener(
         Some(config.repo_root.clone()),
     ));
 
-    // Clone DB before it moves into state
-    let log_queue_db = config.db.clone();
+    let db_write = config.db_write.clone().unwrap_or_else(|| config.db.clone());
+    // The log queue is the instance's busiest steady writer: one statement per
+    // chunk, no transaction held across a second acquire.
+    let log_queue_db = db_write.clone();
 
     let (log_write_queue, log_consumer_handle) =
         rg_core::ci::log_write_queue::LogWriteQueue::spawn_with_shutdown(
@@ -593,6 +605,7 @@ async fn run_with_listener(
         repo_root: Arc::new(config.repo_root),
         spa_build_dir: Arc::new(PathBuf::from(DEFAULT_SPA_BUILD_DIR)),
         db: config.db,
+        db_write,
         jwt_secret: Arc::new(config.jwt_secret),
         encryption_key: Arc::new(config.encryption_key),
         instance_key: config.instance_key,

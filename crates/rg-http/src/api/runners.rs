@@ -1924,7 +1924,7 @@ pub async fn authenticate_runner(
             let refresh = if !due {
                 HeartbeatRefresh::Recent
             } else {
-                match rg_db::ops::runner_ops::update_heartbeat(&state.db, runner_id).await {
+                match rg_db::ops::runner_ops::update_heartbeat(&state.db_write, runner_id).await {
                     Ok(()) => HeartbeatRefresh::Persisted,
                     Err(error) => {
                         tracing::error!(runner_id, error = %format!("{error:#}"), "Failed to update runner heartbeat");

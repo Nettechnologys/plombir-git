@@ -44,3 +44,4 @@ mod user_delete_keeps_foreign_uploads;
 mod user_delete_refreshes_star_counts;
 mod user_grant_writer_integrity;
 mod webauthn_ceremony_single_use;
+mod write_pool_readers;

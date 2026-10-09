@@ -453,6 +453,37 @@ pub async fn connect_with_pool(
     }
 }
 
+/// The pool the instance's steady background writers queue on
+/// (card_bb685235de6f).
+///
+/// SQLite has one writer at a time. A writer that takes a connection from the
+/// shared pool and then meets another writer's lock waits *inside* SQLite's
+/// busy handler — up to `busy_timeout` — while still holding that connection,
+/// so a handful of writers can occupy every connection the readers need. A
+/// separate pool of exactly one connection moves that wait out of SQLite and
+/// into the pool's own fair queue: writers that use it wait for the
+/// connection, not for the lock, and never sit on one a reader could use.
+///
+/// PostgreSQL and MySQL run writes from several connections side by side, so
+/// for them — and for an in-memory SQLite database, which a second pool could
+/// not even see — this is the pool `read` already is.
+///
+/// Only writers that hold the connection for their own statements belong
+/// here: a caller that opens a transaction on this pool and then reaches for
+/// the pool again inside it waits for the connection it is holding.
+pub async fn open_write_pool(
+    db_url: &str,
+    connect_secs: u64,
+    idle_secs: u64,
+    read: &DatabaseConnection,
+) -> Result<DatabaseConnection> {
+    let in_memory = db_url.contains(":memory:") || db_url.contains("mode=memory");
+    match detect_backend(db_url)? {
+        DbBackend::Sqlite if !in_memory => connect_sqlite(db_url, connect_secs, idle_secs, 1).await,
+        _ => Ok(read.clone()),
+    }
+}
+
 /// Connect to SQLite with PRAGMA optimization.
 ///
 /// PRAGMAs are attached to the sqlx [`SqliteConnectOptions`] so they are applied

@@ -375,7 +375,7 @@ fn probe_dir_writable(dir: &std::path::Path) -> DirWriteProbe {
 /// SQLite error exactly as it was: an operator sent to `chown` a directory
 /// whose real problem is a full disk or a path that is not a directory loses
 /// more time than one who got no hint at all.
-fn annotate_db_open_error(error: anyhow::Error, db_url: &str) -> anyhow::Error {
+pub(crate) fn annotate_db_open_error(error: anyhow::Error, db_url: &str) -> anyhow::Error {
     let Some(path) = rg_db::sqlite_database_file(db_url) else {
         return error;
     };
