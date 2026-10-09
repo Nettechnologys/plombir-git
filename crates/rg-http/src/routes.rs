@@ -2028,6 +2028,20 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/tags/{tag}",
             api::repo_content::delete_tag,
         )
+        // `protection` is a legal branch and tag name, but the static segment
+        // of the rule collections above wins over `{branch}` / `{tag}`. The
+        // collections serve no DELETE, so the ref by that name owns it
+        // (card_c9749ef51139).
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/branches/protection",
+            api::repo_content::delete_branch_named_protection,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/tags/protection",
+            api::repo_content::delete_tag_named_protection,
+        )
         .get(
             RepoRead,
             "/repos/{owner}/{name}/commits/{sha}/signature",

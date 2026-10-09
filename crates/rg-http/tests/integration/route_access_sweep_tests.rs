@@ -1498,16 +1498,22 @@ async fn seed_repo_rows(
     let doomed_tag = "sweep-doomed-tag".to_string();
     release("sweep-doomed-tag").await;
     let doomed_branch = "sweep-doomed-branch".to_string();
-    json_of(created("doomed branch")(
-        fx.client
-            .post(format!("{prefix}/branches"))
-            .bearer_auth(&fx.owner_token)
-            .json(&serde_json::json!({"name": doomed_branch}))
-            .send()
-            .await
-            .unwrap(),
-    ))
-    .await;
+    // `protection` is a legal ref name the rule collections' literal segment
+    // shadows; `DELETE /branches/protection` and `DELETE /tags/protection`
+    // delete the ref by that name (card_c9749ef51139), so it has to exist.
+    release("protection").await;
+    for branch in [doomed_branch.as_str(), "protection"] {
+        json_of(created("doomed branch")(
+            fx.client
+                .post(format!("{prefix}/branches"))
+                .bearer_auth(&fx.owner_token)
+                .json(&serde_json::json!({"name": branch}))
+                .send()
+                .await
+                .unwrap(),
+        ))
+        .await;
+    }
     let asset = json_of(created("release asset")(
         fx.client
             .post(format!("{prefix}/releases/{release_id}/assets"))

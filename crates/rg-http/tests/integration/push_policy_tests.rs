@@ -868,3 +868,117 @@ async fn branches_and_tags_are_deleted_under_the_same_rules_over_git_and_the_api
     assert_eq!(status, 409, "{body}");
     assert!(ref_value(&bare, "refs/tags/v1").is_some());
 }
+
+/// card_c9749ef51139: `protection` is a legal branch and tag name, but the
+/// rule collections live at the literal `/branches/protection` and
+/// `/tags/protection`, and a static segment wins over `{branch}` / `{tag}`.
+/// The ref by that name must still be created and deleted through the API —
+/// under the same rules as any other ref — while the rule collections keep
+/// answering at those paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ref_named_protection_is_deleted_through_the_api_like_any_other() {
+    const OWNER: &str = "protname_owner";
+    const REPO: &str = "protname";
+    let (base, _db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (session, _) = register_full(&base, OWNER, "protname_owner@example.com").await;
+    let pat = pat_for(&base, &session).await;
+    create_initialised_repo(&base, &session, REPO).await;
+    let bare = repo_root.join(format!("{OWNER}/{REPO}.git"));
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    let base_for_git = base.clone();
+    let pat_for_git = pat.clone();
+    on_machine(move || {
+        let work = checkout(&root_path, &base_for_git, OWNER, &pat_for_git, OWNER, REPO);
+        commit(&work, OWNER, "topic.txt", "topic\n");
+        git_ok(
+            &work,
+            OWNER,
+            &["push", "-q", "origin", "HEAD:refs/tags/protection"],
+        );
+    })
+    .await;
+    let repo_api = format!("{base}/api/v1/repos/{OWNER}/{REPO}");
+
+    // Created through the API, like any other branch.
+    let (status, body) = api(
+        reqwest::Method::POST,
+        format!("{repo_api}/branches"),
+        &session,
+        Some(serde_json::json!({ "name": "protection", "from": "main" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert!(ref_value(&bare, "refs/heads/protection").is_some());
+
+    // A rule covering it is honoured by the deletion, as for any branch …
+    let (status, rule) = api(
+        reqwest::Method::POST,
+        format!("{repo_api}/branches/protection"),
+        &session,
+        Some(serde_json::json!({ "branch_name": "protection" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{rule}");
+    let (status, body) = api(
+        reqwest::Method::DELETE,
+        format!("{repo_api}/branches/protection"),
+        &session,
+        None,
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(ref_value(&bare, "refs/heads/protection").is_some());
+
+    // … and the rule collection still lists and deletes rules by id.
+    let (status, rules) = api(
+        reqwest::Method::GET,
+        format!("{repo_api}/branches/protection"),
+        &session,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{rules}");
+    assert_eq!(rules.as_array().map(Vec::len), Some(1), "{rules}");
+    let (status, body) = api(
+        reqwest::Method::DELETE,
+        format!("{repo_api}/branches/protection/{}", rule["id"]),
+        &session,
+        None,
+    )
+    .await;
+    assert!(status == 200 || status == 204, "{status}: {body}");
+
+    // Unprotected, the branch goes — through the path the router used to
+    // answer with 405.
+    let (status, body) = api(
+        reqwest::Method::DELETE,
+        format!("{repo_api}/branches/protection"),
+        &session,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ref"], "refs/heads/protection");
+    assert_eq!(ref_value(&bare, "refs/heads/protection"), None);
+
+    // The tag by that name: listed rules untouched, the tag deleted.
+    let (status, body) = api(
+        reqwest::Method::DELETE,
+        format!("{repo_api}/tags/protection"),
+        &session,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ref"], "refs/tags/protection");
+    assert_eq!(ref_value(&bare, "refs/tags/protection"), None);
+    let (status, rules) = api(
+        reqwest::Method::GET,
+        format!("{repo_api}/tags/protection"),
+        &session,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{rules}");
+}

@@ -2248,6 +2248,40 @@ pub async fn delete_tag(
     finish_ref_deletion(&state, repo_path, owner, repo, actor_id, deleted)
 }
 
+/// The one ref name the router cannot hand to `{branch}` / `{tag}`: the
+/// protection-rule collections sit at the literal `/branches/protection` and
+/// `/tags/protection`, and a static segment wins over a parameter. Git accepts
+/// `protection` as a branch or tag, so `DELETE` on those literal paths — which
+/// the rule collections never served, a rule is deleted by its `{id}` — is the
+/// deletion of the ref by that name (card_c9749ef51139).
+const REF_NAMED_LIKE_PROTECTION_COLLECTION: &str = "protection";
+
+/// `DELETE /api/v1/repos/:owner/:name/branches/protection` — the branch named
+/// `protection`, under exactly the rules of [`delete_branch`].
+pub async fn delete_branch_named_protection(
+    state: State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+    gate: RepoWrite,
+) -> impl IntoResponse {
+    let branch = REF_NAMED_LIKE_PROTECTION_COLLECTION.to_string();
+    delete_branch(state, Path((owner, repo, branch)), gate)
+        .await
+        .into_response()
+}
+
+/// `DELETE /api/v1/repos/:owner/:name/tags/protection` — the tag named
+/// `protection`, under exactly the rules of [`delete_tag`].
+pub async fn delete_tag_named_protection(
+    state: State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+    gate: RepoWrite,
+) -> impl IntoResponse {
+    let tag = REF_NAMED_LIKE_PROTECTION_COLLECTION.to_string();
+    delete_tag(state, Path((owner, repo, tag)), gate)
+        .await
+        .into_response()
+}
+
 fn ref_change_repo_path(
     state: &AppState,
     owner: &str,
