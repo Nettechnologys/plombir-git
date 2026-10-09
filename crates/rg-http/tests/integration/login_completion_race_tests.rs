@@ -357,7 +357,15 @@ fn every_http_login_path_finalizes_before_it_publishes_success() {
         "MFA verification minted a session before lifecycle finalization"
     );
 
-    let sso = function_body("api/sso.rs", "callback");
+    // The browser-facing `callback` only turns a refusal into a redirect
+    // (card_0d7c54cae647); the login itself runs in `callback_inner`, and the
+    // ordering below is pinned there — provided `callback` still calls it.
+    code_position(
+        &function_body("api/sso.rs", "callback"),
+        "callback_inner(",
+        "SSO callback",
+    );
+    let sso = function_body("api/sso.rs", "callback_inner");
     let sso_finalize = code_position(&sso, "finalize_primary_login(", "SSO callback");
     assert!(
         sso_finalize < code_position(&sso, "log_attempt(", "SSO callback")
