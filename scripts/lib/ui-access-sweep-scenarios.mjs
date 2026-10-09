@@ -823,6 +823,9 @@ const repoWiki = privileged(
     await context.waitForText('.wiki-content', 'Updated.');
     await context.clickByText('.header-actions button', 'History');
     await context.click('.revision-header');
+    // The click fetches the revision; navigating on at once cancelled that
+    // request before the sweep saw it, intermittently on CI. Wait for its text.
+    await context.waitForText('.revision-content', 'Browser surface page');
 
     await context.navigate(surfacePage(context, `/wiki/${context.fixture.surfaceWikiTitle}`));
     await context.setConfirm(true);
