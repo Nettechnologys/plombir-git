@@ -511,6 +511,12 @@ pub(crate) fn resolve_auth_secrets(
         env_secret
     } else if let Some(cli_secret) = jwt_secret {
         validate_jwt_secret(&cli_secret, "--jwt-secret CLI argument")?;
+        // argv is world-readable through /proc on a shared host.
+        tracing::warn!(
+            "--jwt-secret puts the signing key in this process's command line, which every \
+             local user can read through /proc; prefer PLOMBIR_GIT_JWT_SECRET or the config file"
+        );
+        tracing::info!("Using JWT secret from --jwt-secret");
         cli_secret
     } else if let Some(cfg_secret) = cfg.and_then(|c| c.auth.jwt_secret.clone()) {
         validate_jwt_secret(&cfg_secret, "config file [auth].jwt_secret")?;
@@ -533,6 +539,12 @@ pub(crate) fn resolve_auth_secrets(
         (env_key, None)
     } else if let Some(cli_key) = encryption_key {
         validate_jwt_secret(&cli_key, "--encryption-key CLI argument")?;
+        // Same exposure as --jwt-secret above: the key that opens data at rest
+        // would sit in the process list.
+        tracing::warn!(
+            "--encryption-key puts the at-rest key in this process's command line, which every \
+             local user can read through /proc; prefer PLOMBIR_GIT_ENCRYPTION_KEY or [auth].key_file"
+        );
         tracing::info!("Using at-rest encryption key from --encryption-key");
         (cli_key, None)
     } else if let Some(cfg_key) = cfg.and_then(|c| c.auth.encryption_key.clone()) {
@@ -938,6 +950,14 @@ pub(crate) async fn run_serve(
         .as_ref()
         .and_then(|c| c.external_url.clone())
         .or_else(|| cfg.as_ref().and_then(|c| c.server.external_url.clone()));
+
+    // HSTS `preload` is opt-in: it asks browsers to refuse to connect over
+    // plain http to this domain *and every subdomain*, which is a decision for
+    // the operator who owns the domain (card_5c1a90e4b7d2).
+    let resolved_hsts_preload = cfg
+        .as_ref()
+        .and_then(|c| c.server.hsts_preload)
+        .unwrap_or(false);
 
     // Inbound-webhook HMAC secret: env var wins, fallback to config file.
     // Unset ⇒ signature verification stays off (endpoints are auth-gated).
@@ -1490,6 +1510,7 @@ pub(crate) async fn run_serve(
         smtp_config: smtp_config.clone(),
         tls_config,
         external_url: resolved_external_url.clone(),
+        hsts_preload: resolved_hsts_preload,
         job_timeout_secs: resolved_job_timeout,
         git_stream_timeout_secs: resolved_git_stream_timeout,
         git_idle_timeout_secs: resolved_git_idle_timeout,

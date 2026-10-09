@@ -48,13 +48,29 @@ pub(crate) fn inject_csp_nonce(html: &str, nonce: &str) -> String {
 /// URI is origin-form and carries no scheme, so without it an instance serving
 /// TLS itself — no proxy, no `X-Forwarded-Proto` — never sent HSTS
 /// (card_c94e2be7c148).
+/// What the security layer needs to decide HSTS and the secure-cookie hint.
+///
+/// `tls_enabled` is the listener's own `[tls]` flag; `configured_https` is
+/// `[server].external_url`'s scheme when one is set — and then it decides,
+/// because the URL the operator published is the one a browser visits, however
+/// the request reached this process. `hsts_preload` is the opt-in from
+/// `[server].hsts_preload`.
+#[derive(Clone, Copy, Debug)]
+pub struct SecurityHeaderState {
+    pub tls_enabled: bool,
+    pub configured_https: Option<bool>,
+    pub hsts_preload: bool,
+}
+
 pub async fn security_headers_middleware(
-    State(tls_enabled): State<bool>,
+    State(state): State<SecurityHeaderState>,
     request: Request,
     next: Next,
 ) -> Response {
-    let is_https = is_https_uri(request.uri())
-        || crate::public_url::transport_is_https(tls_enabled, request.headers());
+    let is_https = state.configured_https.unwrap_or_else(|| {
+        is_https_uri(request.uri())
+            || crate::public_url::transport_is_https(state.tls_enabled, request.headers())
+    });
 
     // H-2: Generate a per-request nonce for CSP.
     // 128 bits of entropy (16 bytes → 32 hex chars) — sufficient for CSP nonce.
@@ -89,11 +105,16 @@ pub async fn security_headers_middleware(
         HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
 
-    // HSTS — only over HTTPS
+    // HSTS — only over HTTPS. `preload` is opt-in: it also tells the browser to
+    // refuse plain http to every subdomain, which the operator must have meant.
     if is_https {
         headers.insert(
             header::HeaderName::from_static("strict-transport-security"),
-            HeaderValue::from_static("max-age=31536000; includeSubDomains; preload"),
+            if state.hsts_preload {
+                HeaderValue::from_static("max-age=31536000; includeSubDomains; preload")
+            } else {
+                HeaderValue::from_static("max-age=31536000; includeSubDomains")
+            },
         );
     }
 
@@ -236,6 +257,16 @@ mod tests {
         "ok"
     }
 
+    /// The plain case the older tests are about: no configured URL, no TLS,
+    /// no `preload`.
+    fn plain_state(tls_enabled: bool) -> SecurityHeaderState {
+        SecurityHeaderState {
+            tls_enabled,
+            configured_https: None,
+            hsts_preload: false,
+        }
+    }
+
     #[test]
     fn spa_scripts_receive_exactly_one_csp_nonce() {
         let html = "<script>one()</script><script type=\"module\">two()</script>";
@@ -253,7 +284,10 @@ mod tests {
     async fn test_security_headers_added() {
         let app = Router::new()
             .route("/", get(dummy_handler))
-            .layer(from_fn_with_state(false, security_headers_middleware));
+            .layer(from_fn_with_state(
+                plain_state(false),
+                security_headers_middleware,
+            ));
 
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -273,6 +307,86 @@ mod tests {
         assert!(headers.get("cross-origin-opener-policy").is_some());
     }
 
+    /// A configured public URL decides the scheme: it is the address a browser
+    /// visits, so HSTS follows it rather than the listener that happens to be
+    /// in front of the request (card_c94e2be7c148).
+    #[tokio::test]
+    async fn a_configured_public_url_decides_whether_hsts_is_sent() {
+        let https_app = Router::new()
+            .route("/", get(dummy_handler))
+            .layer(from_fn_with_state(
+                SecurityHeaderState {
+                    tls_enabled: false,
+                    configured_https: Some(true),
+                    hsts_preload: false,
+                },
+                security_headers_middleware,
+            ));
+        let response = https_app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("strict-transport-security")
+                .expect("an https external_url promises HSTS even without TLS here"),
+            "max-age=31536000; includeSubDomains"
+        );
+
+        let http_app = Router::new()
+            .route("/", get(dummy_handler))
+            .layer(from_fn_with_state(
+                SecurityHeaderState {
+                    tls_enabled: false,
+                    configured_https: Some(false),
+                    hsts_preload: false,
+                },
+                security_headers_middleware,
+            ));
+        let response = http_app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response
+                .headers()
+                .get("strict-transport-security")
+                .is_none(),
+            "an http external_url must not claim HSTS however the request arrived"
+        );
+    }
+
+    /// `preload` is a promise about every subdomain; it is only advertised when
+    /// the operator asked for it.
+    #[tokio::test]
+    async fn hsts_preload_is_opt_in() {
+        let app = Router::new()
+            .route("/", get(dummy_handler))
+            .layer(from_fn_with_state(
+                SecurityHeaderState {
+                    tls_enabled: true,
+                    configured_https: None,
+                    hsts_preload: true,
+                },
+                security_headers_middleware,
+            ));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get("strict-transport-security").unwrap(),
+            "max-age=31536000; includeSubDomains; preload"
+        );
+    }
+
     /// The raw file route sandboxes what it serves; the global policy must be
     /// added beside that, never put in its place.
     #[tokio::test]
@@ -288,7 +402,10 @@ mod tests {
         }
         let app = Router::new()
             .route("/", get(sandboxed))
-            .layer(from_fn_with_state(false, security_headers_middleware));
+            .layer(from_fn_with_state(
+                plain_state(false),
+                security_headers_middleware,
+            ));
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -311,7 +428,10 @@ mod tests {
     async fn test_hsts_only_on_https() {
         let app = Router::new()
             .route("/", get(dummy_handler))
-            .layer(from_fn_with_state(false, security_headers_middleware));
+            .layer(from_fn_with_state(
+                plain_state(false),
+                security_headers_middleware,
+            ));
 
         // HTTP request — no HSTS
         let response = app
@@ -347,7 +467,10 @@ mod tests {
     async fn a_tls_listener_sends_hsts_for_an_origin_form_request() {
         let app = Router::new()
             .route("/", get(dummy_handler))
-            .layer(from_fn_with_state(true, security_headers_middleware));
+            .layer(from_fn_with_state(
+                plain_state(true),
+                security_headers_middleware,
+            ));
 
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())

@@ -27,6 +27,9 @@ host_key = "/data/ssh_host_key"
 # realm, the CI OIDC issuer, package indexes — and the Git LFS endpoint for
 # clones made from the SSH URL. Set it to whatever your reverse proxy serves.
 # external_url = "https://git.example.com"
+# Uncomment to send HSTS with `preload` (see the docs before enabling it for a
+# domain with subdomains that are not https):
+# hsts_preload = true
 
 [database]
 url = "sqlite:///data/plombir-git.db?mode=rwc"

@@ -306,11 +306,19 @@ pub(crate) fn validate_jwt_secret(jwt_secret: &str, source: &str) -> anyhow::Res
         anyhow::bail!("refusing to start with default/compromised jwt_secret");
     }
     if jwt_secret.len() < 16 {
-        tracing::warn!(
+        // A warning was not enough: this value signs every session, and it
+        // reached this far from a config file, the environment or argv. The
+        // floor is the shortest length that still leaves the HMAC key out of
+        // brute-force range for an attacker who can ask for tokens
+        // (card_8b0e2f0a1c3d).
+        tracing::error!(
             jwt_len = jwt_secret.len(),
-            "jwt_secret from {} is shorter than 16 characters — consider using a stronger secret",
+            "FATAL: jwt_secret from {} is shorter than 16 characters. \
+             Generate one with `plombir-git gen-secret` and set it via \
+             PLOMBIR_GIT_JWT_SECRET, --jwt-secret, or config file [auth].jwt_secret",
             source
         );
+        anyhow::bail!("refusing to start with a jwt_secret shorter than 16 characters");
     }
     Ok(())
 }
@@ -398,6 +406,16 @@ mod jwt_secret_tests {
         assert!(validate_jwt_secret("", "test").is_err());
         assert!(validate_jwt_secret("   ", "test").is_err());
         assert!(validate_jwt_secret("\n", "test").is_err());
+    }
+
+    /// The floor is 16 characters: below it, a warning was not enough — the
+    /// value signs every session, and an attacker holding one token can brute
+    /// force the rest (card_8b0e2f0a1c3d).
+    #[test]
+    fn rejects_a_short_secret() {
+        assert!(validate_jwt_secret("short", "test").is_err());
+        assert!(validate_jwt_secret("fifteen-chars!!", "test").is_err());
+        assert!(validate_jwt_secret("sixteen-chars!!!", "test").is_ok());
     }
 
     #[test]

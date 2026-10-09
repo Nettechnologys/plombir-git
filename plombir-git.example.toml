@@ -33,6 +33,10 @@ package_upload_max_mb = 512
 # `[tls]` is configured or a proxy sends `X-Forwarded-Proto: https`, and
 # `git lfs` over SSH needs a manual `lfs.url`.
 # external_url = "https://git.example.com"
+# Send HSTS with `preload` (default: off). Only turn this on for a domain whose
+# every subdomain is https: browsers hard-code the refusal to connect over
+# plain http, and getting back off the list takes months.
+# hsts_preload = true
 # Seconds allowed for draining in-flight requests and the CI-log queue after
 # SIGTERM / ctrl-c before the process is forced down. Raise it if a slow clone
 # or a long CI-log flush is being cut off during a rolling restart.
