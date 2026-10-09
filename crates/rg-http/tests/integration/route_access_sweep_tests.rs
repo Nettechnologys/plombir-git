@@ -1115,6 +1115,10 @@ struct RepoSeed {
     /// both — it is a field rather than a constant because a fixture that stops
     /// seeding it must not silently fall back to a number that means something.
     pull_number: String,
+    /// A second pull request, there only to be deleted by
+    /// `DELETE /pulls/{number}` (card_ee4f318c50f1) — the seeded one is the
+    /// subject of every other `/pulls/{number}/...` route registered after it.
+    doomed_pull_number: String,
     /// Review comment on that pull request — the `{comment_id}` of the
     /// `/pulls/comments/...` family and the `{id}` of `/pulls/{number}/comments/{id}/...`.
     pull_comment_id: String,
@@ -1197,6 +1201,7 @@ impl RepoSeed {
             milestone_id: absent(),
             label_id: absent(),
             pull_number: absent(),
+            doomed_pull_number: absent(),
             pull_comment_id: absent(),
             review_id: absent(),
             issue_attachment_id: absent(),
@@ -1381,6 +1386,41 @@ async fn seed_repo_rows(
             repo_id: Set(repo_id),
             number: Set(1),
             title: Set("sweep pull request".to_string()),
+            body: Set(Some("sweep".to_string())),
+            state: Set("open".to_string()),
+            is_draft: Set(false),
+            auto_merge_enabled: Set(false),
+            auto_merge_strategy: Set(None),
+            auto_merge_enabled_by_id: Set(None),
+            auto_merge_enabled_at: Set(None),
+            author_id: Set(owner_id),
+            reviewer_id: Set(None),
+            head_branch: Set("sweep-feature".to_string()),
+            base_branch: Set("main".to_string()),
+            head_sha: Set(None),
+            merge_strategy: Set(None),
+            merge_commit_sha: Set(None),
+            head_repo_id: Set(None),
+            ci_approved_sha: Set(None),
+            ci_approved_by: Set(None),
+            ci_approved_at: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            closed_at: Set(None),
+            merged_at: Set(None),
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("fixture: seeding the pull request in {repo} failed: {error}"));
+    let doomed_pull = rg_db::ops::pull_request_ops::create(
+        db,
+        rg_db::entities::pull_request::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            number: Set(2),
+            title: Set("sweep doomed pull request".to_string()),
             body: Set(Some("sweep".to_string())),
             state: Set("open".to_string()),
             is_draft: Set(false),
@@ -1807,6 +1847,7 @@ async fn seed_repo_rows(
         milestone_id: id_of(milestone),
         label_id: id_of(label),
         pull_number: pull.number.to_string(),
+        doomed_pull_number: doomed_pull.number.to_string(),
         pull_comment_id: review_comment_id,
         review_id: id_of(review),
         issue_attachment_id: id_of(issue_attachment),
@@ -1973,6 +2014,7 @@ fn fill(fact: &RouteFact, repo: &RepoSeed, globals: &GlobalSeed, org: &str) -> S
             // seed rather than be guessed.
             "comment_id" if path.contains("/pulls/comments/") => &repo.pull_comment_id,
             "comment_id" => &repo.comment_id,
+            "number" if deletes && path.ends_with("/pulls/{number}") => &repo.doomed_pull_number,
             "number" if path.contains("/pulls/") => &repo.pull_number,
             "attachment_id" if path.contains("/pulls/comments/") => {
                 &repo.review_comment_attachment_id

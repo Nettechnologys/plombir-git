@@ -133,6 +133,7 @@ probed_entities!(
     release,
     release_asset,
     repo_collaborator,
+    repo_number_floor,
     repo_star,
     repo_watch,
     repository,
