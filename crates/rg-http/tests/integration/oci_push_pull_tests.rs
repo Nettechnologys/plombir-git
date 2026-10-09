@@ -1774,3 +1774,114 @@ async fn a_manifest_above_the_declared_ceiling_is_refused() {
         "a refused push must publish nothing under its digest"
     );
 }
+
+/// Every file below `roots` whose path, lowercased, mentions `needle`.
+fn files_mentioning(roots: [&std::path::Path; 2], needle: &str) -> Vec<std::path::PathBuf> {
+    let mut matches = Vec::new();
+    let mut pending: Vec<std::path::PathBuf> = roots.iter().map(|root| root.to_path_buf()).collect();
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.to_string_lossy().to_lowercase().contains(needle) {
+                matches.push(path);
+            }
+        }
+    }
+    matches
+}
+
+/// A repository's OCI objects are keyed by the namespace the repository row
+/// resolves to, and deleting the repository retires that namespace — nothing a
+/// push wrote outlives it.
+///
+/// The lookup that finds the row and the prefix every storage key is built from
+/// used to be two independent answers. The row came from a lookup the database
+/// may answer without regard to case (MySQL's default collation does), while
+/// the prefix was the URL's spelling verbatim. A push to `OCI_NAMESPACE/mixed-case`
+/// against the repository stored as `oci_namespace/Mixed-Case` therefore wrote
+/// its layers under a second prefix, and repository deletion — which walks the
+/// canonical name off the row — left them there: bytes with no row of their
+/// own, counted by no quota and collected by nothing.
+///
+/// The test database is SQLite, whose `=` compares names byte-for-byte, so a
+/// differently-cased path cannot resolve to the repository here and the variant
+/// request below is refused; on a case-insensitive collation it must resolve
+/// and the same assertions apply. Either way the invariant is the same one the
+/// MySQL case violates: after a push the bytes are under the resolved
+/// namespace, and after the delete neither the blob tree nor upload staging
+/// holds anything a differently-cased namespace could have written.
+#[tokio::test]
+async fn oci_objects_are_keyed_by_the_resolved_repository_and_deletion_retires_them() {
+    let (base, repo_root, upload_root) = spawn_test_app_with_oci_root().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) =
+        register_full(&base, "oci_namespace", "oci_namespace@example.com").await;
+    create_repo(&base, &token, "Mixed-Case").await;
+
+    let layer = b"a layer keyed by the repository row, not by the URL";
+    let layer_digest = push_blob(&base, &token, "oci_namespace", "Mixed-Case", layer).await;
+
+    // Published under the resolved namespace, which for this push is the one
+    // the row spells.
+    let (algorithm, hash) = layer_digest.split_once(':').expect("sha256:hex digest");
+    let published = repo_root
+        .join("oci")
+        .join("oci_namespace")
+        .join("Mixed-Case")
+        .join("blobs")
+        .join(algorithm)
+        .join(&hash[..2])
+        .join(hash);
+    assert!(
+        published.is_file(),
+        "the layer must be published under the resolved namespace: {}",
+        published.display()
+    );
+
+    // A path spelled differently either resolves to this same repository — on a
+    // collation that ignores case — or is refused before touching storage.
+    // What it must never do is open a second namespace.
+    let variant = client
+        .post(format!(
+            "{base}/v2/OCI_NAMESPACE/mixed-case/blobs/uploads/"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        matches!(variant.status().as_u16(), 202 | 401 | 404),
+        "a differently-cased path must resolve to the repository or be refused, not fail: {}",
+        variant.status()
+    );
+
+    let deleted = client
+        .delete(format!("{base}/api/v1/repos/oci_namespace/Mixed-Case"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted.status(),
+        200,
+        "repository deletion failed: {}",
+        deleted.text().await.unwrap_or_default()
+    );
+
+    // Everything the push wrote lived below one namespace, and that namespace
+    // is what deletion walks. Search for the lowercased spelling so a leftover
+    // from a differently-cased push is found whatever case it was written in.
+    let leftover = files_mentioning(
+        [&repo_root, &upload_root],
+        "oci_namespace/mixed-case",
+    );
+    assert!(
+        leftover.is_empty(),
+        "DELETE returned success with OCI objects still on disk: {leftover:?}"
+    );
+}

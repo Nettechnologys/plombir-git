@@ -1242,6 +1242,11 @@ pub async fn put_manifest(
         Ok(None) => return oci_not_found(error_codes::NAME_UNKNOWN, "repository not found"),
         Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
+    // Everything below this line keys storage off the resolved repository, not
+    // off the spelling in the URL: the two differ exactly when the database
+    // matched the path without regard to case, and a key the deletion path
+    // would not walk is a layer nobody will ever collect.
+    let (owner, repo) = oci_repo.namespace();
 
     // The address the push is claiming, decided before anything is stored: a
     // reference that is neither a servable tag nor a verifiable digest has no
@@ -1782,27 +1787,40 @@ pub async fn head_blob(
         return resp;
     }
 
-    let exists = match state.oci_storage.blob_exists(&owner, &repo, &digest).await {
+    // The blob's key is built from the resolved repository's own spelling, not
+    // the URL's, for the same reason a push is: two spellings that resolve to
+    // one repository must not read or write two storage prefixes. When the
+    // repository does not resolve there is no canonical spelling to use, so the
+    // probe keeps the request's own and the missing-metadata answer below stays
+    // exactly what it was.
+    let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
+        Ok(oci_repo) => oci_repo,
+        Err(error) => return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
+    };
+    let (storage_owner, storage_repo) = match &oci_repo {
+        Some(resolved) => resolved.namespace(),
+        None => (owner.as_str(), repo.as_str()),
+    };
+
+    let exists = match state
+        .oci_storage
+        .blob_exists(storage_owner, storage_repo, &digest)
+        .await
+    {
         Ok(exists) => exists,
         Err(error) => return oci_blob_storage_error(&error),
     };
     if exists {
         // The metadata row is the registry's source of truth for the size. Bytes
         // without that row are an inconsistent object, not a zero-byte blob.
-        let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
-            Ok(Some(oci_repo)) => oci_repo,
-            Ok(None) => {
-                return oci_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "UNKNOWN",
-                    &format!(
-                        "OCI repository metadata is missing for {owner}/{repo}, but blob {digest} exists in storage"
-                    ),
-                );
-            }
-            Err(error) => {
-                return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}"));
-            }
+        let Some(oci_repo) = oci_repo else {
+            return oci_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!(
+                    "OCI repository metadata is missing for {owner}/{repo}, but blob {digest} exists in storage"
+                ),
+            );
         };
         let size = match rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, &digest).await {
             Ok(Some(blob)) => blob.size,
@@ -1847,6 +1865,19 @@ pub async fn get_blob(
     if let Some(resp) = blob_digest_refusal(&digest) {
         return resp;
     }
+
+    // As in `head_blob`: prefer the resolved repository's spelling, and fall
+    // back to the request's when there is no row to resolve (the fallback can
+    // only find bytes written by someone else's bug, but it answers the same
+    // way it did before).
+    let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
+        Ok(oci_repo) => oci_repo,
+        Err(error) => return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
+    };
+    let (owner, repo) = match &oci_repo {
+        Some(resolved) => resolved.namespace(),
+        None => (owner.as_str(), repo.as_str()),
+    };
 
     match state.oci_storage.blob_local_path(&owner, &repo, &digest) {
         Ok(Some(path)) => match tokio::fs::File::open(&path).await {
@@ -1942,8 +1973,11 @@ pub async fn start_upload(
         Ok(r) => r,
         Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
+    // The staging directory is part of the namespace deletion walks, so it is
+    // named by the resolved repository rather than by the URL that reached it.
+    let (owner, repo) = oci_repo.namespace();
 
-    match state.oci_storage.create_upload(&owner, &repo).await {
+    match state.oci_storage.create_upload(owner, repo).await {
         Ok((uuid, upload_path)) => {
             // Record upload in DB
             if let Err(e) =
@@ -2003,6 +2037,21 @@ async fn handle_mount(
         return resp;
     }
 
+    // Both ends of a mount are keyed by their *resolved* spelling: the source
+    // read must find the bytes where the source repository's own pushes put
+    // them, and the destination write must land where its deletion will look.
+    // A mount addressed to a repository by a spelling the database matched
+    // case-insensitively would otherwise copy from, or into, a namespace no
+    // other request and no cleanup ever visits.
+    let from_oci_repo = match find_oci_repo(&state.db, from_owner, from_repo).await {
+        Ok(resolved) => resolved,
+        Err(error) => return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
+    };
+    let (from_owner, from_repo) = match &from_oci_repo {
+        Some(resolved) => resolved.namespace(),
+        None => (from_owner, from_repo),
+    };
+
     // Check source blob exists. A backend that cannot answer is not the same as
     // an answer of "no": `unwrap_or(false)` turned an unreachable blob store
     // into a 404, which tells the pushing client the source image is missing
@@ -2026,6 +2075,7 @@ async fn handle_mount(
         Ok(repo) => repo,
         Err(error) => return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
     };
+    let (owner, repo) = oci_repo.namespace();
 
     // Copy blob file via hardlink (or fallback to streaming copy) — avoids
     // memory copy. Same publication protocol as a finalized upload: a mount
@@ -2089,7 +2139,13 @@ async fn upload_in_repo(
     owner: &str,
     repo: &str,
     uuid: &str,
-) -> Result<rg_db::entities::oci_upload::Model, Response> {
+) -> Result<
+    (
+        rg_db::entities::oci_upload::Model,
+        ResolvedOciRepository,
+    ),
+    Response,
+> {
     let unknown = || oci_not_found(error_codes::BLOB_UPLOAD_UNKNOWN, "upload session not found");
 
     // No `oci_repository` row means no session can belong here — including the
@@ -2105,7 +2161,7 @@ async fn upload_in_repo(
             if upload.oci_repository_id == oci_repo.id
                 && upload.expires_at > chrono::Utc::now() =>
         {
-            Ok(upload)
+            Ok((upload, oci_repo))
         }
         Ok(_) => Err(unknown()),
         Err(e) => Err(oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}"))),
@@ -2128,12 +2184,16 @@ pub async fn get_upload_status(
     }
 
     // Refuse an unknown, expired or differently-anchored session before
-    // deriving and opening a path from the caller-supplied uuid.
-    if let Err(resp) = upload_in_repo(&state, &owner, &repo, &uuid).await {
-        return resp;
-    }
+    // deriving and opening a path from the caller-supplied uuid. The resolved
+    // repository the session was anchored to is also where its staging file
+    // lives — the two are one decision, so they come out of one call.
+    let (_, oci_repo) = match upload_in_repo(&state, &owner, &repo, &uuid).await {
+        Ok(resolved) => resolved,
+        Err(resp) => return resp,
+    };
+    let (owner, repo) = oci_repo.namespace();
 
-    let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
+    let file_path = state.oci_storage.upload_file(owner, repo, &uuid);
     let _upload_guard = match acquire_upload_file_lock(&file_path).await {
         Ok(guard) => guard,
         Err(error) => {
@@ -2144,7 +2204,7 @@ pub async fn get_upload_status(
             );
         }
     };
-    let upload = match upload_in_repo(&state, &owner, &repo, &uuid).await {
+    let (upload, _) = match upload_in_repo(&state, &owner, &repo, &uuid).await {
         Ok(upload) => upload,
         Err(resp) => return resp,
     };
@@ -2193,13 +2253,17 @@ pub async fn chunk_upload(
         return resp;
     }
 
-    // Verify the upload session exists *in the gated repository*.
-    match upload_in_repo(&state, &owner, &repo, &uuid).await {
-        Ok(_) => {}
+    // Verify the upload session exists *in the gated repository*. The session
+    // and the storage namespace it is staged under are one resolution: a
+    // session anchored to the repository row must be read and appended to in
+    // the spelling that row's pushes and deletion use.
+    let (_, oci_repo) = match upload_in_repo(&state, &owner, &repo, &uuid).await {
+        Ok(resolved) => resolved,
         Err(resp) => return resp,
-    }
+    };
+    let (owner, repo) = oci_repo.namespace();
 
-    let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
+    let file_path = state.oci_storage.upload_file(owner, repo, &uuid);
     let _upload_guard = match acquire_upload_file_lock(&file_path).await {
         Ok(guard) => guard,
         Err(error) => {
@@ -2213,7 +2277,7 @@ pub async fn chunk_upload(
     // A retry may have waited behind the request whose response it lost. The
     // model fetched before the lock is then stale, so refresh the acknowledged
     // offset while the staging file is exclusively ours.
-    let upload = match upload_in_repo(&state, &owner, &repo, &uuid).await {
+    let (upload, _) = match upload_in_repo(&state, &owner, &repo, &uuid).await {
         Ok(upload) => upload,
         Err(resp) => return resp,
     };
@@ -2585,12 +2649,17 @@ pub async fn complete_upload(
     // else's, but the row is not: finalizing ends by deleting the session, and
     // keyed on the uuid alone that delete landed on whichever repository held
     // it — a stranger's `docker push` cancelled from outside.
-    let upload_before_lock = match upload_in_repo(&state, &owner, &repo, &uuid).await {
-        Ok(upload) => upload,
+    //
+    // The resolution also names the staging file: the session is anchored to
+    // the `oci_repository` row, and the prefix every other request for this
+    // repository uses comes from that row, not from the URL that finds it.
+    let (upload_before_lock, oci_repo) = match upload_in_repo(&state, &owner, &repo, &uuid).await {
+        Ok(resolved) => resolved,
         Err(resp) => return resp,
     };
+    let (owner, repo) = oci_repo.namespace();
 
-    let file_path = state.oci_storage.upload_file(&owner, &repo, &uuid);
+    let file_path = state.oci_storage.upload_file(owner, repo, &uuid);
     let _upload_guard = match acquire_upload_file_lock(&file_path).await {
         Ok(guard) => guard,
         Err(error) => {
@@ -2607,7 +2676,7 @@ pub async fn complete_upload(
     };
     // A PATCH may have completed while this PUT waited for the staging file.
     // Refresh the row under the same lock before using its acknowledged offset.
-    let upload = match upload_in_repo(&state, &owner, &repo, &uuid).await {
+    let (upload, _) = match upload_in_repo(&state, &owner, &repo, &uuid).await {
         Ok(upload) => upload,
         Err(resp) => return resp,
     };
@@ -3014,31 +3083,76 @@ async fn stream_body_to_file(
 
 // ── DB helpers ────────────────────────────────────────────────
 
-/// Find an OCI repository, auto-creating if it doesn't exist.
-/// Uses the Plombir Git repo as the owner.
+/// An OCI repository resolved for one request, together with the canonical
+/// `{owner}/{repo}` its storage lives under.
+///
+/// A client addresses a repository by the two path segments it typed, and the
+/// database is free to match them without regard to case — MySQL's default
+/// collation does. Every storage key and staging path, on the other hand, is a
+/// case-sensitive prefix built from the segments as they were spelled. Two
+/// spellings of one repository therefore used to publish two disjoint copies of
+/// every layer, and repository deletion, which walks the *canonical* namespace
+/// off the row, retired only one of them: the other's layers stayed on disk
+/// with no row of their own to notice them.
+///
+/// The id and the names come out of one resolution, so a caller cannot pair a
+/// row's id with another request's spelling.
+struct ResolvedOciRepository {
+    /// The `oci_repository` row's id.
+    id: i64,
+    /// The account or organization the repository is published under, as
+    /// `repository_namespace_name` spells it.
+    owner: String,
+    /// The repository's own stored name.
+    name: String,
+}
+
+impl ResolvedOciRepository {
+    /// The storage namespace, as the pair of segments every key is built from.
+    fn namespace(&self) -> (&str, &str) {
+        (&self.owner, &self.name)
+    }
+}
+
+/// Find an OCI repository for `owner/repo`, canonically spelled.
 async fn find_oci_repo(
     db: &DatabaseConnection,
     owner: &str,
     repo: &str,
-) -> anyhow::Result<Option<rg_db::entities::oci_repository::Model>> {
+) -> anyhow::Result<Option<ResolvedOciRepository>> {
     // Look up the Plombir Git repository
-    let plombir_git_repo = rg_core::repo::service::find_repo_by_owner_name(db, owner, repo).await?;
-    match plombir_git_repo {
-        Some(r) => {
-            let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(db, r.id).await?;
-            Ok(oci_repo)
-        }
-        None => Ok(None),
-    }
+    let Some(plombir_git_repo) = rg_core::repo::service::find_repo_by_owner_name(db, owner, repo).await?
+    else {
+        return Ok(None);
+    };
+    let Some(oci_repo) = rg_db::ops::oci_ops::find_repo_by_id(db, plombir_git_repo.id).await? else {
+        return Ok(None);
+    };
+    let canonical_owner = rg_core::repo::service::repository_namespace_name(
+        db,
+        plombir_git_repo.owner_id,
+        plombir_git_repo.org_id,
+    )
+    .await?;
+    Ok(Some(ResolvedOciRepository {
+        id: oci_repo.id,
+        owner: canonical_owner,
+        name: plombir_git_repo.name,
+    }))
 }
 
 /// The `oci_repository` row for `owner/repo`, created on the first push.
 ///
-/// The namespace is `owner/repo` — the path the client asked for — and it is
-/// resolved as such. It used to be resolved against *the caller* instead
-/// whenever one was known (`find_by_owner_and_name(actor_id, repo)`), which is
-/// only the same query when the caller happens to be the owner. A collaborator
-/// pushing the first image of a repository they do not own looked up
+/// The namespace is `{owner}/{repo}`, resolved and then stored in the
+/// *canonical* spelling of both segments — the one repository deletion and the
+/// expired-upload sweep later derive their paths from. Storing the request's
+/// spelling instead is what let a differently-cased push put its layers beyond
+/// the reach of a delete; the row is the one place all later readers agree on.
+///
+/// Resolution itself used to go against *the caller* instead whenever one was
+/// known (`find_by_owner_and_name(actor_id, repo)`), which is only the same
+/// query when the caller happens to be the owner. A collaborator pushing the
+/// first image of a repository they do not own looked up
 /// `their-id/repo`, found nothing, and got `500 repository not found` for a
 /// push the gate had just allowed. Nobody noticed because the actor reaching
 /// here was almost always `None`: docker authenticates with a scoped token, and
@@ -3050,20 +3164,29 @@ async fn find_or_create_oci_repo(
     db: &DatabaseConnection,
     owner: &str,
     repo: &str,
-) -> anyhow::Result<rg_db::entities::oci_repository::Model> {
+) -> anyhow::Result<ResolvedOciRepository> {
     let plombir_git_repo = rg_core::repo::service::find_repo_by_owner_name(db, owner, repo)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repository {}/{} not found", owner, repo))?;
-
-    let namespace = format!("{}/{}", owner, repo);
-    rg_db::ops::oci_ops::find_or_create_repo(
+    let canonical_owner = rg_core::repo::service::repository_namespace_name(
+        db,
+        plombir_git_repo.owner_id,
+        plombir_git_repo.org_id,
+    )
+    .await?;
+    let namespace = format!("{}/{}", canonical_owner, plombir_git_repo.name);
+    let oci_repo = rg_db::ops::oci_ops::find_or_create_repo(
         db,
         plombir_git_repo.id,
         &namespace,
         plombir_git_repo.owner_id,
     )
-    .await
-    .map_err(Into::into)
+    .await?;
+    Ok(ResolvedOciRepository {
+        id: oci_repo.id,
+        owner: canonical_owner,
+        name: plombir_git_repo.name,
+    })
 }
 
 /// The token endpoint a challenge sends the client to, on this instance's
