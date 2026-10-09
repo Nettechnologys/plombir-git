@@ -179,6 +179,36 @@ async fn the_first_page_of_type_all_is_not_one_kind_only() {
     );
 }
 
+/// The page number used to be multiplied into an offset unchanged, so
+/// `page=u64::MAX` asked the database for an `OFFSET` beyond `i64::MAX` and
+/// came back a 500. It must answer an empty page instead.
+#[tokio::test]
+async fn a_page_beyond_the_i64_ceiling_is_an_empty_page() {
+    let base = spawn_test_app().await;
+    let (token, _) = register_full(&base, "huge-page-owner", "huge-page-owner@example.com").await;
+    seed(&base, &token, "huge-page-owner").await;
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{base}/api/v1/search?q={TERM}&type=all&page=18446744073709551615"
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("search with a huge page");
+    assert_eq!(
+        resp.status(),
+        200,
+        "a page number beyond the offset ceiling must be an empty page, not an error"
+    );
+    let body: serde_json::Value = resp.json().await.expect("search json");
+    assert_eq!(
+        body["results"].as_array().map(Vec::len),
+        Some(0),
+        "no row lives at page u64::MAX"
+    );
+}
+
 #[tokio::test]
 async fn a_single_kind_search_still_pages_the_way_it_did() {
     let base = spawn_test_app().await;

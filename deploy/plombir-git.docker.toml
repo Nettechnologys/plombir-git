@@ -97,6 +97,10 @@ auth_window_secs = 60
 # Per-account limit shared by every token of one bot account (AI agent).
 agent_max = 600
 agent_window_secs = 60
+# Per-IP limit for anonymous global search; signed-in callers are exempt.
+# 0 disables it.
+search_max = 60
+search_window_secs = 60
 
 [logging]
 # Left unset on purpose: with no `file`, the server logs to stdout, which is

@@ -3537,7 +3537,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         &format!("{wiki_term} repo:{username}/{repo_name}"),
         "wiki",
         Some(user.id),
-        1,
+        0,
         20,
     )
     .await
@@ -3610,7 +3610,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         &format!("{current_wiki_term} repo:{username}/{repo_name}"),
         "wiki",
         Some(user.id),
-        1,
+        0,
         20,
     )
     .await
@@ -3626,7 +3626,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         &format!("{superseded_wiki_term} repo:{username}/{repo_name}"),
         "wiki",
         Some(user.id),
-        1,
+        0,
         20,
     )
     .await
@@ -3675,7 +3675,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         &format!("{repo_name} author:{username}"),
         "repos",
         Some(user.id),
-        1,
+        0,
         20,
     )
     .await
@@ -3691,7 +3691,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         &format!("{current_wiki_term} repo:{username}/{repo_name}"),
         "wiki",
         Some(user.id),
-        1,
+        0,
         20,
     )
     .await
@@ -4538,7 +4538,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         &format!("{repo_restore_term} author:{username}"),
         "repos",
         Some(user.id),
-        1,
+        0,
         20,
     )
     .await

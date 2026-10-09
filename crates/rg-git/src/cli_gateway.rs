@@ -50,6 +50,21 @@ pub enum GitCliError {
         bytes_read: u64,
     },
 
+    /// The command wrote past the disk budget its caller attached and its
+    /// process tree was killed. `bytes` is what the destination held when the
+    /// poll saw the overrun; the child may have written a little more between
+    /// that byte and the kill.
+    #[error(
+        "git command wrote past its {limit_bytes}-byte disk budget ({bytes} bytes under \
+         {path}): {command}"
+    )]
+    DiskBudgetExceeded {
+        command: String,
+        path: std::path::PathBuf,
+        bytes: u64,
+        limit_bytes: u64,
+    },
+
     #[error("I/O error running git: {0}")]
     Io(#[from] std::io::Error),
 }

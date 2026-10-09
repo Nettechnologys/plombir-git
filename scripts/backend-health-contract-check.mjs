@@ -34,6 +34,23 @@ if (/fetch\(\s*['"`]\/health['"`]/.test(layout)) {
   failures.push('Root layout still fetches same-origin /health directly');
 }
 
+// `/health` answers anonymous callers with the verdict only
+// (`{"status":"ok"|"degraded"}`); `checks`, `version` and `commit` require an
+// instance admin. The layout is the anonymous consumer, so it may only look at
+// `status` — and must keep accepting `ok`, the value the minimal body carries
+// (its other accepted value, `healthy`, predates the split).
+if (!/\[\s*'healthy'\s*,\s*'ok'\s*\]/.test(layout)) {
+  failures.push(
+    "Root layout must accept the anonymous /health verdict (`ok`) — the minimal body has no checks to inspect",
+  );
+}
+
+if (/body\??\.\s*(checks|version|commit)|body\??\[\s*['"](checks|version|commit)['"]\s*\]/.test(layout)) {
+  failures.push(
+    'Root layout must not read /health checks/version/commit: anonymous responses no longer carry them (admin-only detail)',
+  );
+}
+
 if (failures.length > 0) {
   for (const failure of failures) {
     console.log(`FAIL ${failure}`);

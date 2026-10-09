@@ -290,13 +290,16 @@ pub(crate) struct Routers {
 /// unauthenticated credential endpoints (register, login, password reset, the
 /// MFA step and the passkey login) to
 /// blunt registration spam and password guessing independently of the global
-/// limit (which is off by default).
+/// limit (which is off by default);
+/// `search_rate_limiter` bounds anonymous global search, whose FTS queries are
+/// the most expensive read an unauthenticated caller can ask for.
 pub(crate) fn create_router(
     state: AppState,
     rate_limiter: rate_limit::RateLimiter,
     auth_rate_limiter: rate_limit::RateLimiter,
+    search_rate_limiter: rate_limit::RateLimiter,
 ) -> Router {
-    build_router(state, rate_limiter, auth_rate_limiter)
+    build_router(state, rate_limiter, auth_rate_limiter, search_rate_limiter)
 }
 
 /// Shared router builder used by both production and test routers.
@@ -320,12 +323,13 @@ fn build_router(
     mut state: AppState,
     rate_limiter: rate_limit::RateLimiter,
     auth_rate_limiter: rate_limit::RateLimiter,
+    search_rate_limiter: rate_limit::RateLimiter,
 ) -> Router {
     // A slot of this router's own: the MCP endpoint dispatches into the router
     // that serves it, never into another one built from a clone of the state.
     state.mcp_router = api::mcp::McpRouterSlot::default();
     let slot = state.mcp_router.clone();
-    let routers = build_all_routes(&state, Some(&auth_rate_limiter));
+    let routers = build_all_routes(&state, Some(&auth_rate_limiter), Some(&search_rate_limiter));
 
     let router = apply_middleware(
         with_spa_fallback(assemble(&routers), &state),
@@ -1022,6 +1026,7 @@ fn rubygems_protocol_routes(table: RouteTable) -> RouteTable {
 pub(crate) fn build_all_routes(
     state: &AppState,
     auth_rate_limiter: Option<&rate_limit::RateLimiter>,
+    search_rate_limiter: Option<&rate_limit::RateLimiter>,
 ) -> Routers {
     // Stricter per-route limiter for the credential endpoints, keyed by the
     // same client-IP resolution as the global limiter. `layer()` returns the
@@ -1034,6 +1039,22 @@ pub(crate) fn build_all_routes(
                 rate_limit::rate_limit_middleware,
             )),
             None => mr,
+        }
+    });
+    // Anonymous search shares that shape but not that budget: an authenticated
+    // session or token is not throttled, so logged-in browsing of the search
+    // box never pays for the FTS queries an anonymous scraper asks for.
+    let anonymous_search_rl = Wrap::plain({
+        let limiter = search_rate_limiter.cloned();
+        let jwt_secret = state.jwt_secret.clone();
+        move |mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
+            match &limiter {
+                Some(limiter) => mr.layer(axum::middleware::from_fn_with_state(
+                    (limiter.clone(), jwt_secret.clone()),
+                    rate_limit::anonymous_search_rate_limit,
+                )),
+                None => mr,
+            }
         }
     });
     // The runner token check. Applied per route rather than to a sub-router so
@@ -2794,7 +2815,12 @@ pub(crate) fn build_all_routes(
             api::admin::update_settings,
         )
         // ── Global search ──────────────────────────────────────────────────
-        .get(PublicFiltered, "/search", api::search::search)
+        .get_with(
+            PublicFiltered,
+            "/search",
+            api::search::search,
+            &anonymous_search_rl,
+        )
         // ── External CI/CD webhook ─────────────────────────────────────────
         .post_with(
             RepoWrite,
@@ -2904,7 +2930,7 @@ pub(crate) fn build_test_router_with_facts(mut state: AppState) -> (Router, Vec<
     let slot = state.mcp_router.clone();
     // No auth limiter in tests: the limiter middleware extracts ConnectInfo,
     // which the test harness does not supply. Passing None skips that layer.
-    let routers = build_all_routes(&state, None);
+    let routers = build_all_routes(&state, None, None);
     let facts = routers.facts.clone();
 
     // Same stack as production, minus the rate limiter — see `apply_middleware`.

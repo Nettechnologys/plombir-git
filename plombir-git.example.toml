@@ -188,6 +188,12 @@ auth_window_secs = 60
 # request per tool call. Independent of `max`; on by default. 0 disables it.
 agent_max = 600
 agent_window_secs = 60
+# Per-IP limit for anonymous global search (/api/v1/search). Search is public
+# and every request runs full-text queries, so it has its own budget; a caller
+# with a valid session or token is exempt. Independent of `max`; on by default.
+# Set search_max = 0 to disable it.
+search_max = 60
+search_window_secs = 60
 
 [smtp]
 # Mail is on when host, user, pass and from are all set, off when none are;

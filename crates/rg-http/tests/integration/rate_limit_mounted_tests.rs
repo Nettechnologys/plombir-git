@@ -19,26 +19,37 @@
 
 use std::net::SocketAddr;
 
-use crate::common::{build_test_app_state, setup_test_db, wait_for_listener};
+use crate::common::{build_test_app_state, register_full, setup_test_db, wait_for_listener};
 use crate::security_headers_tests::assert_security_headers;
 use reqwest::header;
 
 const PASSWORD: &str = "Qz7$wRtm";
 
-/// Spawn the production router with the two limiters set to the given budgets.
+/// Spawn the production router with the two limiters set to the given budgets
+/// and anonymous search unthrottled.
 ///
 /// `0` disables a limiter while leaving its layer mounted, which is how each
 /// test isolates the half it is about: whatever answers 429 can only have come
 /// from the other one.
 async fn spawn_prod_app_with_rate_limits(global_max: u32, auth_max: u32) -> String {
+    spawn_prod_app_with_all_rate_limits(global_max, auth_max, 0).await
+}
+
+/// Like [`spawn_prod_app_with_rate_limits`], with the anonymous-search budget.
+async fn spawn_prod_app_with_all_rate_limits(
+    global_max: u32,
+    auth_max: u32,
+    search_max: u32,
+) -> String {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).expect("create test repo root");
     let state = build_test_app_state(db, repo_root);
-    let app = rg_http::create_router_for_test_with_rate_limits(
+    let app = rg_http::create_router_for_test_with_all_rate_limits(
         state,
         rg_http::rate_limit::RateLimiter::new(global_max, 60),
         rg_http::rate_limit::RateLimiter::new(auth_max, 60),
+        rg_http::rate_limit::RateLimiter::new(search_max, 60),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -236,6 +247,54 @@ async fn every_unauthenticated_credential_door_carries_the_auth_rate_limiter() {
             .status();
         assert_eq!(second, 429, "{path} does not carry the auth rate limiter");
     }
+}
+
+/// Global search is public and expensive, so it carries its own small budget —
+/// and only for anonymous callers: a presented session or token is a known
+/// caller and must not be caught by the scraper's limiter.
+#[tokio::test]
+async fn anonymous_search_carries_its_own_rate_limiter() {
+    // Both other limiters off: whatever answers 429 came from the search budget.
+    let base = spawn_prod_app_with_all_rate_limits(0, 0, 2).await;
+    let client = reqwest::Client::new();
+
+    for attempt in 1..=2 {
+        let resp = client
+            .get(format!("{base}/api/v1/search?q=anything"))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            429,
+            "anonymous search request {attempt} of 2 is inside the budget"
+        );
+    }
+
+    let third = client
+        .get(format!("{base}/api/v1/search?q=anything"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        third.status(),
+        429,
+        "the third anonymous search is over budget — the search route is missing its limiter"
+    );
+
+    // The same IP with a valid token is not anonymous and passes untouched.
+    let (token, _) = register_full(&base, "search-limiter", "search-limiter@example.com").await;
+    let authenticated = client
+        .get(format!("{base}/api/v1/search?q=anything"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        authenticated.status(),
+        429,
+        "an authenticated caller must not spend the anonymous search budget"
+    );
 }
 
 /// The acceptance of card_0beff149adbd in the shipped numbers: ten reset

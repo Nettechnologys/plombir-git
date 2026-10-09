@@ -230,6 +230,11 @@ pub(crate) struct RateLimitConfig {
     pub(crate) agent_max: Option<u32>,
     /// Window (seconds) for the bot-account limiter.
     pub(crate) agent_window_secs: Option<u64>,
+    /// Per-IP cap for anonymous global search (authenticated callers are not
+    /// throttled here). 0 disables it.
+    pub(crate) search_max: Option<u32>,
+    /// Window (seconds) for the anonymous-search limiter.
+    pub(crate) search_window_secs: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -671,6 +676,12 @@ pub(crate) const DEFAULT_AUTH_RATE_LIMIT_WINDOW: u64 = 60;
 /// because an agent loop is the client most likely to run away.
 pub(crate) const DEFAULT_AGENT_RATE_LIMIT_MAX: u32 = 600;
 pub(crate) const DEFAULT_AGENT_RATE_LIMIT_WINDOW: u64 = 60;
+
+/// The anonymous-search limiter: search is public and every request costs FTS
+/// queries, so it gets a budget of its own. Authenticated sessions and tokens
+/// are exempt, which is why this is far below the global default.
+pub(crate) const DEFAULT_SEARCH_RATE_LIMIT_MAX: u32 = 60;
+pub(crate) const DEFAULT_SEARCH_RATE_LIMIT_WINDOW: u64 = 60;
 
 /// `[audit].enabled`: on by default, because an audit log that is never trimmed
 /// grows until the disk does.
@@ -1938,6 +1949,18 @@ mod tests {
                 "agent_window_secs",
                 "DEFAULT_AGENT_RATE_LIMIT_WINDOW",
                 super::DEFAULT_AGENT_RATE_LIMIT_WINDOW.to_string(),
+            ),
+            row(
+                "rate_limit",
+                "search_max",
+                "DEFAULT_SEARCH_RATE_LIMIT_MAX",
+                super::DEFAULT_SEARCH_RATE_LIMIT_MAX.to_string(),
+            ),
+            row(
+                "rate_limit",
+                "search_window_secs",
+                "DEFAULT_SEARCH_RATE_LIMIT_WINDOW",
+                super::DEFAULT_SEARCH_RATE_LIMIT_WINDOW.to_string(),
             ),
             row(
                 "logging",

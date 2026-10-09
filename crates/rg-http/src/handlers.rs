@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 
@@ -303,7 +303,16 @@ async fn database_check(state: &AppState) -> Check {
     }
 }
 
-/// `GET /health`: the full report — every dependency, and which build this is.
+/// Optional `?verbose=` for [`health`]. Deliberately a string so that a junk
+/// value cannot turn a probe into a `400`: only `"0"`/`"false"` mean anything.
+#[derive(serde::Deserialize)]
+pub(crate) struct HealthQuery {
+    #[serde(default)]
+    verbose: Option<String>,
+}
+
+/// `GET /health`: the verdict for every caller, the full report for an instance
+/// admin.
 ///
 /// The status code follows what the instance cannot serve without: the
 /// database, the repository storage and git. SMTP is reported and does not
@@ -311,7 +320,28 @@ async fn database_check(state: &AppState) -> Check {
 /// into a `503` — which Docker's `HEALTHCHECK` read as an unhealthy container and
 /// the web UI's readiness check read as a backend that is not up, for an outage
 /// that stops nothing but outgoing mail (card_0d7755e0dfe0).
-pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
+///
+/// The body, unlike the status code, is not for every caller: `/health` is
+/// public, and the full report names the build (`version`, `commit`), the
+/// configured SMTP host and the raw error text of every failing dependency —
+/// reconnaissance before anything is even attempted. A probe only needs "can
+/// this instance serve?", so anonymous callers get `{"status": "ok"|"degraded"}`
+/// with the unchanged status codes, and `checks`/`version`/`commit` are served
+/// to an instance admin. `?verbose=0` (admins only) asks for the minimal form;
+/// `?verbose=1` is accepted and does not substitute for admin authentication.
+pub(crate) async fn health(
+    State(state): State<AppState>,
+    admin: Option<crate::api::admin::InstanceAdmin>,
+    Query(query): Query<HealthQuery>,
+) -> Response {
+    // The admin gate runs before body-bearing extractors would have; the query
+    // is read defensively, so no caller can 400 their way into a schema error.
+    let detailed = admin.is_some()
+        && !matches!(
+            query.verbose.as_deref(),
+            Some("0") | Some("false")
+        );
+
     let mut checks = serde_json::Map::new();
 
     let db_ok = record(&mut checks, "database", database_check(&state).await);
@@ -323,13 +353,6 @@ pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
         filesystem_check(&state.repo_root).await,
     );
 
-    // Prometheus registry check
-    let metrics_ok = crate::metrics::REGISTRY.get().is_some();
-    checks.insert(
-        "metrics".to_string(),
-        serde_json::json!(if metrics_ok { "ok" } else { "not_initialized" }),
-    );
-
     // Git availability check (gateway already validates git --version at init)
     let git_check = match rg_git::cli_gateway::global_gateway() {
         Ok(_) => Check::ok(),
@@ -337,33 +360,56 @@ pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     };
     let git_ok = record(&mut checks, "git", git_check);
 
-    // SMTP: reported, never decisive, and probed at most once a minute.
-    match state.smtp_config {
-        Some(ref smtp) => {
-            record(
-                &mut checks,
-                "smtp",
-                cached_smtp_check(smtp.host.as_str(), smtp.port).await,
-            );
-        }
-        // Skipped when unconfigured — no section, nothing to be wrong about.
-        None => {
-            record(&mut checks, "smtp", Check::ok());
+    // Prometheus registry check and the SMTP probe are part of the operator's
+    // report only: SMTP is never decisive, and the probe touches the mail relay
+    // — an anonymous poller should not cause that (it is cached, but still).
+    if detailed {
+        let metrics_ok = crate::metrics::REGISTRY.get().is_some();
+        checks.insert(
+            "metrics".to_string(),
+            serde_json::json!(if metrics_ok { "ok" } else { "not_initialized" }),
+        );
+
+        // SMTP: reported, never decisive, and probed at most once a minute.
+        match state.smtp_config {
+            Some(ref smtp) => {
+                record(
+                    &mut checks,
+                    "smtp",
+                    cached_smtp_check(smtp.host.as_str(), smtp.port).await,
+                );
+            }
+            // Skipped when unconfigured — no section, nothing to be wrong about.
+            None => {
+                record(&mut checks, "smtp", Check::ok());
+            }
         }
     }
 
     let serving = db_ok && fs_ok && git_ok;
+    let status_code = if serving {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    if !detailed {
+        // Same codes as the full report, so Docker, the load balancer and the
+        // web UI's readiness check keep working on the verdict alone.
+        let status = if serving { "ok" } else { "degraded" };
+        return (
+            status_code,
+            axum::Json(serde_json::json!({ "status": status })),
+        )
+            .into_response();
+    }
+
     let overall = if serving {
         "ok"
     } else if db_ok || fs_ok {
         "degraded"
     } else {
         "unhealthy"
-    };
-    let status_code = if serving {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
     };
 
     // `version` alone is the workspace's crate version, the same on every
@@ -378,6 +424,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "checks": checks,
         })),
     )
+        .into_response()
 }
 
 /// How long one SMTP probe's verdict is reused.

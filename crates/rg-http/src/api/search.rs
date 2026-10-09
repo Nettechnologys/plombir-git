@@ -79,8 +79,11 @@ pub async fn search(
         &params.q,
         search_type,
         viewer_id,
-        pagination.page,
-        pagination.per_page,
+        // `PaginationParams::offset()` is the one place the page is turned into
+        // a row offset: it clamps to `i64::MAX`, so `page=u64::MAX` asks for an
+        // empty page instead of an `OFFSET` the database refuses.
+        pagination.offset(),
+        pagination.limit(),
     )
     .await
     {
