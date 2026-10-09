@@ -87,7 +87,8 @@ pub(crate) fn page_query(repo_id: i64, state: Option<&str>) -> sea_orm::Select<I
         .order_by_desc(issue::Column::Id)
 }
 
-/// Get the next issue number for a repo (max + 1, or 1 if no issues).
+/// Get the next issue number for a repo: one past the larger of the highest
+/// live number and the highest number a deletion retired (or 1 if neither).
 ///
 /// The answer stops being true the moment anyone else inserts: this read and
 /// the write that uses it are separate statements, and `(repo_id, number)` is
@@ -108,7 +109,15 @@ where
         .one(db)
         .await
         .context("db: get max issue number")?;
-    Ok(max.map(|m| m.number + 1).unwrap_or(1))
+    // A deleted number stays spent: the floor is the highest one a deletion
+    // retired, which the live rows no longer show.
+    let retired = crate::ops::repo_number_floor_ops::retired_up_to(
+        db,
+        repo_id,
+        crate::ops::repo_number_floor_ops::NumberSpace::Issue,
+    )
+    .await?;
+    Ok(max.map_or(0, |m| m.number).max(retired) + 1)
 }
 
 /// Delete an issue row; its comments, labels and the rest of what hangs off

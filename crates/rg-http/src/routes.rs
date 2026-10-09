@@ -1515,6 +1515,11 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/pulls/{number}",
             api::pulls::update_pr,
         )
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/pulls/{number}",
+            api::pulls::delete_pr,
+        )
         .get(
             RepoRead,
             "/repos/{owner}/{name}/pulls/{number}/assets",

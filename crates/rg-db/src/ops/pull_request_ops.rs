@@ -86,7 +86,8 @@ pub(crate) fn page_query(repo_id: i64, state: Option<&str>) -> Select<PrEntity> 
         .order_by_desc(pull_request::Column::Id)
 }
 
-/// Get the next PR number for a repo (max + 1, or 1 if no PRs).
+/// Get the next PR number for a repo: one past the larger of the highest live
+/// number and the highest number a deletion retired (or 1 if neither).
 ///
 /// The answer stops being true the moment anyone else inserts: this read and
 /// the write that uses it are separate statements, and `(repo_id, number)` is
@@ -107,7 +108,15 @@ where
         .one(db)
         .await
         .context("db: get max PR number")?;
-    Ok(max.map(|m| m.number + 1).unwrap_or(1))
+    // A deleted number stays spent: the floor is the highest one a deletion
+    // retired, which the live rows no longer show.
+    let retired = crate::ops::repo_number_floor_ops::retired_up_to(
+        db,
+        repo_id,
+        crate::ops::repo_number_floor_ops::NumberSpace::PullRequest,
+    )
+    .await?;
+    Ok(max.map_or(0, |m| m.number).max(retired) + 1)
 }
 
 /// Create a new PR.
@@ -691,4 +700,85 @@ mod head_sha_refresh_tests {
             "the loser must return the winner's fresh row for pull_request CI"
         );
     }
+}
+
+/// What [`delete_with_dependents`] found when it held the row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrDeletion {
+    /// The pull request and its dependents are gone.
+    Deleted,
+    /// No such pull request — already deleted.
+    Gone,
+    /// The pull request is `merging` or `merged`: its commits are, or are
+    /// about to be, in its base branch, and it stays as their record.
+    Refused { state: String },
+}
+
+/// Delete an `open` or `closed` pull request and every row that hangs off it —
+/// review comments, reviews, reviewer requests, timeline events, its
+/// merge-queue entry — in one transaction, after retiring its number so it is
+/// never handed out again.
+///
+/// The state is re-read under the row lock, inside the transaction that
+/// deletes: a merge that claimed the pull request after the caller looked at
+/// it must win, not lose its record.
+///
+/// The children are deleted explicitly rather than left to foreign keys: not
+/// every one of these tables was created with a cascading key, and a
+/// half-deleted pull request would leave reviews and events pointing at an id
+/// nothing will ever show again. Attachments are the caller's: their bytes
+/// live in blob storage, which a database transaction cannot roll back.
+pub async fn delete_with_dependents(db: &DatabaseConnection, pr_id: i64) -> Result<PrDeletion> {
+    use crate::entities::{
+        merge_queue_entry, pr_event, pr_review, pr_reviewer_request, review_comment,
+    };
+
+    crate::contention::retry_transaction("delete pull request", || async move {
+        let txn = db.begin().await.context("db: begin PR delete")?;
+        let Some(pr) = lock_by_id_for_update(&txn, pr_id).await? else {
+            return Ok(PrDeletion::Gone);
+        };
+        if pr.state != "open" && pr.state != "closed" {
+            return Ok(PrDeletion::Refused { state: pr.state });
+        }
+        crate::ops::repo_number_floor_ops::retire(
+            &txn,
+            pr.repo_id,
+            crate::ops::repo_number_floor_ops::NumberSpace::PullRequest,
+            pr.number,
+        )
+        .await?;
+        review_comment::Entity::delete_many()
+            .filter(review_comment::Column::PrId.eq(pr_id))
+            .exec(&txn)
+            .await
+            .context("db: delete PR review comments")?;
+        pr_review::Entity::delete_many()
+            .filter(pr_review::Column::PrId.eq(pr_id))
+            .exec(&txn)
+            .await
+            .context("db: delete PR reviews")?;
+        pr_reviewer_request::Entity::delete_many()
+            .filter(pr_reviewer_request::Column::PrId.eq(pr_id))
+            .exec(&txn)
+            .await
+            .context("db: delete PR reviewer requests")?;
+        pr_event::Entity::delete_many()
+            .filter(pr_event::Column::PrId.eq(pr_id))
+            .exec(&txn)
+            .await
+            .context("db: delete PR events")?;
+        merge_queue_entry::Entity::delete_many()
+            .filter(merge_queue_entry::Column::PrId.eq(pr_id))
+            .exec(&txn)
+            .await
+            .context("db: delete PR merge queue entry")?;
+        PrEntity::delete_by_id(pr_id)
+            .exec(&txn)
+            .await
+            .context("db: delete PR")?;
+        txn.commit().await.context("db: commit PR delete")?;
+        Ok(PrDeletion::Deleted)
+    })
+    .await
 }

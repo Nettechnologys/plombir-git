@@ -67,6 +67,7 @@ pub mod pull_request;
 pub mod release;
 pub mod release_asset;
 pub mod repo_collaborator;
+pub mod repo_number_floor;
 pub mod repo_star;
 pub mod repo_watch;
 pub mod repository;

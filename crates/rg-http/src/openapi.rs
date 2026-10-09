@@ -407,6 +407,7 @@ pub(crate) fn stamp_security(
         crate::api::pulls::get_pr,
         crate::api::pulls::create_pr,
         crate::api::pulls::update_pr,
+        crate::api::pulls::delete_pr,
         crate::api::pulls::get_diff,
         crate::api::pulls::compare,
         crate::api::pulls::merge_pr,

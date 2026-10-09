@@ -351,6 +351,67 @@ fn log_codeowners_diagnostics(
     }
 }
 
+/// Delete a pull request with its reviews, review comments, timeline and
+/// attachments, cancelling its CI and a queued merge — repository
+/// administrators only (card_ee4f318c50f1). A merged pull request, or one
+/// being merged, is refused with `409`: its commits are in the base branch.
+#[utoipa::path(
+    delete,
+    path = "/repos/{owner}/{name}/pulls/{number}",
+    tag = "Pull Requests",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("number" = i64, Path, description = "pull request number"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Not a repository administrator", body = serde_json::Value),
+        (status = 404, description = "No such pull request", body = serde_json::Value),
+        (status = 409, description = "Merged, or being merged", body = serde_json::Value),
+    ),
+)]
+pub async fn delete_pr(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    repo_access::RepoAdmin { repo, actor_id }: repo_access::RepoAdmin,
+) -> impl IntoResponse {
+    match rg_core::issue::moderation::delete_pull_request(
+        &state.db,
+        state.blob_storage.as_ref(),
+        &state.repo_root,
+        &repo,
+        number,
+        actor_id,
+    )
+    .await
+    {
+        Ok(pr) => {
+            let actor =
+                rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, actor_id).await;
+            rg_core::audit::record(
+                &state.db,
+                &actor,
+                "pull_request.delete",
+                Some("pull_request"),
+                Some(pr.id),
+                Some(&format!("{owner}/{name}!{number}")),
+                Some(&headers),
+                Some(serde_json::json!({
+                    "title": pr.title,
+                    "author_id": pr.author_id,
+                    "state": pr.state,
+                })),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
 #[utoipa::path(
     patch,
     path = "/repos/{owner}/{name}/pulls/{number}",

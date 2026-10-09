@@ -21,6 +21,7 @@ use sea_orm::DatabaseConnection;
 
 use rg_db::entities::issue::Model as Issue;
 use rg_db::entities::issue_comment::Model as IssueComment;
+use rg_db::entities::pull_request::Model as PullRequest;
 use rg_db::entities::review_comment::Model as ReviewComment;
 
 use crate::attachment::AttachmentTarget;
@@ -184,7 +185,8 @@ pub async fn delete_review_comment(
 
 /// Delete issue `number` of `repo_id` with everything in it — its comments,
 /// labels, attachments. Repository administrators only; the caller has decided
-/// that. The search index follows by its own trigger.
+/// that. The search index follows by its own trigger. The number is retired,
+/// not freed: the next issue does not inherit `#number`.
 pub async fn delete_issue(
     db: &DatabaseConnection,
     storage: &dyn BlobStorage,
@@ -207,6 +209,16 @@ pub async fn delete_issue(
     for attachment in rg_db::ops::attachment_ops::list_by_issue(db, repo_id, issue.id).await? {
         crate::attachment::delete_attachment(db, storage, repo_id, target, attachment.id).await?;
     }
+    // Spent before the row goes: if the delete then fails the number is
+    // merely skipped, never handed to the next issue while links to this one
+    // still exist.
+    rg_db::ops::repo_number_floor_ops::retire(
+        db,
+        repo_id,
+        rg_db::ops::repo_number_floor_ops::NumberSpace::Issue,
+        issue.number,
+    )
+    .await?;
     if !rg_db::ops::issue_ops::delete_by_id(db, issue.id).await? {
         return Err(crate::error::not_found("issue"));
     }
@@ -219,4 +231,81 @@ pub async fn delete_issue(
     )
     .await?;
     Ok(issue)
+}
+
+/// Why a pull request was not deleted, beyond "no such pull request".
+const MERGED_PR_IS_NOT_DELETABLE: &str =
+    "a merged pull request is the record of commits in its base branch and cannot be deleted";
+
+/// Delete pull request `number` of `repository` with everything in it — review
+/// comments, reviews, reviewer requests, its timeline, attachments, a pending
+/// merge-queue entry, notifications and subscriptions — and cancel the CI it
+/// still has running (card_ee4f318c50f1). Repository administrators only; the
+/// caller has decided that.
+///
+/// Only an `open` or `closed` pull request goes. A merged one is the record of
+/// commits that are now in its base branch, and one being merged — by hand or
+/// by the queue — is about to be: both are a conflict, not a missing resource.
+/// The final state check happens under the row lock in the deleting
+/// transaction, so a merge that wins the race keeps its record.
+///
+/// The server keeps no git ref of its own per pull request — `refs/pull/N/head`
+/// is only the name its pipelines are recorded under, and the namespace is
+/// reserved against pushes — so the one ref to remove is a queued entry's
+/// `refs/merge-queue/<id>`, which cancelling the entry does.
+pub async fn delete_pull_request(
+    db: &DatabaseConnection,
+    storage: &dyn BlobStorage,
+    repo_root: &std::path::Path,
+    repository: &rg_db::entities::repository::Model,
+    number: i64,
+    actor_id: i64,
+) -> Result<PullRequest> {
+    use crate::pull_request::merge_queue::{self, CancelOutcome};
+    use rg_db::ops::pull_request_ops::PrDeletion;
+
+    let repo_id = repository.id;
+    let pr = rg_db::ops::pull_request_ops::find_by_repo_and_number(db, repo_id, number)
+        .await?
+        .ok_or_else(|| crate::error::not_found("pull request"))?;
+    if pr.state != "open" && pr.state != "closed" {
+        return Err(crate::error::conflict(MERGED_PR_IS_NOT_DELETABLE));
+    }
+    if merge_queue::cancel(db, repo_root, repository, &pr, actor_id).await?
+        == CancelOutcome::AlreadyMerging
+    {
+        return Err(crate::error::conflict(
+            "the merge queue is merging this pull request; wait for it to finish",
+        ));
+    }
+    crate::pull_request::ci::cancel_pull_request_ci(db, &pr, "the pull request was deleted").await;
+
+    for comment in rg_db::ops::review_comment_ops::list_by_pr(db, pr.id).await? {
+        let target = AttachmentTarget::ReviewComment(comment.id);
+        for attachment in
+            rg_db::ops::attachment_ops::list_by_review_comment(db, repo_id, comment.id).await?
+        {
+            crate::attachment::delete_attachment(db, storage, repo_id, target, attachment.id)
+                .await?;
+        }
+    }
+    let target = AttachmentTarget::PullRequest(pr.id);
+    for attachment in rg_db::ops::attachment_ops::list_by_pull_request(db, repo_id, pr.id).await? {
+        crate::attachment::delete_attachment(db, storage, repo_id, target, attachment.id).await?;
+    }
+
+    match rg_db::ops::pull_request_ops::delete_with_dependents(db, pr.id).await? {
+        PrDeletion::Deleted => {}
+        PrDeletion::Gone => return Err(crate::error::not_found("pull request")),
+        PrDeletion::Refused { .. } => {
+            return Err(crate::error::conflict(MERGED_PR_IS_NOT_DELETABLE))
+        }
+    }
+    crate::notification::thread::forget_subject(
+        db,
+        crate::notification::thread::SubjectKind::PullRequest,
+        pr.id,
+    )
+    .await?;
+    Ok(pr)
 }

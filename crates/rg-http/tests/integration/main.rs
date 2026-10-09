@@ -30,6 +30,7 @@ mod common;
 mod compare_and_fork_head_tests;
 mod link_preview_tests;
 mod notification_routing_tests;
+mod pull_request_deletion_tests;
 mod repo_settings_tests;
 
 mod account_deletion_serialized_grant_tests;
