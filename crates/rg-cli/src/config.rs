@@ -85,6 +85,11 @@ pub(crate) struct ServerConfig {
     /// `<source_url>/tree/<commit the binary was built from>` — the AGPL §13
     /// offer. A fork that modifies the code points this at itself.
     pub(crate) source_url: Option<String>,
+    /// Whether HSTS may advertise `preload` (default: false). The header is
+    /// sent whenever the instance is reached over https; `preload` additionally
+    /// asks browsers to hard-code that, which is a promise about every
+    /// subdomain and stays opt-in (card_5c1a90e4b7d2).
+    pub(crate) hsts_preload: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -2131,7 +2136,7 @@ mod tests {
     /// rows that happen to be right today — a new `key = 42` line is either
     /// paired with the code that produces the 42, or declared here with a
     /// reason.
-    const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 31] = [
+    const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 33] = [
         (
             "plombir-git.example.toml",
             "observability",
@@ -2151,6 +2156,19 @@ mod tests {
             "server",
             "external_url",
             "no default: left unset, links point at the address the server bound to",
+        ),
+        (
+            "plombir-git.example.toml",
+            "server",
+            "hsts_preload",
+            "the built-in default is false; the template shows the opt-in spelling, and \
+             enabling it is a decision about every subdomain of the domain",
+        ),
+        (
+            "deploy/plombir-git.docker.toml",
+            "server",
+            "hsts_preload",
+            "as in the example: false by default, shown as the opt-in spelling",
         ),
         (
             "plombir-git.example.toml",

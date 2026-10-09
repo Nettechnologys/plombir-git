@@ -349,6 +349,9 @@ pub struct StateOverrides {
     /// production. The harness still serves plain HTTP; what changes is the
     /// scheme the server writes into the URLs it hands back.
     pub tls_enabled: bool,
+    /// Whether HSTS advertises `preload` for this state. Defaults to false,
+    /// like the configuration.
+    pub hsts_preload: bool,
     /// Outbound mail for this state. The default is none, so no test sends
     /// mail it did not ask for.
     pub smtp_config: Option<rg_core::email::SmtpConfig>,
@@ -453,6 +456,7 @@ pub fn build_test_app_state_with(
         delivery_tracker: overrides.delivery_tracker.unwrap_or_default(),
         external_url: overrides.external_url,
         tls_enabled: overrides.tls_enabled,
+        hsts_preload: overrides.hsts_preload,
         job_timeout_secs: rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,

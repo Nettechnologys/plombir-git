@@ -457,7 +457,7 @@ pub async fn login(
         Err(error) => {
             // Not every failure of `login_with_configured_auth` is a rejected
             // credential, and the two must not share an answer. A verdict is
-            // one of the three the service bails with, listed in
+            // one of the two the service bails with, listed in
             // `CREDENTIAL_VERDICTS`; anything else — an unreachable database on
             // the account lookup, a stored hash the verifier cannot use, a
             // token that would not sign — never produced a verdict at all.
@@ -472,11 +472,13 @@ pub async fn login(
             // retryable 5xx with the full chain in the operator log, not a
             // silent 401. The old form enumerated one failure
             // (`UnusablePasswordHash`) and called everything else a rejection.
-            const CREDENTIAL_VERDICTS: [&str; 3] = [
-                "invalid credentials",
-                "account is disabled",
-                "account is temporarily locked",
-            ];
+            //
+            // A correct password on a locked account is not in the list as a
+            // string: it arrives as `AccountLocked`, whose `Display` is the
+            // uniform `invalid credentials`, so the check below cannot tell it
+            // from a wrong password — the downcast after that check can, and
+            // only for the server-side log.
+            const CREDENTIAL_VERDICTS: [&str; 2] = ["invalid credentials", "account is disabled"];
 
             // A directory bind that succeeded and a provisioning policy that
             // said no. Neither a rejected credential (the password was right,
@@ -502,6 +504,17 @@ pub async fn login(
                 return AppError::from(error).into_response();
             }
 
+            // The password was right and the account is inside its brute-force
+            // lock. It reaches here as the same uniform `invalid credentials`
+            // every other rejection carries; the typed error is what tells the
+            // log, and only the log, that the lock did it. The counter below
+            // stays untouched for it: the strike that created the lock is
+            // already recorded, and counting a correct password again would
+            // extend the lock every time the owner retries it.
+            let refused_by_lock = error
+                .downcast_ref::<rg_core::auth::lockout::AccountLocked>()
+                .is_some();
+
             // A lookup that could not run is not a lookup that found nobody.
             // Flattening the error away turns a degraded database into "no such
             // user", which skips the brute-force counter below and files the
@@ -522,7 +535,7 @@ pub async fn login(
                     None
                 }
             };
-            let mut locked = verdict == "account is temporarily locked";
+            let mut locked = refused_by_lock;
             if !locked && verdict == "invalid credentials" {
                 if let Some(user) = &user {
                     // `false` means "not locked" — which is also what a failed
@@ -581,12 +594,13 @@ pub async fn login(
             };
             crate::metrics::recorder::auth_event("login", "failure");
             crate::metrics::recorder::failed_login(reason);
-            AppError::unauthorized(if locked {
-                "account is temporarily locked"
-            } else {
-                "invalid credentials"
-            })
-            .into_response()
+            // One text for every rejection — a wrong password, a deactivated
+            // account and an active lock are indistinguishable from here on.
+            // The lock used to answer "account is temporarily locked" before
+            // the Argon2 verification, which named a real account after five
+            // requests and made the handler's own lock state a directory lookup
+            // for anyone without a password (Low finding, security audit).
+            AppError::unauthorized("invalid credentials").into_response()
         }
     }
 }

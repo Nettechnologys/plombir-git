@@ -226,6 +226,7 @@ mod runner_repository_scope_tests;
 mod runner_route_coverage_tests;
 mod runner_shutdown_tests;
 mod runner_workspace_tests;
+mod same_origin_tests;
 mod search_pagination_tests;
 mod search_qualifier_quoting_tests;
 mod security_headers_tests;
