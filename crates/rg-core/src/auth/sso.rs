@@ -776,8 +776,14 @@ async fn fetch_oidc_userinfo(
     })
 }
 
+/// The suffix OpenID Connect Discovery (§4) appends to an issuer URL.
+const OIDC_DISCOVERY_SUFFIX: &str = "/.well-known/openid-configuration";
+
 #[derive(Debug, Deserialize)]
 struct OidcEndpoints {
+    /// OpenID Connect Discovery 1.0 §4.3: the issuer URL the document was
+    /// fetched from. Checked by [`Self::require_matching_issuer`].
+    issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
     userinfo_endpoint: String,
@@ -785,8 +791,44 @@ struct OidcEndpoints {
 
 impl OidcEndpoints {
     fn require_confidential_transport(&self, policy: &OidcTransportPolicy) -> Result<()> {
+        // The authorization endpoint starts the login and carries the state
+        // and PKCE challenge; the token and userinfo endpoints carry the
+        // client secret and Bearer token. All three are decided by the same
+        // document, so all three answer to the same transport rule.
+        policy.require_confidential_endpoint(&self.authorization_endpoint, "authorization")?;
         policy.require_confidential_endpoint(&self.token_endpoint, "token")?;
         policy.require_confidential_endpoint(&self.userinfo_endpoint, "userinfo")
+    }
+
+    /// Reject a discovery document whose `issuer` is not the URL it was served
+    /// from.
+    ///
+    /// OpenID Connect Discovery 1.0 §4.3: the `issuer` value "MUST be
+    /// identical to the Issuer URL that was directly used to retrieve the
+    /// configuration information". Without the check, any document reachable
+    /// at the discovery URL — including one a DNS-rebind or a fetch of the
+    /// wrong tenant put there — can present endpoints of its choosing while
+    /// the operator believes the configured issuer answered.
+    fn require_matching_issuer(&self, discovery_url: &str) -> Result<()> {
+        let expected = discovery_url
+            .strip_suffix(OIDC_DISCOVERY_SUFFIX)
+            .with_context(|| {
+                format!(
+                    "OIDC discovery URL '{discovery_url}' does not end in \
+                     '{OIDC_DISCOVERY_SUFFIX}', so its issuer cannot be verified"
+                )
+            })?;
+        // Issuers differ on a trailing slash across implementations; §4.3
+        // errata and the certification suite treat `https://idp` and
+        // `https://idp/` as the same issuer.
+        if self.issuer.trim_end_matches('/') != expected.trim_end_matches('/') {
+            anyhow::bail!(
+                "OIDC discovery document claims issuer '{}', which is not the discovery URL \
+                 issuer '{expected}'; refusing to use its endpoints",
+                self.issuer
+            );
+        }
+        Ok(())
     }
 }
 
@@ -809,12 +851,14 @@ async fn resolve_oidc_endpoints(config: &SsoProviderConfig) -> Result<OidcEndpoi
             .json::<OidcEndpoints>()
             .await
             .provider_call("failed to parse the OIDC discovery document")?;
+        endpoints.require_matching_issuer(discovery_url)?;
         endpoints.require_confidential_transport(&config.transport_policy)?;
         return Ok(endpoints);
     }
 
     if config.slug == "google" {
         let endpoints = OidcEndpoints {
+            issuer: "https://accounts.google.com".to_string(),
             authorization_endpoint: default_oidc_auth_url("google").unwrap_or_default(),
             token_endpoint: default_oidc_token_url("google").unwrap_or_default(),
             userinfo_endpoint: "https://openidconnect.googleapis.com/v1/userinfo".to_string(),
@@ -927,9 +971,78 @@ fn default_oidc_token_url(slug: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        fetch_user_info_with_builtin_urls, oidc_email_verified, BuiltinProfileUrls,
+        fetch_user_info_with_builtin_urls, oidc_email_verified, BuiltinProfileUrls, OidcEndpoints,
         OidcTransportPolicy, SsoIdentityDefect, SsoProviderConfig, SsoUserInfo,
     };
+
+    fn discovery_document(issuer: &str, authorization_endpoint: &str) -> OidcEndpoints {
+        OidcEndpoints {
+            issuer: issuer.to_string(),
+            authorization_endpoint: authorization_endpoint.to_string(),
+            token_endpoint: "https://idp.example/token".to_string(),
+            userinfo_endpoint: "https://idp.example/userinfo".to_string(),
+        }
+    }
+
+    /// Discovery §4.3: a document may only speak for the issuer it was fetched
+    /// from, however valid its endpoint URLs look on their own.
+    #[test]
+    fn discovery_document_issuer_must_be_the_discovery_url_issuer() {
+        const DISCOVERY: &str = "https://idp.example/.well-known/openid-configuration";
+        let matching = discovery_document("https://idp.example", "https://idp.example/authorize");
+        assert!(matching.require_matching_issuer(DISCOVERY).is_ok());
+        // A trailing slash is how some implementations spell the same issuer.
+        let slashed = discovery_document("https://idp.example/", "https://idp.example/authorize");
+        assert!(slashed.require_matching_issuer(DISCOVERY).is_ok());
+
+        let foreign = discovery_document("https://evil.example", "https://evil.example/authorize");
+        let error = foreign
+            .require_matching_issuer(DISCOVERY)
+            .expect_err("a document for another issuer must be refused")
+            .to_string();
+        assert!(
+            error.contains("evil.example"),
+            "error names the claim: {error}"
+        );
+
+        // Without the well-known suffix there is no issuer to compare against,
+        // so the document is refused rather than trusted.
+        assert!(matching
+            .require_matching_issuer("https://idp.example/tenant")
+            .is_err());
+    }
+
+    /// A document that omits `issuer` cannot be attributed to anyone and must
+    /// not deserialize into something usable.
+    #[test]
+    fn discovery_document_without_an_issuer_is_refused() {
+        let error = serde_json::from_value::<OidcEndpoints>(serde_json::json!({
+            "authorization_endpoint": "https://idp.example/authorize",
+            "token_endpoint": "https://idp.example/token",
+            "userinfo_endpoint": "https://idp.example/userinfo",
+        }))
+        .expect_err("a document without an issuer must not parse");
+        assert!(error.to_string().contains("issuer"), "{error}");
+    }
+
+    #[test]
+    fn authorization_endpoint_answers_to_the_transport_policy() {
+        let insecure = discovery_document("https://idp.example", "http://idp.example/authorize");
+        let secure_defaults = OidcTransportPolicy::parse(&[]).expect("empty policy");
+        assert!(
+            insecure
+                .require_confidential_transport(&secure_defaults)
+                .is_err(),
+            "plaintext authorization endpoint must be refused by default"
+        );
+
+        let exception =
+            OidcTransportPolicy::parse(&["http://idp.example".to_string()]).expect("exact origin");
+        assert!(
+            insecure.require_confidential_transport(&exception).is_ok(),
+            "the operator's exact-origin exception also covers authorization"
+        );
+    }
 
     #[tokio::test]
     async fn oidc_builtin_slugs_fetch_profile_from_the_discovered_userinfo_origin() {
@@ -943,6 +1056,7 @@ mod tests {
             let discovery = format!("{origin}/.well-known/openid-configuration");
             let endpoint = format!("{origin}/userinfo");
             let allowed_origin = origin.clone();
+            let issuer = origin.clone();
             let token = format!("private-{slug}-token");
             let expected_token = token.clone();
             let server = tokio::spawn(async move {
@@ -950,6 +1064,7 @@ mod tests {
                     (
                         "/.well-known/openid-configuration",
                         serde_json::json!({
+                            "issuer": issuer,
                             "authorization_endpoint": format!("{origin}/authorize"),
                             "token_endpoint": format!("{origin}/token"),
                             "userinfo_endpoint": endpoint,

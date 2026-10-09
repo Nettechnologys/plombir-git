@@ -18,6 +18,7 @@ use crate::common::{
 
 #[derive(Clone)]
 struct DiscoveryState {
+    issuer: String,
     token_url: String,
     userinfo_url: String,
     hits: Arc<AtomicUsize>,
@@ -26,7 +27,7 @@ struct DiscoveryState {
 async fn discovery(State(state): State<DiscoveryState>) -> Json<serde_json::Value> {
     state.hits.fetch_add(1, Ordering::SeqCst);
     Json(serde_json::json!({
-        "issuer": "https://issuer.example",
+        "issuer": state.issuer,
         "authorization_endpoint": "https://issuer.example/authorize",
         "token_endpoint": state.token_url,
         "userinfo_endpoint": state.userinfo_url,
@@ -208,6 +209,7 @@ async fn oidc_plaintext_sinks_need_their_own_exact_origin_opt_ins() {
     let discovery_origin = format!("http://{discovery_addr}");
     let discovery_url = format!("{discovery_origin}/.well-known/openid-configuration");
     let discovery_state = DiscoveryState {
+        issuer: discovery_origin.clone(),
         token_url: format!("{token_origin}/token"),
         userinfo_url: format!("{userinfo_origin}/userinfo"),
         hits: discovery_hits.clone(),
