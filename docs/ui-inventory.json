@@ -1022,6 +1022,17 @@
       ]
     },
     {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/storage",
+      "access": "RepoRead",
+      "handler": "api::storage::get_storage",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
       "method": "PATCH",
       "url": "/api/v1/repos/{owner}/{name}",
       "access": "RepoAdmin",
@@ -18200,7 +18211,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.repository_info.description",
-          "line": 342,
+          "line": 359,
           "via": null,
           "href": null,
           "handler": "handleSave",
@@ -18228,7 +18239,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 345,
+          "line": 362,
           "via": null,
           "href": null,
           "handler": null,
@@ -18238,7 +18249,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 356,
+          "line": 373,
           "via": null,
           "href": null,
           "handler": null,
@@ -18248,7 +18259,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 369,
+          "line": 386,
           "via": null,
           "href": null,
           "handler": null,
@@ -18258,7 +18269,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.visibility.make_public",
-          "line": 384,
+          "line": 401,
           "via": null,
           "href": null,
           "handler": "openVisibility",
@@ -18268,7 +18279,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.rename.button",
-          "line": 397,
+          "line": 414,
           "via": null,
           "href": null,
           "handler": "openRename",
@@ -18278,27 +18289,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.transfer.confirming",
-          "line": 462,
-          "via": null,
-          "href": null,
-          "handler": "askTransfer",
-          "calls": [],
-          "unresolved": true
-        },
-        {
-          "tag": "button",
-          "label": "i18n:settings.delete.confirming",
-          "line": 496,
-          "via": null,
-          "href": null,
-          "handler": "askDelete",
-          "calls": [],
-          "unresolved": true
-        },
-        {
-          "tag": "button",
-          "label": "i18n:settings.transfer.confirm",
-          "line": 514,
+          "line": 508,
           "via": null,
           "href": null,
           "handler": "handleTransfer",
@@ -18326,18 +18317,8 @@
         },
         {
           "tag": "button",
-          "label": "i18n:common.cancel",
-          "line": 517,
-          "via": null,
-          "href": null,
-          "handler": "() => (transferConfirmOpen = false)",
-          "calls": [],
-          "unresolved": true
-        },
-        {
-          "tag": "button",
-          "label": "i18n:settings.delete.confirm_button",
-          "line": 528,
+          "label": "i18n:settings.delete.confirming",
+          "line": 542,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -18372,7 +18353,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 546,
+          "line": 564,
           "via": null,
           "href": null,
           "handler": "confirmVisibility",
@@ -18396,7 +18377,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 549,
+          "line": 567,
           "via": null,
           "href": null,
           "handler": "closeVisibility",
@@ -18406,7 +18387,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.rename.renaming",
-          "line": 563,
+          "line": 581,
           "via": null,
           "href": null,
           "handler": "confirmRename",
@@ -18430,7 +18411,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 566,
+          "line": 584,
           "via": null,
           "href": null,
           "handler": "closeRename",
@@ -18479,6 +18460,20 @@
         }
       ],
       "passive": [
+        {
+          "symbol": "repoStorage.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/storage",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/storage",
+          "access": "RepoRead",
+          "handler": "api::storage::get_storage",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
         {
           "symbol": "repos.get",
           "method": "GET",
@@ -27051,7 +27046,7 @@
       "outsider"
     ],
     "scenarios": 46,
-    "inventoryEntries": 762,
+    "inventoryEntries": 763,
     "coveredEntries": 171,
     "coveredRoutes": 162,
     "maxUiRoutesWithoutFrontendTest": 26

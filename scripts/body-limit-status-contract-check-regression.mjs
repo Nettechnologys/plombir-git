@@ -174,10 +174,10 @@ expect(
   ({ oci }) =>
     edit(
       oci,
-      `    if crate::body_limit::is_length_limit_error(error.as_ref()) {
+      `    } else if crate::body_limit::is_length_limit_error(error.as_ref()) {
         oci_err(
             StatusCode::PAYLOAD_TOO_LARGE,`,
-      `    if crate::body_limit::is_length_limit_error(error.as_ref()) {
+      `    } else if crate::body_limit::is_length_limit_error(error.as_ref()) {
         oci_err(
             StatusCode::INTERNAL_SERVER_ERROR,`,
     ),
