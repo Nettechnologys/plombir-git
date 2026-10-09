@@ -7678,7 +7678,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 175,
+          "line": 176,
           "via": null,
           "href": null,
           "handler": "retryLoad",
@@ -7757,7 +7757,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 229,
+          "line": 230,
           "via": null,
           "href": null,
           "handler": "retryLoad",
@@ -7824,7 +7824,7 @@
         {
           "tag": "a",
           "label": "i18n:commit_detail.view_details",
-          "line": 273,
+          "line": 274,
           "via": null,
           "href": "status.target_url",
           "handler": null,
@@ -8475,7 +8475,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.open",
-          "line": 209,
+          "line": 210,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('open')",
@@ -8500,7 +8500,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.closed",
-          "line": 216,
+          "line": 217,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('closed')",
@@ -8525,7 +8525,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.all",
-          "line": 223,
+          "line": 224,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('all')",
@@ -8550,7 +8550,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.new",
-          "line": 231,
+          "line": 232,
           "via": null,
           "href": null,
           "handler": "openCreate",
@@ -8597,7 +8597,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.create_form.cancel",
-          "line": 243,
+          "line": 244,
           "via": null,
           "href": null,
           "handler": "() => showChooser = false",
@@ -8607,7 +8607,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.templates.get_started",
-          "line": 252,
+          "line": 253,
           "via": null,
           "href": null,
           "handler": "() => chooseTemplate(template)",
@@ -8617,7 +8617,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.templates.open_blank",
-          "line": 261,
+          "line": 262,
           "via": null,
           "href": null,
           "handler": "() => chooseTemplate()",
@@ -8627,7 +8627,7 @@
         {
           "tag": "a",
           "label": "i18n:issues.templates.open_link",
-          "line": 270,
+          "line": 271,
           "via": null,
           "href": "link.url",
           "handler": null,
@@ -8637,7 +8637,7 @@
         {
           "tag": "form",
           "label": "toggleLabel(label.name, event.currentTarget.checked)} /> }>",
-          "line": 279,
+          "line": 280,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -8684,7 +8684,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 286,
+          "line": 287,
           "via": null,
           "href": null,
           "handler": null,
@@ -8694,7 +8694,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 304,
+          "line": 305,
           "via": null,
           "href": null,
           "handler": "(event) => toggleLabel(label.name, event.currentTarget.checked)",
@@ -8704,7 +8704,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.create_form.submit",
-          "line": 318,
+          "line": 319,
           "via": null,
           "href": null,
           "handler": null,
@@ -8714,7 +8714,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.create_form.cancel",
-          "line": 319,
+          "line": 320,
           "via": null,
           "href": null,
           "handler": "() => { showCreate = false; if (issueTemplates.length > 0 || templateConfig.cont",
@@ -8724,7 +8724,7 @@
         {
           "tag": "a",
           "label": ")}",
-          "line": 338,
+          "line": 339,
           "via": null,
           "href": "`/${owner}/${repo}/issues/${issue.number}`",
           "handler": null,
@@ -9992,7 +9992,7 @@
         {
           "tag": "button",
           "label": "i18n:board.createBoard",
-          "line": 368,
+          "line": 369,
           "via": null,
           "href": null,
           "handler": "toggleCreateBoardForm",
@@ -10002,7 +10002,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 380,
+          "line": 381,
           "via": null,
           "href": null,
           "handler": "() => selectBoard(b.id)",
@@ -10027,7 +10027,7 @@
         {
           "tag": "button",
           "label": "i18n:issue_board.add_board",
-          "line": 388,
+          "line": 389,
           "via": null,
           "href": null,
           "handler": "toggleCreateBoardForm",
@@ -10037,7 +10037,7 @@
         {
           "tag": "button",
           "label": "i18n:issue_board.add_column",
-          "line": 395,
+          "line": 396,
           "via": null,
           "href": null,
           "handler": "toggleAddColumnForm",
@@ -10047,7 +10047,7 @@
         {
           "tag": "button",
           "label": "i18n:common.create",
-          "line": 412,
+          "line": 413,
           "via": null,
           "href": null,
           "handler": "handleCreateBoard",
@@ -10100,7 +10100,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 415,
+          "line": 416,
           "via": null,
           "href": null,
           "handler": "() => { showCreateBoard = false; newBoardName = ''; }",
@@ -10110,7 +10110,7 @@
         {
           "tag": "button",
           "label": "i18n:common.add",
-          "line": 428,
+          "line": 429,
           "via": null,
           "href": null,
           "handler": "handleAddColumn",
@@ -10135,7 +10135,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 429,
+          "line": 430,
           "via": null,
           "href": null,
           "handler": "() => { showAddColumn = false; newColumnName = ''; }",
@@ -10145,7 +10145,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 452,
+          "line": 456,
           "via": null,
           "href": null,
           "handler": "() => handleDeleteColumn(column.id)",
@@ -10184,7 +10184,7 @@
         {
           "tag": "a",
           "label": "#",
-          "line": 482,
+          "line": 486,
           "via": null,
           "href": "`/${owner}/${repo}/issues/${card.issue.number}`",
           "handler": null,
@@ -10194,7 +10194,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 488,
+          "line": 492,
           "via": null,
           "href": null,
           "handler": "() => handleDeleteCard(card.id)",
@@ -10233,7 +10233,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 501,
+          "line": 505,
           "via": null,
           "href": null,
           "handler": null,
@@ -10243,7 +10243,7 @@
         {
           "tag": "button",
           "label": "i18n:common.add",
-          "line": 510,
+          "line": 514,
           "via": null,
           "href": null,
           "handler": "() => handleAddCard(column.id)",
@@ -10282,7 +10282,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 511,
+          "line": 515,
           "via": null,
           "href": null,
           "handler": "() => showAddCard = { ...showAddCard, [column.id]: false }",
@@ -10292,7 +10292,7 @@
         {
           "tag": "button",
           "label": "i18n:issue_board.add_card",
-          "line": 515,
+          "line": 519,
           "via": null,
           "href": null,
           "handler": "() => openAddCardForm(column.id)",
@@ -19302,7 +19302,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 246,
+          "line": 247,
           "via": null,
           "href": null,
           "handler": "openCreateForm",
@@ -19312,7 +19312,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 288,
+          "line": 289,
           "via": null,
           "href": null,
           "handler": "() => formData.color = color",
@@ -19322,7 +19322,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 328,
+          "line": 329,
           "via": null,
           "href": null,
           "handler": "closeForm",
@@ -19332,7 +19332,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 331,
+          "line": 332,
           "via": null,
           "href": null,
           "handler": "handleSave",
@@ -19397,7 +19397,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 348,
+          "line": 349,
           "via": null,
           "href": null,
           "handler": "cancelDelete",
@@ -19407,7 +19407,7 @@
         {
           "tag": "button",
           "label": "i18n:common.deleting",
-          "line": 351,
+          "line": 352,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -19450,7 +19450,7 @@
         {
           "tag": "button",
           "label": "✏️",
-          "line": 381,
+          "line": 382,
           "via": null,
           "href": null,
           "handler": "() => openEditForm(label)",
@@ -19460,7 +19460,7 @@
         {
           "tag": "button",
           "label": "🗑️",
-          "line": 384,
+          "line": 385,
           "via": null,
           "href": null,
           "handler": "() => confirmDelete(label)",

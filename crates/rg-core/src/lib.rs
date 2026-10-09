@@ -172,6 +172,74 @@ pub fn validate_repo_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The one shape a label or board-column colour may have.
+///
+/// Labels accepted any string that started with `#` and was seven characters
+/// long, so `#0;x:1;` was a colour; board columns stored whatever arrived with
+/// no check at all. Those values are not decoration: the web client writes them
+/// into a `style` attribute (`background-color: {color}`), and the app's CSP
+/// carries `style-src 'unsafe-inline'`, so the string the caller sent becomes
+/// CSS in someone else's page.
+///
+/// One rule for every writer, stated where both services can reach it. The
+/// normalised lowercase form is returned rather than `()` so the stored value
+/// is always exactly `#rrggbb` — no second copy of the case-folding rule in a
+/// caller that forgets it.
+///
+/// Typed like the validators above: the request is what is wrong, and the HTTP
+/// layer answers `400` with the rule that was broken, never a `500`.
+pub fn validate_hex_color(color: &str) -> Result<String> {
+    let bytes = color.as_bytes();
+    if bytes.len() != 7 || bytes[0] != b'#' || !bytes[1..].iter().all(u8::is_ascii_hexdigit) {
+        return Err(error::invalid_request(
+            "color must be a hex string like #ff0000",
+        ));
+    }
+    Ok(color.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::validate_hex_color;
+
+    #[test]
+    fn a_six_digit_hex_colour_is_accepted_and_normalised() {
+        for (input, expected) in [("#ff0000", "#ff0000"), ("#ABCDEF", "#abcdef")] {
+            assert_eq!(
+                validate_hex_color(input).expect("a #rrggbb colour must pass"),
+                expected
+            );
+        }
+    }
+
+    /// `#0;x:1;` is exactly the payload the old length check let through: it
+    /// starts with `#` and is seven characters long, and it closes the CSS
+    /// declaration it was interpolated into.
+    #[test]
+    fn a_colour_that_escapes_its_style_declaration_is_refused() {
+        for input in [
+            "#0;x:1;", "#12345", "#1234567", "#123456 ", "123456", "red", "", "#gggggg", "#12 456",
+            "#-23456",
+        ] {
+            let error =
+                validate_hex_color(input).expect_err("this value must be refused as a colour");
+            assert!(
+                format!("{error:#}").contains("hex string"),
+                "the refusal must state the rule for `{input}`: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_colour_longer_than_seven_bytes_is_refused_without_slicing_it() {
+        // Non-ASCII bytes must fail the byte-length check, not a char-index
+        // slice somewhere after it.
+        for input in ["#1234567é", "#ééééééé"] {
+            assert!(validate_hex_color(input).is_err());
+        }
+    }
+}
+
 #[cfg(test)]
 mod repo_name_tests {
     use super::validate_repo_name;

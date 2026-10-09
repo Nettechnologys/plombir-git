@@ -18,7 +18,8 @@
           "symbol": "repos.create",
           "method": "POST",
           "routeUrl": "/api/v1/repos",
-          "access": "User"
+          "access": "User",
+          "line": 245
         },
         {
           "page": "/dashboard",
@@ -35,7 +36,8 @@
           "symbol": "orgs.list",
           "method": "GET",
           "routeUrl": "/api/v1/orgs",
-          "access": "User"
+          "access": "User",
+          "line": 253
         }
       ]
     },
@@ -86,7 +88,8 @@
           "symbol": "repos.star",
           "method": "PUT",
           "routeUrl": "/api/v1/repos/{owner}/{name}/star",
-          "access": "RepoAuthRead"
+          "access": "RepoAuthRead",
+          "line": 400
         }
       ]
     },
@@ -117,12 +120,12 @@
       ]
     },
     {
-    "id": "repo-content-delete",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-content-delete",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/blob/[...path]",
           "kind": "control",
@@ -136,12 +139,12 @@
       ]
     },
     {
-    "id": "repo-watch",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-watch",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]",
           "kind": "control",
@@ -186,7 +189,7 @@
           "page": "/[owner]/[repo]/issues",
           "kind": "control",
           "control": "handleCreate",
-          "line": 279,
+          "line": 280,
           "symbol": "issues.list",
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/issues",
@@ -196,7 +199,7 @@
           "page": "/[owner]/[repo]/issues",
           "kind": "control",
           "control": "openCreate",
-          "line": 231,
+          "line": 232,
           "symbol": "issues.templates",
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/issue_templates",
@@ -206,7 +209,7 @@
           "page": "/[owner]/[repo]/issues",
           "kind": "control",
           "control": "openCreate",
-          "line": 231,
+          "line": 232,
           "symbol": "issues.templateConfig",
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/issue_config",
@@ -216,7 +219,7 @@
           "page": "/[owner]/[repo]/issues",
           "kind": "control",
           "control": "handleCreate",
-          "line": 279,
+          "line": 280,
           "symbol": "issues.create",
           "method": "POST",
           "routeUrl": "/api/v1/repos/{owner}/{name}/issues",
@@ -324,12 +327,12 @@
       ]
     },
     {
-    "id": "repo-milestones",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-milestones",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/milestones",
           "kind": "control",
@@ -383,12 +386,12 @@
       ]
     },
     {
-    "id": "repo-boards",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-boards",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/boards",
           "kind": "passive",
@@ -508,12 +511,12 @@
       ]
     },
     {
-    "id": "repo-time-tracking",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-time-tracking",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/time_tracking",
           "kind": "control",
@@ -557,12 +560,12 @@
       ]
     },
     {
-    "id": "repo-wiki",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-wiki",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/wiki",
           "kind": "passive",
@@ -634,17 +637,17 @@
       ]
     },
     {
-    "id": "repo-labels",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-labels",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/settings/labels",
           "kind": "control",
           "control": "handleSave",
-          "line": 331,
+          "line": 332,
           "symbol": "labels.list",
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/labels",
@@ -654,7 +657,7 @@
           "page": "/[owner]/[repo]/settings/labels",
           "kind": "control",
           "control": "handleSave",
-          "line": 331,
+          "line": 332,
           "symbol": "labels.create",
           "method": "POST",
           "routeUrl": "/api/v1/repos/{owner}/{name}/labels",
@@ -664,7 +667,7 @@
           "page": "/[owner]/[repo]/settings/labels",
           "kind": "control",
           "control": "handleSave",
-          "line": 331,
+          "line": 332,
           "symbol": "labels.update",
           "method": "PATCH",
           "routeUrl": "/api/v1/repos/{owner}/{name}/labels/{id}",
@@ -674,7 +677,7 @@
           "page": "/[owner]/[repo]/settings/labels",
           "kind": "control",
           "control": "handleDelete",
-          "line": 351,
+          "line": 352,
           "symbol": "labels.delete",
           "method": "DELETE",
           "routeUrl": "/api/v1/repos/{owner}/{name}/labels/{id}",
@@ -709,7 +712,7 @@
           "page": "/[owner]/[repo]/commits/[sha]",
           "kind": "control",
           "control": "retryLoad",
-          "line": 175,
+          "line": 176,
           "symbol": "repos.getCombinedStatus",
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/status",
@@ -719,7 +722,7 @@
           "page": "/[owner]/[repo]/commits/[sha]",
           "kind": "control",
           "control": "retryLoad",
-          "line": 175,
+          "line": 176,
           "symbol": "repos.listCommitStatuses",
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/statuses",
@@ -729,7 +732,7 @@
           "page": "/[owner]/[repo]/commits/[sha]",
           "kind": "control",
           "control": "retryLoad",
-          "line": 175,
+          "line": 176,
           "symbol": "repos.commitSignature",
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/signature",
@@ -915,12 +918,12 @@
       ]
     },
     {
-    "id": "repo-pull-detail",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-pull-detail",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/pulls/[number]",
           "kind": "control",
@@ -1123,12 +1126,12 @@
       ]
     },
     {
-    "id": "repo-release-asset-delete",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-release-asset-delete",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/releases",
           "kind": "control",

@@ -8,6 +8,7 @@
     LatestRepositoryResourceRequestFence,
   } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
+  import { safeHexColor } from '$lib/utils/color';
 
   const t = createT();
 
@@ -445,7 +446,10 @@
             role="list"
             aria-label={column.name}
           >
-            <div class="column-header" style="border-top: 3px solid {column.color || '#6366f1'}">
+            <div
+              class="column-header"
+              style="border-top: 3px solid {safeHexColor(column.color, '#6366f1')}"
+            >
               <span class="column-name">{column.name}</span>
               <div class="column-actions">
                 <span class="card-count">{cards.length}</span>

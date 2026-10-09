@@ -8,6 +8,7 @@
     LatestRepositoryResourceRequestFence,
   } from '$lib/asyncStateOwnership';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
+  import { safeHexColor } from '$lib/utils/color';
 
   const t = createT();
 
@@ -307,7 +308,7 @@
                     checked={newLabels.includes(label.name)}
                     onchange={(event) => toggleLabel(label.name, event.currentTarget.checked)}
                   />
-                  <span class="label-swatch" style={`background-color: ${label.color}`}></span>
+                  <span class="label-swatch" style={`background-color: ${safeHexColor(label.color, '#888888')}`}></span>
                   <span>{label.name}</span>
                 </label>
               {/each}
