@@ -40,6 +40,7 @@
   let backupStatus = $state<MfaBackupStatus | Unknown | null>(null);
   let setup = $state<MfaSetupResponse | null>(null);
   let verificationCode = $state('');
+  let enablePassword = $state('');
   let disablePassword = $state('');
   let regeneratePassword = $state('');
   let newBackupCodes = $state<string[]>([]);
@@ -260,15 +261,20 @@
       error = t('account_security.mfa.code_required');
       return;
     }
+    if (!enablePassword) {
+      error = t('account_security.password_required');
+      return;
+    }
 
     try {
       saving = true;
       error = '';
       success = '';
-      const result = await mfa.enable(verificationCode.trim());
+      const result = await mfa.enable(verificationCode.trim(), enablePassword);
       newBackupCodes = result.backup_codes;
       setup = null;
       verificationCode = '';
+      enablePassword = '';
       success = t('account_security.mfa.enabled_notice');
       await loadSecurity();
     } catch (err: any) {
@@ -581,7 +587,11 @@
               {t('account_security.setup.code')}
               <input inputmode="numeric" autocomplete="one-time-code" bind:value={verificationCode} disabled={saving} />
             </label>
-            <button type="submit" class="btn btn-primary" disabled={saving || !verificationCode.trim()}>
+            <label>
+              {t('account_security.setup.password')}
+              <input type="password" autocomplete="current-password" bind:value={enablePassword} disabled={saving} />
+            </label>
+            <button type="submit" class="btn btn-primary" disabled={saving || !verificationCode.trim() || !enablePassword}>
               {saving ? t('account_security.setup.verifying') : t('account_security.setup.enable')}
             </button>
           </form>

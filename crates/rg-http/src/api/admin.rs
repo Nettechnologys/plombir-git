@@ -374,6 +374,80 @@ pub async fn reset_user_password(
     }
 }
 
+/// POST /api/v1/admin/users/:id/mfa/reset
+///
+/// Take the second factor off an account whose owner can no longer pass it:
+/// an authenticator that is gone, or — the case this exists for — one that a
+/// stolen session enrolled and the owner never held. A password reset ends at
+/// the second factor, so without this an administrator's only tool was a
+/// database edit. Every session the account had is revoked in the same pass:
+/// the session that armed the wrong authenticator is the one that must not
+/// outlive its removal. Backup codes go with the factor they recover.
+#[utoipa::path(
+    post,
+    path = "/admin/users/{id}/mfa/reset",
+    tag = "Admin",
+    params(("id" = i64, Path, description = "User ID")),
+    responses(
+        (status = 200, description = "The account, with `mfa_enabled` false and its sessions revoked", body = serde_json::Value),
+        (status = 400, description = "Your own account: take your factor off from your settings, with your password", body = serde_json::Value),
+        (status = 403, description = "Admin required", body = serde_json::Value),
+        (status = 404, description = "User not found", body = serde_json::Value),
+        (status = 409, description = "MFA is not enabled for this account", body = serde_json::Value),
+    ),
+)]
+pub async fn reset_user_mfa(
+    State(state): State<AppState>,
+    InstanceAdmin(current_id): InstanceAdmin,
+    headers: HeaderMap,
+    Path(user_id): Path<i64>,
+) -> impl IntoResponse {
+    // An administrator's own factor comes off through `POST /users/mfa/disable`,
+    // which asks for the password. Letting it come off here would make an
+    // administrator's stolen session the one credential on the instance that
+    // can drop its own second factor without one.
+    if current_id == user_id {
+        return AppError::bad_request(
+            "disable your own MFA from your account settings, with your password",
+        )
+        .into_response();
+    }
+    let target = match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return AppError::not_found("user not found").into_response(),
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    // Resolved before the mutation and with the failure propagated, for the
+    // reason `unlock_user` spells out: the one record of who took an account's
+    // second factor off must not be written with a blank author.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, current_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    match rg_core::user::account::reset_mfa(&state.db, user_id).await {
+        Ok(updated) => {
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                "admin.reset_mfa",
+                Some("user"),
+                Some(user_id),
+                Some(&target.username),
+                Some(&headers),
+                Some(serde_json::json!({
+                    "method": "totp",
+                    "sessions_revoked": true,
+                    "backup_codes_revoked": true,
+                })),
+            )
+            .await;
+            let response: rg_core::user::service::UserInfo = updated.into();
+            (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+        }
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
 /// POST /api/v1/admin/users/:id/unlock
 #[utoipa::path(
     post,

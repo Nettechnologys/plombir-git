@@ -592,6 +592,7 @@ Beyond `serve`, the `plombir-git` binary offers:
 | `backup-db` / `restore-db` | Create / restore a consistent SQLite backup by hand (for a schedule, use `[backup]` — the server snapshots itself) |
 | `rotate-encryption-key` | Re-encrypt every at-rest secret onto a new encryption key (file-backed SQLite requires the server to be stopped, `--dry-run` included; this is enforced) |
 | `rotate-instance-key` | Mint a new provenance signing identity (invalidates past attestations) |
+| `reset-mfa <username>` | Take the second factor off an account whose owner can no longer pass it (signs out its sessions, revokes its backup codes) |
 | `create-repo` | Create a bare repository (no DB record — quick testing) |
 | `runner` | Run as a CI runner (polls and executes jobs) |
 | `import github\|gitlab <url>` | Import a repository (and metadata) from GitHub/GitLab (file-backed SQLite requires the server to be stopped) |
@@ -601,8 +602,8 @@ Beyond `serve`, the `plombir-git` binary offers:
 
 Every subcommand that touches the database or the repository directory
 (`migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,
-`rotate-encryption-key`, `create-repo`, `import`, `index-repo`, `list-tombstones`,
-`package list`)
+`rotate-encryption-key`, `reset-mfa`, `create-repo`, `import`, `index-repo`,
+`list-tombstones`, `package list`)
 takes the same `--config` as `serve` and resolves `--db-url` / `--repo-root` as
 **CLI arg > config file > built-in default**. On a config-file deployment, pass
 `--config` rather than repeating the URL: with neither,

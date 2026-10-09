@@ -99,7 +99,7 @@ async fn enable(base: &str, token: &str, secret: &str) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!("{base}/api/v1/users/mfa/enable"))
         .bearer_auth(token)
-        .json(&serde_json::json!({ "code": current_code(secret) }))
+        .json(&serde_json::json!({ "code": current_code(secret), "password": "Qz7$wRtm" }))
         .send()
         .await
         .expect("enable request")

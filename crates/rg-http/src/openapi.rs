@@ -620,6 +620,7 @@ pub(crate) fn stamp_security(
         crate::api::admin::create_user,
         crate::api::admin::reset_user_password,
         crate::api::admin::unlock_user,
+        crate::api::admin::reset_user_mfa,
         crate::api::admin::list_orgs,
         crate::api::admin::get_org,
         crate::api::admin::delete_org,

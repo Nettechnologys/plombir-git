@@ -62,7 +62,10 @@ async fn enrol(base: &str, token: &str) -> Vec<String> {
     let enabled = client
         .post(format!("{base}/api/v1/users/mfa/enable"))
         .bearer_auth(token)
-        .json(&serde_json::json!({ "code": code_for_step(&secret, current_step()) }))
+        .json(&serde_json::json!({
+            "code": code_for_step(&secret, current_step()),
+            "password": PASSWORD,
+        }))
         .send()
         .await
         .expect("enable request");

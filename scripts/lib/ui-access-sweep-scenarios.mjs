@@ -125,6 +125,26 @@ const adminUsersResetPassword = privileged(
   ]),
 );
 
+// The target is enrolled in MFA by the fixture seed, which is what makes the
+// page offer this control for it. Ahead of `admin-users-delete` for the same
+// reason the password reset is.
+const adminUsersResetMfa = privileged(
+  async (context) => {
+    await context.navigate('/admin/users');
+    await context.setConfirm(true);
+    await context.clickWithin(
+      '.users-table tbody tr',
+      context.fixture.targetUsername,
+      'button',
+      'Reset MFA',
+    );
+  },
+  (context) => requestSequence(context, [
+    [`/api/v1/admin/users/${context.fixture.targetUserId}/mfa/reset`, { method: 'POST' }],
+    ['/api/v1/admin/users'],
+  ]),
+);
+
 const adminUsersDelete = privileged(
   async (context) => {
     await context.navigate('/admin/users');
@@ -1404,6 +1424,7 @@ export const UI_ACCESS_SWEEP_SCENARIOS = new Map([
   ['admin-users-update', adminUsersUpdate],
   ['admin-users-create', adminUsersCreate],
   ['admin-users-reset-password', adminUsersResetPassword],
+  ['admin-users-reset-mfa', adminUsersResetMfa],
   ['admin-users-delete', adminUsersDelete],
   ['admin-orgs-delete', adminOrgsDelete],
   ['admin-runners-register', adminRunnersRegister],

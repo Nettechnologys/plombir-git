@@ -252,6 +252,12 @@ async fn run() -> anyhow::Result<()> {
             commands::cmd_list_tombstones(repo_root, config).await?
         }
 
+        Commands::ResetMfa {
+            username,
+            db_url,
+            config: _,
+        } => commands::cmd_reset_mfa(username, db_url, state_cfg()).await?,
+
         Commands::IndexRepo {
             repo_slug,
             repo_root,

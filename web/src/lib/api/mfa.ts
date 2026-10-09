@@ -24,10 +24,13 @@ export interface MfaBackupStatus {
 export const mfa = {
   setup: () =>
     request<MfaSetupResponse>('/users/mfa/setup', { method: 'POST' }),
-  enable: (code: string) =>
+  // The password is asked for at the moment the factor is armed, first
+  // enrolment included: a stolen session must not be enough to put a second
+  // factor only the thief can pass on the account.
+  enable: (code: string, password: string) =>
     request<MfaEnableResponse>('/users/mfa/enable', {
       method: 'POST',
-      body: JSON.stringify({ code }),
+      body: JSON.stringify({ code, password }),
     }),
   backup: () =>
     request<MfaBackupStatus>('/users/mfa/backup'),

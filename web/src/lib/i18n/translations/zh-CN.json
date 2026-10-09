@@ -1499,6 +1499,8 @@
       "unlock": "解锁",
       "reset_password": "重置密码",
       "reset_password_confirm": "要为 {username} 生成新密码吗？该用户的所有会话都将被登出。",
+      "reset_mfa": "重置 MFA",
+      "reset_mfa_confirm": "要移除 {username} 账号的第二因素吗？其身份验证器和备用码将失效，该用户的所有会话都将被登出。仅在该用户确实无法再通过第二因素时执行此操作。",
       "display_name": "显示名称",
       "bio": "简介"
     },
@@ -1916,6 +1918,7 @@
       "qr_label": "身份验证器二维码",
       "hint": "用身份验证器应用扫描二维码，然后输入六位数验证码。",
       "code": "验证码",
+      "password": "当前密码",
       "verifying": "验证中...",
       "enable": "启用 MFA"
     },

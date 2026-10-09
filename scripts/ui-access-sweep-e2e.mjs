@@ -5,7 +5,7 @@
 // accounts, Chrome, the scenario registry and the persona matrix.
 
 import { dirname, resolve } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
@@ -212,6 +212,37 @@ async function jsonRequest(url, options = {}) {
   return body;
 }
 
+// The authenticator's side of a TOTP enrolment (RFC 6238 over RFC 4226, SHA-1,
+// six digits, 30-second steps — what `POST /users/mfa/setup` hands out). The
+// seed needs one real code: enabling MFA on the target account is what makes
+// the admin page offer "Reset MFA" for it.
+function totpCode(base32Secret, now = Date.now()) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const bytes = [];
+  let bits = 0;
+  let value = 0;
+  for (const char of base32Secret.replace(/=+$/u, '').toUpperCase()) {
+    const index = alphabet.indexOf(char);
+    if (index < 0) throw new Error(`MFA setup secret is not base32: ${JSON.stringify(char)}`);
+    value = (value << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(now / 1000 / 30)));
+  const digest = createHmac('sha1', Buffer.from(bytes)).update(counter).digest();
+  const offset = digest[digest.length - 1] & 0x0f;
+  const binary =
+    ((digest[offset] & 0x7f) << 24)
+    | (digest[offset + 1] << 16)
+    | (digest[offset + 2] << 8)
+    | digest[offset + 3];
+  return String(binary % 1_000_000).padStart(6, '0');
+}
+
 async function registerPersonas(backendUrl) {
   const tokens = {};
   for (const persona of REQUIRED_PERSONAS) {
@@ -264,6 +295,24 @@ async function seedFixtures(backendUrl, tokens) {
     headers: { authorization: `Bearer ${target.token}` },
   });
   if (!Number.isInteger(targetProfile?.id)) throw new Error('target-user profile returned no numeric id');
+
+  // The target stands on a second factor, so `/admin/users` offers "Reset MFA"
+  // for it (`admin-users-reset-mfa`). Enrolled through the real endpoints with
+  // the registration session: a PAT could not, and since security audit
+  // finding #6 the enable step wants the account password as well as a code.
+  const mfaSetup = await jsonRequest(`${backendUrl}/api/v1/users/mfa/setup`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${target.token}` },
+  });
+  if (typeof mfaSetup?.secret !== 'string' || mfaSetup.secret === '') {
+    throw new Error('target-user MFA setup returned no secret');
+  }
+  const mfaEnabled = await jsonRequest(`${backendUrl}/api/v1/users/mfa/enable`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${target.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ code: totpCode(mfaSetup.secret), password: PASSWORD }),
+  });
+  if (mfaEnabled?.enabled !== true) throw new Error('target-user MFA enable did not report enabled');
 
   const resourceUser = await jsonRequest(`${backendUrl}/api/v1/users/register`, {
     method: 'POST',

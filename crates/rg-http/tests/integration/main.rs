@@ -134,6 +134,7 @@ mod mfa_account_delete_race_tests;
 mod mfa_backup_regenerate_tests;
 mod mfa_disable_lockout_tests;
 mod mfa_enable_atomicity_tests;
+mod mfa_enrolment_password_tests;
 mod mfa_reenrolment_tests;
 mod mfa_totp_replay_tests;
 mod milestone_state_tests;

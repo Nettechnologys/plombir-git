@@ -360,7 +360,7 @@ template). Model sections include `server`, `database`, `auth`, `ci`, `releases`
 `timeouts`, `webhooks`, and `observability`. The model and the resolution live in
 `rg-cli/src/config.rs` and are shared by **every** subcommand, not just `serve`:
 `migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,
-`rotate-encryption-key`, `create-repo`, `import`, `index-repo`,
+`rotate-encryption-key`, `reset-mfa`, `create-repo`, `import`, `index-repo`,
 `list-tombstones` and `package list` all take `--config` and read `[database].url` /
 `[server].repo_root` through the same functions the server uses; `import` also
 reads `[imports].trusted_origins`, so an operator-only private-origin exception

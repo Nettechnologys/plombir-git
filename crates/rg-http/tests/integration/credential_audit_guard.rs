@@ -96,7 +96,7 @@ struct Credential {
 /// What a handler does to a credential table that is not reading it.
 const MUTATING_VERBS: [&str; 4] = ["create", "upsert", "update", "delete"];
 
-const CREDENTIALS: [Credential; 13] = [
+const CREDENTIALS: [Credential; 14] = [
     // A personal access token authenticates as the account it belongs to.
     Credential {
         entity: Some("access_token"),
@@ -160,6 +160,16 @@ const CREDENTIALS: [Credential; 13] = [
         entity: None,
         ops: "user_ops",
         verbs: &["enable_mfa", "disable_mfa"],
+    },
+    // The same factor taken off by an *administrator*, through the service
+    // function `POST /admin/users/{id}/mfa/reset` and `plombir-git reset-mfa`
+    // share (security audit finding #6). Named by its service module for the
+    // reason the password below is: the handler carries no `user_ops` call of
+    // its own, so the row above would not see it.
+    Credential {
+        entity: None,
+        ops: "user::account",
+        verbs: &["reset_mfa"],
     },
     // Backup codes are single-use passwords for the account, and re-issuing
     // them is interesting because the old set stops working — not because the

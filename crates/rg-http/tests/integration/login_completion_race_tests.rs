@@ -135,7 +135,7 @@ async fn setup_mfa(base: &str, token: &str) -> String {
     let enable = client
         .post(format!("{base}/api/v1/users/mfa/enable"))
         .bearer_auth(token)
-        .json(&serde_json::json!({ "code": current_code(&secret) }))
+        .json(&serde_json::json!({ "code": current_code(&secret), "password": PASSWORD }))
         .send()
         .await
         .expect("enable MFA");

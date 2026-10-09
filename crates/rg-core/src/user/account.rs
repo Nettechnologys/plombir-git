@@ -233,6 +233,38 @@ pub async fn reset_password(
     })
 }
 
+/// Take the second factor off `target_user_id`'s account, as an operator.
+///
+/// The way back in for an owner whose authenticator is gone — and, since a
+/// password reset of an MFA account ends at the second factor, the only way
+/// back in once a stolen session has enrolled an authenticator the owner never
+/// held. Shared by `POST /admin/users/{id}/mfa/reset` and
+/// `plombir-git reset-mfa` so the two doors cannot drift: both revoke every
+/// session first (the one that enrolled the attacker's authenticator is the
+/// one that must not survive this), then drop the factor, the enrolment in
+/// flight and every unused backup code in one commit. The caller journals.
+///
+/// An account with no second factor is refused rather than quietly "reset":
+/// the operator was told MFA locks this person out, and the honest answer is
+/// that it does not — their problem is elsewhere, and their sessions need not
+/// be revoked for it.
+pub async fn reset_mfa(db: &DatabaseConnection, target_user_id: i64) -> Result<User> {
+    let target = user_ops::find_by_id(db, target_user_id)
+        .await?
+        .ok_or_else(|| crate::error::not_found("user"))?;
+    if !target.mfa_enabled {
+        return Err(crate::error::conflict(
+            "MFA is not enabled for this account",
+        ));
+    }
+    user_ops::invalidate_sessions(db, target.id)
+        .await
+        .context("revoke the sessions of an account whose MFA is being reset")?;
+    user_ops::disable_mfa(db, target.id)
+        .await?
+        .ok_or_else(|| crate::error::not_found("user"))
+}
+
 // ── Profile ──────────────────────────────────────────────────────────────
 
 /// Trim a free-text profile field; blank is "unset", over `max` is refused.

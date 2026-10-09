@@ -279,6 +279,80 @@ async fn pat_cannot_issue_a_broader_pat_or_ssh_key_but_a_browser_session_can() {
         .contains("credential creation requires a login session"));
 }
 
+/// A `user`-scoped PAT reaches every `/users/mfa/*` door it used to, and is
+/// refused at each one that changes the factor (security audit finding #6).
+///
+/// The second factor is what a stolen credential is stopped by, so it must not
+/// be something a stolen credential can set: a token that enrols an
+/// authenticator its owner never held locks the owner out for good, because a
+/// password reset of an MFA account ends at the second factor. Reading the
+/// backup-code *status* reveals nothing and stays open to the token.
+#[tokio::test]
+async fn pat_cannot_change_the_second_factor() {
+    let base = spawn_test_app().await;
+    let jwt = register_user(&base, "patmfa", "patmfa@example.com", "Qz7$wRtm").await;
+    let cookie = format!("plombir_git_token={jwt}");
+    let user_pat = create_pat_with_scopes(&base, &jwt, Some("user")).await;
+    let client = reqwest::Client::new();
+
+    for (route, body) in [
+        ("/users/mfa/setup", serde_json::json!({})),
+        (
+            "/users/mfa/enable",
+            serde_json::json!({ "code": "000000", "password": "Qz7$wRtm" }),
+        ),
+        (
+            "/users/mfa/backup/regenerate",
+            serde_json::json!({ "password": "Qz7$wRtm" }),
+        ),
+        (
+            "/users/mfa/disable",
+            serde_json::json!({ "password": "Qz7$wRtm" }),
+        ),
+    ] {
+        let denied = client
+            .post(format!("{base}/api/v1{route}"))
+            .bearer_auth(&user_pat)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 403, "a PAT reached POST {route}");
+        assert!(
+            denied
+                .text()
+                .await
+                .unwrap()
+                .contains("credential creation requires a login session"),
+            "POST {route} must say why the token is refused"
+        );
+    }
+
+    let status_with_pat = client
+        .get(format!("{base}/api/v1/users/mfa/backup"))
+        .bearer_auth(&user_pat)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        status_with_pat.status(),
+        200,
+        "the backup-code status is a read and stays open to a user-scoped token"
+    );
+
+    let started = client
+        .post(format!("{base}/api/v1/users/mfa/setup"))
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        started.status(),
+        200,
+        "browser session starts MFA enrolment"
+    );
+}
+
 #[tokio::test]
 async fn pat_cannot_issue_bot_or_deploy_credentials_or_start_passkey_registration() {
     let base = spawn_test_app().await;
