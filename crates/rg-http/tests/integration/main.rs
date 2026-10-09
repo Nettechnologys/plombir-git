@@ -28,6 +28,7 @@ mod client_address_tests;
 mod comment_moderation_tests;
 mod common;
 mod compare_and_fork_head_tests;
+mod link_preview_tests;
 mod notification_routing_tests;
 mod repo_settings_tests;
 

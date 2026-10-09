@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Extension, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 
 use crate::api::auth::AuthUser;
@@ -31,15 +31,24 @@ const WEB_BUILD_HINT: &str = "the frontend bundle is expected in `web/build/` re
 /// request extensions. This handler reads it and injects `nonce="<value>"`
 /// into every `<script>` tag so the browser allows inline scripts under
 /// the strict `script-src 'self' 'nonce-<value>'` CSP.
+///
+/// A page of a public repository additionally gets that repository's link
+/// preview — see [`public_repo_preview`].
 pub(crate) async fn spa_index_handler(
     Extension(nonce): Extension<security::CspNonce>,
     Extension(spa_build_dir): Extension<SpaBuildDir>,
+    Extension(SpaAppState(state)): Extension<SpaAppState>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Response {
     let index_path = spa_index_path(&spa_build_dir.0);
     match tokio::fs::read(&index_path).await {
         Ok(html_bytes) => {
             let html = String::from_utf8_lossy(&html_bytes).into_owned();
-            let modified = security::inject_csp_nonce(&html, &nonce.0);
+            let mut modified = security::inject_csp_nonce(&html, &nonce.0);
+            if let Some(preview) = public_repo_preview(&state, &headers, uri.path()).await {
+                modified = preview.apply(&modified);
+            }
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -49,6 +58,148 @@ pub(crate) async fn spa_index_handler(
         }
         Err(error) => spa_index_error_response(&index_path, &error),
     }
+}
+
+/// The application state, handed to [`spa_index_handler`] as an extension
+/// because `ServeDir::fallback` takes a stateless service.
+#[derive(Clone)]
+pub(crate) struct SpaAppState(pub AppState);
+
+/// The `description` and Open Graph tags of one public repository's pages.
+///
+/// The SPA is built with `ssr = false`, and link-preview crawlers (messengers,
+/// social networks, search engines) do not run JavaScript, so whatever a
+/// repository page sets from Svelte never reaches them — every link showed the
+/// instance's generic text (card_86579dfda909). The server writes these into
+/// the shell instead.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RepoPreview {
+    title: String,
+    description: String,
+    url: Option<String>,
+}
+
+/// Longest description handed to a crawler, in characters. Preview cards cut
+/// far shorter; the bound keeps an unbounded column out of every page shell.
+const PREVIEW_DESCRIPTION_MAX_CHARS: usize = 300;
+
+/// The preview for `path` if it is a page of a repository an **anonymous**
+/// visitor may read, decided by the same gate as the API (`may_read` with no
+/// actor) — a crawler is anonymous, and a page that previews a repository the
+/// API would refuse would announce that it exists.
+///
+/// Everything else — a top-level page, an unknown owner or repository, a
+/// private one, an instance closed to anonymous readers, a lookup that failed —
+/// gets `None`, and with it the generic shell: one answer for "missing" and
+/// "hidden", so the shell is no existence oracle. A failed lookup is logged and
+/// otherwise ignored: the page itself must still load.
+pub(crate) async fn public_repo_preview(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+) -> Option<RepoPreview> {
+    let mut segments = path.trim_start_matches('/').split('/');
+    let owner = segments.next().filter(|s| !s.is_empty())?;
+    let name = segments.next().filter(|s| !s.is_empty())?;
+    if rg_core::platform::validate_repo_path(owner).is_err()
+        || rg_core::platform::validate_repo_path(name).is_err()
+    {
+        return None;
+    }
+    let repo = match rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name).await {
+        Ok(Some(repo)) => repo,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(owner, name, error = %format!("{error:#}"), "link preview: repository lookup failed");
+            return None;
+        }
+    };
+    match crate::api::repo_access::may_read(state, &repo, None).await {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => {
+            tracing::warn!(owner, name, error = ?error, "link preview: read check failed");
+            return None;
+        }
+    }
+    let title = format!("{owner}/{}", repo.name);
+    let description = repo
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(|d| d.chars().take(PREVIEW_DESCRIPTION_MAX_CHARS).collect())
+        .unwrap_or_else(|| format!("{title} — a repository on Plombir Git."));
+    let url = crate::public_url::public_base_url(state, headers)
+        .map(|base| format!("{}/{title}", base.trim_end_matches('/')));
+    Some(RepoPreview {
+        title,
+        description,
+        url,
+    })
+}
+
+impl RepoPreview {
+    /// Replace the shell's generic `description` and add the Open Graph and
+    /// Twitter card tags before `</head>`. Every value is attribute-escaped:
+    /// the description is whatever the repository's owner typed.
+    pub(crate) fn apply(&self, html: &str) -> String {
+        let title = escape_attribute(&self.title);
+        let description = escape_attribute(&self.description);
+        let mut tags = format!(
+            "<meta name=\"description\" content=\"{description}\" />\n\
+             <meta property=\"og:type\" content=\"website\" />\n\
+             <meta property=\"og:site_name\" content=\"Plombir Git\" />\n\
+             <meta property=\"og:title\" content=\"{title}\" />\n\
+             <meta property=\"og:description\" content=\"{description}\" />\n\
+             <meta name=\"twitter:card\" content=\"summary\" />\n\
+             <meta name=\"twitter:title\" content=\"{title}\" />\n\
+             <meta name=\"twitter:description\" content=\"{description}\" />\n"
+        );
+        if let Some(url) = &self.url {
+            tags.push_str(&format!(
+                "<meta property=\"og:url\" content=\"{}\" />\n",
+                escape_attribute(url)
+            ));
+        }
+        let html = strip_meta_description(html);
+        match html.find("</head>") {
+            Some(at) => format!("{}{tags}{}", &html[..at], &html[at..]),
+            None => html,
+        }
+    }
+}
+
+/// Drop the shell's own `<meta name="description" …>` so the page carries one
+/// description, not two that disagree.
+fn strip_meta_description(html: &str) -> String {
+    const OPEN: &str = "<meta name=\"description\"";
+    let Some(start) = html.find(OPEN) else {
+        return html.to_string();
+    };
+    let Some(len) = html[start..].find('>') else {
+        return html.to_string();
+    };
+    let mut end = start + len + 1;
+    if html[end..].starts_with('\n') {
+        end += 1;
+    }
+    format!("{}{}", &html[..start], &html[end..])
+}
+
+fn escape_attribute(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn spa_index_path(web_build_dir: &Path) -> PathBuf {

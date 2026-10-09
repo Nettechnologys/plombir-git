@@ -468,9 +468,13 @@ fn with_spa_fallback(router: Router<AppState>, state: &AppState) -> Router<AppSt
     let spa_build_dir = state.spa_build_dir.as_ref().clone();
     // Serves `index.html` with a per-request CSP nonce injected into every
     // `<script>` tag (H-2).
-    let spa_fallback = axum::routing::get(handlers::spa_index_handler).layer(axum::Extension(
-        handlers::SpaBuildDir(spa_build_dir.clone()),
-    ));
+    let spa_fallback = axum::routing::get(handlers::spa_index_handler)
+        .layer::<_, std::convert::Infallible>(axum::Extension(handlers::SpaBuildDir(
+            spa_build_dir.clone(),
+        )))
+        // A public repository's page carries its link preview, which needs the
+        // database (card_86579dfda909).
+        .layer(axum::Extension(handlers::SpaAppState(state.clone())));
 
     // `append_index_html_on_directories` is what made `/` — the one URL every
     // visitor types — the only page of the app that did not work: ServeDir
