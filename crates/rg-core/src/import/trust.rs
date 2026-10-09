@@ -17,6 +17,13 @@ use crate::net::HttpOrigin as ImportOrigin;
 #[derive(Clone, Debug, Default)]
 pub struct TrustedImportOrigins(Arc<HashSet<ImportOrigin>>);
 
+/// The built-in ceiling on what one import clone may write, in megabytes.
+///
+/// The clone deadline bounds time, not bytes: a hostile source can stream
+/// gigabytes within it. Applies to the repository and wiki clone paths;
+/// `[imports].max_clone_size_mb = 0` removes the ceiling.
+pub const DEFAULT_MAX_CLONE_MB: u64 = 2048;
+
 /// A validated import API destination coupled to the only client builder that
 /// may connect to it.
 ///
@@ -141,8 +148,20 @@ impl TrustedImportOrigins {
 /// that may bypass private-address SSRF rejection has not thereby been granted
 /// authority to expose a PAT to the network, and the converse does not make a
 /// private destination reachable.
-#[derive(Clone, Debug, Default)]
-pub struct ImportTransportPolicy(Arc<HashSet<ImportOrigin>>);
+#[derive(Clone, Debug)]
+pub struct ImportTransportPolicy {
+    origins: Arc<HashSet<ImportOrigin>>,
+    max_clone_bytes: u64,
+}
+
+impl Default for ImportTransportPolicy {
+    fn default() -> Self {
+        Self {
+            origins: Arc::default(),
+            max_clone_bytes: DEFAULT_MAX_CLONE_MB * 1024 * 1024,
+        }
+    }
+}
 
 impl ImportTransportPolicy {
     /// Parse `[imports].allow_insecure_http_origins` as exact HTTP origins.
@@ -158,12 +177,27 @@ impl ImportTransportPolicy {
             }
             origins.insert(origin);
         }
-        Ok(Self(Arc::new(origins)))
+        Ok(Self {
+            origins: Arc::new(origins),
+            ..Self::default()
+        })
+    }
+
+    /// Override the built-in clone ceiling; 0 disables it.
+    pub const fn with_max_clone_bytes(mut self, max_clone_bytes: u64) -> Self {
+        self.max_clone_bytes = max_clone_bytes;
+        self
+    }
+
+    /// The ceiling in bytes one clone may write into its staging directory, or
+    /// 0 for no ceiling.
+    pub const fn max_clone_bytes(&self) -> u64 {
+        self.max_clone_bytes
     }
 
     /// Whether at least one plaintext credential origin was explicitly named.
     pub fn allows_insecure_http(&self) -> bool {
-        !self.0.is_empty()
+        !self.origins.is_empty()
     }
 
     /// Reject native Git before an import reaches DNS, an API, or a git sink.
@@ -213,7 +247,7 @@ impl ImportTransportPolicy {
             // The ordinary import URL guard owns malformed/non-HTTP schemes.
             return Ok(());
         };
-        if origin.scheme == "http" && !self.0.contains(&origin) {
+        if origin.scheme == "http" && !self.origins.contains(&origin) {
             return Err(crate::error::invalid_request(
                 "plaintext HTTP imports may not carry credentials; use https:// or add the \
                  exact origin to `[imports].allow_insecure_http_origins` as a separate \

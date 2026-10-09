@@ -106,6 +106,35 @@ impl OutboundGitInvocation {
         args: &[&str],
         repo_path: Option<&Path>,
     ) -> Result<GitOutput> {
+        self.run_with_disk_budget(git, args, repo_path, None)
+    }
+
+    /// [`Self::run`], with a ceiling on what the command may write under
+    /// `disk_budget_dir`.
+    ///
+    /// A clone of a remote somebody else controls is bounded by its timeout in
+    /// time, not in bytes: within two minutes it can fill the volume. The
+    /// caller names the directory the operation is expected to fill — the
+    /// staging clone or mirror destination, never a directory holding other
+    /// repositories — and the ceiling it may reach there.
+    pub fn run_under_disk_budget(
+        &self,
+        git: &GitCommandGateway,
+        args: &[&str],
+        repo_path: Option<&Path>,
+        disk_budget_dir: &Path,
+        max_bytes: u64,
+    ) -> Result<GitOutput> {
+        self.run_with_disk_budget(git, args, repo_path, Some((disk_budget_dir, max_bytes)))
+    }
+
+    fn run_with_disk_budget(
+        &self,
+        git: &GitCommandGateway,
+        args: &[&str],
+        repo_path: Option<&Path>,
+        disk_budget: Option<(&Path, u64)>,
+    ) -> Result<GitOutput> {
         let mut full_args: Vec<&str> = self.args.iter().map(String::as_str).collect();
         full_args.extend_from_slice(args);
         let env: Vec<(&str, &str)> = self
@@ -117,7 +146,17 @@ impl OutboundGitInvocation {
             .filter_map(|(key, _)| is_ambient_transport_env(&key).then_some(key))
             .collect();
 
-        git.run_with_env_removed(&full_args, repo_path, &env, &inherited_env_to_remove)
+        match disk_budget {
+            Some((disk_budget_dir, max_bytes)) => git.run_with_env_removed_under_disk_budget(
+                &full_args,
+                repo_path,
+                &env,
+                &inherited_env_to_remove,
+                disk_budget_dir,
+                max_bytes,
+            ),
+            None => git.run_with_env_removed(&full_args, repo_path, &env, &inherited_env_to_remove),
+        }
     }
 }
 

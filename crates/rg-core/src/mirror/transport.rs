@@ -9,18 +9,49 @@
 
 use anyhow::{Context, Result};
 
-/// Whether this instance deliberately permits plaintext HTTP mirror remotes.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// The built-in ceiling on what one mirror sync may write, in megabytes.
+///
+/// A mirror remote is chosen by a repository owner, and the 120-second sync
+/// deadline bounds time, not bytes: a hostile repository can stream gigabytes
+/// within it. The default is generous enough for ordinary heavyweight
+/// repositories; `[mirror].max_clone_size_mb = 0` removes the ceiling for the
+/// operator who has a legitimate reason.
+pub const DEFAULT_MAX_CLONE_MB: u64 = 2048;
+
+/// Whether this instance deliberately permits plaintext HTTP mirror remotes,
+/// and how much disk one sync may fill.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MirrorTransportPolicy {
     allow_insecure_http: bool,
+    max_clone_bytes: u64,
+}
+
+impl Default for MirrorTransportPolicy {
+    fn default() -> Self {
+        Self::new(false)
+    }
 }
 
 impl MirrorTransportPolicy {
-    /// Build the policy resolved from `[mirror].allow_insecure_http`.
+    /// Build the policy resolved from `[mirror].allow_insecure_http` and
+    /// `[mirror].max_clone_size_mb`.
     pub const fn new(allow_insecure_http: bool) -> Self {
         Self {
             allow_insecure_http,
+            max_clone_bytes: DEFAULT_MAX_CLONE_MB * 1024 * 1024,
         }
+    }
+
+    /// Override the built-in clone ceiling; 0 disables it.
+    pub const fn with_max_clone_bytes(mut self, max_clone_bytes: u64) -> Self {
+        self.max_clone_bytes = max_clone_bytes;
+        self
+    }
+
+    /// The ceiling in bytes one sync may write into the mirror directory, or 0
+    /// for no ceiling.
+    pub const fn max_clone_bytes(self) -> u64 {
+        self.max_clone_bytes
     }
 
     /// Whether plaintext HTTP is an explicit operator exception.

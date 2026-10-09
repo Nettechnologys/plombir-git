@@ -147,6 +147,9 @@ trusted_origins = []
 # origin again here as a separate acknowledgement of that exposure.
 allow_insecure_http_origins = []
 # Example exact origins: ["http://gitlab.internal.example:8080"]
+# Ceiling in MiB on what one import clone may write into its staging directory
+# before git is killed (the clone timeout bounds time, not bytes). 0 disables.
+max_clone_size_mb = 2048
 
 [mirror]
 # The sweep that refreshes repository mirrors on the interval each mirror was
@@ -160,3 +163,6 @@ enabled = true
 allow_insecure_http = false
 poll_interval_secs = 60
 batch_size = 10
+# Ceiling in MiB on what one sync may write into a mirror directory before git
+# is killed (the sync timeout bounds time, not bytes). 0 disables the ceiling.
+max_clone_size_mb = 2048

@@ -325,6 +325,7 @@ impl GitCommandGateway {
             &[],
             DEFAULT_STDOUT_LIMIT_BYTES,
             DEFAULT_STDERR_LIMIT_BYTES,
+            None,
         )
     }
 
@@ -350,6 +351,7 @@ impl GitCommandGateway {
             &[],
             stdout_limit_bytes,
             DEFAULT_STDERR_LIMIT_BYTES,
+            None,
         )
     }
 
@@ -372,6 +374,7 @@ impl GitCommandGateway {
             &[],
             DEFAULT_STDOUT_LIMIT_BYTES,
             DEFAULT_STDERR_LIMIT_BYTES,
+            None,
         )
     }
 
@@ -402,10 +405,41 @@ impl GitCommandGateway {
             inherited_env_to_remove,
             DEFAULT_STDOUT_LIMIT_BYTES,
             DEFAULT_STDERR_LIMIT_BYTES,
+            None,
+        )
+    }
+
+    /// [`Self::run_with_env_removed`], with a ceiling on what the command may
+    /// write under `disk_budget_dir`.
+    ///
+    /// The timeout bounds time, not bytes: a `git clone` of a repository
+    /// somebody else controls can write gigabytes within it. This variant
+    /// watches the directory and kills the process tree the moment the ceiling
+    /// is crossed, reporting [`GitCliError::DiskBudgetExceeded`].
+    pub(crate) fn run_with_env_removed_under_disk_budget(
+        &self,
+        args: &[&str],
+        repo_path: Option<&Path>,
+        env: &[(&str, &str)],
+        inherited_env_to_remove: &[OsString],
+        disk_budget_dir: &Path,
+        max_bytes: u64,
+    ) -> Result<GitOutput> {
+        self.run_inner(
+            args,
+            repo_path,
+            Some(env),
+            inherited_env_to_remove,
+            DEFAULT_STDOUT_LIMIT_BYTES,
+            DEFAULT_STDERR_LIMIT_BYTES,
+            Some(rg_process::DiskBudget::new(disk_budget_dir, max_bytes)),
         )
     }
 
     /// Core implementation shared by the synchronous invocation variants.
+    ///
+    /// `disk_budget` swaps the capture for the variant that also watches the
+    /// child's writes; the bound on buffered output is the same either way.
     fn run_inner(
         &self,
         args: &[&str],
@@ -414,6 +448,7 @@ impl GitCommandGateway {
         inherited_env_to_remove: &[OsString],
         stdout_limit_bytes: u64,
         stderr_limit_bytes: u64,
+        disk_budget: Option<rg_process::DiskBudget>,
     ) -> Result<GitOutput> {
         let full_cmd = self.build_command_line(args, repo_path);
         let command_str = full_cmd.join(" ");
@@ -436,13 +471,25 @@ impl GitCommandGateway {
         // and the only bound on the way was the 120-second deadline — for a
         // command whose output size is chosen by a repository's content, this
         // is exactly no bound. `_and_limit` stops reading at the caller's
-        // ceiling and reports the refusal by variant, not by exit code.
-        let output = match rg_process::output_in_process_tree_with_timeout_and_limit(
-            &mut builder,
-            self.timeout,
-            stdout_limit_bytes,
-            stderr_limit_bytes,
-        )
+        // ceiling and reports the refusal by variant, not by exit code; the
+        // disk-budget variant adds the same bound in bytes on disk.
+        let timed = match disk_budget {
+            Some(disk_budget) => {
+                rg_process::output_in_process_tree_with_timeout_limit_and_disk_budget(
+                    &mut builder,
+                    self.timeout,
+                    stdout_limit_bytes,
+                    stderr_limit_bytes,
+                    disk_budget,
+                )
+            }
+            None => rg_process::output_in_process_tree_with_timeout_and_limit(
+                &mut builder,
+                self.timeout,
+                stdout_limit_bytes,
+                stderr_limit_bytes,
+            ),
+        }
         .map_err(|error| match error {
             rg_process::ProcessOutputError::Spawn(error)
                 if error.kind() == std::io::ErrorKind::NotFound =>
@@ -451,12 +498,27 @@ impl GitCommandGateway {
             }
             rg_process::ProcessOutputError::Spawn(error)
             | rg_process::ProcessOutputError::Wait(error) => GitCliError::Io(error),
-        })? {
+        })?;
+
+        let output = match timed {
             rg_process::TimedOutput::Completed(output) => output,
             rg_process::TimedOutput::TimedOut => {
                 return Err(GitCliError::Timeout {
                     command: command_str,
                     timeout: self.timeout,
+                }
+                .into());
+            }
+            rg_process::TimedOutput::DiskBudgetExceeded {
+                path,
+                bytes,
+                limit_bytes,
+            } => {
+                return Err(GitCliError::DiskBudgetExceeded {
+                    command: command_str,
+                    path,
+                    bytes,
+                    limit_bytes,
                 }
                 .into());
             }
@@ -637,6 +699,49 @@ mod tests {
         let g1 = global_gateway();
         let g2 = global_gateway();
         assert!(std::ptr::eq(g1.as_ref().unwrap(), g2.as_ref().unwrap()));
+    }
+
+    /// A clone whose content somebody else chooses is bounded in bytes, not
+    /// only in time. The fake command writes until the tree is killed; the
+    /// gateway must surface that as a typed refusal, not as a git exit code.
+    #[cfg(unix)]
+    #[test]
+    fn a_writing_command_is_reported_as_a_disk_budget_refusal() {
+        let gateway = GitCommandGateway::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("clone");
+        let script = format!(
+            "mkdir -p '{dest}'; i=0; while :; do i=$((i + 1)); \
+             dd if=/dev/zero of='{dest}/blob-$i' bs=65536 count=4 2>/dev/null; done",
+            dest = destination.display()
+        );
+        let alias = format!("alias.fill=!{script}");
+
+        let error = gateway
+            .run_with_env_removed_under_disk_budget(
+                &["-c", &alias, "fill"],
+                None,
+                &[],
+                &[],
+                &destination,
+                256 * 1024,
+            )
+            .expect_err("the disk budget must stop the writing command");
+
+        match error
+            .downcast_ref::<GitCliError>()
+            .expect("the refusal is a typed GitCliError")
+        {
+            GitCliError::DiskBudgetExceeded {
+                path,
+                limit_bytes,
+                ..
+            } => {
+                assert_eq!(path, &destination);
+                assert_eq!(*limit_bytes, 256 * 1024);
+            }
+            other => panic!("expected DiskBudgetExceeded, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]

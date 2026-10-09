@@ -926,7 +926,7 @@ pub(crate) async fn run_serve(
              endpoints because [auth].allow_insecure_ldap_endpoints is non-empty"
         );
     }
-    let resolved_mirror_transport_policy = resolve_mirror_transport_policy(cfg.as_ref());
+    let resolved_mirror_transport_policy = resolve_mirror_transport_policy(cfg.as_ref())?;
     if resolved_mirror_transport_policy.allows_insecure_http() {
         tracing::warn!(
             "Mirror credentials and repository content may traverse plaintext HTTP because \
@@ -1971,7 +1971,9 @@ mod serve_tests {
         assert_eq!(config.mirror.poll_interval_secs, Some(120));
         assert_eq!(config.mirror.batch_size, Some(4));
         assert!(
-            resolve_mirror_transport_policy(Some(&config)).allows_insecure_http(),
+            resolve_mirror_transport_policy(Some(&config))
+                .expect("resolve mirror policy")
+                .allows_insecure_http(),
             "only an explicit true enables plaintext mirror HTTP"
         );
 
@@ -1981,7 +1983,9 @@ mod serve_tests {
         let bare: ConfigFile = toml::from_str("").expect("an empty config still parses");
         assert_eq!(bare.mirror.enabled, None);
         assert!(
-            !resolve_mirror_transport_policy(Some(&bare)).allows_insecure_http(),
+            !resolve_mirror_transport_policy(Some(&bare))
+                .expect("resolve mirror policy")
+                .allows_insecure_http(),
             "an omitted [mirror] section must retain the secure transport default"
         );
     }

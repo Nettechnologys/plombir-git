@@ -1277,14 +1277,25 @@ fn run_git_clone_mirror(
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let invocation = remote.bind_invocation(credential_invocation(credentials))?;
     let destination = path.to_string_lossy();
-    invocation
-        .run(
+    // The deadline bounds time, not bytes: a hostile upstream can stream
+    // gigabytes within it. The ceiling measures the mirror directory itself,
+    // which this clone is about to create or fill.
+    let output = if transport_policy.max_clone_bytes() == 0 {
+        invocation.run(
             git,
             &["clone", "--mirror", remote.url(), &destination],
             None,
         )?
-        .ensure_success()
-        .context("git clone --mirror")
+    } else {
+        invocation.run_under_disk_budget(
+            git,
+            &["clone", "--mirror", remote.url(), &destination],
+            None,
+            path,
+            transport_policy.max_clone_bytes(),
+        )?
+    };
+    output.ensure_success().context("git clone --mirror")
 }
 
 /// Refresh an existing mirror clone from `url`.

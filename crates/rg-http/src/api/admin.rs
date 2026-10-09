@@ -109,6 +109,25 @@ impl axum::extract::FromRequestParts<AppState> for InstanceAdmin {
     }
 }
 
+/// The same gate, for endpoints that serve both audiences.
+///
+/// A missing session, a non-admin, or a failed lookup is not an error here:
+/// the caller is offered the public view instead of a `401`/`403`, so a health
+/// probe keeps answering for anyone who asks. Only the extra detail is gated.
+impl axum::extract::OptionalFromRequestParts<AppState> for InstanceAdmin {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(require_instance_admin(state, &parts.headers)
+            .await
+            .ok()
+            .map(Self))
+    }
+}
+
 // ── User management endpoints ─────────────────────────────────────────
 
 /// GET /api/v1/admin/users
