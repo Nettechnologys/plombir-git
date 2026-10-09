@@ -1410,3 +1410,106 @@ async fn coordinates_that_contradict_an_authoritative_manifest_are_refused() {
         );
     }
 }
+
+/// card_1d11a4357cee: `list` and `publish` are the literal segments of the
+/// registry's own routes, so a package with either name was published and then
+/// unreachable — its page answered with the registry listing, and `npm install
+/// list` received that listing in place of a packument. Both publish doors now
+/// refuse the name and say why; a neighbouring name still publishes.
+#[tokio::test]
+async fn a_package_cannot_take_the_name_of_a_registry_endpoint() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, OWNER, &format!("{OWNER}@example.com")).await;
+    create_repo(&base, &token, REPO).await;
+    let client = reqwest::Client::new();
+
+    for name in ["list", "publish"] {
+        let generic = client
+            .post(format!(
+                "{base}/api/v1/repos/{OWNER}/{REPO}/packages/generic/publish?name={name}&version=1.0.0"
+            ))
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"artifact.bin\"",
+            )
+            .body("package-bytes")
+            .send()
+            .await
+            .unwrap();
+        let status = generic.status();
+        let body = generic.text().await.unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "generic '{name}': {body}");
+        assert!(
+            body.contains("reserved"),
+            "generic '{name}' refusal does not say why: {body}"
+        );
+
+        let manifest = format!(r#"{{"name":"{name}","version":"1.0.0"}}"#);
+        let npm = client
+            .post(format!(
+                "{base}/api/v1/repos/{OWNER}/{REPO}/packages/npm/publish"
+            ))
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"package.tgz\"",
+            )
+            .body(tar_gz(&[("package/package.json", manifest.as_bytes())]))
+            .send()
+            .await
+            .unwrap();
+        let status = npm.status();
+        let body = npm.text().await.unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "npm '{name}': {body}");
+        assert!(
+            body.contains("reserved"),
+            "npm '{name}' refusal does not say why: {body}"
+        );
+    }
+
+    let neighbour = client
+        .post(format!(
+            "{base}/api/v1/repos/{OWNER}/{REPO}/packages/generic/publish?name=lists&version=1.0.0"
+        ))
+        .bearer_auth(&token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"artifact.bin\"",
+        )
+        .body("package-bytes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(neighbour.status(), StatusCode::CREATED);
+    let page = client
+        .get(format!(
+            "{base}/api/v1/repos/{OWNER}/{REPO}/packages/generic/lists"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let listing = client
+        .get(format!(
+            "{base}/api/v1/repos/{OWNER}/{REPO}/packages/generic/list"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listing.status(), StatusCode::OK);
+    let listing: serde_json::Value = listing.json().await.unwrap();
+    let names: Vec<&str> = listing["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|package| package["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["lists"],
+        "a refused name reached the registry: {listing}"
+    );
+}

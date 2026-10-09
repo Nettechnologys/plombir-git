@@ -218,12 +218,36 @@ pub fn protocol_version_key(
     }
 }
 
+/// Package names the registry's own routes already spell.
+///
+/// `GET …/packages/{type}/list` lists a registry and `POST
+/// …/packages/{type}/publish` uploads into it; npm repeats both under
+/// `…/packages/npm/`. The router prefers a literal segment to `{pkg_name}`, so a
+/// package published under either name could never be addressed again: its page
+/// answered with the registry listing, `npm install list` received that listing
+/// in place of a packument, and `npm publish` of either name was turned away
+/// `405` by a route that has no `PUT` (card_1d11a4357cee). The name is refused
+/// where the package would be created, with the reason, rather than accepted
+/// into a row nothing can reach.
+pub const RESERVED_PACKAGE_NAMES: &[&str] = &["list", "publish"];
+
+fn refuse_reserved_package_name(package_type: &str, name: &str) -> Result<()> {
+    if RESERVED_PACKAGE_NAMES.contains(&name) {
+        return Err(crate::error::invalid_request(format!(
+            "the package name '{name}' is reserved: `/packages/{package_type}/{name}` is the \
+             registry's own endpoint, so a package of that name could not be addressed"
+        )));
+    }
+    Ok(())
+}
+
 /// Publish a package version to the registry.
 pub async fn publish(
     db: &DatabaseConnection,
     storage: &PackageStorage,
     mut info: PublishInfo,
 ) -> Result<PublishResult> {
+    refuse_reserved_package_name(&info.package_type, &info.name)?;
     if let Some(tag) = info.npm_dist_tag.as_deref() {
         if info.package_type != package_types::NPM {
             return Err(crate::error::invalid_request(
