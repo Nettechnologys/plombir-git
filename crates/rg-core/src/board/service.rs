@@ -145,6 +145,12 @@ pub async fn create_column(
     name: String,
     color: Option<String>,
 ) -> Result<Column> {
+    // A column colour is written into a `style` attribute by the web client
+    // and the CSP allows inline styles, so the stored value has to be a colour
+    // and nothing else — see [`crate::validate_hex_color`].
+    let color = color
+        .map(|value| crate::validate_hex_color(&value))
+        .transpose()?;
     let now = Utc::now();
     let model = ColumnAM {
         board_id: Set(board_id),
@@ -184,6 +190,12 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    // Validated before the read: a malformed colour is the request's fault and
+    // never a reason to touch the database — see [`create_column`].
+    let color = color
+        .map(|value| crate::validate_hex_color(&value))
+        .transpose()?;
+
     rg_db::ops::board_ops::find_column_by_id(db, id)
         .await?
         .ok_or_else(|| crate::error::not_found("board column"))?;
