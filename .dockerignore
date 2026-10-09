@@ -5,6 +5,12 @@
 target/
 target/**/*
 
+# AI assistant worktrees, target-dir seeds and notes. Gitignored, local-only,
+# and the worktrees are whole copies of the repository: leaving this out made
+# every `docker build` upload them (tens of gigabytes of target dirs) and, worse,
+# put every sibling branch's working tree in front of the Dockerfile's COPYs.
+.ai/
+
 # Node.js dependencies and build cache
 web/node_modules/
 web/.svelte-kit/
@@ -20,6 +26,28 @@ testdata/
 
 # Logs
 *.log
+
+# Secrets and host-local deployment files.
+#
+# The build context is shipped to the daemon and anything the Dockerfile
+# COPYs becomes an image layer, so a stray .env is one `COPY . .` away from
+# being published; the Dockerfile's COPY list names Cargo.toml, Cargo.lock,
+# rust-toolchain.toml, crates/ and web/, and none of these patterns touches
+# one of those. Non-slash patterns match only the context root in Docker, so
+# each is paired with a `**/` form: a secret one directory down is still in
+# the context.
+.env
+.env.*
+**/.env
+**/.env.*
+plombir-git*.toml
+**/plombir-git*.toml
+*.pem
+**/*.pem
+*_host_key*
+**/*_host_key*
+encryption_key
+**/encryption_key
 
 # IDE and editor
 .idea/
