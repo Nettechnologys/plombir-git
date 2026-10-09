@@ -2189,6 +2189,16 @@ mod tests {
                 "default_db_idle_timeout",
                 super::default_db_idle_timeout().to_string(),
             ),
+            // The shipped template points at SQLite, so its default is the
+            // SQLite pool size; PostgreSQL and MySQL get a wider one.
+            row(
+                "database",
+                "max_connections",
+                "rg_db::default_max_connections",
+                rg_db::default_max_connections("sqlite://./plombir-git.db?mode=rwc")
+                    .expect("the template's SQLite URL is a known backend")
+                    .to_string(),
+            ),
             row(
                 "limits",
                 "repo_quota_mb",
