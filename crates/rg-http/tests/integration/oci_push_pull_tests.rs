@@ -909,6 +909,457 @@ async fn an_oci_image_index_pushes_without_layers() {
     assert_eq!(pulled.text().await.unwrap(), index);
 }
 
+/// A manifest whose `Content-Type` header and whose body `mediaType` disagree
+/// is refused, and the type that gets stored is the one the body declares.
+///
+/// The two are the same claim written twice, and nothing compared them: the
+/// header was the only value `oci_manifest.media_type` ever saw, so a client
+/// could PUT bytes that declare `application/vnd.oci.image.manifest.v1+json`
+/// under `application/vnd.docker.distribution.manifest.v2+json` and every
+/// later pull was handed the header's type for a body that says otherwise.
+/// Pullers dispatch on that type — a registry that returns a type no parser
+/// checks turns a type-confusion into a parse a client did not agree to.
+#[tokio::test]
+async fn a_manifest_whose_body_media_type_contradicts_its_header_is_refused() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_media", "oci_media@example.com").await;
+    create_repo(&base, &token, "media-type").await;
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_media", "media-type", config).await;
+
+    // The header says Docker, the body says OCI. Both are valid on their own;
+    // the pair is not.
+    let contradictory = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [],
+    })
+    .to_string();
+
+    let refused = client
+        .put(format!("{base}/v2/oci_media/media-type/manifests/contradiction"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, DOCKER_MANIFEST_V2)
+        .body(contradictory.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        400,
+        "a Content-Type that contradicts the body's mediaType must be refused"
+    );
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["errors"][0]["code"], "MANIFEST_INVALID");
+    let refusal_message = refusal["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        refusal_message.contains(DOCKER_MANIFEST_V2)
+            && refusal_message.contains(OCI_MANIFEST_V1),
+        "the refusal must name both declared types, got: {refusal_message}"
+    );
+
+    // Nothing was published under the contradicting tag — the refusal has to be
+    // a refusal, not a write the client is told about with a 400.
+    let pulled = client
+        .get(format!(
+            "{base}/v2/oci_media/media-type/manifests/contradiction"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pulled.status(),
+        404,
+        "the refused push must leave nothing behind"
+    );
+
+    // The honest push of the same bytes is accepted, and the type served back
+    // is the document's own `mediaType`.
+    let accepted = client
+        .put(format!("{base}/v2/oci_media/media-type/manifests/agreed"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(contradictory.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 201);
+    let served = client
+        .get(format!("{base}/v2/oci_media/media-type/manifests/agreed"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(served.status(), 200);
+    assert_eq!(
+        served
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some(OCI_MANIFEST_V1),
+        "the stored and served type must be the body's mediaType"
+    );
+    assert_eq!(served.text().await.unwrap(), contradictory);
+
+    // A body that carries no `mediaType` at all still publishes under the
+    // header it arrived with: older `docker push` builds omit the field, and
+    // refusing them would be a compatibility break, not a check.
+    let header_only = serde_json::json!({
+        "schemaVersion": 2,
+        "config": {
+            "mediaType": DOCKER_CONFIG_V1,
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [],
+    })
+    .to_string();
+    let accepted = client
+        .put(format!(
+            "{base}/v2/oci_media/media-type/manifests/header-only"
+        ))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, DOCKER_MANIFEST_V2)
+        .body(header_only)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted.status(),
+        201,
+        "a body without mediaType must still publish under the header"
+    );
+    let served = client
+        .get(format!(
+            "{base}/v2/oci_media/media-type/manifests/header-only"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(served.status(), 200);
+    assert_eq!(
+        served
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some(DOCKER_MANIFEST_V2),
+        "a body without mediaType is stored under its Content-Type"
+    );
+}
+
+/// An image index is only meaningful if every child it names can be pulled.
+///
+/// The children are separate manifests pushed in advance, and a pull of the
+/// index is followed by a pull of each child by digest. Nothing checked that
+/// the children existed: an index naming a digest no push ever wrote was
+/// accepted, and the failure only surfaced on the client, halfway through a
+/// pull, as a 404 that reads like a broken registry. The digest in a
+/// descriptor is a lookup here, and the declared size has to be the stored
+/// manifest's own.
+#[tokio::test]
+async fn an_image_index_must_name_child_manifests_the_repository_holds() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_index_child", "oci_index_child@example.com")
+        .await;
+    create_repo(&base, &token, "child-check").await;
+
+    let config = br#"{"architecture":"arm64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_index_child", "child-check", config).await;
+
+    let child = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [],
+    })
+    .to_string();
+    let child_digest = sha256(child.as_bytes());
+
+    // The index names the child's digest, but no push has written the child.
+    let missing_child_index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX_V1,
+        "manifests": [{
+            "mediaType": OCI_MANIFEST_V1,
+            "size": child.len(),
+            "digest": child_digest,
+            "platform": { "architecture": "arm64", "os": "linux" },
+        }],
+    })
+    .to_string();
+
+    let refused = client
+        .put(format!("{base}/v2/oci_index_child/child-check/manifests/unbuilt"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_INDEX_V1)
+        .body(missing_child_index.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        400,
+        "an index naming a child the repository does not hold must be refused"
+    );
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+    let refusal_message = refusal["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        refusal_message.contains(&child_digest),
+        "the refusal must name the missing child, got: {refusal_message}"
+    );
+
+    // Now publish the child, and prepare the same index with a size that
+    // contradicts what was stored.
+    let child_pushed = client
+        .put(format!(
+            "{base}/v2/oci_index_child/child-check/manifests/{child_digest}"
+        ))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(child.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(child_pushed.status(), 201);
+
+    let wrong_size_index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX_V1,
+        "manifests": [{
+            "mediaType": OCI_MANIFEST_V1,
+            "size": child.len() + 1,
+            "digest": child_digest,
+            "platform": { "architecture": "arm64", "os": "linux" },
+        }],
+    })
+    .to_string();
+    let refused = client
+        .put(format!("{base}/v2/oci_index_child/child-check/manifests/stale"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_INDEX_V1)
+        .body(wrong_size_index)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        400,
+        "an index descriptor whose size is not the child's size must be refused"
+    );
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["errors"][0]["code"], "MANIFEST_INVALID");
+
+    // Neither refusal published anything, and the honest index over the child
+    // that is now stored is accepted.
+    for tag in ["unbuilt", "stale"] {
+        let pulled = client
+            .get(format!(
+                "{base}/v2/oci_index_child/child-check/manifests/{tag}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pulled.status(), 404, "refused index {tag} must not exist");
+    }
+
+    let honest_index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX_V1,
+        "manifests": [{
+            "mediaType": OCI_MANIFEST_V1,
+            "size": child.len(),
+            "digest": child_digest,
+            "platform": { "architecture": "arm64", "os": "linux" },
+        }],
+    })
+    .to_string();
+    let pushed = client
+        .put(format!("{base}/v2/oci_index_child/child-check/manifests/latest"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_INDEX_V1)
+        .body(honest_index.clone())
+        .send()
+        .await
+        .unwrap();
+    let status = pushed.status();
+    let body = pushed.text().await.unwrap();
+    assert_eq!(status, 201, "the honest index must publish: {body}");
+
+    let served = client
+        .get(format!(
+            "{base}/v2/oci_index_child/child-check/manifests/latest"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.text().await.unwrap(), honest_index);
+
+    // Every descriptor a client follows from the index resolves, which is what
+    // the push-time check was for.
+    let child_served = client
+        .get(format!(
+            "{base}/v2/oci_index_child/child-check/manifests/{child_digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(child_served.status(), 200);
+}
+
+/// A manifest's config and layer descriptors must declare the size of the blob
+/// the registry actually stored.
+///
+/// `size` is not metadata a client can shrug at: a puller pre-allocates from
+/// it, a mirror compares its progress against it and a size-based quota counts
+/// it. The push only checked that a blob with the digest existed, so a
+/// descriptor could declare a size the bytes never had and the number was
+/// published with the manifest.
+#[tokio::test]
+async fn a_manifest_descriptor_whose_size_contradicts_the_blob_is_refused() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_size", "oci_size@example.com").await;
+    create_repo(&base, &token, "size-check").await;
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_size", "size-check", config).await;
+    let layer = b"plombir-git-size-check-layer";
+    let layer_digest = push_blob(&base, &token, "oci_size", "size-check", layer).await;
+
+    // The config descriptor overstates the stored config.
+    let lying_config = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len() + 1024,
+            "digest": config_digest,
+        },
+        "layers": [],
+    })
+    .to_string();
+    let refused = client
+        .put(format!("{base}/v2/oci_size/size-check/manifests/lying-config"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(lying_config)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        400,
+        "a config descriptor whose size is not the stored blob's size must be refused"
+    );
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["errors"][0]["code"], "MANIFEST_INVALID");
+    let refusal_message = refusal["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        refusal_message.contains(&config_digest)
+            && refusal_message.contains(&config.len().to_string())
+            && refusal_message.contains(&(config.len() + 1024).to_string()),
+        "the refusal must name the blob and both sizes, got: {refusal_message}"
+    );
+
+    // The same holds for a layer, not just the config.
+    let lying_layer = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "size": layer.len() - 1,
+            "digest": layer_digest,
+        }],
+    })
+    .to_string();
+    let refused = client
+        .put(format!("{base}/v2/oci_size/size-check/manifests/lying-layer"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(lying_layer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        400,
+        "a layer descriptor whose size is not the stored blob's size must be refused"
+    );
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["errors"][0]["code"], "MANIFEST_INVALID");
+
+    for tag in ["lying-config", "lying-layer"] {
+        let pulled = client
+            .get(format!("{base}/v2/oci_size/size-check/manifests/{tag}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pulled.status(), 404, "refused manifest {tag} must not exist");
+    }
+
+    // The honest manifest over the same stored blobs is accepted.
+    let honest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "size": layer.len(),
+            "digest": layer_digest,
+        }],
+    })
+    .to_string();
+    let pushed = client
+        .put(format!("{base}/v2/oci_size/size-check/manifests/agreed"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(honest.clone())
+        .send()
+        .await
+        .unwrap();
+    let status = pushed.status();
+    let body = pushed.text().await.unwrap();
+    assert_eq!(status, 201, "the honest manifest must publish: {body}");
+
+    let served = client
+        .get(format!("{base}/v2/oci_size/size-check/manifests/agreed"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.text().await.unwrap(), honest);
+}
+
 /// A reference the registry cannot address is refused — it is never published
 /// under a name no client can use.
 ///
@@ -1321,5 +1772,116 @@ async fn a_manifest_above_the_declared_ceiling_is_refused() {
         pulled.status(),
         404,
         "a refused push must publish nothing under its digest"
+    );
+}
+
+/// Every file below `roots` whose path, lowercased, mentions `needle`.
+fn files_mentioning(roots: [&std::path::Path; 2], needle: &str) -> Vec<std::path::PathBuf> {
+    let mut matches = Vec::new();
+    let mut pending: Vec<std::path::PathBuf> = roots.iter().map(|root| root.to_path_buf()).collect();
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.to_string_lossy().to_lowercase().contains(needle) {
+                matches.push(path);
+            }
+        }
+    }
+    matches
+}
+
+/// A repository's OCI objects are keyed by the namespace the repository row
+/// resolves to, and deleting the repository retires that namespace — nothing a
+/// push wrote outlives it.
+///
+/// The lookup that finds the row and the prefix every storage key is built from
+/// used to be two independent answers. The row came from a lookup the database
+/// may answer without regard to case (MySQL's default collation does), while
+/// the prefix was the URL's spelling verbatim. A push to `OCI_NAMESPACE/mixed-case`
+/// against the repository stored as `oci_namespace/Mixed-Case` therefore wrote
+/// its layers under a second prefix, and repository deletion — which walks the
+/// canonical name off the row — left them there: bytes with no row of their
+/// own, counted by no quota and collected by nothing.
+///
+/// The test database is SQLite, whose `=` compares names byte-for-byte, so a
+/// differently-cased path cannot resolve to the repository here and the variant
+/// request below is refused; on a case-insensitive collation it must resolve
+/// and the same assertions apply. Either way the invariant is the same one the
+/// MySQL case violates: after a push the bytes are under the resolved
+/// namespace, and after the delete neither the blob tree nor upload staging
+/// holds anything a differently-cased namespace could have written.
+#[tokio::test]
+async fn oci_objects_are_keyed_by_the_resolved_repository_and_deletion_retires_them() {
+    let (base, repo_root, upload_root) = spawn_test_app_with_oci_root().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) =
+        register_full(&base, "oci_namespace", "oci_namespace@example.com").await;
+    create_repo(&base, &token, "Mixed-Case").await;
+
+    let layer = b"a layer keyed by the repository row, not by the URL";
+    let layer_digest = push_blob(&base, &token, "oci_namespace", "Mixed-Case", layer).await;
+
+    // Published under the resolved namespace, which for this push is the one
+    // the row spells.
+    let (algorithm, hash) = layer_digest.split_once(':').expect("sha256:hex digest");
+    let published = repo_root
+        .join("oci")
+        .join("oci_namespace")
+        .join("Mixed-Case")
+        .join("blobs")
+        .join(algorithm)
+        .join(&hash[..2])
+        .join(hash);
+    assert!(
+        published.is_file(),
+        "the layer must be published under the resolved namespace: {}",
+        published.display()
+    );
+
+    // A path spelled differently either resolves to this same repository — on a
+    // collation that ignores case — or is refused before touching storage.
+    // What it must never do is open a second namespace.
+    let variant = client
+        .post(format!(
+            "{base}/v2/OCI_NAMESPACE/mixed-case/blobs/uploads/"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        matches!(variant.status().as_u16(), 202 | 401 | 404),
+        "a differently-cased path must resolve to the repository or be refused, not fail: {}",
+        variant.status()
+    );
+
+    let deleted = client
+        .delete(format!("{base}/api/v1/repos/oci_namespace/Mixed-Case"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted.status(),
+        200,
+        "repository deletion failed: {}",
+        deleted.text().await.unwrap_or_default()
+    );
+
+    // Everything the push wrote lived below one namespace, and that namespace
+    // is what deletion walks. Search for the lowercased spelling so a leftover
+    // from a differently-cased push is found whatever case it was written in.
+    let leftover = files_mentioning(
+        [&repo_root, &upload_root],
+        "oci_namespace/mixed-case",
+    );
+    assert!(
+        leftover.is_empty(),
+        "DELETE returned success with OCI objects still on disk: {leftover:?}"
     );
 }
