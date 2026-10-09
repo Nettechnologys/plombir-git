@@ -492,14 +492,9 @@ impl AttachmentBackup {
 /// like a bad filename.
 fn validate_filename(filename: &str) -> Result<String> {
     let filename = filename.trim();
-    if filename.is_empty() || filename.len() > 255 || filename.chars().any(char::is_control) {
-        return Err(invalid_request("invalid attachment filename"));
-    }
-    if filename.contains('/') || filename.contains('\\') || matches!(filename, "." | "..") {
-        return Err(invalid_request(
-            "attachment filename must not contain a path",
-        ));
-    }
+    // The path half of the rule is shared with release assets: both keep the
+    // uploader's name and both join it onto a directory on the way back out.
+    crate::platform::path::validate_upload_filename("attachment", filename)?;
     let extension = filename
         .rsplit_once('.')
         .map(|(_, extension)| extension.to_ascii_lowercase())

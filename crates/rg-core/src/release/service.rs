@@ -693,6 +693,13 @@ async fn prepare_asset_upload(
     uploader_id: i64,
     sha256: String,
 ) -> Result<(Asset, BlobKey)> {
+    // Refused before the row exists. The name becomes a path twice — the blob
+    // key, and for a row the blob store cannot answer for, the pre-migration
+    // layout under `repo_root` — and the handler used to check nothing but
+    // non-emptiness, so `/data/encryption_key` was stored as given (security
+    // audit finding #1). Typed as the uploader's mistake: a `400`, not a 5xx.
+    crate::platform::path::validate_upload_filename("release asset", filename)?;
+
     // Verify release exists and get repo info
     let _release = get_release(db, release_id).await?;
 
@@ -884,9 +891,24 @@ pub async fn resolve_asset_source(
         }
     }
 
-    // `asset_file_path` builds the path from `repo_root` and never hands it
-    // back, so a bare io error names an asset file the operator cannot locate.
-    let file_path = asset_file_path(repo_root, owner, repo_name, asset);
+    // Only a row that predates digest tracking can have a legacy copy. Uploads
+    // already went through the blob store when the digest column arrived
+    // (`m20260723_000002_add_release_asset_sha256`), so every row carrying one
+    // was written there and nowhere else — including the row
+    // `prepare_asset_upload` inserts *before* `put_file` runs. Falling back
+    // for that row would resolve the uploader's name under `repo_root` at the
+    // one moment nothing has yet checked that any bytes exist behind it
+    // (security audit finding #1); refusing it closes that window without a
+    // schema change. The row is there and its bytes are not (yet): a typed
+    // `NotFound`, not a storage-path 5xx.
+    if asset.sha256.is_some() {
+        return Err(crate::error::not_found("release asset"));
+    }
+
+    // `asset_file_path` refuses a stored name that is not a plain file name,
+    // and builds the path from `repo_root` without handing it back, so a bare
+    // io error names an asset file the operator cannot locate.
+    let file_path = asset_file_path(repo_root, owner, repo_name, asset)?;
     let meta = tokio::fs::metadata(&file_path).await.map_err(|error| {
         crate::platform::fs::path_error(
             "legacy release asset",
@@ -1120,11 +1142,39 @@ fn asset_storage_dir(repo_root: &Path, owner: &str, repo_name: &str) -> PathBuf 
     legacy_asset_root(repo_root, owner, repo_name).join("assets")
 }
 
-/// Get the file path for a specific asset.
-fn asset_file_path(repo_root: &Path, owner: &str, repo_name: &str, asset: &Asset) -> PathBuf {
-    asset_storage_dir(repo_root, owner, repo_name)
-        .join(asset.id.to_string())
-        .join(&asset.filename)
+/// The pre-migration on-disk path of one asset, or an error if its stored
+/// name cannot be joined safely.
+///
+/// `Path::join` replaces the whole path when the name is absolute and keeps a
+/// `..` component as it is, so a stored name that is a path would resolve to
+/// whatever file it names — `/data/encryption_key`, the database — and the
+/// fallback would serve it (security audit finding #1). Uploads refuse such a
+/// name at the door (`validate_upload_filename`); this is the second lock, for
+/// a row that reached the table some other way, and it holds both before the
+/// join (one ordinary component) and after it (the result stays under the
+/// asset's own directory). The error names the row, never the name: it is
+/// the operator's to read, and the name is the hostile part.
+fn asset_file_path(
+    repo_root: &Path,
+    owner: &str,
+    repo_name: &str,
+    asset: &Asset,
+) -> Result<PathBuf> {
+    let asset_dir = asset_storage_dir(repo_root, owner, repo_name).join(asset.id.to_string());
+    if !crate::platform::path::is_single_path_component(&asset.filename) {
+        anyhow::bail!(
+            "release asset {} has a stored name that is not a plain file name; refusing to resolve it on disk",
+            asset.id
+        );
+    }
+    let path = asset_dir.join(&asset.filename);
+    if !path.starts_with(&asset_dir) {
+        anyhow::bail!(
+            "release asset {} resolved outside its own directory; refusing to serve it",
+            asset.id
+        );
+    }
+    Ok(path)
 }
 
 fn asset_blob_key(
@@ -1429,7 +1479,8 @@ mod download_source_tests {
         let (dir, _db, storage, owner, repo_name, asset) = fixture().await;
         // Blob storage stays empty — force the fallback branch.
         let repo_root = dir.path().join("repos");
-        let legacy = asset_file_path(&repo_root, &owner, &repo_name, &asset);
+        let legacy =
+            asset_file_path(&repo_root, &owner, &repo_name, &asset).expect("a plain file name");
         tokio::fs::create_dir_all(legacy.parent().unwrap())
             .await
             .expect("create legacy dir");
@@ -1449,6 +1500,219 @@ mod download_source_tests {
             AssetSource::Buffered(_) => {
                 panic!("legacy fallback must return LocalFile, not Buffered")
             }
+        }
+    }
+
+    /// A second row in the fixture's release, with the name and digest the
+    /// test chooses.
+    async fn asset_row(
+        db: &DatabaseConnection,
+        template: &Asset,
+        filename: &str,
+        sha256: Option<&str>,
+    ) -> Asset {
+        rg_db::ops::release_ops::create_asset(
+            db,
+            AssetActiveModel {
+                id: NotSet,
+                release_id: Set(template.release_id),
+                filename: Set(filename.to_string()),
+                size: Set(0),
+                content_type: Set("application/octet-stream".to_string()),
+                download_count: Set(0),
+                uploader_id: Set(template.uploader_id),
+                created_at: Set(Utc::now()),
+                sha256: Set(sha256.map(str::to_string)),
+                attestation: Set(None),
+            },
+        )
+        .await
+        .expect("create asset row")
+    }
+
+    /// Security audit finding #1, the fallback half. A stored name that is a
+    /// path — absolute, or climbing out with `..` — must be refused by the
+    /// legacy lookup, not resolved: `Path::join` would otherwise hand back the
+    /// file the name points at, and the fallback would serve it.
+    #[tokio::test]
+    async fn the_legacy_fallback_refuses_a_stored_name_that_is_a_path() {
+        let (dir, db, storage, owner, repo_name, asset) = fixture().await;
+        let repo_root = dir.path().join("repos");
+        // The file the hostile names point at: outside the asset root, inside
+        // the state directory — where the encryption key lives.
+        let secret = dir.path().join("encryption_key");
+        tokio::fs::write(&secret, b"the key")
+            .await
+            .expect("write the secret");
+        let absolute = secret.to_string_lossy().into_owned();
+        // `<dir>/repos/<owner>/<repo>.releases/assets/<id>` is five levels
+        // below `<dir>`.
+        let climbing = "../../../../../encryption_key";
+
+        for hostile in [absolute.as_str(), climbing] {
+            let row = asset_row(&db, &asset, hostile, None).await;
+            // The naive join reaches the secret — this is what the lookup
+            // used to do. The directory has to exist for `..` to resolve
+            // through it; an absolute name needs nothing.
+            let asset_dir =
+                asset_storage_dir(&repo_root, &owner, &repo_name).join(row.id.to_string());
+            tokio::fs::create_dir_all(&asset_dir)
+                .await
+                .expect("create the asset directory");
+            assert_eq!(
+                tokio::fs::read(asset_dir.join(&row.filename)).await.expect(
+                    "the unchecked join must reach the secret, or this test proves nothing"
+                ),
+                b"the key",
+                "{hostile:?}"
+            );
+
+            let Err(error) =
+                resolve_asset_source(&storage, &repo_root, &owner, &repo_name, &row).await
+            else {
+                panic!("a stored name that is a path must be refused, not served: {hostile:?}");
+            };
+            let rendered = format!("{error:#}");
+            assert!(
+                !rendered.contains("encryption_key"),
+                "the error must not spell the hostile name back: {rendered}"
+            );
+        }
+    }
+
+    /// Security audit finding #1, the race half. A row that carries a digest
+    /// was written through the blob store — digests arrived after that move —
+    /// so the pre-migration layout has nothing of it, and the fallback must
+    /// not look there. The row `prepare_asset_upload` inserts before
+    /// `put_file` is exactly such a row; a download that catches it must be
+    /// told the asset is not there, not handed a path under `repo_root`.
+    #[tokio::test]
+    async fn the_legacy_fallback_is_closed_to_a_row_written_through_the_blob_store() {
+        let (dir, db, storage, owner, repo_name, asset) = fixture().await;
+        let repo_root = dir.path().join("repos");
+        let fresh = asset_row(
+            &db,
+            &asset,
+            "payload.bin",
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        )
+        .await;
+        // Bytes where the legacy lookup would find them, and none in the
+        // blob store: the window between the row insert and the blob write.
+        let legacy =
+            asset_file_path(&repo_root, &owner, &repo_name, &fresh).expect("a plain file name");
+        tokio::fs::create_dir_all(legacy.parent().unwrap())
+            .await
+            .expect("create legacy dir");
+        tokio::fs::write(&legacy, b"not the asset")
+            .await
+            .expect("write legacy bytes");
+
+        let Err(error) =
+            resolve_asset_source(&storage, &repo_root, &owner, &repo_name, &fresh).await
+        else {
+            panic!("a row with a digest has no legacy copy; the fallback must not serve one");
+        };
+        assert!(
+            error.downcast_ref::<crate::error::NotFound>().is_some(),
+            "an asset whose bytes are not stored yet is a typed not-found, got {error:#}"
+        );
+    }
+
+    /// The door itself: a name that is a path is refused before a row or a
+    /// blob exists, and refused as the uploader's mistake.
+    #[tokio::test]
+    async fn an_upload_whose_name_is_a_path_writes_neither_a_row_nor_a_blob() {
+        let (dir, db, storage, owner, repo_name, asset) = fixture().await;
+        let source = dir.path().join("staged-upload");
+        tokio::fs::write(&source, b"payload")
+            .await
+            .expect("stage the upload");
+        let uploader = asset.uploader_id.expect("the fixture sets an uploader");
+
+        for hostile in [
+            "/data/encryption_key",
+            "../../x",
+            "..",
+            "..\\..\\x",
+            "a/b",
+            "",
+        ] {
+            let Err(error) = upload_asset_from_file(
+                &db,
+                asset.release_id,
+                &storage,
+                &owner,
+                &repo_name,
+                hostile,
+                "application/octet-stream",
+                uploader,
+                &source,
+                7,
+            )
+            .await
+            else {
+                panic!("a name that is a path must be refused: {hostile:?}");
+            };
+            assert!(
+                error
+                    .downcast_ref::<crate::error::InvalidRequest>()
+                    .is_some(),
+                "the refusal is the uploader's to fix: {hostile:?} -> {error:#}"
+            );
+        }
+
+        let rows = rg_db::ops::release_ops::list_assets(&db, asset.release_id)
+            .await
+            .expect("list assets");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the fixture's own row may exist: {:?}",
+            rows.iter().map(|row| &row.filename).collect::<Vec<_>>()
+        );
+        let stored = storage.list(None).await.expect("blob inventory");
+        assert!(
+            stored.is_empty(),
+            "a refused upload must write nothing: {stored:?}"
+        );
+    }
+
+    /// The path builder on its own: a plain name lands under the asset's
+    /// directory, anything else is an error rather than a different directory.
+    #[test]
+    fn asset_file_path_stays_under_the_asset_directory_or_refuses() {
+        let root = Path::new("/srv/plombir-git/repos");
+        let row = |filename: &str| Asset {
+            id: 7,
+            release_id: 1,
+            filename: filename.to_string(),
+            size: 0,
+            content_type: "application/octet-stream".to_string(),
+            download_count: 0,
+            uploader_id: None,
+            created_at: Utc::now(),
+            sha256: None,
+            attestation: None,
+        };
+        let asset_dir = root.join("alice/app.releases/assets/7");
+
+        for plain in ["payload.bin", "пакет 1.0 (final).tgz", "release;notes.txt"] {
+            let path = asset_file_path(root, "alice", "app", &row(plain)).expect("a plain name");
+            assert_eq!(path, asset_dir.join(plain));
+        }
+        for hostile in [
+            "/data/encryption_key",
+            "../../../plombir-git.db",
+            "..",
+            ".",
+            "a/b",
+            "",
+        ] {
+            assert!(
+                asset_file_path(root, "alice", "app", &row(hostile)).is_err(),
+                "a stored name that is a path must be refused: {hostile:?}"
+            );
         }
     }
 
