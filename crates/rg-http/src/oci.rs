@@ -579,16 +579,91 @@ async fn require_access(
 ) -> Result<Option<i64>, Response> {
     match check_access(state, headers, owner, repo, required_action).await {
         Ok((true, user_id)) => Ok(user_id),
-        Ok((false, _)) => Err(oci_unauthorized(
-            state,
-            headers,
-            &format!("repository:{owner}/{repo}:{required_action}"),
-            "authentication required",
-        )),
+        Ok((false, _)) => {
+            let caller = registry_caller(state, headers, owner, repo).await;
+            if let Some(moved_to) = renamed_for_reader(state, owner, repo, caller).await {
+                return Err(oci_not_found(
+                    error_codes::NAME_UNKNOWN,
+                    &format!(
+                        "repository '{owner}/{repo}' was renamed to '{moved_to}'; use \
+                         '{moved_to}' instead"
+                    ),
+                ));
+            }
+            Err(oci_unauthorized(
+                state,
+                headers,
+                &format!("repository:{owner}/{repo}:{required_action}"),
+                "authentication required",
+            ))
+        }
         // The gate's own status (503 on a database outage, 500 otherwise)
         // inside the OCI envelope docker expects.
         Err(e) => Err(oci_err(e.status(), "UNKNOWN", &e.to_string())),
     }
+}
+
+/// The account behind a registry request about `owner/repo`, when it names one:
+/// a Plombir Git JWT, or an OCI scoped token minted for this very name.
+async fn registry_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    repo: &str,
+) -> Option<i64> {
+    if let Some(uid) = bearer_user_id(headers, &state.jwt_secret) {
+        return Some(uid);
+    }
+    let claims =
+        bearer_token(headers).and_then(|token| validate_oci_token(token, &state.jwt_secret))?;
+    let about_this_name = claims
+        .scope
+        .iter()
+        .flat_map(|scope| scope.split_whitespace())
+        .any(|scope| {
+            ParsedScope::parse(scope).is_some_and(|parsed| parsed.matches_repo(owner, repo))
+        });
+    if !about_this_name {
+        return None;
+    }
+    match token_subject(&state.db, &claims.sub).await {
+        Ok(TokenSubject::User(uid)) => Some(uid),
+        _ => None,
+    }
+}
+
+/// Where a repository a rename or a transfer moved away from `owner/repo` lives
+/// now, as `new_owner/new_name` — only for a caller who may read it there
+/// (card_e0351e77eabd).
+///
+/// The registry cannot follow the move the way the REST API and `git` do: the
+/// blobs of a repository are stored under its name, and the token a client
+/// pulls with is scoped to the name it asked for, so a redirect would land on a
+/// path that token does not open. What the old name can do is say where the
+/// repository went, in the error a client prints, instead of a bare
+/// `NAME_UNKNOWN` or `unauthorized`. Someone who could not read it there learns
+/// nothing here.
+async fn renamed_for_reader(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    actor: Option<i64>,
+) -> Option<String> {
+    let (target, new_owner) = match rg_core::repo::service::find_renamed_repo(
+        &state.db, owner, repo,
+    )
+    .await
+    {
+        Ok(found) => found?,
+        Err(error) => {
+            tracing::warn!(owner, repo, error = %format!("{error:#}"), "renamed-repository lookup failed");
+            return None;
+        }
+    };
+    repo_access::check_read_for(state, &target, actor)
+        .await
+        .is_ok()
+        .then(|| format!("{new_owner}/{}", target.name))
 }
 
 /// Resolve owner/repo from OCI namespace string.
@@ -886,6 +961,17 @@ async fn grant_repository_scope(
             .map_err(AppError::from)?
         {
             Some(repo) => repo,
+            // A name a rename left behind: a reader of the repository it led to
+            // gets a pull scope on the old name, which opens nothing there, so
+            // the client comes back with it and is told where the repository
+            // went (`renamed_for_reader`) instead of bouncing off `401`.
+            None if parsed.has_action("pull")
+                && renamed_for_reader(state, scope_owner, scope_repo, authenticated_user_id)
+                    .await
+                    .is_some() =>
+            {
+                return Ok(Some(format!("repository:{}:pull", parsed.name)));
+            }
             None => return Ok(None),
         };
 

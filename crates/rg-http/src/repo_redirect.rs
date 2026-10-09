@@ -12,6 +12,17 @@
 //! repository at the address always wins and the ordinary path costs nothing.
 //! A caller who may not read the target gets the original `404`, untouched: a
 //! redirect must not reveal where a repository it cannot see went.
+//!
+//! The Git LFS API under `…/lfs` is the exception to "writes are refused"
+//! (card_e0351e77eabd). It is not a REST client naming a repository: it is
+//! `git lfs`, deriving its endpoint from the remote URL `git` kept after a
+//! clone of the old address, and the git transport already carries that clone,
+//! fetch and push to the new name by redirecting `info/refs`. Refusing the
+//! batch `POST` left the files of every such clone as pointer text. So the LFS
+//! API is redirected with `307`, which keeps the method and the body, and an
+//! anonymous request for a private repository gets the `401` its live name
+//! would give — the only answer that makes `git lfs` come back with
+//! credentials.
 
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
@@ -53,11 +64,17 @@ pub(crate) async fn follow_renamed_repository(
     if response.status() != StatusCode::NOT_FOUND {
         return response;
     }
-    let Some((owner, name, rest)) = split_repo_path(uri.path(), API_REPOS) else {
+    // `git lfs` reaches this table through `…/{repo}.git/info/lfs/…`, which
+    // is rewritten onto the REST path before routing — so the original URI
+    // still has the git spelling (`routes::with_lfs_endpoint_discovery`).
+    let api_path =
+        crate::routes::lfs_discovery_api_path(uri.path()).unwrap_or_else(|| uri.path().to_string());
+    let Some((owner, name, rest)) = split_repo_path(&api_path, API_REPOS) else {
         return response;
     };
+    let lfs = is_lfs_api(rest);
     match redirect_target(&state, &headers, owner, name).await {
-        Some((new_owner, new_name)) => {
+        RenamedTarget::Readable(new_owner, new_name) => {
             let location = format!(
                 "{API_REPOS}{new_owner}/{new_name}{rest}{}",
                 uri.query()
@@ -70,6 +87,12 @@ pub(crate) async fn follow_renamed_repository(
                     [(header::LOCATION, location)],
                 )
                     .into_response()
+            } else if lfs {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(header::LOCATION, location)],
+                )
+                    .into_response()
             } else {
                 AppError::not_found(format!(
                     "repository '{owner}/{name}' was renamed to '{new_owner}/{new_name}'; send \
@@ -78,35 +101,63 @@ pub(crate) async fn follow_renamed_repository(
                 .into_response()
             }
         }
-        None => response,
+        RenamedTarget::Refused(refusal) if lfs && refusal.status() == StatusCode::UNAUTHORIZED => {
+            refusal.into_response()
+        }
+        RenamedTarget::Refused(_) | RenamedTarget::Nothing => response,
     }
 }
 
-/// The new `owner/name` of the repository `owner/name` was moved away from,
-/// if the caller may read it.
+/// Whether `rest` — the path after `owner/name` — is the Git LFS API.
+fn is_lfs_api(rest: &str) -> bool {
+    rest == "/lfs" || rest.starts_with("/lfs/")
+}
+
+/// What the address `owner/name` leads to, as the caller may learn it.
+enum RenamedTarget {
+    /// The repository moved to this `owner/name`, and the caller may read it.
+    Readable(String, String),
+    /// The repository moved, and the read check refused the caller with this.
+    /// Never shown to a REST client: the new name stays undisclosed.
+    Refused(AppError),
+    /// Nothing moved out of the address, or the lookup failed.
+    Nothing,
+}
+
+/// The repository `owner/name` was moved away from, checked against the caller.
 async fn redirect_target(
     state: &AppState,
     headers: &HeaderMap,
     owner: &str,
     name: &str,
-) -> Option<(String, String)> {
+) -> RenamedTarget {
     let found = match rg_core::repo::service::find_renamed_repo(&state.db, owner, name).await {
-        Ok(found) => found?,
+        Ok(Some(found)) => found,
+        Ok(None) => return RenamedTarget::Nothing,
         Err(error) => {
             tracing::warn!(owner, name, error = %format!("{error:#}"), "renamed-repository lookup failed");
-            return None;
+            return RenamedTarget::Nothing;
         }
     };
     let (target, new_owner) = found;
     match crate::api::repo_access::check_read(state, headers, &target).await {
-        Ok(()) => Some((new_owner, target.name)),
-        Err(_) => None,
+        Ok(()) => RenamedTarget::Readable(new_owner, target.name),
+        Err(refusal) => RenamedTarget::Refused(refusal),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::split_repo_path;
+    use super::{is_lfs_api, split_repo_path};
+
+    #[test]
+    fn only_the_lfs_subtree_is_the_lfs_api() {
+        assert!(is_lfs_api("/lfs/objects/batch"));
+        assert!(is_lfs_api("/lfs/locks/verify"));
+        assert!(!is_lfs_api("/lfs-settings"));
+        assert!(!is_lfs_api("/issues"));
+        assert!(!is_lfs_api(""));
+    }
 
     #[test]
     fn the_repository_address_is_split_off_the_rest_of_the_path() {
