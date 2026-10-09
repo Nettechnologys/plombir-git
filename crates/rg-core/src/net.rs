@@ -383,16 +383,28 @@ pub fn ssrf_safe_outbound_client() -> &'static reqwest::Client {
 ///
 /// Covers loopback, private (RFC 1918), link-local (incl. the
 /// `169.254.169.254` cloud-metadata address), unspecified, broadcast,
-/// multicast, documentation, CGNAT (RFC 6598) for v4, and loopback /
-/// unspecified / multicast / unique-local / link-local for v6 (plus
-/// IPv4-mapped v6 folded back to its v4 check).
+/// multicast, documentation, CGNAT (RFC 6598), benchmarking, IETF protocol
+/// assignments and reserved space for v4, and loopback / unspecified /
+/// multicast / unique-local / link-local / documentation / benchmarking /
+/// discard for v6 (plus every v6 form that carries an IPv4 address — mapped,
+/// NAT64, 6to4, Teredo, IPv4-compatible — folded back to its v4 check).
 pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_forbidden_v4(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(mapped) => is_forbidden_v4(mapped),
-            None => is_forbidden_v6(v6),
-        },
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_forbidden_v4(mapped);
+            }
+            // An address that only exists to be translated to IPv4 reaches
+            // whatever v4 address it embeds, so the verdict is about that
+            // address. Checking only the wrapper would call every NAT64,
+            // 6to4 and Teredo address "public" and let a user-supplied URL
+            // dial a private IPv4 through one.
+            if let Some(embedded) = embedded_ipv4(v6) {
+                return is_forbidden_v4(embedded);
+            }
+            is_forbidden_v6(v6)
+        }
     }
 }
 
@@ -405,6 +417,9 @@ fn is_forbidden_v4(ip: Ipv4Addr) -> bool {
         || ip.is_multicast()   // 224/4
         || ip.is_documentation()
         || is_shared_cgnat(ip) // 100.64/10 (RFC 6598)
+        || is_benchmark_v4(ip) // 198.18/15 (RFC 2544)
+        || is_ietf_protocol_assignment(ip) // 192.0.0.0/24 (RFC 6890)
+        || is_reserved_v4(ip)  // 240/4 (RFC 1112)
         || ip.octets()[0] == 0 // 0.0.0.0/8 "this network"
 }
 
@@ -414,12 +429,95 @@ fn is_shared_cgnat(ip: Ipv4Addr) -> bool {
     o[0] == 100 && (o[1] & 0xc0) == 64
 }
 
+/// 198.18.0.0/15 — benchmark networks (RFC 2544), never routed publicly.
+fn is_benchmark_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 198 && (o[1] & 0xfe) == 18
+}
+
+/// 192.0.0.0/24 — IETF protocol assignments (RFC 6890), including
+/// `192.0.0.0/29`-style special-purpose addresses and DS-Lite/NAT64 relays.
+fn is_ietf_protocol_assignment(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 192 && o[1] == 0 && o[2] == 0
+}
+
+/// 240.0.0.0/4 — reserved for future use (RFC 1112); `255.255.255.255` is
+/// already covered as broadcast, the rest is not a destination.
+fn is_reserved_v4(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] & 0xf0 == 240
+}
+
+/// The IPv4 address an IPv6 transition/translation address embeds, if any.
+///
+/// Returns `None` for ordinary IPv6 addresses and for the IPv4-mapped form
+/// (`::ffff:0:0/96`), which [`is_forbidden_ip`] folds separately via the
+/// standard library. Every other form here is defined by the RFC that gives it
+/// a v4 address it can reach:
+///
+/// * `64:ff9b::/96` — NAT64 well-known prefix, v4 in the low 32 bits
+///   (RFC 6052 §2.2, prefix length 96).
+/// * `64:ff9b:1::/48` — NAT64 local-use prefix (RFC 8215), v4 split around
+///   the reserved bits 64-71 (RFC 6052 §2.2, prefix length 48).
+/// * `2002::/16` — 6to4 (RFC 3056), v4 in bits 16-47.
+/// * `2001::/32` — Teredo (RFC 4380), the client's v4 in the low 32 bits,
+///   stored bitwise-negated.
+/// * `::/96` — the deprecated IPv4-compatible form (RFC 4291 §2.5.5.1), v4 in
+///   the low 32 bits. `::` and `::1` fall out of the same arithmetic as the
+///   unspecified and loopback addresses.
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let bytes = ip.octets();
+    let segments = ip.segments();
+
+    // 64:ff9b::/96 — NAT64 well-known prefix.
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2..6].iter().all(|segment| *segment == 0)
+    {
+        return Some(Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]));
+    }
+
+    // 64:ff9b:1::/48 — NAT64 local-use prefix. RFC 6052 embeds the v4 address
+    // in bits 48-63 and 72-87, with the "u" octet (bits 64-71) reserved zero.
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 && bytes[8] == 0 {
+        return Some(Ipv4Addr::new(bytes[6], bytes[7], bytes[9], bytes[10]));
+    }
+
+    // 2002::/16 — 6to4 relay prefix; the v4 address follows it directly.
+    if segments[0] == 0x2002 {
+        return Some(Ipv4Addr::new(bytes[2], bytes[3], bytes[4], bytes[5]));
+    }
+
+    // 2001::/32 — Teredo. The low 32 bits are the client's v4 address with
+    // every bit flipped (RFC 4380 §2.1: "The IPv4 address of the Teredo
+    // client ... is obfuscated by bitwise complementing it").
+    if segments[0] == 0x2001 && segments[1] == 0x0000 {
+        let obfuscated = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        let client = Ipv4Addr::from(!obfuscated);
+        // The Teredo server itself (bits 32-63) is expected outside the
+        // client's own network; only the client address decides reachability.
+        return Some(client);
+    }
+
+    // ::/96 — IPv4-compatible (deprecated). Anything with a nonzero low 32
+    // bits reaches that v4 address; :: and ::1 are handled by the v4 check as
+    // unspecified and loopback.
+    if segments[0..6].iter().all(|segment| *segment == 0) {
+        return Some(Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]));
+    }
+
+    None
+}
+
 fn is_forbidden_v6(ip: Ipv6Addr) -> bool {
     ip.is_loopback()               // ::1
         || ip.is_unspecified()     // ::
         || ip.is_multicast()       // ff00::/8
         || is_unique_local(ip)     // fc00::/7
         || is_unicast_link_local(ip) // fe80::/10
+        || is_documentation_v6(ip) // 2001:db8::/32
+        || is_benchmark_v6(ip)     // 2001:2::/48 (RFC 5180)
+        || is_discard_v6(ip) // 100::/64 (RFC 6666)
 }
 
 /// fc00::/7 — IPv6 unique-local (the `is_unique_local` std method is unstable).
@@ -430,6 +528,24 @@ fn is_unique_local(ip: Ipv6Addr) -> bool {
 /// fe80::/10 — IPv6 link-local unicast (std method unstable).
 fn is_unicast_link_local(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// 2001:db8::/32 — documentation (RFC 3849).
+fn is_documentation_v6(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    s[0] == 0x2001 && s[1] == 0x0db8
+}
+
+/// 2001:2::/48 — benchmarking (RFC 5180).
+fn is_benchmark_v6(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0x0000
+}
+
+/// 100::/64 — discard-only (RFC 6666).
+fn is_discard_v6(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0
 }
 
 /// Cheap, DNS-free pre-check: enforce `http`/`https` and reject an obviously
@@ -931,8 +1047,14 @@ mod tests {
             "169.254.169.254", // cloud metadata
             "0.0.0.0",
             "255.255.255.255",
-            "100.64.0.1", // CGNAT
-            "224.0.0.1",  // multicast
+            "100.64.0.1",  // CGNAT
+            "224.0.0.1",   // multicast
+            "198.18.0.1",  // benchmarking (RFC 2544)
+            "198.19.0.1",  // benchmarking (RFC 2544)
+            "192.0.0.1",   // IETF protocol assignments (RFC 6890)
+            "192.0.0.170", // NAT64/DNS64 discovery relay
+            "240.0.0.1",   // reserved (RFC 1112)
+            "250.1.2.3",   // reserved (RFC 1112)
         ] {
             let ip: IpAddr = s.parse().unwrap();
             assert!(is_forbidden_ip(ip), "{s} should be forbidden");
@@ -941,7 +1063,13 @@ mod tests {
 
     #[test]
     fn allows_v4_public() {
-        for s in ["1.1.1.1", "8.8.8.8", "93.184.216.34"] {
+        for s in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.216.34",
+            "198.20.0.1",
+            "192.0.1.1",
+        ] {
             let ip: IpAddr = s.parse().unwrap();
             assert!(!is_forbidden_ip(ip), "{s} should be allowed");
         }
@@ -949,7 +1077,17 @@ mod tests {
 
     #[test]
     fn classifies_v6_internal() {
-        for s in ["::1", "::", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1"] {
+        for s in [
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "ff02::1",
+            "2001:db8::1", // documentation (RFC 3849)
+            "2001:2::1",   // benchmarking (RFC 5180)
+            "100::1",      // discard-only (RFC 6666)
+        ] {
             let ip: IpAddr = s.parse().unwrap();
             assert!(is_forbidden_ip(ip), "{s} should be forbidden");
         }
@@ -959,6 +1097,73 @@ mod tests {
             is_forbidden_ip(mapped),
             "mapped loopback should be forbidden"
         );
+    }
+
+    fn embedded(s: &str) -> Option<Ipv4Addr> {
+        embedded_ipv4(s.parse().unwrap())
+    }
+
+    #[test]
+    fn extracts_ipv4_from_transition_ranges() {
+        // NAT64 well-known prefix: low 32 bits are the v4 address.
+        assert_eq!(
+            embedded("64:ff9b::7f00:1"),
+            Some(Ipv4Addr::new(127, 0, 0, 1))
+        );
+        assert_eq!(
+            embedded("64:ff9b::808:808"),
+            Some(Ipv4Addr::new(8, 8, 8, 8))
+        );
+        // NAT64 local-use prefix: RFC 6052 layout for a /48 (bits 48-63 and
+        // 72-87, with the "u" octet in between).
+        assert_eq!(
+            embedded("64:ff9b:1:a00:0:100::"),
+            Some(Ipv4Addr::new(10, 0, 0, 1))
+        );
+        // 6to4: v4 directly after the 2002::/16 prefix.
+        assert_eq!(
+            embedded("2002:c0a8:101::1"),
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+        assert_eq!(embedded("2002:808:808::1"), Some(Ipv4Addr::new(8, 8, 8, 8)));
+        // Teredo: the client v4 is bitwise-negated in the low 32 bits.
+        assert_eq!(
+            embedded("2001::f5ff:fffe"),
+            Some(Ipv4Addr::new(10, 0, 0, 1))
+        );
+        assert_eq!(embedded("2001::f7f7:f7f7"), Some(Ipv4Addr::new(8, 8, 8, 8)));
+        // ::/96 IPv4-compatible.
+        assert_eq!(embedded("::a00:1"), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(embedded("::808:808"), Some(Ipv4Addr::new(8, 8, 8, 8)));
+        // Ordinary and IPv4-mapped addresses are not "embedded".
+        assert_eq!(embedded("2606:4700:4700::1111"), None);
+        assert_eq!(embedded("::ffff:127.0.0.1"), None);
+    }
+
+    #[test]
+    fn classifies_v4_via_embedded_transition_addresses() {
+        for s in [
+            "64:ff9b::7f00:1",       // NAT64 → 127.0.0.1
+            "64:ff9b::a00:1",        // NAT64 → 10.0.0.1
+            "64:ff9b:1:a00:0:100::", // local NAT64 → 10.0.0.1
+            "2002:c0a8:101::1",      // 6to4 → 192.168.1.1
+            "2002:7f00:1::1",        // 6to4 → 127.0.0.1
+            "2001::f5ff:fffe",       // Teredo → 10.0.0.1
+            "2001::ff00:1",          // Teredo → 0.255.255.254 (reserved)
+            "::a00:1",               // IPv4-compatible → 10.0.0.1
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_forbidden_ip(ip), "{s} should be forbidden");
+        }
+        for s in [
+            "64:ff9b::808:808", // NAT64 → 8.8.8.8
+            "2002:808:808::1",  // 6to4 → 8.8.8.8
+            "2001::f7f7:f7f7",  // Teredo → 8.8.8.8
+            "::808:808",        // IPv4-compatible → 8.8.8.8
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!is_forbidden_ip(ip), "{s} should be allowed");
+        }
     }
 
     #[test]
