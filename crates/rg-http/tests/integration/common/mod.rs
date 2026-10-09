@@ -793,7 +793,28 @@ pub async fn spawn_test_app_with_oci_root() -> (String, std::path::PathBuf, std:
     (base_url, returned_repo_root, oci_root)
 }
 
+/// Register an account and return its session token, already in sudo mode.
+///
+/// The routes that mint credentials outliving the session — SSH keys, PATs,
+/// passkeys, SSO links — take `SudoUser` and refuse a session that has not
+/// re-proved its password through `POST /users/me/sudo` (security audit
+/// finding #7). Most tests mint one of those right after registering, so the
+/// token handed back here has already stepped up; a test about the step-up
+/// itself wants [`register_user_plain`] or [`login`] for a session that has
+/// not.
 pub async fn register_user(base: &str, username: &str, email: &str, password: &str) -> String {
+    let token = register_user_plain(base, username, email, password).await;
+    sudo_session(base, &token, password, None).await
+}
+
+/// Register an account and return the session exactly as the registration
+/// answered it: a login session that has not stepped up.
+pub async fn register_user_plain(
+    base: &str,
+    username: &str,
+    email: &str,
+    password: &str,
+) -> String {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{}/api/v1/users/register", base))
@@ -808,6 +829,47 @@ pub async fn register_user(base: &str, username: &str, email: &str, password: &s
         resp.status()
     );
     let body: serde_json::Value = resp.json().await.unwrap();
+    body["token"].as_str().unwrap().to_string()
+}
+
+/// `POST /users/login` for an account without a second factor; the session
+/// has not stepped up.
+#[allow(dead_code)]
+pub async fn login(base: &str, login: &str, password: &str) -> String {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/login"))
+        .json(&serde_json::json!({ "login": login, "password": password }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "login failed for '{login}': {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["mfa_required"], false, "login owes a second factor");
+    body["token"].as_str().unwrap().to_string()
+}
+
+/// `POST /users/me/sudo` with `token`: the same session re-issued in sudo
+/// mode. `totp_code` is the authenticator's current code for an account with
+/// MFA enrolled.
+pub async fn sudo_session(base: &str, token: &str, password: &str, totp_code: Option<&str>) -> String {
+    let mut body = serde_json::json!({ "password": password });
+    if let Some(code) = totp_code {
+        body["totp_code"] = serde_json::Value::String(code.to_string());
+    }
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/me/sudo"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    assert!(status.is_success(), "sudo step-up failed: {status} {body}");
     body["token"].as_str().unwrap().to_string()
 }
 

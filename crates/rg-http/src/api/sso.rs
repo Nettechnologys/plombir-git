@@ -31,7 +31,7 @@ use tracing;
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{AuthUser, SessionUser};
+use crate::api::auth::{AuthUser, SudoUser};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -583,9 +583,11 @@ pub struct SsoLinkStart {
 /// Holding a session proves the account; the provider round trip that follows
 /// proves the identity; the callback attaches the second to the first.
 ///
-/// A login session, not a PAT: a linked identity is a way to sign in, so a
-/// token scoped to anything less than the account must not be able to mint
-/// one — that is exactly the escalation [`SessionUser`] exists to refuse.
+/// A login session in sudo mode, not a PAT: a linked identity is a way to
+/// sign in, so a token scoped to anything less than the account must not be
+/// able to mint one, and neither may a session whose holder has not just
+/// re-proved the password — that is exactly the escalation [`SudoUser`] exists
+/// to refuse.
 #[utoipa::path(
     post,
     path = "/auth/sso/{slug}/link",
@@ -596,14 +598,14 @@ pub struct SsoLinkStart {
     responses(
         (status = 200, description = "Provider authorization URL to send the browser to", body = SsoLinkStart),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "A login session is required, or the provider is disabled"),
+        (status = 403, description = "A login session in sudo mode is required (`reason: sudo_required` — step up through `POST /users/me/sudo`), or the provider is disabled"),
         (status = 404, description = "SSO provider not found"),
         (status = 409, description = "This account already has an identity from this provider"),
     ),
 )]
 pub async fn start_link(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    SudoUser(user_id): SudoUser,
     headers: HeaderMap,
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {

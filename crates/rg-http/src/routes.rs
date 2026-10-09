@@ -1141,6 +1141,10 @@ pub(crate) fn build_all_routes(
         .patch(User, "/users/me", api::account::update_profile)
         .delete(User, "/users/me", api::account::delete_account)
         .put(User, "/users/me/password", api::account::change_password)
+        // Sudo mode: the password proved again from inside a session, which
+        // the credential-minting routes below (`SudoUser`) require. Behind
+        // the login limiter because it is a password door.
+        .post_with(User, "/users/me/sudo", api::sudo::step_up, &auth_rl)
         .post_with(
             Public,
             "/users/password/initial",

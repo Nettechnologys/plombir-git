@@ -208,6 +208,7 @@ fn maintenance_api_response() -> Response {
                 code: "MAINTENANCE_MODE",
                 message: "Instance is in maintenance mode. Read-only access only.".to_string(),
                 request_id: None,
+                reason: None,
             },
         }),
     )

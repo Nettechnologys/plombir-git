@@ -138,13 +138,16 @@ const TAKEN: &[(&str, Rank)] = &[
 /// are also why this is a set membership and not a name comparison — a level can
 /// be proven by more than the extractor that shares its name.
 /// `SessionUser` also proves `User` and further refuses delegated PATs on
-/// routes that issue new credentials.
+/// routes that issue new credentials; `SudoUser` is `SessionUser` plus a
+/// recent password re-proof (`POST /users/me/sudo`) on the routes that mint
+/// credentials outliving the session.
 const NON_REPO: &[(&str, &[&str])] = &[
     (
         "User",
         &[
             "AuthUser",
             "SessionUser",
+            "SudoUser",
             "OrgAdmin",
             "InstanceAdmin",
             "RepoAuthRead",

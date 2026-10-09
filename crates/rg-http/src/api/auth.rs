@@ -68,26 +68,113 @@ impl FromRequestParts<crate::AppState> for SessionUser {
         parts: &mut Parts,
         state: &crate::AppState,
     ) -> Result<Self, Self::Rejection> {
-        let claims = extract_token_from_cookie(&parts.headers)
-            .and_then(|token| rg_core::auth::jwt::validate_token(&token, &state.jwt_secret))
-            .or_else(|| extract_bearer_claims(&parts.headers, &state.jwt_secret))
-            .ok_or_else(|| crate::error::AppError::unauthorized("authentication required"))?;
-        if claims.pat_id.is_some()
-            || parts
-                .extensions
-                .get::<crate::agent_scope::TokenGrant>()
-                .is_some()
-        {
-            return Err(crate::error::AppError::forbidden(
-                "credential creation requires a login session",
-            ));
-        }
-        let user_id = claims
-            .sub
-            .parse::<i64>()
-            .map_err(|_| crate::error::AppError::unauthorized("authentication required"))?;
+        let (user_id, _) = login_session(parts, state)?;
         Ok(SessionUser(user_id))
     }
+}
+
+/// The session a request presents, as [`SessionUser`] reads it: the account
+/// and the claims it was minted with. Refuses a PAT in either spelling — the
+/// `pat_id` claim on the translated token, or the `TokenGrant` the PAT
+/// middleware attached.
+fn login_session(
+    parts: &Parts,
+    state: &crate::AppState,
+) -> Result<(i64, Claims), crate::error::AppError> {
+    let claims = session_claims(&parts.headers, &state.jwt_secret)
+        .ok_or_else(|| crate::error::AppError::unauthorized("authentication required"))?;
+    if claims.pat_id.is_some()
+        || parts
+            .extensions
+            .get::<crate::agent_scope::TokenGrant>()
+            .is_some()
+    {
+        return Err(crate::error::AppError::forbidden(
+            "credential creation requires a login session",
+        ));
+    }
+    let user_id = claims
+        .sub
+        .parse::<i64>()
+        .map_err(|_| crate::error::AppError::unauthorized("authentication required"))?;
+    Ok((user_id, claims))
+}
+
+/// The `reason` a [`SudoUser`] refusal carries, so a client can tell "step up
+/// and retry" from every other `403` without parsing prose.
+pub(crate) const SUDO_REQUIRED_REASON: &str = "sudo_required";
+
+/// A login session whose holder has re-proved the password (and second
+/// factor) within [`rg_core::auth::jwt::SUDO_TTL`] — "sudo mode".
+///
+/// [`SessionUser`] answers *which credential* a request carries; this answers
+/// *how recently its holder was seen*. A bearer session is good for seven days,
+/// and for reading and writing code that is the right length. For minting a
+/// credential that outlives the session — an SSH key, a personal access token,
+/// a passkey, an SSO link — it is the wrong one: a session stolen from a laptop
+/// left open becomes permanent access the moment it adds a key. Those routes
+/// take this extractor, and a session that has not stepped up through
+/// `POST /users/me/sudo` is answered `403` with `reason: "sudo_required"`, which
+/// the frontend turns into a password prompt and a retry.
+///
+/// The window travels in the token (`Claims::sudo_exp`) rather than in server
+/// state, so it is revoked exactly when the session is — a logout or a
+/// password change bumps `session_version` and the elevated token dies with
+/// the plain one.
+#[derive(Debug, Clone, Copy)]
+pub struct SudoUser(pub i64);
+
+/// Why a [`SudoUser`] extraction was refused.
+///
+/// Its own type rather than an [`AppError`](crate::error::AppError) because the
+/// sudo refusal has to carry a machine-readable `reason`, and `AppError` is a
+/// message with a status. Every other refusal is the one [`SessionUser`] would
+/// have given.
+#[derive(Debug)]
+pub enum SudoRejection {
+    /// No session, or a PAT: answered exactly as [`SessionUser`] answers it.
+    Session(crate::error::AppError),
+    /// A valid login session that has not stepped up, or whose window passed.
+    SudoRequired,
+}
+
+impl IntoResponse for SudoRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Session(error) => error.into_response(),
+            Self::SudoRequired => crate::error::forbidden_with_reason(
+                "confirm your password to create credentials",
+                SUDO_REQUIRED_REASON,
+            ),
+        }
+    }
+}
+
+impl FromRequestParts<crate::AppState> for SudoUser {
+    type Rejection = SudoRejection;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &crate::AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (user_id, claims) = login_session(parts, state).map_err(SudoRejection::Session)?;
+        if !claims.sudo_active_at(chrono::Utc::now().timestamp()) {
+            return Err(SudoRejection::SudoRequired);
+        }
+        Ok(SudoUser(user_id))
+    }
+}
+
+/// The session claims a request presents: the HttpOnly cookie first, then
+/// `Authorization: Bearer`. `None` for anything that is not a valid user JWT.
+///
+/// The one reading [`SessionUser`], [`SudoUser`] and `POST /users/me/sudo`
+/// share — the step-up re-issues the *presented* token, so it has to read the
+/// same one the extractors do.
+pub(crate) fn session_claims(headers: &HeaderMap, jwt_secret: &str) -> Option<Claims> {
+    extract_token_from_cookie(headers)
+        .and_then(|token| rg_core::auth::jwt::validate_token(&token, jwt_secret))
+        .or_else(|| extract_bearer_claims(headers, jwt_secret))
 }
 
 /// Cookie name used for HttpOnly JWT storage (M-4).
