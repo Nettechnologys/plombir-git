@@ -29,8 +29,10 @@ use utoipa::{IntoParams, ToSchema};
 /// every websocket subscriber of the job, and stored by rewriting the job row's
 /// whole `log` column. `rg_runner::api` trims to the same ceiling before it
 /// sends, so an over-long log arrives shortened and marked instead of being
-/// refused.
-pub(crate) const JOB_LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// refused. The number is `rg_core::ci::JOB_LOG_MAX_BYTES`: the same one both
+/// executors stop retaining output at, so the intake, the embedded runner and
+/// the agent cannot disagree about it.
+pub(crate) const JOB_LOG_MAX_BYTES: usize = rg_core::ci::JOB_LOG_MAX_BYTES;
 
 /// The declared ceiling for one CI cache archive.
 ///

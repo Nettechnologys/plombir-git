@@ -1145,23 +1145,12 @@ impl PipelineRunner {
             c
         };
 
-        let output = rg_process::output_in_process_tree(&mut cmd)
-            .await
-            .context("failed to spawn job process")?;
+        let output =
+            rg_process::output_in_process_tree_bounded(&mut cmd, rg_core::ci::JOB_LOG_MAX_BYTES)
+                .await
+                .context("failed to spawn job process")?;
 
-        let exit_code = output.status.code().unwrap_or(-1);
-        let mut log = String::new();
-        if !output.stdout.is_empty() {
-            log.push_str(&String::from_utf8_lossy(&output.stdout));
-        }
-        if !output.stderr.is_empty() {
-            if !log.is_empty() {
-                log.push('\n');
-            }
-            log.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
-
-        Ok((exit_code, log))
+        Ok((output.status.code().unwrap_or(-1), bounded_job_log(&output)))
     }
 
     /// Execute script inside a Docker container.
@@ -1180,6 +1169,16 @@ impl PipelineRunner {
         let repo_path_str = workspace_path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("repo path is not valid UTF-8"))?;
+
+        // Asked again here, not only at trigger time: the row was validated by
+        // whatever server version wrote it, and this is the last point before
+        // the value is handed to a process. Refused as a job failure (the
+        // message reaches the job log), the way the docker-disabled case is.
+        if let Err(reason) = rg_core::ci::validate_image_reference(image) {
+            return Err(anyhow::anyhow!(
+                "Job image is not a valid image reference ({reason}); refusing to run it"
+            ));
+        }
 
         // Check if Docker is available
         let mut docker_check_command = self.docker_command();
@@ -1203,7 +1202,7 @@ impl PipelineRunner {
         // Generate a unique container name
         let container_name = job_container_name(job_id);
 
-        // Run: docker run --rm --name <name> <hardening flags> -v <repo_path>:/workspace -w /workspace <image> sh -c <script>
+        // Run: docker run --rm --name <name> <hardening flags> -v <repo_path>:/workspace -w /workspace -- <image> sh -c <script>
         //
         // SECURITY (CWE-269 privilege escalation): the container is confined so a
         // malicious job cannot break out onto the host:
@@ -1212,6 +1211,9 @@ impl PipelineRunner {
         // - `--pids-limit` / `--memory` / `--cpus` bound resource exhaustion (fork bomb, OOM).
         // The Docker socket is deliberately NOT mounted and `--privileged` is never
         // passed, so the job has no path to the daemon or host devices.
+        // `--` ends option parsing, so the image — the one value here the job's
+        // author wrote — is positional whatever it looks like: `image:
+        // "--privileged"` used to be read by the CLI as exactly that flag.
         let mut args = vec![
             "run".to_string(),
             "--rm".to_string(),
@@ -1245,34 +1247,34 @@ impl PipelineRunner {
         args.extend([
             "-e".to_string(),
             "HOME=/tmp".to_string(),
+            "--".to_string(),
             image.to_string(),
             "sh".to_string(),
             "-c".to_string(),
             script.to_string(),
         ]);
         let mut command = self.docker_command();
-        command.args(&args);
+        command
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         for (key, value) in job_environment {
             if key != "HOME" {
                 command.env(key, value);
             }
         }
-        let output = command
-            .output()
+        // Spawned and waited for in two steps so the output is read under
+        // `JOB_LOG_MAX_BYTES` as it arrives; `output()` kept all of it. The
+        // child keeps `kill_on_drop` from `docker_command`, which is what the
+        // timeout boundary relies on.
+        let child = command.spawn().context("failed to spawn docker run")?;
+        let output = rg_process::wait_with_bounded_output(child, rg_core::ci::JOB_LOG_MAX_BYTES)
             .await
-            .context("failed to spawn docker run")?;
+            .context("failed to read the output of docker run")?;
 
         let exit_code = output.status.code().unwrap_or(-1);
-        let mut log = String::new();
-        if !output.stdout.is_empty() {
-            log.push_str(&String::from_utf8_lossy(&output.stdout));
-        }
-        if !output.stderr.is_empty() {
-            if !log.is_empty() {
-                log.push('\n');
-            }
-            log.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
+        let mut log = bounded_job_log(&output);
 
         // If docker run itself failed (e.g. image not found), provide a clear message
         if exit_code != 0 && log.is_empty() {
@@ -1751,6 +1753,25 @@ fn remove_cache_archive(archive: &std::path::Path, why: &str) {
 /// Prefix used for runner-generated lines so they are distinguishable from the
 /// job script's own output.
 const JOB_NOTICE_PREFIX: &str = "[plombir-git] ";
+
+/// A job's output as the log its row will carry: stdout, then stderr, within
+/// [`rg_core::ci::JOB_LOG_MAX_BYTES`], and ending with a notice when the job
+/// printed more than that.
+///
+/// The readers already stopped retaining at the ceiling, so what is cut here is
+/// at most the room the notice needs. A `yes | head -c 20G` that ran for its
+/// whole timeout used to be collected whole, copied once more for masking and
+/// written whole to the job row — the server was the thing that ran out of
+/// memory, not the job.
+fn bounded_job_log(output: &rg_process::BoundedOutput) -> String {
+    output.merged_log(rg_core::ci::JOB_LOG_MAX_BYTES, |dropped| {
+        format!(
+            "{JOB_NOTICE_PREFIX}log truncated: the job printed more than {} bytes; {dropped} \
+             bytes were dropped",
+            rg_core::ci::JOB_LOG_MAX_BYTES
+        )
+    })
+}
 
 /// Append runner diagnostics to a job's captured output.
 ///
@@ -2931,6 +2952,11 @@ case "$1" in
         printf 'docker success\n'
         exit 0
       fi
+      if [ "$arg" = "fixture:flood" ]; then
+        head -c 20971520 /dev/zero | tr '\0' x
+        printf 'flood done\n' >&2
+        exit 0
+      fi
     done
     : > "$state/client.live"
     : > "$state/container.live"
@@ -3128,6 +3154,140 @@ esac
             "a successful container was force-removed"
         );
         assert_process_stops(fixture.pid("client.pid"), "successful docker client").await;
+    }
+
+    /// What a bounded job log has to look like, whichever executor produced it:
+    /// under the ceiling, the job's own output first, the notice last.
+    fn assert_bounded_flood_log(log: &str, fill: char) {
+        assert!(
+            log.len() <= rg_core::ci::JOB_LOG_MAX_BYTES,
+            "the stored log is {} bytes, over the {} ceiling",
+            log.len(),
+            rg_core::ci::JOB_LOG_MAX_BYTES
+        );
+        assert!(
+            log.len() > rg_core::ci::JOB_LOG_MAX_BYTES / 2,
+            "the ceiling is a cut, not a refusal: {} bytes kept",
+            log.len()
+        );
+        assert!(
+            log.starts_with(&fill.to_string().repeat(1024)),
+            "{}",
+            &log[..64]
+        );
+        let last = log.lines().last().unwrap_or_default();
+        assert!(
+            last.starts_with("[plombir-git] log truncated: the job printed more than"),
+            "the log must end with the notice, not with silence: {last:?}"
+        );
+        assert!(
+            last.contains("bytes were dropped"),
+            "the notice names what was lost: {last:?}"
+        );
+    }
+
+    /// A job that prints without end used to be collected whole in the
+    /// server's memory (`Command::output`), copied for masking and written
+    /// whole to the row. The fixture prints 20 MiB; the row keeps the ceiling
+    /// and the job still finishes as the success it was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_docker_job_that_floods_its_log_is_bounded_and_still_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = DockerFixture::new(&temp.path().join("fake-docker"));
+        let (mut runner, db, job) = runner_with_one_job(
+            temp.path(),
+            "docker-flood",
+            "yes",
+            Some("fixture:flood"),
+            30,
+        )
+        .await;
+        runner.set_docker_program(&fixture.program);
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), runner.run())
+            .await
+            .expect("a flooding job must still finish")
+            .unwrap();
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "success");
+        assert_eq!(completed.exit_code, Some(0));
+        assert_bounded_flood_log(&completed.log.unwrap_or_default(), 'x');
+        assert!(
+            !fixture.root.join("rm.args").exists(),
+            "a job that merely printed too much was force-removed"
+        );
+    }
+
+    /// The same ceiling on the host-shell path, which reads through the
+    /// process-tree owner rather than a Docker client.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_job_that_floods_its_log_is_bounded_and_still_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runner, db, job) = runner_with_one_job(
+            temp.path(),
+            "local-flood",
+            "head -c 20971520 /dev/zero | tr '\\0' y; printf 'flood done\\n' >&2",
+            None,
+            30,
+        )
+        .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), runner.run())
+            .await
+            .expect("a flooding job must still finish")
+            .unwrap();
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "success", "{:?}", completed.log);
+        assert_eq!(completed.exit_code, Some(0));
+        assert_bounded_flood_log(&completed.log.unwrap_or_default(), 'y');
+    }
+
+    /// The row's `image` is validated at trigger time, but the executor is the
+    /// last line before the value reaches a process and the row may predate
+    /// the rule. A flag spelled as an image is a recorded failure that names
+    /// the rule, and `docker run` is never invoked for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_docker_image_spelled_like_a_flag_is_refused_before_docker_is_asked() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = DockerFixture::new(&temp.path().join("fake-docker"));
+        let (mut runner, db, job) = runner_with_one_job(
+            temp.path(),
+            "docker-flag",
+            "echo should-not-run",
+            Some("--privileged"),
+            30,
+        )
+        .await;
+        runner.set_docker_program(&fixture.program);
+
+        runner.run().await.unwrap();
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "failed");
+        let log = completed.log.unwrap_or_default();
+        assert!(
+            log.contains("not a valid image reference"),
+            "the refusal must name the rule: {log}"
+        );
+        assert!(!log.contains("should-not-run"), "{log}");
+        assert!(
+            !fixture.root.join("client.pid").exists(),
+            "`docker run` was invoked with a flag for an image"
+        );
     }
 
     /// The embedded timeout owns the shell's whole process tree. Recording both
