@@ -28,7 +28,9 @@
 //!   and the `discard_*` helpers for cleanup whose failure must be logged
 //!   rather than propagated.
 //! * [`path`] — `validate_repo_path`, the traversal check every git entry point
-//!   runs on an owner/repo component.
+//!   runs on an owner/repo component, and `validate_upload_filename`, the one
+//!   rule release assets and attachments share for a name they will later
+//!   join onto a server-owned directory.
 //!
 //! `scripts/db-ops-consumer-contract-check.mjs` covers this directory, so a
 //! public function added here without a caller fails a gate instead of settling

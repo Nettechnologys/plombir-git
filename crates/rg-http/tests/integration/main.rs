@@ -200,6 +200,7 @@ mod rate_limit_mounted_tests;
 mod registration_toggle_tests;
 mod registry_lockout_tests;
 mod registry_mfa_tests;
+mod release_asset_filename_tests;
 mod release_attestation_tests;
 mod release_deletion_storage_tests;
 mod release_tests;
