@@ -1813,16 +1813,18 @@ async fn clone_repo(
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             let invocation = remote.bind_invocation(credential_invocation(credentials.as_ref()))?;
             let destination = staged_clone.path.to_string_lossy();
-            let clone = ["clone", "--bare", remote.url(), &destination];
+            // The argument list is spelled at the call: the ref-policy census
+            // in scripts/server-side-ref-policy-contract-check.mjs reads the
+            // first list argument of the invocation call to classify it.
             let output = if max_clone_bytes == 0 {
-                invocation.run(git, &clone, None)?
+                invocation.run(git, &["clone", "--bare", remote.url(), &destination], None)?
             } else {
                 // The ceiling measures the staging directory this clone is
                 // about to fill — not the repository root, where other
                 // repositories live.
                 invocation.run_under_disk_budget(
                     git,
-                    &clone,
+                    &["clone", "--bare", remote.url(), &destination],
                     None,
                     &staged_clone.path,
                     max_clone_bytes,
@@ -2425,21 +2427,32 @@ async fn import_wiki_pages_from_destination(
             // `--depth 1`: only the pages as they stand are imported. A Plombir Git wiki
             // keeps its own revision history from the first edit onwards, and there is
             // nowhere to put the source's.
-            let clone = [
-                "clone",
-                "--bare",
-                "--depth",
-                "1",
-                remote.url(),
-                &destination,
-            ];
+            // The argument list stays at the call for the ref-policy census.
             // The ceiling measures the wiki staging directory this clone fills.
             let cloned = if max_clone_bytes == 0 {
-                invocation.run(git, &clone, None)
+                invocation.run(
+                    git,
+                    &[
+                        "clone",
+                        "--bare",
+                        "--depth",
+                        "1",
+                        remote.url(),
+                        &destination,
+                    ],
+                    None,
+                )
             } else {
                 invocation.run_under_disk_budget(
                     git,
-                    &clone,
+                    &[
+                        "clone",
+                        "--bare",
+                        "--depth",
+                        "1",
+                        remote.url(),
+                        &destination,
+                    ],
                     None,
                     &staged_clone.path,
                     max_clone_bytes,
@@ -6268,8 +6281,15 @@ mod clone_credential_tests {
             "http://{address}/upstream.git"
         ));
 
-        let outcome =
-            clone_repo(remote, directory.path(), "alice", "site", Some(credentials), 0).await;
+        let outcome = clone_repo(
+            remote,
+            directory.path(),
+            "alice",
+            "site",
+            Some(credentials),
+            0,
+        )
+        .await;
         assert!(
             outcome.is_err(),
             "the stub remote refuses everyone — the clone cannot succeed"
