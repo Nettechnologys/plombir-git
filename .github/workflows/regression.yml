@@ -336,6 +336,11 @@ jobs:
       # Single-use and compare-and-swap are claims the *database* arbitrates, so
       # they are claims about each backend. Both files honour
       # PLOMBIR_GIT_TEST_DATABASE_URL for exactly this step.
+      # SQLite answers `SUM(integer)` with an INTEGER; this backend does not,
+      # and only a non-NULL total exposes the difference.
+      - name: Prove integer SUM aggregates decode on PostgreSQL
+        run: "cargo test -p rg-db -j 6 --test integration aggregate_sums_decode:: -- --nocapture"
+
       - name: Prove single-use credentials hold on PostgreSQL
         run: >-
           cargo test -p rg-db -j 6 --test integration -- --nocapture
@@ -409,6 +414,11 @@ jobs:
       # *changed* rows rather than matched ones, so a compare-and-swap that
       # answers from `rows_affected` alone reads a no-op as a lost race here and
       # nowhere else.
+      # SQLite answers `SUM(integer)` with an INTEGER; this backend does not,
+      # and only a non-NULL total exposes the difference.
+      - name: Prove integer SUM aggregates decode on MySQL
+        run: "cargo test -p rg-db -j 6 --test integration aggregate_sums_decode:: -- --nocapture"
+
       - name: Prove single-use credentials hold on MySQL
         run: >-
           cargo test -p rg-db -j 6 --test integration -- --nocapture

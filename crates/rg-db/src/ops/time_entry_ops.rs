@@ -52,7 +52,13 @@ pub async fn total_minutes_by_issue(db: &DatabaseConnection, issue_id: i64) -> R
     let result: Option<(Option<i64>,)> = TimeEntryEntity::find()
         .filter(time_entry::Column::IssueId.eq(issue_id))
         .select_only()
-        .column_as(time_entry::Column::DurationMinutes.sum(), "total")
+        .column_as(
+            super::aggregate::sum_i64(
+                db.get_database_backend(),
+                time_entry::Column::DurationMinutes,
+            ),
+            "total",
+        )
         .into_tuple()
         .one(db)
         .await
