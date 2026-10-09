@@ -95,6 +95,7 @@ fn evaluate_with(input: &str, resolver: impl Fn(&str) -> Option<String>) -> Resu
         tokens,
         position: 0,
         resolver: &resolver,
+        depth: 0,
     };
     let result = parser.parse_or()?;
     if parser.peek() != &Token::End {
@@ -199,12 +200,32 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
     Ok(out)
 }
 
+/// How deeply a condition may nest `(`, function arguments and `!`.
+///
+/// The parser is a recursive descent, and a stack overflow in Rust is not an
+/// error the caller can catch: it aborts the whole server, HTTP and SSH alike.
+/// The condition comes from a workflow file anyone with push access writes, and
+/// it is parsed synchronously on the post-push path, so `"!".repeat(1 << 20)`
+/// in an `if:` was a one-push crash. Real conditions nest a handful of levels.
+const MAX_NESTING: usize = 64;
+
 struct Parser<'a, F> {
     tokens: Vec<Token>,
     position: usize,
     resolver: &'a F,
+    depth: usize,
 }
 impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
+    /// Run `step` one nesting level deeper, refusing past [`MAX_NESTING`].
+    fn nested(&mut self, step: impl FnOnce(&mut Self) -> Result<Value>) -> Result<Value> {
+        if self.depth >= MAX_NESTING {
+            bail!("condition nests deeper than {MAX_NESTING} levels");
+        }
+        self.depth += 1;
+        let value = step(self);
+        self.depth -= 1;
+        value
+    }
     fn peek(&self) -> &Token {
         self.tokens.get(self.position).unwrap_or(&Token::End)
     }
@@ -250,7 +271,8 @@ impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
     fn parse_unary(&mut self) -> Result<Value> {
         if self.peek() == &Token::Not {
             self.take();
-            return Ok(Value::Bool(!self.parse_unary()?.truthy()));
+            let operand = self.nested(Self::parse_unary)?;
+            return Ok(Value::Bool(!operand.truthy()));
         }
         self.parse_primary()
     }
@@ -259,7 +281,7 @@ impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
             Token::Bool(value) => Ok(Value::Bool(value)),
             Token::String(value) => Ok(Value::String(value)),
             Token::LParen => {
-                let value = self.parse_or()?;
+                let value = self.nested(Self::parse_or)?;
                 if self.take() != Token::RParen {
                     bail!("condition is missing ')'");
                 }
@@ -284,11 +306,11 @@ impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
         if !matches!(lower.as_str(), "startswith" | "endswith" | "contains") {
             bail!("unsupported condition function '{name}'");
         }
-        let left = self.parse_or()?;
+        let left = self.nested(Self::parse_or)?;
         if self.take() != Token::Comma {
             bail!("{name}() requires two arguments");
         }
-        let right = self.parse_or()?;
+        let right = self.nested(Self::parse_or)?;
         if self.take() != Token::RParen {
             bail!("{name}() requires two arguments");
         }
@@ -304,6 +326,48 @@ impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse `input` on a thread with a small stack, the way a hostile `if:`
+    /// would meet the parser: without the nesting limit these inputs overflow
+    /// it, which aborts the whole test binary rather than failing one test.
+    fn validate_on_a_small_stack(input: String) -> Result<()> {
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || validate_condition(&input))
+            .expect("spawn the parser thread")
+            .join()
+            .expect("the parser thread panicked")
+    }
+
+    #[test]
+    fn a_condition_nested_past_the_limit_is_refused_not_a_stack_overflow() {
+        for hostile in [
+            format!("{}true", "!".repeat(1_000_000)),
+            format!("{}true{}", "(".repeat(1_000_000), ")".repeat(1_000_000)),
+            format!(
+                "{}'a', 'b'{}",
+                "contains(".repeat(200_000),
+                ")".repeat(200_000)
+            ),
+        ] {
+            let error = validate_on_a_small_stack(hostile)
+                .expect_err("a condition nested a million levels deep must be refused");
+            assert!(
+                error.to_string().contains("nests deeper than"),
+                "the refusal must say why: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_condition_nested_up_to_the_limit_still_parses() {
+        let depth = MAX_NESTING - 1;
+        let parens = format!("{}true{}", "(".repeat(depth), ")".repeat(depth));
+        validate_on_a_small_stack(parens)
+            .expect("nesting below the limit is an ordinary condition");
+        let negations = format!("{}true", "!".repeat(depth));
+        validate_on_a_small_stack(negations).expect("negation below the limit is ordinary");
+    }
     #[test]
     fn evaluates_boolean_context_and_string_functions() {
         let context = HashMap::from([
