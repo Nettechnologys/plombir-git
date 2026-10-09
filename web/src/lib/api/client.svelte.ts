@@ -1,5 +1,15 @@
 // Re-export for backward compatibility — many route files import these from client.
-export { API_BASE, getToken, setToken, type PaginationMeta, type PaginatedResponse } from './_base.svelte';
+export {
+  API_BASE,
+  getToken,
+  isSudoRequired,
+  requestSudo,
+  setSudoPrompt,
+  setToken,
+  type PaginationMeta,
+  type PaginatedResponse,
+  type SudoPrompt,
+} from './_base.svelte';
 export { ApiError } from './error';
 export { connectJobLogWebSocket, connectNotificationWebSocket } from './websockets';
 export {
@@ -32,7 +42,14 @@ export {
   type BoardEditFormState,
 } from './boardForm';
 export { search, type SearchResponse, type SearchResult } from './search';
-export { auth, type AuthLoginResponse, type Me, type PublicSsoProvider, type SsoLink } from './auth';
+export {
+  auth,
+  type AuthLoginResponse,
+  type Me,
+  type PublicSsoProvider,
+  type SsoLink,
+  type SudoConfirmation,
+} from './auth';
 export { attachments, type Attachment, type AttachmentTarget } from './attachments';
 export {
   releases,

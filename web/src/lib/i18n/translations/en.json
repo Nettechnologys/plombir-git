@@ -1884,6 +1884,20 @@
     "status_disabled": "Disabled",
     "status_none": "None",
     "password_required": "Current password is required",
+    "sudo": {
+      "title": "Confirm it's you",
+      "description": "Adding a key, token, passkey or sign-in method needs your password again. The confirmation lasts ten minutes.",
+      "password": "Password",
+      "password_required": "Enter your password",
+      "code": "Authentication code",
+      "backup_code": "Backup code",
+      "code_required": "Enter your authentication code",
+      "use_backup_code": "Use a backup code instead",
+      "use_code": "Use the authenticator code instead",
+      "confirm": "Confirm",
+      "confirming": "Confirming...",
+      "failed": "Could not confirm your password"
+    },
     "mfa": {
       "title": "Multi-Factor Authentication",
       "description": "Add a time-based authenticator code after password login.",

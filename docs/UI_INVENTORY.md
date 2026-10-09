@@ -23,7 +23,7 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 404 |
+| Роутов в роутере (с объявленным `Access`) | 405 |
 | Из них достижимы из браузера | 282 (70%) |
 | Layout-модулей | 2 |
 | Страниц | 70 |
@@ -40,7 +40,7 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 106 | 68 | 4 | 0 |
 | `RepoWrite` | 83 | 66 | 13 | 0 |
-| `User` | 51 | 40 | 6 | 0 |
+| `User` | 52 | 40 | 6 | 0 |
 | `RepoAdmin` | 38 | 38 | 0 | 0 |
 | `Public` | 25 | 10 | 2 | 0 |
 | `InstanceAdmin` | 25 | 21 | 0 | 0 |
@@ -1282,6 +1282,7 @@
 | POST | `/api/v1/users/register` | `Public` | rust+web+smoke |
 | POST | `/api/v1/users/login` | `Public` | rust+web+smoke |
 | POST | `/api/v1/users/logout` | `User` | rust+web |
+| POST | `/api/v1/users/me/sudo` | `User` | rust+web+smoke |
 | POST | `/api/v1/users/password/initial` | `Public` | rust+web |
 | GET | `/api/v1/avatars/{username}` | `Public` | rust |
 | POST | `/api/v1/users/mfa/verify` | `Public` | rust |

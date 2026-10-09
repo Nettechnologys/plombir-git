@@ -266,6 +266,24 @@ stand_register_founder() {
     echo "stand: registration returned no token" >&2
     return 1
   }
+
+  # The stands mint SSH keys and tokens with this session, and those routes
+  # require sudo mode (security audit finding #7): prove the password once
+  # more and carry on with the re-issued session.
+  STAND_PW="${password}" python3 -c 'import json, os; print(json.dumps({"password": os.environ["STAND_PW"]}))' \
+    >"${STAND_WORK_DIR}/sudo.json"
+  response="$(curl -fsS -X POST "${STAND_BACKEND_URL}/api/v1/users/me/sudo" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${STAND_TOKEN}" \
+    --data-binary "@${STAND_WORK_DIR}/sudo.json")" || {
+    echo "stand: sudo step-up for ${STAND_USERNAME} failed" >&2
+    return 1
+  }
+  STAND_TOKEN="$(printf '%s' "${response}" | python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])')"
+  [[ -n "${STAND_TOKEN}" ]] || {
+    echo "stand: sudo step-up returned no token" >&2
+    return 1
+  }
 }
 
 # vite colours its banner whenever `CI` is set, TTY or not (picocolors reads

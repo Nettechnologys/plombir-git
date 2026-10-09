@@ -243,6 +243,7 @@ mod sso_provisioning_policy_tests;
 mod sso_secret_decryption_tests;
 mod sso_transport_policy_tests;
 mod status_check_without_names_tests;
+mod sudo_step_up_tests;
 mod suggestion_push_hook_tests;
 mod tag_protection_lifecycle_tests;
 mod tail_lookup_failure_status_tests;

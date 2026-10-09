@@ -12,7 +12,7 @@ use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
 use crate::{
-    api::auth::{AuthUser, SessionUser},
+    api::auth::{AuthUser, SudoUser},
     error::AppError,
     AppState,
 };
@@ -83,13 +83,13 @@ pub async fn list_ssh_keys(
         (status = 201, description = "SSH key added", body = SshKeyResponse),
         (status = 400, description = "Invalid SSH key", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
-        (status = 403, description = "A login session is required to create credentials", body = serde_json::Value),
+        (status = 403, description = "A login session in sudo mode is required to create credentials (`reason: sudo_required` — step up through `POST /users/me/sudo`)", body = serde_json::Value),
         (status = 409, description = "SSH key already registered", body = serde_json::Value),
     )
 )]
 pub async fn create_ssh_key(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    SudoUser(user_id): SudoUser,
     headers: HeaderMap,
     Json(body): Json<CreateSshKeyRequest>,
 ) -> impl IntoResponse {

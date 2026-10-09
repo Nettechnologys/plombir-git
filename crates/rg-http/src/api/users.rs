@@ -13,7 +13,7 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::auth::{AuthUser, SessionUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{AuthUser, SudoUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -643,6 +643,9 @@ pub async fn me(State(state): State<AppState>, AuthUser(user_id): AuthUser) -> i
                 "bio": user.bio,
                 "auth_provider": user.auth_provider,
                 "is_admin": user.is_admin,
+                // Read by the sudo prompt, which has to know whether to ask
+                // for a second factor before it can ask for anything.
+                "mfa_enabled": user.mfa_enabled,
                 "created_at": user.created_at,
             })),
         )
@@ -770,12 +773,12 @@ pub async fn list_tokens(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
-        (status = 403, description = "A login session is required to create credentials", body = serde_json::Value),
+        (status = 403, description = "A login session in sudo mode is required to create credentials (`reason: sudo_required` — step up through `POST /users/me/sudo`)", body = serde_json::Value),
     ),
 )]
 pub async fn create_token(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    SudoUser(user_id): SudoUser,
     headers: HeaderMap,
     Json(body): Json<CreateTokenRequest>,
 ) -> impl IntoResponse {

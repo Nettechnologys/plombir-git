@@ -34,10 +34,41 @@ pub struct Claims {
     /// (card_e4e177acd095).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pat_id: Option<i64>,
+    /// Until when (Unix timestamp seconds) this session counts as *recently
+    /// re-authenticated* — "sudo mode". `None` for a session that has only
+    /// ever logged in.
+    ///
+    /// A seven-day bearer session is the right length for reading and writing
+    /// code and the wrong length for minting a credential that outlives it: a
+    /// stolen session that can add an SSH key or a personal access token is
+    /// permanent access, not seven days of it. The routes that mint such
+    /// credentials therefore demand a session whose holder has re-proved the
+    /// password (and the second factor) within [`SUDO_TTL`], and that proof is
+    /// carried here rather than in a second cookie so the one session gate
+    /// (`session_standing_middleware`, the revocation check) keeps seeing one
+    /// token. Set only by [`reissue_with_sudo`]; a token minted before this
+    /// claim existed decodes as `None` and simply has to step up once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sudo_exp: Option<i64>,
     /// Issued-at (Unix timestamp seconds).
     pub iat: i64,
     /// Expiry (Unix timestamp seconds).
     pub exp: i64,
+}
+
+/// How long a successful `POST /users/me/sudo` keeps a session in sudo mode.
+///
+/// Ten minutes is long enough to add a key, mint a token and register a
+/// passkey in one sitting, and short enough that a session stolen *after* the
+/// step-up is back to an ordinary session before an attacker is likely to
+/// notice it. The window is counted from the step-up, not extended by use.
+pub const SUDO_TTL: Duration = Duration::minutes(10);
+
+impl Claims {
+    /// Whether this session is in sudo mode at `now` (Unix seconds).
+    pub fn sudo_active_at(&self, now: i64) -> bool {
+        self.sudo_exp.is_some_and(|until| until > now)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -102,6 +133,7 @@ fn encode_claims(
         username: username.to_string(),
         session_version,
         pat_id,
+        sudo_exp: None,
         iat: now.timestamp(),
         exp: exp.timestamp(),
     };
@@ -111,6 +143,38 @@ fn encode_claims(
         &EncodingKey::from_secret(secret.as_bytes()),
     )
     .context("jwt encode failed")
+}
+
+/// Re-issue a session token in sudo mode: the same subject, generation and
+/// expiry, with `sudo_exp` set to now plus [`SUDO_TTL`].
+///
+/// The expiry is kept rather than renewed on purpose — proving the password
+/// again is not a new login, and a session that was going to end tomorrow still
+/// ends tomorrow. `sudo_exp` is clamped to `exp` so the claim never promises
+/// more than the token can deliver. The synthetic session a PAT is translated
+/// into is refused: a PAT holder cannot step up, because the whole point of the
+/// step is to tell a session from a delegated token.
+pub fn reissue_with_sudo(claims: &Claims, secret: &str) -> Result<String> {
+    if claims.pat_id.is_some() {
+        anyhow::bail!("a personal access token cannot enter sudo mode");
+    }
+    let now = Utc::now();
+    let sudo_exp = (now + SUDO_TTL).timestamp().min(claims.exp);
+    let reissued = Claims {
+        sub: claims.sub.clone(),
+        username: claims.username.clone(),
+        session_version: claims.session_version,
+        pat_id: None,
+        sudo_exp: Some(sudo_exp),
+        iat: now.timestamp(),
+        exp: claims.exp,
+    };
+    encode(
+        &Header::default(),
+        &reissued,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .context("sudo jwt encode failed")
 }
 
 /// Validate and decode a JWT. Returns `None` if invalid/expired.
@@ -222,6 +286,105 @@ mod tests {
     fn test_malformed_token_fails() {
         assert!(validate_token("aaa.bbb", "secret").is_none());
         assert!(validate_token("aaa.bbb.ccc.ddd", "secret").is_none());
+    }
+
+    /// A login session carries no sudo claim, the re-issued one carries a
+    /// bounded one, and nothing else about the session moves.
+    #[test]
+    fn reissue_with_sudo_keeps_the_session_and_adds_a_bounded_window() {
+        let secret = "sudo-secret";
+        let token = generate_token(42, "alice", 3, secret, 7).unwrap();
+        let claims = validate_token(&token, secret).unwrap();
+        assert_eq!(claims.sudo_exp, None);
+        assert!(!claims.sudo_active_at(Utc::now().timestamp()));
+        assert!(
+            !token.contains("sudo_exp"),
+            "an absent claim is not serialized"
+        );
+
+        let elevated = reissue_with_sudo(&claims, secret).unwrap();
+        let sudo = validate_token(&elevated, secret).unwrap();
+        assert_eq!(sudo.sub, "42");
+        assert_eq!(sudo.username, "alice");
+        assert_eq!(sudo.session_version, 3);
+        assert_eq!(sudo.pat_id, None);
+        assert_eq!(sudo.exp, claims.exp, "stepping up is not a new login");
+        let now = Utc::now().timestamp();
+        let until = sudo.sudo_exp.expect("the re-issued token is in sudo mode");
+        assert!(sudo.sudo_active_at(now));
+        assert!(until > now && until <= now + SUDO_TTL.num_seconds());
+        assert!(!sudo.sudo_active_at(until), "the window is half-open");
+    }
+
+    /// The window never outlives the session it is attached to.
+    #[test]
+    fn sudo_window_is_clamped_to_the_session_expiry() {
+        let secret = "sudo-secret";
+        let claims = Claims {
+            sub: "1".into(),
+            username: "short".into(),
+            session_version: 0,
+            pat_id: None,
+            sudo_exp: None,
+            iat: Utc::now().timestamp(),
+            exp: Utc::now().timestamp() + 60,
+        };
+        let elevated = reissue_with_sudo(&claims, secret).unwrap();
+        let sudo = validate_token(&elevated, secret).unwrap();
+        assert_eq!(sudo.sudo_exp, Some(claims.exp));
+    }
+
+    /// A PAT's synthetic session has no password to re-prove.
+    #[test]
+    fn a_pat_session_cannot_be_reissued_in_sudo_mode() {
+        let secret = "sudo-secret";
+        let token = generate_token_for_pat(7, "bot", 0, 99, secret, 1).unwrap();
+        let claims = validate_token(&token, secret).unwrap();
+        assert!(reissue_with_sudo(&claims, secret).is_err());
+    }
+
+    /// Tokens minted before the claim existed keep validating, as `None`.
+    #[test]
+    fn a_token_without_the_sudo_claim_still_validates() {
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            sub: &'a str,
+            username: &'a str,
+            session_version: i64,
+            iat: i64,
+            exp: i64,
+        }
+        let now = Utc::now().timestamp();
+        let legacy = encode(
+            &Header::default(),
+            &Legacy {
+                sub: "5",
+                username: "old",
+                session_version: 2,
+                iat: now,
+                exp: now + 3600,
+            },
+            &EncodingKey::from_secret(b"legacy"),
+        )
+        .unwrap();
+        let claims = validate_token(&legacy, "legacy").expect("a pre-sudo token still decodes");
+        assert_eq!(claims.sudo_exp, None);
+        assert!(!claims.sudo_active_at(now));
+
+        // And a token whose window has passed is an ordinary session again.
+        let expired = Claims {
+            sudo_exp: Some(now - 1),
+            ..claims
+        };
+        let token = encode(
+            &Header::default(),
+            &expired,
+            &EncodingKey::from_secret(b"legacy"),
+        )
+        .unwrap();
+        let decoded = validate_token(&token, "legacy").unwrap();
+        assert_eq!(decoded.sudo_exp, Some(now - 1));
+        assert!(!decoded.sudo_active_at(now));
     }
 
     #[test]

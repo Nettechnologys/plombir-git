@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{AuthUser, SessionUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{AuthUser, SudoUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 use rg_core::auth::webauthn as wa;
@@ -481,13 +481,13 @@ async fn load_passkeys_for_rp(
         (status = 200, description = "Registration challenge issued", body = PasskeyRegisterStartResponse),
         (status = 400, description = "Invalid WebAuthn relying-party configuration", body = serde_json::Value),
         (status = 401, description = "Authentication required", body = serde_json::Value),
-        (status = 403, description = "A login session is required to create credentials", body = serde_json::Value),
+        (status = 403, description = "A login session in sudo mode is required to create credentials (`reason: sudo_required` — step up through `POST /users/me/sudo`)", body = serde_json::Value),
         (status = 404, description = "User not found", body = serde_json::Value),
     ),
 )]
 pub async fn register_start(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    SudoUser(user_id): SudoUser,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
@@ -556,13 +556,13 @@ pub struct RegisterFinishRequest {
         (status = 200, description = "Passkey registered", body = Vec<PasskeyInfo>),
         (status = 400, description = "Missing, expired, already-answered, or invalid registration challenge", body = serde_json::Value),
         (status = 401, description = "Authentication required", body = serde_json::Value),
-        (status = 403, description = "A login session is required to create credentials", body = serde_json::Value),
+        (status = 403, description = "A login session in sudo mode is required to create credentials (`reason: sudo_required` — step up through `POST /users/me/sudo`)", body = serde_json::Value),
         (status = 409, description = "Passkey already registered", body = serde_json::Value),
     ),
 )]
 pub async fn register_finish(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    SudoUser(user_id): SudoUser,
     headers: HeaderMap,
     Json(req): Json<RegisterFinishRequest>,
 ) -> Result<impl IntoResponse, AppError> {

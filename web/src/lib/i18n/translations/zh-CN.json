@@ -1884,6 +1884,20 @@
     "status_disabled": "未启用",
     "status_none": "无",
     "password_required": "请输入当前密码",
+    "sudo": {
+      "title": "确认是您本人",
+      "description": "添加密钥、令牌、通行密钥或登录方式需要再次输入密码。确认有效期为十分钟。",
+      "password": "密码",
+      "password_required": "请输入密码",
+      "code": "验证码",
+      "backup_code": "备用码",
+      "code_required": "请输入验证码",
+      "use_backup_code": "改用备用码",
+      "use_code": "改用身份验证器验证码",
+      "confirm": "确认",
+      "confirming": "确认中...",
+      "failed": "无法确认您的密码"
+    },
     "mfa": {
       "title": "多因素认证",
       "description": "在密码登录后再输入一个基于时间的身份验证器代码。",

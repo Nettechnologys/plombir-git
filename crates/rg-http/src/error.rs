@@ -63,6 +63,32 @@ pub struct ErrorBody {
     /// Request ID (injected by request-id middleware for error responses).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// A machine-readable qualifier for a refusal the client can *act on*
+    /// rather than merely display — `sudo_required` is the one so far: the
+    /// session is fine, it just has to re-prove the password first. Absent
+    /// from every error that has no such next step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+/// A `403` whose body names a `reason` the client can act on.
+///
+/// Built here rather than as an [`AppError`] variant because every `AppError`
+/// is a status plus a message, and the forty call sites that match on it
+/// should not grow an arm for a field only one refusal carries.
+pub(crate) fn forbidden_with_reason(message: &str, reason: &'static str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(ErrorResponse {
+            error: ErrorBody {
+                code: "FORBIDDEN",
+                message: message.to_string(),
+                request_id: None,
+                reason: Some(reason),
+            },
+        }),
+    )
+        .into_response()
 }
 
 /// Unified application error type for all HTTP handlers.
@@ -177,6 +203,7 @@ impl IntoResponse for AppError {
                 code,
                 message: sanitized_message,
                 request_id: None,
+                reason: None,
             },
         };
         (status, axum::Json(body)).into_response()
@@ -284,6 +311,7 @@ pub(crate) async fn api_rejection_envelope(response: Response) -> Response {
             code,
             message,
             request_id: None,
+            reason: None,
         },
     })
     .expect("ErrorResponse contains only serializable primitives");
