@@ -349,6 +349,28 @@ pub async fn list_org_members(
         .context("db: list org members")
 }
 
+/// Which of `user_ids` are members of `org_id` — the batch form of
+/// [`is_org_member`], one statement for a page of people. The caller bounds the
+/// page.
+pub async fn members_among(
+    db: &DatabaseConnection,
+    org_id: i64,
+    user_ids: &[i64],
+) -> Result<Vec<i64>> {
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    organization_member::Entity::find()
+        .select_only()
+        .column(organization_member::Column::UserId)
+        .filter(organization_member::Column::OrgId.eq(org_id))
+        .filter(organization_member::Column::UserId.is_in(user_ids.iter().copied()))
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list org members among users")
+}
+
 /// Check if a user is a member of an organization.
 pub async fn is_org_member(db: &DatabaseConnection, org_id: i64, user_id: i64) -> Result<bool> {
     let member = organization_member::Entity::find()

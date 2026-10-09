@@ -28,6 +28,45 @@ pub async fn create_notification(
     model.insert(db).await.context("db: create notification")
 }
 
+/// Create the same notification for every user in `user_ids`, in one statement.
+///
+/// The watch fan-out delivers one event to a page of up to 500 subscribers.
+/// Inserting them one autocommit at a time took SQLite's write lock 500 times
+/// for one event, and every other writer on the instance queued behind each of
+/// them. One multi-row `INSERT` is one write — and it is atomic, so a failure
+/// leaves the page undelivered rather than half delivered. The caller bounds
+/// the page: seven bound values per row, and SQLite's parameter ceiling is
+/// 32 766.
+///
+/// Returns how many rows were written.
+pub async fn create_notifications(
+    db: &DatabaseConnection,
+    user_ids: &[i64],
+    event_type: &str,
+    title: &str,
+    body: Option<&str>,
+    repo_id: Option<i64>,
+) -> Result<u64> {
+    if user_ids.is_empty() {
+        return Ok(0);
+    }
+    let now = chrono::Utc::now();
+    let rows = user_ids.iter().map(|user_id| notification::ActiveModel {
+        user_id: Set(*user_id),
+        event_type: Set(event_type.to_string()),
+        title: Set(title.to_string()),
+        body: Set(body.map(|s| s.to_string())),
+        repo_id: Set(repo_id),
+        is_read: Set(false),
+        created_at: Set(now),
+        ..Default::default()
+    });
+    notification::Entity::insert_many(rows)
+        .exec_without_returning(db)
+        .await
+        .context("db: create notifications")
+}
+
 /// Paginated list of notifications for a user. Returns (data, total).
 ///
 /// Ordered by `created_at` **and** `id`: the timestamp alone leaves ties for

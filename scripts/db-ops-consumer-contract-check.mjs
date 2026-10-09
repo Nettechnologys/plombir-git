@@ -188,6 +188,14 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
       'the fixtures across the workspace that want a plain account row without going through HTTP',
   ],
   [
+    'crates/rg-db/src/ops/notification_ops.rs::create_notification',
+    'the one-row spelling that hands back the inserted model. Production delivers a watch ' +
+      'notification to a page of subscribers at once through `create_notifications` — one ' +
+      'multi-row INSERT instead of one autocommit per recipient (card_f25c98fdf3ee) — and thread ' +
+      'notifications through `create_for_subject`. What is left calling this one is the fixtures ' +
+      'across rg-http and rg-core that need a notification row and its id',
+  ],
+  [
     'crates/rg-db/src/ops/audit_log_ops.rs::insert',
     'the append path is `rg_core::audit::record`, and it writes the row through ' +
       '`audit_log::Entity::insert(...).exec(db)` rather than this op on purpose: the op reads the ' +

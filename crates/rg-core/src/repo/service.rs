@@ -163,7 +163,16 @@ type PermEntry = (bool, Instant);
 /// global mid-flight would otherwise flake the cache unit tests.
 #[derive(Default)]
 struct PermCache {
-    entries: RwLock<HashMap<PermKey, PermEntry>>,
+    entries: RwLock<PermEntries>,
+}
+
+/// The cached decisions plus the bookkeeping for their amortized expiry.
+#[derive(Default)]
+struct PermEntries {
+    map: HashMap<PermKey, PermEntry>,
+    /// When `set` last swept expired entries out of `map`; `None` before the
+    /// first sweep.
+    last_sweep: Option<Instant>,
 }
 
 impl PermCache {
@@ -176,6 +185,7 @@ impl PermCache {
     ) -> Option<bool> {
         let cache = self.entries.read().unwrap_or_else(|e| e.into_inner());
         cache
+            .map
             .get(&(instance, repo_id, actor_id, for_write))
             .filter(|(_, ts)| ts.elapsed() < PERM_CACHE_TTL)
             .map(|(v, _)| *v)
@@ -189,22 +199,56 @@ impl PermCache {
         for_write: bool,
         value: bool,
     ) {
+        self.set_at(
+            instance,
+            repo_id,
+            actor_id,
+            for_write,
+            value,
+            Instant::now(),
+        );
+    }
+
+    /// [`Self::set`] on an explicit clock, so the sweep throttle is testable
+    /// without sleeping through a TTL.
+    fn set_at(
+        &self,
+        instance: rg_db::InstanceId,
+        repo_id: i64,
+        actor_id: Option<i64>,
+        for_write: bool,
+        value: bool,
+        now: Instant,
+    ) {
         let mut cache = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        // Expired entries are swept out at most once per TTL, not on every
+        // miss. The sweep is O(entries) under the exclusive lock, and running
+        // it on each `set` made k misses inside one TTL window cost O(k²) —
+        // every concurrent permission check queued behind it. Between sweeps an
+        // expired entry is merely dead weight: `check` already refuses it.
+        //
         // This also reaps the entries of databases that are gone entirely: a
         // test's database dies with its test, and nothing would otherwise
         // invalidate what it left here before the process exits.
-        cache.retain(|_, (_, ts)| ts.elapsed() < PERM_CACHE_TTL);
-        cache.insert(
-            (instance, repo_id, actor_id, for_write),
-            (value, Instant::now()),
-        );
+        let due = cache
+            .last_sweep
+            .is_none_or(|last| now.saturating_duration_since(last) >= PERM_CACHE_TTL);
+        if due {
+            cache
+                .map
+                .retain(|_, (_, ts)| now.saturating_duration_since(*ts) < PERM_CACHE_TTL);
+            cache.last_sweep = Some(now);
+        }
+        cache
+            .map
+            .insert((instance, repo_id, actor_id, for_write), (value, now));
     }
 
     /// Drop the cached read+write decisions for a specific user on a repo.
     fn invalidate_user(&self, instance: rg_db::InstanceId, repo_id: i64, user_id: i64) {
         let mut cache = self.entries.write().unwrap_or_else(|e| e.into_inner());
-        cache.remove(&(instance, repo_id, Some(user_id), false));
-        cache.remove(&(instance, repo_id, Some(user_id), true));
+        cache.map.remove(&(instance, repo_id, Some(user_id), false));
+        cache.map.remove(&(instance, repo_id, Some(user_id), true));
     }
 
     /// Drop every cached entry belonging to a repo.
@@ -212,6 +256,7 @@ impl PermCache {
         self.entries
             .write()
             .unwrap_or_else(|e| e.into_inner())
+            .map
             .retain(|(inst, rid, _, _), _| (*inst, *rid) != (instance, repo_id));
     }
 
@@ -220,6 +265,7 @@ impl PermCache {
         self.entries
             .write()
             .unwrap_or_else(|e| e.into_inner())
+            .map
             .retain(|(inst, _, _, _), _| *inst != instance);
     }
 }
@@ -516,6 +562,48 @@ pub async fn can_read_repo(
 
     set_perm_cache(db, repo.id, actor_id, false, result);
     Ok(result)
+}
+
+/// Which of `user_ids` [`can_read_repo`] would let read `repo` — the same
+/// decision, taken for a page of people in at most two statements instead of
+/// up to two per person.
+///
+/// Kept beside [`can_read_repo`] on purpose: the rules are the same four
+/// (public, owner, collaborator, member of the owning organisation) and have
+/// to stay the same four. `readers_among_agrees_with_can_read_repo` holds them
+/// together over every kind of account the single check distinguishes.
+///
+/// The permission cache is neither read nor filled: a fan-out asks about each
+/// subscriber once, so a cache entry would serve nobody, and filling hundreds
+/// of them would only cost the next sweep.
+pub async fn readers_among(
+    db: &DatabaseConnection,
+    repo: &rg_db::entities::repository::Model,
+    user_ids: &[i64],
+) -> Result<std::collections::HashSet<i64>> {
+    if !repo.is_private {
+        return Ok(user_ids.iter().copied().collect());
+    }
+    let mut readers: std::collections::HashSet<i64> = user_ids
+        .iter()
+        .copied()
+        .filter(|id| *id == repo.owner_id)
+        .collect();
+    let rest: Vec<i64> = user_ids
+        .iter()
+        .copied()
+        .filter(|id| !readers.contains(id))
+        .collect();
+    readers
+        .extend(rg_db::ops::repo_collaborator_ops::collaborators_among(db, repo.id, &rest).await?);
+    if let Some(org_id) = repo.org_id {
+        let rest: Vec<i64> = rest
+            .into_iter()
+            .filter(|id| !readers.contains(id))
+            .collect();
+        readers.extend(rg_db::ops::org_ops::members_among(db, org_id, &rest).await?);
+    }
+    Ok(readers)
 }
 
 /// Check whether `actor_id` (None = anonymous) can read `owner/repo`.
@@ -7929,6 +8017,50 @@ mod perm_cache_tests {
         assert_eq!(cache.check(DB_B, 910_004, Some(1), false), Some(true));
     }
 
+    /// A miss used to sweep the whole map on every `set`, so k misses inside
+    /// one TTL cost O(k²) under the exclusive lock. The sweep now runs at most
+    /// once per TTL: an expired entry survives a `set` made soon after the last
+    /// sweep, and is gone after the first `set` a TTL later.
+    #[test]
+    fn expired_entries_are_swept_at_most_once_per_ttl() {
+        let cache = PermCache::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let repos = |cache: &PermCache| {
+            let mut repos: Vec<i64> = cache
+                .entries
+                .read()
+                .unwrap()
+                .map
+                .keys()
+                .map(|(_, repo, _, _)| *repo)
+                .collect();
+            repos.sort_unstable();
+            repos
+        };
+        let ttl = PERM_CACHE_TTL.as_secs();
+
+        // The first set sweeps (nothing to sweep yet) and anchors the throttle.
+        cache.set_at(DB_A, 1, Some(1), false, true, at(0));
+        cache.set_at(DB_A, 2, Some(1), false, true, at(ttl - 10));
+        // A TTL after the first sweep: due, so entry 1 (now expired) goes.
+        cache.set_at(DB_A, 3, Some(1), false, true, at(ttl));
+        assert_eq!(repos(&cache), vec![2, 3]);
+
+        // Entry 2 has expired by now, but the last sweep was less than a TTL
+        // ago: this set must not pay for another walk over the map.
+        cache.set_at(DB_A, 4, Some(1), false, true, at(2 * ttl - 5));
+        assert_eq!(
+            repos(&cache),
+            vec![2, 3, 4],
+            "a set inside the throttle window must not sweep"
+        );
+
+        // A TTL after the previous sweep, the next set sweeps again.
+        cache.set_at(DB_A, 5, Some(1), false, true, at(2 * ttl));
+        assert_eq!(repos(&cache), vec![4, 5]);
+    }
+
     /// The bug the instance component of the key exists to prevent: two
     /// databases whose row ids collide (which is every pair of them, since ids
     /// restart at 1) must not answer each other's questions.
@@ -8160,6 +8292,71 @@ mod permission_matrix_tests {
             .unwrap();
         assert!(can_admin_repo(&db, &repo, Some(team_admin)).await.unwrap());
         assert!(can_write_repo(&db, &repo, Some(team_admin)).await.unwrap());
+    }
+
+    /// `readers_among` restates `can_read_repo`'s rules for a page of people at
+    /// once (the watch fan-out). The two must not drift: for every kind of
+    /// account the single check tells apart, on a private personal repository,
+    /// a private organisation repository and a public one, the batch answers
+    /// exactly what the single check answers.
+    #[tokio::test]
+    async fn readers_among_agrees_with_can_read_repo() {
+        let db = setup_db().await;
+        let owner = mk_user(&db).await;
+        let org_owner = mk_user(&db).await;
+        let org_name = format!("org_{}", uuid::Uuid::new_v4().simple());
+        let org = org_ops::create_org(&db, &org_name, None, None, org_owner, "private")
+            .await
+            .unwrap();
+
+        let collaborator = mk_user(&db).await;
+        let org_member = mk_user(&db).await;
+        org_ops::add_org_member(&db, org.id, org_member, "member")
+            .await
+            .unwrap();
+        let org_admin = mk_user(&db).await;
+        org_ops::add_org_member(&db, org.id, org_admin, "admin")
+            .await
+            .unwrap();
+        let stranger = mk_user(&db).await;
+        let gone = i64::MAX;
+
+        let personal = mk_repo(&db, owner, None, true).await;
+        let org_repo = mk_repo(&db, org_owner, Some(org.id), true).await;
+        let public = mk_repo(&db, owner, None, false).await;
+        for repo in [&personal, &org_repo] {
+            add_collab(&db, repo.id, collaborator, "read").await;
+        }
+
+        let everyone = [
+            owner,
+            org_owner,
+            collaborator,
+            org_member,
+            org_admin,
+            stranger,
+            gone,
+        ];
+        for repo in [&personal, &org_repo, &public] {
+            let batch = readers_among(&db, repo, &everyone).await.unwrap();
+            for user in everyone {
+                assert_eq!(
+                    batch.contains(&user),
+                    can_read_repo(&db, repo, Some(user)).await.unwrap(),
+                    "readers_among and can_read_repo disagree about user {user} on repo {} \
+                     (private: {}, org: {:?})",
+                    repo.id,
+                    repo.is_private,
+                    repo.org_id
+                );
+            }
+        }
+        // The matrix is not vacuous: each repository admits someone and, when
+        // private, refuses someone.
+        let personal_readers = readers_among(&db, &personal, &everyone).await.unwrap();
+        assert!(personal_readers.contains(&collaborator) && !personal_readers.contains(&stranger));
+        let org_readers = readers_among(&db, &org_repo, &everyone).await.unwrap();
+        assert!(org_readers.contains(&org_member) && !org_readers.contains(&owner));
     }
 
     /// The card's headline concern: after a collaborator is removed, the 30s-TTL

@@ -180,21 +180,24 @@ pub fn spawn_notify_watchers(
 
 /// Notify all watchers of a repository about an event.
 ///
-/// Every watcher is re-checked against [`crate::repo::service::can_read_repo`]
-/// before delivery. A watch row outlives the access that created it — the repo
+/// Every watcher is re-checked against the rules of
+/// [`crate::repo::service::can_read_repo`] — page by page, through
+/// [`crate::repo::service::readers_among`] — before delivery. A watch row outlives the access that created it — the repo
 /// can be flipped to private, a collaborator removed, or the row predate the
 /// read gate on the subscribe endpoint — and the notification body carries the
 /// repository's content (PR titles, branch and milestone names). Gating only
 /// the subscribe endpoint would keep serving all three cases, so the check
 /// lives here, at the single point every watch notification passes through.
-/// A failed check drops the recipient rather than delivering to them.
+/// A failed check drops the recipients rather than delivering to them.
 ///
 /// The subscription state is filtered for the same reason, one layer down in
 /// the query this pages through: see [`WATCH_STATE_SUBSCRIBED`].
 ///
-/// Every subscriber is reached, however many there are. A per-recipient failure
-/// is logged and the walk continues; only a failed *query* aborts it, and the
-/// count reached by then is logged rather than lost.
+/// Every subscriber is reached, however many there are. Each page of
+/// [`WATCH_FANOUT_PAGE`] is one read check and one multi-row insert, so a
+/// failed check or insert costs that page — logged with its size — and the
+/// walk continues; only a failed *page query* aborts it, and the count reached
+/// by then is logged rather than lost.
 pub async fn notify_watchers(db: &DatabaseConnection, event: &WatchEvent) -> Result<()> {
     let repo_id = event.repo_id;
     let mut page = watch_page(db, repo_id, 0).await?;
@@ -222,49 +225,63 @@ pub async fn notify_watchers(db: &DatabaseConnection, event: &WatchEvent) -> Res
         let page_len = page.len() as u64;
         let last_id = page.last().map_or(0, |watcher| watcher.id);
 
-        for watcher in page {
-            considered += 1;
+        // One read check and one insert per page, not per subscriber: the walk
+        // used to autocommit an INSERT for every watcher, taking the write lock
+        // once per recipient while every other writer on the instance waited.
+        let candidates: Vec<i64> = page
+            .iter()
+            .map(|watcher| watcher.user_id)
             // Don't notify the author themselves
-            if let Some(ref author) = author_opt {
-                if author.id == watcher.user_id {
-                    continue;
-                }
+            .filter(|user_id| {
+                author_opt
+                    .as_ref()
+                    .is_none_or(|author| author.id != *user_id)
+            })
+            .collect();
+        considered += page.len();
+        let readers = match crate::repo::service::readers_among(db, &repo, &candidates).await {
+            Ok(readers) => readers,
+            Err(e) => {
+                // Fail closed: an unreadable permission answer must not become
+                // a delivered notification. The page is skipped, not the walk.
+                tracing::warn!(
+                    repo_id,
+                    notification_type,
+                    skipped = candidates.len(),
+                    "Skipping a page of watchers: read check failed: {e:#}"
+                );
+                Default::default()
             }
-            match crate::repo::service::can_read_repo(db, &repo, Some(watcher.user_id)).await {
-                Ok(true) => {}
-                Ok(false) => {
+        };
+        let recipients: Vec<i64> = candidates
+            .into_iter()
+            .filter(|user_id| {
+                let readable = readers.contains(user_id);
+                if !readable {
                     tracing::debug!(
-                        "Skipping watcher {} for {notification_type}: no read access to repo {repo_id}",
-                        watcher.user_id
+                        "Skipping watcher {user_id} for {notification_type}: no read access to repo {repo_id}"
                     );
-                    continue;
                 }
-                Err(e) => {
-                    // Fail closed: an unreadable permission answer must not become
-                    // a delivered notification.
-                    tracing::warn!(
-                        "Skipping watcher {} for {notification_type}: read check failed: {e}",
-                        watcher.user_id
-                    );
-                    continue;
-                }
-            }
-            match notification_ops::create_notification(
-                db,
-                watcher.user_id,
+                readable
+            })
+            .collect();
+        match notification_ops::create_notifications(
+            db,
+            &recipients,
+            notification_type,
+            &event.title,
+            event.body.as_deref(),
+            Some(repo_id),
+        )
+        .await
+        {
+            Ok(written) => delivered += written as usize,
+            Err(e) => tracing::warn!(
+                repo_id,
                 notification_type,
-                &event.title,
-                event.body.as_deref(),
-                Some(repo_id),
-            )
-            .await
-            {
-                Ok(_) => delivered += 1,
-                Err(e) => tracing::warn!(
-                    "Failed to notify watcher {} about {notification_type}: {e}",
-                    watcher.user_id
-                ),
-            }
+                undelivered = recipients.len(),
+                "Failed to notify a page of watchers: {e:#}"
+            ),
         }
 
         // A short page is the last one — no extra query to discover the end.
@@ -398,6 +415,111 @@ mod tests {
         assert!(
             logs.rendered().is_empty(),
             "a genuine missing row must not be reported as a database failure"
+        );
+    }
+
+    /// Statements one watch fan-out sends for a private repository whose
+    /// `watchers` subscribers are all collaborators, and how many of them it
+    /// notified.
+    async fn fanout_cost(watchers: usize) -> (usize, usize) {
+        use sea_orm::{ActiveValue::Set, EntityTrait, PaginatorTrait};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut db = migrated_memory_database().await;
+        let owner = rg_db::ops::user_ops::create_user(&db, "fan-owner", "fan-owner@x.test", "", "")
+            .await
+            .expect("create owner");
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(owner.id),
+                name: Set("fanned".to_string()),
+                is_private: Set(true),
+                default_branch: Set("main".to_string()),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create repo");
+        for index in 0..watchers {
+            let user = rg_db::ops::user_ops::create_user(
+                &db,
+                &format!("fan-{index}"),
+                &format!("fan-{index}@x.test"),
+                "",
+                "",
+            )
+            .await
+            .expect("create watcher");
+            rg_db::ops::repo_collaborator_ops::create(
+                &db,
+                rg_db::entities::repo_collaborator::ActiveModel {
+                    repo_id: Set(repo.id),
+                    user_id: Set(user.id),
+                    permission: Set("read".to_string()),
+                    created_at: Set(now),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("add collaborator");
+            rg_db::ops::repo_watch_ops::set_watch_state(&db, user.id, repo.id, "watching")
+                .await
+                .expect("watch");
+        }
+        // One subscriber who may not read the repository any more.
+        let outsider = rg_db::ops::user_ops::create_user(&db, "fan-out", "fan-out@x.test", "", "")
+            .await
+            .expect("create outsider");
+        rg_db::ops::repo_watch_ops::set_watch_state(&db, outsider.id, repo.id, "watching")
+            .await
+            .expect("watch");
+
+        let statements = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&statements);
+        db.set_metric_callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        super::notify_watchers(
+            &db,
+            &super::WatchEvent {
+                repo_id: repo.id,
+                author_name: "fan-owner".to_string(),
+                title: "pushed".to_string(),
+                notification_type: "push".to_string(),
+                body: None,
+            },
+        )
+        .await
+        .expect("fan out");
+        let sent = statements.load(Ordering::SeqCst);
+        let delivered = rg_db::entities::notification::Entity::find()
+            .count(&db)
+            .await
+            .expect("count notifications") as usize;
+        (sent, delivered)
+    }
+
+    /// card_f25c98fdf3ee: the fan-out used to check and insert one subscriber
+    /// at a time — up to two reads and an autocommitted INSERT each, the write
+    /// lock taken once per recipient. A page is now one read check and one
+    /// insert, so the statement count does not grow with the audience, and the
+    /// outsider who lost access is still left out.
+    #[tokio::test]
+    async fn a_fan_out_costs_the_same_statements_for_three_watchers_or_forty() {
+        let (few, few_delivered) = fanout_cost(3).await;
+        let (many, many_delivered) = fanout_cost(40).await;
+        assert_eq!(few_delivered, 3);
+        assert_eq!(many_delivered, 40);
+        assert_eq!(
+            few, many,
+            "a fan-out to 3 watchers sent {few} statements, to 40 sent {many}"
         );
     }
 }

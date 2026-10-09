@@ -39,6 +39,31 @@ pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<R
         .context("db: list collaborators by repo")
 }
 
+/// Which of `user_ids` hold any collaborator grant on `repo_id`.
+///
+/// The batch form of [`get_permission`]`.is_some()` for a caller that has to
+/// ask the same question about a page of people at once — the watch fan-out
+/// checks every subscriber before it delivers. One statement for the page
+/// instead of one per person; the caller bounds the page.
+pub async fn collaborators_among(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    user_ids: &[i64],
+) -> Result<Vec<i64>> {
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    CollabEntity::find()
+        .select_only()
+        .column(repo_collaborator::Column::UserId)
+        .filter(repo_collaborator::Column::RepoId.eq(repo_id))
+        .filter(repo_collaborator::Column::UserId.is_in(user_ids.iter().copied()))
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list collaborators among users")
+}
+
 /// Get the effective permission of a user on a repo.
 /// Returns: "admin" | "write" | "read" | None
 pub async fn get_permission(
