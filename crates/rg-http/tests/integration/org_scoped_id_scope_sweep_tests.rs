@@ -912,9 +912,12 @@ async fn removing_a_member_reports_only_real_membership_changes() {
         );
     }
 
+    // The team family comes first: removing an org member cascades into the
+    // member's team rows of that org, so the team membership must be exercised
+    // while it still exists.
     for (family, base_path) in [
-        ("organization", format!("/api/v1/orgs/{ORG}/members")),
         ("team", format!("/api/v1/orgs/{ORG}/teams/{team}/members")),
+        ("organization", format!("/api/v1/orgs/{ORG}/members")),
     ] {
         let removed = fx
             .client
