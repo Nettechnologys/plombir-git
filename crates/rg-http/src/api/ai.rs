@@ -437,7 +437,8 @@ pub async fn ai_index_repository(
         crate::api::repo_content::RepoEmptiness::NotEmpty => {}
     }
 
-    let indexer = rg_core::search::code_indexer::CodeIndexer::new(state.db.clone());
+    let indexer = rg_core::search::code_indexer::CodeIndexer::new(state.db.clone())
+        .with_write_pool(state.db_write.clone());
     match indexer
         .index_repository(repo.id, &repo_path, &repo.default_branch)
         .await

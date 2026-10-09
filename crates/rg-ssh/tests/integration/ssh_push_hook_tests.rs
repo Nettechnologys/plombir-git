@@ -229,6 +229,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
             external_url: None,
             notifier: Some(notifier),
             delivery_tracker: delivery_tracker.clone(),
+            write_pool: None,
         })),
         lfs: None,
     };

@@ -259,6 +259,7 @@ pub async fn run_post_push_hooks(
             ci_engine: &ci,
             external_url: None,
             delivery_tracker: &delivery_tracker,
+            write_pool: None,
         },
         ref_updates,
     )

@@ -307,6 +307,8 @@ fn content_bytes_expr(backend: DatabaseBackend) -> &'static str {
 /// Code indexer service.
 pub struct CodeIndexer {
     db: DatabaseConnection,
+    /// Where every write transaction opens — see [`Self::with_write_pool`].
+    db_write: DatabaseConnection,
 }
 
 /// One file's row in `code_fts`, before it knows which generation it joins.
@@ -614,7 +616,24 @@ fn file_count(files: i64) -> usize {
 impl CodeIndexer {
     /// Create a new code indexer.
     pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+        Self {
+            db_write: db.clone(),
+            db,
+        }
+    }
+
+    /// Open every write transaction on `db_write` (`rg_db::open_write_pool`).
+    ///
+    /// A refresh writes a snapshot in a run of short chunk transactions, and on
+    /// the shared pool each of them waits in SQLite's busy handler holding a
+    /// connection a reader needs (card_a84b25c9efbe). Every transaction here
+    /// goes through [`Self::begin_write`], and its body reads and writes only
+    /// through that transaction — the lookups that run beside it stay on the
+    /// shared pool, outside it — so none holds the write pool while asking it
+    /// for a second connection.
+    pub fn with_write_pool(mut self, db_write: DatabaseConnection) -> Self {
+        self.db_write = db_write;
+        self
     }
 
     /// Rebuild a repository's code index from the tree `ref_name` names.
@@ -852,7 +871,7 @@ impl CodeIndexer {
         attempt: usize,
         stage: &str,
     ) -> Result<Option<DatabaseTransaction>> {
-        match self.db.begin().await {
+        match self.db_write.begin().await {
             Ok(transaction) => Ok(Some(transaction)),
             Err(error) if budget.may_retry() && classify(&error).is_worthwhile() => {
                 classify(&error).wait(attempt).await;
@@ -2511,6 +2530,89 @@ mod tests {
             "count and page disagree"
         );
         paths
+    }
+
+    /// card_a84b25c9efbe: a rebuild and an incremental push open every write
+    /// transaction on the write pool, and nothing the indexer writes lands on
+    /// the shared one. The write pool is one connection that gives up after two
+    /// seconds, so a transaction that asked the pool for a second connection
+    /// from inside itself would fail here instead of hanging.
+    #[tokio::test]
+    async fn index_writes_go_through_the_write_pool() {
+        type Sent = Arc<Mutex<Vec<String>>>;
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("index.db").display()
+        );
+        let mut shared = rg_db::connect_with_pool(&url, 2, 60, 2)
+            .await
+            .expect("shared pool");
+        rg_db::run_migrations(&shared).await.expect("migrate");
+        seed_repository(&shared, Some(TEST_OWNER_ID), Some(TEST_REPO_ID), "pool").await;
+        let mut write = rg_db::open_write_pool(&url, 2, 60, &shared)
+            .await
+            .expect("write pool");
+        let record = |pool: &mut DatabaseConnection| -> Sent {
+            let sent: Sent = Arc::default();
+            let sink = Arc::clone(&sent);
+            pool.set_metric_callback(move |info: &sea_orm::metric::Info<'_>| {
+                let sql = info.statement.sql.trim_start().to_ascii_uppercase();
+                if ["INSERT", "UPDATE", "DELETE"]
+                    .iter()
+                    .any(|verb| sql.starts_with(verb))
+                {
+                    sink.lock().unwrap().push(info.statement.sql.clone());
+                }
+            });
+            sent
+        };
+        let on_shared = record(&mut shared);
+        let on_write = record(&mut write);
+        let indexer = CodeIndexer::new(shared.clone()).with_write_pool(write.clone());
+
+        let files = forty_files();
+        let (_dir, worktree) = committed_files(&files);
+        let indexed = tokio::time::timeout(
+            Duration::from_secs(60),
+            indexer.index_repository(TEST_REPO_ID, &worktree, "HEAD"),
+        )
+        .await
+        .expect("the rebuild hung on its own write pool")
+        .expect("rebuild");
+        assert_eq!(indexed, files.len());
+        std::fs::write(worktree.join("changed.rs"), b"fn changed() {}\n").expect("change");
+        commit_all(&worktree, "change one file");
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            indexer.refresh_repository(TEST_REPO_ID, &worktree, "HEAD"),
+        )
+        .await
+        .expect("the refresh hung on its own write pool")
+        .expect("refresh");
+        assert!(indexed_paths(&indexer, TEST_REPO_ID)
+            .await
+            .contains(&"changed.rs".to_string()));
+
+        let written = on_write.lock().unwrap().clone();
+        for table in ["code_fts", "code_index_snapshots"] {
+            assert!(
+                written.iter().any(|sql| sql.contains(table)),
+                "no {table} write went through the write pool: {written:?}"
+            );
+        }
+        let leaked: Vec<String> = on_shared
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|sql| sql.contains("code_fts") || sql.contains("code_index_snapshots"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            leaked,
+            Vec::<String>::new(),
+            "index writes on the shared pool"
+        );
     }
 
     /// card_9ca44c148b8f: `repo_id` is an indexed column of the SQLite FTS5

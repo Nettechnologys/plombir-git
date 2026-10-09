@@ -70,6 +70,10 @@ pub struct PostPushParams<'a> {
     pub ci_engine: &'a dyn CiTrigger,
     pub external_url: Option<&'a str>,
     pub delivery_tracker: &'a crate::task_tracker::TaskTracker,
+    /// The pool the hooks' steady writers queue on (`rg_db::open_write_pool`)
+    /// — today the code index refresh (card_a84b25c9efbe). `None` writes
+    /// through `db`.
+    pub write_pool: Option<&'a DatabaseConnection>,
 }
 
 impl PostPushParams<'_> {
@@ -120,6 +124,8 @@ pub struct PostPushContext {
     pub notifier: Option<Arc<dyn PushNotifier>>,
     /// Tracker used for detached post-push work spawned from this context.
     pub delivery_tracker: crate::task_tracker::TaskTracker,
+    /// See [`PostPushParams::write_pool`].
+    pub write_pool: Option<DatabaseConnection>,
 }
 
 impl PostPushContext {
@@ -157,6 +163,7 @@ impl PostPushContext {
                 ci_engine: &*self.ci_engine,
                 external_url: self.external_url.as_deref(),
                 delivery_tracker: &self.delivery_tracker,
+                write_pool: self.write_pool.as_ref(),
             },
             ref_updates,
         )
@@ -198,6 +205,7 @@ impl PostPushContext {
                     ci_engine: &*context.ci_engine,
                     external_url: context.external_url.as_deref(),
                     delivery_tracker: &context.delivery_tracker,
+                    write_pool: context.write_pool.as_ref(),
                 },
                 &ref_updates,
             )
@@ -899,12 +907,13 @@ fn refresh_code_index_for_push(
     }
 
     let db = params.db.clone();
+    let db_write = params.write_pool.unwrap_or(params.db).clone();
     let repo_id = target.repo_id;
     let repo_path = target.path.clone();
     let ref_name = target.default_branch.clone();
 
     params.delivery_tracker.spawn(async move {
-        let indexer = crate::search::code_indexer::CodeIndexer::new(db);
+        let indexer = crate::search::code_indexer::CodeIndexer::new(db).with_write_pool(db_write);
         match indexer
             .refresh_repository(repo_id, &repo_path, &ref_name)
             .await
@@ -1812,6 +1821,7 @@ mod tests {
             ci_engine: &ci,
             external_url: None,
             delivery_tracker: &tracker,
+            write_pool: None,
         };
         trigger_push_webhooks(
             &params,
@@ -1879,6 +1889,7 @@ mod tests {
             ci_engine: &ci,
             external_url: None,
             delivery_tracker: &tracker,
+            write_pool: None,
         };
         let update = moved(
             "refs/heads/main",
@@ -2035,6 +2046,7 @@ mod tests {
             external_url: None,
             notifier: None,
             delivery_tracker: tracker.clone(),
+            write_pool: None,
         };
         let delayed_update = RefUpdate {
             old_sha: initial,
@@ -2298,6 +2310,7 @@ mod tests {
             ci_engine: &ci,
             external_url: None,
             delivery_tracker: &tracker,
+            write_pool: None,
         };
         let target = HookTarget {
             repo_id: repo.id,
@@ -2585,6 +2598,7 @@ mod seed_lookup_tests {
                 ci_engine: &ci,
                 external_url: None,
                 delivery_tracker: &delivery_tracker,
+                write_pool: None,
             },
             &[RefUpdate {
                 old_sha: "0".repeat(40),

@@ -1616,6 +1616,7 @@ pub(crate) async fn run_serve(
         external_url: resolved_external_url,
         notifier: Some(std::sync::Arc::new(notification_hub)),
         delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
+        write_pool: Some(db_write.clone()),
     };
 
     // ── Scheduled mirror sync ─────────────────────────────────────

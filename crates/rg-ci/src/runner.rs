@@ -905,7 +905,8 @@ impl PipelineRunner {
         let engine = crate::CiEngine::with_notifications_and_job_timeout(
             self.notifications.clone(),
             self.job_timeout_secs,
-        );
+        )
+        .with_write_pool(self.db_write.clone());
         crate::post_push_context(
             repo_root,
             self.docker_enabled,

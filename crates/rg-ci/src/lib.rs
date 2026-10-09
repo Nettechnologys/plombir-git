@@ -1197,6 +1197,7 @@ fn post_push_context(
         external_url: external_url.map(str::to_string),
         notifier: engine.notifications.notifier.clone(),
         delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
+        write_pool: engine.write_pool.clone(),
     }
 }
 

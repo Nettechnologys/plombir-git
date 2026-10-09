@@ -270,6 +270,7 @@ impl AppState {
             external_url: self.external_url.clone(),
             notifier: Some(Arc::new(self.notification_hub.clone())),
             delivery_tracker: self.delivery_tracker.clone(),
+            write_pool: Some(self.db_write.clone()),
         }
     }
 

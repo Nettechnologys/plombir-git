@@ -1657,6 +1657,7 @@ mod tests {
             external_url: None,
             notifier: None,
             delivery_tracker: tracker.clone(),
+            write_pool: None,
         };
         let pass = |mirror: Mirror| {
             let (db, repo_root, clone, hooks) =
