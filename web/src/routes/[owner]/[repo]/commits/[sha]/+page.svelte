@@ -5,6 +5,7 @@
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { isUnavailable, optionalSection } from '$lib/optionalSection';
   import { createT, formatDate as formatCalendarDate } from '$lib/i18n';
+  import { isHttpUrl } from '$lib/utils/url';
 
   const t = createT();
 
@@ -269,10 +270,15 @@
                   <span class="status-date">{formatDate(status.created_at)}</span>
                 </div>
                 <p class="status-description">{status.description || t('common.no_description')}</p>
-                {#if status.target_url}
+                {#if isHttpUrl(status.target_url)}
                   <a href={status.target_url} target="_blank" rel="noopener noreferrer" class="status-details-link">
                     {t('commit_detail.view_details')}
                   </a>
+                {:else if status.target_url}
+                  <!-- A status row written before the backend rule existed can
+                       name any scheme; never bind it to an href. Show what the
+                       server said, as text. -->
+                  <span class="status-details-plain">{status.target_url}</span>
                 {/if}
               </div>
             </div>
@@ -517,6 +523,13 @@
   .status-details-link:hover {
     opacity: 0.8;
     text-decoration: underline;
+  }
+
+  .status-details-plain {
+    display: inline-block;
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    word-break: break-all;
   }
 
   /* Responsive */
