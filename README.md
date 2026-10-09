@@ -253,7 +253,12 @@ required.
 ### Requirements
 
 - Rust 1.95+ (stable)
-- `git` on `PATH` (used for a few pack / diff operations still delegated to the CLI)
+- `git` 2.38 or newer on `PATH`. A few pack / diff operations are still
+  delegated to the CLI, and outbound clones (imports, pull mirrors) pin the
+  remote's checked address through `http.curloptResolve`, which git before
+  2.38 silently ignores — the server refuses to start on an older git rather
+  than clone through an unpinned resolver. Debian 12, Ubuntu 24.04 and current
+  macOS ship a new enough git; Ubuntu 22.04 (2.34) needs the `git-core` PPA.
 - Linux or macOS
 
 ### Build

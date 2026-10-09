@@ -139,6 +139,11 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    # git 2.38 or newer, which bookworm's 2.39 satisfies: the server refuses to
+    # start below it, because the DNS pin on import/mirror clones
+    # (`http.curloptResolve`) only exists from 2.38 — see
+    # `rg_git::cli_gateway::MIN_GIT_VERSION`. Changing the base image means
+    # re-checking this.
     git \
     curl \
     libsqlite3-0 \
