@@ -3,6 +3,11 @@
 pub mod embedded_runners;
 pub mod log_write_queue;
 
+/// The two CI job rules the external runner applies as well. They live in
+/// `rg-process`, the one crate both executors link (the agent deliberately
+/// links none of the server's crates), and are the server's through this path.
+pub use rg_process::ci_job::{validate_image_reference, JOB_LOG_MAX_BYTES};
+
 use anyhow::{Context, Result};
 use sea_orm::{DatabaseConnection, TransactionTrait};
 use std::collections::HashMap;

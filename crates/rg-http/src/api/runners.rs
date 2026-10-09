@@ -30,7 +30,15 @@ use utoipa::{IntoParams, ToSchema};
 /// whole `log` column. `rg_runner::api` trims to the same ceiling before it
 /// sends, so an over-long log arrives shortened and marked instead of being
 /// refused.
+///
+/// Spelled as a literal because `body-limit-declaration-contract-check.mjs`
+/// reads the ceiling of every whole-body route from this crate's source and, by
+/// design, follows no path into another crate. The authority is
+/// `rg_core::ci::JOB_LOG_MAX_BYTES` — the number both executors stop retaining
+/// output at — and the assertion below makes a drift between the two a build
+/// that does not compile rather than an intake that disagrees with its runners.
 pub(crate) const JOB_LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
+const _: () = assert!(JOB_LOG_MAX_BYTES == rg_core::ci::JOB_LOG_MAX_BYTES);
 
 /// The declared ceiling for one CI cache archive.
 ///

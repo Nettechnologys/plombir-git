@@ -140,7 +140,7 @@ pub(crate) async fn run_job_local(
         for (key, value) in variables {
             command.env(key, value);
         }
-        rg_process::output_in_process_tree(&mut command).await
+        rg_process::output_in_process_tree_bounded(&mut command, JOB_LOG_MAX_BYTES).await
     };
 
     #[cfg(windows)]
@@ -153,24 +153,32 @@ pub(crate) async fn run_job_local(
         for (key, value) in variables {
             command.env(key, value);
         }
-        rg_process::output_in_process_tree(&mut command).await
+        rg_process::output_in_process_tree_bounded(&mut command, JOB_LOG_MAX_BYTES).await
     };
 
     match output {
-        Ok(o) => {
-            let code = o.status.code().unwrap_or(-1);
-            let mut log = String::from_utf8_lossy(&o.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-            if !stderr.is_empty() {
-                if !log.is_empty() {
-                    log.push('\n');
-                }
-                log.push_str(&stderr);
-            }
-            (code, log)
-        }
+        Ok(o) => (o.status.code().unwrap_or(-1), bounded_job_log(&o)),
         Err(e) => (-1, format!("Failed to spawn job: {}", e)),
     }
+}
+
+/// The most of a job's output this runner keeps in memory — the server's own
+/// ceiling on one log upload, so what is kept is what can be sent.
+const JOB_LOG_MAX_BYTES: usize = rg_process::ci_job::JOB_LOG_MAX_BYTES;
+
+/// A job's output as the log that will be uploaded: stdout, then stderr, within
+/// [`JOB_LOG_MAX_BYTES`], and ending with a notice when the job printed more.
+///
+/// The readers already stopped retaining at the ceiling, so what is cut here is
+/// at most the room the notice needs. Collecting the whole output first and
+/// trimming it before the upload bounded the request, not this process.
+fn bounded_job_log(output: &rg_process::BoundedOutput) -> String {
+    output.merged_log(JOB_LOG_MAX_BYTES, |dropped| {
+        format!(
+            "[plombir-git-runner] log truncated: the job printed more than {JOB_LOG_MAX_BYTES} \
+             bytes; {dropped} bytes were dropped"
+        )
+    })
 }
 
 /// Hard cap on the number of processes a job container may spawn (fork-bomb guard).
@@ -198,6 +206,16 @@ pub(crate) async fn run_job_docker(
     workspace: &std::path::Path,
     job_id: i64,
 ) -> (i32, String) {
+    // Asked again here, not only by the server at trigger time: the job came
+    // over the wire from whatever server version validated it, and this is the
+    // last point before the value is handed to a process.
+    if let Err(reason) = rg_process::ci_job::validate_image_reference(image) {
+        let msg =
+            format!("Job image is not a valid image reference ({reason}); refusing to run it");
+        tracing::warn!(job_id, "{}", msg);
+        return (-1, msg);
+    }
+
     // Check if Docker daemon is running
     let docker_ok = tokio::process::Command::new("docker")
         .arg("info")
@@ -223,18 +241,21 @@ pub(crate) async fn run_job_docker(
     for (key, value) in variables {
         command.env(key, value);
     }
-    command.kill_on_drop(true);
-    match command.output().await {
+    command
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Spawned and waited for in two steps so the output is read under
+    // `JOB_LOG_MAX_BYTES` as it arrives; `output()` kept all of it.
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return (-1, format!("Failed to run docker: {}", e)),
+    };
+    match rg_process::wait_with_bounded_output(child, JOB_LOG_MAX_BYTES).await {
         Ok(o) => {
             let code = o.status.code().unwrap_or(-1);
-            let mut log = String::from_utf8_lossy(&o.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-            if !stderr.is_empty() {
-                if !log.is_empty() {
-                    log.push('\n');
-                }
-                log.push_str(&stderr);
-            }
+            let mut log = bounded_job_log(&o);
             if code != 0 && log.is_empty() {
                 log = format!("Docker exited with code {}", code);
             }
@@ -257,6 +278,10 @@ pub(crate) async fn run_job_docker(
 /// passed, so the job has no path to the daemon or host devices. Only variable
 /// *names* are placed on the command line; values are inherited from the CLI
 /// environment so secrets never appear in the host process arguments.
+///
+/// `--` ends option parsing, so the image — the one value here the job's author
+/// wrote — is positional whatever it looks like: `image: "--privileged"` used to
+/// be read by the CLI as exactly that flag.
 fn docker_run_args(
     image: &str,
     script: &str,
@@ -288,6 +313,7 @@ fn docker_run_args(
         args.push("-e".to_string());
         args.push(key.clone());
     }
+    args.push("--".to_string());
     args.push(image.to_string());
     args.push("sh".to_string());
     args.push("-c".to_string());
@@ -388,10 +414,15 @@ mod tests {
             "secret value leaked into argv"
         );
 
-        // Image and script still terminate the invocation.
+        // Image and script still terminate the invocation, behind the `--`
+        // that keeps the image positional whatever it is spelled like.
         assert_eq!(
-            &args[args.len() - 4..],
-            &["alpine:3.20", "sh", "-c", "echo hi"]
+            &args[args.len() - 5..],
+            &["--", "alpine:3.20", "sh", "-c", "echo hi"]
+        );
+        assert!(
+            !args[..args.len() - 5].iter().any(|a| a == "--"),
+            "a `--` before the hardening flags would turn them into positionals: {args:?}"
         );
     }
 
@@ -406,6 +437,62 @@ mod tests {
         .await;
         assert_eq!(code, 0, "{log}");
         assert!(log.contains("ok"));
+    }
+
+    /// A job that prints without end used to be collected whole in this
+    /// process's memory and only trimmed before the upload. The script prints
+    /// 20 MiB; what is kept is the ceiling, the job still finishes as the
+    /// success it was, and the log ends by saying what was cut.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_executor_keeps_a_flooding_job_under_the_log_ceiling() {
+        let temp = tempfile::tempdir().unwrap();
+        let (code, log) = run_job_local(
+            "head -c 20971520 /dev/zero | tr '\\0' y; printf 'flood done\\n' >&2",
+            &job_variables(None),
+            temp.path(),
+        )
+        .await;
+        assert_eq!(code, 0, "{}", &log[log.len().saturating_sub(200)..]);
+        assert!(
+            log.len() <= JOB_LOG_MAX_BYTES,
+            "{} bytes kept, over the {JOB_LOG_MAX_BYTES} ceiling",
+            log.len()
+        );
+        assert!(
+            log.len() > JOB_LOG_MAX_BYTES / 2,
+            "{} bytes kept",
+            log.len()
+        );
+        assert!(log.starts_with(&"y".repeat(1024)));
+        let last = log.lines().last().unwrap_or_default();
+        assert!(
+            last.starts_with("[plombir-git-runner] log truncated: the job printed more than"),
+            "{last:?}"
+        );
+        assert!(last.contains("bytes were dropped"), "{last:?}");
+    }
+
+    /// The server validates `image` at trigger time, but the job came over the
+    /// wire from whatever version did, and this is the last line before the
+    /// value reaches a process: a flag spelled as an image is a failure that
+    /// names the rule, not a `docker run`.
+    #[tokio::test]
+    async fn a_docker_image_spelled_like_a_flag_is_refused_before_docker_runs() {
+        for image in [
+            "--privileged",
+            "-v/:/host",
+            "--env-file=/etc/passwd",
+            "Nginx",
+        ] {
+            let (code, log) =
+                run_job_docker(image, "echo hi", &[], std::path::Path::new("."), 7).await;
+            assert_eq!(code, -1, "{image}");
+            assert!(
+                log.contains("not a valid image reference"),
+                "{image}: {log}"
+            );
+        }
     }
 
     #[cfg(unix)]

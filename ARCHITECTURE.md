@@ -124,7 +124,7 @@ ForgeKeep/
 ```
 rg-ci ──> rg-core, rg-db, rg-git, rg-process
 rg-cli ──> rg-ci, rg-core, rg-db, rg-git, rg-http, rg-process, rg-runner, rg-ssh
-rg-core ──> rg-db, rg-git
+rg-core ──> rg-db, rg-git, rg-process
 rg-db ──> none
 rg-git ──> rg-process
 rg-http ──> rg-core, rg-db, rg-git, rg-mcp
@@ -144,7 +144,10 @@ the business-agnostic `rg-process` lifecycle helper. `rg-ci` and `rg-runner` als
 workspace archive through `rg_process::workspace_archive`, so the embedded and
 the external runner share one rule for symlinks: a link met while walking a
 declared directory is stored as a link, and a declared path that resolves outside
-the workspace is refused.
+the workspace is refused. `rg-core` takes `rg-process` for the same reason: the
+two rules a job's inputs to a child process obey on both sides of the runner
+API — the image-reference grammar and the job-log ceiling (`rg_process::ci_job`)
+— are written once there and re-exported as `rg_core::ci` for the server.
 
 `scripts/architecture-crate-dependency-contract-check.mjs` compares this block
 with `cargo metadata`, so adding a crate edge without updating the graph fails

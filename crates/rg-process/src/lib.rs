@@ -11,6 +11,7 @@ compile_error!("rg-process supports Unix and Windows process trees only");
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
+pub mod ci_job;
 mod retired_environment;
 pub mod workspace_archive;
 
@@ -172,15 +173,168 @@ impl std::error::Error for ProcessOutputError {
     }
 }
 
-/// Run `command` while owning its whole descendant tree.
+/// What a child printed, kept under a ceiling the caller declared.
+///
+/// Produced by [`output_in_process_tree_bounded`] and
+/// [`wait_with_bounded_output`]. Unlike [`TimedOutput::OutputTooLarge`],
+/// crossing the ceiling is not a refusal: a CI job's log is wanted even when
+/// the job was too talkative, so the readers keep draining both pipes until
+/// the child closes them and only stop *retaining*. `dropped_bytes` counts what
+/// left the kernel and went nowhere, so the log can end with an honest line
+/// about it.
+#[derive(Debug)]
+pub struct BoundedOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// Bytes read from either pipe once the shared budget was spent.
+    pub dropped_bytes: u64,
+}
+
+/// Room kept free under a log ceiling for the line that says the log was cut.
+pub const TRUNCATION_NOTICE_BUDGET: usize = 256;
+
+impl BoundedOutput {
+    /// stdout, then stderr after one newline — the merge both runners did by
+    /// hand on [`Output`] — fitted under `limit` bytes.
+    ///
+    /// When anything was cut, by the readers or by this fit, the text is
+    /// shortened to leave [`TRUNCATION_NOTICE_BUDGET`] free and `notice` is
+    /// asked for the closing line, given the total number of bytes the reader
+    /// of the log never gets to see. A notice longer than the budget is clipped
+    /// so the result still fits `limit`.
+    pub fn merged_log(&self, limit: usize, notice: impl FnOnce(u64) -> String) -> String {
+        let mut log = String::from_utf8_lossy(&self.stdout).into_owned();
+        if !self.stderr.is_empty() {
+            if !log.is_empty() {
+                log.push('\n');
+            }
+            log.push_str(&String::from_utf8_lossy(&self.stderr));
+        }
+        if self.dropped_bytes == 0 && log.len() <= limit {
+            return log;
+        }
+        let mut cut = limit
+            .saturating_sub(TRUNCATION_NOTICE_BUDGET)
+            .min(log.len());
+        while !log.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let dropped = self.dropped_bytes.saturating_add((log.len() - cut) as u64);
+        log.truncate(cut);
+        if !log.is_empty() && !log.ends_with('\n') {
+            log.push('\n');
+        }
+        // The newline above took one byte of the budget.
+        let mut notice = notice(dropped);
+        let mut notice_cut = (TRUNCATION_NOTICE_BUDGET - 1).min(notice.len());
+        while !notice.is_char_boundary(notice_cut) {
+            notice_cut -= 1;
+        }
+        notice.truncate(notice_cut);
+        log.push_str(&notice);
+        log
+    }
+}
+
+/// Take up to `want` bytes from the shared budget; what is granted may be kept.
+fn claim(budget: &std::sync::atomic::AtomicUsize, want: usize) -> usize {
+    use std::sync::atomic::Ordering;
+    let mut remaining = budget.load(Ordering::Relaxed);
+    loop {
+        let granted = want.min(remaining);
+        match budget.compare_exchange_weak(
+            remaining,
+            remaining - granted,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return granted,
+            Err(actual) => remaining = actual,
+        }
+    }
+}
+
+/// Drain `reader` to EOF, keeping only what `budget` still allows.
+///
+/// The chunk is appended up to what was granted and the rest is counted, not
+/// stored: the point of the ceiling is that those bytes never enter this
+/// process's heap, while the child never finds its pipe full and never blocks.
+async fn read_retaining<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    budget: &std::sync::atomic::AtomicUsize,
+) -> std::io::Result<(Vec<u8>, u64)> {
+    use tokio::io::AsyncReadExt as _;
+    let mut kept = Vec::new();
+    let mut dropped = 0u64;
+    // On the heap, not in the future: this reader is awaited inside the
+    // embedded runner's deeply nested job future, which lives on a 2 MiB test
+    // thread stack, and two inline 8 KiB arrays there were enough to overflow
+    // it for the largest of those tests.
+    let mut chunk = vec![0u8; 8192];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok((kept, dropped));
+        }
+        let granted = claim(budget, n);
+        kept.extend_from_slice(&chunk[..granted]);
+        dropped += (n - granted) as u64;
+    }
+}
+
+/// Wait for an already-spawned child, keeping at most `retain_limit_bytes` of
+/// its stdout and stderr together.
+///
+/// Both pipes have to be captured (`Stdio::piped()`) by the caller, which also
+/// decides what dropping the child means — `kill_on_drop(true)` for a Docker
+/// client, whose container is then removed by name. Both streams are read to
+/// EOF whatever the budget says, so a child that prints past the ceiling is
+/// never left blocked on a full pipe and still exits on its own; the exit
+/// status is the child's, not a verdict on its volume.
+pub async fn wait_with_bounded_output(
+    mut child: tokio::process::Child,
+    retain_limit_bytes: usize,
+) -> std::io::Result<BoundedOutput> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("stderr was not piped"))?;
+    let budget = std::sync::atomic::AtomicUsize::new(retain_limit_bytes);
+    let (stdout, stderr, status) = tokio::join!(
+        read_retaining(stdout, &budget),
+        read_retaining(stderr, &budget),
+        child.wait(),
+    );
+    let (stdout, dropped_stdout) = stdout?;
+    let (stderr, dropped_stderr) = stderr?;
+    Ok(BoundedOutput {
+        status: status?,
+        stdout,
+        stderr,
+        dropped_bytes: dropped_stdout.saturating_add(dropped_stderr),
+    })
+}
+
+/// Run `command` while owning its whole descendant tree, keeping at most
+/// `retain_limit_bytes` of what it prints.
 ///
 /// Dropping this future (for example when `tokio::time::timeout` elapses) kills
 /// the direct child and every process it started. The tree is also torn down
 /// after normal completion, so a background process cannot outlive the job that
-/// launched it.
-pub async fn output_in_process_tree(
+/// launched it. The output goes through [`wait_with_bounded_output`] rather
+/// than `wait_with_output`, so a job whose shell prints without end costs this
+/// process `retain_limit_bytes` of memory and not the size of what it printed.
+/// The unbounded twin is gone rather than deprecated, for the reason given on
+/// [`output_in_process_tree_with_timeout_and_limit`].
+pub async fn output_in_process_tree_bounded(
     command: &mut tokio::process::Command,
-) -> std::io::Result<Output> {
+    retain_limit_bytes: usize,
+) -> std::io::Result<BoundedOutput> {
     // Match `Command::output`: no inherited stdin, captured stdout/stderr. The
     // direct-child guard remains defense in depth if platform setup fails after
     // spawn but before the tree owner is returned.
@@ -191,9 +345,91 @@ pub async fn output_in_process_tree(
         .kill_on_drop(true);
 
     let (child, tree) = platform::spawn_async(command)?;
-    let output = child.wait_with_output().await;
+    let output = wait_with_bounded_output(child, retain_limit_bytes).await;
     drop(tree);
     output
+}
+
+#[cfg(all(test, unix))]
+mod bounded_async_tests {
+    use super::*;
+
+    const CEILING: usize = 1024 * 1024;
+
+    #[tokio::test]
+    async fn a_job_under_the_ceiling_keeps_everything_and_both_streams_in_order() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "printf out; printf err >&2; exit 3"]);
+        let output = output_in_process_tree_bounded(&mut command, CEILING)
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+        assert_eq!(output.dropped_bytes, 0);
+        assert_eq!(
+            output.merged_log(CEILING, |_| panic!("nothing was cut")),
+            "out\nerr"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_past_the_ceiling_is_drained_kept_under_it_and_still_reaped() {
+        let printed = 4 * CEILING;
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!("head -c {printed} /dev/zero | tr '\\0' x; printf 'tail' >&2; exit 7"),
+        ]);
+        let output = output_in_process_tree_bounded(&mut command, CEILING)
+            .await
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "the child ran to its own exit; the ceiling is not SIGPIPE"
+        );
+        assert!(
+            output.stdout.len() + output.stderr.len() <= CEILING,
+            "stdout {} + stderr {} over the shared ceiling",
+            output.stdout.len(),
+            output.stderr.len()
+        );
+        assert_eq!(
+            output.dropped_bytes as usize,
+            printed + 4 - output.stdout.len() - output.stderr.len(),
+            "every byte read is either kept or counted"
+        );
+        let log = output.merged_log(CEILING, |dropped| format!("[cut] {dropped} bytes dropped"));
+        assert!(log.len() <= CEILING, "{}", log.len());
+        assert!(
+            log.ends_with(&format!(
+                "\n[cut] {} bytes dropped",
+                printed + 4 - (CEILING - TRUNCATION_NOTICE_BUDGET)
+            )),
+            "{}",
+            &log[log.len() - 80..]
+        );
+    }
+
+    #[test]
+    fn a_fit_cuts_on_a_character_boundary_and_clips_an_oversized_notice() {
+        let line = "шаг\n";
+        let output = BoundedOutput {
+            status: std::process::ExitStatus::default(),
+            stdout: line.repeat(400).into_bytes(),
+            stderr: Vec::new(),
+            dropped_bytes: 0,
+        };
+        let limit = 1000;
+        let log = output.merged_log(limit, |dropped| {
+            assert!(dropped > 0);
+            "n".repeat(TRUNCATION_NOTICE_BUDGET * 2)
+        });
+        assert!(log.len() <= limit, "{}", log.len());
+        assert!(log.starts_with(line));
+        assert!(log.ends_with(&"n".repeat(TRUNCATION_NOTICE_BUDGET - 1)));
+    }
 }
 
 /// Run a blocking command under a deadline *and* under caller-declared stdout /
@@ -811,7 +1047,7 @@ mod windows_tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            output_in_process_tree(&mut command),
+            output_in_process_tree_bounded(&mut command, usize::MAX),
         )
         .await;
         assert!(

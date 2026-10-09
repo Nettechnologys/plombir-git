@@ -315,8 +315,11 @@ pub async fn start_job(
 /// The server declares the same ceiling on `POST
 /// /api/v1/runners/{id}/jobs/{job_id}/log` (`api::runners::JOB_LOG_MAX_BYTES`);
 /// `ci_job_log_boundary_tests` drives this very function against the live
-/// router, which is the only place both halves of that agreement exist.
-const LOG_UPLOAD_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// router, which is the only place both halves of that agreement exist. The
+/// number itself is `rg_process::ci_job::JOB_LOG_MAX_BYTES`, the one definition
+/// both sides link; the executor already retains no more than that, so this trim
+/// is the backstop for the notices appended after the job ran.
+const LOG_UPLOAD_MAX_BYTES: usize = rg_process::ci_job::JOB_LOG_MAX_BYTES;
 
 /// Room reserved inside [`LOG_UPLOAD_MAX_BYTES`] for the truncation notice, so
 /// the shortened upload still fits under the ceiling that caused it.

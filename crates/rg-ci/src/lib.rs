@@ -1449,6 +1449,19 @@ fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
                  {declared}"
             )));
         }
+        if let Some(image) = job.image.as_deref() {
+            // `image:` becomes the positional image argument of `docker run`.
+            // Both executors put `--` in front of it, so a value spelled like
+            // a flag can no longer be read as one — but it is still not an
+            // image, and a bad one used to be discovered only by the job's own
+            // failure (or, for `--env-file=<server config>`, by the first lines
+            // of that file arriving in the job log inside Docker's parse error).
+            if let Err(reason) = rg_core::ci::validate_image_reference(image) {
+                return Err(rg_core::error::invalid_request(format!(
+                    "job '{name}' has an invalid image: {reason}"
+                )));
+            }
+        }
         if let Some(when) = job.when.as_deref() {
             // The accepted spelling of the default is the constant the row is
             // actually written with, not a second copy of the same word: a
@@ -1714,6 +1727,16 @@ fn resolve_action_job_fields(
         .map(|template| render_action_template(job_name, "container.image", template, &context))
         .transpose()?
         .or_else(|| config.image.clone());
+    // Rendered from `${{ matrix.* }}` / `${{ inputs.* }}`, so the value the
+    // executor receives is not the one `validate_execution_semantics` saw —
+    // and a `workflow_dispatch` input is typed by whoever presses Run.
+    if let Some(image) = image.as_deref() {
+        if let Err(reason) = rg_core::ci::validate_image_reference(image) {
+            return Err(rg_core::error::invalid_request(format!(
+                "job '{job_name}' has an invalid container.image: {reason}"
+            )));
+        }
+    }
     let tags = templates
         .tags
         .as_ref()
@@ -6536,6 +6559,101 @@ mod matrix_tests {
             actions_workflow: false,
         };
         assert!(validate_execution_semantics(&config).is_err());
+    }
+
+    fn config_with_image(image: &str) -> CiConfig {
+        let mut job = config(BTreeMap::new());
+        job.matrix = None;
+        job.image = Some(image.into());
+        CiConfig {
+            stages: Some(vec!["test".into()]),
+            concurrency: None,
+            jobs: HashMap::from([("build".into(), job)]),
+            actions_workflow: false,
+        }
+    }
+
+    /// `image:` is the positional image of `docker run`. A value spelled like a
+    /// flag used to reach the CLI as one (`--privileged`, `-v/:/host`), and
+    /// `--env-file=<server config>` echoed the file's first lines into the job
+    /// log through Docker's parse error. The file is refused with the rule it
+    /// broke, by job name, before any row is written.
+    #[test]
+    fn an_image_that_is_not_an_image_reference_is_refused_at_trigger_time() {
+        for image in [
+            "--privileged",
+            "-v/:/host",
+            "--env-file=x",
+            "--env-file=/etc/plombir-git/plombir-git.toml",
+            " nginx",
+            "nginx latest",
+            "Nginx",
+            "ngïnx",
+            "",
+        ] {
+            let error = validate_execution_semantics(&config_with_image(image))
+                .map_err(|error| format!("{error:#}"))
+                .expect_err(image);
+            assert!(
+                error.contains("job 'build' has an invalid image"),
+                "{image:?}: {error}"
+            );
+        }
+        for image in [
+            "nginx",
+            "nginx:1.27",
+            "ghcr.io/org/img@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "localhost:5000/x:y",
+            "registry.example.com:5000/a/b/c:v1.2",
+        ] {
+            validate_execution_semantics(&config_with_image(image))
+                .unwrap_or_else(|error| panic!("{image}: {error:#}"));
+        }
+    }
+
+    /// The same rule for a `container.image` written as an expression: the
+    /// value the executor receives exists only once the matrix variant (or a
+    /// `workflow_dispatch` input) has been rendered into it, so it is judged
+    /// per variant, where the trigger-time validator never saw it.
+    #[test]
+    fn a_rendered_container_image_is_validated_per_matrix_variant() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/images.yml",
+            b"on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        target: [alpine, '--privileged']\n    runs-on: ubuntu-latest\n    container:\n      image: 'ghcr.io/org/${{ matrix.target }}'\n    steps:\n      - run: echo ok\n" as &[u8],
+        )]);
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect("a templated container.image is read, not judged, at parse time");
+        let job_name = "images/build";
+        let job = &config.jobs[job_name];
+        let outcomes = expand_matrix(job_name, job)
+            .unwrap()
+            .iter()
+            .map(|variant| {
+                resolve_action_job_fields(
+                    job_name,
+                    job,
+                    variant,
+                    "refs/heads/main",
+                    "push",
+                    &sha,
+                    RepositoryName {
+                        owner: "owner",
+                        name: "repo",
+                    },
+                )
+                .map(|fields| fields.image)
+                .map_err(|error| format!("{error:#}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes[0], Ok(Some("ghcr.io/org/alpine".into())));
+        let error = outcomes[1]
+            .clone()
+            .expect_err("a flag rendered into the image");
+        assert!(
+            error.contains("job 'images/build' has an invalid container.image"),
+            "{error}"
+        );
     }
 
     /// `tags:` names the labels a runner must carry, and the only code that ever
