@@ -523,6 +523,22 @@ pub async fn add_org_member(
         Err(error) => return AppError::from(error).into_response(),
     };
     let role = body.role.as_deref().unwrap_or("member");
+    // Handing out the `owner` role is handing out the organization: `OrgOwner`
+    // admits owners — and only owners — to delete and transfer, so an `admin`
+    // who could mint one (for a confederate; the unique `(org_id, user_id)`
+    // index rules out raising their own row) would capture exactly the
+    // disposal rights reserved to owners. Admins keep `member` and `admin`.
+    // Unknown role strings are refused by `rg_core::org::add_org_member`.
+    if role == "owner" {
+        match is_org_owner(&state.db, &org, actor_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return AppError::forbidden("only organization owners can grant the owner role")
+                    .into_response();
+            }
+            Err(error) => return AppError::from(error).into_response(),
+        }
+    }
     // Resolving before the insert is also what keeps a mistyped identifier a
     // 400: `organization_members.user_id` is a foreign key, so an id naming
     // nobody used to reach the database and come back as a constraint failure.

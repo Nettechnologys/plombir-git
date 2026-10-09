@@ -1,10 +1,12 @@
 //! Database operations for organizations, teams, and org/team membership.
 
 use anyhow::{Context, Result};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, Query};
 use sea_orm::*;
 
-use crate::entities::{organization, organization_member, team, team_member};
+use crate::entities::{
+    organization, organization_member, repo_collaborator, team, team_member,
+};
 
 // ── Organization ops ──────────────────────────────────────────
 
@@ -393,6 +395,35 @@ pub async fn remove_org_member(
         .exec(&transaction)
         .await
         .context("db: remove org member")?;
+    // Membership is not the only row that grants. A direct `repo_collaborators`
+    // row on one of this organization's repositories is consulted *before*
+    // membership by `can_read_repo`/`can_write_repo`, so a removed member who
+    // had one kept reading (and, with `admin`, pushing to and administering)
+    // those repositories; a `team_members` row would silently reactivate on
+    // re-add. Access to this organization goes with the membership, in the same
+    // transaction.
+    let org_repos = Query::select()
+        .column(crate::entities::repository::Column::Id)
+        .from(crate::entities::repository::Entity)
+        .and_where(crate::entities::repository::Column::OrgId.eq(org_id))
+        .to_owned();
+    repo_collaborator::Entity::delete_many()
+        .filter(repo_collaborator::Column::RepoId.in_subquery(org_repos))
+        .filter(repo_collaborator::Column::UserId.eq(user_id))
+        .exec(&transaction)
+        .await
+        .context("db: revoke removed org member's repository collaborator grants")?;
+    let org_teams = Query::select()
+        .column(team::Column::Id)
+        .from(team::Entity)
+        .and_where(team::Column::OrgId.eq(org_id))
+        .to_owned();
+    team_member::Entity::delete_many()
+        .filter(team_member::Column::TeamId.in_subquery(org_teams))
+        .filter(team_member::Column::UserId.eq(user_id))
+        .exec(&transaction)
+        .await
+        .context("db: drop removed org member's team memberships")?;
     transaction
         .commit()
         .await

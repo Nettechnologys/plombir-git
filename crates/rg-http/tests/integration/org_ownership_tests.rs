@@ -16,6 +16,7 @@
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::common::{register_full, spawn_test_app_with_db};
+use rg_db::entities::{repo_collaborator, team_member};
 
 async fn create_org(base: &str, token: &str, name: &str, visibility: &str) -> i64 {
     let resp = reqwest::Client::new()
@@ -484,5 +485,260 @@ async fn ownership_transfer_hands_over_the_role_the_column_and_the_repositories(
             .await
             .status(),
         200
+    );
+}
+
+/// Like [`add_member`], but hands the response back so a refusal can be
+/// asserted (and its status read) instead of panicking.
+async fn add_member_response(
+    base: &str,
+    token: &str,
+    org: &str,
+    user_id: i64,
+    role: &str,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/api/v1/orgs/{org}/members"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"user_id": user_id, "role": role}))
+        .send()
+        .await
+        .expect("add member")
+}
+
+/// The escalation the first fix left open: `POST /orgs/{name}/members` was
+/// gated `OrgAdmin` and passed the body's `role` straight to the insert. An
+/// `admin`-role member could therefore add a confederate — or a second account —
+/// with `role: "owner"`, and owners are exactly whom `OrgOwner` admits to
+/// `DELETE /orgs/{name}` and `POST /orgs/{name}/transfer-ownership`. Membership
+/// administration had become ownership capture.
+#[tokio::test]
+async fn only_an_owner_may_hand_out_the_owner_role() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (creator, _creator_id) =
+        register_full(&base, "own5e-creator", "own5e-creator@example.com").await;
+    let (admin, admin_id) = register_full(&base, "own5e-admin", "own5e-admin@example.com").await;
+    let (_target_admin, target_admin_id) =
+        register_full(&base, "own5e-tadmin", "own5e-tadmin@example.com").await;
+    let (target_owner, target_owner_id) =
+        register_full(&base, "own5e-towner", "own5e-towner@example.com").await;
+    let (_unknown, unknown_id) =
+        register_full(&base, "own5e-unknown", "own5e-unknown@example.com").await;
+    create_org(&base, &creator, "own5ecorp", "public").await;
+    add_member(&base, &creator, "own5ecorp", admin_id, "admin").await;
+
+    let client = reqwest::Client::new();
+    let org_url = format!("{base}/api/v1/orgs/own5ecorp");
+
+    // An admin still administers membership: `member` and `admin` are theirs.
+    assert_eq!(
+        add_member_response(&base, &admin, "own5ecorp", target_admin_id, "admin")
+            .await
+            .status(),
+        201,
+        "an admin may grant the admin role"
+    );
+    // `owner` is not theirs to give.
+    assert_eq!(
+        add_member_response(&base, &admin, "own5ecorp", target_owner_id, "owner")
+            .await
+            .status(),
+        403,
+        "an admin granted the owner role"
+    );
+    // The refusal stored nothing: the target is still no one in this
+    // organization, and can neither see it as an admin nor delete it.
+    assert_eq!(
+        status(client.delete(&org_url).bearer_auth(&target_owner)).await,
+        403,
+        "the refused target was admitted anyway"
+    );
+    // Unknown roles are a bad request from either rung, not a stored role.
+    assert_eq!(
+        add_member_response(&base, &admin, "own5ecorp", unknown_id, "root")
+            .await
+            .status(),
+        400,
+        "an unknown org role must be rejected"
+    );
+    assert_eq!(
+        add_member_response(&base, &creator, "own5ecorp", unknown_id, "root")
+            .await
+            .status(),
+        400,
+        "an unknown org role must be rejected by the owner too"
+    );
+    // An owner may hand out the role — and the new owner can dispose of the
+    // organization immediately, which is the right the admin could not mint.
+    assert_eq!(
+        add_member_response(&base, &creator, "own5ecorp", target_owner_id, "owner")
+            .await
+            .status(),
+        201,
+        "an owner may grant the owner role"
+    );
+    assert_eq!(
+        status(client.delete(&org_url).bearer_auth(&target_owner)).await,
+        200,
+        "the newly granted owner cannot delete the organization"
+    );
+}
+
+/// The other leftover: `remove_org_member` deleted only the membership row. A
+/// member who had added themselves (or been given) a direct `repo_collaborators`
+/// row on one of the organization's repositories kept access to it after the
+/// removal — collaborator rows are consulted before membership — and a
+/// `team_members` row stayed behind to silently reactivate on re-add. Both must
+/// go with the membership.
+#[tokio::test]
+async fn removing_a_member_revokes_their_direct_access_rows() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner, _) = register_full(&base, "own5f-owner", "own5f-owner@example.com").await;
+    let (intruder, intruder_id) =
+        register_full(&base, "own5f-intruder", "own5f-intruder@example.com").await;
+    create_org(&base, &owner, "own5fcorp", "private").await;
+    let repo_id = create_org_repo(&base, &owner, "own5fcorp", "vault", true).await;
+    // Admin is what the `RepoAdmin` gate wants before it lets the intruder
+    // write their own collaborator row (`can_admin_repo` admits org admins).
+    add_member(&base, &owner, "own5fcorp", intruder_id, "admin").await;
+
+    let client = reqwest::Client::new();
+    let repo = format!("{base}/api/v1/repos/own5fcorp/vault");
+    // The direct grant that used to survive the removal.
+    assert_eq!(
+        status(
+            client
+                .post(format!("{repo}/collaborators"))
+                .bearer_auth(&intruder)
+                .json(&serde_json::json!({"user_id": intruder_id, "permission": "admin"}))
+        )
+        .await,
+        201,
+        "an org admin may grant themselves a collaborator row"
+    );
+    // And a team membership that used to stay behind.
+    let team_id = reqwest::Client::new()
+        .post(format!("{base}/api/v1/orgs/own5fcorp/teams"))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({"name": "vault-team", "permission": "admin"}))
+        .send()
+        .await
+        .expect("create team")
+        .json::<serde_json::Value>()
+        .await
+        .expect("json")["id"]
+        .as_i64()
+        .expect("team id");
+    assert_eq!(
+        status(
+            client
+                .post(format!(
+                    "{base}/api/v1/orgs/own5fcorp/teams/{team_id}/members"
+                ))
+                .bearer_auth(&owner)
+                .json(&serde_json::json!({"user_id": intruder_id, "role": "member"}))
+        )
+        .await,
+        201,
+        "baseline: the intruder joins a team"
+    );
+
+    // Baseline: the rows added up to real access.
+    assert_eq!(status(client.get(&repo).bearer_auth(&intruder)).await, 200);
+    assert!(
+        listed_repos(&base, &intruder, "own5fcorp")
+            .await
+            .contains(&"vault".to_string()),
+        "baseline: the private repository is listed to its admin"
+    );
+    let search: serde_json::Value = client
+        .get(format!("{base}/api/v1/search?q=vault&type=repos"))
+        .bearer_auth(&intruder)
+        .send()
+        .await
+        .expect("search")
+        .json()
+        .await
+        .expect("json");
+    assert!(
+        search["results"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|e| e["repo_name"].as_str() == Some("vault"))),
+        "baseline: the private repository is searchable by its admin: {search}"
+    );
+
+    let removed = remove_member(&base, &owner, "own5fcorp", intruder_id).await;
+    assert_eq!(removed.status(), 200, "the owner removes the intruder");
+
+    // Read, write and admin are all refused now.
+    let read = status(client.get(&repo).bearer_auth(&intruder)).await;
+    assert!(
+        matches!(read, 403 | 404),
+        "the removed member still reads through the collaborator row: {read}"
+    );
+    assert_eq!(
+        status(
+            client
+                .post(format!("{repo}/labels"))
+                .bearer_auth(&intruder)
+                .json(&serde_json::json!({"name": "intruder", "color": "#ff0000"}))
+        )
+        .await,
+        403,
+        "the removed member still writes through the collaborator row"
+    );
+    assert_eq!(
+        status(
+            client
+                .post(format!("{repo}/collaborators"))
+                .bearer_auth(&intruder)
+                .json(&serde_json::json!({"user_id": intruder_id, "permission": "admin"}))
+        )
+        .await,
+        403,
+        "the removed member still administers through the collaborator row"
+    );
+    assert!(
+        !listed_repos(&base, &intruder, "own5fcorp")
+            .await
+            .contains(&"vault".to_string()),
+        "the private repository is still listed to the removed member"
+    );
+    let search: serde_json::Value = client
+        .get(format!("{base}/api/v1/search?q=vault&type=repos"))
+        .bearer_auth(&intruder)
+        .send()
+        .await
+        .expect("search")
+        .json()
+        .await
+        .expect("json");
+    assert!(
+        !search["results"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|e| e["repo_name"].as_str() == Some("vault"))),
+        "the private repository is still searchable by the removed member: {search}"
+    );
+
+    // Both rows really are gone, not merely inert.
+    let grants = repo_collaborator::Entity::find()
+        .filter(repo_collaborator::Column::RepoId.eq(repo_id))
+        .filter(repo_collaborator::Column::UserId.eq(intruder_id))
+        .all(&db)
+        .await
+        .expect("read collaborator rows");
+    assert!(
+        grants.is_empty(),
+        "the removed member's direct collaborator row survived: {grants:?}"
+    );
+    let teams = team_member::Entity::find()
+        .filter(team_member::Column::TeamId.eq(team_id))
+        .filter(team_member::Column::UserId.eq(intruder_id))
+        .all(&db)
+        .await
+        .expect("read team member rows");
+    assert!(
+        teams.is_empty(),
+        "the removed member's team membership survived: {teams:?}"
     );
 }
