@@ -61,27 +61,45 @@ pub async fn get_board(db: &DatabaseConnection, id: i64) -> Result<Option<BoardF
     let board = rg_db::ops::board_ops::find_board_by_id(db, id).await?;
     let Some(board) = board else { return Ok(None) };
 
+    // Four statements for the whole board — columns, cards, the linked issues,
+    // their labels — however many columns and cards it has. It used to be one
+    // query per column and two per linked card.
     let columns = rg_db::ops::board_ops::list_columns_by_board(db, board.id).await?;
-    let mut columns_full = Vec::new();
+    let cards = rg_db::ops::board_ops::list_cards_by_board(db, board.id).await?;
 
-    for col in columns {
-        let cards = rg_db::ops::board_ops::list_cards_by_column(db, col.id).await?;
-        let mut cards_full = Vec::with_capacity(cards.len());
-        for card in cards {
-            let issue = match card.issue_id {
-                Some(issue_id) => match rg_db::ops::issue_ops::find_by_id(db, issue_id).await? {
-                    Some(issue) => Some(crate::issue::issue_with_labels(db, issue).await?),
-                    None => None,
-                },
-                None => None,
-            };
-            cards_full.push(CardFull { card, issue });
-        }
-        columns_full.push(ColumnFull {
-            column: col,
-            cards: cards_full,
-        });
+    let mut issue_ids: Vec<i64> = cards.iter().filter_map(|card| card.issue_id).collect();
+    issue_ids.sort_unstable();
+    issue_ids.dedup();
+    let issues = rg_db::ops::issue_ops::find_by_ids(db, &issue_ids).await?;
+    let issues_by_id: std::collections::HashMap<i64, crate::issue::IssueWithLabels> =
+        crate::issue::issues_with_labels(db, issues)
+            .await?
+            .into_iter()
+            .map(|issue| (issue.issue.id, issue))
+            .collect();
+
+    let mut cards_by_column: std::collections::HashMap<i64, Vec<CardFull>> =
+        std::collections::HashMap::new();
+    for card in cards {
+        // A card linked to an issue that no longer exists keeps rendering as a
+        // card without one, as it did when each issue was looked up alone. Two
+        // cards linked to one issue each get their own copy.
+        let issue = card
+            .issue_id
+            .and_then(|issue_id| issues_by_id.get(&issue_id).cloned());
+        cards_by_column
+            .entry(card.column_id)
+            .or_default()
+            .push(CardFull { card, issue });
     }
+
+    let columns_full = columns
+        .into_iter()
+        .map(|column| ColumnFull {
+            cards: cards_by_column.remove(&column.id).unwrap_or_default(),
+            column,
+        })
+        .collect();
 
     Ok(Some(BoardFull {
         board,

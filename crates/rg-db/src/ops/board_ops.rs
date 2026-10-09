@@ -375,10 +375,14 @@ pub async fn find_card_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<
         .context("db: find card")
 }
 
-/// List cards in a column, ordered by position and then by id.
+/// List cards in a column, ordered by position and then by id — the order
+/// [`list_cards_by_board`] keeps within each column.
 ///
 /// See [`list_columns_by_board`] for why the tiebreaker is not decoration.
-pub async fn list_cards_by_column(db: &DatabaseConnection, column_id: i64) -> Result<Vec<Card>> {
+/// Production reads a whole board at once; the per-column read is what the
+/// ordering tests below compare positions with.
+#[cfg(test)]
+async fn list_cards_by_column(db: &DatabaseConnection, column_id: i64) -> Result<Vec<Card>> {
     CardEntity::find()
         .filter(board_card::Column::ColumnId.eq(column_id))
         .order_by_asc(board_card::Column::Position)
@@ -386,6 +390,33 @@ pub async fn list_cards_by_column(db: &DatabaseConnection, column_id: i64) -> Re
         .all(db)
         .await
         .context("db: list cards by column")
+}
+
+/// Every card on a board, in one statement, ordered column by column and
+/// within a column by position, then id (see [`list_columns_by_board`] for why
+/// the tiebreaker is not decoration).
+///
+/// Rendering a board used to ask for each column's cards separately, so the
+/// page cost one query per column on top of everything else. The column filter
+/// is a subquery rather than a bound list of column ids: the board decides how
+/// many columns there are, and the statement does not grow with it.
+pub async fn list_cards_by_board(db: &DatabaseConnection, board_id: i64) -> Result<Vec<Card>> {
+    CardEntity::find()
+        .filter(
+            board_card::Column::ColumnId.in_subquery(
+                ColumnEntity::find()
+                    .select_only()
+                    .column(board_column::Column::Id)
+                    .filter(board_column::Column::BoardId.eq(board_id))
+                    .into_query(),
+            ),
+        )
+        .order_by_asc(board_card::Column::ColumnId)
+        .order_by_asc(board_card::Column::Position)
+        .order_by_asc(board_card::Column::Id)
+        .all(db)
+        .await
+        .context("db: list cards by board")
 }
 
 /// Update a card's editable fields in one statement.
