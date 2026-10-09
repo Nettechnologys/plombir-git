@@ -48,7 +48,7 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(1);
 const BACKOFF_CEILING: Duration = Duration::from_millis(25);
 
 /// Attempts [`retry_transaction`] makes in total, including the first.
-const MAX_ATTEMPTS: usize = 8;
+pub(crate) const MAX_ATTEMPTS: usize = 8;
 
 /// How long a *bulk* write keeps retrying before it reports contention as a
 /// failure.
