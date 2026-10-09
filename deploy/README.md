@@ -748,8 +748,10 @@ export OTEL_SERVICE_NAME="plombir-git"
 ```
 
 With no endpoint configured, none of the tracing machinery runs. When enabled,
-each HTTP request produces an `http_request` span (method, uri, status,
-request_id) plus any nested `tracing` spans, and the W3C `traceparent` header is
+each HTTP request produces an `http_request` span (method, path, query, status,
+request_id — the query string with credential-bearing parameters such as
+`token`, `code`, `state` or `signature` replaced by `[redacted]`) plus any
+nested `tracing` spans, and the W3C `traceparent` header is
 honoured so traces stitch across services. Spans are batched on a background
 thread and flushed on graceful shutdown.
 
