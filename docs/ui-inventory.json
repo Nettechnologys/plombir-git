@@ -1027,6 +1027,7 @@
       "access": "RepoAdmin",
       "handler": "api::repos::update_repo_handler",
       "testedIn": [
+        "rust",
         "web",
         "browser"
       ],
@@ -3355,6 +3356,22 @@
       "url": "/api/v1/orgs/{name}",
       "access": "OrgAdmin",
       "handler": "api::orgs::delete_org",
+      "testedIn": [
+        "rust",
+        "web",
+        "smoke",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "organization-admin"
+      ]
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/orgs/{name}/transfer-ownership",
+      "access": "OrgAdmin",
+      "handler": "api::orgs::transfer_ownership",
       "testedIn": [
         "rust",
         "web",
@@ -18215,6 +18232,7 @@
               "handler": "api::repos::update_repo_handler",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web",
                 "browser"
               ],
@@ -18387,6 +18405,7 @@
               "handler": "api::repos::update_repo_handler",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -18421,6 +18440,7 @@
               "handler": "api::repos::update_repo_handler",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -25025,7 +25045,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 524,
+          "line": 580,
           "via": null,
           "href": null,
           "handler": "startEditingOrganization",
@@ -25034,8 +25054,18 @@
         },
         {
           "tag": "button",
+          "label": "i18n:orgs.transfer_ownership",
+          "line": 584,
+          "via": null,
+          "href": null,
+          "handler": "startTransferOwnership",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
           "label": "i18n:common.loading",
-          "line": 527,
+          "line": 587,
           "via": null,
           "href": null,
           "handler": "deleteOrganization",
@@ -25064,8 +25094,82 @@
         },
         {
           "tag": "form",
+          "label": "transferringOwnership = false} disabled= >",
+          "line": 596,
+          "via": null,
+          "href": null,
+          "handler": "transferOwnership",
+          "calls": [
+            {
+              "symbol": "orgs.transferOwnership",
+              "method": "POST",
+              "url": "/api/v1/orgs/{name}/transfer-ownership",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/transfer-ownership",
+              "access": "OrgAdmin",
+              "handler": "api::orgs::transfer_ownership",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "organization-admin"
+              ]
+            },
+            {
+              "symbol": "orgs.listMembers",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/members",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/members",
+              "access": "OrgRead",
+              "handler": "api::orgs::list_org_members",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "select",
+          "label": "",
+          "line": 604,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.loading",
+          "line": 612,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 615,
+          "via": null,
+          "href": null,
+          "handler": "() => transferringOwnership = false",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "form",
           "label": "editingOrg = false} disabled= >",
-          "line": 535,
+          "line": 623,
           "via": null,
           "href": null,
           "handler": "saveOrganization",
@@ -25095,7 +25199,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.visibility_public",
-          "line": 544,
+          "line": 632,
           "via": null,
           "href": null,
           "handler": null,
@@ -25105,7 +25209,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 551,
+          "line": 639,
           "via": null,
           "href": null,
           "handler": null,
@@ -25115,7 +25219,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 555,
+          "line": 643,
           "via": null,
           "href": null,
           "handler": null,
@@ -25125,7 +25229,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 558,
+          "line": 646,
           "via": null,
           "href": null,
           "handler": "() => editingOrg = false",
@@ -25135,7 +25239,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 581,
+          "line": 669,
           "via": null,
           "href": null,
           "handler": null,
@@ -25145,7 +25249,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 584,
+          "line": 672,
           "via": null,
           "href": null,
           "handler": "createOrgRepo",
@@ -25185,7 +25289,7 @@
         {
           "tag": "a",
           "label": "i18n:orgs.create_repo_advanced",
-          "line": 597,
+          "line": 685,
           "via": null,
           "href": "`/dashboard?owner=${encodeURIComponent(org.name)}`",
           "handler": null,
@@ -25195,7 +25299,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 605,
+          "line": 693,
           "via": null,
           "href": "`/${org.name}/${repo.name}`",
           "handler": null,
@@ -25205,7 +25309,7 @@
         {
           "tag": "form",
           "label": "i18n:orgs.new_team",
-          "line": 620,
+          "line": 708,
           "via": null,
           "href": null,
           "handler": "createTeam",
@@ -25247,7 +25351,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.permission.read",
-          "line": 622,
+          "line": 710,
           "via": null,
           "href": null,
           "handler": null,
@@ -25257,7 +25361,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 627,
+          "line": 715,
           "via": null,
           "href": null,
           "handler": null,
@@ -25267,7 +25371,7 @@
         {
           "tag": "button",
           "label": "i18n:orgs.hide_team_members",
-          "line": 645,
+          "line": 733,
           "via": null,
           "href": null,
           "handler": "() => toggleTeamMembers(team.id)",
@@ -25292,7 +25396,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.delete')}",
-          "line": 649,
+          "line": 737,
           "via": null,
           "href": null,
           "handler": "() => deleteTeam(team)",
@@ -25336,7 +25440,7 @@
         {
           "tag": "form",
           "label": "` ? t('common.loading') : t('common.add')}",
-          "line": 660,
+          "line": 748,
           "via": null,
           "href": null,
           "handler": "(event) => addTeamMember(event, team.id)",
@@ -25379,7 +25483,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 667,
+          "line": 755,
           "via": null,
           "href": null,
           "handler": null,
@@ -25389,7 +25493,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.add')}",
-          "line": 671,
+          "line": 759,
           "via": null,
           "href": null,
           "handler": null,
@@ -25399,7 +25503,7 @@
         {
           "tag": "button",
           "label": "-$ ` ? t('common.loading') : t('common.delete')}",
-          "line": 688,
+          "line": 776,
           "via": null,
           "href": null,
           "handler": "() => removeTeamMember(team.id, teamMember)",
@@ -25442,7 +25546,7 @@
         {
           "tag": "form",
           "label": "i18n:orgs.member_placeholder",
-          "line": 713,
+          "line": 801,
           "via": null,
           "href": null,
           "handler": "addOrganizationMember",
@@ -25486,7 +25590,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 720,
+          "line": 808,
           "via": null,
           "href": null,
           "handler": null,
@@ -25496,7 +25600,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 725,
+          "line": 813,
           "via": null,
           "href": null,
           "handler": null,
@@ -25506,7 +25610,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.delete')}",
-          "line": 739,
+          "line": 827,
           "via": null,
           "href": null,
           "handler": "() => removeOrganizationMember(member)",
@@ -27051,9 +27155,9 @@
       "outsider"
     ],
     "scenarios": 46,
-    "inventoryEntries": 762,
-    "coveredEntries": 171,
-    "coveredRoutes": 162,
+    "inventoryEntries": 764,
+    "coveredEntries": 172,
+    "coveredRoutes": 163,
     "maxUiRoutesWithoutFrontendTest": 26
   }
 }

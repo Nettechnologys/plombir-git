@@ -1346,6 +1346,13 @@ const organizationAdmin = privileged(
     await context.clickWithin('.managed-item', 'browser-team', 'button', 'View members');
     await context.fill('.team-members .member-form input', context.fixture.resourceUsername);
     await context.click('.team-members .member-form button[type="submit"]');
+    // Owner-only, like the delete below it: the resource user was re-added as
+    // a member above, so they are a valid target. The owner keeps the `owner`
+    // role afterwards and can still delete the organization.
+    await context.clickByText('.header-actions button', 'Transfer ownership');
+    await context.select('.transfer-ownership select', context.fixture.resourceUsername);
+    await context.setConfirm(true);
+    await context.click('.transfer-ownership button[type="submit"]');
     await context.clickByText('.header-actions button', 'Delete organization');
     await context.waitForPath('/orgs');
   },
@@ -1357,6 +1364,10 @@ const organizationAdmin = privileged(
         description: '',
         visibility: 'private',
       },
+    }],
+    [`/api/v1/orgs/${context.fixture.managedOrg}/transfer-ownership`, {
+      method: 'POST',
+      json: { username: context.fixture.resourceUsername },
     }],
     [`/api/v1/orgs/${context.fixture.managedOrg}/members`, {
       method: 'POST',

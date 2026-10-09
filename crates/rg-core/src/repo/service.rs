@@ -497,7 +497,7 @@ pub async fn can_read_repo(
 
     let result = match actor_id {
         Some(id) => {
-            if id == repo.owner_id {
+            if owns_personally(repo, id) {
                 true
             } else {
                 let perm =
@@ -516,6 +516,21 @@ pub async fn can_read_repo(
 
     set_perm_cache(db, repo.id, actor_id, false, result);
     Ok(result)
+}
+
+/// Whether `actor_id` owns `repo` *as a personal repository*.
+///
+/// `repositories.owner_id` names a user on every row, but it is a grant only in
+/// the personal namespace. An organization repository carries a user there too
+/// — the organization's owner at creation, or the member who forked it in — and
+/// that user's rights over it come from the organization's membership roles,
+/// teams and collaborator rows exactly like everybody else's. Reading the column
+/// as a grant on an organization repository is what kept an organization's
+/// creator in full control of every repository after being removed from the
+/// organization (security audit #5). Every `can_*` predicate below asks this
+/// instead of comparing the column directly.
+fn owns_personally(repo: &rg_db::entities::repository::Model, actor_id: i64) -> bool {
+    repo.org_id.is_none() && repo.owner_id == actor_id
 }
 
 /// Check whether `actor_id` (None = anonymous) can read `owner/repo`.
@@ -568,7 +583,7 @@ pub async fn can_write_repo(
 
     let result = match actor_id {
         Some(id) => {
-            if id == repo.owner_id {
+            if owns_personally(repo, id) {
                 true
             } else {
                 let perm =
@@ -609,7 +624,7 @@ pub async fn can_admin_repo(
     let Some(actor_id) = actor_id else {
         return Ok(false);
     };
-    if actor_id == repo.owner_id {
+    if owns_personally(repo, actor_id) {
         return Ok(true);
     }
     if rg_db::ops::repo_collaborator_ops::get_permission(db, repo.id, actor_id)
@@ -629,6 +644,36 @@ pub async fn can_admin_repo(
         return Ok(true);
     }
     rg_db::ops::org_ops::is_member_of_admin_team(db, org_id, actor_id).await
+}
+
+/// Check whether an actor may dispose of the repository itself — delete it, or
+/// transfer it to another namespace. Stronger than [`can_admin_repo`].
+///
+/// A personal repository is owned by the account in `owner_id` and by nobody
+/// else. An organization repository is owned by the organization, and the
+/// people who may dispose of it are the members holding the `owner` role —
+/// not `owner_id` (see [`owns_personally`]), and deliberately not the `admin`
+/// role either: an organization admin runs the organization's day-to-day
+/// (members, teams, repository settings) without being entitled to destroy or
+/// give away what it holds, the same line `RepoAdmin` / `RepoOwner` already
+/// draws for a collaborator with `admin` permission. Collaborators and teams
+/// never reach this level on an organization repository.
+///
+/// Not cached: the two callers are the rarest operations a repository sees.
+pub async fn can_own_repo(
+    db: &DatabaseConnection,
+    repo: &rg_db::entities::repository::Model,
+    actor_id: Option<i64>,
+) -> Result<bool> {
+    let Some(actor_id) = actor_id else {
+        return Ok(false);
+    };
+    let Some(org_id) = repo.org_id else {
+        return Ok(repo.owner_id == actor_id);
+    };
+    Ok(rg_db::ops::org_ops::find_org_member(db, org_id, actor_id)
+        .await?
+        .is_some_and(|member| member.role == "owner"))
 }
 
 /// Check whether `actor_id` can write to `owner/repo`.
@@ -3310,7 +3355,12 @@ where
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))?;
 
-    if required_owner.is_some_and(|user_id| repo.owner_id != user_id) {
+    // The personal namespace's rule is the row's own: `owner_id`, nobody else.
+    // An organization repository's rule is the organization's — the `owner`
+    // *role* of its membership, never `owner_id` (security audit #5) — and that
+    // is decided by the route's `RepoOwner` gate (`can_own_repo`), the one place
+    // membership may be read; it is deliberately not re-derived here.
+    if required_owner.is_some_and(|user_id| repo.org_id.is_none() && repo.owner_id != user_id) {
         return Err(crate::error::forbidden(
             "only the repository owner can transfer it",
         ));
@@ -8160,6 +8210,76 @@ mod permission_matrix_tests {
             .unwrap();
         assert!(can_admin_repo(&db, &repo, Some(team_admin)).await.unwrap());
         assert!(can_write_repo(&db, &repo, Some(team_admin)).await.unwrap());
+    }
+
+    /// Security audit #5: on an organization repository `owner_id` is not a
+    /// grant. The creator (who *is* `owner_id`) loses every level once their
+    /// membership row is gone, the `owner` role is what owns the repository,
+    /// and the `admin` role administers without owning.
+    #[tokio::test]
+    async fn org_repo_rights_come_from_membership_roles_not_owner_id() {
+        let db = setup_db().await;
+
+        let creator = mk_user(&db).await;
+        let org_name = format!("org_{}", uuid::Uuid::new_v4().simple());
+        let org = org_ops::create_org(&db, &org_name, None, None, creator, "private")
+            .await
+            .unwrap();
+        // `owner_id = creator`, exactly as `resolve_owner` stores it.
+        let repo = mk_repo(&db, creator, Some(org.id), true).await;
+
+        let other_owner = mk_user(&db).await;
+        org_ops::add_org_member(&db, org.id, other_owner, "owner")
+            .await
+            .unwrap();
+        let org_admin = mk_user(&db).await;
+        org_ops::add_org_member(&db, org.id, org_admin, "admin")
+            .await
+            .unwrap();
+
+        // While a member with the `owner` role, the creator owns it like any
+        // other owner; the second owner owns it too, the admin does not.
+        assert!(can_own_repo(&db, &repo, Some(creator)).await.unwrap());
+        assert!(can_own_repo(&db, &repo, Some(other_owner)).await.unwrap());
+        assert!(!can_own_repo(&db, &repo, Some(org_admin)).await.unwrap());
+        assert!(can_admin_repo(&db, &repo, Some(org_admin)).await.unwrap());
+        assert!(!can_own_repo(&db, &repo, None).await.unwrap());
+
+        // Removed from the organization: `owner_id` still names the creator,
+        // and it buys them nothing.
+        assert_eq!(
+            org_ops::remove_org_member(&db, org.id, creator)
+                .await
+                .unwrap(),
+            org_ops::RemoveOrgMemberOutcome::Removed
+        );
+        invalidate_perm_cache_all(&db);
+        assert_eq!(
+            repo.owner_id, creator,
+            "the fixture still mirrors the column"
+        );
+        assert!(!can_read_repo(&db, &repo, Some(creator)).await.unwrap());
+        assert!(!can_write_repo(&db, &repo, Some(creator)).await.unwrap());
+        assert!(!can_admin_repo(&db, &repo, Some(creator)).await.unwrap());
+        assert!(!can_own_repo(&db, &repo, Some(creator)).await.unwrap());
+
+        // The last owner stays: the row is refused, not deleted.
+        assert_eq!(
+            org_ops::remove_org_member(&db, org.id, other_owner)
+                .await
+                .unwrap(),
+            org_ops::RemoveOrgMemberOutcome::LastOwner
+        );
+        assert!(can_own_repo(&db, &repo, Some(other_owner)).await.unwrap());
+
+        // A personal repository is still owned by its `owner_id`, and by nobody
+        // else — the column keeps its meaning where it has one.
+        let personal = mk_repo(&db, creator, None, true).await;
+        assert!(can_own_repo(&db, &personal, Some(creator)).await.unwrap());
+        assert!(can_read_repo(&db, &personal, Some(creator)).await.unwrap());
+        assert!(!can_own_repo(&db, &personal, Some(other_owner))
+            .await
+            .unwrap());
     }
 
     /// The card's headline concern: after a collaborator is removed, the 30s-TTL

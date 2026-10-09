@@ -387,9 +387,12 @@ fn build_visibility_clause(repo_alias: &str, viewer_id: Option<i64>) -> (String,
                 Value::from(viewer),
                 Value::from(viewer),
             ]);
+            // `owner_id` grants only a *personal* repository: an organization
+            // repository carries its organization's owner there, and rights
+            // over it come from the membership clause below (security audit #5).
             format!(
                 "({repo_alias}.is_private = ? \
-                 OR {repo_alias}.owner_id = ? \
+                 OR ({repo_alias}.owner_id = ? AND {repo_alias}.org_id IS NULL) \
                  OR EXISTS (SELECT 1 FROM repo_collaborators rc_vis \
                             WHERE rc_vis.repo_id = {repo_alias}.id AND rc_vis.user_id = ?) \
                  OR EXISTS (SELECT 1 FROM organization_members om_vis \

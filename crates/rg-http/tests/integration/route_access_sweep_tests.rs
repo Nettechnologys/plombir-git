@@ -2141,6 +2141,10 @@ fn access_body(fact: &RouteFact) -> serde_json::Value {
             serde_json::json!({"comment_ids": []})
         }
         "rg_http::api::reviews::request_reviewer" => serde_json::json!({"username": OWNER}),
+        // A member of the fixture organization, so the owner's cell is a real
+        // transfer rather than a `422` the gate never saw. The owner keeps the
+        // `owner` role afterwards, so every later owner-only row still passes.
+        "rg_http::api::orgs::transfer_ownership" => serde_json::json!({"username": ORG_MEMBER}),
         "rg_http::api::issues::edit_comment" | "rg_http::api::reviews::edit_review_comment" => {
             serde_json::json!({"body": "route access sweep"})
         }

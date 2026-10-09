@@ -602,6 +602,7 @@ const GATE_BINDINGS: &[(&str, &str)] = &[
     ("RepoAdmin", "repo"),
     ("RepoOwner", "repo"),
     ("OrgAdmin", "org"),
+    ("OrgOwner", "org"),
     ("OrgRead", "org"),
 ];
 

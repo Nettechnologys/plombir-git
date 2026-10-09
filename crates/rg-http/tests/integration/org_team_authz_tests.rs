@@ -459,6 +459,11 @@ fn org_admin_routes(
         (Method::DELETE, String::new(), serde_json::json!({})),
         (
             Method::POST,
+            "/transfer-ownership".to_string(),
+            serde_json::json!({"user_id": user_id}),
+        ),
+        (
+            Method::POST,
             "/members".to_string(),
             serde_json::json!({"user_id": user_id, "role": "owner"}),
         ),

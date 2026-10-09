@@ -2169,6 +2169,13 @@ pub(crate) fn build_all_routes(
         .get(OrgRead, "/orgs/{name}", api::orgs::get_org)
         .patch(OrgAdmin, "/orgs/{name}", api::orgs::update_org)
         .delete(OrgAdmin, "/orgs/{name}", api::orgs::delete_org)
+        // Owner-only like the delete above it: `OrgAdmin` is the declared
+        // floor, `api::orgs::OrgOwner` the rule the handler runs.
+        .post(
+            OrgAdmin,
+            "/orgs/{name}/transfer-ownership",
+            api::orgs::transfer_ownership,
+        )
         .get(OrgRead, "/orgs/{name}/members", api::orgs::list_org_members)
         .post(OrgAdmin, "/orgs/{name}/members", api::orgs::add_org_member)
         .delete(

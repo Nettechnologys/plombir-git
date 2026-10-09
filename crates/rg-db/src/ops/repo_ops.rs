@@ -103,7 +103,16 @@ fn visible_to(viewer_id: Option<i64>) -> Condition {
     };
 
     visible
-        .add(repository::Column::OwnerId.eq(viewer))
+        // Only a *personal* repository is the viewer's by `owner_id`. An
+        // organization repository carries a user there too (the organization's
+        // owner at creation), but rights over it come from the membership roles
+        // — a creator removed from the organization must not keep seeing its
+        // private repositories through this column (security audit #5).
+        .add(
+            Condition::all()
+                .add(repository::Column::OwnerId.eq(viewer))
+                .add(repository::Column::OrgId.is_null()),
+        )
         .add(
             repository::Column::Id.in_subquery(
                 Query::select()

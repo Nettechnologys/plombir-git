@@ -90,7 +90,13 @@ pub async fn update_org(
 /// different variants instead of being distinguished by which number was typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrgDeleteActor {
-    /// A regular user. Allowed only when they own the organization.
+    /// A member holding the `owner` role, already authorized by the HTTP gate
+    /// (`api::orgs::OrgOwner`). Ownership is a membership *role*, not
+    /// `organizations.owner_id` — the creator keeps that column after being
+    /// removed from the organization, and comparing against it here is what let
+    /// them delete it anyway (security audit #5). Membership is decided in the
+    /// gate module alone, so this variant carries the actor for the record and
+    /// does not re-read the role.
     Owner(i64),
     /// An instance administrator. The route-level `InstanceAdmin` gate *is* the
     /// authorization here; owning the organization is deliberately not required,
@@ -118,17 +124,12 @@ pub async fn delete_org(
         .await?
         .ok_or_else(|| crate::error::not_found("organization"))?;
 
-    match actor {
-        OrgDeleteActor::Owner(user_id) if org.owner_id != user_id => {
-            return Err(crate::error::forbidden(
-                "only the organization owner can delete it",
-            ));
-        }
-        OrgDeleteActor::Owner(_) | OrgDeleteActor::InstanceAdmin => {}
-    }
+    // Both variants arrive authorized — see [`OrgDeleteActor`]. The actor is
+    // kept in the log line so a deletion can be read back to who asked for it.
+    tracing::info!(org_id = id, org = %org.name, ?actor, "deleting organization");
 
-    // Close the namespace before inventorying it. The ownership check above
-    // read the org in a statement of its own, so two concurrent deletes both
+    // Close the namespace before inventorying it. The read above is a statement
+    // of its own, so two concurrent deletes both
     // pass it; this claim is the one statement only one of them can win, and
     // the loser gets the same 404 as a request for an organization that was
     // never there rather than a second retirement of the same storage.
@@ -275,12 +276,59 @@ pub async fn add_org_member(
 }
 
 /// Remove a member from an organization.
+///
+/// The last `owner`-role member cannot leave: the organization would be left
+/// with nobody able to administer, transfer or delete it. That refusal is a
+/// [`Conflict`](crate::error::Conflict) — the request is well-formed, the
+/// organization's state is what refuses it — and the way out is to raise another
+/// member to `owner` first ([`transfer_ownership`] does that in one step).
 pub async fn remove_org_member(db: &DatabaseConnection, org_id: i64, user_id: i64) -> Result<()> {
-    if !org_ops::remove_org_member(db, org_id, user_id).await? {
-        return Err(crate::error::not_found("organization member"));
+    match org_ops::remove_org_member(db, org_id, user_id).await? {
+        org_ops::RemoveOrgMemberOutcome::Removed => {}
+        org_ops::RemoveOrgMemberOutcome::NotAMember => {
+            return Err(crate::error::not_found("organization member"));
+        }
+        org_ops::RemoveOrgMemberOutcome::LastOwner => {
+            return Err(crate::error::conflict(
+                "this member is the organization's last owner; make another member an owner \
+                 (transfer ownership) before removing them",
+            ));
+        }
     }
     crate::repo::service::invalidate_perm_cache_all(db);
     Ok(())
+}
+
+/// Make `to_user_id` — who must already be a member — the organization's owner
+/// of record, raising them to the `owner` role.
+///
+/// The authorization (only an `owner`-role member may do this) is the HTTP
+/// gate's, `api::orgs::OrgOwner`; membership is deliberately not re-read here.
+pub async fn transfer_ownership(
+    db: &DatabaseConnection,
+    org_id: i64,
+    to_user_id: i64,
+) -> Result<rg_db::entities::organization::Model> {
+    let updated = match org_ops::transfer_ownership(db, org_id, to_user_id).await? {
+        org_ops::TransferOwnershipOutcome::Transferred(updated) => updated,
+        org_ops::TransferOwnershipOutcome::NotAMember => {
+            return Err(crate::error::conflict(
+                "the new owner must already be a member of the organization",
+            ));
+        }
+        org_ops::TransferOwnershipOutcome::AlreadyOwner => {
+            return Err(crate::error::conflict(
+                "that member already is the organization's owner",
+            ));
+        }
+        org_ops::TransferOwnershipOutcome::Closed => {
+            return Err(crate::error::not_found("organization"));
+        }
+    };
+    // A membership row changed role, which is what every organization
+    // repository's permission reads — flush the cache like any role change.
+    crate::repo::service::invalidate_perm_cache_all(db);
+    Ok(updated)
 }
 
 /// List organization members.

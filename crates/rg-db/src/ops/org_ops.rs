@@ -326,15 +326,195 @@ pub async fn add_org_member(
     model.insert(db).await.context("db: add org member")
 }
 
-/// Remove a member from an organization. Returns whether a row was removed.
-pub async fn remove_org_member(db: &DatabaseConnection, org_id: i64, user_id: i64) -> Result<bool> {
-    let result = organization_member::Entity::delete_many()
+/// What [`remove_org_member`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOrgMemberOutcome {
+    /// The membership row is gone.
+    Removed,
+    /// There was no such membership to remove.
+    NotAMember,
+    /// The row is the organization's only `owner` and was left in place.
+    LastOwner,
+}
+
+/// How many `owner`-role members the organization has, read inside `conn`.
+async fn count_owners<C: ConnectionTrait>(conn: &C, org_id: i64) -> Result<u64> {
+    organization_member::Entity::find()
+        .filter(organization_member::Column::OrgId.eq(org_id))
+        .filter(organization_member::Column::Role.eq("owner"))
+        .count(conn)
+        .await
+        .context("db: count org owners")
+}
+
+/// Remove a member from an organization — unless they are its last `owner`.
+///
+/// Every right over an organization comes from the `owner` role on a membership
+/// row (`organizations.owner_id` is a display column and a deletion anchor, not
+/// a permission), so an organization whose last owner leaves is an organization
+/// nobody can administer, transfer or delete. The count and the delete run in
+/// one transaction under an exclusive lock on the organization row, so two
+/// concurrent removals of two owners cannot both read "two owners" and both
+/// delete.
+pub async fn remove_org_member(
+    db: &DatabaseConnection,
+    org_id: i64,
+    user_id: i64,
+) -> Result<RemoveOrgMemberOutcome> {
+    let transaction = db.begin().await.context("db: begin org member removal")?;
+    // The lock serialises membership mutations of this organization on
+    // PostgreSQL / MySQL; SQLite's writer lock does the same without it.
+    organization::Entity::find_by_id(org_id)
+        .lock_exclusive()
+        .one(&transaction)
+        .await
+        .context("db: lock organization for member removal")?;
+    let Some(member) = organization_member::Entity::find()
         .filter(organization_member::Column::OrgId.eq(org_id))
         .filter(organization_member::Column::UserId.eq(user_id))
-        .exec(db)
+        .one(&transaction)
+        .await
+        .context("db: find org member for removal")?
+    else {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back org member removal")?;
+        return Ok(RemoveOrgMemberOutcome::NotAMember);
+    };
+    if member.role == "owner" && count_owners(&transaction, org_id).await? <= 1 {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back org member removal")?;
+        return Ok(RemoveOrgMemberOutcome::LastOwner);
+    }
+    organization_member::Entity::delete_by_id(member.id)
+        .exec(&transaction)
         .await
         .context("db: remove org member")?;
-    Ok(result.rows_affected > 0)
+    transaction
+        .commit()
+        .await
+        .context("db: commit org member removal")?;
+    Ok(RemoveOrgMemberOutcome::Removed)
+}
+
+/// What [`transfer_ownership`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransferOwnershipOutcome {
+    /// Ownership moved; the organization row as it now reads.
+    Transferred(organization::Model),
+    /// The target holds no membership in the organization.
+    NotAMember,
+    /// The target already is the organization's owner of record.
+    AlreadyOwner,
+    /// The organization is gone or claimed for retirement.
+    Closed,
+}
+
+/// Make `to_user_id` the organization's owner of record, in one transaction.
+///
+/// Three things change together, or not at all: the target's membership row is
+/// raised to the `owner` role (the thing every permission reads), the
+/// organization's `owner_id` follows (the thing user deletion refuses on and the
+/// admin listing shows), and the repositories of the organization that still
+/// mirror the previous owner in `repositories.owner_id` — the column every
+/// organization repository carries its owner's account in, `ON DELETE CASCADE`
+/// — are re-pointed too, so the previous owner's account can later be deleted
+/// without destroying the organization's repositories. The previous owner keeps
+/// their `owner` role; an organization may have several, and demoting is a
+/// separate decision.
+pub async fn transfer_ownership(
+    db: &DatabaseConnection,
+    org_id: i64,
+    to_user_id: i64,
+) -> Result<TransferOwnershipOutcome> {
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin org ownership transfer")?;
+    let Some(org) = organization::Entity::find_by_id(org_id)
+        .lock_exclusive()
+        .one(&transaction)
+        .await
+        .context("db: lock organization for ownership transfer")?
+    else {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back org ownership transfer")?;
+        return Ok(TransferOwnershipOutcome::Closed);
+    };
+    if org.deleted_at.is_some() {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back org ownership transfer")?;
+        return Ok(TransferOwnershipOutcome::Closed);
+    }
+    if org.owner_id == to_user_id {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back org ownership transfer")?;
+        return Ok(TransferOwnershipOutcome::AlreadyOwner);
+    }
+    let Some(member) = organization_member::Entity::find()
+        .filter(organization_member::Column::OrgId.eq(org_id))
+        .filter(organization_member::Column::UserId.eq(to_user_id))
+        .one(&transaction)
+        .await
+        .context("db: find ownership transfer target")?
+    else {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back org ownership transfer")?;
+        return Ok(TransferOwnershipOutcome::NotAMember);
+    };
+
+    let now = chrono::Utc::now();
+    if member.role != "owner" {
+        organization_member::Entity::update_many()
+            .col_expr(
+                organization_member::Column::Role,
+                Expr::value("owner".to_string()),
+            )
+            .filter(organization_member::Column::Id.eq(member.id))
+            .exec(&transaction)
+            .await
+            .context("db: raise ownership transfer target to owner")?;
+    }
+    let previous_owner_id = org.owner_id;
+    organization::Entity::update_many()
+        .col_expr(organization::Column::OwnerId, Expr::value(to_user_id))
+        .col_expr(organization::Column::UpdatedAt, Expr::value(now))
+        .filter(organization::Column::Id.eq(org_id))
+        .exec(&transaction)
+        .await
+        .context("db: update organization owner")?;
+    crate::entities::repository::Entity::update_many()
+        .col_expr(
+            crate::entities::repository::Column::OwnerId,
+            Expr::value(to_user_id),
+        )
+        .filter(crate::entities::repository::Column::OrgId.eq(org_id))
+        .filter(crate::entities::repository::Column::OwnerId.eq(previous_owner_id))
+        .exec(&transaction)
+        .await
+        .context("db: re-point organization repositories at the new owner")?;
+
+    let updated = organization::Entity::find_by_id(org_id)
+        .one(&transaction)
+        .await
+        .context("db: re-read organization after ownership transfer")?
+        .context("db: organization vanished inside its ownership transfer")?;
+    transaction
+        .commit()
+        .await
+        .context("db: commit org ownership transfer")?;
+    Ok(TransferOwnershipOutcome::Transferred(updated))
 }
 
 /// List members of an organization.
