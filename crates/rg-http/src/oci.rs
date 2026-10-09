@@ -437,48 +437,31 @@ enum TokenSubject {
 /// Fails closed on a denial ([`TokenSubject::Gone`]) and keeps a *failed*
 /// lookup an error, so a database outage stays a 503 instead of collapsing into
 /// the 401 that sends docker straight back for another token.
-async fn token_subject(state: &AppState, sub: &str) -> Result<TokenSubject, AppError> {
+async fn token_subject(
+    db: &sea_orm::DatabaseConnection,
+    sub: &str,
+) -> Result<TokenSubject, AppError> {
     if sub == ANONYMOUS_SUBJECT {
         return Ok(TokenSubject::Anonymous);
     }
-    let observed = match rg_db::ops::user_ops::find_by_username(&state.db, sub).await {
-        Ok(Some(user)) if user.is_usable() => user,
+    // One fresh read of the owner is the whole finalization: the token names
+    // its subject by username, so this read both resolves the account and
+    // decides whether it still stands. Retirement, deletion or a rename since
+    // the token was minted all leave no usable row under that name.
+    match rg_db::ops::user_ops::find_by_username(db, sub).await {
+        Ok(Some(user)) if user.is_usable() => Ok(TokenSubject::User(user.id)),
         Ok(_) => {
             tracing::warn!(
                 subject = sub,
-                "rejecting an OCI scoped token: the account behind it is disabled or gone"
-            );
-            return Ok(TokenSubject::Gone);
-        }
-        Err(error) => {
-            tracing::error!(
-                subject = sub,
-                error = %format!("{error:#}"),
-                "could not verify the account behind an OCI scoped token"
-            );
-            return Err(AppError::from(error));
-        }
-    };
-
-    let user_id = observed.id;
-    match rg_db::ops::user_ops::finalize_standing_credential_owner(&state.db, user_id).await {
-        Ok(Some(user)) if user.is_usable() && user.username == sub => {
-            Ok(TokenSubject::User(user.id))
-        }
-        Ok(_) => {
-            tracing::warn!(
-                subject = sub,
-                user_id,
-                "rejecting an OCI scoped token: account retirement, deletion, or rename won owner finalization"
+                "rejecting an OCI scoped token: the account behind it is disabled, renamed or gone"
             );
             Ok(TokenSubject::Gone)
         }
         Err(error) => {
             tracing::error!(
                 subject = sub,
-                user_id,
                 error = %format!("{error:#}"),
-                "could not finalize the account behind an OCI scoped token"
+                "could not verify the account behind an OCI scoped token"
             );
             Err(AppError::service_unavailable(
                 "could not verify the account behind the OCI scoped token",
@@ -544,7 +527,7 @@ async fn check_access(
             });
 
         if scoped_for_this {
-            let actor = match token_subject(state, &claims.sub).await? {
+            let actor = match token_subject(&state.db, &claims.sub).await? {
                 TokenSubject::Anonymous => None,
                 TokenSubject::User(uid) => Some(uid),
                 // Nobody behind the token: it grants nothing of its own. The
@@ -3186,5 +3169,88 @@ mod password_shed_status_tests {
         })
         .context("registry basic auth: verifying the password of 'alice'");
         assert_eq!(oci_status_for(&shed), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+/// The scoped-token owner check's two refusals, kept apart
+/// (card_b83b9bc36e3a). An integration test cannot fail this read alone —
+/// resolving the repository reads `users` first — so the branches are pinned
+/// here, on the function.
+#[cfg(test)]
+mod token_subject_tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    async fn owner_db() -> (sea_orm::DatabaseConnection, rg_db::entities::user::Model) {
+        use sea_orm::{ActiveModelTrait, ConnectOptions, Database, Set};
+
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options)
+            .await
+            .expect("connect to in-memory db");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        let now = chrono::Utc::now();
+        let owner = rg_db::entities::user::ActiveModel {
+            username: Set("capability-owner".to_string()),
+            email: Set("capability-owner@example.test".to_string()),
+            password_hash: Set("x".to_string()),
+            is_admin: Set(false),
+            is_active: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert capability owner");
+        (db, owner)
+    }
+
+    /// The fault: a column the owner read selects. Nothing on this path reads
+    /// `users` before the finalizer, so the failure lands there and only there.
+    async fn break_owner_reads(db: &sea_orm::DatabaseConnection) {
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared(
+            "ALTER TABLE users RENAME COLUMN deleted_at TO deleted_at_unreadable",
+        )
+        .await
+        .expect("break owner reads");
+    }
+
+    async fn retire(db: &sea_orm::DatabaseConnection, user_id: i64) {
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared(&format!(
+            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP WHERE id = {user_id}"
+        ))
+        .await
+        .expect("retire owner");
+    }
+
+    /// A failed owner read is a retryable registry failure, not an anonymous
+    /// request and not an invalid scoped token.
+    #[tokio::test]
+    async fn a_failed_owner_read_is_503_not_anonymous() {
+        let (db, owner) = owner_db().await;
+        assert!(matches!(
+            token_subject(&db, &owner.username).await,
+            Ok(TokenSubject::User(id)) if id == owner.id
+        ));
+
+        break_owner_reads(&db).await;
+        match token_subject(&db, &owner.username).await {
+            Err(error) => assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE),
+            Ok(_) => panic!("an owner that could not be read was resolved"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retired_owner_is_gone() {
+        let (db, owner) = owner_db().await;
+        retire(&db, owner.id).await;
+        assert!(matches!(
+            token_subject(&db, &owner.username).await,
+            Ok(TokenSubject::Gone)
+        ));
     }
 }

@@ -58,13 +58,7 @@ pub async fn list_by_repo_paginated(
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<PullRequest>, i64)> {
-    let mut base = PrEntity::find().filter(pull_request::Column::RepoId.eq(repo_id));
-    if let Some(s) = state {
-        base = base.filter(pull_request::Column::State.eq(s));
-    }
-    let query = base
-        .order_by_desc(pull_request::Column::CreatedAt)
-        .order_by_desc(pull_request::Column::Id);
+    let query = page_query(repo_id, state);
 
     let total = query
         .clone()
@@ -79,6 +73,17 @@ pub async fn list_by_repo_paginated(
         .context("db: list PRs by repo (paginated)")?;
 
     Ok((prs, total))
+}
+
+/// The ordered selection [`list_by_repo_paginated`] cuts a page from, kept
+/// apart so `query_plan_tests` explains the statement the server sends.
+pub(crate) fn page_query(repo_id: i64, state: Option<&str>) -> Select<PrEntity> {
+    let mut base = PrEntity::find().filter(pull_request::Column::RepoId.eq(repo_id));
+    if let Some(s) = state {
+        base = base.filter(pull_request::Column::State.eq(s));
+    }
+    base.order_by_desc(pull_request::Column::CreatedAt)
+        .order_by_desc(pull_request::Column::Id)
 }
 
 /// Get the next PR number for a repo (max + 1, or 1 if no PRs).

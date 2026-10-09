@@ -41,15 +41,7 @@ pub async fn list_notifications_paginated(
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<notification::Model>, i64)> {
-    let mut base = notification::Entity::find().filter(notification::Column::UserId.eq(user_id));
-
-    if unread_only {
-        base = base.filter(notification::Column::IsRead.eq(false));
-    }
-
-    let query = base
-        .order_by_desc(notification::Column::CreatedAt)
-        .order_by_desc(notification::Column::Id);
+    let query = page_query(user_id, unread_only);
 
     let total = query
         .clone()
@@ -64,6 +56,17 @@ pub async fn list_notifications_paginated(
         .context("db: list notifications (paginated)")?;
 
     Ok((notifications, total))
+}
+
+/// The ordered selection [`list_notifications_paginated`] cuts a page from,
+/// kept apart so `query_plan_tests` explains the statement the server sends.
+pub(crate) fn page_query(user_id: i64, unread_only: bool) -> Select<notification::Entity> {
+    let mut base = notification::Entity::find().filter(notification::Column::UserId.eq(user_id));
+    if unread_only {
+        base = base.filter(notification::Column::IsRead.eq(false));
+    }
+    base.order_by_desc(notification::Column::CreatedAt)
+        .order_by_desc(notification::Column::Id)
 }
 
 /// Mark a notification as read for its owning user.

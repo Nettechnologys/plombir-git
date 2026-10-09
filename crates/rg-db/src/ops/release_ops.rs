@@ -40,10 +40,7 @@ pub async fn list_by_repo(
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<ReleaseModel>, i64)> {
-    let base = ReleaseEntity::find()
-        .filter(release::Column::RepoId.eq(repo_id))
-        .order_by_desc(release::Column::CreatedAt)
-        .order_by_desc(release::Column::Id);
+    let base = page_query(repo_id);
 
     let total = base.clone().count(db).await.context("db: count releases")? as i64;
 
@@ -55,6 +52,15 @@ pub async fn list_by_repo(
         .context("db: list releases")?;
 
     Ok((releases, total))
+}
+
+/// The ordered selection [`list_by_repo`] cuts a page from, kept apart so
+/// `query_plan_tests` explains the statement the server sends.
+pub(crate) fn page_query(repo_id: i64) -> Select<ReleaseEntity> {
+    ReleaseEntity::find()
+        .filter(release::Column::RepoId.eq(repo_id))
+        .order_by_desc(release::Column::CreatedAt)
+        .order_by_desc(release::Column::Id)
 }
 
 /// Create a new release.

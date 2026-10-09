@@ -56,13 +56,7 @@ pub async fn list_by_repo_paginated(
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<Issue>, i64)> {
-    let mut base = IssueEntity::find().filter(issue::Column::RepoId.eq(repo_id));
-    if let Some(s) = state {
-        base = base.filter(issue::Column::State.eq(s));
-    }
-    let query = base
-        .order_by_desc(issue::Column::CreatedAt)
-        .order_by_desc(issue::Column::Id);
+    let query = page_query(repo_id, state);
 
     let total = query
         .clone()
@@ -77,6 +71,20 @@ pub async fn list_by_repo_paginated(
         .context("db: list issues by repo (paginated)")?;
 
     Ok((issues, total))
+}
+
+/// The ordered selection [`list_by_repo_paginated`] cuts a page from.
+///
+/// Its own function so `query_plan_tests` explains the statement the server
+/// sends: the `(repo_id[, state], created_at, id)` indexes exist for exactly
+/// this filter and order.
+pub(crate) fn page_query(repo_id: i64, state: Option<&str>) -> sea_orm::Select<IssueEntity> {
+    let mut base = IssueEntity::find().filter(issue::Column::RepoId.eq(repo_id));
+    if let Some(s) = state {
+        base = base.filter(issue::Column::State.eq(s));
+    }
+    base.order_by_desc(issue::Column::CreatedAt)
+        .order_by_desc(issue::Column::Id)
 }
 
 /// Get the next issue number for a repo (max + 1, or 1 if no issues).
