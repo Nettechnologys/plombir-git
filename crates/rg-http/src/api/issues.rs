@@ -766,6 +766,14 @@ async fn issues_with_authors(
 ) -> Result<Vec<IssueResponse>, AppError> {
     let mut names = super::author_names::AuthorNames::default();
     let mut responses = Vec::with_capacity(issues.len());
+    names
+        .prefetch(
+            db,
+            issues
+                .iter()
+                .flat_map(|issue| std::iter::once(issue.author_id).chain(issue.assignee_id)),
+        )
+        .await?;
     let issues = rg_core::issue::issues_with_labels(db, issues)
         .await
         .map_err(AppError::from)?;
@@ -800,6 +808,9 @@ async fn comments_with_authors(
     comments: Vec<rg_db::entities::issue_comment::Model>,
 ) -> Result<Vec<CommentResponse>, AppError> {
     let mut names = super::author_names::AuthorNames::default();
+    names
+        .prefetch(db, comments.iter().map(|comment| comment.author_id))
+        .await?;
     let mut responses = Vec::with_capacity(comments.len());
     for comment in comments {
         let (author, author_bot_owner) = names.author(db, comment.author_id).await?;
@@ -1367,6 +1378,88 @@ mod author_enrichment_tests {
             .await
             .expect("missing author is a valid result");
         assert_eq!(enriched.author, None);
+    }
+
+    /// How many statements `issues_with_authors` sends for a page whose
+    /// issues are written and assigned by `authors` distinct people, one of
+    /// them a bot whose owner has to be named too.
+    async fn statements_for_a_page_by(authors: usize) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut db = test_db().await;
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "page-bot-owner",
+            "page-bot-owner@example.com",
+            "irrelevant-in-this-test",
+            "",
+        )
+        .await
+        .expect("create bot owner");
+        let mut people = Vec::new();
+        for index in 0..authors {
+            let user = rg_db::ops::user_ops::create_user(
+                &db,
+                &format!("page-author-{index}"),
+                &format!("page-author-{index}@example.com"),
+                "irrelevant-in-this-test",
+                "",
+            )
+            .await
+            .expect("create author");
+            people.push(user.id);
+        }
+        db.execute_unprepared(&format!(
+            "UPDATE users SET bot_owner_id = {} WHERE id = {}",
+            owner.id, people[0]
+        ))
+        .await
+        .expect("make the first author a bot");
+
+        let page: Vec<_> = (0..20)
+            .map(|position| {
+                let mut row = issue(people[position % authors]);
+                row.id = position as i64 + 1;
+                row.number = position as i64 + 1;
+                row.assignee_id = Some(people[(position + 1) % authors]);
+                row
+            })
+            .collect();
+
+        let statements = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&statements);
+        db.set_metric_callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let enriched = issues_with_authors(&db, page)
+            .await
+            .expect("enrich the page");
+        assert_eq!(enriched.len(), 20);
+        assert_eq!(
+            enriched[0].author_bot_owner.as_deref(),
+            Some("page-bot-owner"),
+            "the bot's owner is named"
+        );
+        assert!(enriched
+            .iter()
+            .all(|row| row.author.is_some() && row.assignee.is_some()));
+        statements.load(Ordering::SeqCst)
+    }
+
+    /// card_f25c98fdf3ee: listing issues used to ask for each author (and each
+    /// assignee, and each bot's owner) separately, so a page by twenty people
+    /// cost twenty-odd extra queries. The page now costs the same however many
+    /// people wrote it.
+    #[tokio::test]
+    async fn a_page_of_issues_costs_the_same_queries_whoever_wrote_it() {
+        let by_one = statements_for_a_page_by(1).await;
+        let by_twenty = statements_for_a_page_by(20).await;
+        assert_eq!(
+            by_one, by_twenty,
+            "statements for a page by 1 author ({by_one}) and by 20 authors ({by_twenty}) differ"
+        );
+        assert!(by_twenty <= 4, "a page took {by_twenty} statements");
     }
 
     #[tokio::test]

@@ -1171,13 +1171,19 @@ pub async fn list_requested_reviewers(
         Err(error) => return AppError::from(error).into_response(),
     };
 
+    let reviewer_ids: Vec<i64> = requests.iter().map(|request| request.reviewer_id).collect();
+    let reviewers = match super::user_ref::accounts_by_id(&state.db, &reviewer_ids).await {
+        Ok(reviewers) => reviewers,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+
     let mut response = Vec::with_capacity(requests.len());
     for request in requests {
-        let username = match rg_db::ops::user_ops::find_by_id(&state.db, request.reviewer_id).await
-        {
-            Ok(Some(user)) => user.username,
-            Ok(None) => continue,
-            Err(error) => return AppError::from(error).into_response(),
+        let Some(username) = reviewers
+            .get(&request.reviewer_id)
+            .map(|user| user.username.clone())
+        else {
+            continue;
         };
         response.push(RequestedReviewerResponse {
             id: request.id,

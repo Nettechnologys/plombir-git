@@ -51,6 +51,9 @@ async fn prs_with_authors(
     prs: Vec<rg_db::entities::pull_request::Model>,
 ) -> Result<Vec<PullRequestResponse>, AppError> {
     let mut names = super::author_names::AuthorNames::default();
+    names
+        .prefetch(db, prs.iter().map(|pr| pr.author_id))
+        .await?;
     let mut responses = Vec::with_capacity(prs.len());
     for pr in prs {
         let (author, author_bot_owner) = names.author(db, pr.author_id).await?;

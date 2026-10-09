@@ -1369,18 +1369,19 @@ pub async fn explore(
             // fails the response instead of inventing one: a placeholder here
             // ships a `200` the client trusts, never retries, and turns a live
             // account into an unknown one (card_f15f12e055d0).
-            let lookups = futures::future::join_all(
-                data.iter()
-                    .map(|repo| rg_db::ops::user_ops::find_by_id(&state.db, repo.owner_id)),
-            )
-            .await;
+            //
+            // One round-trip for the page, not one per repository: a page of a
+            // hundred public repositories used to fan out a hundred concurrent
+            // lookups against the same pool.
+            let owner_ids: Vec<i64> = data.iter().map(|repo| repo.owner_id).collect();
+            let owners = match super::user_ref::accounts_by_id(&state.db, &owner_ids).await {
+                Ok(owners) => owners,
+                Err(error) => return AppError::from(error).into_response(),
+            };
 
             let mut enriched: Vec<ExploreRepoResponse> = Vec::with_capacity(data.len());
-            for (repo, lookup) in data.iter().zip(lookups) {
-                let owner_name = match lookup {
-                    Ok(owner) => owner.map(|user| user.username),
-                    Err(error) => return AppError::from(error).into_response(),
-                };
+            for repo in &data {
+                let owner_name = owners.get(&repo.owner_id).map(|user| user.username.clone());
                 enriched.push(ExploreRepoResponse {
                     id: repo.id,
                     owner_id: repo.owner_id,
