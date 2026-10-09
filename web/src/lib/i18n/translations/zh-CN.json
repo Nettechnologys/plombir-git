@@ -1382,14 +1382,18 @@
     },
     "ci_secrets": {
       "title": "CI 密钥",
-      "desc": "加密的仓库密钥会注入到任务中，并在保存的日志里被遮蔽。",
+      "desc": "加密的仓库密钥会注入到任务中，并在保存的日志里被遮蔽。限定环境的密钥只会提供给通过该环境审批的任务。",
       "add_title": "添加或替换密钥",
       "name": "名称",
       "value": "值",
+      "environment": "环境",
+      "environment_repository_wide": "仓库范围（所有任务）",
+      "environment_scoped": "环境：{environment}",
       "save": "保存密钥",
       "list_title": "已配置的密钥",
       "empty": "暂无已配置的密钥。",
-      "delete_confirm": "删除 {name}？"
+      "delete_confirm": "删除 {name}？",
+      "delete_confirm_scoped": "从 {environment} 环境删除 {name}？"
     },
     "retention": {
       "title": "CI 保留策略",

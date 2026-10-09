@@ -62,6 +62,7 @@ mod ci_job_log_boundary_tests;
 mod ci_job_token_tests;
 mod ci_oidc_tests;
 mod ci_permission_tests;
+mod ci_secret_environment_tests;
 mod ci_secrets_tag_protection_tests;
 mod ci_state_conflict_tests;
 mod clearable_patch_field_tests;

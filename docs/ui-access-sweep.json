@@ -117,12 +117,12 @@
       ]
     },
     {
-    "id": "repo-content-delete",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-content-delete",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/blob/[...path]",
           "kind": "control",
@@ -136,12 +136,12 @@
       ]
     },
     {
-    "id": "repo-watch",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-watch",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]",
           "kind": "control",
@@ -324,12 +324,12 @@
       ]
     },
     {
-    "id": "repo-milestones",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-milestones",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/milestones",
           "kind": "control",
@@ -383,12 +383,12 @@
       ]
     },
     {
-    "id": "repo-boards",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-boards",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/boards",
           "kind": "passive",
@@ -508,12 +508,12 @@
       ]
     },
     {
-    "id": "repo-time-tracking",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-time-tracking",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/time_tracking",
           "kind": "control",
@@ -557,12 +557,12 @@
       ]
     },
     {
-    "id": "repo-wiki",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-wiki",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/wiki",
           "kind": "passive",
@@ -634,12 +634,12 @@
       ]
     },
     {
-    "id": "repo-labels",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-labels",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/settings/labels",
           "kind": "control",
@@ -915,12 +915,12 @@
       ]
     },
     {
-    "id": "repo-pull-detail",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-pull-detail",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/pulls/[number]",
           "kind": "control",
@@ -1123,12 +1123,12 @@
       ]
     },
     {
-    "id": "repo-release-asset-delete",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-release-asset-delete",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/releases",
           "kind": "control",
@@ -1585,7 +1585,6 @@
           "page": "/[owner]/[repo]/settings/ci-secrets",
           "kind": "control",
           "control": "save",
-          "line": 94,
           "symbol": "ciSecrets.list",
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/actions/secrets",
@@ -1595,7 +1594,6 @@
           "page": "/[owner]/[repo]/settings/ci-secrets",
           "kind": "control",
           "control": "save",
-          "line": 94,
           "symbol": "ciSecrets.put",
           "method": "PUT",
           "routeUrl": "/api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}",
@@ -1605,7 +1603,6 @@
           "page": "/[owner]/[repo]/settings/ci-secrets",
           "kind": "control",
           "control": "() => remove(item)",
-          "line": 94,
           "symbol": "ciSecrets.delete",
           "method": "DELETE",
           "routeUrl": "/api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}",

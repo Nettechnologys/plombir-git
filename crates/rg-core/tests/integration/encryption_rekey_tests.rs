@@ -86,9 +86,16 @@ async fn live_instance(db: &DatabaseConnection, secret: &str) {
 
     let ci = encryption::encrypt(CI_SECRET_PLAINTEXT, &encryption::derive_key(secret))
         .expect("encrypt ci secret");
-    rg_db::ops::ci_secret_ops::upsert(db, repo.id, "DEPLOY_TOKEN", &ci, user.id)
-        .await
-        .expect("store ci secret");
+    rg_db::ops::ci_secret_ops::upsert_in_environment(
+        db,
+        repo.id,
+        None,
+        "DEPLOY_TOKEN",
+        &ci,
+        user.id,
+    )
+    .await
+    .expect("store ci secret");
 
     // A webhook whose deliveries are signed. Registered through the service so
     // the secret is sealed exactly the way a running server seals it.

@@ -276,6 +276,53 @@ the key:
 > trigger-time check is long behind it — the runner's own refusal is what stops
 > those jobs from running here.
 
+## Secrets and workload identity
+
+Secrets are configured per repository under **Settings → CI secrets**. Each one
+is stored encrypted at rest, injected into a job's environment, and masked in
+the stored job log.
+
+A secret is either **repository-wide** or scoped to one **environment** of the
+repository. Repository-wide secrets reach every job. An environment-scoped
+secret reaches only a job that declares that environment with
+[`environment:`](#environment) — and only once the environment's gate, if it is
+protected, has released the job to a runner. A job that declares no environment
+reads no environment scope at all, whichever branch or pull request it runs
+from, and a job that declares `staging` never sees the `production` scope. The
+same name may exist once per scope (repository-wide, and each environment), so
+scoping a token to a deploy does not rename the build jobs' secret.
+
+The job also receives a workload identity token URL in `CI_OIDC_TOKEN_URL`
+(beside `CI_JOB_TOKEN`), and `GET <CI_OIDC_TOKEN_URL>?audience=<audience>` with
+`Authorization: Bearer $CI_JOB_TOKEN` answers a short-lived, Ed25519-signed JWT
+— verifiable against the instance's public keys at `/api/v1/ci/oidc/jwks`,
+which is what lets a cloud provider's OIDC federation trust this instance
+without a shared secret. The token is bound to the persisted job: a job that
+stopped running, a retried pipeline or a stale token is refused when the
+exchange asks the database.
+
+The claims are:
+
+| Claim | Value |
+|-------|-------|
+| `iss` | The instance's OIDC issuer URL (`…/api/v1/ci/oidc`) |
+| `aud` | The requested audience |
+| `sub` | `repo:<owner>/<name>:environment:<env>` for a job that declares an environment, `repo:<owner>/<name>:ref:<ref>` otherwise |
+| `repository` / `repository_id` / `repository_owner` | `owner/name`, the numeric repository id, and the owner |
+| `ref` / `ref_type` / `sha` | The full ref, its kind (`branch`, `tag`, `pull_request`, `unknown`), and the commit |
+| `environment` | The job's environment name; omitted for a job without one |
+| `pipeline_id` / `job_id` | The workflow run and the job |
+| `actor` | The account that triggered the pipeline; omitted when there was none |
+
+The subject is the part a relying party should match. Because an
+environment-declaring job's subject names the environment instead of the ref,
+a production role can require
+`sub = repo:<owner>/<name>:environment:production` and refuse tokens from a
+`ref:` subject — including fork pull requests, whatever branch they push.
+A relying party should match the whole subject value rather than a prefix: the
+environment name is interpolated verbatim, so `environment:production` is also
+a prefix of `environment:production-staging`.
+
 ## Matrix
 
 `matrix` turns one job declaration into one run per combination of the values —

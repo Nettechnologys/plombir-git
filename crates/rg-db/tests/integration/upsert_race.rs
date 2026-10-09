@@ -279,9 +279,10 @@ async fn concurrent_first_ci_secret_saves_all_succeed_and_leave_one_row() {
     let attempts = (0..ATTEMPTS).map(|i| {
         let db = db.clone();
         async move {
-            rg_db::ops::ci_secret_ops::upsert(
+            rg_db::ops::ci_secret_ops::upsert_in_environment(
                 &db,
                 repo_id,
+                None,
                 "DEPLOY_TOKEN",
                 &format!("ciphertext-{i}"),
                 user_id,
@@ -303,10 +304,15 @@ async fn concurrent_first_ci_secret_saves_all_succeed_and_leave_one_row() {
         "one secret name in one repository must occupy exactly one row",
     );
 
-    let secret = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo_id, "DEPLOY_TOKEN")
-        .await
-        .expect("read the secret back")
-        .expect("the secret exists");
+    let secret = rg_db::ops::ci_secret_ops::find_by_repo_environment_and_name(
+        &db,
+        repo_id,
+        None,
+        "DEPLOY_TOKEN",
+    )
+    .await
+    .expect("read the secret back")
+    .expect("the secret exists");
     assert!(
         secret.encrypted_value.starts_with("ciphertext-"),
         "the stored value came from one of the callers, got {:?}",
@@ -1032,9 +1038,16 @@ async fn writes_that_fail_on_something_other_than_uniqueness_are_still_errors() 
     );
 
     assert!(
-        rg_db::ops::ci_secret_ops::upsert(&db, ORPHAN, "DEPLOY_TOKEN", "ciphertext", user_id)
-            .await
-            .is_err(),
+        rg_db::ops::ci_secret_ops::upsert_in_environment(
+            &db,
+            ORPHAN,
+            None,
+            "DEPLOY_TOKEN",
+            "ciphertext",
+            user_id,
+        )
+        .await
+        .is_err(),
         "a secret for a repository that does not exist must stay a failure",
     );
     assert!(

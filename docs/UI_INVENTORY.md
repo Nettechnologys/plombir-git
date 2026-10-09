@@ -27,7 +27,7 @@
 | Из них достижимы из браузера | 282 (70%) |
 | Layout-модулей | 2 |
 | Страниц | 70 |
-| Интерактивных элементов | 969 |
+| Интерактивных элементов | 970 |
 | — из них дёргают API | 357 |
 | — приходят из общих компонентов | 358 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 46 / 171 / 162 |
@@ -119,10 +119,10 @@
 | `/help` | 5 | 0 | 0 |
 | `/reset-password` | 5 | 1 | 0 |
 | `/[owner]` | 4 | 0 | 0 |
+| `/[owner]/[repo]/settings/ci-secrets` | 4 | 2 | 0 |
 | `/notifications` | 4 | 4 | 0 |
 | `/settings/ssh-keys` | 4 | 2 | 0 |
 | `/settings/tokens` | 4 | 2 | 0 |
-| `/[owner]/[repo]/settings/ci-secrets` | 3 | 2 | 0 |
 | `/[owner]/[repo]/settings/retention` | 3 | 2 | 0 |
 | `/explore` | 3 | 2 | 0 |
 | `/forgot-password` | 3 | 1 | 0 |
@@ -787,10 +787,12 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.ci_secrets.name | :94 | `PUT /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+web+browser |
-| i18n:settings.ci_secrets.name | :94 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust+web+browser |
-| i18n:common.delete | :94 | `DELETE /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+web+browser |
-| i18n:common.delete | :94 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust+web |
+| i18n:settings.ci_secrets.name | :101 | `PUT /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+web+browser |
+| i18n:settings.ci_secrets.name | :101 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust+web+browser |
+| i18n:settings.ci_secrets.name | :101 | `GET /api/v1/repos/{owner}/{name}/actions/environments` | `RepoRead` | rust+web |
+| i18n:common.delete | :101 | `DELETE /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+web+browser |
+| i18n:common.delete | :101 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust+web |
+| i18n:common.delete | :101 | `GET /api/v1/repos/{owner}/{name}/actions/environments` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/settings/collaborators`
 

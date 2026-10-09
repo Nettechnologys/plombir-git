@@ -424,7 +424,7 @@ quietly win.
 | `container` | block | See [Containers](#containers). |
 | `defaults` | block | `run:` defaults for this job. See [Defaults](#defaults). |
 | `strategy` | block | Only `matrix`. See [Matrix](#matrix). |
-| `environment` | string or `{ name: … }` | A deployment environment **the repository already has**; a protected one holds the job for approval. |
+| `environment` | string or `{ name: … }` | A deployment environment **the repository already has**; a protected one holds the job for approval, and an environment-scoped CI secret reaches only jobs that declare it. |
 | `timeout-minutes` | integer | Per-job timeout. Converted to seconds, and the result must land in `1`–`86400` — so `1`–`1440` minutes. |
 | `continue-on-error` | bool | A failure of this job does not fail the pipeline. |
 | `uses` / `with` / `secrets` | — | Reusable workflow invocation. See [Reusable workflows](#reusable-workflows). |
@@ -579,7 +579,7 @@ contexts.
 | `github.repository` | `${CI_REPOSITORY}` |
 | `github.repository_owner` | `${CI_REPOSITORY_OWNER}` |
 | `env.NAME` | The variable's value. |
-| `secrets.NAME` | The repository secret. |
+| `secrets.NAME` | The secret's value: repository-wide, plus the job's environment scope when the job declares one. |
 | `matrix.NAME` | The variant's coordinate. |
 | `inputs.NAME` | The dispatch or call input. |
 

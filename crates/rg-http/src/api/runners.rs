@@ -658,7 +658,8 @@ pub async fn poll_job(
                     for reserved in rg_core::ci::BUILTIN_CI_VARIABLES {
                         variables.remove(reserved);
                     }
-                    match decrypted_repo_secrets(&state, pipeline.repo_id).await {
+                    match decrypted_repo_secrets(&state, pipeline.repo_id, job.environment_id).await
+                    {
                         Ok(secrets) => {
                             for (name, value) in secrets {
                                 variables.insert(name, serde_json::json!(value));
@@ -915,7 +916,7 @@ pub async fn upload_log(
         Err(error) => return error.into_response(),
     };
 
-    let body = match secrets_for_job(&state, job.stage_id).await {
+    let body = match secrets_for_job(&state, job.stage_id, job.environment_id).await {
         Ok(secrets) => rg_core::auth::encryption::mask_values(&body, &secrets),
         Err(error) => {
             tracing::error!(job_id, error = %format!("{error:#}"), "failed to load secrets while masking runner log");
@@ -1526,10 +1527,16 @@ fn cache_content_hash(bytes: &[u8]) -> String {
 async fn decrypted_repo_secrets(
     state: &AppState,
     repo_id: i64,
+    environment_id: Option<i64>,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let mut values = Vec::new();
-    for secret in rg_db::ops::ci_secret_ops::list_by_repo(&state.db, repo_id).await? {
+    // Repository-wide secrets plus, only when the job declares an environment,
+    // that environment's own scope. A job without `environment:` never reads
+    // an environment secret, whatever branch it runs from.
+    for secret in
+        rg_db::ops::ci_secret_ops::list_for_job(&state.db, repo_id, environment_id).await?
+    {
         values.push((
             secret.name,
             rg_core::auth::encryption::decrypt(&secret.encrypted_value, &key)?,
@@ -1538,18 +1545,24 @@ async fn decrypted_repo_secrets(
     Ok(values)
 }
 
-async fn secrets_for_job(state: &AppState, stage_id: i64) -> anyhow::Result<Vec<String>> {
+async fn secrets_for_job(
+    state: &AppState,
+    stage_id: i64,
+    environment_id: Option<i64>,
+) -> anyhow::Result<Vec<String>> {
     let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, stage_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("pipeline stage not found"))?;
     let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("pipeline not found"))?;
-    Ok(decrypted_repo_secrets(state, pipeline.repo_id)
-        .await?
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect())
+    Ok(
+        decrypted_repo_secrets(state, pipeline.repo_id, environment_id)
+            .await?
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect(),
+    )
 }
 
 /// POST /api/v1/runners/:id/jobs/:job_id/finish

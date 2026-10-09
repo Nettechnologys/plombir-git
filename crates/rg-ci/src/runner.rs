@@ -750,6 +750,7 @@ impl PipelineRunner {
         let job_result = self
             .run_job(
                 job.id,
+                job.environment_id,
                 &job.script,
                 job.image.as_deref(),
                 job.variables.as_deref(),
@@ -872,6 +873,7 @@ impl PipelineRunner {
     async fn run_job(
         &self,
         job_id: i64,
+        environment_id: Option<i64>,
         script: &str,
         image: Option<&str>,
         variables: Option<&str>,
@@ -951,7 +953,7 @@ impl PipelineRunner {
             None
         };
         let (job_environment, secret_values) = self
-            .job_environment(ci_job_token.as_deref(), variables)
+            .job_environment(ci_job_token.as_deref(), variables, environment_id)
             .await?;
         let cache = cache_spec(cache_key, cache_paths, &job_environment)?;
         // A cache failure never fails the job, so the server log is the only
@@ -1289,6 +1291,7 @@ impl PipelineRunner {
         &self,
         ci_job_token: Option<&str>,
         variables: Option<&str>,
+        environment_id: Option<i64>,
     ) -> Result<(Vec<(String, String)>, Vec<String>)> {
         let pipeline = pipeline_ops::get_pipeline(&self.db, self.pipeline_id)
             .await?
@@ -1309,8 +1312,13 @@ impl PipelineRunner {
         if self.repo_id > 0 {
             if let Some(encryption_key) = &self.encryption_key {
                 let key = rg_core::auth::encryption::derive_key(encryption_key);
+                // Repository-wide secrets plus, only when this job declares an
+                // environment, that environment's own scope. A job with no
+                // `environment:` never reads an environment secret, whatever
+                // branch it runs from.
                 for secret in
-                    rg_db::ops::ci_secret_ops::list_by_repo(&self.db, self.repo_id).await?
+                    rg_db::ops::ci_secret_ops::list_for_job(&self.db, self.repo_id, environment_id)
+                        .await?
                 {
                     if !valid_environment_name(&secret.name)
                         || is_reserved_ci_variable(&secret.name)
@@ -3549,9 +3557,16 @@ esac
             &rg_core::auth::encryption::derive_key(encryption_key),
         )
         .unwrap();
-        rg_db::ops::ci_secret_ops::upsert(&db, repo.id, "DEPLOY_SECRET", &encrypted, user.id)
-            .await
-            .unwrap();
+        rg_db::ops::ci_secret_ops::upsert_in_environment(
+            &db,
+            repo.id,
+            None,
+            "DEPLOY_SECRET",
+            &encrypted,
+            user.id,
+        )
+        .await
+        .unwrap();
 
         let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
         runner.set_repo_id(repo.id);
@@ -4170,5 +4185,150 @@ esac
             "the pipeline succeeded but reported {:?}",
             &pipelines[pipelines_before..]
         );
+    }
+
+    /// Security audit finding #11: a job reads its repository's repository-wide
+    /// secrets, and an environment's secrets only when the job declares that
+    /// environment. A plain job on any branch must not see `PROD_KEY`, and the
+    /// staging job must not see the production scope either.
+    #[tokio::test]
+    async fn environment_scoped_secrets_reach_only_their_environment_jobs() {
+        use rg_db::entities::{ci_environment, repository};
+
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "env-owner",
+            "env-owner@example.com",
+            "unused",
+            "Env Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("environment-secrets".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "refs/heads/main",
+            "push",
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+
+        let environment =
+            |name: &str, protected: bool, created_at: chrono::DateTime<chrono::Utc>| {
+                ci_environment::ActiveModel {
+                    id: NotSet,
+                    repo_id: Set(repo.id),
+                    name: Set(name.to_string()),
+                    protected: Set(protected),
+                    required_approvals: Set(1),
+                    allowed_approver_ids: Set(None),
+                    created_at: Set(created_at),
+                    updated_at: Set(created_at),
+                }
+            };
+        let staging = rg_db::ops::ci_environment_ops::create_with_approvers(
+            &db,
+            environment("staging", false, now),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let production = rg_db::ops::ci_environment_ops::create_with_approvers(
+            &db,
+            environment("production", true, now),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let key = rg_core::auth::encryption::derive_key("ci-secret-key");
+        for (name, environment_id, value) in [
+            ("REPO_KEY", None, "repo-value"),
+            ("STAGING_KEY", Some(staging.id), "staging-value"),
+            ("PROD_KEY", Some(production.id), "prod-value"),
+        ] {
+            let encrypted = rg_core::auth::encryption::encrypt(value, &key).unwrap();
+            rg_db::ops::ci_secret_ops::upsert_in_environment(
+                &db,
+                repo.id,
+                environment_id,
+                name,
+                &encrypted,
+                user.id,
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut runner =
+            PipelineRunner::new(db, std::path::Path::new("/tmp/env-secrets"), pipeline.id);
+        runner.set_repo_id(repo.id);
+        runner.set_encryption_key("ci-secret-key".into());
+
+        let (plain, masked) = runner.job_environment(None, None, None).await.unwrap();
+        let names: Vec<_> = plain.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(names.contains(&"REPO_KEY"));
+        assert!(
+            !names.contains(&"STAGING_KEY") && !names.contains(&"PROD_KEY"),
+            "a job without an environment must not read environment scopes: {names:?}"
+        );
+        assert!(masked.contains(&"repo-value".to_string()));
+        assert!(!masked.contains(&"prod-value".to_string()));
+
+        let (staged, masked) = runner
+            .job_environment(None, None, Some(staging.id))
+            .await
+            .unwrap();
+        let names: Vec<_> = staged.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(names.contains(&"REPO_KEY") && names.contains(&"STAGING_KEY"));
+        assert!(
+            !names.contains(&"PROD_KEY"),
+            "one environment must not read another's scope: {names:?}"
+        );
+        assert!(!masked.contains(&"prod-value".to_string()));
+
+        let (prod, masked) = runner
+            .job_environment(None, None, Some(production.id))
+            .await
+            .unwrap();
+        let names: Vec<_> = prod.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(names.contains(&"REPO_KEY") && names.contains(&"PROD_KEY"));
+        assert!(!names.contains(&"STAGING_KEY"));
+        assert!(masked.contains(&"prod-value".to_string()));
+        assert!(!masked.contains(&"staging-value".to_string()));
     }
 }
