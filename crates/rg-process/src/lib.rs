@@ -86,6 +86,48 @@ impl std::fmt::Display for StateCreationPermissions {
     }
 }
 
+/// `uid:gid` of this process, for `docker run --user`, or `None` where the
+/// platform has no such identity (Windows).
+///
+/// A job container bind-mounts a workspace this process created under
+/// [`StateCreationPermissions`]: owner-only by default, at most group access,
+/// never world. The container's root runs with `--cap-drop ALL`, so it has no
+/// `CAP_DAC_OVERRIDE` and is just another uid to the kernel — it can neither
+/// read the checkout nor write next to it. Running the job as the owner of the
+/// workspace is what makes the mount usable, and it keeps everything the job
+/// creates removable by the process that cleans the workspace up afterwards;
+/// a root-owned `node_modules` or `target/` would outlive every cleanup.
+pub fn container_user() -> Option<String> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid/getgid always succeed and touch no memory.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        Some(format!("{uid}:{gid}"))
+    }
+
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+#[cfg(all(test, unix))]
+mod container_user_tests {
+    #[test]
+    fn the_container_user_is_this_process_as_id_reports_it() {
+        let id = |flag: &str| {
+            let output = std::process::Command::new("id").arg(flag).output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+
+        assert_eq!(
+            super::container_user().as_deref(),
+            Some(format!("{}:{}", id("-u"), id("-g")).as_str())
+        );
+    }
+}
+
 #[cfg(test)]
 mod state_creation_permission_tests {
     use super::StateCreationPermissions;
@@ -172,15 +214,35 @@ impl std::error::Error for ProcessOutputError {
     }
 }
 
+/// How long the captured pipes may stay open after the direct child exited and
+/// its process group was killed.
+///
+/// Killing the group closes every pipe end its members held, so the readers see
+/// EOF almost at once. Only a process that left the group (`setsid`, `nohup
+/// setsid`, a double-forking daemon) survives the kill with the pipe still
+/// open; for that one the run ends with whatever output arrived in time rather
+/// than waiting for a process the job no longer owns.
+const ORPHANED_PIPE_GRACE: Duration = Duration::from_secs(5);
+
 /// Run `command` while owning its whole descendant tree.
 ///
 /// Dropping this future (for example when `tokio::time::timeout` elapses) kills
 /// the direct child and every process it started. The tree is also torn down
 /// after normal completion, so a background process cannot outlive the job that
 /// launched it.
+///
+/// Completion is the direct child's exit, not EOF on the pipes. A script such
+/// as `./server & cargo test` leaves `server` holding the inherited stdout; a
+/// run that waited for EOF before tearing the tree down waited for `server`,
+/// which never exits on its own, and the job sat "running" until its timeout.
+/// Here the child is reaped first, the group is killed, and the pipes are then
+/// drained for at most [`ORPHANED_PIPE_GRACE`]. A process that called `setsid`
+/// is outside the group and is not killed; its later output is not captured.
 pub async fn output_in_process_tree(
     command: &mut tokio::process::Command,
 ) -> std::io::Result<Output> {
+    use tokio::io::AsyncReadExt as _;
+
     // Match `Command::output`: no inherited stdin, captured stdout/stderr. The
     // direct-child guard remains defense in depth if platform setup fails after
     // spawn but before the tree owner is returned.
@@ -190,10 +252,65 @@ pub async fn output_in_process_tree(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let (child, tree) = platform::spawn_async(command)?;
-    let output = child.wait_with_output().await;
-    drop(tree);
-    output
+    let (mut child, tree) = platform::spawn_async(command)?;
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("stdout was not piped"))?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("stderr was not piped"))?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = {
+        // The pipes are read while the child runs: a child that fills a pipe
+        // buffer nobody drains blocks forever on its next write.
+        let drain = async {
+            tokio::try_join!(
+                stdout_pipe.read_to_end(&mut stdout),
+                stderr_pipe.read_to_end(&mut stderr),
+            )
+            .map(drop)
+        };
+        let mut drain = std::pin::pin!(drain);
+
+        enum First {
+            Exited(std::io::Result<std::process::ExitStatus>),
+            Drained(std::io::Result<()>),
+        }
+        let first = tokio::select! {
+            status = child.wait() => First::Exited(status),
+            drained = &mut drain => First::Drained(drained),
+        };
+        let (status, drained) = match first {
+            First::Exited(status) => (status?, None),
+            First::Drained(drained) => (child.wait().await?, Some(drained)),
+        };
+
+        // The child is gone; anything left in its group is a background job
+        // the script started. Kill it before waiting on the pipes it holds.
+        drop(tree);
+        match drained {
+            Some(drained) => drained?,
+            None => match tokio::time::timeout(ORPHANED_PIPE_GRACE, &mut drain).await {
+                Ok(drained) => drained?,
+                Err(_) => tracing::warn!(
+                    grace_secs = ORPHANED_PIPE_GRACE.as_secs(),
+                    "a process outside the job's process group still holds its output pipe; \
+                     returning the output captured so far"
+                ),
+            },
+        }
+        status
+    };
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Run a blocking command under a deadline *and* under caller-declared stdout /
@@ -237,42 +354,65 @@ pub fn output_in_process_tree_with_timeout_and_limit(
         .take()
         .ok_or_else(|| ProcessOutputError::Spawn(std::io::Error::other("stderr was not piped")))?;
 
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let deadline = std::time::Instant::now() + timeout;
+    // Room for both events, so the waiter never blocks on a slow receiver.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(2);
     let waiter = std::thread::Builder::new()
         .name("rg-process-wait-bounded".into())
         .spawn(move || {
-            drop(sender.send(wait_with_capped_output(
+            let exited = sender.clone();
+            let result = wait_with_capped_output(
                 child,
                 stdout_pipe,
                 stderr_pipe,
                 stdout_limit_bytes,
                 stderr_limit_bytes,
-            )));
+                move || drop(exited.send(WaiterEvent::ChildExited)),
+            );
+            drop(sender.send(WaiterEvent::Finished(result)));
         })
         .map_err(ProcessOutputError::Wait)?;
 
-    match receiver.recv_timeout(timeout) {
-        Ok(result) => {
-            // Even a bounded reader that overflowed leaves the tree owning
-            // whatever descendants the direct child had spawned; drop first
-            // so the guard SIGKILLs anything still holding a captured pipe.
-            drop(tree);
-            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
-            result.map_err(ProcessOutputError::Wait)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            drop(tree);
-            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
-            Ok(TimedOutput::TimedOut)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            drop(tree);
-            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
-            Err(ProcessOutputError::Wait(std::io::Error::other(
-                "process wait thread disconnected before reporting an output",
-            )))
+    let mut tree = Some(tree);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(WaiterEvent::ChildExited) => {
+                // The direct child is reaped while the readers may still be
+                // blocked on a pipe a background descendant inherited. Killing
+                // the group now is what lets them reach EOF; waiting for EOF
+                // first would wait out the whole deadline instead.
+                drop(tree.take());
+            }
+            Ok(WaiterEvent::Finished(result)) => {
+                // Even a bounded reader that overflowed leaves the tree owning
+                // whatever descendants the direct child had spawned; drop first
+                // so the guard SIGKILLs anything still holding a captured pipe.
+                drop(tree.take());
+                join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                return result.map_err(ProcessOutputError::Wait);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                drop(tree.take());
+                join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                return Ok(TimedOutput::TimedOut);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                drop(tree.take());
+                join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                return Err(ProcessOutputError::Wait(std::io::Error::other(
+                    "process wait thread disconnected before reporting an output",
+                )));
+            }
         }
     }
+}
+
+/// What the waiter thread reports to the thread that owns the process tree.
+enum WaiterEvent {
+    /// The direct child has been reaped; the readers may still be draining.
+    ChildExited,
+    Finished(std::io::Result<TimedOutput>),
 }
 
 /// What one reader thread returns after draining (or refusing) its pipe.
@@ -314,6 +454,7 @@ fn wait_with_capped_output(
     stderr_pipe: std::process::ChildStderr,
     stdout_limit: u64,
     stderr_limit: u64,
+    on_child_exit: impl FnOnce(),
 ) -> std::io::Result<TimedOutput> {
     let stdout_handle = std::thread::Builder::new()
         .name("rg-process-read-stdout".into())
@@ -322,18 +463,21 @@ fn wait_with_capped_output(
         .name("rg-process-read-stderr".into())
         .spawn(move || read_capped(stderr_pipe, stderr_limit))?;
 
+    // Reap the child before joining the readers: a background descendant that
+    // inherited stdout keeps the pipe open after the child is gone, and only
+    // the tree owner killing the group (told by `on_child_exit`) ends it. On
+    // overflow the reader has already closed its pipe end, so the child's
+    // next write returns EPIPE and it exits; a child that ignores SIGPIPE
+    // hits the outer deadline instead, which is what the tree guard is for.
+    let status = child.wait()?;
+    on_child_exit();
+
     let stdout_result = stdout_handle
         .join()
         .map_err(|_| std::io::Error::other("stdout reader thread panicked"))??;
     let stderr_result = stderr_handle
         .join()
         .map_err(|_| std::io::Error::other("stderr reader thread panicked"))??;
-
-    // Reap the child regardless: on overflow, the reader has closed its pipe
-    // end, so the next write from the child returns EPIPE and it exits. A
-    // child that ignores SIGPIPE hits the outer deadline instead, which is
-    // what the process-tree guard is for.
-    let status = child.wait()?;
 
     match (stdout_result, stderr_result) {
         (ReaderOutcome::Exceeded { limit, bytes_read }, _) => Ok(TimedOutput::OutputTooLarge {
@@ -537,6 +681,114 @@ mod bounded_tests {
             matches!(result, TimedOutput::TimedOut),
             "expected TimedOut, got {result:?}"
         );
+    }
+
+    #[test]
+    fn a_background_descendant_holding_stdout_does_not_hold_the_run() {
+        let started = std::time::Instant::now();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 1000 & echo done"]);
+
+        let result = output_in_process_tree_with_timeout_and_limit(
+            &mut command,
+            Duration::from_secs(30),
+            1024,
+            1024,
+        )
+        .expect("bounded run failed");
+
+        match result {
+            TimedOutput::Completed(output) => {
+                assert!(output.status.success(), "child exited non-zero");
+                assert_eq!(output.stdout, b"done\n");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the run waited {:?} for a background `sleep` that held stdout",
+            started.elapsed()
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod background_job_tests {
+    use super::*;
+
+    /// `./server & cargo test` — the script is done, the server is not.
+    #[tokio::test]
+    async fn a_background_job_holding_stdout_does_not_hold_the_script() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("background.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sleep 1000 & echo $! > \"$PID_FILE\"; echo done; true",
+            ])
+            .env("PID_FILE", &pid_file);
+
+        // Below `ORPHANED_PIPE_GRACE`: a run that only gave up on the pipes
+        // after the grace, instead of killing their holder, is the defect.
+        let output = tokio::time::timeout(
+            ORPHANED_PIPE_GRACE - Duration::from_secs(1),
+            output_in_process_tree(&mut command),
+        )
+        .await
+        .expect("the script finished but the run waited for its background job")
+        .expect("run failed");
+
+        assert!(output.status.success(), "script exited non-zero");
+        assert_eq!(output.stdout, b"done\n");
+
+        // The background job is part of the tree the run owned, and it must
+        // not outlive it either.
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_running(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background job {pid} survived the run"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A killed orphan is reaped by whoever adopted it, and a container's
+    /// PID 1 may never do that: a zombie still answers signal 0.
+    fn process_is_running(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes whether the pid exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // The state follows the parenthesised command name.
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .is_some_and(|state| state != "Z" && state != "X"),
+            Err(_) => !std::path::Path::new("/proc/self/stat").exists(),
+        }
+    }
+
+    #[tokio::test]
+    async fn output_written_before_exit_is_kept() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "head -c 200000 /dev/zero | tr '\\0' 'a'; echo err 1>&2; exit 3",
+        ]);
+
+        let output = output_in_process_tree(&mut command).await.unwrap();
+
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout.len(), 200_000);
+        assert_eq!(output.stderr, b"err\n");
     }
 }
 
