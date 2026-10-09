@@ -28,8 +28,14 @@ if (!/deleteConfirm\s*!==\s*repositoryPath/.test(settings)) {
   failures.push('Delete button and handler must require the full repository path.');
 }
 
-if (!/confirm_instruction',\s*\{\s*repo:\s*repositoryPath\s*\}/.test(settings)) {
-  failures.push('Delete confirmation copy must display the exact owner/repo path the backend route deletes.');
+// The sentence is split around its `{repo}` placeholder and the path rendered
+// between the halves as text — never interpolated into `{@html}`.
+if (
+  !/confirm_instruction',\s*\{\s*repo:\s*'\\u0001'\s*\}\)\.split\('\\u0001'\)/.test(settings) ||
+  !/<strong>\{repositoryPath\}<\/strong>/.test(settings) ||
+  /\{@html\s+t\('settings\.delete\.confirm_instruction'/.test(settings)
+) {
+  failures.push('Delete confirmation copy must display the exact owner/repo path the backend route deletes, as text.');
 }
 
 if (en.settings.delete.confirm_placeholder !== 'Type owner/repository') {

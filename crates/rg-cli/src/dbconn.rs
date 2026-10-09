@@ -250,13 +250,14 @@ fn first_stored_repository(
     Ok(None)
 }
 
-/// [`connect_online`] with the `[timeouts]` connect/idle budget the server
-/// configures.
+/// [`connect_online`] with the `[timeouts]` connect/idle budget and the
+/// `[database].max_connections` pool size the server configures.
 pub(crate) async fn connect_server_with_timeouts(
     db_url: &str,
     repo_root: &std::path::Path,
     connect_secs: u64,
     idle_secs: u64,
+    max_connections: u32,
 ) -> anyhow::Result<GuardedDatabaseConnection> {
     check_database_presence(
         db_url,
@@ -264,7 +265,7 @@ pub(crate) async fn connect_server_with_timeouts(
         MissingDatabase::CreateForANewInstance { repo_root },
     )?;
     let process_guard = rg_db::sqlite_process_guard::acquire_server(db_url)?;
-    let connection = rg_db::connect_with_timeouts(db_url, connect_secs, idle_secs)
+    let connection = rg_db::connect_with_pool(db_url, connect_secs, idle_secs, max_connections)
         .await
         .map_err(|e| annotate_db_open_error(e, db_url))?;
     Ok(GuardedDatabaseConnection {
@@ -434,12 +435,33 @@ mod tests {
         );
     }
 
+    /// card_04beeccc2e32: `[database].max_connections` is the size of the pool
+    /// the server actually opens, not a value that stops at the config struct.
+    #[tokio::test]
+    async fn server_pool_has_the_configured_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/plombir-git.db?mode=rwc", dir.path().display());
+        let repo_root = dir.path().join("repos");
+        let server = super::connect_server_with_timeouts(&url, &repo_root, 10, 60, 7)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server
+                .connection()
+                .get_sqlite_connection_pool()
+                .options()
+                .get_max_connections(),
+            7
+        );
+    }
+
     #[tokio::test]
     async fn server_connection_holds_the_sqlite_lease_for_its_lifetime() {
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}/plombir-git.db?mode=rwc", dir.path().display());
         let repo_root = dir.path().join("repos");
-        let server = super::connect_server_with_timeouts(&url, &repo_root, 10, 60)
+        let server = super::connect_server_with_timeouts(&url, &repo_root, 10, 60, 2)
             .await
             .unwrap();
 

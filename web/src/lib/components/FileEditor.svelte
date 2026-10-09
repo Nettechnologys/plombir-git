@@ -56,7 +56,6 @@
   let highlightRequestId = 0;
 
   let isMarkdown = $derived(/\.(md|markdown)$/i.test(filePath));
-  let highlightLanguage = $derived(languageFromPath(filePath));
   let renderedPreview = $derived(isMarkdown ? renderMarkdown(fileContent) : '');
   let diffLines = $derived(buildLineDiff(initialContent, fileContent));
   let changed = $derived(mode === 'create' || initialContent !== fileContent);
@@ -73,54 +72,18 @@
     initialized = true;
   });
 
+  // Re-highlight a moment after typing stops, not on every keystroke: the
+  // whole file is highlighted each time, and on a large file that work used to
+  // sit between each key and its echo (card_61e77c8abec1). The escaped text
+  // shows meanwhile, so nothing typed is ever hidden.
+  const HIGHLIGHT_DEBOUNCE_MS = 150;
   $effect(() => {
-    filePath;
-    fileContent;
-    void updateHighlightedContent();
+    const content = fileContent;
+    const path = filePath;
+    highlightedContent = escapeHtml(content || ' ');
+    const timer = setTimeout(() => void updateHighlightedContent(content, path), HIGHLIGHT_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
   });
-
-  function languageFromPath(path: string): string {
-    const ext = path.split('.').pop()?.toLowerCase() || '';
-    const map: Record<string, string> = {
-      c: 'c',
-      h: 'c',
-      cpp: 'cpp',
-      cc: 'cpp',
-      cxx: 'cpp',
-      hpp: 'cpp',
-      rs: 'rust',
-      go: 'go',
-      py: 'python',
-      js: 'javascript',
-      mjs: 'javascript',
-      cjs: 'javascript',
-      ts: 'typescript',
-      jsx: 'javascript',
-      tsx: 'typescript',
-      java: 'java',
-      rb: 'ruby',
-      php: 'php',
-      swift: 'swift',
-      kt: 'kotlin',
-      dart: 'dart',
-      html: 'xml',
-      css: 'css',
-      scss: 'scss',
-      json: 'json',
-      xml: 'xml',
-      yaml: 'yaml',
-      yml: 'yaml',
-      toml: 'ini',
-      sh: 'bash',
-      bash: 'bash',
-      zsh: 'bash',
-      sql: 'sql',
-      dockerfile: 'dockerfile',
-      md: 'markdown',
-      markdown: 'markdown',
-    };
-    return map[ext] || '';
-  }
 
   function escapeHtml(value: string): string {
     return value
@@ -131,21 +94,14 @@
       .replace(/'/g, '&#39;');
   }
 
-  async function updateHighlightedContent() {
+  async function updateHighlightedContent(text: string, path: string) {
     const requestId = ++highlightRequestId;
-    const content = fileContent || ' ';
-    const language = highlightLanguage;
+    const content = text || ' ';
 
     try {
-      const hljs = await import('highlight.js');
+      const { highlightSource, languageForPath } = await import('$lib/highlight');
       if (requestId !== highlightRequestId) return;
-
-      const highlighter = hljs.default;
-      if (language && highlighter.getLanguage(language)) {
-        highlightedContent = highlighter.highlight(content, { language }).value;
-      } else {
-        highlightedContent = highlighter.highlightAuto(content).value;
-      }
+      highlightedContent = highlightSource(content, languageForPath(path));
     } catch {
       if (requestId === highlightRequestId) {
         highlightedContent = escapeHtml(content);
@@ -291,7 +247,7 @@
           class="highlight-backdrop"
           aria-hidden="true"
           bind:this={highlightBackdrop}
-        ><code class="hljs language-{highlightLanguage}">{@html highlightedContent}</code></pre>
+        ><code class="hljs">{@html highlightedContent}</code></pre>
         <textarea
           id="file-content"
           bind:this={editorTextarea}

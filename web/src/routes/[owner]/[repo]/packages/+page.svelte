@@ -4,6 +4,7 @@
   import { packages } from '$lib/api/client.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
   import {
     PACKAGE_FORMATS,
     packageFormatLabel,
@@ -16,6 +17,8 @@
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
+  // Publishing is `RepoWrite` (card_270a0a77fd79).
+  const permission = viewerPermission(() => owner, () => repo);
   let formatFilter = $state<string>('');
   let searchQuery = $state<string>('');
   let packageList = $state<any[]>([]);
@@ -145,7 +148,9 @@
 
   <div class="page-header">
     <h1>{t('repo.tabs.packages')}</h1>
-    <a href={`/${owner}/${repo}/packages/upload`} class="btn-primary">{t('packages.upload')}</a>
+    {#if permission.canWrite}
+      <a href={`/${owner}/${repo}/packages/upload`} class="btn-primary">{t('packages.upload')}</a>
+    {/if}
   </div>
 
   {#if error}

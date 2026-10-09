@@ -607,21 +607,98 @@ fn scan_total_order(source: &str) -> SourceScan {
     let mut offenders = Vec::new();
     let mut checked = 0usize;
 
-    for function in production_function_ranges(&code) {
-        let body = &code[function.body];
+    let functions = production_function_ranges(&code);
+    // A listing may build its ordered selection in a helper of the same file
+    // (so a query-plan test can explain the very statement the server sends)
+    // and only cut the page itself. The helper's `ORDER BY` is then the one
+    // the page is cut from, so it counts — but only when the helper is called
+    // as a free function: `.name(` is some other type's method and `path::name(`
+    // another module's function, and neither is the helper this file defines.
+    let ordering_helpers: Vec<&str> = functions
+        .iter()
+        .filter(|function| orders_by_primary_key(&code[function.body.clone()]))
+        .map(|function| &code[function.name.clone()])
+        .collect();
+
+    for function in &functions {
+        let body = &code[function.body.clone()];
         if !has_method_call(body, "offset") && !has_method_call(body, "paginate") {
             continue;
         }
         checked += 1;
-        let breaks_ties = method_call_argument_ranges(body, "order_by_")
-            .into_iter()
-            .any(|argument| contains_column_id(&body[argument]));
+        let breaks_ties = orders_by_primary_key(body)
+            || ordering_helpers
+                .iter()
+                .any(|helper| calls_free_function(body, helper));
         if !breaks_ties {
-            offenders.push(source[function.name].to_owned());
+            offenders.push(source[function.name.clone()].to_owned());
         }
     }
 
     SourceScan { checked, offenders }
+}
+
+/// Whether some `order_by_*` in `body` names the primary key.
+fn orders_by_primary_key(body: &str) -> bool {
+    method_call_argument_ranges(body, "order_by_")
+        .into_iter()
+        .any(|argument| contains_column_id(&body[argument]))
+}
+
+/// Whether `body` calls `name(` as a free function — not as `.name(` (a
+/// method) and not as `path::name(` (another module's function).
+fn calls_free_function(body: &str, name: &str) -> bool {
+    let bytes = body.as_bytes();
+    body.match_indices(name).any(|(at, _)| {
+        let before_ok = bytes
+            .get(at.wrapping_sub(1))
+            .is_none_or(|byte| !is_ident_byte(*byte) && *byte != b'.' && *byte != b':');
+        let after = skip_whitespace(body, at + name.len());
+        before_ok && bytes.get(after) == Some(&b'(')
+    })
+}
+
+#[test]
+fn pagination_source_scan_follows_an_ordering_helper_of_the_same_file_only() {
+    let source = r###"
+pub async fn delegates() {
+    page_query(repo_id).offset(offset);
+}
+
+fn page_query(repo_id: i64) -> Select<Entity> {
+    Entity::find()
+        .order_by_desc(entity::Column::CreatedAt)
+        .order_by_desc(entity::Column::Id)
+}
+
+pub async fn delegates_to_a_builder_that_leaves_ties() {
+    loose_query().offset(offset);
+}
+
+fn loose_query() -> Select<Entity> {
+    Entity::find().order_by_desc(entity::Column::CreatedAt)
+}
+
+pub async fn calls_a_method_of_the_same_name() {
+    other.page_query(repo_id).offset(offset);
+}
+
+pub async fn calls_another_modules_function_of_the_same_name() {
+    elsewhere::page_query(repo_id).offset(offset);
+}
+"###;
+
+    assert_eq!(
+        scan_total_order(source),
+        SourceScan {
+            checked: 4,
+            offenders: vec![
+                "delegates_to_a_builder_that_leaves_ties".to_owned(),
+                "calls_a_method_of_the_same_name".to_owned(),
+                "calls_another_modules_function_of_the_same_name".to_owned(),
+            ],
+        }
+    );
 }
 
 fn scan_fetch_page_arguments(source: &str) -> SourceScan {

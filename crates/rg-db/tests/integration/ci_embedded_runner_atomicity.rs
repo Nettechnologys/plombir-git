@@ -500,7 +500,7 @@ async fn a_job_from_another_stage_is_refused() {
 ///
 /// The runner's `prepare_workspace` failure used to write one row — the
 /// pipeline — and return. Every stage and job under it stayed `pending`
-/// forever: the scheduler will not take them (`job_is_schedulable` refuses a
+/// forever: the scheduler will not take them (`pending_jobs_query` refuses a
 /// job whose pipeline left `pending`/`running`), so nothing ever moved them,
 /// and the API kept advertising work as waiting under a run that failed
 /// minutes ago. A single-row write reddens this test on the second and third

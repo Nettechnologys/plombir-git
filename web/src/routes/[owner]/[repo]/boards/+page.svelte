@@ -22,11 +22,16 @@
     LatestRepositoryResourceRequestFence,
   } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
 
   const t = createT();
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
+  // Every board mutation is `RepoWrite`; a reader sees the boards and nothing
+  // to change them with (card_270a0a77fd79).
+  const permission = viewerPermission(() => owner, () => repo);
+  const canWrite = $derived(permission.canWrite);
 
   let boardList = $state<Board[]>([]);
   let activeBoard = $state<Board | null>(null);
@@ -448,14 +453,16 @@
 
   <div class="page-header">
     <h1>{t('board.title')}</h1>
-    <button
-      class="btn btn-primary"
-      onclick={openCreateModal}
-      disabled={boardControlsBusy}
-      aria-busy={boardControlsBusy}
-    >
-      + {t('board.createBoard')}
-    </button>
+    {#if canWrite}
+      <button
+        class="btn btn-primary"
+        onclick={openCreateModal}
+        disabled={boardControlsBusy}
+        aria-busy={boardControlsBusy}
+      >
+        + {t('board.createBoard')}
+      </button>
+    {/if}
   </div>
 
   {#if error}
@@ -526,19 +533,21 @@
             tabindex={boardMutationBusy ? -1 : 0}
           >
             {b.name}
-            <button
-              type="button"
-              class="close"
-              onclick={(e) => {
-                e.stopPropagation();
-                deleteBoard(b.id);
-              }}
-              disabled={boardControlsBusy}
-              aria-busy={boardControlsBusy}
-              aria-label={`${t('board.deleteBoard')} ${b.name}`}
-            >
-              &times;
-            </button>
+            {#if canWrite}
+              <button
+                type="button"
+                class="close"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  deleteBoard(b.id);
+                }}
+                disabled={boardControlsBusy}
+                aria-busy={boardControlsBusy}
+                aria-label={`${t('board.deleteBoard')} ${b.name}`}
+              >
+                &times;
+              </button>
+            {/if}
           </div>
         {/each}
       </div>
@@ -553,12 +562,14 @@
               <p>{activeBoard.description}</p>
             {/if}
           </div>
-          <div class="board-header-actions">
-            <button class="btn btn-sm" onclick={startEditBoard} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.edit')}</button>
-            <button class="btn btn-sm" onclick={openAddColumnForm} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>
-              + {t('board.addColumn')}
-            </button>
-          </div>
+          {#if canWrite}
+            <div class="board-header-actions">
+              <button class="btn btn-sm" onclick={startEditBoard} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.edit')}</button>
+              <button class="btn btn-sm" onclick={openAddColumnForm} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>
+                + {t('board.addColumn')}
+              </button>
+            </div>
+          {/if}
         </div>
 
         {#if showEditBoard}
@@ -596,10 +607,14 @@
                   <button class="btn-icon btn-icon-sm" onclick={() => (editingColumnId = null)} title={t('common.cancel')}>×</button>
                 {:else}
                   <strong>{col.name}</strong>
-                  <button class="btn-icon btn-icon-sm" onclick={() => startEditColumn(col)} title={t('common.edit')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>✎</button>
+                  {#if canWrite}
+                    <button class="btn-icon btn-icon-sm" onclick={() => startEditColumn(col)} title={t('common.edit')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>✎</button>
+                  {/if}
                 {/if}
                 <span class="card-count">{(col.cards || []).length}</span>
-                <button class="btn-icon" onclick={() => deleteColumn(col.id)} title={t('common.delete')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>&times;</button>
+                {#if canWrite}
+                  <button class="btn-icon" onclick={() => deleteColumn(col.id)} title={t('common.delete')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>&times;</button>
+                {/if}
               </div>
 
               <div class="col-body">
@@ -607,6 +622,7 @@
                   <div class="card">
                     <div class="card-header">
                       <span>{card.note || card.issue?.title || `#${card.issue_id}`}</span>
+                      {#if canWrite}
                       <div class="card-actions">
                         <button
                           class="btn-icon btn-icon-sm"
@@ -625,6 +641,7 @@
                         <button class="btn-icon btn-icon-sm" onclick={() => startEditCard(card)} title={t('common.edit')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>✎</button>
                         <button class="btn-icon btn-icon-sm" onclick={() => deleteCard(card.id, col.id)} title={t('common.delete')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>&times;</button>
                       </div>
+                      {/if}
                     </div>
                     {#if card.issue}
                       <a class="card-link" href={`/${owner}/${repo}/issues/${card.issue.number}`}>
@@ -632,6 +649,7 @@
                       </a>
                     {/if}
                     <!-- Move dropdown -->
+                    {#if canWrite}
                     <select
                       class="card-move"
                       value={col.id}
@@ -644,6 +662,7 @@
                         <option value={targetCol.id}>{targetCol.name}</option>
                       {/each}
                     </select>
+                    {/if}
                   </div>
                 {/each}
 
@@ -653,7 +672,7 @@
                     <button class="btn btn-primary btn-sm" onclick={() => addCard(col.id)} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.add')}</button>
                     <button class="btn btn-sm" onclick={() => { showAddCard = null; newCardTitle = ''; }}>{t('common.cancel')}</button>
                   </div>
-                {:else}
+                {:else if canWrite}
                   <button class="btn btn-ghost btn-sm add-card-btn" onclick={() => openAddCardForm(col.id)} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>
                     + {t('board.addCard')}
                   </button>

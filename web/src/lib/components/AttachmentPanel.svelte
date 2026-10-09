@@ -2,11 +2,14 @@
   import { attachments, type Attachment, type AttachmentTarget } from '$lib/api/client.svelte';
   import { createT } from '$lib/i18n';
 
-  let { owner, repo, target, targetId }: {
+  // Uploading and deleting are `RepoWrite` on the server; a reader sees the
+  // files and nothing to do with them (card_270a0a77fd79).
+  let { owner, repo, target, targetId, canWrite = false }: {
     owner: string;
     repo: string;
     target: AttachmentTarget;
     targetId: number;
+    canWrite?: boolean;
   } = $props();
 
   const t = createT();
@@ -14,7 +17,6 @@
   let uploading = $state(false);
   let deletingId = $state<number | null>(null);
   let error = $state('');
-  let input: HTMLInputElement;
 
   $effect(() => {
     owner;
@@ -33,14 +35,15 @@
   }
 
   async function upload(event: Event) {
-    const file = (event.currentTarget as HTMLInputElement).files?.[0];
+    const field = event.currentTarget as HTMLInputElement;
+    const file = field.files?.[0];
     if (!file) return;
     try {
       uploading = true;
       error = '';
       const item = await attachments.upload(owner, repo, target, targetId, file);
       items = [...items, item];
-      input.value = '';
+      field.value = '';
     } catch (e: any) {
       error = e.message;
     } finally {
@@ -68,16 +71,19 @@
   }
 </script>
 
+{#if canWrite || items.length > 0 || error}
 <section class="attachment-panel">
   <div class="attachment-heading">
     <div>
       <h3>{t('attachments.title')}</h3>
-      <p>{t('attachments.hint')}</p>
+      {#if canWrite}<p>{t('attachments.hint')}</p>{/if}
     </div>
-    <label class="upload-button" class:disabled={uploading}>
-      {uploading ? t('attachments.uploading') : t('attachments.upload')}
-      <input bind:this={input} type="file" onchange={upload} disabled={uploading} />
-    </label>
+    {#if canWrite}
+      <label class="upload-button" class:disabled={uploading}>
+        {uploading ? t('attachments.uploading') : t('attachments.upload')}
+        <input type="file" onchange={upload} disabled={uploading} />
+      </label>
+    {/if}
   </div>
 
   {#if error}<div class="error-banner">{error}</div>{/if}
@@ -87,14 +93,17 @@
         <li>
           <a href={item.browser_download_url} download={item.name} data-sveltekit-reload>{item.name}</a>
           <span>{sizeLabel(item.size)}</span>
-          <button class="btn-secondary" onclick={() => remove(item.id)} disabled={deletingId === item.id}>
-            {t('attachments.delete')}
-          </button>
+          {#if canWrite}
+            <button class="btn-secondary" onclick={() => remove(item.id)} disabled={deletingId === item.id}>
+              {t('attachments.delete')}
+            </button>
+          {/if}
         </li>
       {/each}
     </ul>
   {/if}
 </section>
+{/if}
 
 <style>
   .attachment-panel { border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin: 16px 0; }

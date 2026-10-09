@@ -96,7 +96,7 @@ beforeEach(async () => {
 		is_admin: false,
 		display_name: 'Alice',
 	});
-	repos.get.mockResolvedValue({ default_branch: 'main' });
+	repos.get.mockResolvedValue({ default_branch: 'main', viewer_permission: 'admin' });
 	repos.starred.mockResolvedValue({ starred: false });
 	repos.watchStatus.mockResolvedValue({ watch_state: 'not_watching' });
 	await fetchUser();

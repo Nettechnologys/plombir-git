@@ -36,7 +36,8 @@
     "prev_arrow": "← Prev",
     "next_arrow": "Next →",
     "page_info": "Page {page} of {total}",
-    "deleting": "Deleting..."
+    "deleting": "Deleting...",
+    "copy_failed": "Copying failed. Select the text and copy it yourself."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -67,7 +68,8 @@
     "agents": "Agents",
     "home_label": "Plombir Git Home",
     "user_menu": "User menu",
-    "notification_settings": "Notification settings"
+    "notification_settings": "Notification settings",
+    "menu": "Menu"
   },
   "author": {
     "bot": "bot",
@@ -115,7 +117,7 @@
       "title": "Why choose Plombir Git?",
       "lightweight": {
         "title": "Lightweight",
-        "desc": "Memory usage <50MB, minimal resource footprint"
+        "desc": "One server process on SQLite, PostgreSQL or MySQL"
       },
       "all_in_one": {
         "title": "All-in-One",
@@ -123,7 +125,7 @@
       },
       "security": {
         "title": "Security",
-        "desc": "Argon2 + JWT authentication, enterprise-ready"
+        "desc": "Argon2 passwords, passkeys and two-factor sign-in"
       },
       "self_hosted": {
         "title": "Self-Hosted",
@@ -147,13 +149,13 @@
       "view_all": "View all",
       "empty": "No public repositories yet"
     },
-    "description": "Plombir Git is a lightweight Git hosting platform built in Rust, designed as a modern alternative to Gitea. Single binary deployment, memory efficient, full-featured.",
+    "description": "Plombir Git is a self-hosted Git platform written in Rust: repositories, issues, pull requests, wiki, CI/CD and package registries on SQLite, PostgreSQL or MySQL.",
     "sign_up": "Sign up",
     "sign_in": "Sign in",
     "stats": {
-      "memory": "Memory Usage",
-      "binary": "Single Binary",
-      "compatible": "Git Compatible",
+      "protocols": "Git over smart HTTP v2 and SSH",
+      "lfs": "Git LFS with file locking",
+      "ci": "Built-in pipelines and runners",
       "language": "Built with"
     },
     "public_repos": "Public Repositories",
@@ -202,7 +204,8 @@
       "submitting": "Creating account...",
       "footer": "Already have an account? {link}",
       "footer_link": "Sign in",
-      "failed": "Registration failed"
+      "failed": "Registration failed",
+      "closed": "Self-service sign-up is closed on this instance. Ask an administrator for an account."
     },
     "back_to_login": "Back to Login",
     "password_rules": {
@@ -238,7 +241,30 @@
       "email_required": "Email is required",
       "sent": "If that email exists, a reset link has been sent.",
       "failed": "Failed to request password reset"
-    }
+    },
+    "sso_error": {
+      "state_invalid": "Signing in with {provider} expired or was started in another window. Please try again.",
+      "provider_unavailable": "{provider} is not available right now. Try again later, or sign in another way.",
+      "code_rejected": "{provider} did not accept this sign-in, usually because it took too long. Please start again.",
+      "profile_no_id": "{provider} did not say which of its accounts you signed in with. Ask an administrator to check the provider's settings.",
+      "profile_no_email": "{provider} did not share your email address. Allow it to (on GitHub, the user:email permission) and try again.",
+      "profile_bad_email": "{provider} returned an email address that is not valid.",
+      "profile_unverified_email": "{provider} reports your email address as unconfirmed. Confirm it with {provider} and sign in again.",
+      "profile_no_username": "No username could be made from your {provider} profile. Ask an administrator to create an account for you.",
+      "link_required": "An account here already uses this email address. Sign in to that account and link {provider} under Settings → Security.",
+      "auto_provision_disabled": "{provider} cannot create new accounts here. If you already have an account, sign in to it and link {provider} under Settings → Security; otherwise ask an administrator to create one.",
+      "email_domain_not_allowed": "{provider} cannot create accounts here for your email domain. If you already have an account, sign in to it and link {provider} under Settings → Security; otherwise ask an administrator to create one.",
+      "email_not_verified": "{provider} creates accounts here only for confirmed addresses, and it did not confirm yours. Confirm it with {provider}, or sign in to an existing account and link {provider} under Settings → Security.",
+      "account_disabled": "This account is disabled.",
+      "account_locked": "This account is temporarily locked after too many failed attempts. Try again later.",
+      "linked_elsewhere": "This {provider} identity is already linked to another account.",
+      "provider_already_linked": "Your account is already linked to a {provider} identity. Unlink it first to link a different one.",
+      "session_ended": "Your session ended before the link finished. Sign in and start linking again.",
+      "retry": "Signing in with {provider} collided with another attempt. Please try again.",
+      "server_error": "Something went wrong on the server while signing in with {provider}. Please try again later.",
+      "failed": "Signing in with {provider} failed. Please try again."
+    },
+    "password_policy": "At least {min} characters, with an uppercase and a lowercase letter, a digit and a symbol. Not your username, and not a common password."
   },
   "dashboard": {
     "title": "Dashboard",
@@ -986,7 +1012,15 @@
     "backend_unreachable": "Cannot reach the backend. Make sure the service on port 8080 is running.",
     "session_check_failed": "Plombir Git could not verify your session. You have not been signed out.",
     "session_check_retry": "Retry",
-    "session_check_retrying": "Retrying..."
+    "session_check_retrying": "Retrying...",
+    "page": {
+      "not_found_title": "Page not found",
+      "not_found": "Nothing lives at this address. It may have moved, or you may not have access to it.",
+      "failed_title": "This page could not be loaded",
+      "failed": "Something went wrong while loading this page. Try again in a moment.",
+      "home": "Go home",
+      "explore": "Explore repositories"
+    }
   },
   "search": {
     "title": "Search",
@@ -1302,7 +1336,7 @@
     "delete": {
       "title": "Delete this repository",
       "desc": "Once you delete a repository, there is no going back.",
-      "confirm_instruction": "Type <strong>{repo}</strong> to confirm:",
+      "confirm_instruction": "Type {repo} to confirm:",
       "confirm_placeholder": "Type owner/repository",
       "confirm_button": "Delete this repository",
       "confirming": "Deleting...",
@@ -1406,6 +1440,10 @@
       "confirm_title": "Rename this repository?",
       "confirm_body": "{from} will become {to}.",
       "no_redirect": "Old web links and clone URLs stop working: there is no redirect from the old name. Everyone who cloned it has to point their remote at the new URL."
+    },
+    "access": {
+      "admin_required": "This page is for the repository’s administrators.",
+      "write_required": "This page is for people who can write to the repository."
     }
   },
   "commit": {

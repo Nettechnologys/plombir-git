@@ -140,6 +140,7 @@ pub mod m20261007_000003_issue_comments_reference_their_issue;
 pub mod m20261008_000001_account_self_service;
 pub mod m20261009_000001_owner_names_unique;
 pub mod m20261009_000002_notification_routing;
+pub mod m20261009_000003_listing_and_foreign_key_indexes;
 
 use sea_orm_migration::prelude::*;
 
@@ -370,6 +371,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261008_000001_account_self_service::Migration),
             Box::new(m20261009_000001_owner_names_unique::Migration),
             Box::new(m20261009_000002_notification_routing::Migration),
+            Box::new(m20261009_000003_listing_and_foreign_key_indexes::Migration),
         ]
     }
 }

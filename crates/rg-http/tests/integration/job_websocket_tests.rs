@@ -305,22 +305,19 @@ async fn retirement_or_delete_wins_job_log_owner_finalization() {
             "the owner finalizer closed a healthy job-log socket"
         );
 
-        let mutation = if delete {
-            "DELETE FROM users WHERE id = OLD.id;"
-        } else {
-            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
-             WHERE id = OLD.id;"
-        };
         db.execute(Statement::from_string(
             db.get_database_backend(),
-            format!(
-                "CREATE TRIGGER lose_job_log_owner_{index} \
-                 BEFORE UPDATE OF session_version ON users WHEN OLD.id = {owner_id} \
-                 BEGIN {mutation} SELECT RAISE(IGNORE); END"
-            ),
+            if delete {
+                format!("DELETE FROM users WHERE id = {owner_id}")
+            } else {
+                format!(
+                    "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, \
+                     updated_at = CURRENT_TIMESTAMP WHERE id = {owner_id}"
+                )
+            },
         ))
         .await
-        .expect("install competing job-log owner lifecycle mutation");
+        .expect("retire or delete the job-log owner");
 
         let ended = tokio::time::timeout(std::time::Duration::from_secs(20), async {
             while let Some(frame) = socket.next().await {

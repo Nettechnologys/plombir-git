@@ -21,7 +21,7 @@
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { getUser } from '$lib/stores/auth.svelte';
   import { canModifyComment, isEdited } from '$lib/commentState';
-  import { isRepoAdmin } from '$lib/repoPermission';
+  import { canWriteRepo, isRepoAdmin } from '$lib/repoPermission';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
   import { renderMarkdown as renderMarkdownSafe } from '$lib/utils/markdown';
 
@@ -48,6 +48,10 @@
   let viewerPermission = $state<RepoPermission | null>(null);
   let viewer = $derived(getUser());
   let isAdmin = $derived(isRepoAdmin(viewerPermission));
+  // Editing the issue itself — state, assignee, milestone, attachments — is
+  // `RepoWrite`; commenting is `RepoAuthRead`, any signed-in reader
+  // (card_270a0a77fd79).
+  let canWrite = $derived(canWriteRepo(viewerPermission));
   let editingCommentId = $state<number | null>(null);
   let editDraft = $state('');
   let editBusy = $state(false);
@@ -374,7 +378,7 @@
         <div class="issue-links-grid">
           <label>
             {t('issues.assignee')}
-            <select bind:value={linkForm.assigneeId} disabled={mutationBusy}>
+            <select bind:value={linkForm.assigneeId} disabled={mutationBusy || !canWrite}>
               <option value="">{t('issues.unassigned')}</option>
               {#each assigneeOptions as assignee (assignee.id)}
                 <option value={String(assignee.id)}>{assignee.label}</option>
@@ -383,16 +387,18 @@
           </label>
           <label>
             {t('issues.milestone')}
-            <select bind:value={linkForm.milestoneId} disabled={mutationBusy}>
+            <select bind:value={linkForm.milestoneId} disabled={mutationBusy || !canWrite}>
               <option value="">{t('issues.no_milestone')}</option>
               {#each milestoneList as milestone (milestone.id)}
                 <option value={String(milestone.id)}>{milestone.title} · {t(`milestones.${milestone.state}`, undefined, formatTranslationFallback(milestone.state))}</option>
               {/each}
             </select>
           </label>
-          <button class="btn-primary save-links" type="button" onclick={saveLinks} disabled={mutationBusy}>
-            {mutationBusy ? t('common.loading') : t('issues.save_links')}
-          </button>
+          {#if canWrite}
+            <button class="btn-primary save-links" type="button" onclick={saveLinks} disabled={mutationBusy}>
+              {mutationBusy ? t('common.loading') : t('issues.save_links')}
+            </button>
+          {/if}
         </div>
       </section>
 
@@ -405,7 +411,7 @@
         </div>
       {/if}
 
-      <AttachmentPanel {owner} {repo} target="issues" targetId={number} />
+      <AttachmentPanel {owner} {repo} target="issues" targetId={number} {canWrite} />
 
       <!-- Comments -->
       {#each commentList as comment (comment.id)}
@@ -440,20 +446,26 @@
           {:else}
             <div class="comment-body markdown-body">{@html renderMarkdown(comment.body)}</div>
           {/if}
-          <AttachmentPanel {owner} {repo} target="issues/comments" targetId={comment.id} />
+          <AttachmentPanel {owner} {repo} target="issues/comments" targetId={comment.id} {canWrite} />
         </div>
       {/each}
 
       <!-- Add comment -->
-      <form onsubmit={handleComment} class="comment-form">
-        <textarea bind:value={newComment} rows="4" placeholder={t('issues.comment_placeholder')} disabled={mutationBusy}></textarea>
-        <div class="form-actions">
-          <button type="submit" class="btn-primary" disabled={mutationBusy || !newComment.trim()}>{t('issues.comment')}</button>
-          <button type="button" class="btn-close" onclick={toggleState} disabled={mutationBusy}>
-            {issue.state === 'open' ? t('issues.close_issue') : t('issues.reopen_issue')}
-          </button>
-        </div>
-      </form>
+      <!-- A writer is signed in by definition — the server reports `write` only
+           to an authenticated caller — so either fact opens the form. -->
+      {#if viewer || canWrite}
+        <form onsubmit={handleComment} class="comment-form">
+          <textarea bind:value={newComment} rows="4" placeholder={t('issues.comment_placeholder')} disabled={mutationBusy}></textarea>
+          <div class="form-actions">
+            <button type="submit" class="btn-primary" disabled={mutationBusy || !newComment.trim()}>{t('issues.comment')}</button>
+            {#if canWrite}
+              <button type="button" class="btn-close" onclick={toggleState} disabled={mutationBusy}>
+                {issue.state === 'open' ? t('issues.close_issue') : t('issues.reopen_issue')}
+              </button>
+            {/if}
+          </div>
+        </form>
+      {/if}
 
       {#if isAdmin}
         <section class="issue-danger">

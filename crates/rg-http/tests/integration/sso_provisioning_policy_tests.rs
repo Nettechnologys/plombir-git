@@ -14,9 +14,9 @@
 
 use std::collections::HashMap;
 
-use crate::common::{build_test_app_state_with, setup_test_db, StateOverrides};
+use crate::common::{build_test_app_state_with, setup_test_db, SsoCallbackOutcome, StateOverrides};
 use axum::extract::{Form, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rg_db::ops::sso_provider_ops::SsoProviderInput;
@@ -185,7 +185,7 @@ impl Harness {
     }
 
     /// One full first login, exactly as a browser drives it.
-    async fn sign_in(&self) -> (StatusCode, String) {
+    async fn sign_in(&self) -> SsoCallbackOutcome {
         let authorize = self
             .client
             .get(format!("{}/api/v1/auth/sso/idp", self.base))
@@ -206,7 +206,7 @@ impl Harness {
             .send()
             .await
             .unwrap();
-        (callback.status(), callback.text().await.unwrap())
+        SsoCallbackOutcome::of(&callback)
     }
 
     async fn provisioned(&self, email: &str) -> bool {
@@ -233,22 +233,14 @@ impl Drop for Harness {
 
 /// The defect itself: a valid identity nobody here knows must not become an
 /// account when the provider is not allowed to create them — and the refusal
-/// is a decision (403), not a crash (500).
+/// names the rule that refused, not a crash.
 #[tokio::test]
 async fn a_provider_without_auto_provision_creates_no_account() {
     let app = Harness::start("newcomer@example.com", false, None).await;
 
-    let (status, body) = app.sign_in().await;
-
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "a refused provisioning must answer 403, got body: {body}"
-    );
-    assert!(
-        body.contains("does not create new accounts"),
-        "the refusal has to say which rule refused, got: {body}"
-    );
+    app.sign_in()
+        .await
+        .assert_refused("/login", "auto_provision_disabled");
     assert!(
         !app.provisioned("newcomer@example.com").await,
         "a refused SSO login provisioned an account anyway"
@@ -265,12 +257,17 @@ async fn a_provider_without_auto_provision_creates_no_account() {
 async fn the_same_login_is_provisioned_when_the_provider_may() {
     let app = Harness::start("newcomer@example.com", true, None).await;
 
-    let (status, _) = app.sign_in().await;
+    let outcome = app.sign_in().await;
 
     assert_eq!(
-        status,
-        StatusCode::TEMPORARY_REDIRECT,
-        "an allowed first login must complete"
+        outcome.refusal(),
+        None,
+        "an allowed first login must complete, went to: {}",
+        outcome.location
+    );
+    assert!(
+        outcome.session_issued,
+        "an allowed first login issued no session"
     );
     assert!(
         app.provisioned("newcomer@example.com").await,
@@ -284,13 +281,9 @@ async fn the_same_login_is_provisioned_when_the_provider_may() {
 async fn an_address_outside_the_allowlist_creates_no_account() {
     let app = Harness::start("newcomer@outsider.com", true, Some("example.com")).await;
 
-    let (status, body) = app.sign_in().await;
-
-    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
-    assert!(
-        body.contains("email domain"),
-        "the refusal has to name the domain rule, got: {body}"
-    );
+    app.sign_in()
+        .await
+        .assert_refused("/login", "email_domain_not_allowed");
     assert!(!app.provisioned("newcomer@outsider.com").await);
     assert!(!app.linked().await);
 }
@@ -300,9 +293,7 @@ async fn an_address_outside_the_allowlist_creates_no_account() {
 async fn an_address_inside_the_allowlist_is_provisioned() {
     let app = Harness::start("newcomer@example.com", true, Some("example.com")).await;
 
-    let (status, _) = app.sign_in().await;
-
-    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(app.sign_in().await.refusal(), None);
     assert!(app.provisioned("newcomer@example.com").await);
 }
 
@@ -317,25 +308,15 @@ async fn an_allowlist_refuses_an_address_the_provider_did_not_confirm() {
             Harness::start_with_claim("someone@example.com", true, Some("example.com"), claim)
                 .await;
 
-        let (status, body) = app.sign_in().await;
-
         // An explicit `false` is already refused one layer earlier, by the
-        // identity gate, with a 400 of its own; `None` reaches the allowlist.
+        // identity gate, with a reason of its own; `None` reaches the
+        // allowlist.
         let expected = if claim.is_none() {
-            StatusCode::FORBIDDEN
+            "email_not_verified"
         } else {
-            StatusCode::BAD_REQUEST
+            "profile_unverified_email"
         };
-        assert_eq!(
-            status, expected,
-            "claim {claim:?}: an unconfirmed address inside the allowlist must be refused, body: {body}"
-        );
-        if claim.is_none() {
-            assert!(
-                body.contains("did not confirm"),
-                "the refusal has to say the address was not confirmed, got: {body}"
-            );
-        }
+        app.sign_in().await.assert_refused("/login", expected);
         assert!(
             !app.provisioned("someone@example.com").await,
             "claim {claim:?}: an unconfirmed address got an account through the allowlist"
@@ -351,13 +332,13 @@ async fn a_confirmed_address_or_an_unrestricted_provider_still_provisions() {
     let app =
         Harness::start_with_claim("someone@example.com", true, Some("example.com"), Some(true))
             .await;
-    let (status, body) = app.sign_in().await;
-    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "body: {body}");
+    let outcome = app.sign_in().await;
+    assert_eq!(outcome.refusal(), None, "went to: {}", outcome.location);
     assert!(app.provisioned("someone@example.com").await);
 
     let app = Harness::start_with_claim("someone@example.com", true, None, None).await;
-    let (status, body) = app.sign_in().await;
-    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "body: {body}");
+    let outcome = app.sign_in().await;
+    assert_eq!(outcome.refusal(), None, "went to: {}", outcome.location);
     assert!(app.provisioned("someone@example.com").await);
 }
 
@@ -389,13 +370,15 @@ async fn an_existing_account_still_signs_in_through_a_closed_provider() {
     .unwrap()
     .expect("the identity is linked");
 
-    let (status, body) = app.sign_in().await;
+    let outcome = app.sign_in().await;
 
     assert_eq!(
-        status,
-        StatusCode::TEMPORARY_REDIRECT,
-        "a provisioning switch locked out an account that already existed, body: {body}"
+        outcome.refusal(),
+        None,
+        "a provisioning switch locked out an account that already existed, went to: {}",
+        outcome.location
     );
+    assert!(outcome.session_issued, "the existing member got no session");
     assert!(
         app.linked().await,
         "the existing account lost its provider link"
@@ -404,16 +387,19 @@ async fn an_existing_account_still_signs_in_through_a_closed_provider() {
 
 /// A refused provisioning names the way in for somebody who does have an
 /// account here — said to everyone, so it discloses nothing about whether this
-/// person's address is taken.
+/// person's address is taken. The sentence lives on the login page, keyed by
+/// the refusal code (`web/src/lib/api/loginSsoError.test.ts`); what the server
+/// owes it is the provider, so the page can name it.
 #[tokio::test]
 async fn a_refused_provisioning_points_an_existing_member_at_linking() {
     let app = Harness::start("newcomer@example.com", false, None).await;
 
-    let (status, body) = app.sign_in().await;
+    let outcome = app.sign_in().await;
 
-    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    outcome.assert_refused("/login", "auto_provision_disabled");
     assert!(
-        body.contains("link Mock IdP under Settings"),
-        "the refusal does not say how an existing member gets in, got: {body}"
+        outcome.location.ends_with("&provider=idp"),
+        "the refusal does not name the provider to link: {}",
+        outcome.location
     );
 }

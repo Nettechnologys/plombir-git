@@ -177,9 +177,9 @@ async fn deactivating_an_account_revokes_its_personal_access_token() {
 }
 
 /// Every HTTP consumer shares `resolve_pat`; drive all three production doors
-/// to prove none bypasses its owner finalizer. The trigger makes retirement
-/// win inside the finalizing user-row update, after token lookup and before an
-/// authenticated continuation can be published.
+/// to prove none bypasses its owner finalizer. The token lookup does not read
+/// the owner, so a retirement committed after the PAT was issued is caught by
+/// the finalizer's read or by nothing.
 #[tokio::test]
 async fn retirement_wins_each_pat_transport_before_authentication_is_published() {
     for (index, transport) in [PatTransport::Rest, PatTransport::GitHttp, PatTransport::Oci]
@@ -205,17 +205,12 @@ async fn retirement_wins_each_pat_transport_before_authentication_is_published()
         db.execute(Statement::from_string(
             db.get_database_backend(),
             format!(
-                "CREATE TRIGGER retire_pat_owner_{index} \
-                 BEFORE UPDATE OF session_version ON users WHEN OLD.id = {user_id} \
-                 BEGIN \
-                   UPDATE users SET deleted_at = CURRENT_TIMESTAMP, \
-                     updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; \
-                   SELECT RAISE(IGNORE); \
-                 END"
+                "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, \
+                 updated_at = CURRENT_TIMESTAMP WHERE id = {user_id}"
             ),
         ))
         .await
-        .expect("install competing PAT-owner retirement");
+        .expect("retire the PAT owner");
 
         let rejected = present_pat(&base, &username, &repo, &pat, transport).await;
         assert_eq!(

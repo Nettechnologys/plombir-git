@@ -8,6 +8,7 @@
     isLoggedIn,
   } from '$lib/stores/auth.svelte';
   import { createT } from '$lib/i18n';
+  import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from '$lib/passwordPolicy';
 
   const t = createT();
 
@@ -252,7 +253,16 @@
           </label>
           <label>
             {t('settings.profile.new_password', 'New password')}
-            <input type="password" bind:value={newPassword} required autocomplete="new-password" />
+            <input
+              type="password"
+              bind:value={newPassword}
+              required
+              autocomplete="new-password"
+              minlength={PASSWORD_MIN_LENGTH}
+              maxlength={PASSWORD_MAX_LENGTH}
+              aria-describedby="password-policy"
+            />
+            <small id="password-policy" class="hint">{t('auth.password_policy', { min: PASSWORD_MIN_LENGTH })}</small>
           </label>
           <label>
             {t('settings.profile.confirm_password', 'Repeat the new password')}
@@ -326,6 +336,13 @@
 </div>
 
 <style>
+  .hint {
+    display: block;
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
   .profile-page { max-width: 760px; }
 
   .page-header { margin-bottom: 24px; }
