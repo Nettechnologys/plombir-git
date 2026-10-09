@@ -15,6 +15,10 @@ use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 
 use rg_db::ops::pipeline_ops;
+// One shape predicate and one reserved-name predicate, shared with the config
+// validator, the secrets API and the external runner (security audit finding
+// #2, `=`-name follow-up).
+use rg_core::ci::{is_reserved_ci_variable, valid_environment_name};
 
 /// A healthy embedded job must report liveness well inside the HTTP watchdog's
 /// ten-minute stale window. External runners do the same through their 30s
@@ -300,9 +304,18 @@ impl PipelineRunner {
     /// The timeout boundary owns the returned future, not the child handle. If
     /// it expires, dropping `output()` must kill the Docker CLI; otherwise a
     /// wedged client survives even after the job has been recorded as failed.
+    ///
+    /// The client also starts from an empty environment and gets back only
+    /// what the operator's own environment says it needs to reach the daemon
+    /// (`rg_core::ci::docker_cli_environment`). The server process
+    /// carries its database URL, encryption key and whatever else the
+    /// deployment exported; none of it belongs to a `docker` child.
     fn docker_command(&self) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(&self.docker_program);
-        command.kill_on_drop(true);
+        command
+            .kill_on_drop(true)
+            .env_clear()
+            .envs(rg_core::ci::docker_cli_environment());
         command
     }
 
@@ -1232,14 +1245,21 @@ impl PipelineRunner {
             "-w".to_string(),
             "/workspace".to_string(),
         ];
+        // Pass only the variable name on the command line. The value is
+        // inherited from the Docker CLI environment so CI_JOB_TOKEN and
+        // secrets are not exposed in the host process arguments — which is
+        // also why the name is judged here: a variable the CLI reads is a
+        // variable that acts on the host, outside the container's
+        // `--cap-drop`. `LD_PRELOAD` would load a library the push delivered
+        // into the workspace; `DOCKER_HOST` would hand this very command, every
+        // `-e` secret included, to a daemon of the job's choosing. `PATH`,
+        // `LANG` and `HOME` are the local shell's and the container keeps its
+        // image's own (security audit finding #2).
         for (key, _) in job_environment {
-            if key == "HOME" {
+            if rg_core::ci::is_host_sensitive_variable(key) {
                 continue;
             }
             args.push("-e".to_string());
-            // Pass only the variable name on the command line. The value is
-            // inherited from the Docker CLI environment so CI_JOB_TOKEN and
-            // future secrets are not exposed in the host process arguments.
             args.push(key.clone());
         }
         args.extend([
@@ -1253,7 +1273,7 @@ impl PipelineRunner {
         let mut command = self.docker_command();
         command.args(&args);
         for (key, value) in job_environment {
-            if key != "HOME" {
+            if !rg_core::ci::is_host_sensitive_variable(key) {
                 command.env(key, value);
             }
         }
@@ -1943,15 +1963,10 @@ fn cache_spec(
     Ok(Some((key, paths)))
 }
 
-fn valid_environment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
-        && chars.all(|ch| matches!(ch, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
-}
-
-fn is_reserved_ci_variable(name: &str) -> bool {
-    rg_core::ci::is_builtin_ci_variable(name) || matches!(name, "HOME" | "PATH")
-}
+// `valid_environment_name` and `is_reserved_ci_variable` live in
+// `rg_process::job_environment` / `rg_core::ci`: one shape predicate and one
+// reserved-name predicate for the config validator, the secrets API and both
+// executors (security audit finding #2).
 
 #[cfg(test)]
 mod tests {
@@ -2228,10 +2243,54 @@ mod tests {
         assert!(valid_environment_name("DEPLOY_TARGET_2"));
         assert!(!valid_environment_name("2TARGET"));
         assert!(!valid_environment_name("BAD-NAME"));
+        // A name carrying `=` cannot be an environment name: libc/Go `getenv`
+        // reads the entry up to the first `=`, so `PATH=/tmp` would become an
+        // effective job-supplied `PATH` (security audit finding #2, follow-up).
+        assert!(!valid_environment_name("PATH=/tmp"));
+        assert!(!valid_environment_name("HTTPS_PROXY=http://attacker:8080"));
         assert!(is_reserved_ci_variable("CI_JOB_TOKEN"));
         assert!(is_reserved_ci_variable("CI_REPOSITORY"));
         assert!(is_reserved_ci_variable("CI_REPOSITORY_OWNER"));
         assert!(!is_reserved_ci_variable("PROJECT_MODE"));
+        // Names that act on the host `docker` CLI rather than in the container
+        // (security audit finding #2): the loader, the client's own
+        // configuration, the Go runtime knobs, TLS trust, proxies, and the
+        // shell's basics in both spellings Windows accepts.
+        for name in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DOCKER_HOST",
+            "DOCKER_CONFIG",
+            "DOCKER_CERT_PATH",
+            "DOCKER_TLS_VERIFY",
+            "GODEBUG",
+            "GOTRACEBACK",
+            "GOMAXPROCS",
+            "SSL_CERT_FILE",
+            "HTTP_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "PATH",
+            "Path",
+            "HOME",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+        ] {
+            assert!(is_reserved_ci_variable(name), "{name} must be reserved");
+        }
+        for name in [
+            "DEPLOY_TOKEN",
+            "LANGUAGE",
+            "MY_LD_FLAGS",
+            "PROXY_USER",
+            "GOFLAGS",
+            "GOPROXY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ] {
+            assert!(!is_reserved_ci_variable(name), "{name} must stay usable");
+        }
     }
 
     #[test]
@@ -2926,6 +2985,8 @@ case "$1" in
     ;;
   run)
     printf '%s\n' "$$" > "$state/client.pid"
+    printf '%s\n' "$@" > "$state/run.args"
+    env > "$state/run.env"
     for arg in "$@"; do
       if [ "$arg" = "fixture:success" ]; then
         printf 'docker success\n'
@@ -3128,6 +3189,134 @@ esac
             "a successful container was force-removed"
         );
         assert_process_stops(fixture.pid("client.pid"), "successful docker client").await;
+    }
+
+    /// The host `docker` CLI runs as the server, outside the container's
+    /// `--cap-drop`, so whatever reaches its environment runs on the host. It
+    /// must see neither the server's own environment (the canary stands in for
+    /// the database URL and the encryption key) nor a job-supplied
+    /// `LD_PRELOAD` or `DOCKER_HOST` — only the operator's allow-list and the
+    /// job's harmless variables, whose values still travel in the environment
+    /// and never on the command line (security audit finding #2).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_docker_job_cannot_reach_the_host_cli_with_its_own_or_the_servers_variables() {
+        use sea_orm::ActiveModelTrait;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = DockerFixture::new(&temp.path().join("fake-docker"));
+        let (mut runner, db, job) = runner_with_one_job(
+            temp.path(),
+            "docker-environment",
+            "echo accepted",
+            Some("fixture:success"),
+            30,
+        )
+        .await;
+        runner.set_docker_program(&fixture.program);
+        let evil_library = temp.path().join("evil.so").display().to_string();
+        rg_db::entities::pipeline_job::ActiveModel {
+            id: Set(job.id),
+            variables: Set(Some(
+                serde_json::json!({
+                    "LD_PRELOAD": evil_library,
+                    "DOCKER_HOST": "tcp://attacker:2375",
+                    "GODEBUG": "http2debug=2",
+                    "http_proxy": "http://attacker",
+                    "PATH": "/job/bin",
+                    // A name with `=` in it: `getenv` stops at the first `=`,
+                    // so these would read back as an effective `HTTPS_PROXY`
+                    // and `PATH` chosen by the job (security audit finding #2,
+                    // `=`-name follow-up).
+                    "HTTPS_PROXY=http://attacker:8080": "x",
+                    "PATH=/tmp": "y",
+                    "MULTI_LINE": "first\nsecond",
+                })
+                .to_string(),
+            )),
+            ..Default::default()
+        }
+        .update(&db)
+        .await
+        .unwrap();
+        // Cargo sets this in every test process; it stands in for the database
+        // URL and the encryption key the server carries.
+        assert!(
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            "the canary must exist in the server process for the check to mean anything"
+        );
+
+        runner.run().await.unwrap();
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "success", "{:?}", completed.log);
+        let env = std::fs::read_to_string(fixture.root.join("run.env")).unwrap();
+        let has = |line: &str| env.lines().any(|candidate| candidate == line);
+        assert!(has("CI=true"), "{env}");
+        assert!(
+            has(&format!("CI_PIPELINE_ID={}", runner.pipeline_id)),
+            "{env}"
+        );
+        assert!(
+            env.contains("MULTI_LINE=first\nsecond\n"),
+            "a multi-line value must survive the trip through the environment: {env}"
+        );
+        for denied in [
+            "CARGO_MANIFEST_DIR=",
+            "LD_PRELOAD=",
+            "DOCKER_HOST=",
+            "GODEBUG=",
+            "http_proxy=",
+            "PATH=/job/bin",
+            // The malformed entries would show up literally as
+            // `HTTPS_PROXY=http://attacker:8080=x` and `PATH=/tmp=y`; an
+            // environment entry's effective name is what precedes its first
+            // `=`, and both of those are host-sensitive.
+            "HTTPS_PROXY=http://attacker:8080=",
+            "PATH=/tmp=",
+        ] {
+            assert!(
+                !env.lines().any(|line| line.starts_with(denied)),
+                "{denied} reached the docker CLI environment: {env}"
+            );
+        }
+        // Whatever host-sensitive name still appears by its effective name
+        // (the first `=` splits name from value) may only carry the operator's
+        // value: the job cannot express a denied name through a `=`-carrying
+        // one.
+        for line in env.lines() {
+            let Some((effective_name, value)) = line.split_once('=') else {
+                continue;
+            };
+            if !rg_core::ci::is_host_sensitive_variable(effective_name) {
+                continue;
+            }
+            let operator_value = std::env::var(effective_name).ok();
+            assert_eq!(
+                Some(value.to_string()),
+                operator_value,
+                "the job overrode `{effective_name}` in the docker CLI environment: {env}"
+            );
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            assert!(
+                has(&format!("PATH={}", path.to_string_lossy())),
+                "the CLI must keep the operator's PATH: {env}"
+            );
+        }
+        let args = std::fs::read_to_string(fixture.root.join("run.args")).unwrap();
+        assert!(args.lines().any(|line| line == "MULTI_LINE"), "{args}");
+        assert!(args.lines().any(|line| line == "HOME=/tmp"), "{args}");
+        for leaked in ["first", "LD_PRELOAD", "DOCKER_HOST", "PATH", "LANG"] {
+            assert!(
+                !args.lines().any(|line| line == leaked),
+                "{leaked} appeared on the docker command line: {args}"
+            );
+        }
+        assert_process_stops(fixture.pid("client.pid"), "docker client").await;
     }
 
     /// The embedded timeout owns the shell's whole process tree. Recording both

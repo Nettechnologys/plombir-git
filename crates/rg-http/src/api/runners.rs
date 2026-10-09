@@ -655,12 +655,45 @@ pub async fn poll_job(
                         }
                     };
 
-                    for reserved in rg_core::ci::BUILTIN_CI_VARIABLES {
-                        variables.remove(reserved);
-                    }
+                    // The runner's own vocabulary, and every name that would
+                    // reconfigure the host `docker` CLI the runner reads these
+                    // into (`LD_PRELOAD`, `DOCKER_HOST`, proxies…). The config
+                    // validator refuses them on the way in; this is the row
+                    // written before it did, and the secret stored before the
+                    // secrets API refused the name (security audit finding #2).
+                    //
+                    // A malformed name is refused too: an environment entry is
+                    // `NAME=VALUE` and `getenv` stops at the first `=`, so
+                    // `PATH=/tmp` would arrive as a job-chosen `PATH`
+                    // (`=`-name follow-up). Dropped with a warning rather than
+                    // executed — the server is the trust boundary for external
+                    // runners.
+                    variables.retain(|name, _| {
+                        let trusted = rg_core::ci::valid_environment_name(name)
+                            && !rg_core::ci::is_reserved_ci_variable(name);
+                        if !trusted {
+                            tracing::warn!(
+                                job_id = job.id,
+                                variable = %name,
+                                "poll_job: dropping job variable with a malformed or reserved name"
+                            );
+                        }
+                        trusted
+                    });
                     match decrypted_repo_secrets(&state, pipeline.repo_id).await {
                         Ok(secrets) => {
                             for (name, value) in secrets {
+                                if !rg_core::ci::valid_environment_name(&name)
+                                    || rg_core::ci::is_reserved_ci_variable(&name)
+                                {
+                                    tracing::warn!(
+                                        job_id = job.id,
+                                        pipeline_id,
+                                        secret = %name,
+                                        "poll_job: dropping CI secret with a malformed or reserved name"
+                                    );
+                                    continue;
+                                }
                                 variables.insert(name, serde_json::json!(value));
                             }
                         }
