@@ -217,3 +217,163 @@ async fn every_foreign_key_column_leads_an_index() {
          child table once per row — {unindexed:#?}"
     );
 }
+
+/// Repository deletion inventories a repository's CI jobs and package files
+/// through the ownership chain. Those walks used to carry each level's ids to
+/// the next as bound `IN (?, ?, …)` parameters, so a repository with a long
+/// history outgrew PostgreSQL's 65 535-parameter ceiling and could not be
+/// deleted at all (card_f25c98fdf3ee). Each walk is now one statement that
+/// binds the repository id and nothing else, however long the history is.
+#[tokio::test]
+async fn repository_inventory_walks_bind_one_value_however_long_the_history() {
+    use std::sync::{Arc, Mutex};
+
+    let mut db = migrated().await;
+    // A real chain, so a walk that carried ids from level to level would have
+    // something to carry: two pipelines, a stage each, two jobs each.
+    let now = chrono::Utc::now();
+    let owner = crate::ops::user_ops::create_user(&db, "walker", "walker@example.test", "", "")
+        .await
+        .expect("create owner");
+    let repo = repo_ops::create(
+        &db,
+        crate::entities::repository::ActiveModel {
+            owner_id: sea_orm::Set(owner.id),
+            name: sea_orm::Set("history".to_string()),
+            is_private: sea_orm::Set(false),
+            default_branch: sea_orm::Set("main".to_string()),
+            stars_count: sea_orm::Set(0),
+            forks_count: sea_orm::Set(0),
+            created_at: sea_orm::Set(now),
+            updated_at: sea_orm::Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create repository");
+    let mut expected_jobs = Vec::new();
+    for run in 0..2 {
+        let pipeline = pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            &format!("{run:040}"),
+            "main",
+            "push",
+            None,
+        )
+        .await
+        .expect("create pipeline");
+        let stage = pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+            .await
+            .expect("create stage");
+        for job in 0..2 {
+            expected_jobs.push(
+                pipeline_ops::create_job(
+                    &db,
+                    stage.id,
+                    &format!("job-{job}"),
+                    "true",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("create job")
+                .id,
+            );
+        }
+    }
+
+    // And one package file down the registry → package → version chain.
+    use sea_orm::{ActiveModelTrait, Set};
+    let registry = crate::entities::package_registry::ActiveModel {
+        repo_id: Set(repo.id),
+        package_type: Set("npm".to_string()),
+        enabled: Set(true),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("create registry");
+    let package = crate::entities::package::ActiveModel {
+        package_registry_id: Set(registry.id),
+        owner_id: Set(owner.id),
+        name: Set("walked".to_string()),
+        is_public: Set(true),
+        download_count: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("create package");
+    let version = crate::entities::package_version::ActiveModel {
+        package_id: Set(package.id),
+        version: Set("1.0.0".to_string()),
+        protocol_variant_key: Set(String::new()),
+        size: Set(1),
+        is_yanked: Set(false),
+        download_count: Set(0),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("create version");
+    crate::entities::package_file::ActiveModel {
+        version_id: Set(version.id),
+        filename: Set("walked-1.0.0.tgz".to_string()),
+        size: Set(1),
+        storage_path: Set("packages/walker/history/walked-1.0.0.tgz".to_string()),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("create package file");
+
+    let seen: Arc<Mutex<Vec<usize>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    db.set_metric_callback(move |info| {
+        let values = info
+            .statement
+            .values
+            .as_ref()
+            .map_or(0, |values| values.0.len());
+        sink.lock().unwrap().push(values);
+    });
+
+    let mut jobs = pipeline_ops::list_job_ids_by_repo(&db, repo.id)
+        .await
+        .expect("list job ids");
+    jobs.sort_unstable();
+    assert_eq!(jobs, expected_jobs, "the walk must still find every job");
+    assert_eq!(
+        std::mem::take(&mut *seen.lock().unwrap()),
+        vec![1],
+        "the CI inventory must be one statement binding only the repository id"
+    );
+
+    let paths = crate::ops::package_file_ops::list_storage_paths_by_repo(&db, repo.id)
+        .await
+        .expect("list package storage paths");
+    assert_eq!(
+        paths,
+        vec!["packages/walker/history/walked-1.0.0.tgz".to_string()]
+    );
+    assert_eq!(
+        std::mem::take(&mut *seen.lock().unwrap()),
+        vec![1],
+        "the package inventory must be one statement binding only the repository id"
+    );
+}

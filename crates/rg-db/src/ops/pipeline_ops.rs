@@ -152,39 +152,35 @@ pub(crate) fn pipelines_page_query(repo_id: i64) -> Select<pipeline::Entity> {
 /// path. Ownership has to be read out of the database instead of guessed from
 /// a string prefix.
 ///
-/// Returns bare ids through three id-only statements rather than the
-/// per-stage walk [`crate::ops::artifact_ops::list_by_pipeline`] does: a
-/// repository with a long CI history would otherwise cost one query per
-/// stage, and the caller has no use for the rows themselves.
+/// One id-only statement, the ownership walk expressed as nested subqueries
+/// rather than as id lists carried between three round-trips. The lists used
+/// to be bound as `IN (?, ?, …)` parameters, and a repository with a long CI
+/// history has more stages and jobs than PostgreSQL's 65 535-parameter ceiling
+/// — so deleting exactly the repositories with the most to clean up failed
+/// before it started. A subquery binds one value however long the history is,
+/// and the per-stage walk [`crate::ops::artifact_ops::list_by_pipeline`] once
+/// did is not an option either: one query per stage.
 pub async fn list_job_ids_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<i64>> {
-    let pipeline_ids: Vec<i64> = pipeline::Entity::find()
-        .select_only()
-        .column(pipeline::Column::Id)
-        .filter(pipeline::Column::RepoId.eq(repo_id))
-        .into_tuple()
-        .all(db)
-        .await
-        .context("db: list pipeline ids by repo")?;
-    if pipeline_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let stage_ids: Vec<i64> = pipeline_stage::Entity::find()
-        .select_only()
-        .column(pipeline_stage::Column::Id)
-        .filter(pipeline_stage::Column::PipelineId.is_in(pipeline_ids))
-        .into_tuple()
-        .all(db)
-        .await
-        .context("db: list stage ids by repo")?;
-    if stage_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
     pipeline_job::Entity::find()
         .select_only()
         .column(pipeline_job::Column::Id)
-        .filter(pipeline_job::Column::StageId.is_in(stage_ids))
+        .filter(
+            pipeline_job::Column::StageId.in_subquery(
+                pipeline_stage::Entity::find()
+                    .select_only()
+                    .column(pipeline_stage::Column::Id)
+                    .filter(
+                        pipeline_stage::Column::PipelineId.in_subquery(
+                            pipeline::Entity::find()
+                                .select_only()
+                                .column(pipeline::Column::Id)
+                                .filter(pipeline::Column::RepoId.eq(repo_id))
+                                .into_query(),
+                        ),
+                    )
+                    .into_query(),
+            ),
+        )
         .into_tuple()
         .all(db)
         .await
