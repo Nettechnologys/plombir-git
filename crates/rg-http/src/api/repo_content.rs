@@ -611,15 +611,23 @@ pub async fn get_raw(
     let response = match raw {
         RawBlob::Loaded(data) => match rg_core::lfs::pointer::parse(&data) {
             Some(pointer) => {
-                match rg_core::lfs::service::object_claims_upload(
+                // The object row, not the committed pointer, is where the
+                // response length comes from. `size` in the pointer text is
+                // written by whoever committed the pointer; the compressed
+                // branch of `lfs_object_response` streams without a length of
+                // its own, and this insertion used to fill that gap from the
+                // pointer — so a repository could frame its own download with
+                // any `Content-Length` it liked. The row's size is the one the
+                // upload was verified against.
+                let object = match rg_db::ops::lfs_object_ops::find_by_repo_and_oid(
                     &state.db,
                     repo_model.id,
                     &pointer.oid,
                 )
                 .await
                 {
-                    Ok(true) => {}
-                    Ok(false) => {
+                    Ok(Some(object)) if object.uploaded => object,
+                    Ok(_) => {
                         return AppError::not_found(
                             "this file is stored in Git LFS and its object has not been \
                              uploaded to this server",
@@ -627,7 +635,7 @@ pub async fn get_raw(
                         .into_response()
                     }
                     Err(e) => return AppError::from(e).into_response(),
-                }
+                };
                 let mut response =
                     crate::api::lfs::lfs_object_response(&state, &owner, &repo, &pointer.oid).await;
                 if response.status() == StatusCode::OK
@@ -635,10 +643,9 @@ pub async fn get_raw(
                         .headers()
                         .contains_key(axum::http::header::CONTENT_LENGTH)
                 {
-                    // A compressed object streams without a length; the
-                    // pointer's size is what it decompresses to.
-                    if let Ok(value) = axum::http::HeaderValue::from_str(&pointer.size.to_string())
-                    {
+                    // A compressed object streams without a length; the row's
+                    // size is what it decompresses to.
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&object.size.to_string()) {
                         response
                             .headers_mut()
                             .insert(axum::http::header::CONTENT_LENGTH, value);

@@ -194,6 +194,39 @@ async fn an_lfs_file_is_viewed_as_its_object_and_a_missing_object_is_a_404() {
     );
 }
 
+/// The pointer is committed by a client; its `size:` line is not the object's
+/// length. The compressed streaming branch of the object response carries no
+/// `Content-Length` of its own, and the raw route used to fill that gap with
+/// the pointer's line — so a repository could frame its own download with any
+/// length it liked. The row the upload was verified against answers now.
+#[tokio::test]
+async fn a_lying_pointer_size_does_not_frame_the_raw_response() {
+    let base = spawn_test_app().await;
+    let (token, _) = register_full(&base, OWNER, &format!("{OWNER}@example.com")).await;
+    let repo = "lfs-lying-size";
+    create_repo(&base, &token, repo, false).await;
+
+    let payload: Vec<u8> = (0..2048u32).map(|n| (n % 251) as u8).collect();
+    upload_object(&base, &token, repo, &payload).await;
+    // The right object, the wrong length: 1000 bytes more than decompresses.
+    let lying_pointer = format!(
+        "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+        oid_of(&payload),
+        payload.len() + 1000
+    );
+    commit_file(&base, &token, repo, "lying.bin", &lying_pointer).await;
+
+    let api = format!("{base}/api/v1/repos/{OWNER}/{repo}");
+    let raw = get(&format!("{api}/raw/lying.bin"), Some(&token)).await;
+    assert_eq!(raw.status(), 200);
+    assert_eq!(
+        raw.headers()["content-length"],
+        payload.len().to_string(),
+        "the response was framed by the pointer's size line, not the object row"
+    );
+    assert_eq!(raw.bytes().await.unwrap().to_vec(), payload);
+}
+
 /// A private repository's LFS file is refused to a stranger exactly as its
 /// ordinary files are — the raw route is a read of the repository, not of a
 /// storage key.
