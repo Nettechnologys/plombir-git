@@ -344,6 +344,22 @@ batch_size = 10
 # db_connect_secs = 10
 # db_idle_secs = 600
 
+[limits]
+# How much storage one repository may hold, summed over LFS objects, release
+# assets, attachments, CI caches, packages and OCI blobs. A registered account
+# could otherwise fill the volume that also holds the git data and the
+# database; this is the backstop. 20480 MiB = 20 GiB.
+repo_quota_mb = 20480
+# Cumulative size of one OCI blob upload (a `docker push` layer) across every
+# chunk and the final PUT. The HTTP body limit bounds one request, not a
+# session, so this is what stops an endless sequence of PATCHes.
+oci_blob_max_mb = 10240
+# Cache keys one repository may keep. Entries still expire on their retention
+# window; this is the independent entry count.
+ci_cache_max_entries_per_repo = 200
+# Files one release may hold.
+release_assets_max_per_release = 100
+
 [observability]
 # OpenTelemetry distributed tracing (OTLP/HTTP export), and who may read the
 # Prometheus metrics at /metrics (the last two knobs below). The OTLP knobs only

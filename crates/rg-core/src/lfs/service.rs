@@ -55,6 +55,7 @@ use std::path::PathBuf;
 
 use crate::blob_storage::{BlobKey, BlobStorage};
 use crate::platform::fs::discard_file;
+use crate::storage_quota::{self, QuotaError, StorageLimits};
 use rg_db::entities::lfs_object;
 use rg_db::ops::lfs_object_ops;
 
@@ -598,6 +599,13 @@ fn negotiate_transfer(offered: Option<&[String]>) -> Result<&'static str> {
 
 /// Handle a batch upload/download request.
 /// Processes all objects concurrently using `join_all` to avoid serial DB round-trips.
+///
+/// `limits` is consulted per upload object: an object that does not fit the
+/// repository's remaining budget comes back rejected with the LFS-spec
+/// `507 insufficient storage` rather than an upload action the PUT would then
+/// refuse. The whole batch is not budgeted as one sum, because a batch may
+/// legitimately contain objects the repository already holds — those answer
+/// with no action at all and must not consume room they do not need.
 #[allow(clippy::too_many_arguments)]
 pub async fn batch(
     db: &DatabaseConnection,
@@ -610,6 +618,7 @@ pub async fn batch(
     req: &LfsBatchRequest,
     signing_secret: &[u8],
     actor: Option<LfsActor>,
+    limits: &StorageLimits,
 ) -> Result<LfsBatchResponse> {
     let transfer = negotiate_transfer(req.transfers.as_deref())?.to_string();
 
@@ -643,6 +652,7 @@ pub async fn batch(
                             size,
                             signing_secret,
                             actor,
+                            limits,
                         )
                         .await
                     }
@@ -696,6 +706,7 @@ async fn handle_upload(
     size: i64,
     signing_secret: &[u8],
     actor: Option<LfsActor>,
+    limits: &StorageLimits,
 ) -> Result<LfsObjectResponse> {
     // Check if object already exists
     let existing = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await?;
@@ -728,6 +739,28 @@ async fn handle_upload(
     // one insert land, and the loser wants that row rather than a failed batch.
     if existing.is_none() {
         find_or_register_object(db, repo_id, oid, size).await?;
+    }
+
+    // Refuse here, not at the PUT: the client is about to spend an object's
+    // worth of bandwidth, and the LFS batch API has a per-object status for
+    // exactly this. `507` is what git-lfs translates into "insufficient
+    // storage"; `413` would name the HTTP request's size, which is not the
+    // ceiling that was hit. A database that cannot answer the question stays an
+    // `Err` — a refused upload must be a decision, not an outage.
+    match storage_quota::check_room(db, repo_id, size as u64, limits).await {
+        Ok(()) => {}
+        Err(QuotaError::Exceeded(exceeded)) => {
+            return Ok(LfsObjectResponse {
+                oid: oid.to_string(),
+                size,
+                actions: None,
+                error: Some(LfsError {
+                    code: 507,
+                    message: exceeded.message,
+                }),
+            });
+        }
+        Err(QuotaError::Db(error)) => return Err(error),
     }
 
     // Return upload URL

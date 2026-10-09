@@ -444,6 +444,7 @@ pub(crate) fn stamp_security(
         crate::api::lfs::batch,
         crate::api::lfs::upload_object,
         crate::api::lfs::download_object,
+        crate::api::storage::get_storage,
         crate::api::lfs_locks::create_lock,
         crate::api::lfs_locks::list_locks,
         crate::api::lfs_locks::verify_locks,

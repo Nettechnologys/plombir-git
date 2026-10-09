@@ -15,6 +15,7 @@ use tokio::io::AsyncReadExt as _;
 use crate::error::not_found;
 use crate::package_registry::artifact::PackageArtifact;
 use crate::package_registry::storage::{PackageFileSource, PackageStorage, StoredFile};
+use crate::storage_quota::{self, QuotaError, StorageLimits};
 
 /// Package type constants for known package managers.
 pub mod package_types {
@@ -219,10 +220,16 @@ pub fn protocol_version_key(
 }
 
 /// Publish a package version to the registry.
+///
+/// `limits` is consulted once the repository the names resolve to is known and
+/// before anything is written: the decoded artifact ceiling in the HTTP layer
+/// bounded one file, not the repository, so this is the shared budget that
+/// stops packages being another way to fill the volume.
 pub async fn publish(
     db: &DatabaseConnection,
     storage: &PackageStorage,
     mut info: PublishInfo,
+    limits: &StorageLimits,
 ) -> Result<PublishResult> {
     if let Some(tag) = info.npm_dist_tag.as_deref() {
         if info.package_type != package_types::NPM {
@@ -258,6 +265,21 @@ pub async fn publish(
     let repo = crate::repo::service::find_repo_by_owner_name(db, &info.owner, &info.repo)
         .await?
         .ok_or_else(|| not_found("repository"))?;
+
+    // Everything this request proposes to store, checked once against the
+    // repository budget. Summed here rather than per file because the files
+    // share one budget: a request adding a POM, a JAR and a sources JAR must be
+    // refused as a whole, not accepted until the last file crosses the line.
+    // A database that cannot answer the question is an outage, not a policy
+    // decision, so it stays an error.
+    let incoming: u64 = info.files.iter().map(|(_, file)| file.len()).sum();
+    match storage_quota::check_room(db, repo.id, incoming, limits).await {
+        Ok(()) => {}
+        Err(QuotaError::Exceeded(exceeded)) => {
+            return Err(crate::error::payload_too_large(exceeded.message));
+        }
+        Err(QuotaError::Db(error)) => return Err(error),
+    }
 
     let registry =
         rg_db::ops::package_registry_ops::find_or_create(db, repo.id, &info.package_type).await?;

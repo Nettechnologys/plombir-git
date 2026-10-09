@@ -48,6 +48,8 @@ pub(crate) struct ConfigFile {
     #[serde(default)]
     pub(crate) timeouts: TimeoutConfig,
     #[serde(default)]
+    pub(crate) limits: LimitsConfig,
+    #[serde(default)]
     pub(crate) webhooks: WebhooksConfig,
     #[serde(default)]
     pub(crate) observability: ObservabilityConfig,
@@ -450,6 +452,29 @@ impl Default for TimeoutConfig {
 pub(crate) fn default_job_timeout() -> u64 {
     rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS
 }
+
+/// `[limits]` — the storage ceilings every upload path enforces. Hand-written
+/// for the same reason as [`TimeoutConfig`]: an omitted table must land on the
+/// documented defaults rather than zeroes. Zero is refused at startup — a
+/// ceiling of zero refuses every write — so "disabled" has no spelling here.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LimitsConfig {
+    /// Total bytes one repository may hold across LFS, releases, attachments,
+    /// CI caches, packages and OCI blobs. `None` means the built-in
+    /// [`DEFAULT_REPO_QUOTA_MB`].
+    pub(crate) repo_quota_mb: Option<u64>,
+    /// Cumulative bytes of one OCI blob upload session, across every PATCH and
+    /// the final PUT. `None` means the built-in [`DEFAULT_OCI_BLOB_MAX_MB`].
+    pub(crate) oci_blob_max_mb: Option<u64>,
+    /// CI cache entries one repository may keep. `None` means the built-in
+    /// [`DEFAULT_CI_CACHE_MAX_ENTRIES_PER_REPO`].
+    pub(crate) ci_cache_max_entries_per_repo: Option<u64>,
+    /// Release assets one release may hold. `None` means the built-in
+    /// [`DEFAULT_RELEASE_ASSETS_MAX_PER_RELEASE`].
+    pub(crate) release_assets_max_per_release: Option<u64>,
+}
+
 pub(crate) fn default_git_timeout() -> u64 {
     120
 }
@@ -720,6 +745,81 @@ pub(crate) fn resolve_webhook_transport_policy(
 /// holding the rest of the state rather than inside the container layer.
 pub(crate) const DEFAULT_AUDIT_ARCHIVE_DIR: &str = "./data/audit-archive";
 pub(crate) const DEFAULT_DB_BACKUP_DIR: &str = "./data/backups";
+
+/// `[limits].repo_quota_mb`: one repository's total budget (20 GiB). Generous
+/// on purpose — it is a backstop against an account filling the volume that
+/// holds the git data and the database, not a provisioning tool.
+pub(crate) const DEFAULT_REPO_QUOTA_MB: u64 = 20480;
+/// `[limits].oci_blob_max_mb`: one OCI upload session's cumulative ceiling
+/// (10 GiB), matching the per-request body limit that used to be the only
+/// bound.
+pub(crate) const DEFAULT_OCI_BLOB_MAX_MB: u64 = 10240;
+/// `[limits].ci_cache_max_entries_per_repo`: how many cache keys one repository
+/// may keep (matches the TTL's practical working set).
+pub(crate) const DEFAULT_CI_CACHE_MAX_ENTRIES_PER_REPO: u64 = 200;
+/// `[limits].release_assets_max_per_release`: how many files one release may
+/// publish.
+pub(crate) const DEFAULT_RELEASE_ASSETS_MAX_PER_RELEASE: u64 = 100;
+
+/// Turn one `[limits]` MiB knob into bytes. Zero is a misconfiguration — a
+/// ceiling that refuses everything — and a value that cannot be represented
+/// fails startup rather than wrapping.
+fn limit_bytes(section: &str, key: &str, mb: u64) -> anyhow::Result<u64> {
+    if mb == 0 {
+        anyhow::bail!("config `{section}.{key}` must be greater than zero");
+    }
+    mb.checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("config `{section}.{key}` is too large: {mb} MiB"))
+}
+
+/// Turn one `[limits]` count knob into its ceiling. Zero refuses every write
+/// and is a misconfiguration, exactly like the byte knobs.
+fn limit_count(section: &str, key: &str, count: u64) -> anyhow::Result<u64> {
+    if count == 0 {
+        anyhow::bail!("config `{section}.{key}` must be greater than zero");
+    }
+    Ok(count)
+}
+
+/// Resolve `[limits]` into the ceilings every storage write path enforces.
+///
+/// The MiB knobs are converted here, once, so no handler does arithmetic on a
+/// config value.
+pub(crate) fn resolve_storage_limits(
+    cfg: Option<&ConfigFile>,
+) -> anyhow::Result<rg_core::storage_quota::StorageLimits> {
+    let limits = cfg.map(|config| &config.limits);
+    Ok(rg_core::storage_quota::StorageLimits {
+        repo_quota_bytes: limit_bytes(
+            "limits",
+            "repo_quota_mb",
+            limits
+                .and_then(|limits| limits.repo_quota_mb)
+                .unwrap_or(DEFAULT_REPO_QUOTA_MB),
+        )?,
+        oci_blob_max_bytes: limit_bytes(
+            "limits",
+            "oci_blob_max_mb",
+            limits
+                .and_then(|limits| limits.oci_blob_max_mb)
+                .unwrap_or(DEFAULT_OCI_BLOB_MAX_MB),
+        )?,
+        ci_cache_max_entries_per_repo: limit_count(
+            "limits",
+            "ci_cache_max_entries_per_repo",
+            limits
+                .and_then(|limits| limits.ci_cache_max_entries_per_repo)
+                .unwrap_or(DEFAULT_CI_CACHE_MAX_ENTRIES_PER_REPO),
+        )?,
+        release_assets_max_per_release: limit_count(
+            "limits",
+            "release_assets_max_per_release",
+            limits
+                .and_then(|limits| limits.release_assets_max_per_release)
+                .unwrap_or(DEFAULT_RELEASE_ASSETS_MAX_PER_RELEASE),
+        )?,
+    })
+}
 
 /// Resolve `[server].package_upload_max_mb` to the byte ceiling consumed by
 /// rg-http. Zero and values that cannot fit the current platform fail startup
@@ -2089,15 +2189,29 @@ mod tests {
                 "default_db_idle_timeout",
                 super::default_db_idle_timeout().to_string(),
             ),
-            // The shipped template points at SQLite, so its default is the
-            // SQLite pool size; PostgreSQL and MySQL get a wider one.
             row(
-                "database",
-                "max_connections",
-                "rg_db::default_max_connections",
-                rg_db::default_max_connections("sqlite://./plombir-git.db?mode=rwc")
-                    .expect("the template's SQLite URL is a known backend")
-                    .to_string(),
+                "limits",
+                "repo_quota_mb",
+                "DEFAULT_REPO_QUOTA_MB",
+                super::DEFAULT_REPO_QUOTA_MB.to_string(),
+            ),
+            row(
+                "limits",
+                "oci_blob_max_mb",
+                "DEFAULT_OCI_BLOB_MAX_MB",
+                super::DEFAULT_OCI_BLOB_MAX_MB.to_string(),
+            ),
+            row(
+                "limits",
+                "ci_cache_max_entries_per_repo",
+                "DEFAULT_CI_CACHE_MAX_ENTRIES_PER_REPO",
+                super::DEFAULT_CI_CACHE_MAX_ENTRIES_PER_REPO.to_string(),
+            ),
+            row(
+                "limits",
+                "release_assets_max_per_release",
+                "DEFAULT_RELEASE_ASSETS_MAX_PER_RELEASE",
+                super::DEFAULT_RELEASE_ASSETS_MAX_PER_RELEASE.to_string(),
             ),
             // `{:?}` rather than `to_string()`: TOML spells a string with its
             // quotes and a float with its point, and `1.0f64.to_string()` is

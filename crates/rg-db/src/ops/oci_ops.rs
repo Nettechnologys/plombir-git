@@ -25,6 +25,19 @@ pub async fn find_repo_by_id(
         .await
 }
 
+/// Find an OCI repository row by its own id.
+///
+/// The storage budget is per Plombir Git repository, and an upload session
+/// carries only `oci_repository_id`; this is the one lookup that gets from the
+/// session back to the repository whose quota governs it.
+pub async fn find_repo_row_by_id(
+    db: &DatabaseConnection,
+    oci_repository_id: i64,
+) -> Result<Option<oci_repository::Model>, DbErr> {
+    use oci_repository::Entity as OciRepo;
+    OciRepo::find_by_id(oci_repository_id).one(db).await
+}
+
 /// Find or create an OCI repository.
 #[allow(clippy::too_many_arguments)]
 pub async fn find_or_create_repo(
@@ -415,6 +428,36 @@ pub async fn upsert_tag_manifest(
 }
 
 // ── OCI Blob ────────────────────────────────────────────────
+
+/// How many blobs `repo_id` has stored, and how many bytes they declare.
+///
+/// Resolved in two statements on purpose: `oci_blob` rows point at
+/// `oci_repository`, whose relationship to the Plombir Git repository is the
+/// thing being asked about, and the entity layer carries no relation between
+/// the two — the lookup is the anchor the rest of this module already uses.
+pub async fn repo_blob_usage(db: &DatabaseConnection, repo_id: i64) -> Result<(u64, i64), DbErr> {
+    use oci_blob::Entity as Blob;
+
+    let Some(oci_repo) = find_repo_by_id(db, repo_id).await? else {
+        return Ok((0, 0));
+    };
+    #[derive(Debug, FromQueryResult)]
+    struct Usage {
+        count: i64,
+        bytes: Option<i64>,
+    }
+    let usage = Blob::find()
+        .select_only()
+        .column_as(oci_blob::Column::Id.count(), "count")
+        .column_as(oci_blob::Column::Size.sum(), "bytes")
+        .filter(oci_blob::Column::OciRepositoryId.eq(oci_repo.id))
+        .into_model::<Usage>()
+        .one(db)
+        .await?;
+    Ok(usage.map_or((0, 0), |usage| {
+        (usage.count.max(0) as u64, usage.bytes.unwrap_or(0))
+    }))
+}
 
 /// Find a blob by digest.
 pub async fn find_blob(

@@ -541,11 +541,49 @@ pub async fn upload_asset(
         .unwrap_or("application/octet-stream")
         .to_string();
 
+    // The per-file ceiling below bounded one request, not how many requests a
+    // release could answer: a client could publish until the TTL sweep found
+    // nothing to sweep. Read before the body so a full release is refused
+    // without spooling 512 MiB to learn what the count already said; the
+    // overshoot two concurrent uploads for the last slot can produce is one
+    // asset each, not unbounded growth.
+    match rg_db::ops::release_ops::count_assets(&state.db, release.id).await {
+        Ok(count) if count >= state.storage_limits.release_assets_max_per_release => {
+            return AppError::payload_too_large(format!(
+                "release already holds the maximum of {} asset(s)",
+                state.storage_limits.release_assets_max_per_release
+            ))
+            .into_response();
+        }
+        Ok(_) => {}
+        Err(error) => return AppError::from(error).into_response(),
+    }
+
     let staged =
         match stage_release_upload(body, &state.repo_root, RELEASE_ASSET_UPLOAD_MAX_BYTES).await {
             Ok(staged) => staged,
             Err(error) => return error.into_response(),
         };
+
+    // The shared repository budget: releases used to count their per-file
+    // ceiling and nothing else, so this store was another way to fill the
+    // volume the quota exists to protect.
+    match rg_core::storage_quota::check_room(
+        &state.db,
+        repo.id,
+        staged.len,
+        &state.storage_limits,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(rg_core::storage_quota::QuotaError::Exceeded(exceeded)) => {
+            return AppError::payload_too_large(exceeded.message).into_response();
+        }
+        Err(rg_core::storage_quota::QuotaError::Db(error)) => {
+            return AppError::from(error).into_response();
+        }
+    }
 
     match rg_core::release::service::upload_asset_from_file(
         &state.db,

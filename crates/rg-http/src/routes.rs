@@ -1294,6 +1294,11 @@ pub(crate) fn build_all_routes(
         .get(PublicFiltered, "/repos/explore", api::repos::explore)
         .get(PublicFiltered, "/repos/{owner}", api::repos::list_repos)
         .get(RepoRead, "/repos/{owner}/{name}", api::repos::get_repo)
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/storage",
+            api::storage::get_storage,
+        )
         .patch(
             RepoAdmin,
             "/repos/{owner}/{name}",

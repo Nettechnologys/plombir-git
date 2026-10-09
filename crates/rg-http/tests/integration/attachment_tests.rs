@@ -1,6 +1,6 @@
 use crate::common::{
     create_issue, create_repo, register_full, register_user, spawn_test_app,
-    spawn_test_app_with_db, spawn_test_app_with_db_and_repo_root,
+    spawn_test_app_with_db, spawn_test_app_with_db_and_repo_root, test_storage_limits,
 };
 use chrono::Utc;
 use reqwest::multipart::{Form, Part};
@@ -763,7 +763,9 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
             filename: Set("quota.txt".to_string()),
             blob_key: Set(format!("attachments/{repo_id}/quota/quota.txt")),
             content_type: Set("text/plain".to_string()),
-            size: Set(rg_core::attachment::DEFAULT_REPO_ATTACHMENT_QUOTA - 1),
+            // One byte short of the whole repository budget: the next upload,
+            // however small, must be refused by the shared quota.
+            size: Set(test_storage_limits().repo_quota_bytes as i64 - 1),
             download_count: Set(0),
             created_at: Set(Utc::now()),
             sha256: Set(None),
@@ -781,12 +783,12 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
         .send()
         .await
         .unwrap();
-    assert_eq!(quota_rejected.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert!(quota_rejected
-        .text()
-        .await
-        .unwrap()
-        .contains("quota exceeded"));
+    assert_eq!(quota_rejected.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    let quota_message = quota_rejected.text().await.unwrap();
+    assert!(
+        quota_message.contains("repository storage quota exceeded"),
+        "the 413 must say which budget was hit: {quota_message}"
+    );
 
     assert_eq!(pull.repo_id, repo_id);
 }

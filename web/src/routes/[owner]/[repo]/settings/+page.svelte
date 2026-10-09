@@ -5,8 +5,10 @@
   import Modal from '$lib/components/Modal.svelte';
   import {
     buildRepoSettingsPatch,
+    repoStorage,
     repoSettingsFormState,
     repos,
+    type RepoStorageReport,
     type RepoSettingsFormState,
     type RepositoryDetail,
   } from '$lib/api/client.svelte';
@@ -47,6 +49,34 @@
       ? [repository.default_branch, ...branchNames]
       : branchNames,
   );
+
+  // Storage read-out (security audit #10): the ceilings every upload path
+  // enforces are only actionable if the owner can see how close the repository
+  // is. One compact section, loaded alongside the repository itself.
+  let storage = $state<RepoStorageReport | null>(null);
+  let storageError = $state('');
+
+  function formatSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+  }
+
+  async function loadStorage(expectedOwner: string, expectedRepo: string) {
+    const expectedRoute = routeGeneration;
+    try {
+      const report = await repoStorage.get(expectedOwner, expectedRepo);
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        storage = report;
+        storageError = '';
+      }
+    } catch (err: any) {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        storageError = err?.message || t('settings.storage.load_failed');
+      }
+    }
+  }
 
   let visibilityOpen = $state(false);
   let visibilityBusy = $state(false);
@@ -103,6 +133,8 @@
     deleteConfirm = '';
     deleting = false;
     deleteError = '';
+    storage = null;
+    storageError = '';
     void loadRepository(expectedOwner, expectedRepo);
   });
 
@@ -123,6 +155,9 @@
       const response = await repos.get(expectedOwner, expectedRepo);
       if (!repositoryRequests.owns(claim, owner, repo)) return;
       adopt(response);
+      // Not gated on admin: the endpoint is a read, and the page shows the
+      // section to whoever can see the repository.
+      void loadStorage(expectedOwner, expectedRepo);
       error = '';
       if (isRepoAdmin(response.viewer_permission)) {
         // Only a picker: the current default stays selectable even when the
@@ -427,6 +462,35 @@
         </div>
       </div>
       <p class="section-desc admin-only-note">{t('settings.general_form.admin_only')}</p>
+    </section>
+  {/if}
+
+  {#if repository}
+    <!-- Storage (security audit #10): usage per store against the enforced budget. -->
+    <section class="section storage-section">
+      <h2>{t('settings.storage.title')}</h2>
+      {#if storage}
+        <p class="section-desc">
+          {t('settings.storage.usage', {
+            used: formatSize(storage.usage.total_bytes),
+            limit: formatSize(storage.limits.repo_quota_bytes),
+          })}
+        </p>
+        <p class="storage-breakdown">
+          {t('settings.storage.breakdown', {
+            lfs: formatSize(storage.usage.lfs_bytes),
+            releases: formatSize(storage.usage.release_bytes),
+            attachments: formatSize(storage.usage.attachment_bytes),
+            ci: formatSize(storage.usage.ci_cache_bytes),
+            packages: formatSize(storage.usage.package_bytes),
+            oci: formatSize(storage.usage.oci_bytes),
+          })}
+        </p>
+      {:else if storageError}
+        <p class="section-desc storage-error">{storageError}</p>
+      {:else}
+        <p class="section-desc">{t('common.loading')}</p>
+      {/if}
     </section>
   {/if}
 

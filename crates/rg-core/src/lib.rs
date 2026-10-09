@@ -58,6 +58,7 @@ pub mod net; // SSRF-hardened outbound HTTP for user-supplied URLs
 pub mod platform;
 pub mod search; // Cross-platform abstractions
 pub mod staging; // The `.tmp/` spools of in-flight uploads, and the startup sweep that retires them
+pub mod storage_quota; // Per-repository storage accounting and the `[limits]` ceilings
 pub mod task_tracker; // Drain-aware tracker for detached fire-and-forget delivery tasks
 
 pub(crate) mod blocking; // Keep synchronous Git/IO phases off Tokio's worker threads

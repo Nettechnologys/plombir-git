@@ -3038,7 +3038,13 @@ async fn persist_package(
         files,
     };
 
-    match rg_core::package_registry::service::publish(&state.db, &storage, info).await {
+    match rg_core::package_registry::service::publish(
+        &state.db,
+        &storage,
+        info,
+        &state.storage_limits,
+    )
+    .await {
         Ok(result) => {
             let status = if result.existing {
                 StatusCode::OK

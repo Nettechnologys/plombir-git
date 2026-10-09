@@ -144,6 +144,22 @@ trusted_origins = []
 allow_insecure_http_origins = []
 # Example exact origins: ["http://gitlab.internal.example:8080"]
 
+[limits]
+# One repository's total storage budget, summed over LFS objects, release
+# assets, attachments, CI caches, packages and OCI blobs. A registered account
+# could otherwise fill the volume that also holds the git data and the
+# database; this is the backstop. 20480 MiB = 20 GiB.
+repo_quota_mb = 20480
+# Cumulative size of one OCI blob upload (a `docker push` layer) across every
+# chunk and the final PUT. The HTTP body limit bounds one request, not a
+# session, so this is what stops an endless sequence of PATCHes.
+oci_blob_max_mb = 10240
+# Cache keys one repository may keep. Entries still expire on their retention
+# window; this is the independent entry count.
+ci_cache_max_entries_per_repo = 200
+# Files one release may hold.
+release_assets_max_per_release = 100
+
 [mirror]
 # The sweep that refreshes repository mirrors on the interval each mirror was
 # configured with. On by default; set false if this instance should only refresh

@@ -1151,6 +1151,13 @@
       "kept": "Kept {oid}: {reason}",
       "remove_failed": "Failed to remove objects: {message}"
     },
+    "storage": {
+      "title": "Storage",
+      "desc": "Everything this repository holds, and the budget it fits in.",
+      "usage": "{used} of {limit} used",
+      "breakdown": "LFS {lfs} · Releases {releases} · Attachments {attachments} · CI caches {ci} · Packages {packages} · OCI {oci}",
+      "load_failed": "Failed to load storage usage"
+    },
     "deploy_keys": {
       "title": "Deploy keys",
       "desc": "Grant an automation key access to this repository only.",

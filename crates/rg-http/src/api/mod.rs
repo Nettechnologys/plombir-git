@@ -26,6 +26,7 @@ pub mod labels;
 pub mod lfs;
 pub mod lfs_locks;
 pub mod lfs_storage;
+pub mod storage;
 pub mod mcp;
 pub mod mfa;
 pub mod mirrors;

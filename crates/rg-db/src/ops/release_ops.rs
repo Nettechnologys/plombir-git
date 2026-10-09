@@ -206,3 +206,39 @@ pub async fn increment_download_count(db: &DatabaseConnection, id: i64) -> Resul
         rows => anyhow::bail!("db: asset download increment affected {rows} rows for id {id}"),
     }
 }
+
+/// How many assets `repo_id` has published, and how many bytes they declare.
+///
+/// The join is the only way from a release to its repository: `release_assets`
+/// carries `release_id`, and the storage budget is per repository, so the
+/// filter belongs on the parent row.
+pub async fn repo_asset_usage(db: &DatabaseConnection, repo_id: i64) -> Result<(u64, i64)> {
+    #[derive(Debug, FromQueryResult)]
+    struct Usage {
+        count: i64,
+        bytes: Option<i64>,
+    }
+    let usage = AssetEntity::find()
+        .join(JoinType::InnerJoin, release_asset::Relation::Release.def())
+        .filter(release::Column::RepoId.eq(repo_id))
+        .select_only()
+        .column_as(release_asset::Column::Id.count(), "count")
+        .column_as(release_asset::Column::Size.sum(), "bytes")
+        .into_model::<Usage>()
+        .one(db)
+        .await
+        .context("db: sum the release assets of a repository")?;
+    Ok(usage.map_or((0, 0), |usage| {
+        (usage.count.max(0) as u64, usage.bytes.unwrap_or(0))
+    }))
+}
+
+/// How many assets one release holds, for the per-release entry ceiling.
+pub async fn count_assets(db: &DatabaseConnection, release_id: i64) -> Result<u64> {
+    let count = AssetEntity::find()
+        .filter(release_asset::Column::ReleaseId.eq(release_id))
+        .count(db)
+        .await
+        .context("db: count the release assets of a release")?;
+    Ok(count)
+}

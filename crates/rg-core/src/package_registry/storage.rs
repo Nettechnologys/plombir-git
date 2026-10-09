@@ -661,6 +661,7 @@ mod tests {
         FileDigests, PackageArtifact, PackageFileSource, PackageStorage, DIGEST_BUFFER_BYTES,
     };
     use crate::blob_storage::{BlobKey, BlobMetadata, BlobStorage, LocalBlobStorage};
+    use crate::storage_quota::StorageLimits;
     use futures::future::BoxFuture;
     use sea_orm::ActiveValue::Set;
     use std::path::Path as StdPath;
@@ -878,6 +879,7 @@ mod tests {
             &db,
             &storage,
             publish_info(author_id, two_files()),
+            &StorageLimits::default(),
         )
         .await
         .unwrap();
@@ -900,6 +902,7 @@ mod tests {
                     ),
                 ],
             ),
+            &StorageLimits::default(),
         )
         .await
         .unwrap();

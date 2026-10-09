@@ -247,6 +247,31 @@ pub async fn list_expired_cache(db: &DatabaseConnection) -> Result<Vec<ci_cache_
         .await
         .context("db: list expired CI caches")
 }
+
+/// How many cache entries `repo_id` holds, and how many bytes they declare.
+///
+/// Expiry is not filtered out: an expired row still names an archive on disk
+/// until the sweep retires it, and the storage budget counts what occupies the
+/// volume, not what a later reader may still serve.
+pub async fn repo_cache_usage(db: &DatabaseConnection, repo_id: i64) -> Result<(u64, i64)> {
+    #[derive(Debug, FromQueryResult)]
+    struct Usage {
+        count: i64,
+        bytes: Option<i64>,
+    }
+    let usage = ci_cache_entry::Entity::find()
+        .select_only()
+        .column_as(ci_cache_entry::Column::Id.count(), "count")
+        .column_as(ci_cache_entry::Column::Size.sum(), "bytes")
+        .filter(ci_cache_entry::Column::RepoId.eq(repo_id))
+        .into_model::<Usage>()
+        .one(db)
+        .await
+        .context("db: sum the CI cache entries of a repository")?;
+    Ok(usage.map_or((0, 0), |usage| {
+        (usage.count.max(0) as u64, usage.bytes.unwrap_or(0))
+    }))
+}
 pub async fn find_cache_entry(
     db: &DatabaseConnection,
     repo_id: i64,

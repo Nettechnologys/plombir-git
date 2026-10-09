@@ -1362,6 +1362,48 @@ pub async fn upload_cache(
         return AppError::bad_request("cache archive must contain 1 byte to 1 GiB").into_response();
     }
     let size = len as i64;
+
+    // The per-archive ceiling above bounded one pipeline's upload, not how many
+    // uploads could land: a job that hashes its key with a loop could pile up
+    // archives until their retention windows expired. Two ceilings are checked
+    // here, and the answer to both is 413 rather than evicting the oldest entry:
+    // an eviction picks a victim the uploader was not asking about, and there is
+    // no route that lists caches, so the owner would have no way to learn which
+    // key disappeared. A refusal names the number and lets them remove one.
+    let existing = match rg_db::ops::ci_retention_ops::find_cache_entry(
+        &state.db,
+        repo_id,
+        &key_hash,
+    )
+    .await
+    {
+        Ok(entry) => entry,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    if existing.is_none() {
+        let count = match rg_db::ops::ci_retention_ops::repo_cache_usage(&state.db, repo_id).await {
+            Ok((count, _bytes)) => count,
+            Err(error) => return AppError::from(error).into_response(),
+        };
+        if count >= state.storage_limits.ci_cache_max_entries_per_repo {
+            return AppError::payload_too_large(format!(
+                "repository already holds the maximum of {} CI cache entries; remove one before \
+                 storing another",
+                state.storage_limits.ci_cache_max_entries_per_repo
+            ))
+            .into_response();
+        }
+    }
+    match rg_core::storage_quota::check_room(&state.db, repo_id, len, &state.storage_limits).await {
+        Ok(()) => {}
+        Err(rg_core::storage_quota::QuotaError::Exceeded(exceeded)) => {
+            return AppError::payload_too_large(exceeded.message).into_response();
+        }
+        Err(rg_core::storage_quota::QuotaError::Db(error)) => {
+            return AppError::from(error).into_response();
+        }
+    }
+
     if let Err(error) = rg_core::ci_cache::publish_from_spool(
         &state.db,
         &state.repo_root,
