@@ -53,9 +53,9 @@ pub async fn register_runner(
 
 /// Update runner heartbeat and the liveness of its executing job atomically.
 ///
-/// Runner authentication refreshes this on every authenticated request, and
-/// the external runner also calls `/heartbeat` every 30 seconds while a job is
-/// executing. The job timestamp is part of the same fact: committing only the
+/// Runner authentication refreshes this on `/heartbeat`, which the external
+/// runner calls every 30 seconds while a job is executing, and on any other
+/// authenticated request once the stored value is 15 seconds old. The job timestamp is part of the same fact: committing only the
 /// runner half would let the job watchdog reclaim healthy work.
 pub async fn update_heartbeat(db: &DatabaseConnection, runner_id: i64) -> Result<()> {
     let now = Utc::now();

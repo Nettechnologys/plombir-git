@@ -359,6 +359,12 @@ pub async fn heartbeat(
         Some(HeartbeatRefresh::Failed) => {
             AppError::internal("runner heartbeat was not recorded").into_response()
         }
+        // The middleware always writes on this route; a skipped write here is
+        // the same wiring fault as a missing extension, and `200` would claim
+        // a write nobody made.
+        Some(HeartbeatRefresh::Recent) => {
+            AppError::internal("runner heartbeat route skipped its write").into_response()
+        }
         None => {
             AppError::internal("runner heartbeat route reached without the runner-auth middleware")
                 .into_response()
@@ -1713,7 +1719,8 @@ pub async fn list_runners_admin(
 ///
 /// Used as a route-layer middleware via `from_fn_with_state`.
 /// The runner_id is extracted from the path to verify token ownership.
-/// Also updates heartbeat on every authenticated request.
+/// Also refreshes the heartbeat — on `/heartbeat` always, elsewhere at most
+/// once per [`OPPORTUNISTIC_REFRESH_WINDOW`].
 /// What became of the `last_seen_at` refresh `authenticate_runner` performs on
 /// every authenticated runner request.
 ///
@@ -1733,6 +1740,40 @@ pub enum HeartbeatRefresh {
     Unavailable,
     /// The write failed for a reason retrying will not fix (500).
     Failed,
+    /// Not attempted: `last_seen_at` was written less than
+    /// [`OPPORTUNISTIC_REFRESH_WINDOW`] ago, and this request is not
+    /// `/heartbeat`. Never produced for `/heartbeat`.
+    Recent,
+}
+
+/// How stale `last_seen_at` must be before a runner request other than
+/// `/heartbeat` rewrites it.
+///
+/// A runner polls every few seconds, and each refresh is a write transaction —
+/// on SQLite, a turn on the instance's one write lock — so N idle runners used
+/// to cost N writes every poll interval for a fact nothing reads at that
+/// resolution (card_c6dd2bed5613). Its readers are coarse: a runner goes
+/// offline after 90 s without a refresh (`find_offline_runners`) and a running
+/// job is reclaimed after 600 s without one (`find_stuck_jobs`), and the
+/// runner's own `/heartbeat` — which always writes — comes every 30 s. Fifteen
+/// seconds of staleness moves neither deadline.
+const OPPORTUNISTIC_REFRESH_WINDOW: chrono::Duration = chrono::Duration::seconds(15);
+
+/// Whether this request has to rewrite `last_seen_at`: always on
+/// `/heartbeat`, whose answer is a statement about that write; otherwise only
+/// once the stored value is older than [`OPPORTUNISTIC_REFRESH_WINDOW`]. A
+/// value in the future (the clock stepped back) counts as stale, so a skewed
+/// row is repaired rather than trusted until the clock catches up.
+fn heartbeat_write_due(
+    path: &str,
+    last_seen_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if path.trim_end_matches('/').ends_with("/heartbeat") {
+        return true;
+    }
+    let age = now - last_seen_at;
+    age < chrono::Duration::zero() || age >= OPPORTUNISTIC_REFRESH_WINDOW
 }
 
 pub async fn authenticate_runner(
@@ -1773,27 +1814,36 @@ pub async fn authenticate_runner(
                 )
                 .into_response();
             }
-            // Valid token — also update heartbeat. The outcome travels with the
-            // request instead of being dropped here: `heartbeat` answers for
-            // this write, every other handler is free to ignore it.
-            let refresh = match rg_db::ops::runner_ops::update_heartbeat(&state.db, runner_id).await
-            {
-                Ok(()) => HeartbeatRefresh::Persisted,
-                Err(error) => {
-                    tracing::error!(runner_id, error = %format!("{error:#}"), "Failed to update runner heartbeat");
-                    // Same predicate the `AppError` conversions use, so a dead
-                    // pool — or a heartbeat write the backend refused because
-                    // somebody else held the write lock — is a retryable 503 on
-                    // `/heartbeat` exactly as it is on every other route,
-                    // classified here, where the `DbErr` still exists. A runner
-                    // told 500 stops reporting; one told 503 comes back.
-                    if error
-                        .downcast_ref::<sea_orm::DbErr>()
-                        .is_some_and(AppError::is_db_retryable)
-                    {
-                        HeartbeatRefresh::Unavailable
-                    } else {
-                        HeartbeatRefresh::Failed
+            // Valid token — also update heartbeat, unless a recent one already
+            // stands (see `OPPORTUNISTIC_REFRESH_WINDOW`). The outcome travels
+            // with the request instead of being dropped here: `heartbeat`
+            // answers for this write, every other handler is free to ignore it.
+            let due = heartbeat_write_due(
+                request.uri().path(),
+                runner.last_seen_at,
+                chrono::Utc::now(),
+            );
+            let refresh = if !due {
+                HeartbeatRefresh::Recent
+            } else {
+                match rg_db::ops::runner_ops::update_heartbeat(&state.db, runner_id).await {
+                    Ok(()) => HeartbeatRefresh::Persisted,
+                    Err(error) => {
+                        tracing::error!(runner_id, error = %format!("{error:#}"), "Failed to update runner heartbeat");
+                        // Same predicate the `AppError` conversions use, so a dead
+                        // pool — or a heartbeat write the backend refused because
+                        // somebody else held the write lock — is a retryable 503 on
+                        // `/heartbeat` exactly as it is on every other route,
+                        // classified here, where the `DbErr` still exists. A runner
+                        // told 500 stops reporting; one told 503 comes back.
+                        if error
+                            .downcast_ref::<sea_orm::DbErr>()
+                            .is_some_and(AppError::is_db_retryable)
+                        {
+                            HeartbeatRefresh::Unavailable
+                        } else {
+                            HeartbeatRefresh::Failed
+                        }
                     }
                 }
             };

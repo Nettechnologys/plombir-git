@@ -548,3 +548,95 @@ async fn another_runners_job_id_is_indistinguishable_from_an_unused_one() {
         "the assigned runner cannot start its own job — the denials above prove nothing"
     );
 }
+
+/// card_c6dd2bed5613: every authenticated runner request used to rewrite
+/// `last_seen_at` — a write transaction per runner per poll. Now only
+/// `/heartbeat` always writes; any other runner request writes only once the
+/// stored value is older than the 15-second refresh window.
+///
+/// `last_seen_at` is planted directly so the test does not race the clock:
+/// a value 5 s old must survive a non-heartbeat request byte for byte, a value
+/// 60 s old must be replaced by it, and `/heartbeat` replaces even the fresh
+/// one — its `200` is a statement that the write happened.
+#[tokio::test]
+async fn only_heartbeat_always_writes_last_seen_at_other_runner_requests_wait_out_the_window() {
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "hbwindow", "hbwindow@example.com").await;
+    let repo_id = crate::common::create_repo(&base, &token, "hbwindow").await;
+    let (runner, runner_token) =
+        rg_db::ops::runner_ops::register_runner(&db, repo_id, "hb", "[]", None, None, None)
+            .await
+            .unwrap();
+    let client = reqwest::Client::new();
+
+    let plant = |age_secs: i64| {
+        let db = db.clone();
+        async move {
+            let at = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+            let at = chrono::DateTime::<chrono::Utc>::from_timestamp(at.timestamp(), 0).unwrap();
+            rg_db::entities::runner::ActiveModel {
+                id: Set(runner.id),
+                last_seen_at: Set(at),
+                ..Default::default()
+            }
+            .update(&db)
+            .await
+            .unwrap();
+            at
+        }
+    };
+    let stored = || {
+        let db = db.clone();
+        async move {
+            rg_db::entities::runner::Entity::find_by_id(runner.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_seen_at
+        }
+    };
+    // Any authenticated runner route other than `/heartbeat`; the job does
+    // not exist, so the handler answers at once, after the middleware ran.
+    let other_request = || {
+        client
+            .get(format!(
+                "{base}/api/v1/runners/{}/jobs/999999999/workspace",
+                runner.id
+            ))
+            .bearer_auth(&runner_token)
+            .send()
+    };
+
+    let fresh = plant(5).await;
+    let resp = other_request().await.unwrap();
+    assert_eq!(resp.status(), 404, "the request passed the runner gate");
+    assert_eq!(
+        stored().await,
+        fresh,
+        "a refresh 5 s old was rewritten by a non-heartbeat request"
+    );
+
+    let stale = plant(60).await;
+    let resp = other_request().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    assert!(
+        stored().await > stale,
+        "a refresh 60 s old was not renewed by a runner request"
+    );
+
+    let fresh = plant(5).await;
+    let resp = client
+        .post(format!("{base}/api/v1/runners/{}/heartbeat", runner.id))
+        .bearer_auth(&runner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        stored().await > fresh,
+        "`/heartbeat` answered 200 without writing last_seen_at"
+    );
+}
