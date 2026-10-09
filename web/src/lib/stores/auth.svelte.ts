@@ -9,6 +9,8 @@ interface User {
   email: string;
   is_admin: boolean;
   display_name: string | null;
+  /** Whether the sudo prompt asks for a second factor as well as the password. */
+  mfa_enabled: boolean;
 }
 
 let currentUser = $state<User | null>(null);
@@ -28,6 +30,7 @@ function sessionUser(me: Awaited<ReturnType<typeof auth.me>>): User {
     email: me.email,
     is_admin: me.is_admin ?? false,
     display_name: me.display_name,
+    mfa_enabled: me.mfa_enabled ?? false,
   };
 }
 
@@ -116,6 +119,7 @@ export async function login(username: string, password: string) {
       email: me.email,
       is_admin: me.is_admin ?? false,
       display_name: me.display_name,
+      mfa_enabled: me.mfa_enabled ?? false,
     };
     authReady = true;
     sessionCheckError = null;
@@ -176,6 +180,7 @@ export async function verifyMfa(code: string, backup = false) {
       email: me.email,
       is_admin: me.is_admin ?? false,
       display_name: me.display_name,
+      mfa_enabled: me.mfa_enabled ?? false,
     };
     authReady = true;
     sessionCheckError = null;
@@ -207,6 +212,7 @@ export async function loginWithPasskey(username: string) {
       email: me.email,
       is_admin: me.is_admin ?? false,
       display_name: me.display_name,
+      mfa_enabled: me.mfa_enabled ?? false,
     };
     authReady = true;
     sessionCheckError = null;
@@ -256,6 +262,7 @@ export async function fetchUser() {
       email: me.email,
       is_admin: me.is_admin ?? false,
       display_name: me.display_name,
+      mfa_enabled: me.mfa_enabled ?? false,
     };
     authReady = true;
     sessionCheckError = null;

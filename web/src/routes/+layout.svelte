@@ -3,6 +3,7 @@
   import Navbar from '$lib/components/Navbar.svelte';
   import InstanceBanner from '$lib/components/InstanceBanner.svelte';
   import SessionStatusBanner from '$lib/components/SessionStatusBanner.svelte';
+  import SudoPrompt from '$lib/components/SudoPrompt.svelte';
   import Layout from '$lib/components/Layout.svelte';
   import SourceFooter from '$lib/components/SourceFooter.svelte';
 import { fetchUser, isAuthReady } from '$lib/stores/auth.svelte';
@@ -88,6 +89,7 @@ import { withBackendBase } from '$lib/api/_base';
     </main>
   </Layout>
   <SourceFooter />
+  <SudoPrompt />
 </div>
 
 <style>

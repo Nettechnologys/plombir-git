@@ -42,10 +42,10 @@ const CHANNEL: &str = "sudo";
 
 #[derive(Deserialize, ToSchema)]
 pub struct SudoRequest {
-    /// The account's current password. Ignored — and may be empty — for an
-    /// account whose password lives with an identity provider and that
-    /// confirms with its second factor instead.
-    #[serde(default)]
+    /// The account's current password. Required in the body — a request with
+    /// no password is malformed, not a wrong guess, and must not strike the
+    /// lockout — but may be empty for an account whose password lives with an
+    /// OAuth/OIDC provider and that confirms with its second factor instead.
     pub password: String,
     /// The authenticator's current code, required when MFA is enrolled and no
     /// `backup_code` is given.

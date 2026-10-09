@@ -32,6 +32,18 @@ export interface Me {
   bio: string | null;
   /** `local` accounts have a password and an address of their own here. */
   auth_provider: string;
+  /** Whether the sudo prompt will ask for a second factor as well. */
+  mfa_enabled: boolean;
+}
+
+/**
+ * What `POST /users/me/sudo` asks for: the password, plus one of the two
+ * second-factor spellings when MFA is enrolled.
+ */
+export interface SudoConfirmation {
+  password: string;
+  totp_code?: string;
+  backup_code?: string;
 }
 
 /** Following a mailed confirmation link: a new account, or a moved address. */
@@ -76,6 +88,15 @@ export const auth = {
       body: JSON.stringify({ username, code, backup }),
     }),
   me: () => request<Me>('/users/me'),
+  // Sudo mode: the same session re-issued for ten minutes, answered exactly
+  // like `login`. The routes that mint SSH keys, tokens, passkeys and SSO
+  // links refuse a session outside that window with `reason: sudo_required`;
+  // `request` turns that into the prompt that calls this.
+  sudo: (confirmation: SudoConfirmation) =>
+    request<AuthLoginResponse>('/users/me/sudo', {
+      method: 'POST',
+      body: JSON.stringify(confirmation),
+    }),
   // Signs every other session out; this one continues with the token in the
   // answer, which the HttpOnly cookie already carries.
   changePassword: (currentPassword: string, newPassword: string) =>
