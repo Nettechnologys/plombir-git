@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from '$lib/clipboard';
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { packages } from '$lib/api/client.svelte';
@@ -194,7 +195,7 @@
   }
 
   function copyInstall(ver: string) {
-    navigator.clipboard.writeText(getInstallCommand(ver));
+    void copyToClipboard(getInstallCommand(ver));
   }
 
   function formatSize(size?: number): string {

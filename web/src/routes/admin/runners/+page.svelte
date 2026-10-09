@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from '$lib/clipboard';
   import { goto } from '$app/navigation';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDateTime } from '$lib/i18n';
@@ -115,7 +116,7 @@
 
   async function copyRunnerToken() {
     if (!registeredRunner) return;
-    await navigator.clipboard.writeText(registeredRunner.token);
+    if (!(await copyToClipboard(registeredRunner.token))) error = t('common.copy_failed', 'Copying failed. Select the text and copy it yourself.');
   }
 
   function confirmDelete(runner: any) {

@@ -61,6 +61,9 @@ const NON_TRANSLATABLE = new Set([
 	// Protocols, products and technologies, named the same in every language.
 	'HTTPS',
 	'SSH',
+	'HTTP · SSH',
+	'LFS',
+	'CI/CD',
 	'Rust',
 	'Git',
 	'GitHub',
@@ -70,7 +73,6 @@ const NON_TRANSLATABLE = new Set([
 	'application/json',
 	'application/x-www-form-urlencoded',
 	// Units, prefixes and keywords rendered next to a value.
-	'50MB',
 	'v',
 	'if',
 	'📄 README.md',

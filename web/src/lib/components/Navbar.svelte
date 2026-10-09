@@ -1,9 +1,17 @@
 <script lang="ts">
-  import { goto } from '$app/navigation';
+  import { afterNavigate, goto } from '$app/navigation';
   import { getUser, isLoggedIn, isAdmin, isAuthReady, logout } from '$lib/stores/auth.svelte';
   import { locale, createT, type Locale } from '$lib/i18n';
   import Dropdown from './Dropdown.svelte';
+  import Logo from './Logo.svelte';
   import { getRegistrationOpen } from '$lib/stores/instance.svelte';
+
+  // Below 900px the links, the search and the account menu fold behind one
+  // button instead of stacking into three rows (card_c30077df5603).
+  let menuOpen = $state(false);
+  afterNavigate(() => {
+    menuOpen = false;
+  });
 
   const t = createT();
 
@@ -52,15 +60,25 @@
   }
 </script>
 
-<nav class="navbar">
+<nav class="navbar" class:menu-open={menuOpen}>
   <div class="navbar-inner">
     <div class="navbar-left">
       <a href="/" class="logo" aria-label={t('nav.home_label')}>
-        <svg viewBox="0 0 16 16" width="28" height="28" fill="currentColor" aria-hidden="true">
-          <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
-        </svg>
+        <Logo size={28} />
         <span class="logo-text">Plombir Git</span>
       </a>
+
+      <button
+        type="button"
+        class="menu-toggle"
+        aria-expanded={menuOpen}
+        aria-label={t('nav.menu', 'Menu')}
+        onclick={() => (menuOpen = !menuOpen)}
+      >
+        <svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true">
+          <path d="M1 2.75A.75.75 0 0 1 1.75 2h12.5a.75.75 0 0 1 0 1.5H1.75A.75.75 0 0 1 1 2.75Zm0 5A.75.75 0 0 1 1.75 7h12.5a.75.75 0 0 1 0 1.5H1.75A.75.75 0 0 1 1 7.75ZM1.75 12h12.5a.75.75 0 0 1 0 1.5H1.75a.75.75 0 0 1 0-1.5Z" />
+        </svg>
+      </button>
 
       <a href="/dashboard" class="nav-link">{t('nav.dashboard')}</a>
       <a href="/explore" class="nav-link">{t('nav.explore')}</a>
@@ -407,5 +425,26 @@
     }
 
     .search-input { min-width: 180px; }
+
+    .navbar-left { width: 100%; }
+    .menu-toggle { display: inline-flex; margin-left: auto; }
+
+    .navbar:not(.menu-open) .navbar-left .nav-link,
+    .navbar:not(.menu-open) .navbar-search,
+    .navbar:not(.menu-open) .navbar-right {
+      display: none;
+    }
+  }
+
+  .menu-toggle {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 8px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    cursor: pointer;
   }
 </style>

@@ -1362,4 +1362,16 @@
   .comment-edit-input { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-primary); color: var(--text-primary); font-family: inherit; }
   .comment-edit-actions { display: flex; gap: 8px; margin-top: 8px; }
   .btn-link.danger { color: var(--red); }
+
+  /* Phone widths (card_c30077df5603): rows of controls wrap, the tab bar
+     scrolls, and replies keep most of the width. The diff already scrolls. */
+  @media (max-width: 700px) {
+    .pr-meta,
+    .merge-row,
+    .reviewer-form,
+    .dismiss-form { flex-wrap: wrap; }
+    .pr-tabs { overflow-x: auto; }
+    .thread-comment.reply { margin-left: 12px; }
+    .dismiss-form input { min-width: 0; }
+  }
 </style>

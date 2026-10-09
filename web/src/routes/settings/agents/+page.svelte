@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from '$lib/clipboard';
   import { goto } from '$app/navigation';
   import { bots, splitList, type Bot, type BotToken } from '$lib/api/client.svelte';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
@@ -203,8 +204,8 @@
 
   async function copyNewToken() {
     if (!newToken) return;
-    await navigator.clipboard.writeText(newToken);
-    success = t('agents.token_copied');
+    if (await copyToClipboard(newToken)) success = t('agents.token_copied');
+    else error = t('common.copy_failed', 'Copying failed. Select the text and copy it yourself.');
   }
 
   function formatDate(value?: string | null) {

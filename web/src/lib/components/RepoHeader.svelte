@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from '$lib/clipboard';
   import { createT } from '$lib/i18n';
   import { getUser, isLoggedIn } from '$lib/stores/auth.svelte';
   import { repos } from '$lib/api/client.svelte';
@@ -74,8 +75,9 @@
   let httpCloneUrl = $derived(buildHttpCloneUrl(owner, repo));
   let sshCloneUrl = $derived(browser ? buildSshCloneUrl(owner, repo, location.hostname) : '');
 
-  function copyUrl(url: string) {
-    navigator.clipboard.writeText(url);
+  async function copyUrl(url: string) {
+    // "Copied" only for a copy that happened (card_c30077df5603).
+    if (!(await copyToClipboard(url))) return;
     if (cloneTab === 'http') {
       httpCopied = true;
       setTimeout(() => httpCopied = false, 2000);
@@ -124,27 +126,33 @@
   $effect(() => {
     const expectedOwner = owner;
     const expectedRepo = repo;
-    const knownDefault = defaultBranch;
-    const fallbackRef = knownDefault || 'main';
+    const fallbackRef = defaultBranch || 'main';
     const archiveOwner = ++archiveRefStateOwner;
     archiveRef = fallbackRef;
     viewerLevel = null;
-    void loadRepoInfo(expectedOwner, expectedRepo, fallbackRef, !knownDefault, archiveOwner);
+    void loadArchiveRef(expectedOwner, expectedRepo, fallbackRef, archiveOwner);
   });
 
-  async function loadRepoInfo(
+  async function loadArchiveRef(
     expectedOwner: string,
     expectedRepo: string,
     fallbackRef: string,
-    needsArchiveRef: boolean,
     archiveOwner: number,
   ) {
     try {
       const repoInfo = await repos.get(expectedOwner, expectedRepo);
-      if (archiveRefStateOwner !== archiveOwner || !isCurrentRepo(expectedOwner, expectedRepo)) return;
-      viewerLevel = repoInfo?.viewer_permission ?? null;
-      if (needsArchiveRef && repoInfo?.default_branch) {
-        archiveRef = repoInfo.default_branch;
+      if (
+        archiveRefStateOwner === archiveOwner &&
+        isCurrentRepo(expectedOwner, expectedRepo)
+      ) {
+        // One answer, two uses: the viewer's level rides on the same read.
+        // A `defaultBranch` the page passed wins over the server's; changing
+        // it re-runs the effect and claims a new owner, so this read cannot
+        // apply to a prop it did not see.
+        viewerLevel = repoInfo?.viewer_permission ?? null;
+        if (!defaultBranch && repoInfo?.default_branch) {
+          archiveRef = repoInfo.default_branch;
+        }
       }
     } catch {
       if (
@@ -662,11 +670,14 @@
     white-space: nowrap;
   }
 
+  /* Thirteen tabs do not fit a phone; they scroll sideways in one row
+     instead of wrapping into three (card_c30077df5603). */
   .repo-tabs {
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     gap: 0;
-    overflow: visible;
+    overflow-x: auto;
+    scrollbar-width: thin;
   }
 
   .tab {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from '$lib/clipboard';
   import { goto } from '$app/navigation';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
@@ -330,8 +331,8 @@
 
   async function copyBackupCodes() {
     if (newBackupCodes.length === 0) return;
-    await navigator.clipboard.writeText(newBackupCodes.join('\n'));
-    success = t('account_security.backup.copied');
+    if (await copyToClipboard(newBackupCodes.join('\n'))) success = t('account_security.backup.copied');
+    else error = t('common.copy_failed', 'Copying failed. Select the text and copy it yourself.');
   }
 </script>
 

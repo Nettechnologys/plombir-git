@@ -26,6 +26,35 @@
   --layout-block-padding: clamp(16px, 3.2vw, 24px);
   --layout-max: min(1280px, calc(100vw - 2 * var(--layout-gutter)));
   --layout-narrow-max: min(980px, calc(100vw - 2 * var(--layout-gutter)));
+
+  /* The app is dark only: native controls — selects, date pickers, scroll
+     bars — follow this instead of the browser's light default. */
+  color-scheme: dark;
+
+  /* Names pages reached for that the palette above never defined. Each one
+     used to resolve to nothing, or to a light-theme fallback such as #fee
+     behind near-white text (card_770a114fdafe); they are aliases now, and
+     `cssTokens.test.ts` keeps every var() a page uses defined. */
+  --accent-rgb: 88, 166, 255;
+  --accent-weak: rgba(56, 139, 253, 0.15);
+  --border-color: var(--border);
+  --card-bg: var(--bg-secondary);
+  --color-primary: var(--accent);
+  --primary: var(--accent);
+  --primary-hover: var(--accent-hover);
+  --link-color: var(--accent);
+  --text: var(--text-primary);
+  --text-tertiary: var(--text-muted);
+  --danger: var(--red);
+  --danger-text: var(--red);
+  --danger-bg: rgba(248, 81, 73, 0.12);
+  --error-bg: rgba(248, 81, 73, 0.12);
+  --error-border: var(--red-dim);
+  --red-dark: var(--red-dim);
+  --orange-dark: var(--orange);
+  --warning: var(--yellow);
+  --success-bg: rgba(63, 185, 80, 0.15);
+  --success-text: var(--green);
 }
 
 * {

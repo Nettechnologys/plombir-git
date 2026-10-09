@@ -423,14 +423,6 @@ pub struct SsoCallbackQuery {
     state: Option<String>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct LoginResponse {
-    token: String,
-    user_id: i64,
-    username: String,
-    mfa_required: bool,
-}
-
 // ── List providers ───────────────────────────────────────────────
 
 /// GET /auth/sso/providers

@@ -36,7 +36,8 @@
     "prev_arrow": "← Prev",
     "next_arrow": "Next →",
     "page_info": "Page {page} of {total}",
-    "deleting": "Deleting..."
+    "deleting": "Deleting...",
+    "copy_failed": "Copying failed. Select the text and copy it yourself."
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -67,7 +68,8 @@
     "agents": "Agents",
     "home_label": "Plombir Git Home",
     "user_menu": "User menu",
-    "notification_settings": "Notification settings"
+    "notification_settings": "Notification settings",
+    "menu": "Menu"
   },
   "author": {
     "bot": "bot",
@@ -115,7 +117,7 @@
       "title": "Why choose Plombir Git?",
       "lightweight": {
         "title": "Lightweight",
-        "desc": "Memory usage <50MB, minimal resource footprint"
+        "desc": "One server process on SQLite, PostgreSQL or MySQL"
       },
       "all_in_one": {
         "title": "All-in-One",
@@ -123,7 +125,7 @@
       },
       "security": {
         "title": "Security",
-        "desc": "Argon2 + JWT authentication, enterprise-ready"
+        "desc": "Argon2 passwords, passkeys and two-factor sign-in"
       },
       "self_hosted": {
         "title": "Self-Hosted",
@@ -147,13 +149,13 @@
       "view_all": "View all",
       "empty": "No public repositories yet"
     },
-    "description": "Plombir Git is a lightweight Git hosting platform built in Rust, designed as a modern alternative to Gitea. Single binary deployment, memory efficient, full-featured.",
+    "description": "Plombir Git is a self-hosted Git platform written in Rust: repositories, issues, pull requests, wiki, CI/CD and package registries on SQLite, PostgreSQL or MySQL.",
     "sign_up": "Sign up",
     "sign_in": "Sign in",
     "stats": {
-      "memory": "Memory Usage",
-      "binary": "Single Binary",
-      "compatible": "Git Compatible",
+      "protocols": "Git over smart HTTP v2 and SSH",
+      "lfs": "Git LFS with file locking",
+      "ci": "Built-in pipelines and runners",
       "language": "Built with"
     },
     "public_repos": "Public Repositories",
@@ -1010,7 +1012,15 @@
     "backend_unreachable": "Cannot reach the backend. Make sure the service on port 8080 is running.",
     "session_check_failed": "Plombir Git could not verify your session. You have not been signed out.",
     "session_check_retry": "Retry",
-    "session_check_retrying": "Retrying..."
+    "session_check_retrying": "Retrying...",
+    "page": {
+      "not_found_title": "Page not found",
+      "not_found": "Nothing lives at this address. It may have moved, or you may not have access to it.",
+      "failed_title": "This page could not be loaded",
+      "failed": "Something went wrong while loading this page. Try again in a moment.",
+      "home": "Go home",
+      "explore": "Explore repositories"
+    }
   },
   "search": {
     "title": "Search",

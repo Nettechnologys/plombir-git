@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from '$lib/clipboard';
   import { page } from '$app/stores';
   import { browser } from '$app/environment';
   import { goto } from '$app/navigation';
@@ -43,8 +44,8 @@
   let sshCopied = $state(false);
 
   function copyUrl(url: string) {
-    return () => {
-      navigator.clipboard.writeText(url);
+    return async () => {
+      if (!(await copyToClipboard(url))) return;
       if (url === httpCloneUrl) { httpCopied = true; setTimeout(() => httpCopied = false, 2000); }
       else { sshCopied = true; setTimeout(() => sshCopied = false, 2000); }
     };

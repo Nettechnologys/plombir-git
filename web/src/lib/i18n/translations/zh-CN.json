@@ -36,7 +36,8 @@
     "prev_arrow": "← 上一页",
     "next_arrow": "下一页 →",
     "page_info": "第 {page} 页，共 {total} 页",
-    "deleting": "正在删除..."
+    "deleting": "正在删除...",
+    "copy_failed": "复制失败。请选中文本后手动复制。"
   },
   "nav": {
     "dashboard": "仪表板",
@@ -67,7 +68,8 @@
     "agents": "智能体",
     "home_label": "Plombir Git 首页",
     "user_menu": "用户菜单",
-    "notification_settings": "通知设置"
+    "notification_settings": "通知设置",
+    "menu": "菜单"
   },
   "author": {
     "bot": "机器人",
@@ -104,7 +106,7 @@
   },
   "home": {
     "tagline": "轻量级自托管 Git 服务",
-    "description": "Plombir Git 是用 Rust 构建的轻量级 Git 托管平台，作为 Gitea 的现代替代品。单二进制部署，内存高效，功能完整。",
+    "description": "Plombir Git 是用 Rust 编写的自托管 Git 平台：在 SQLite、PostgreSQL 或 MySQL 上提供仓库、问题、拉取请求、Wiki、CI/CD 与包注册表。",
     "sign_up": "注册",
     "sign_in": "登录",
     "cta": {
@@ -122,7 +124,7 @@
       "cicd_desc": "内置流水线引擎",
       "lightweight": {
         "title": "轻量级",
-        "desc": "内存占用 <50MB，最小化资源消耗"
+        "desc": "单个服务进程，可使用 SQLite、PostgreSQL 或 MySQL"
       },
       "all_in_one": {
         "title": "一站式",
@@ -130,7 +132,7 @@
       },
       "security": {
         "title": "安全",
-        "desc": "Argon2 + JWT 认证，企业级安全"
+        "desc": "Argon2 密码、通行密钥与双因素登录"
       },
       "self_hosted": {
         "title": "自托管",
@@ -146,9 +148,9 @@
       }
     },
     "stats": {
-      "memory": "内存占用",
-      "binary": "单二进制",
-      "compatible": "Git 兼容",
+      "protocols": "通过智能 HTTP v2 和 SSH 访问 Git",
+      "lfs": "支持文件锁定的 Git LFS",
+      "ci": "内置流水线与运行器",
       "language": "构建语言"
     },
     "public_repos": "公开仓库",
@@ -1010,7 +1012,15 @@
     "backend_unreachable": "无法连接后端，请确认 8080 服务已启动。",
     "session_check_failed": "Plombir Git 无法验证当前会话。您尚未退出登录。",
     "session_check_retry": "重试",
-    "session_check_retrying": "正在重试..."
+    "session_check_retrying": "正在重试...",
+    "page": {
+      "not_found_title": "页面不存在",
+      "not_found": "此地址没有内容。它可能已被移动，或者您没有访问权限。",
+      "failed_title": "无法加载此页面",
+      "failed": "加载此页面时出错。请稍后重试。",
+      "home": "返回首页",
+      "explore": "探索仓库"
+    }
   },
   "search": {
     "title": "搜索",
