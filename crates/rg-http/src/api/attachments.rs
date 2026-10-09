@@ -696,25 +696,18 @@ async fn stream_attachment(
     rg_db::ops::attachment_ops::increment_download_count(&state.db, attachment.id).await?;
 
     // The part's own `Content-Type` is the uploader's word; only a passive
-    // one is passed through (card_36b620ab3467).
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
+    // one is passed through (card_36b620ab3467). The name goes through the
+    // shared builder: the hand-rolled `safe_name` escaped the quoting
+    // characters and stopped there, so an uploaded file named in anything but
+    // ASCII was served with no `Content-Disposition` at all.
+    crate::content_disposition::apply_download_headers(
+        response.headers_mut(),
         crate::content_disposition::served_upload_type(&attachment.content_type),
-    );
-    response.headers_mut().insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(crate::content_disposition::UPLOAD_SANDBOX_CSP),
+        Some(&attachment.filename),
     );
     if let Ok(value) = HeaderValue::from_str(&attachment.size.to_string()) {
         response.headers_mut().insert(header::CONTENT_LENGTH, value);
     }
-    // The hand-rolled `safe_name` escaped the quoting characters and stopped
-    // there, so an uploaded file named in anything but ASCII was served with no
-    // `Content-Disposition` at all.
-    response.headers_mut().insert(
-        header::CONTENT_DISPOSITION,
-        crate::content_disposition::attachment(&attachment.filename),
-    );
     // Expose the upload-time digest so clients can verify the payload
     // end-to-end as well. The server-side check above happens as the bytes pass,
     // so it can only abort a transfer already in flight; this header lets the

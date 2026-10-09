@@ -763,31 +763,25 @@ fn raw_file_headers(
     let headers = response.headers_mut();
     match inline_image_type(path) {
         Some(content_type) => {
-            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            // Shown in the page, so no name: the sandbox and `nosniff` still
+            // apply, which is what keeps an image that is not one from
+            // becoming a document of this origin.
+            crate::content_disposition::apply_download_headers(
+                headers,
+                HeaderValue::from_static(content_type),
+                None,
+            );
             headers.insert(
                 header::CONTENT_DISPOSITION,
                 HeaderValue::from_static("inline"),
             );
         }
-        None => {
-            headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/octet-stream"),
-            );
-            headers.insert(
-                header::CONTENT_DISPOSITION,
-                crate::content_disposition::attachment(filename),
-            );
-        }
+        None => crate::content_disposition::apply_download_headers(
+            headers,
+            HeaderValue::from_static("application/octet-stream"),
+            Some(filename),
+        ),
     }
-    headers.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; sandbox"),
-    );
     response
 }
 
