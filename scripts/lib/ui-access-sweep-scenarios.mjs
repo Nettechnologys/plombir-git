@@ -165,6 +165,11 @@ const adminRunnersRegister = privileged(
     await context.fill('#runner-label-0', 'browser');
     await context.fill('#runner-label-1', 'sweep');
     await context.click('.form-grid .btn-primary');
+    // `click` returns as soon as the button is clicked, not when its POST has
+    // answered; reading the list straight away raced the registration and lost
+    // on CI. The page lists the runner once the register call and the reload
+    // behind it are done — wait for that, then read the API.
+    await context.waitForText('.runners-table td.name', context.fixture.runnerName);
     const rows = await context.fetchJson('/api/v1/admin/runners');
     const runner = rows.find((row) => row.name === context.fixture.runnerName);
     if (!runner?.id) throw new Error(`registered runner ${context.fixture.runnerName} is absent from the admin list`);
@@ -254,6 +259,8 @@ const adminSsoCreate = privileged(
     await context.fill('#sso-ldap-base-dn', 'dc=example,dc=com');
     await context.fill('#sso-ldap-filter', '(uid={username})');
     await context.clickByText('.sso-form .inline-actions button', 'Create Provider');
+    // Same race as the runner above: wait until the page lists the provider.
+    await context.waitForText('.provider-list .provider-meta', context.fixture.ssoSlug);
     const providers = await context.fetchJson('/api/v1/admin/sso/providers');
     const provider = providers.find((row) => row.slug === context.fixture.ssoSlug);
     if (!provider?.id) throw new Error(`created SSO provider ${context.fixture.ssoSlug} is absent from the admin list`);
@@ -1299,8 +1306,10 @@ const repoTransfer = privileged(
       `/${context.ownerUsername}/${context.fixture.settingsRepository}/settings`,
     );
     await context.fill('#new-owner', context.fixture.managedOrg);
-    await context.setConfirm(true);
     await context.click('.transfer-section button.btn-warning');
+    // The transfer confirms in the page's own dialog, which names the source
+    // and the destination, not in window.confirm() (card_270a0a77fd79).
+    await context.click('[role="dialog"] .confirm-transfer');
     await context.waitForPath(
       `/${context.fixture.managedOrg}/${context.fixture.settingsRepository}`,
     );
