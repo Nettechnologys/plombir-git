@@ -31,6 +31,8 @@ pub async fn create_protection(
     require_signed_commits: bool,
     allowed_push_user_ids: Option<Vec<i64>>,
 ) -> Result<ProtectedBranch> {
+    rg_git::protocol::receive_pack::validate_branch_protection_pattern(&branch_name)
+        .map_err(crate::error::invalid_request)?;
     let repo = resolve_repo(db, owner, repo_name).await?;
 
     // `Conflict`, not `InvalidRequest`: the branch name is well-formed and an

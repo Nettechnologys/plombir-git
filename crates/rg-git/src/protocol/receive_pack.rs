@@ -1655,23 +1655,61 @@ pub fn ref_matches_rejection_pattern(refname: &str, pattern: &str) -> bool {
     if !pattern.contains('*') {
         return refname == pattern;
     }
-    let value = refname.as_bytes();
-    let pattern = pattern.as_bytes();
-    let mut dp = vec![vec![false; value.len() + 1]; pattern.len() + 1];
-    dp[0][0] = true;
-    for i in 1..=pattern.len() {
-        if pattern[i - 1] == b'*' {
-            dp[i][0] = dp[i - 1][0];
-        }
-        for j in 1..=value.len() {
-            dp[i][j] = if pattern[i - 1] == b'*' {
-                dp[i - 1][j] || dp[i][j - 1]
-            } else {
-                dp[i - 1][j - 1] && pattern[i - 1] == value[j - 1]
-            };
+    // `*` is the only wildcard, so the classic two-cursor match is exact: on a
+    // mismatch, let the most recent `*` swallow one more byte and retry from
+    // there. Constant memory, where the dynamic-programming table this
+    // replaced allocated pattern × ref cells up front on every push — a
+    // branch rule of a few megabytes against a long pushed ref name was an
+    // out-of-memory kill of the whole server (card_e53d4a5c6e69).
+    let (value, pattern) = (refname.as_bytes(), pattern.as_bytes());
+    let (mut v, mut p) = (0, 0);
+    let mut resume: Option<(usize, usize)> = None;
+    while v < value.len() {
+        if p < pattern.len() && pattern[p] == b'*' {
+            resume = Some((p + 1, v));
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == value[v] {
+            p += 1;
+            v += 1;
+        } else if let Some((after_star, swallowed)) = resume {
+            resume = Some((after_star, swallowed + 1));
+            p = after_star;
+            v = swallowed + 1;
+        } else {
+            return false;
         }
     }
-    dp[pattern.len()][value.len()]
+    pattern[p..].iter().all(|&byte| byte == b'*')
+}
+
+/// Validate a branch protection pattern before it is stored.
+///
+/// The same pattern language as [`validate_tag_protection_pattern`], for the
+/// same reasons, plus the one that made it urgent: nothing bounded a branch
+/// rule, so a repository admin — any registered account, on its own
+/// repository — could store a pattern of megabytes that every later push is
+/// matched against.
+pub fn validate_branch_protection_pattern(pattern: &str) -> std::result::Result<(), String> {
+    use gix::bstr::ByteSlice;
+
+    if pattern.is_empty() {
+        return Err("branch name must not be empty".to_string());
+    }
+    if pattern.len() > 255 {
+        return Err("branch name must be at most 255 bytes".to_string());
+    }
+    if pattern.starts_with("refs/") {
+        return Err("branch name must omit the refs/ prefix".to_string());
+    }
+    if let Some(metacharacter) = pattern.chars().find(|c| matches!(c, '?' | '[' | '+')) {
+        return Err(format!(
+            "branch name contains unsupported wildcard metacharacter '{metacharacter}'; only '*' is supported"
+        ));
+    }
+    let witness = format!("refs/heads/{}", pattern.replace('*', "wildcard"));
+    gix::validate::reference::name(witness.as_bytes().as_bstr())
+        .map(|_| ())
+        .map_err(|error| format!("branch name cannot match a valid branch ref: {error}"))
 }
 
 async fn drain_pack<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<()> {
@@ -2343,6 +2381,99 @@ mod rejection_pattern_tests {
             "refs/tags/test-1",
             "refs/tags/v*"
         ));
+    }
+
+    /// The table matcher this replaced, kept as the oracle.
+    fn table_match(refname: &str, pattern: &str) -> bool {
+        if !pattern.contains('*') {
+            return refname == pattern;
+        }
+        let (value, pattern) = (refname.as_bytes(), pattern.as_bytes());
+        let mut dp = vec![vec![false; value.len() + 1]; pattern.len() + 1];
+        dp[0][0] = true;
+        for i in 1..=pattern.len() {
+            if pattern[i - 1] == b'*' {
+                dp[i][0] = dp[i - 1][0];
+            }
+            for j in 1..=value.len() {
+                dp[i][j] = if pattern[i - 1] == b'*' {
+                    dp[i - 1][j] || dp[i][j - 1]
+                } else {
+                    dp[i - 1][j - 1] && pattern[i - 1] == value[j - 1]
+                };
+            }
+        }
+        dp[pattern.len()][value.len()]
+    }
+
+    #[test]
+    fn the_constant_memory_matcher_agrees_with_the_table_on_every_small_case() {
+        // Every pattern and ref over a three-letter alphabet up to length 5:
+        // small enough to enumerate, and `*` placement is where a two-cursor
+        // match goes wrong if it goes wrong at all.
+        fn all(alphabet: &[u8], max: usize) -> Vec<String> {
+            let mut out = vec![String::new()];
+            let mut frontier = vec![String::new()];
+            for _ in 0..max {
+                frontier = frontier
+                    .iter()
+                    .flat_map(|prefix| {
+                        alphabet
+                            .iter()
+                            .map(move |&byte| format!("{prefix}{}", byte as char))
+                    })
+                    .collect();
+                out.extend(frontier.iter().cloned());
+            }
+            out
+        }
+        let patterns = all(b"ab*", 5);
+        let refs = all(b"ab", 5);
+        for pattern in &patterns {
+            for refname in &refs {
+                assert_eq!(
+                    ref_matches_rejection_pattern(refname, pattern),
+                    table_match(refname, pattern),
+                    "pattern {pattern:?} against {refname:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_rule_against_a_long_ref_answers_at_once() {
+        // The table matcher filled pattern x ref cells before answering: here
+        // 2^34 of them, tens of seconds and gigabytes. The deadline fails it
+        // within a second, so a regression is a red test and not an
+        // out-of-memory kill of whatever machine runs the suite.
+        let pattern = format!("refs/heads/{}", "a*".repeat(1 << 17));
+        let refname = format!("refs/heads/{}", "a".repeat(1 << 16));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // The receiver is gone only when the deadline already failed
+            // the test; there is nobody left to tell.
+            sender
+                .send(ref_matches_rejection_pattern(&refname, &pattern))
+                .ok();
+        });
+        let matched = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("matching one rule against one ref must not take seconds");
+        assert!(!matched);
+    }
+
+    #[test]
+    fn branch_rules_are_bounded_and_shaped_like_branches() {
+        use super::validate_branch_protection_pattern as validate;
+        assert!(validate("main").is_ok());
+        assert!(validate("release/*").is_ok());
+        assert!(validate(&"a".repeat(255)).is_ok());
+        assert!(validate(&"a".repeat(256)).unwrap_err().contains("255"));
+        assert!(validate("").is_err());
+        assert!(validate("refs/heads/main").is_err());
+        assert!(validate("release-?").is_err());
+        assert!(validate("bad name").is_err());
+        assert!(validate("topic.lock").is_err());
     }
 
     #[test]
