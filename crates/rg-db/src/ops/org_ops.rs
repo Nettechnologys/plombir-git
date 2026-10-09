@@ -4,9 +4,7 @@ use anyhow::{Context, Result};
 use sea_orm::sea_query::{Expr, Query};
 use sea_orm::*;
 
-use crate::entities::{
-    organization, organization_member, repo_collaborator, team, team_member,
-};
+use crate::entities::{organization, organization_member, repo_collaborator, team, team_member};
 
 // ── Organization ops ──────────────────────────────────────────
 
