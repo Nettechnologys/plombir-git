@@ -1338,6 +1338,14 @@ impl PipelineRunner {
             "-w".to_string(),
             "/workspace".to_string(),
         ];
+        // The workspace is created owner-only and container root holds no
+        // capability to override that; the job runs as the workspace's owner,
+        // which also keeps everything it builds removable by the cleanup
+        // (`rg_process::container_user`).
+        if let Some(user) = rg_process::container_user() {
+            args.push("--user".to_string());
+            args.push(user);
+        }
         for (key, _) in job_environment {
             if key == "HOME" {
                 continue;
@@ -3073,6 +3081,7 @@ case "$1" in
     ;;
   run)
     printf '%s\n' "$$" > "$state/client.pid"
+    printf '%s\n' "$@" > "$state/run.args"
     for arg in "$@"; do
       if [ "$arg" = "fixture:success" ]; then
         printf 'docker success\n'
@@ -3273,6 +3282,17 @@ esac
         assert!(
             !fixture.root.join("rm.args").exists(),
             "a successful container was force-removed"
+        );
+        // Container root under `--cap-drop ALL` cannot read an owner-only
+        // workspace, and what it creates outlives the workspace cleanup.
+        let run_args = std::fs::read_to_string(fixture.root.join("run.args")).unwrap();
+        let run_args: Vec<&str> = run_args.lines().collect();
+        let owner = rg_process::container_user().expect("a unix process has a uid");
+        assert!(
+            run_args
+                .windows(2)
+                .any(|pair| pair[0] == "--user" && pair[1] == owner),
+            "the job container does not run as the workspace owner {owner}: {run_args:?}"
         );
         assert_process_stops(fixture.pid("client.pid"), "successful docker client").await;
     }

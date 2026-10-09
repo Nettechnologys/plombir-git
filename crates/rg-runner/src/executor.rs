@@ -221,7 +221,11 @@ pub(crate) async fn run_job_docker(
     // inherited from the Docker CLI environment so secrets are not exposed in the
     // host process arguments.
     for (key, value) in variables {
-        command.env(key, value);
+        // The job's `HOME` is not the Docker CLI's: the client reads its own
+        // config and registry credentials from there.
+        if key != "HOME" {
+            command.env(key, value);
+        }
     }
     command.kill_on_drop(true);
     match command.output().await {
@@ -284,10 +288,21 @@ fn docker_run_args(
         "-w".to_string(),
         "/workspace".to_string(),
     ];
+    if let Some(user) = rg_process::container_user() {
+        args.push("--user".to_string());
+        args.push(user);
+    }
     for (key, _) in variables {
+        // `HOME` is this host's workspace path, which does not exist inside
+        // the container; the job gets a home every uid can write instead.
+        if key == "HOME" {
+            continue;
+        }
         args.push("-e".to_string());
         args.push(key.clone());
     }
+    args.push("-e".to_string());
+    args.push("HOME=/tmp".to_string());
     args.push(image.to_string());
     args.push("sh".to_string());
     args.push("-c".to_string());
@@ -393,6 +408,42 @@ mod tests {
             &args[args.len() - 4..],
             &["alpine:3.20", "sh", "-c", "echo hi"]
         );
+    }
+
+    /// Container root has no `CAP_DAC_OVERRIDE` under `--cap-drop ALL`, so an
+    /// owner-only workspace is unreadable to it, and whatever it does create is
+    /// root-owned and outlives the runner's cleanup.
+    #[cfg(unix)]
+    #[test]
+    fn docker_jobs_run_as_the_owner_of_their_workspace_with_a_home_inside_the_container() {
+        let variables = vec![
+            (
+                "HOME".to_string(),
+                "/tmp/plombir-git-runner/jobs/7".to_string(),
+            ),
+            ("CI".to_string(), "true".to_string()),
+        ];
+        let args = docker_run_args(
+            "node:20",
+            "npm ci",
+            &variables,
+            std::path::Path::new("/tmp/plombir-git-runner/jobs/7"),
+            "plombir-git-runner-job-7",
+        );
+
+        let owner = rg_process::container_user().expect("a unix process has a uid");
+        let window =
+            |flag: &str, value: &str| args.windows(2).any(|w| w[0] == flag && w[1] == value);
+        assert!(window("--user", &owner), "missing --user {owner}: {args:?}");
+        assert!(
+            window("-e", "HOME=/tmp"),
+            "missing container HOME: {args:?}"
+        );
+        assert!(
+            !window("-e", "HOME"),
+            "the host workspace path was passed as the container's HOME: {args:?}"
+        );
+        assert!(window("-e", "CI"));
     }
 
     #[tokio::test]

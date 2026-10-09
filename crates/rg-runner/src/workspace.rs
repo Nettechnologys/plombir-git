@@ -14,6 +14,17 @@ const RUNNER_DIRECTORY: &str = "plombir-git-runner";
 const JOBS_DIRECTORY: &str = "jobs";
 const WORKSPACE_DOWNLOAD_SUFFIX: &str = ".workspace.download.tar";
 const ARTIFACT_SUFFIX: &str = ".artifact.tar";
+const CACHE_DOWNLOAD_SUFFIX: &str = ".cache.download.tar";
+const CACHE_ARCHIVE_SUFFIX: &str = ".cache.tar";
+/// Every file name a job writes beside its workspace, and so every one the
+/// startup sweep has to recognise. A cache transfer is up to a gigabyte; one
+/// left by a `SIGKILL` mid-transfer that no sweep knows stays in `TMPDIR`.
+const OWNED_FILE_SUFFIXES: [&str; 4] = [
+    WORKSPACE_DOWNLOAD_SUFFIX,
+    ARTIFACT_SUFFIX,
+    CACHE_DOWNLOAD_SUFFIX,
+    CACHE_ARCHIVE_SUFFIX,
+];
 
 /// Longest execution deadline the server can hand an external runner.
 pub(crate) const MAX_EXTERNAL_JOB_TIMEOUT_SECS: i64 = 86_400;
@@ -55,6 +66,14 @@ pub(crate) fn job_artifact_path(workspace: &Path) -> PathBuf {
     workspace.with_extension(ARTIFACT_SUFFIX.trim_start_matches('.'))
 }
 
+pub(crate) fn cache_download_spool_path(workspace: &Path) -> PathBuf {
+    workspace.with_extension(CACHE_DOWNLOAD_SUFFIX.trim_start_matches('.'))
+}
+
+pub(crate) fn cache_archive_path(workspace: &Path) -> PathBuf {
+    workspace.with_extension(CACHE_ARCHIVE_SUFFIX.trim_start_matches('.'))
+}
+
 fn is_job_id(value: &str) -> bool {
     value
         .parse::<i64>()
@@ -62,7 +81,7 @@ fn is_job_id(value: &str) -> bool {
 }
 
 fn is_owned_file_name(name: &str) -> bool {
-    [WORKSPACE_DOWNLOAD_SUFFIX, ARTIFACT_SUFFIX]
+    OWNED_FILE_SUFFIXES
         .iter()
         .any(|suffix| name.strip_suffix(suffix).is_some_and(is_job_id))
 }
@@ -158,8 +177,9 @@ async fn sweep_stale_job_entries_in(temp_root: &Path, older_than: Duration) -> S
 #[cfg(test)]
 mod tests {
     use super::{
-        job_artifact_path, job_workspace_path_in, sweep_stale_job_entries_in,
-        workspace_download_spool_path, SweepReport, STALE_JOB_ENTRY_AGE,
+        cache_archive_path, cache_download_spool_path, job_artifact_path, job_workspace_path_in,
+        sweep_stale_job_entries_in, workspace_download_spool_path, SweepReport,
+        STALE_JOB_ENTRY_AGE,
     };
     use std::path::Path;
     use std::time::{Duration, SystemTime};
@@ -220,6 +240,26 @@ mod tests {
             false,
         );
 
+        // The cache transfer files, up to a gigabyte each, used to be the two
+        // names this sweep did not know.
+        let stale_cache_download =
+            cache_download_spool_path(&job_workspace_path_in(temp_root.path(), 7));
+        let fresh_cache_download =
+            cache_download_spool_path(&job_workspace_path_in(temp_root.path(), 8));
+        let stale_cache_archive = cache_archive_path(&job_workspace_path_in(temp_root.path(), 9));
+        let fresh_cache_archive = cache_archive_path(&job_workspace_path_in(temp_root.path(), 10));
+        for (path, stale) in [
+            (&stale_cache_download, true),
+            (&fresh_cache_download, false),
+            (&stale_cache_archive, true),
+            (&fresh_cache_archive, false),
+        ] {
+            std::fs::write(path, b"cache").expect("cache spool");
+            if stale {
+                age(path, STALE_JOB_ENTRY_AGE + Duration::from_secs(60), false);
+            }
+        }
+
         let unknown = stale_workspace.parent().unwrap().join("operator-notes");
         std::fs::create_dir(&unknown).expect("unknown directory");
         age(
@@ -233,15 +273,28 @@ mod tests {
         assert_eq!(
             report,
             SweepReport {
-                removed: 3,
-                retained: 3,
+                removed: 5,
+                retained: 5,
                 failed: 0,
             }
         );
-        for stale in [&stale_workspace, &stale_artifact, &stale_download] {
+        for stale in [
+            &stale_workspace,
+            &stale_artifact,
+            &stale_download,
+            &stale_cache_download,
+            &stale_cache_archive,
+        ] {
             assert!(!stale.exists(), "{} was not retired", stale.display());
         }
-        for live in [&fresh_workspace, &fresh_artifact, &fresh_download, &unknown] {
+        for live in [
+            &fresh_workspace,
+            &fresh_artifact,
+            &fresh_download,
+            &fresh_cache_download,
+            &fresh_cache_archive,
+            &unknown,
+        ] {
             assert!(live.exists(), "{} was removed", live.display());
         }
     }
@@ -254,10 +307,14 @@ mod tests {
         let commands_code = rust_source::production_rust_code_only(commands);
 
         assert!(!api.contains("workspace.download.tar"));
+        assert!(!api_code.contains("\"cache.download.tar\""));
+        assert!(!api_code.contains("\"cache.tar\""));
         assert!(!api.contains(".join(\"plombir-git-runner\")"));
         assert!(!commands.contains("artifact.tar"));
         assert!(api_code.contains("job_workspace_path(job_id)"));
         assert!(api_code.contains("workspace_download_spool_path(&workspace)"));
+        assert!(api_code.contains("cache_download_spool_path(workspace)"));
+        assert!(api_code.contains("cache_archive_path(workspace)"));
         assert!(commands_code.contains("job_artifact_path(workspace)"));
         assert!(commands_code.contains("sweep_stale_job_entries(STALE_JOB_ENTRY_AGE)"));
     }

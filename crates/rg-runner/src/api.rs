@@ -6,7 +6,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::workspace::{job_workspace_path, workspace_download_spool_path};
+use crate::workspace::{
+    cache_archive_path, cache_download_spool_path, job_workspace_path,
+    workspace_download_spool_path,
+};
 
 /// Register a runner with the server.
 pub async fn register_runner(
@@ -647,7 +650,7 @@ pub async fn restore_cache(
             )
         })?;
     }
-    let spool = workspace.with_extension("cache.download.tar");
+    let spool = cache_download_spool_path(workspace);
     let spool_outcome = spool_response_body(response, &spool, "cache").await;
     let workspace = workspace.to_path_buf();
     let unpack_outcome = match spool_outcome {
@@ -829,7 +832,7 @@ pub async fn save_cache(
     paths: &[String],
     workspace: &std::path::Path,
 ) -> Result<()> {
-    let archive = workspace.with_extension("cache.tar");
+    let archive = cache_archive_path(workspace);
     let paths = paths.to_vec();
     let pack_workspace = workspace.to_path_buf();
     let pack_archive = archive.clone();
@@ -1738,7 +1741,7 @@ mod archive_upload_tests {
         );
 
         assert!(
-            !workspace.with_extension("cache.tar").exists(),
+            !crate::workspace::cache_archive_path(&workspace).exists(),
             "the packed cache archive must not stay on the runner's disk"
         );
     }
@@ -2036,7 +2039,7 @@ mod archive_download_tests {
         // exit path — a leaked archive here would double the disk footprint
         // of every successful cache restore.
         assert!(
-            !workspace.with_extension("cache.download.tar").exists(),
+            !crate::workspace::cache_download_spool_path(&workspace).exists(),
             "the download spool must not stay on the runner's disk"
         );
     }
