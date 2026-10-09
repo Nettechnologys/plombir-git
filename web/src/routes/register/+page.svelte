@@ -1,6 +1,8 @@
 <script lang="ts">
   import { register, getAuthError, getAuthLoading } from '$lib/stores/auth.svelte';
   import { createT } from '$lib/i18n';
+  import { getRegistrationOpen } from '$lib/stores/instance.svelte';
+  import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from '$lib/passwordPolicy';
 
   const t = createT();
 
@@ -42,7 +44,14 @@
       <div class="error-banner">{localError}</div>
     {/if}
 
-    {#if confirmationSent}
+    {#if getRegistrationOpen() === false}
+      <p class="registration-closed" role="status">
+        {t(
+          'auth.register.closed',
+          'Self-service sign-up is closed on this instance. Ask an administrator for an account.',
+        )}
+      </p>
+    {:else if confirmationSent}
       <p class="confirmation-sent" role="status">
         {t(
           'auth.register.confirmation_sent',
@@ -63,7 +72,16 @@
 
       <label>
         {t('auth.register.password')}
-        <input type="password" bind:value={password} required autocomplete="new-password" minlength={6} />
+        <input
+          type="password"
+          bind:value={password}
+          required
+          autocomplete="new-password"
+          minlength={PASSWORD_MIN_LENGTH}
+          maxlength={PASSWORD_MAX_LENGTH}
+          aria-describedby="password-policy"
+        />
+        <small id="password-policy" class="hint">{t('auth.password_policy', { min: PASSWORD_MIN_LENGTH })}</small>
       </label>
 
       <button type="submit" class="btn-primary" disabled={getAuthLoading()}>
@@ -80,6 +98,17 @@
 </div>
 
 <style>
+  .hint {
+    display: block;
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .registration-closed {
+    color: var(--text-secondary);
+  }
+
   .confirmation-sent {
     font-size: 14px;
     line-height: 1.5;

@@ -202,7 +202,8 @@
       "submitting": "Creating account...",
       "footer": "Already have an account? {link}",
       "footer_link": "Sign in",
-      "failed": "Registration failed"
+      "failed": "Registration failed",
+      "closed": "Self-service sign-up is closed on this instance. Ask an administrator for an account."
     },
     "back_to_login": "Back to Login",
     "password_rules": {
@@ -260,7 +261,8 @@
       "retry": "Signing in with {provider} collided with another attempt. Please try again.",
       "server_error": "Something went wrong on the server while signing in with {provider}. Please try again later.",
       "failed": "Signing in with {provider} failed. Please try again."
-    }
+    },
+    "password_policy": "At least {min} characters, with an uppercase and a lowercase letter, a digit and a symbol. Not your username, and not a common password."
   },
   "dashboard": {
     "title": "Dashboard",
@@ -1324,7 +1326,7 @@
     "delete": {
       "title": "Delete this repository",
       "desc": "Once you delete a repository, there is no going back.",
-      "confirm_instruction": "Type <strong>{repo}</strong> to confirm:",
+      "confirm_instruction": "Type {repo} to confirm:",
       "confirm_placeholder": "Type owner/repository",
       "confirm_button": "Delete this repository",
       "confirming": "Deleting...",
@@ -1428,6 +1430,10 @@
       "confirm_title": "Rename this repository?",
       "confirm_body": "{from} will become {to}.",
       "no_redirect": "Old web links and clone URLs stop working: there is no redirect from the old name. Everyone who cloned it has to point their remote at the new URL."
+    },
+    "access": {
+      "admin_required": "This page is for the repository’s administrators.",
+      "write_required": "This page is for people who can write to the repository."
     }
   },
   "commit": {

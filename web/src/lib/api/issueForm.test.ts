@@ -45,7 +45,7 @@ beforeEach(() => {
 	collaborators.list.mockResolvedValue([
 		{ user_id: 7, username: 'bob' },
 	]);
-	repos.get.mockResolvedValue({ owner_id: 1, default_branch: 'main' });
+	repos.get.mockResolvedValue({ owner_id: 1, default_branch: 'main', viewer_permission: 'write' });
 	attachments.list.mockResolvedValue([]);
 });
 

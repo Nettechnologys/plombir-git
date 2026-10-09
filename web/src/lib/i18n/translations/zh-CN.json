@@ -202,7 +202,8 @@
       "submitting": "创建中...",
       "footer": "已有账号？{link}",
       "footer_link": "登录",
-      "failed": "注册失败"
+      "failed": "注册失败",
+      "closed": "此实例已关闭自助注册。请联系管理员为您创建账户。"
     },
     "back_to_login": "返回登录",
     "password_rules": {
@@ -260,7 +261,8 @@
       "retry": "使用 {provider} 登录时与另一次尝试冲突。请重试。",
       "server_error": "使用 {provider} 登录时服务器出错。请稍后重试。",
       "failed": "使用 {provider} 登录失败。请重试。"
-    }
+    },
+    "password_policy": "至少 {min} 个字符，需包含大写字母、小写字母、数字和符号；不能是用户名，也不能是常见密码。"
   },
   "dashboard": {
     "title": "仪表板",
@@ -1324,7 +1326,7 @@
     "delete": {
       "title": "删除此仓库",
       "desc": "一旦删除仓库，将无法恢复。",
-      "confirm_instruction": "输入 <strong>{repo}</strong> 以确认：",
+      "confirm_instruction": "输入 {repo} 以确认：",
       "confirm_placeholder": "输入 owner/repository",
       "confirm_button": "删除此仓库",
       "confirming": "删除中...",
@@ -1428,6 +1430,10 @@
       "confirm_title": "重命名此仓库？",
       "confirm_body": "{from} 将变为 {to}。",
       "no_redirect": "旧的网页链接和克隆地址将失效：旧名称不会重定向。所有克隆过它的人都需要将远程地址改为新的 URL。"
+    },
+    "access": {
+      "admin_required": "此页面仅供仓库管理员使用。",
+      "write_required": "此页面仅供对仓库有写权限的用户使用。"
     }
   },
   "commit": {

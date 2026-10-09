@@ -41,6 +41,22 @@ export function setSourceLink(link: SourceLink | null) {
   sourceLink = link;
 }
 
+// ── Self-service registration ───────────────────────────
+
+/// Whether `/users/register` would accept a sign-up, as `GET /api/v1/instance`
+/// reported it (card_e1baa94866ed). `null` until that answer arrives; only an
+/// explicit `false` hides the sign-up links, so a server that predates the
+/// field keeps them.
+let registrationOpen = $state<boolean | null>(null);
+
+export function getRegistrationOpen(): boolean | null {
+  return registrationOpen;
+}
+
+export function setRegistrationOpen(open: boolean | null) {
+  registrationOpen = open;
+}
+
 // ── Keyboard Shortcuts ──────────────────────────────────
 
 /// Call this once in root layout to register global keyboard shortcuts.

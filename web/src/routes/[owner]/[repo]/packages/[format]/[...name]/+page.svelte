@@ -5,6 +5,7 @@
   import { nextYankState } from '$lib/api/packageYank';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
   import { packageFormatLabel } from '$lib/packageFormats';
   import { packageInstallSnippet, packageInstallText } from '$lib/packageInstall';
 
@@ -12,6 +13,8 @@
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
+  // Yanking and deleting a version are `RepoWrite` (card_270a0a77fd79).
+  const permission = viewerPermission(() => owner, () => repo);
   let format = $derived($page.params.format!);
   let name = $derived($page.params.name!);
 
@@ -261,17 +264,19 @@
                 <button class="copy-btn" onclick={() => copyInstall(version.version)}>
                   {t('common.copy')} {t('packages.install')}
                 </button>
-                <button
-                  class="secondary-btn"
-                  disabled={isVersionBusy(version.version)}
-                  title={t('packages.yank_hint')}
-                  onclick={() => handleToggleYank(version)}
-                >
-                  {version.is_yanked ? t('packages.unyank') : t('packages.yank')}
-                </button>
-                <button class="danger-btn" disabled={isVersionBusy(version.version)} onclick={() => { confirmDelete = version.version; }}>
-                  {t('common.delete')}
-                </button>
+                {#if permission.canWrite}
+                  <button
+                    class="secondary-btn"
+                    disabled={isVersionBusy(version.version)}
+                    title={t('packages.yank_hint')}
+                    onclick={() => handleToggleYank(version)}
+                  >
+                    {version.is_yanked ? t('packages.unyank') : t('packages.yank')}
+                  </button>
+                  <button class="danger-btn" disabled={isVersionBusy(version.version)} onclick={() => { confirmDelete = version.version; }}>
+                    {t('common.delete')}
+                  </button>
+                {/if}
               </div>
             </div>
 

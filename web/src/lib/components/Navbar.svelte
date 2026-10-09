@@ -3,6 +3,7 @@
   import { getUser, isLoggedIn, isAdmin, isAuthReady, logout } from '$lib/stores/auth.svelte';
   import { locale, createT, type Locale } from '$lib/i18n';
   import Dropdown from './Dropdown.svelte';
+  import { getRegistrationOpen } from '$lib/stores/instance.svelte';
 
   const t = createT();
 
@@ -140,7 +141,9 @@
           </Dropdown>
         </div>
       {:else}
-        <a href="/register" class="btn-outline">{t('nav.sign_up')}</a>
+        {#if getRegistrationOpen() !== false}
+          <a href="/register" class="btn-outline">{t('nav.sign_up')}</a>
+        {/if}
         <a href="/login" class="btn-outline">{t('nav.sign_in')}</a>
       {/if}
     </div>

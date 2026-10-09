@@ -15,6 +15,8 @@
   import { auth, isPasskeySupported, type PublicSsoProvider } from '$lib/api/client.svelte';
   import { isUnavailable, optionalSection } from '$lib/optionalSection';
   import { readSsoError, ssoErrorMessage, type SsoError } from '$lib/ssoError';
+  import { getRegistrationOpen } from '$lib/stores/instance.svelte';
+  import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from '$lib/passwordPolicy';
   import { goto } from '$app/navigation';
 
   const t = createT();
@@ -174,7 +176,16 @@
         </p>
         <label>
           {t('auth.login.new_password', 'New password')}
-          <input type="password" bind:value={newPassword} required autocomplete="new-password" />
+          <input
+            type="password"
+            bind:value={newPassword}
+            required
+            autocomplete="new-password"
+            minlength={PASSWORD_MIN_LENGTH}
+            maxlength={PASSWORD_MAX_LENGTH}
+            aria-describedby="password-policy"
+          />
+          <small id="password-policy" class="hint">{t('auth.password_policy', { min: PASSWORD_MIN_LENGTH })}</small>
         </label>
         <label>
           {t('auth.login.confirm_password', 'Repeat the new password')}
@@ -265,9 +276,11 @@
     {/if}
 
     <p class="footer">
-      {t('auth.login.footer', { link: '' })}
-      <a href="/register">{t('auth.login.footer_link')}</a>
-      <span class="separator">·</span>
+      {#if getRegistrationOpen() !== false}
+        {t('auth.login.footer', { link: '' })}
+        <a href="/register">{t('auth.login.footer_link')}</a>
+        <span class="separator">·</span>
+      {/if}
       <a href="/forgot-password">{t('auth.login.forgot_password')}</a>
     </p>
   </div>

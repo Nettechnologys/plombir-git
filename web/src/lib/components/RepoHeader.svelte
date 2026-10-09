@@ -6,6 +6,8 @@
   import { isUnavailable, optionalSection } from '$lib/optionalSection';
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
+  import { canWriteRepo } from '$lib/repoPermission';
+  import type { RepoPermission } from '$lib/api/client.svelte';
 
   const t = createT();
 
@@ -18,6 +20,10 @@
   }
 
   let { owner, repo, activeTab = 'code', starsCount = 0, defaultBranch }: Props = $props();
+  // The viewer's level, read from the same `GET /repos/{owner}/{name}` that
+  // settles the archive ref — one request per visit, not two
+  // (card_270a0a77fd79). `null` until it arrives and for an anonymous reader.
+  let viewerLevel = $state<RepoPermission | null>(null);
 
   // Action button states
   type WatchState = 'not_watching' | 'watching' | 'ignoring';
@@ -118,27 +124,26 @@
   $effect(() => {
     const expectedOwner = owner;
     const expectedRepo = repo;
-    const fallbackRef = defaultBranch || 'main';
+    const knownDefault = defaultBranch;
+    const fallbackRef = knownDefault || 'main';
     const archiveOwner = ++archiveRefStateOwner;
     archiveRef = fallbackRef;
-    if (!defaultBranch) {
-      void loadArchiveRef(expectedOwner, expectedRepo, fallbackRef, archiveOwner);
-    }
+    viewerLevel = null;
+    void loadRepoInfo(expectedOwner, expectedRepo, fallbackRef, !knownDefault, archiveOwner);
   });
 
-  async function loadArchiveRef(
+  async function loadRepoInfo(
     expectedOwner: string,
     expectedRepo: string,
     fallbackRef: string,
+    needsArchiveRef: boolean,
     archiveOwner: number,
   ) {
     try {
       const repoInfo = await repos.get(expectedOwner, expectedRepo);
-      if (
-        archiveRefStateOwner === archiveOwner &&
-        isCurrentRepo(expectedOwner, expectedRepo) &&
-        repoInfo.default_branch
-      ) {
+      if (archiveRefStateOwner !== archiveOwner || !isCurrentRepo(expectedOwner, expectedRepo)) return;
+      viewerLevel = repoInfo?.viewer_permission ?? null;
+      if (needsArchiveRef && repoInfo?.default_branch) {
         archiveRef = repoInfo.default_branch;
       }
     } catch {
@@ -362,7 +367,9 @@
     { id: 'board', label: t('repo.tabs.board'), icon: '◫', path: 'boards' },
     { id: 'time_tracking', label: t('repo.tabs.time_tracking'), icon: '⏱' },
     { id: 'commits', label: t('repo.tabs.commits'), icon: '📜' },
-    { id: 'settings', label: t('repo.tabs.settings'), icon: '⚙' },
+    // Settings holds sections for writers (labels, mirror, LFS locks) and
+    // for administrators; a reader has none (card_270a0a77fd79).
+    ...(canWriteRepo(viewerLevel) ? [{ id: 'settings', label: t('repo.tabs.settings'), icon: '⚙' }] : []),
   ]);
 
   function tabHref(tab: { id: string; path?: string }) {

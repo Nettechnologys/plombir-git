@@ -8,6 +8,7 @@
     type RepositoryResourceRequestClaim,
   } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
   import { renderMarkdown } from '$lib/utils/markdown';
 
   const t = createT();
@@ -38,6 +39,9 @@
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
+  // Editing and deleting a file are `RepoWrite` (card_e1baa94866ed); a reader
+  // is offered neither, rather than a button that ends in a 403.
+  const permission = viewerPermission(() => owner, () => repo);
   let filePath = $derived($page.params.path!);
   let queryRef = $derived($page.url.searchParams.get('ref') || '');
 
@@ -494,18 +498,20 @@
             {t('repo.blob.download')}
           </button>
         {/if}
-        {#if canEdit}
-          <a href={buildEditHref()} class="btn-outline btn-sm">
-            {t('repo.edit_file')}
-          </a>
-        {:else}
-          <span class="btn-outline btn-sm disabled" title={t('repo.blob.edit_unavailable')}>
-            {t('repo.edit_file')}
-          </span>
+        {#if permission.canWrite}
+          {#if canEdit}
+            <a href={buildEditHref()} class="btn-outline btn-sm">
+              {t('repo.edit_file')}
+            </a>
+          {:else}
+            <span class="btn-outline btn-sm disabled" title={t('repo.blob.edit_unavailable')}>
+              {t('repo.edit_file')}
+            </span>
+          {/if}
+          <button type="button" class="btn-outline btn-sm danger" onclick={() => deleteOpen = !deleteOpen}>
+            {t('repo.blob.delete_file')}
+          </button>
         {/if}
-        <button type="button" class="btn-outline btn-sm danger" onclick={() => deleteOpen = !deleteOpen}>
-          {t('repo.blob.delete_file')}
-        </button>
       </div>
     </div>
 
@@ -524,7 +530,7 @@
       <div class="warning-banner">{t('repo.blob.large_file')}</div>
     {/if}
 
-    {#if deleteOpen}
+    {#if deleteOpen && permission.canWrite}
       <div class="delete-panel">
         <div>
           <strong>{t('repo.blob.delete_title')}</strong>

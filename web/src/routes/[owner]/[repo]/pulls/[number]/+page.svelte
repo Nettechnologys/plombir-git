@@ -92,6 +92,12 @@
   // A pull request itself has no delete route on purpose.
   const permission = viewerPermission(() => owner, () => repo);
   let viewer = $derived(getUser());
+  // Reviews and review comments are `RepoAuthRead`: any signed-in reader may
+  // leave one. Everything else that changes the pull request — draft state,
+  // reviewers, CI approval, merging, dismissing, resolving, applying a
+  // suggestion — is `RepoWrite` on the server, and offered only to a writer
+  // (card_270a0a77fd79).
+  let signedIn = $derived(Boolean(viewer));
   let editingCommentId = $state<number | null>(null);
   let editDraft = $state('');
   let editBusy = $state(false);
@@ -653,7 +659,7 @@
             →
             <span class="branch-label">{pr.base_branch}</span>
           </span>
-          {#if pr.state === 'open'}
+          {#if pr.state === 'open' && permission.canWrite}
             <button class="btn-link" onclick={toggleDraft} disabled={mutationBusy || updatingDraft}>
               {pr.is_draft ? t('pulls.mark_ready') : t('pulls.convert_draft')}
             </button>
@@ -670,7 +676,7 @@
         </div>
       {/if}
 
-      <AttachmentPanel {owner} {repo} target="pulls" targetId={number} />
+      <AttachmentPanel {owner} {repo} target="pulls" targetId={number} canWrite={permission.canWrite} />
 
       <!-- Tabs -->
       <div class="pr-tabs">
@@ -698,21 +704,25 @@
                 {#each requestedReviewers as reviewer (reviewer.id)}
                   <span class="reviewer-chip">
                     @{reviewer.username}
-                    <button
-                      aria-label={t('pulls.reviewers.remove', { username: reviewer.username })}
-                      disabled={mutationBusy || managingReviewer}
-                      onclick={() => removeReviewer(reviewer.username)}
-                    >×</button>
+                    {#if permission.canWrite}
+                      <button
+                        aria-label={t('pulls.reviewers.remove', { username: reviewer.username })}
+                        disabled={mutationBusy || managingReviewer}
+                        onclick={() => removeReviewer(reviewer.username)}
+                      >×</button>
+                    {/if}
                   </span>
                 {/each}
               </div>
             {/if}
-            <div class="reviewer-form">
-              <input bind:value={reviewerUsername} placeholder={t('pulls.reviewers.placeholder')} disabled={mutationBusy} />
-              <button class="btn-secondary" onclick={requestReviewer} disabled={mutationBusy || managingReviewer || !reviewerUsername.trim()}>
-                {t('pulls.reviewers.request')}
-              </button>
-            </div>
+            {#if permission.canWrite}
+              <div class="reviewer-form">
+                <input bind:value={reviewerUsername} placeholder={t('pulls.reviewers.placeholder')} disabled={mutationBusy} />
+                <button class="btn-secondary" onclick={requestReviewer} disabled={mutationBusy || managingReviewer || !reviewerUsername.trim()}>
+                  {t('pulls.reviewers.request')}
+                </button>
+              </div>
+            {/if}
           </section>
 
           <!-- Fork CI approval -->
@@ -722,9 +732,11 @@
                 <strong>{t('pulls.fork_ci.held')}</strong>
                 <span>{t('pulls.fork_ci.explanation')}</span>
               </div>
-              <button class="btn-secondary ci-approve" onclick={approveForkCi} disabled={mutationBusy || approvingCi}>
-                {approvingCi ? t('pulls.fork_ci.approving') : t('pulls.fork_ci.approve')}
-              </button>
+              {#if permission.canWrite}
+                <button class="btn-secondary ci-approve" onclick={approveForkCi} disabled={mutationBusy || approvingCi}>
+                  {approvingCi ? t('pulls.fork_ci.approving') : t('pulls.fork_ci.approve')}
+                </button>
+              {/if}
             </div>
           {/if}
 
@@ -752,9 +764,11 @@
                     <strong>{t('pulls.merge.queue_position', { position: queuedEntry.position })}</strong>
                     <span>{t('pulls.merge.queue_waiting', { strategy: queuedEntry.strategy })}</span>
                   </div>
-                  <button class="btn-secondary" onclick={cancelQueuedMerge} disabled={mutationBusy || managingMergeQueue || queuedEntry.status === 'running'}>
-                    {t('pulls.merge.leave_queue')}
-                  </button>
+                  {#if permission.canWrite}
+                    <button class="btn-secondary" onclick={cancelQueuedMerge} disabled={mutationBusy || managingMergeQueue || queuedEntry.status === 'running'}>
+                      {t('pulls.merge.leave_queue')}
+                    </button>
+                  {/if}
                 </div>
               {:else if pr.auto_merge_enabled}
                 <div class="auto-merge-pending">
@@ -763,11 +777,13 @@
                     <span>{t('pulls.merge.auto_waiting', { strategy: pr.auto_merge_strategy })}</span>
                     {#if autoMergeReason}<small>{autoMergeReason}</small>{/if}
                   </div>
-                  <button class="btn-secondary" onclick={disableAutoMerge} disabled={mutationBusy || managingAutoMerge}>
-                    {t('pulls.merge.disable_auto')}
-                  </button>
+                  {#if permission.canWrite}
+                    <button class="btn-secondary" onclick={disableAutoMerge} disabled={mutationBusy || managingAutoMerge}>
+                      {t('pulls.merge.disable_auto')}
+                    </button>
+                  {/if}
                 </div>
-              {:else}
+              {:else if permission.canWrite}
                 <div class="merge-row">
                   <select bind:value={mergeStrategy} class="merge-select" disabled={mutationBusy}>
                     <option value="merge">{t('pulls.merge.strategy.merge')}</option>
@@ -828,7 +844,7 @@
                       <code>{event.metadata.path}{event.metadata.line ? `:${event.metadata.start_line && event.metadata.start_line !== event.metadata.line ? `${event.metadata.start_line}-${event.metadata.line}` : event.metadata.line}` : ''}</code>
                     {/if}
                     {#if event.body}<div class="timeline-body">{event.body}</div>{/if}
-                    {#if verdict && !verdict.dismissed_at && pr.state === 'open'}
+                    {#if verdict && !verdict.dismissed_at && pr.state === 'open' && permission.canWrite}
                       {#if dismissTargetId === verdict.id}
                         <div class="dismiss-form">
                           <input bind:value={dismissMessage} placeholder={t('pulls.review.dismiss_placeholder')} disabled={mutationBusy} />
@@ -853,7 +869,7 @@
             </section>
           {/if}
 
-          {#if applicableSuggestions.length > 1}
+          {#if applicableSuggestions.length > 1 && permission.canWrite}
             <div class="suggestion-batch-bar">
               <span>{t('pulls.suggestion.batch_selected', { count: selectedSuggestionIds.length })}</span>
               <button
@@ -876,10 +892,10 @@
                     <span>{comment.resolved_at ? t('pulls.threads.resolved') : t('pulls.threads.open')}</span>
                   </header>
                   {@render reviewComment(comment, false)}
-                  <AttachmentPanel {owner} {repo} target="pulls/comments" targetId={comment.id} />
+                  <AttachmentPanel {owner} {repo} target="pulls/comments" targetId={comment.id} canWrite={permission.canWrite} />
                   {#if comment.suggestion !== null && comment.suggestion !== undefined}
                     <div class="suggestion-block">
-                      {#if !comment.suggestion_applied_at && comment.commit_id === pr.head_sha}
+                      {#if !comment.suggestion_applied_at && comment.commit_id === pr.head_sha && permission.canWrite}
                         <label class="suggestion-select">
                           <input
                             type="checkbox"
@@ -897,7 +913,7 @@
                       {/if}
                       {#if comment.suggestion_applied_at}
                         <span>{t('pulls.suggestion.applied')}</span>
-                      {:else}
+                      {:else if permission.canWrite}
                         <button class="btn-secondary" disabled={mutationBusy || applyingSuggestionId === comment.id} onclick={() => applySuggestion(comment)}>
                           {t('pulls.suggestion.apply')}
                         </button>
@@ -906,17 +922,19 @@
                   {/if}
                   {#each repliesFor(comment.id) as reply (reply.id)}
                     {@render reviewComment(reply, true)}
-                    <AttachmentPanel {owner} {repo} target="pulls/comments" targetId={reply.id} />
+                    <AttachmentPanel {owner} {repo} target="pulls/comments" targetId={reply.id} canWrite={permission.canWrite} />
                   {/each}
-                  <footer>
-                    <button
-                      class="btn-secondary"
-                      disabled={mutationBusy || resolvingCommentId === comment.id}
-                      onclick={() => setThreadResolved(comment, !comment.resolved_at)}
-                    >
-                      {comment.resolved_at ? t('pulls.threads.reopen') : t('pulls.threads.resolve')}
-                    </button>
-                  </footer>
+                  {#if permission.canWrite}
+                    <footer>
+                      <button
+                        class="btn-secondary"
+                        disabled={mutationBusy || resolvingCommentId === comment.id}
+                        onclick={() => setThreadResolved(comment, !comment.resolved_at)}
+                      >
+                        {comment.resolved_at ? t('pulls.threads.reopen') : t('pulls.threads.resolve')}
+                      </button>
+                    </footer>
+                  {/if}
                 </article>
               {/each}
             </section>
@@ -945,7 +963,7 @@
                     {@const lineComments = target ? commentsForLine(file.path, target.line, target.side) : []}
                     <div class="diff-line" class:addition={line.kind === 'addition'} class:deletion={line.kind === 'deletion'} class:meta={line.kind === 'meta'}>
                       <span class="comment-gutter">
-                        {#if target}
+                        {#if target && signedIn}
                           <button title={t('pulls.diff.add_comment')} aria-label={t('pulls.diff.add_comment')} onclick={() => startInlineComment(target, line.content)} disabled={mutationBusy}>+</button>
                         {/if}
                       </span>
@@ -965,7 +983,7 @@
                             {/if}
                             {#if comment.suggestion_applied_at}
                               <span>{t('pulls.suggestion.applied')}</span>
-                            {:else}
+                            {:else if permission.canWrite}
                               <button class="btn-secondary" disabled={mutationBusy || applyingSuggestionId === comment.id} onclick={() => applySuggestion(comment)}>
                                 {t('pulls.suggestion.apply')}
                               </button>
@@ -975,9 +993,11 @@
                         {#each repliesFor(comment.id) as reply (reply.id)}
                           <div class="inline-reply">{reply.body}{#if isEdited(reply)} <span class="edited-marker">{t('comments.edited')}</span>{/if}</div>
                         {/each}
-                        <button class="btn-link" disabled={mutationBusy || resolvingCommentId === comment.id} onclick={() => setThreadResolved(comment, !comment.resolved_at)}>
-                          {comment.resolved_at ? t('pulls.threads.reopen') : t('pulls.threads.resolve')}
-                        </button>
+                        {#if permission.canWrite}
+                          <button class="btn-link" disabled={mutationBusy || resolvingCommentId === comment.id} onclick={() => setThreadResolved(comment, !comment.resolved_at)}>
+                            {comment.resolved_at ? t('pulls.threads.reopen') : t('pulls.threads.resolve')}
+                          </button>
+                        {/if}
                       </div>
                     {/each}
                     {#if target && commentTarget?.key === target.key}
@@ -1015,7 +1035,7 @@
       {/if}
 
       <!-- Review tab -->
-      {#if activeTab === 'review'}
+      {#if activeTab === 'review' && signedIn}
         <div class="review-form">
           <h3>{t('pulls.review.title')}</h3>
           <div class="verdict-select">

@@ -27,6 +27,12 @@ export interface InstanceInfo {
   source_url: string;
   /** The commit this binary was built from, or `null` when the build was not told. */
   source_commit: string | null;
+  /**
+   * Whether self-service sign-up would be accepted now — `false` on a closed
+   * instance once its first account exists. Optional: an older server does not
+   * send it, and then the sign-up links stay.
+   */
+  registration_open?: boolean;
 }
 
 export const instance = {
