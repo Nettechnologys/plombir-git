@@ -7,6 +7,16 @@ services:
     image: prom/prometheus:v2.55.0
     container_name: plombir-git-prometheus
     restart: unless-stopped
+    # Unprivileged image (runs as `nobody`): no capability is needed, and the
+    # process has no business escalating through one. Prometheus writes only
+    # /prometheus (the volume below) and /tmp, both writable here.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     # Every port of this stack is loopback-only: Prometheus and Alertmanager
     # have no authentication (anyone could silence alerts), and node-exporter
     # describes the host. Reach them through an SSH tunnel or an authenticating
@@ -34,10 +44,22 @@ services:
     image: prom/alertmanager:v0.27.0
     container_name: plombir-git-alertmanager
     restart: unless-stopped
+    # Same shape as Prometheus above. Alertmanager persists silences and the
+    # notification log under /alertmanager; without the volume below those lived
+    # and died in the container layer, and `read_only: true` would break
+    # startup outright.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
       - "127.0.0.1:9093:9093"
     volumes:
       - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
     command:
       - '--config.file=/etc/alertmanager/alertmanager.yml'
       - '--storage.path=/alertmanager'
@@ -49,6 +71,19 @@ services:
     image: grafana/grafana:11.3.0
     container_name: plombir-git-grafana
     restart: unless-stopped
+    # Hardening verified against the image itself: `docker run --rm
+    # --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs
+    # /tmp` came up with /api/health 200, and a plugin install wrote inside
+    # /var/lib/grafana. The entrypoint's chown of the data directory needs no
+    # capability because a fresh named volume is seeded with the image's own
+    # ownership; the drop to the `grafana` user then happens inside that user.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
       - "127.0.0.1:3000:3000"
     environment:
@@ -72,6 +107,15 @@ services:
     image: prom/node-exporter:v1.8.2
     container_name: plombir-git-node-exporter
     restart: unless-stopped
+    # Read-only reader of /proc, /sys and /: it writes nothing, so no
+    # capability and no writable filesystem are needed.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
       - "127.0.0.1:9100:9100"
     volumes:
@@ -88,6 +132,8 @@ services:
 
 volumes:
   prometheus-data:
+    driver: local
+  alertmanager-data:
     driver: local
   grafana-data:
     driver: local

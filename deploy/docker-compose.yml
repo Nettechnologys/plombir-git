@@ -28,6 +28,25 @@ services:
         PLOMBIR_GIT_SOURCE_COMMIT: ${PLOMBIR_GIT_SOURCE_COMMIT:-}
     container_name: plombir-git
     restart: unless-stopped
+    # Hardening. The image runs as its non-root user, has no entrypoint that
+    # chowns or drops privileges at start (the Dockerfile fixes /data's owner at
+    # build time), and binds only unprivileged ports, so it needs no Linux
+    # capability at all: drop the entire set and refuse to ever gain one back
+    # through a setuid binary in the image.
+    #
+    # Deliberately no `read_only: true` here. Without a config file the SSH host
+    # key and the at-rest encryption key default to $HOME/.ssh (see
+    # `default_host_key_path` in crates/rg-cli/src/config.rs), i.e. the
+    # container layer; a read-only root filesystem would need a tmpfs at that
+    # path, and the keys would then be regenerated on every container recreate —
+    # while the database in the named volume refuses to start under a changed
+    # encryption key. Mount `plombir-git.toml` (which pins /data/ssh_host_key)
+    # and use docker-compose.hostdir.yml if you want a read-only root
+    # filesystem; that variant ships the config file this one does not.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     # Loopback only: this is the try-out stack, and on an empty instance the
     # first account registered becomes its administrator. Register yours, then
     # put a TLS proxy in front of 127.0.0.1:8080 or drop the "127.0.0.1:"
