@@ -503,16 +503,44 @@ pub async fn run_import(
     trusted_origins.check_url_static(&task.source_url)?;
 
     let auth_token = auth_token.unwrap_or("");
+    let max_clone_bytes = transport_policy.max_clone_bytes();
 
     match task.platform.as_str() {
         "github" => {
-            run_github_import(db, task, repo_root, auth_token, &mut stats, trusted_origins).await?
+            run_github_import(
+                db,
+                task,
+                repo_root,
+                auth_token,
+                &mut stats,
+                trusted_origins,
+                max_clone_bytes,
+            )
+            .await?
         }
         "gitlab" => {
-            run_gitlab_import(db, task, repo_root, auth_token, &mut stats, trusted_origins).await?
+            run_gitlab_import(
+                db,
+                task,
+                repo_root,
+                auth_token,
+                &mut stats,
+                trusted_origins,
+                max_clone_bytes,
+            )
+            .await?
         }
         "gitea" | "git" => {
-            run_git_import(db, task, repo_root, auth_token, &mut stats, trusted_origins).await?
+            run_git_import(
+                db,
+                task,
+                repo_root,
+                auth_token,
+                &mut stats,
+                trusted_origins,
+                max_clone_bytes,
+            )
+            .await?
         }
         other => anyhow::bail!("unsupported platform: {other}"),
     }
@@ -548,6 +576,7 @@ async fn clone_into_target(
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
     repo_root: &Path,
     token: &str,
+    max_clone_bytes: u64,
     progress_when_done: i32,
     stats: &mut ImportStats,
 ) -> Result<()> {
@@ -558,6 +587,7 @@ async fn clone_into_target(
         trusted_origins.git_destination(clone_url),
         repo_root,
         token,
+        max_clone_bytes,
         progress_when_done,
         stats,
     )
@@ -686,6 +716,7 @@ async fn clone_into_target_for_test(
         ))),
         repo_root,
         token,
+        0,
         progress_when_done,
         stats,
     )
@@ -701,6 +732,7 @@ async fn clone_into_target_with_destination(
     destination: impl Future<Output = Result<crate::net::GuardedGitRemote>>,
     repo_root: &Path,
     token: &str,
+    max_clone_bytes: u64,
     progress_when_done: i32,
     stats: &mut ImportStats,
 ) -> Result<CloneOutcome> {
@@ -727,6 +759,7 @@ async fn clone_into_target_with_destination(
         &task.target_owner,
         &task.target_name,
         source_credentials(&task.platform, &task.source_url, token),
+        max_clone_bytes,
     )
     .await?;
     // The fact, not the intention. Set unconditionally, this reported the one
@@ -905,6 +938,7 @@ async fn run_git_import(
     auth_token: &str,
     stats: &mut ImportStats,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
+    max_clone_bytes: u64,
 ) -> Result<()> {
     let repo_id = resolve_or_create_target_repo(
         db,
@@ -927,6 +961,7 @@ async fn run_git_import(
             trusted_origins,
             repo_root,
             auth_token,
+            max_clone_bytes,
             90,
             stats,
         )
@@ -1001,6 +1036,7 @@ async fn run_github_import(
     token: &str,
     stats: &mut ImportStats,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
+    max_clone_bytes: u64,
 ) -> Result<()> {
     // Parse the repository identity and its API host together. Computing only
     // owner/repo here used to leave the client's optional base URL at `None`,
@@ -1038,6 +1074,7 @@ async fn run_github_import(
             trusted_origins,
             repo_root,
             token,
+            max_clone_bytes,
             10,
             stats,
         )
@@ -1184,6 +1221,7 @@ async fn run_github_import(
             repo_id,
             wiki_clone_url(&task.source_url),
             trusted_origins,
+            max_clone_bytes,
             wiki_staging_dir(repo_root, &task.target_owner, &task.target_name),
             source_credentials(&task.platform, &task.source_url, token),
             Some(task.user_id),
@@ -1213,6 +1251,7 @@ async fn run_gitlab_import(
     token: &str,
     stats: &mut ImportStats,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
+    max_clone_bytes: u64,
 ) -> Result<()> {
     // Parse the project identity and its API host together. Computing only the
     // path here used to leave the client's optional base URL at `None`, which
@@ -1257,6 +1296,7 @@ async fn run_gitlab_import(
             trusted_origins,
             repo_root,
             token,
+            max_clone_bytes,
             10,
             stats,
         )
@@ -1390,6 +1430,7 @@ async fn run_gitlab_import(
             repo_id,
             wiki_clone_url(&task.source_url),
             trusted_origins,
+            max_clone_bytes,
             wiki_staging_dir(repo_root, &task.target_owner, &task.target_name),
             source_credentials(&task.platform, &task.source_url, token),
             Some(task.user_id),
@@ -1718,6 +1759,7 @@ async fn clone_repo(
     owner: &str,
     name: &str,
     credentials: Option<GitCredentials>,
+    max_clone_bytes: u64,
 ) -> Result<CloneOutcome> {
     // Admission guard before any filesystem touch. The blocking closure repeats
     // it at the final sink so a future direct caller or derived clone URL cannot
@@ -1771,9 +1813,24 @@ async fn clone_repo(
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             let invocation = remote.bind_invocation(credential_invocation(credentials.as_ref()))?;
             let destination = staged_clone.path.to_string_lossy();
-            invocation
-                .run(git, &["clone", "--bare", remote.url(), &destination], None)
-                .and_then(|output| output.ensure_success().context("git clone --bare"))?;
+            // The argument list is spelled at the call: the ref-policy census
+            // in scripts/server-side-ref-policy-contract-check.mjs reads the
+            // first list argument of the invocation call to classify it.
+            let output = if max_clone_bytes == 0 {
+                invocation.run(git, &["clone", "--bare", remote.url(), &destination], None)?
+            } else {
+                // The ceiling measures the staging directory this clone is
+                // about to fill — not the repository root, where other
+                // repositories live.
+                invocation.run_under_disk_budget(
+                    git,
+                    &["clone", "--bare", remote.url(), &destination],
+                    None,
+                    &staged_clone.path,
+                    max_clone_bytes,
+                )?
+            };
+            output.ensure_success().context("git clone --bare")?;
             Ok(staged_clone)
         })
         .await?;
@@ -2296,6 +2353,7 @@ async fn import_wiki_pages(
     repo_id: i64,
     wiki_url: String,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
+    max_clone_bytes: u64,
     staging: PathBuf,
     credentials: Option<GitCredentials>,
     author_id: Option<i64>,
@@ -2305,7 +2363,16 @@ async fn import_wiki_pages(
     // refused plaintext transport into a successful zero-page import.
     crate::import::trust::ImportTransportPolicy::require_confidential_transport(&wiki_url)?;
     let remote = trusted_origins.git_destination(&wiki_url).await?;
-    import_wiki_pages_from_destination(db, repo_id, remote, staging, credentials, author_id).await
+    import_wiki_pages_from_destination(
+        db,
+        repo_id,
+        remote,
+        max_clone_bytes,
+        staging,
+        credentials,
+        author_id,
+    )
+    .await
 }
 
 /// Import a wiki from an explicit local path for the filesystem integration
@@ -2320,13 +2387,17 @@ pub async fn import_wiki_pages_from_local_path(
     author_id: Option<i64>,
 ) -> Result<usize> {
     let remote = crate::net::GuardedGitRemote::local_path(wiki_path)?;
-    import_wiki_pages_from_destination(db, repo_id, remote, staging, credentials, author_id).await
+    // A filesystem path from the integration contract clones locally; the
+    // remote-clone ceiling does not apply.
+    import_wiki_pages_from_destination(db, repo_id, remote, 0, staging, credentials, author_id)
+        .await
 }
 
 async fn import_wiki_pages_from_destination(
     db: &DatabaseConnection,
     repo_id: i64,
     remote: crate::net::GuardedGitRemote,
+    max_clone_bytes: u64,
     staging: PathBuf,
     credentials: Option<GitCredentials>,
     author_id: Option<i64>,
@@ -2356,8 +2427,10 @@ async fn import_wiki_pages_from_destination(
             // `--depth 1`: only the pages as they stand are imported. A Plombir Git wiki
             // keeps its own revision history from the first edit onwards, and there is
             // nowhere to put the source's.
-            let cloned = invocation
-                .run(
+            // The argument list stays at the call for the ref-policy census.
+            // The ceiling measures the wiki staging directory this clone fills.
+            let cloned = if max_clone_bytes == 0 {
+                invocation.run(
                     git,
                     &[
                         "clone",
@@ -2369,7 +2442,23 @@ async fn import_wiki_pages_from_destination(
                     ],
                     None,
                 )
-                .and_then(|output| output.ensure_success().context("git clone --bare (wiki)"));
+            } else {
+                invocation.run_under_disk_budget(
+                    git,
+                    &[
+                        "clone",
+                        "--bare",
+                        "--depth",
+                        "1",
+                        remote.url(),
+                        &destination,
+                    ],
+                    None,
+                    &staged_clone.path,
+                    max_clone_bytes,
+                )
+            }
+            .and_then(|output| output.ensure_success().context("git clone --bare (wiki)"));
             let outcome = match cloned {
                 Err(error) => WikiCloneOutcome::CloneFailed(error),
                 Ok(()) => match collect_wiki_pages(&staged_clone.path)? {
@@ -5270,6 +5359,7 @@ mod import_target_lifecycle_tests {
             &trusted_origins,
             repo_root.path(),
             "",
+            0,
             90,
             &mut stats,
         )
@@ -5922,7 +6012,7 @@ mod clone_path_tests {
             "https://example.invalid/alice/site.git",
         );
 
-        let error = clone_repo(remote, &repo_root, "alice", "site", None)
+        let error = clone_repo(remote, &repo_root, "alice", "site", None, 0)
             .await
             .expect_err("repo_root is a file");
         let rendered = format!("{error:#}");
@@ -6019,7 +6109,7 @@ mod clone_path_tests {
             .expect("block the journal prefix");
 
         let remote = crate::net::GuardedGitRemote::unbound_for_test(&source.to_string_lossy());
-        let error = clone_repo(remote, &repo_root, "alice", "site", None)
+        let error = clone_repo(remote, &repo_root, "alice", "site", None, 0)
             .await
             .expect_err("an import that cannot record its move must not make it");
 
@@ -6066,7 +6156,7 @@ mod clone_path_tests {
             .expect("block the commit-marker prefix");
 
         let remote = crate::net::GuardedGitRemote::unbound_for_test(&source.to_string_lossy());
-        let outcome = clone_repo(remote, &repo_root, "alice", "site", None)
+        let outcome = clone_repo(remote, &repo_root, "alice", "site", None, 0)
             .await
             .expect("a marker that cannot be written is reported, not fatal");
         assert_eq!(outcome, CloneOutcome::Cloned);
@@ -6097,7 +6187,7 @@ mod clone_path_tests {
             "git://does-not-resolve.invalid/alice/site.git",
         );
 
-        let error = clone_repo(remote, &repo_root, "alice", "site", None)
+        let error = clone_repo(remote, &repo_root, "alice", "site", None, 0)
             .await
             .expect_err("the final clone sink must refuse native Git");
 
@@ -6160,7 +6250,7 @@ mod clone_credential_tests {
         let credentials =
             source_credentials("github", "https://github.com/o/r.git", TOKEN).expect("a token");
         let remote = crate::net::GuardedGitRemote::unbound_for_test(&source.to_string_lossy());
-        clone_repo(remote, &repo_root, "alice", "site", Some(credentials))
+        clone_repo(remote, &repo_root, "alice", "site", Some(credentials), 0)
             .await
             .expect("clone of a local source");
 
@@ -6191,8 +6281,15 @@ mod clone_credential_tests {
             "http://{address}/upstream.git"
         ));
 
-        let outcome =
-            clone_repo(remote, directory.path(), "alice", "site", Some(credentials)).await;
+        let outcome = clone_repo(
+            remote,
+            directory.path(),
+            "alice",
+            "site",
+            Some(credentials),
+            0,
+        )
+        .await;
         assert!(
             outcome.is_err(),
             "the stub remote refuses everyone — the clone cannot succeed"
@@ -6226,7 +6323,7 @@ mod clone_credential_tests {
         ));
 
         let started = std::time::Instant::now();
-        let outcome = clone_repo(remote, directory.path(), "alice", "site", None).await;
+        let outcome = clone_repo(remote, directory.path(), "alice", "site", None, 0).await;
         let elapsed = started.elapsed();
 
         assert!(outcome.is_err(), "the stub remote demands authentication");
@@ -6248,7 +6345,7 @@ mod clone_credential_tests {
             .expect("the public-answer stand-in is allowed");
         let directory = tempfile::tempdir().expect("tempdir");
 
-        let outcome = clone_repo(remote, directory.path(), "alice", "site", None).await;
+        let outcome = clone_repo(remote, directory.path(), "alice", "site", None, 0).await;
         assert!(
             outcome.is_err(),
             "the checked sink deliberately returns 403"
@@ -6470,7 +6567,7 @@ mod wiki_clone_emptiness_tests {
         let db = crate::test_support::migrated_memory_database().await;
 
         let imported =
-            import_wiki_pages_from_destination(&db, 7, remote, staging.clone(), None, None)
+            import_wiki_pages_from_destination(&db, 7, remote, 0, staging.clone(), None, None)
                 .await
                 .expect("a missing wiki remains non-fatal");
         assert_eq!(imported, 0);
@@ -6499,6 +6596,7 @@ mod wiki_clone_emptiness_tests {
             7,
             "git://does-not-resolve.invalid/importer/target.wiki.git".to_string(),
             &trusted_origins,
+            0,
             staging.clone(),
             None,
             None,

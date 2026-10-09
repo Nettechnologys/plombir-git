@@ -12,8 +12,70 @@ async fn test_health_endpoint() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ok");
-    assert!(body["checks"]["database"] == "ok");
-    assert!(body["checks"]["filesystem"] == "ok");
+    // `/health` is public: an anonymous caller gets the verdict, not the report.
+    assert!(
+        body.get("checks").is_none(),
+        "anonymous /health must not carry dependency detail: {body}"
+    );
+    assert!(
+        body.get("version").is_none() && body.get("commit").is_none(),
+        "anonymous /health must not fingerprint the build: {body}"
+    );
+}
+
+/// The detection side of the same rule: an instance admin gets the full report,
+/// a signed-in non-admin gets exactly what an anonymous caller gets — `?verbose=1`
+/// is not a bypass.
+#[tokio::test]
+async fn health_details_are_for_the_instance_admin_only() {
+    use crate::common::register_full;
+
+    let base = spawn_test_app().await;
+    let client = reqwest::Client::new();
+    // The first registration on a fresh instance is the founder (admin).
+    let (admin_token, _) = register_full(&base, "health-admin", "health-admin@example.com").await;
+    let (member_token, _) = register_full(&base, "health-member", "health-member@example.com").await;
+
+    let anonymous: serde_json::Value = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(anonymous.get("checks").is_none(), "{anonymous}");
+
+    let admin: serde_json::Value = client
+        .get(format!("{base}/health?verbose=1"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(admin["status"], "ok");
+    assert_eq!(admin["checks"]["database"], "ok");
+    assert_eq!(admin["checks"]["filesystem"], "ok");
+    assert!(
+        admin.get("version").is_some() && admin.get("commit").is_some(),
+        "the admin report names the build: {admin}"
+    );
+
+    let member: serde_json::Value = client
+        .get(format!("{base}/health?verbose=1"))
+        .bearer_auth(&member_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        member.get("checks").is_none() && member.get("version").is_none(),
+        "verbose=1 must not substitute for the admin gate: {member}"
+    );
 }
 
 /// card_0d7755e0dfe0: an unreachable SMTP relay stops outgoing mail and
@@ -43,9 +105,13 @@ async fn an_unreachable_smtp_relay_fails_no_probe() {
         assert_eq!(body["status"], "ok", "{probe}: {body}");
     }
 
-    // The report still names the relay as down: reported, not decisive.
+    // The report still names the relay as down: reported, not decisive — to an
+    // instance admin, the only caller the SMTP check is for now.
+    let (admin_token, _) =
+        crate::common::register_full(&base, "smtp-admin", "smtp-admin@example.com").await;
     let body: serde_json::Value = client
         .get(format!("{base}/health"))
+        .bearer_auth(&admin_token)
         .send()
         .await
         .unwrap()

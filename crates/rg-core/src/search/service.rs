@@ -170,19 +170,22 @@ impl SearchFilters {
 /// It is a parameter rather than a post-filter on the results because the
 /// backends page in SQL: dropping rows afterwards would return short pages and
 /// a `total` counting repos the caller cannot open.
+///
+/// `offset`/`limit` are already in rows, from
+/// `rg_http::pagination::PaginationParams` — callers must not hand over a raw
+/// query-string page, whose `(page - 1) * per_page` overflows into an `OFFSET`
+/// no backend accepts. Direct callers get the same `i64` ceiling applied here
+/// defensively; no page can address more than that many rows anyway.
 pub async fn search(
     db: &DatabaseConnection,
     raw_query: &str,
     search_type: &str,
     viewer_id: Option<i64>,
-    page: u64,
-    per_page: u64,
+    offset: u64,
+    limit: u64,
 ) -> Result<(Vec<SearchResult>, i64)> {
-    // `page` is whatever the caller put in the query string, so the product is
-    // saturated rather than left to wrap: an overflowed offset would silently
-    // hand back page one under the name of page 10^18.
-    let offset = page.saturating_sub(1).saturating_mul(per_page);
-    let limit = per_page.min(100);
+    let offset = offset.min(i64::MAX as u64);
+    let limit = limit.clamp(1, 100);
 
     let filters = SearchFilters::parse(raw_query);
     let raw_text = filters.query.as_str();

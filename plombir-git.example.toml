@@ -188,6 +188,12 @@ auth_window_secs = 60
 # request per tool call. Independent of `max`; on by default. 0 disables it.
 agent_max = 600
 agent_window_secs = 60
+# Per-IP limit for anonymous global search (/api/v1/search). Search is public
+# and every request runs full-text queries, so it has its own budget; a caller
+# with a valid session or token is exempt. Independent of `max`; on by default.
+# Set search_max = 0 to disable it.
+search_max = 60
+search_window_secs = 60
 
 [smtp]
 # Mail is on when host, user, pass and from are all set, off when none are;
@@ -290,6 +296,10 @@ trusted_origins = []
 # origin again here as a separate acknowledgement of that exposure.
 allow_insecure_http_origins = []
 # Example exact origins: ["http://gitlab.internal.example:8080"]
+# Ceiling in MiB on what one import clone may write into its staging directory
+# before git is killed: the clone timeout bounds time, not bytes, and a hostile
+# source can stream gigabytes within it. 0 disables the ceiling.
+max_clone_size_mb = 2048
 
 [mirror]
 # The background schedule that refreshes repository mirrors. A mirror is
@@ -320,6 +330,10 @@ poll_interval_secs = 60
 # keeps a hundred simultaneously-due mirrors from turning one tick into an hour
 # of back-to-back fetches. Whatever is left over is still due on the next pass.
 batch_size = 10
+# Ceiling in MiB on what one sync may write into a mirror directory before git
+# is killed: the sync timeout bounds time, not bytes, and a hostile upstream can
+# stream gigabytes within it. 0 disables the ceiling.
+max_clone_size_mb = 2048
 
 [timeouts]
 # Every value is in seconds. These are the bounds that keep one hung job, one

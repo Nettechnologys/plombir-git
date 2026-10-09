@@ -113,6 +113,13 @@ mod state_creation_permission_tests {
 pub enum TimedOutput {
     Completed(Output),
     TimedOut,
+    /// The tree was killed because what it had written under a caller-named
+    /// directory passed the caller's ceiling before the deadline did.
+    DiskBudgetExceeded {
+        path: std::path::PathBuf,
+        bytes: u64,
+        limit_bytes: u64,
+    },
     /// The child wrote more than the caller was willing to hold. The refused
     /// stream stopped being read the moment it would have crossed `limit`, so
     /// what the child wrote after that never entered this process's heap — the
@@ -123,6 +130,32 @@ pub enum TimedOutput {
         bytes_read: u64,
     },
 }
+
+/// Upper bound on what a command may write beneath a directory.
+///
+/// Bytes are measured by walking `path` while the command runs, so the child
+/// can overshoot by whatever it writes between two polls — the budget bounds
+/// the download, it is not an atomic quota. A path that does not exist yet (a
+/// clone destination before `git` creates it) is measured as zero.
+#[derive(Debug, Clone)]
+pub struct DiskBudget {
+    pub path: std::path::PathBuf,
+    pub max_bytes: u64,
+}
+
+impl DiskBudget {
+    pub fn new(path: impl Into<std::path::PathBuf>, max_bytes: u64) -> Self {
+        Self {
+            path: path.into(),
+            max_bytes,
+        }
+    }
+}
+
+/// How often the disk budget is measured. Frequent enough that a local clone
+/// stops within a second of crossing the ceiling, coarse enough that the walk
+/// stays noise next to the clone itself.
+const DISK_BUDGET_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Which pipe grew past its caller-declared ceiling.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -222,6 +255,46 @@ pub fn output_in_process_tree_with_timeout_and_limit(
     stdout_limit_bytes: u64,
     stderr_limit_bytes: u64,
 ) -> Result<TimedOutput, ProcessOutputError> {
+    output_in_process_tree_bounded(
+        command,
+        timeout,
+        stdout_limit_bytes,
+        stderr_limit_bytes,
+        None,
+    )
+}
+
+/// [`output_in_process_tree_with_timeout_and_limit`], plus a disk budget.
+///
+/// The descendant tree is killed and the result is
+/// [`TimedOutput::DiskBudgetExceeded`] as soon as `disk_budget.path` holds more
+/// than `disk_budget.max_bytes` — without waiting out the deadline. This is the
+/// bound that keeps one `git clone` from filling the volume: the deadline bounds
+/// time, not bytes, and a mirror of a hostile repository can write gigabytes in
+/// a minute.
+pub fn output_in_process_tree_with_timeout_limit_and_disk_budget(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    stdout_limit_bytes: u64,
+    stderr_limit_bytes: u64,
+    disk_budget: DiskBudget,
+) -> Result<TimedOutput, ProcessOutputError> {
+    output_in_process_tree_bounded(
+        command,
+        timeout,
+        stdout_limit_bytes,
+        stderr_limit_bytes,
+        Some(disk_budget),
+    )
+}
+
+fn output_in_process_tree_bounded(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    stdout_limit_bytes: u64,
+    stderr_limit_bytes: u64,
+    disk_budget: Option<DiskBudget>,
+) -> Result<TimedOutput, ProcessOutputError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -251,28 +324,99 @@ pub fn output_in_process_tree_with_timeout_and_limit(
         })
         .map_err(ProcessOutputError::Wait)?;
 
-    match receiver.recv_timeout(timeout) {
-        Ok(result) => {
-            // Even a bounded reader that overflowed leaves the tree owning
-            // whatever descendants the direct child had spawned; drop first
-            // so the guard SIGKILLs anything still holding a captured pipe.
-            drop(tree);
-            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
-            result.map_err(ProcessOutputError::Wait)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            drop(tree);
-            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
-            Ok(TimedOutput::TimedOut)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            drop(tree);
-            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
-            Err(ProcessOutputError::Wait(std::io::Error::other(
-                "process wait thread disconnected before reporting an output",
-            )))
+    let started = std::time::Instant::now();
+    loop {
+        // With a budget the wait is sliced so the directory can be measured
+        // between slices; without one the deadline is waited out in a single
+        // call, exactly as before.
+        let wait = match (&disk_budget, timeout.checked_sub(started.elapsed())) {
+            (Some(_), Some(remaining)) => remaining.min(DISK_BUDGET_POLL_INTERVAL),
+            (_, Some(remaining)) => remaining,
+            // The deadline already passed (a zero timeout): same path as a
+            // `recv_timeout` expiring below.
+            (_, None) => {
+                if let Some(budget) = &disk_budget {
+                    if let Some(bytes) = directory_size(&budget.path) {
+                        if bytes > budget.max_bytes {
+                            drop(tree);
+                            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                            return Ok(TimedOutput::DiskBudgetExceeded {
+                                path: budget.path.clone(),
+                                bytes,
+                                limit_bytes: budget.max_bytes,
+                            });
+                        }
+                    }
+                }
+                drop(tree);
+                join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                return Ok(TimedOutput::TimedOut);
+            }
+        };
+
+        match receiver.recv_timeout(wait) {
+            Ok(result) => {
+                // Even a bounded reader that overflowed leaves the tree owning
+                // whatever descendants the direct child had spawned; drop first
+                // so the guard SIGKILLs anything still holding a captured pipe.
+                drop(tree);
+                join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                return result.map_err(ProcessOutputError::Wait);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(budget) = &disk_budget {
+                    if let Some(bytes) = directory_size(&budget.path) {
+                        if bytes > budget.max_bytes {
+                            // Drop the guard first: the tree is killed before
+                            // the waiter is joined, so a descendant writing
+                            // into the measured directory cannot keep going.
+                            drop(tree);
+                            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                            return Ok(TimedOutput::DiskBudgetExceeded {
+                                path: budget.path.clone(),
+                                bytes,
+                                limit_bytes: budget.max_bytes,
+                            });
+                        }
+                    }
+                }
+                if started.elapsed() >= timeout {
+                    drop(tree);
+                    join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                    return Ok(TimedOutput::TimedOut);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                drop(tree);
+                join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                return Err(ProcessOutputError::Wait(std::io::Error::other(
+                    "process wait thread disconnected before reporting an output",
+                )));
+            }
         }
     }
+}
+
+/// Recursively sum the sizes of the regular files under `root`.
+///
+/// Returns `None` while the tree cannot be read (the destination does not
+/// exist yet, or a directory vanished between two opens): a partial walk must
+/// not be mistaken for a small one. Symlinks are counted by their own metadata
+/// and never followed, so the walk cannot leave the measured directory.
+fn directory_size(root: &std::path::Path) -> Option<u64> {
+    let metadata = std::fs::symlink_metadata(root).ok()?;
+    if metadata.is_file() {
+        return Some(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Some(0);
+    }
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(root).ok()? {
+        let entry = entry.ok()?;
+        total = total.saturating_add(directory_size(&entry.path())?);
+    }
+    Some(total)
 }
 
 /// What one reader thread returns after draining (or refusing) its pipe.
@@ -868,5 +1012,56 @@ mod windows_tests {
         for pid in pids {
             assert_process_stops(pid);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod disk_budget_tests {
+    use super::*;
+
+    /// The fake command writes a fresh 256 KiB file per iteration until the
+    /// tree is killed. The deadline is far away on purpose: only the budget
+    /// may end this run.
+    #[test]
+    fn a_writing_child_is_killed_when_the_disk_budget_is_crossed() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("clone");
+        let script = format!(
+            "mkdir -p '{dest}'; i=0; while :; do i=$((i + 1)); \
+             dd if=/dev/zero of='{dest}/blob-'$i bs=65536 count=4 2>/dev/null; done",
+            dest = destination.display()
+        );
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", &script]);
+
+        let started = std::time::Instant::now();
+        let result = output_in_process_tree_with_timeout_limit_and_disk_budget(
+            &mut command,
+            Duration::from_secs(30),
+            65_536,
+            65_536,
+            DiskBudget::new(destination.clone(), 256 * 1024),
+        )
+        .expect("bounded run failed");
+
+        match result {
+            TimedOutput::DiskBudgetExceeded {
+                path,
+                bytes,
+                limit_bytes,
+            } => {
+                assert_eq!(path, destination, "the budget names its directory");
+                assert_eq!(limit_bytes, 256 * 1024);
+                assert!(
+                    bytes > limit_bytes,
+                    "the kill happens once the measured size passed the ceiling: {bytes}"
+                );
+            }
+            other => panic!("expected DiskBudgetExceeded, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the disk budget, not the 30-second deadline, must have ended the run"
+        );
     }
 }

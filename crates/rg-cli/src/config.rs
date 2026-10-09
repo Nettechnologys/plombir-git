@@ -230,6 +230,11 @@ pub(crate) struct RateLimitConfig {
     pub(crate) agent_max: Option<u32>,
     /// Window (seconds) for the bot-account limiter.
     pub(crate) agent_window_secs: Option<u64>,
+    /// Per-IP cap for anonymous global search (authenticated callers are not
+    /// throttled here). 0 disables it.
+    pub(crate) search_max: Option<u32>,
+    /// Window (seconds) for the anonymous-search limiter.
+    pub(crate) search_window_secs: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -335,6 +340,11 @@ pub(crate) struct MirrorConfig {
     /// native `git://` is always disabled and does not inherit this exception.
     #[serde(default)]
     pub(crate) allow_insecure_http: Option<bool>,
+    /// Ceiling on what one sync may write into the mirror directory, in
+    /// megabytes. Defaults to `DEFAULT_MIRROR_MAX_CLONE_MB`; 0 removes the
+    /// ceiling for an operator who needs it.
+    #[serde(default)]
+    pub(crate) max_clone_size_mb: Option<u64>,
 }
 
 /// `[imports]` — operator-owned trust exceptions for private self-hosted
@@ -351,6 +361,11 @@ pub(crate) struct ImportConfig {
     /// reachability and transport confidentiality are independent decisions.
     #[serde(default)]
     pub(crate) allow_insecure_http_origins: Vec<String>,
+    /// Ceiling on what one import clone may write into its staging directory,
+    /// in megabytes. Defaults to `DEFAULT_IMPORTS_MAX_CLONE_MB`; 0 removes the
+    /// ceiling for an operator who needs it.
+    #[serde(default)]
+    pub(crate) max_clone_size_mb: Option<u64>,
 }
 
 /// `[observability]` — OpenTelemetry distributed-tracing (OTLP) export. All
@@ -672,6 +687,12 @@ pub(crate) const DEFAULT_AUTH_RATE_LIMIT_WINDOW: u64 = 60;
 pub(crate) const DEFAULT_AGENT_RATE_LIMIT_MAX: u32 = 600;
 pub(crate) const DEFAULT_AGENT_RATE_LIMIT_WINDOW: u64 = 60;
 
+/// The anonymous-search limiter: search is public and every request costs FTS
+/// queries, so it gets a budget of its own. Authenticated sessions and tokens
+/// are exempt, which is why this is far below the global default.
+pub(crate) const DEFAULT_SEARCH_RATE_LIMIT_MAX: u32 = 60;
+pub(crate) const DEFAULT_SEARCH_RATE_LIMIT_WINDOW: u64 = 60;
+
 /// `[audit].enabled`: on by default, because an audit log that is never trimmed
 /// grows until the disk does.
 pub(crate) const DEFAULT_AUDIT_ENABLED: bool = true;
@@ -693,14 +714,38 @@ pub(crate) const DEFAULT_BACKUP_ENABLED: bool = false;
 pub(crate) const DEFAULT_MIRROR_ENABLED: bool = true;
 /// `[mirror].allow_insecure_http`: an omitted/new section is always secure.
 pub(crate) const DEFAULT_MIRROR_ALLOW_INSECURE_HTTP: bool = false;
+/// `[mirror].max_clone_size_mb`: bytes one mirror sync may write before it is
+/// killed. Generous for ordinary heavyweight repositories; 0 disables it.
+pub(crate) const DEFAULT_MIRROR_MAX_CLONE_MB: u64 =
+    rg_core::mirror::transport::DEFAULT_MAX_CLONE_MB;
+/// `[imports].max_clone_size_mb`; see [`DEFAULT_MIRROR_MAX_CLONE_MB`].
+pub(crate) const DEFAULT_IMPORTS_MAX_CLONE_MB: u64 = rg_core::import::trust::DEFAULT_MAX_CLONE_MB;
+
+/// Convert a `max_clone_size_mb` knob to bytes. 0 disables the ceiling; a
+/// value that cannot fit the byte count fails startup instead of wrapping.
+fn resolve_max_clone_bytes(section: &str, max_mb: u64) -> anyhow::Result<u64> {
+    max_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+        anyhow::anyhow!(
+            "config `[{section}].max_clone_size_mb` is too large to convert to bytes: {max_mb}"
+        )
+    })
+}
 
 /// Resolve the instance-owned outbound mirror transport policy.
 pub(crate) fn resolve_mirror_transport_policy(
     cfg: Option<&ConfigFile>,
-) -> rg_core::mirror::transport::MirrorTransportPolicy {
-    rg_core::mirror::transport::MirrorTransportPolicy::new(
-        cfg.and_then(|config| config.mirror.allow_insecure_http)
-            .unwrap_or(DEFAULT_MIRROR_ALLOW_INSECURE_HTTP),
+) -> anyhow::Result<rg_core::mirror::transport::MirrorTransportPolicy> {
+    let allow_insecure_http = cfg
+        .and_then(|config| config.mirror.allow_insecure_http)
+        .unwrap_or(DEFAULT_MIRROR_ALLOW_INSECURE_HTTP);
+    let max_clone_bytes = resolve_max_clone_bytes(
+        "mirror",
+        cfg.and_then(|config| config.mirror.max_clone_size_mb)
+            .unwrap_or(DEFAULT_MIRROR_MAX_CLONE_MB),
+    )?;
+    Ok(
+        rg_core::mirror::transport::MirrorTransportPolicy::new(allow_insecure_http)
+            .with_max_clone_bytes(max_clone_bytes),
     )
 }
 
@@ -763,8 +808,14 @@ pub(crate) fn resolve_import_transport_policy(
     let values = cfg
         .map(|config| config.imports.allow_insecure_http_origins.as_slice())
         .unwrap_or_default();
-    rg_core::import::trust::ImportTransportPolicy::parse(values)
-        .context("invalid config `[imports].allow_insecure_http_origins`")
+    let max_clone_bytes = resolve_max_clone_bytes(
+        "imports",
+        cfg.and_then(|config| config.imports.max_clone_size_mb)
+            .unwrap_or(DEFAULT_IMPORTS_MAX_CLONE_MB),
+    )?;
+    Ok(rg_core::import::trust::ImportTransportPolicy::parse(values)
+        .context("invalid config `[imports].allow_insecure_http_origins`")?
+        .with_max_clone_bytes(max_clone_bytes))
 }
 
 /// Parse exact origins on which custom OIDC traffic may cross plaintext HTTP.
@@ -1940,6 +1991,18 @@ mod tests {
                 super::DEFAULT_AGENT_RATE_LIMIT_WINDOW.to_string(),
             ),
             row(
+                "rate_limit",
+                "search_max",
+                "DEFAULT_SEARCH_RATE_LIMIT_MAX",
+                super::DEFAULT_SEARCH_RATE_LIMIT_MAX.to_string(),
+            ),
+            row(
+                "rate_limit",
+                "search_window_secs",
+                "DEFAULT_SEARCH_RATE_LIMIT_WINDOW",
+                super::DEFAULT_SEARCH_RATE_LIMIT_WINDOW.to_string(),
+            ),
+            row(
                 "logging",
                 "max_size_mb",
                 "DEFAULT_LOG_MAX_SIZE_MB",
@@ -2036,10 +2099,22 @@ mod tests {
                 rg_core::mirror::scheduler::DEFAULT_BATCH_SIZE.to_string(),
             ),
             row(
+                "mirror",
+                "max_clone_size_mb",
+                "DEFAULT_MIRROR_MAX_CLONE_MB",
+                super::DEFAULT_MIRROR_MAX_CLONE_MB.to_string(),
+            ),
+            row(
                 "imports",
                 "allow_insecure_http_origins",
                 "Vec::<String>::default",
                 format!("{:?}", Vec::<String>::default()),
+            ),
+            row(
+                "imports",
+                "max_clone_size_mb",
+                "DEFAULT_IMPORTS_MAX_CLONE_MB",
+                super::DEFAULT_IMPORTS_MAX_CLONE_MB.to_string(),
             ),
             row(
                 "webhooks",
@@ -3040,6 +3115,67 @@ mod tests {
                 "[{section}] error does not name misspelled key {key}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn max_clone_size_mb_is_resolved_for_mirrors_and_imports() {
+        let config: ConfigFile =
+            toml::from_str("[mirror]\nmax_clone_size_mb = 16\n[imports]\nmax_clone_size_mb = 8\n")
+                .expect("parse config");
+        assert_eq!(
+            super::resolve_mirror_transport_policy(Some(&config))
+                .expect("resolve mirror policy")
+                .max_clone_bytes(),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            super::resolve_import_transport_policy(Some(&config))
+                .expect("resolve import policy")
+                .max_clone_bytes(),
+            8 * 1024 * 1024
+        );
+
+        // 0 is the documented way to say "no ceiling"; an omitted knob keeps
+        // the built-in ceiling instead.
+        let unlimited: ConfigFile =
+            toml::from_str("[mirror]\nmax_clone_size_mb = 0\n[imports]\nmax_clone_size_mb = 0\n")
+                .expect("parse config");
+        assert_eq!(
+            super::resolve_mirror_transport_policy(Some(&unlimited))
+                .expect("resolve mirror policy")
+                .max_clone_bytes(),
+            0
+        );
+        assert_eq!(
+            super::resolve_import_transport_policy(Some(&unlimited))
+                .expect("resolve import policy")
+                .max_clone_bytes(),
+            0
+        );
+        let defaults: ConfigFile = toml::from_str("").expect("empty config");
+        assert_eq!(
+            super::resolve_mirror_transport_policy(Some(&defaults))
+                .expect("resolve mirror policy")
+                .max_clone_bytes(),
+            super::DEFAULT_MIRROR_MAX_CLONE_MB * 1024 * 1024
+        );
+        assert_eq!(
+            super::resolve_import_transport_policy(Some(&defaults))
+                .expect("resolve import policy")
+                .max_clone_bytes(),
+            super::DEFAULT_IMPORTS_MAX_CLONE_MB * 1024 * 1024
+        );
+
+        // TOML integers stop at i64::MAX, which is already far past what a
+        // megabyte count can turn into bytes.
+        let overflow: ConfigFile = toml::from_str(&format!(
+            "[mirror]\nmax_clone_size_mb = {}\n",
+            i64::MAX as u64
+        ))
+        .expect("parse config");
+        let error = super::resolve_mirror_transport_policy(Some(&overflow))
+            .expect_err("a megabyte count that cannot fit bytes must fail");
+        assert!(format!("{error:#}").contains("[mirror].max_clone_size_mb"));
     }
 
     #[test]
