@@ -2254,7 +2254,7 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 19] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 23] = [
         (
             "DEFAULT_SOURCE_URL",
             "config-file-only: `[server].source_url` has no CLI flag, so no help text names it",
@@ -2342,6 +2342,25 @@ const AFTER: &str = "after";
         (
             "DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP",
             "config-file-only: `[webhooks].allow_insecure_http` has no CLI flag",
+        ),
+        (
+            "DEFAULT_IMPORTS_MAX_CLONE_MB",
+            "config-file-only: `[imports].max_clone_size_mb` has no CLI flag, so no help \
+             paragraph names it",
+        ),
+        (
+            "DEFAULT_MIRROR_MAX_CLONE_MB",
+            "config-file-only: `[mirror].max_clone_size_mb` has no CLI flag, as above",
+        ),
+        (
+            "DEFAULT_SEARCH_RATE_LIMIT_MAX",
+            "config-file-only: the anonymous-search limiter is tuned through \
+             `[rate_limit].search_max`, with no CLI flag",
+        ),
+        (
+            "DEFAULT_SEARCH_RATE_LIMIT_WINDOW",
+            "config-file-only: the anonymous-search limiter is tuned through \
+             `[rate_limit].search_window_secs`, with no CLI flag",
         ),
     ];
 
