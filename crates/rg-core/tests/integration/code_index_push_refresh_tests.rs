@@ -163,6 +163,107 @@ async fn a_push_to_the_default_branch_refreshes_an_existing_code_index() {
     );
 }
 
+/// Every stored row of the repository's published snapshot as `(rowid, path)`.
+///
+/// Read straight from `code_fts`: the row id is what tells a rewritten row from
+/// one the refresh left alone, and no reader API shows it.
+async fn stored_rows(db: &sea_orm::DatabaseConnection, repo_id: i64) -> Vec<(i64, String)> {
+    use sea_orm::{ConnectionTrait, Statement};
+    db.query_all(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT rowid, file_path FROM code_fts WHERE repo_id = \
+         (SELECT published_key FROM code_index_snapshots WHERE repo_id = ?) ORDER BY file_path",
+        [repo_id.into()],
+    ))
+    .await
+    .expect("read the stored code index rows")
+    .into_iter()
+    .map(|row| {
+        (
+            row.try_get_by_index(0).expect("rowid"),
+            row.try_get_by_index(1).expect("file path"),
+        )
+    })
+    .collect()
+}
+
+/// card_cfaccf4c5241: a push that changes one file of many rewrites that one
+/// row. Before, every push to the default branch re-read the whole tree and
+/// replaced every row in one transaction that held SQLite's write lock for
+/// the whole rewrite.
+#[tokio::test]
+async fn a_push_that_changes_one_file_rewrites_only_that_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(dir.path()).await;
+    let repo_root = dir.path().join("repos");
+
+    let owner = user(&db, "incrementalowner").await;
+    let repo = rg_core::repo::service::create_repo(
+        &db,
+        owner.id,
+        "incrementalrepo",
+        None,
+        false,
+        &repo_root,
+        None,
+    )
+    .await
+    .expect("create repo");
+    let bare_path = repo_root.join("incrementalowner/incrementalrepo.git");
+    let worktree = seed_worktree(&bare_path);
+    let path = worktree.path();
+    for index in 0..30 {
+        std::fs::write(
+            path.join(format!("file{index:02}.rs")),
+            format!("fn untouched_{index}() {{}}\n"),
+        )
+        .expect("write a fixture file");
+    }
+    git(&["add", "-A"], Some(path));
+    git(&["commit", "-qm", "thirty files"], Some(path));
+    git(&["push", "-q", "origin", "main"], Some(path));
+
+    CodeIndexer::new(db.clone())
+        .index_repository(repo.id, &bare_path, "main")
+        .await
+        .expect("build the initial index");
+    let before = stored_rows(&db, repo.id).await;
+    assert_eq!(before.len(), 31);
+
+    let new_sha = push_replacement_commit(path, "main");
+    run_post_push_hooks(
+        &db,
+        &repo_root,
+        "incrementalowner",
+        "incrementalrepo",
+        Some(owner.id),
+        &[accepted_push("refs/heads/main", &new_sha)],
+    )
+    .await;
+
+    let after = stored_rows(&db, repo.id).await;
+    let untouched = |rows: &[(i64, String)]| {
+        rows.iter()
+            .filter(|(_, path)| path.starts_with("file"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(untouched(&before).len(), 30);
+    assert_eq!(
+        untouched(&after),
+        untouched(&before),
+        "the push rewrote rows of files it did not touch"
+    );
+    assert!(
+        after.iter().any(|(_, path)| path == "fresh.rs"),
+        "the file the push added is missing: {after:?}"
+    );
+    assert!(
+        !after.iter().any(|(_, path)| path == "stale.rs"),
+        "the file the push deleted is still indexed: {after:?}"
+    );
+}
+
 /// Repository deletion is also the retention boundary for the opt-in source
 /// snapshot. The Git tree is removed by the same operation, so leaving its text
 /// in `code_fts` would keep a second, unbounded copy that no live repository can

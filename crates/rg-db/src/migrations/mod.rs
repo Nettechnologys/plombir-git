@@ -143,6 +143,7 @@ pub mod m20261009_000002_notification_routing;
 pub mod m20261009_000003_listing_and_foreign_key_indexes;
 pub mod m20261009_000004_repo_number_floors;
 pub mod m20261009_000090_retention_sweep_indexes;
+pub mod m20261009_000901_code_index_snapshots;
 
 use sea_orm_migration::prelude::*;
 
@@ -376,6 +377,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261009_000003_listing_and_foreign_key_indexes::Migration),
             Box::new(m20261009_000004_repo_number_floors::Migration),
             Box::new(m20261009_000090_retention_sweep_indexes::Migration),
+            Box::new(m20261009_000901_code_index_snapshots::Migration),
         ]
     }
 }

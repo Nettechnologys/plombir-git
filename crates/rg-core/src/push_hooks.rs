@@ -867,9 +867,16 @@ async fn adopt_unborn_head(
 /// (`POST /ai/repos/{owner}/{name}/index`, or `plombir-git index-repo`); what this
 /// fixes is that the act used to be permanent.
 ///
+/// **Incremental.** The refresh diffs the published tree against the new one
+/// and rewrites only the paths that changed, in one short transaction; a whole
+/// rebuild is the fallback, written in chunks under a key readers do not see
+/// until it is complete (card_cfaccf4c5241). Before that, every push re-read
+/// the whole tree and rewrote it in ONE transaction that held SQLite's only
+/// write lock for the duration — every other writer of the instance waited.
+///
 /// Detached onto the run's tracker rather than awaited, for the same reason the
-/// watch fan-out is: a whole-tree walk has no business delaying the CI trigger
-/// of the next ref in the same push. Tracked rather than bare-spawned so a
+/// watch fan-out is: a tree walk has no business delaying the CI trigger of the
+/// next ref in the same push. Tracked rather than bare-spawned so a
 /// SIGTERM in the next second cannot sever it silently.
 fn refresh_code_index_for_push(
     params: &PostPushParams<'_>,
@@ -898,25 +905,13 @@ fn refresh_code_index_for_push(
 
     params.delivery_tracker.spawn(async move {
         let indexer = crate::search::code_indexer::CodeIndexer::new(db);
-        match indexer.indexed_file_count(repo_id).await {
-            // Never indexed — see "refresh, not build" above.
-            Ok(0) => return,
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    repo_id,
-                    error = %format!("{error:#}"),
-                    "Post-push: could not read code index state, skipping refresh"
-                );
-                return;
-            }
-        }
-
         match indexer
-            .index_repository(repo_id, &repo_path, &ref_name)
+            .refresh_repository(repo_id, &repo_path, &ref_name)
             .await
         {
-            Ok(indexed_files) => tracing::info!(
+            // Never indexed — see "refresh, not build" above.
+            Ok(None) => {}
+            Ok(Some(indexed_files)) => tracing::info!(
                 repo_id,
                 indexed_files,
                 "Post-push: code search index refreshed"
@@ -926,8 +921,8 @@ fn refresh_code_index_for_push(
             // learns that code search is now answering out of a stale one.
             //
             // `error!` and not `warn!`: the refresh no longer gives up on a
-            // third of a second of contention — it keeps trying for
-            // `rg_db::contention::BULK_WRITE_BUDGET` (card_0b936c68e1ea), so
+            // third of a second of contention — each of its writes keeps trying
+            // for `rg_db::contention::BULK_WRITE_BUDGET` (card_0b936c68e1ea), so
             // reaching this arm means the database stayed unwritable for half a
             // minute or the failure was never contention at all. Neither is
             // routine, and nothing else will retry: the next refresh happens on
