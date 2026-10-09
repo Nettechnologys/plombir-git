@@ -149,6 +149,18 @@
         // A `defaultBranch` the page passed wins over the server's; changing
         // it re-runs the effect and claims a new owner, so this read cannot
         // apply to a prop it did not see.
+        // An address a rename or a transfer left: the API followed it to the
+        // repository's current one, and the page moves there too, keeping the
+        // rest of the path (card_e83bf21a5e5b).
+        if (
+          repoInfo?.owner_name &&
+          (repoInfo.owner_name !== expectedOwner || repoInfo.name !== expectedRepo)
+        ) {
+          void goto(movedPath(expectedOwner, expectedRepo, repoInfo.owner_name, repoInfo.name), {
+            replaceState: true,
+          });
+          return;
+        }
         viewerLevel = repoInfo?.viewer_permission ?? null;
         if (!defaultBranch && repoInfo?.default_branch) {
           archiveRef = repoInfo.default_branch;
@@ -162,6 +174,14 @@
         archiveRef = fallbackRef;
       }
     }
+  }
+
+  /** The current page's address with the repository segment moved. */
+  function movedPath(fromOwner: string, fromRepo: string, toOwner: string, toRepo: string) {
+    const from = `/${fromOwner}/${fromRepo}`;
+    const { pathname, search, hash } = window.location;
+    const rest = pathname.startsWith(from) ? pathname.slice(from.length) : '';
+    return `/${toOwner}/${toRepo}${rest}${search}${hash}`;
   }
 
   function isCurrentRepo(expectedOwner: string, expectedRepo: string) {

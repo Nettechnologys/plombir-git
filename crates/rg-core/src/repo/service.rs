@@ -475,6 +475,48 @@ pub async fn find_repo_by_owner_name(
     Ok(None)
 }
 
+/// The repository a renamed or transferred one's old address `owner/repo_name`
+/// leads to, with the name of the namespace it lives in now
+/// (card_e83bf21a5e5b).
+///
+/// `None` whenever a live repository answers at that address — it owns the
+/// address, and a redirect never shadows it — and whenever nothing was ever
+/// moved out of it. Access is the caller's question: a redirect must not tell
+/// anyone the new name of a repository they could not read.
+pub async fn find_renamed_repo(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo_name: &str,
+) -> Result<Option<(rg_db::entities::repository::Model, String)>> {
+    use rg_db::ops::repo_redirect_ops::{self, Namespace};
+
+    if find_repo_by_owner_name(db, owner, repo_name)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let namespace = if let Some(user) = user_ops::find_by_username(db, owner).await? {
+        Namespace::User(user.id)
+    } else if let Some(org) = rg_db::ops::org_ops::get_org_by_name(db, owner).await? {
+        Namespace::Org(org.id)
+    } else {
+        return Ok(None);
+    };
+    let Some(target) = repo_redirect_ops::target(db, namespace, repo_name).await? else {
+        return Ok(None);
+    };
+    let owner_name = match target.org_id {
+        Some(org_id) => rg_db::ops::org_ops::get_org(db, org_id)
+            .await?
+            .map(|org| org.name),
+        None => user_ops::find_by_id(db, target.owner_id)
+            .await?
+            .map(|user| user.username),
+    };
+    Ok(owner_name.map(|owner_name| (target, owner_name)))
+}
+
 /// Refuse `name` if it is already taken in the namespace it is being claimed
 /// in — `Some(org_id)` for an organization, `None` for `owner_id`'s personal
 /// account.

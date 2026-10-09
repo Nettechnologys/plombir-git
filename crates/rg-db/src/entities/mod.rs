@@ -71,6 +71,7 @@ pub mod repo_number_floor;
 pub mod repo_star;
 pub mod repo_watch;
 pub mod repository;
+pub mod repository_redirect;
 pub mod repository_transfer_lease;
 pub mod review_comment;
 pub mod runner;

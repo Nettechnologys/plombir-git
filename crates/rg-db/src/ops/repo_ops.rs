@@ -334,8 +334,36 @@ pub async fn list_non_ascii_names(db: &DatabaseConnection) -> Result<Vec<(String
         .collect())
 }
 
+/// Insert a repository row. A redirect left at the same address by an earlier
+/// rename or transfer is released in the same transaction: the new repository
+/// owns the address now (card_e83bf21a5e5b).
 pub async fn create(db: &DatabaseConnection, model: RepoActiveModel) -> Result<Repo> {
-    model.insert(db).await.context("db: create repo")
+    let address = match (&model.owner_id, &model.org_id, &model.name) {
+        (ActiveValue::Set(owner_id), org_id, ActiveValue::Set(name)) => {
+            let org_id = match org_id {
+                ActiveValue::Set(org_id) | ActiveValue::Unchanged(org_id) => *org_id,
+                ActiveValue::NotSet => None,
+            };
+            Some((
+                crate::ops::repo_redirect_ops::Namespace::of(*owner_id, org_id),
+                name.clone(),
+            ))
+        }
+        _ => None,
+    };
+    let transaction = db.begin().await.context("db: begin create repo")?;
+    if let Some((namespace, name)) = address {
+        crate::ops::repo_redirect_ops::release(&transaction, namespace, &name).await?;
+    }
+    let repo = model
+        .insert(&transaction)
+        .await
+        .context("db: create repo")?;
+    transaction
+        .commit()
+        .await
+        .context("db: commit create repo")?;
+    Ok(repo)
 }
 
 /// Point `default_branch` at the branch the repository's Git `HEAD` names.
@@ -1114,6 +1142,18 @@ pub async fn transfer_owner(
             .await?
         }
     };
+    // The address the repository left leads to it from now on, and the one it
+    // took is no longer anyone else's redirect — in the transaction that moves
+    // it, so the two can never disagree (card_e83bf21a5e5b).
+    crate::ops::repo_redirect_ops::record_move(
+        &transaction,
+        repo_id,
+        crate::ops::repo_redirect_ops::Namespace::of(source_owner_id, source_org_id),
+        repo_name,
+        crate::ops::repo_redirect_ops::Namespace::of(owner_id, org_id),
+        destination_repo_name,
+    )
+    .await?;
 
     let source_package_prefix = format!("packages/{source_namespace}/{repo_name}/");
     let destination_package_prefix =

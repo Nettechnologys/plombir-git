@@ -162,3 +162,30 @@ describe('RepoHeader star and watch state availability', () => {
 		expect(repos.watch).toHaveBeenCalledWith('alice', 'demo', 'watching');
 	});
 });
+
+// card_e83bf21a5e5b: an address a rename or a transfer left is redirected by
+// the API to the repository's current one; the page follows it, keeping the
+// rest of its path, and replaces the history entry rather than adding one.
+describe('RepoHeader on a renamed repository', () => {
+	it('moves the page to the address the API answered from', async () => {
+		const { navigation } = await import('../test/app');
+		navigation.goto.mockClear();
+		window.history.replaceState({}, '', '/alice/demo/issues/4?tab=files#c2');
+		repos.get.mockResolvedValue({ name: 'renamed', owner_name: 'acme', default_branch: 'main' });
+		await renderHeader();
+		await vi.waitFor(() => expect(navigation.goto).toHaveBeenCalled());
+		expect(navigation.goto).toHaveBeenCalledWith('/acme/renamed/issues/4?tab=files#c2', {
+			replaceState: true,
+		});
+		window.history.replaceState({}, '', '/');
+	});
+
+	it('stays put when the address is the current one', async () => {
+		const { navigation } = await import('../test/app');
+		navigation.goto.mockClear();
+		repos.get.mockResolvedValue({ name: 'demo', owner_name: 'alice', default_branch: 'main' });
+		await renderHeader();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(navigation.goto).not.toHaveBeenCalled();
+	});
+});

@@ -106,6 +106,11 @@ pub struct RepoResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
     pub viewer_permission: Option<&'static str>,
+    /// The namespace the repository lives in now — only on `GET`. A request
+    /// for an address a rename or a transfer left is redirected here, and this
+    /// is how the web app learns the address to show (card_e83bf21a5e5b).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
 }
 
 /// Public repository row as it appears in the explore listing.
@@ -421,6 +426,7 @@ pub async fn list_repos(
 pub async fn get_repo(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    Path((owner, _name)): Path<(String, String)>,
     RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     let viewer_permission = match viewer_permission(&state, &headers, &repo).await {
@@ -428,8 +434,13 @@ pub async fn get_repo(
         Err(e) => return e.into_response(),
     };
     let mut body = serde_json::json!(repo);
-    if let (Some(permission), Some(fields)) = (viewer_permission, body.as_object_mut()) {
-        fields.insert("viewer_permission".into(), permission.into());
+    if let Some(fields) = body.as_object_mut() {
+        if let Some(permission) = viewer_permission {
+            fields.insert("viewer_permission".into(), permission.into());
+        }
+        // The path resolved to this repository, so its owner segment is the
+        // namespace's current name.
+        fields.insert("owner_name".into(), owner.into());
     }
     (StatusCode::OK, Json(body)).into_response()
 }

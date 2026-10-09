@@ -120,6 +120,12 @@ export interface RepositoryDetail {
   forks_count: number;
   created_at: string;
   viewer_permission?: RepoPermission;
+  /**
+   * The namespace the repository lives in now. Differs from the address that
+   * was asked for when a rename or a transfer left it and the API redirected
+   * the read here.
+   */
+  owner_name?: string;
 }
 
 /**

@@ -956,6 +956,97 @@ fn strip_git_suffix(repo: &str) -> String {
         .unwrap_or_else(|| repo.to_string())
 }
 
+/// `GET …/{owner}/{repo}/info/refs` at an address a rename or a transfer left
+/// (card_e83bf21a5e5b): the first request of every clone, fetch and push.
+///
+/// Answered by [`handle_info_refs`] first; only its `404` is looked at again.
+/// If the address leads to a repository, the caller is checked against *that*
+/// repository exactly as the live name would check them — so an anonymous
+/// clone of a private one gets the `401` challenge and comes back with
+/// credentials — and then redirected (`308`) to the same URL under the new
+/// name. git follows the redirect of this initial request and talks to the new
+/// address for the rest of the operation.
+pub(crate) async fn handle_info_refs_following_renames(
+    state: State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::OriginalUri(original): axum::extract::OriginalUri,
+    axum::extract::Path((owner, repo)): axum::extract::Path<(String, String)>,
+    query: Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let service = query.get("service").cloned().unwrap_or_default();
+    let response = handle_info_refs(
+        State(state.0.clone()),
+        headers.clone(),
+        axum::extract::Path((owner.clone(), repo.clone())),
+        query,
+    )
+    .await
+    .into_response();
+    if response.status() != StatusCode::NOT_FOUND {
+        return response;
+    }
+    let name = strip_git_suffix(&repo);
+    let (target, new_owner) = match rg_core::repo::service::find_renamed_repo(
+        &state.db, &owner, &name,
+    )
+    .await
+    {
+        Ok(Some(found)) => found,
+        Ok(None) => return response,
+        Err(error) => {
+            tracing::warn!(owner, name = %name, error = %format!("{error:#}"), "renamed-repository lookup failed");
+            return response;
+        }
+    };
+    let credential = match extract_git_credential(&state.db, &headers, &state.jwt_secret).await {
+        Ok(credential) => credential,
+        Err(_) => return response,
+    };
+    let actor_id = credential.as_ref().map(|credential| credential.user_id);
+    if let Err(refusal) = git_grant_refusal(
+        &state,
+        credential.as_ref(),
+        &new_owner,
+        &target.name,
+        &headers,
+    )
+    .await
+    {
+        return refusal.into_response();
+    }
+    if let Err(refusal) = check_git_access(
+        &state.db,
+        &new_owner,
+        &target.name,
+        actor_id,
+        service == "git-receive-pack",
+    )
+    .await
+    {
+        return refusal.into_response();
+    }
+    // Same prefix (`/git` or none), same `.git` spelling, same query.
+    let path = original.path();
+    let old_segment = format!("/{owner}/{repo}/info/refs");
+    let Some(prefix) = path.strip_suffix(old_segment.as_str()) else {
+        return response;
+    };
+    let suffix = if repo.ends_with(".git") { ".git" } else { "" };
+    let location = format!(
+        "{prefix}/{new_owner}/{}{suffix}/info/refs{}",
+        target.name,
+        original
+            .query()
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default()
+    );
+    (
+        StatusCode::PERMANENT_REDIRECT,
+        [(header::LOCATION, location)],
+    )
+        .into_response()
+}
+
 pub(crate) async fn handle_info_refs(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,

@@ -261,8 +261,11 @@ async fn repository_settings_are_editable_and_take_effect_where_they_are_read() 
     assert_eq!(status, 200, "{renamed}");
     assert_eq!(renamed["name"], "renamed");
 
-    let (status, _) = api(reqwest::Method::GET, repo_api("proj"), Some(&owner), None).await;
-    assert_eq!(status, 404, "the old name still answers");
+    // The old name leads to the renamed repository (card_e83bf21a5e5b;
+    // `repo_redirect_tests` pins the redirect itself).
+    let (status, followed) = api(reqwest::Method::GET, repo_api("proj"), Some(&owner), None).await;
+    assert_eq!(status, 200, "{followed}");
+    assert_eq!(followed["name"], "renamed");
     let (status, body) = api(
         reqwest::Method::GET,
         format!("{}/issues/{}", repo_api("renamed"), issue["number"]),

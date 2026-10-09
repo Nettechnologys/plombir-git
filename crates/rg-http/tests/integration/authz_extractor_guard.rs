@@ -138,6 +138,13 @@ const SIGNED_OFF: &[(&str, &str)] = &[
         "job-log WebSocket: the token arrives in the cookie or `Sec-WebSocket-Protocol`, not in \
          `Authorization`, so a headers-based gate does not reach it",
     ),
+    (
+        "repo_redirect.rs",
+        "renamed-repository redirect (card_e83bf21a5e5b): a middleware that runs after the \
+         handler answered 404, so there is no handler argument to carry an extractor; it asks \
+         `repo_access::check_read` — the extractors' own gate — about the repository the old \
+         address leads to, before revealing where that is",
+    ),
 ];
 
 /// The non-REST transports, and what each of them is allowed to decide.

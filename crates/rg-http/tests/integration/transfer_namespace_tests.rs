@@ -53,8 +53,13 @@ async fn create_repo_in_org(base: &str, token: &str, name: &str, org: &str) -> u
         .as_u16()
 }
 
+/// Whether the repository lives at `owner/name` — answered there itself, not
+/// by a redirect from an address it left (card_e83bf21a5e5b).
 async fn repo_visible_at(base: &str, token: &str, owner: &str, name: &str) -> bool {
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
         .get(format!("{base}/api/v1/repos/{owner}/{name}"))
         .bearer_auth(token)
         .send()
@@ -224,6 +229,22 @@ async fn an_org_repository_transfers_back_out_to_its_owners_account() {
     assert!(
         !repo_visible_at(&base, &owner_token, "tp6corp", "gadgets").await,
         "the repository still answers at the organization it left"
+    );
+    // It is only redirected from there, to where it went.
+    let left = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .get(format!("{base}/api/v1/repos/tp6corp/gadgets"))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(left.status(), 308);
+    assert_eq!(
+        left.headers()["location"],
+        "/api/v1/repos/tp6-owner/gadgets",
+        "a transfer leaves a redirect across namespaces too"
     );
 }
 

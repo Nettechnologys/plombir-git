@@ -1379,6 +1379,10 @@ impl Handler for SshHandler {
         }
 
         let db = &*self.shared.db;
+        // A clone URL from before a rename or a transfer keeps working: the
+        // exec runs against the repository the old address leads to, and every
+        // check below is asked about *that* repository (card_e83bf21a5e5b).
+        let repo_path = follow_renamed_repo_path(db, repo_path).await;
 
         if let Err(error) = authorize_git_service(
             db,
@@ -1939,6 +1943,24 @@ fn unquote_repo_path(raw_path: &str) -> String {
         .trim_end_matches('"')
         .trim_start_matches('/')
         .to_string()
+}
+
+/// `repo_path` rewritten to the current `owner/name.git` of the repository a
+/// rename or a transfer moved away from it; unchanged when a live repository
+/// answers there, when nothing was moved out of it, or when the lookup failed
+/// (the exec then fails on the original path, as before).
+async fn follow_renamed_repo_path(db: &DatabaseConnection, repo_path: String) -> String {
+    let Ok((owner, repo_name)) = parse_repo_owner_name(&repo_path) else {
+        return repo_path;
+    };
+    match rg_core::repo::service::find_renamed_repo(db, &owner, &repo_name).await {
+        Ok(Some((target, new_owner))) => format!("{new_owner}/{}.git", target.name),
+        Ok(None) => repo_path,
+        Err(error) => {
+            tracing::warn!(%repo_path, error = %format!("{error:#}"), "renamed-repository lookup failed");
+            repo_path
+        }
+    }
 }
 
 fn parse_repo_owner_name(repo_path: &str) -> Result<(String, String)> {

@@ -1106,7 +1106,7 @@ pub(crate) fn build_all_routes(
         .get(
             GIT_HTTP,
             "/{owner}/{repo}/info/refs",
-            git_http::handle_info_refs,
+            git_http::handle_info_refs_following_renames,
         )
         .post(
             GIT_HTTP,
@@ -1127,7 +1127,7 @@ pub(crate) fn build_all_routes(
         .get(
             GIT_HTTP,
             "/{owner}/{repo}/info/refs",
-            git_http::handle_info_refs,
+            git_http::handle_info_refs_following_renames,
         )
         .post(
             GIT_HTTP,
@@ -2898,6 +2898,13 @@ pub(crate) fn build_all_routes(
         )
         .get(WS_JOB_LOG, "/ws/job/{job_id}", ws::ws_job_log_handler)
         .finish();
+
+    // A renamed repository's old address: inside the PAT translation, so its
+    // access check reads the credential the handlers read (card_e83bf21a5e5b).
+    let api_v1 = api_v1.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::repo_redirect::follow_renamed_repository,
+    ));
 
     // Accept Personal Access Tokens on the REST API by translating them to a
     // Bearer JWT before the (JWT-only) handlers run.

@@ -38,6 +38,7 @@ mod http_stream;
 mod log_redaction;
 mod public_url;
 mod refusal;
+mod repo_redirect;
 // Public for the same reason `route_table` is: `required_pat_scope` states
 // which token family a route belongs to, and the only way to check that
 // statement against the levels the route table declares is for a test to be

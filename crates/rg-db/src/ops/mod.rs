@@ -47,6 +47,7 @@ pub mod release_ops;
 pub mod repo_collaborator_ops;
 pub mod repo_number_floor_ops;
 pub mod repo_ops;
+pub mod repo_redirect_ops;
 pub mod repo_star_ops;
 pub mod repo_watch_ops;
 pub mod review_comment_ops;
