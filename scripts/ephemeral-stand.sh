@@ -75,6 +75,9 @@ STAND_PASSWORD=""
 if [[ ${REGISTER_FOUNDER} -eq 1 ]]; then
   stand_register_founder "${STAND_USER:-stand-founder}"
 fi
+# With --no-founder the consumer registers the first account itself, and that
+# registration needs the one-time setup token from the stand's data directory.
+stand_read_setup_token
 if [[ ${WITH_FRONTEND} -eq 1 ]]; then
   stand_start_frontend
 fi
@@ -90,6 +93,8 @@ STAND_ENV_FILE="${STAND_WORK_DIR}/stand.env"
   printf 'STAND_USERNAME=%s\n' "${STAND_USERNAME}"
   printf 'STAND_TOKEN=%s\n' "${STAND_TOKEN}"
   printf 'STAND_WORK_DIR=%s\n' "${STAND_WORK_DIR}"
+  printf 'STAND_SETUP_TOKEN_FILE=%s\n' "${STAND_SETUP_TOKEN_FILE}"
+  printf 'STAND_SETUP_TOKEN=%s\n' "${STAND_SETUP_TOKEN}"
   if [[ -n "${STAND_FRONTEND_URL:-}" ]]; then
     printf 'FRONTEND_URL=%s\n' "${STAND_FRONTEND_URL}"
     printf 'STAND_FRONTEND_URL=%s\n' "${STAND_FRONTEND_URL}"
@@ -114,6 +119,7 @@ if ((${#COMMAND[@]} > 0)); then
   export BACKEND_URL="${STAND_BACKEND_URL}"
   export API_BASE="${STAND_BACKEND_URL}/api/v1"
   export STAND_BACKEND_URL STAND_SSH_ADDR STAND_USERNAME STAND_TOKEN STAND_WORK_DIR STAND_ENV_FILE
+  export STAND_SETUP_TOKEN_FILE STAND_SETUP_TOKEN
   if [[ -n "${STAND_FRONTEND_URL:-}" ]]; then
     export FRONTEND_URL="${STAND_FRONTEND_URL}"
     export STAND_FRONTEND_URL

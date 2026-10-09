@@ -1140,6 +1140,12 @@
 | ` ? t('common.loading') : t('common.delete')} | :739 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
 | _(загрузка страницы)_ | — | `GET /api/v1/orgs/{name}` | `OrgRead` | rust+web+smoke |
 
+### `/register`
+
+| Элемент | Откуда | Вызов | `Access` | тест |
+|---|---|---|---|---|
+| _(загрузка страницы)_ | — | `GET /api/v1/instance` | `Public` | rust+web |
+
 ### `/reset-password`
 
 | Элемент | Откуда | Вызов | `Access` | тест |

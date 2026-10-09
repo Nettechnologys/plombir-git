@@ -176,6 +176,16 @@ async fn run() -> anyhow::Result<()> {
             config: _,
         } => commands::cmd_create_repo(owner, name, repo_root, state_cfg())?,
 
+        Commands::CreateAdmin {
+            username,
+            email,
+            password_stdin,
+            db_url,
+            config: _,
+        } => {
+            commands::cmd_create_admin(username, email, password_stdin, db_url, state_cfg()).await?
+        }
+
         Commands::Runner {
             server,
             allow_insecure_http,

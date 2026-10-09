@@ -48,7 +48,21 @@ pub struct RegisterRequest {
     pub username: String,
     pub email: String,
     pub password: String,
+    /// The one-time setup token from the server's startup log. Required for
+    /// the first account on an empty instance (also accepted as the
+    /// `X-Setup-Token` header); ignored once any account exists.
+    #[serde(default)]
+    pub setup_token: Option<String>,
 }
+
+/// Header carrying the setup token, for clients that keep it out of the body.
+pub const SETUP_TOKEN_HEADER: &str = "x-setup-token";
+
+/// The refusal a fresh instance answers a registration without its token.
+pub const SETUP_TOKEN_REQUIRED_MESSAGE: &str = "this instance has no account yet: the first one \
+     needs the one-time setup token from the server's startup log (kept beside the encryption \
+     key as `setup_token`), sent as `setup_token` in the body or the `X-Setup-Token` header — \
+     or create the administrator on the host with `plombir-git create-admin`";
 
 /// Login request body.
 #[derive(Deserialize, ToSchema)]
@@ -107,9 +121,22 @@ pub async fn register(
     // Ask before spending anything: a closed instance answers 403 here, ahead
     // of the password hash (deliberately expensive) and ahead of every row this
     // request would otherwise write.
-    let permit = match rg_core::user::registration::authorize(&state.db, state.registration).await {
-        Ok(Some(permit)) => permit,
-        Ok(None) => {
+    use rg_core::user::registration::Decision;
+    let presented_setup_token = body.setup_token.as_deref().or_else(|| {
+        headers
+            .get(SETUP_TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok())
+    });
+    let permit = match rg_core::user::registration::authorize(
+        &state.db,
+        state.registration,
+        &state.setup_token,
+        presented_setup_token,
+    )
+    .await
+    {
+        Ok(Decision::Permit(permit)) => permit,
+        Ok(Decision::Closed) => {
             crate::metrics::recorder::auth_event("register", "closed");
             tracing::info!(
                 username = %body.username,
@@ -120,6 +147,16 @@ pub async fn register(
                     .to_string(),
             )
             .into_response();
+        }
+        Ok(Decision::SetupTokenRequired) => {
+            // Same series as a closed refusal: an attempt on the bootstrap
+            // window without its token is a stranger at a closed door.
+            crate::metrics::recorder::auth_event("register", "closed");
+            tracing::warn!(
+                username = %body.username,
+                "registration refused: the instance has no account yet and the request did not carry the setup token"
+            );
+            return AppError::Forbidden(SETUP_TOKEN_REQUIRED_MESSAGE.to_string()).into_response();
         }
         Err(error) => {
             // Whether registration is allowed could not be *read*. Failing open

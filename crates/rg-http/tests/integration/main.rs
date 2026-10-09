@@ -232,6 +232,7 @@ mod service_failure_status_sweep_tests;
 mod service_failure_status_tests;
 mod session_gate_cost_tests;
 mod session_standing_envelope_tests;
+mod setup_token_tests;
 mod ssh_key_tests;
 mod sso_account_link_tests;
 mod sso_disabled_provider_tests;

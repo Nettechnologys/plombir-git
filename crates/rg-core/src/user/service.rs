@@ -292,8 +292,99 @@ pub(crate) async fn create_registered_account(
     })?;
     // The first row is committed, so a waiting registration can now observe a
     // non-empty database. Do not serialise token generation behind the lock.
-    drop(permit);
+    // A bootstrap permit also retires the one-time setup token here.
+    permit.finish();
     Ok(user)
+}
+
+/// What `plombir-git create-admin` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminBootstrap {
+    /// A new account was created with the instance-admin flag.
+    Created,
+    /// The named account existed and was promoted.
+    Promoted,
+    /// The named account was an instance admin already; nothing changed.
+    AlreadyAdmin,
+}
+
+/// Create an instance administrator from the host, with the rules
+/// self-registration applies — taken name or address, username shape and
+/// reservations, password strength — but with no bootstrap permit: the caller
+/// is an operator with the database in hand, which is the position of trust the
+/// setup token stands in for over HTTP (security audit finding #13).
+///
+/// Deliberately not routed through [`register`]: that path hands out the admin
+/// flag exactly once, to the first row, and an operator adding a second
+/// administrator from the CLI is asking for the flag on purpose.
+pub async fn create_admin_account(
+    db: &DatabaseConnection,
+    username: &str,
+    email: &str,
+    plaintext_password: &str,
+) -> Result<rg_db::entities::user::Model> {
+    if crate::namespace::owner_name_is_taken(db, username).await? {
+        return Err(crate::error::conflict(format!(
+            "username '{username}' is already taken"
+        )));
+    }
+    if user_ops::find_by_email(db, email).await?.is_some() {
+        return Err(crate::error::conflict(format!(
+            "email '{email}' is already registered"
+        )));
+    }
+    validate_username(username)?;
+    if !valid_email(email) {
+        return Err(crate::error::invalid_request(
+            "email must contain '@' with a non-empty local and domain part",
+        ));
+    }
+    password::PasswordValidator::standard()
+        .validate_with_username(plaintext_password, username)
+        .map_err(|e| crate::error::invalid_request(e.to_string()))?;
+
+    let password_hash = password::hash_password(plaintext_password)
+        .await
+        .context("failed to hash password")?;
+    let now = Utc::now();
+    let model = UserActiveModel {
+        username: Set(username.to_string()),
+        email: Set(email.to_string()),
+        password_hash: Set(password_hash),
+        is_admin: Set(true),
+        is_active: Set(true),
+        created_at: Set(now),
+        updated_at: Set(now),
+        deleted_at: Set(None),
+        ..Default::default()
+    };
+    user_ops::create(db, model).await.map_err(|error| {
+        if rg_db::is_unique_violation_anyhow(&error) {
+            crate::error::conflict("username or email is already registered")
+        } else {
+            error
+        }
+    })
+}
+
+/// Give an existing account the instance-admin flag, from the host.
+pub async fn promote_to_admin(
+    db: &DatabaseConnection,
+    user: rg_db::entities::user::Model,
+) -> Result<AdminBootstrap> {
+    use sea_orm::ActiveModelTrait;
+
+    if user.is_admin {
+        return Ok(AdminBootstrap::AlreadyAdmin);
+    }
+    let mut active: UserActiveModel = user.into();
+    active.is_admin = Set(true);
+    active.updated_at = Set(Utc::now());
+    active
+        .update(db)
+        .await
+        .context("promote the account to instance admin")?;
+    Ok(AdminBootstrap::Promoted)
 }
 
 async fn verify_local_login(

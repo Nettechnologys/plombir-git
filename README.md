@@ -298,7 +298,7 @@ Common `serve` flags:
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--repo-root` | Root directory for bare repositories | `./repos` |
-| `--http-addr` | HTTP listen address | `0.0.0.0:8080` |
+| `--http-addr` | HTTP listen address (loopback by default — put a reverse proxy in front, or bind `0.0.0.0:8080` on purpose) | `127.0.0.1:8080` |
 | `--ssh-addr` | SSH listen address | `0.0.0.0:2222` |
 | `--host-key` | SSH host key path | — |
 | `--db-url` | `sqlite://` / `postgres://` / `mysql://` URL | `sqlite://./plombir-git.db?mode=rwc` |
@@ -537,9 +537,13 @@ All endpoints live under `/api/v1/`. Authenticated routes expect an
 or a Personal Access Token.
 
 ```bash
-# Register
+# Register. The first account on an empty instance becomes the administrator and
+# must carry the one-time setup token from the server's startup log (or use the
+# `create-admin` subcommand on the host instead); later accounts need none —
+# and are refused unless `[auth].registration = "open"`.
 curl -X POST http://localhost:8080/api/v1/users/register \
   -H "Content-Type: application/json" \
+  -H "X-Setup-Token: <token from the startup log>" \
   -d '{"username":"testuser","email":"test@example.com","password":"secret123"}'
 
 # Login → returns a JWT
@@ -592,6 +596,7 @@ Beyond `serve`, the `plombir-git` binary offers:
 | `backup-db` / `restore-db` | Create / restore a consistent SQLite backup by hand (for a schedule, use `[backup]` — the server snapshots itself) |
 | `rotate-encryption-key` | Re-encrypt every at-rest secret onto a new encryption key (file-backed SQLite requires the server to be stopped, `--dry-run` included; this is enforced) |
 | `rotate-instance-key` | Mint a new provenance signing identity (invalidates past attestations) |
+| `create-admin --username <name> --email <address>` | Create the first instance administrator from the host (no setup token needed), or promote an existing account; the password is prompted for, or read with `--password-stdin` |
 | `create-repo` | Create a bare repository (no DB record — quick testing) |
 | `runner` | Run as a CI runner (polls and executes jobs) |
 | `import github\|gitlab <url>` | Import a repository (and metadata) from GitHub/GitLab (file-backed SQLite requires the server to be stopped) |
@@ -601,8 +606,8 @@ Beyond `serve`, the `plombir-git` binary offers:
 
 Every subcommand that touches the database or the repository directory
 (`migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,
-`rotate-encryption-key`, `create-repo`, `import`, `index-repo`, `list-tombstones`,
-`package list`)
+`rotate-encryption-key`, `create-admin`, `create-repo`, `import`, `index-repo`,
+`list-tombstones`, `package list`)
 takes the same `--config` as `serve` and resolves `--db-url` / `--repo-root` as
 **CLI arg > config file > built-in default**. On a config-file deployment, pass
 `--config` rather than repeating the URL: with neither,

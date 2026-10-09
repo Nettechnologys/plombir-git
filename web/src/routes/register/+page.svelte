@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import Logo from '$lib/components/Logo.svelte';
   import { register, getAuthError, getAuthLoading } from '$lib/stores/auth.svelte';
+  import { instance } from '$lib/api/client.svelte';
   import { createT } from '$lib/i18n';
   import { getRegistrationOpen } from '$lib/stores/instance.svelte';
   import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from '$lib/passwordPolicy';
@@ -10,14 +12,34 @@
   let username = $state('');
   let email = $state('');
   let password = $state('');
+  let setupToken = $state('');
+  // The instance has no account yet: the first registration needs the
+  // one-time setup token from the server's startup log, so ask for it.
+  let setupRequired = $state(false);
   let localError = $state('');
   // The instance creates the account only once the mailed link is followed.
   let confirmationSent = $state(false);
 
+  onMount(async () => {
+    try {
+      const info = await instance.get();
+      setupRequired = info.setup_required === true;
+    } catch {
+      // The register endpoint is the authority and names the token itself
+      // when it refuses; an unreachable announcement hides nothing.
+      setupRequired = false;
+    }
+  });
+
   async function handleSubmit(e: Event) {
     e.preventDefault();
     localError = '';
-    const ok = await register(username, email, password);
+    const ok = await register(
+      username,
+      email,
+      password,
+      setupRequired && setupToken.trim() ? setupToken.trim() : undefined,
+    );
     if (ok === 'confirmation_sent') {
       confirmationSent = true;
     } else if (ok) {
@@ -82,6 +104,14 @@
         />
         <small id="password-policy" class="hint">{t('auth.password_policy', { min: PASSWORD_MIN_LENGTH })}</small>
       </label>
+
+      {#if setupRequired}
+        <label class="setup-token">
+          {t('auth.register.setup_token')}
+          <input type="password" name="setup_token" bind:value={setupToken} required autocomplete="off" spellcheck={false} />
+          <span class="hint">{t('auth.register.setup_token_hint')}</span>
+        </label>
+      {/if}
 
       <button type="submit" class="btn-primary" disabled={getAuthLoading()}>
         {getAuthLoading() ? t('auth.register.submitting') : t('auth.register.submit')}
@@ -151,6 +181,13 @@
   }
 
   input { padding: 8px 12px; }
+
+  .hint {
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.4;
+    color: var(--text-secondary);
+  }
 
   .btn-primary {
     padding: 8px 16px;

@@ -311,9 +311,14 @@ pub struct StateOverrides {
     pub ws_session_recheck_secs: Option<u64>,
     /// Closes self-service registration for this state.
     ///
-    /// The default is `Open`, which is what almost every test needs: the
-    /// harness's own `register_user` helper is how fixtures get accounts.
+    /// The harness default is `Open` — deliberately not the production
+    /// default, which is `Closed` — because the harness's own `register_user`
+    /// helper is how fixtures get accounts.
     pub registration: Option<rg_core::user::registration::RegistrationMode>,
+    /// Guards the bootstrap registration with a setup token. The harness
+    /// default requires none, so a fixture's first `register_user` is the
+    /// instance admin without ceremony.
+    pub setup_token: Option<rg_core::user::registration::SetupToken>,
     /// Replaces the empty private-import trust set.
     pub trusted_import_origins: Option<rg_core::import::trust::TrustedImportOrigins>,
     /// Replaces the secure-default import credential transport policy.
@@ -431,7 +436,10 @@ pub fn build_test_app_state_with(
         docker_enabled: false,
         external_runners: false,
         allow_host_runner: false,
-        registration: overrides.registration.unwrap_or_default(),
+        registration: overrides
+            .registration
+            .unwrap_or(rg_core::user::registration::RegistrationMode::Open),
+        setup_token: overrides.setup_token.unwrap_or_default(),
         trusted_import_origins: overrides.trusted_import_origins.unwrap_or_default(),
         import_transport_policy: overrides.import_transport_policy.unwrap_or_default(),
         oidc_transport_policy: overrides.oidc_transport_policy.unwrap_or_default(),

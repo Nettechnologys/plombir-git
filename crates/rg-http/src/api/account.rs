@@ -461,8 +461,18 @@ pub async fn confirm_email(
 ) -> Response {
     use rg_core::user::account::Confirmed;
 
-    let permit = match rg_core::user::registration::authorize(&state.db, state.registration).await {
-        Ok(permit) => permit,
+    // A confirmation link never carries the setup token: a pending registration
+    // cannot exist on an instance that has never had a user, so on an empty
+    // database this is "closed" and answers like it.
+    let permit = match rg_core::user::registration::authorize(
+        &state.db,
+        state.registration,
+        &state.setup_token,
+        None,
+    )
+    .await
+    {
+        Ok(decision) => decision.permit(),
         Err(error) => return AppError::from(error).into_response(),
     };
     match rg_core::user::account::confirm(&state.db, directories(&state), permit, &body.token).await

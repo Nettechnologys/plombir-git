@@ -110,13 +110,16 @@ pub struct AppState {
     /// Whether imageless CI jobs may run as a shell on the host (default false).
     pub allow_host_runner: bool,
     /// Whether `POST /users/register` accepts new accounts from outside.
-    /// Defaults to [`rg_core::user::registration::RegistrationMode::Open`] — the
-    /// historical behaviour — and is the *only* switch that closes it:
-    /// `[rate_limit].auth_max` throttles
-    /// registration spam but never refuses it. LDAP/SSO auto-provision is a
-    /// separate channel this does not touch; see
-    /// [`rg_core::user::registration`].
+    /// Defaults to [`rg_core::user::registration::RegistrationMode::Closed`]
+    /// since security audit finding #13 — and is the *only* switch that opens
+    /// or closes it: `[rate_limit].auth_max` throttles registration spam but
+    /// never refuses it. LDAP/SSO auto-provision is a separate channel this
+    /// does not touch; see [`rg_core::user::registration`].
     pub registration: rg_core::user::registration::RegistrationMode,
+    /// The one-time secret the bootstrap registration on an empty instance has
+    /// to present. `plombir-git serve` generates it at the first start; see
+    /// [`rg_core::user::registration::SetupToken`].
+    pub setup_token: rg_core::user::registration::SetupToken,
     /// Exact operator-approved private origins for repository imports. Empty
     /// keeps every user-supplied source behind the normal SSRF guard.
     pub trusted_import_origins: rg_core::import::trust::TrustedImportOrigins,
@@ -361,6 +364,8 @@ pub struct HttpServerConfig {
     /// Whether self-service registration is accepted. See
     /// [`AppState::registration`].
     pub registration: rg_core::user::registration::RegistrationMode,
+    /// The bootstrap setup token. See [`AppState::setup_token`].
+    pub setup_token: rg_core::user::registration::SetupToken,
     /// Exact operator-approved private origins for repository imports.
     pub trusted_import_origins: rg_core::import::trust::TrustedImportOrigins,
     /// Import credential transport policy. Plain HTTP remains disabled unless
@@ -599,6 +604,7 @@ async fn run_with_listener(
         external_runners: config.external_runners,
         allow_host_runner: config.allow_host_runner,
         registration: config.registration,
+        setup_token: config.setup_token,
         trusted_import_origins: config.trusted_import_origins,
         import_transport_policy: config.import_transport_policy,
         oidc_transport_policy: config.oidc_transport_policy,

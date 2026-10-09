@@ -34,7 +34,7 @@ function run(fixture) {
 
 /**
  * The unleased openers the check's ONLINE_POOL_COMMANDS inventory expects:
- * two in `commands.rs`, one in `admin.rs`. Every fixture starts from this, so
+ * three in `commands.rs`, one in `admin.rs`. Every fixture starts from this, so
  * a red below is about the mutation rather than about a missing inventory.
  */
 function writeOnlineInventory(fixture, { adminExtra = '', commandsExtra = '' } = {}) {
@@ -42,6 +42,11 @@ function writeOnlineInventory(fixture, { adminExtra = '', commandsExtra = '' } =
     join(fixture, 'crates/rg-cli/src/commands.rs'),
     `pub(crate) async fn cmd_rotate_instance_key(db_url: &str) -> anyhow::Result<()> {
     let _db = dbconn::connect_online(db_url, "plombir-git rotate-instance-key", dbconn::OnlineAccess::SingleRowWrite).await?;
+    Ok(())
+}
+
+pub(crate) async fn cmd_create_admin(db_url: &str) -> anyhow::Result<()> {
+    let _db = dbconn::connect_online(db_url, "plombir-git create-admin", dbconn::OnlineAccess::SingleRowWrite).await?;
     Ok(())
 }
 

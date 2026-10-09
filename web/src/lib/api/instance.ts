@@ -28,6 +28,12 @@ export interface InstanceInfo {
   /** The commit this binary was built from, or `null` when the build was not told. */
   source_commit: string | null;
   /**
+   * Whether the instance is still waiting for its first account. That one
+   * registration needs the one-time setup token from the server's startup
+   * log, so the register page shows a field for it while this is true.
+   */
+  setup_required: boolean;
+  /**
    * Whether self-service sign-up would be accepted now — `false` on a closed
    * instance once its first account exists. Optional: an older server does not
    * send it, and then the sign-up links stay.
