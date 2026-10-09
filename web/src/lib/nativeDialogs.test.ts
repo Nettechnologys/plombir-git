@@ -14,10 +14,6 @@ declare const process: { cwd(): string };
 // runtime half of this guard is in `test/setup.ts`: any `window.confirm()`
 // a test reaches throws.
 
-// Pending removal in card_340703b4564b: the route redirects to `/boards` and
-// this component is never rendered. Drop the entry together with the file.
-const EXEMPT = new Set(['routes/[owner]/[repo]/issues/board/+page.svelte']);
-
 function sources(root: string, files: Record<string, string> = {}): Record<string, string> {
 	for (const entry of readdirSync(root, { withFileTypes: true })) {
 		const path = join(root, entry.name);
@@ -70,7 +66,7 @@ describe('native browser dialogs', () => {
 		expect(Object.keys(files).length).toBeGreaterThan(150);
 		const offenders = Object.entries(files)
 			.map(([path, source]) => [relative(root, path).replaceAll('\\', '/'), nativeDialogCalls(source)] as const)
-			.filter(([file, calls]) => calls.length > 0 && !EXEMPT.has(file))
+			.filter(([file, calls]) => calls.length > 0)
 			.map(([file, calls]) => `${file} ${calls.join(', ')}`);
 		expect(offenders).toEqual([]);
 	});

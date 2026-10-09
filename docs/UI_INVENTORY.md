@@ -23,13 +23,13 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 404 |
-| Из них достижимы из браузера | 282 (70%) |
+| Роутов в роутере (с объявленным `Access`) | 406 |
+| Из них достижимы из браузера | 282 (69%) |
 | Layout-модулей | 2 |
-| Страниц | 70 |
-| Интерактивных элементов | 1017 |
-| — из них дёргают API | 357 |
-| — приходят из общих компонентов | 406 |
+| Страниц | 69 |
+| Интерактивных элементов | 991 |
+| — из них дёргают API | 347 |
+| — приходят из общих компонентов | 395 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 46 / 171 / 162 |
 | **UI-роутов без единого web/smoke/browser-теста** | **26** |
 | UI-роутов без corpus-hit и browser-сценария | 0 |
@@ -39,7 +39,7 @@
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
 | `RepoRead` | 106 | 68 | 4 | 0 |
-| `RepoWrite` | 83 | 66 | 13 | 0 |
+| `RepoWrite` | 85 | 66 | 13 | 2 |
 | `User` | 51 | 40 | 6 | 0 |
 | `RepoAdmin` | 38 | 38 | 0 | 0 |
 | `Public` | 25 | 10 | 2 | 0 |
@@ -67,7 +67,6 @@
 | `/[owner]/[repo]/pulls` | 28 | 12 | 12 |
 | `/[owner]/[repo]/releases` | 27 | 12 | 11 |
 | `/[owner]/[repo]/issues` | 26 | 9 | 12 |
-| `/[owner]/[repo]/issues/board` | 26 | 10 | 11 |
 | `/orgs/[name]` | 26 | 10 | 2 |
 | `/[owner]/[repo]/pipelines` | 25 | 11 | 14 |
 | `/[owner]/[repo]` | 24 | 5 | 12 |
@@ -365,32 +364,6 @@
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/subscription` | `RepoAuthRead` | web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/issues/{number}/assets` | `RepoRead` | rust+web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets` | `RepoRead` | rust+web |
-
-### `/[owner]/[repo]/issues/board`
-
-| Элемент | Откуда | Вызов | `Access` | тест |
-|---|---|---|---|---|
-| () => selectBoard(b.id) | :380 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust+web |
-| i18n:common.create | :412 | `POST /api/v1/repos/{owner}/{name}/boards` | `RepoWrite` | rust+web |
-| i18n:common.create | :412 | `GET /api/v1/repos/{owner}/{name}/boards` | `RepoRead` | rust+web |
-| i18n:common.create | :412 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust+web |
-| i18n:common.add | :428 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust+web |
-| ✕ | :452 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}` | `RepoWrite` | rust+web |
-| ✕ | :452 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust+web |
-| ✕ | :488 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}` | `RepoWrite` | rust+web |
-| ✕ | :488 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust+web |
-| i18n:common.add | :510 | `POST /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}/cards` | `RepoWrite` | rust+web |
-| i18n:common.add | :510 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust+web |
-| toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
-| toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
-| 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
-| 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
-| 👁 | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
-| ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
-| i18n:repo.download_zip | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/archive/{archive}` | `RepoRead` | rust+web |
-| _(загрузка страницы)_ | — | `POST /api/v1/repos/{owner}/{name}/boards/{id}/cards/reorder` | `RepoWrite` | rust+web |
-| _(загрузка страницы)_ | — | `POST /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}/move` | `RepoWrite` | rust+web |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/milestones`
 
@@ -1304,6 +1277,8 @@
 | GET | `/api/v1/ci/oidc/jwks` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/token` | `Foreign:api/ci_oidc.rs` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoRead` | rust |
+| DELETE | `/api/v1/repos/{owner}/{name}/branches/protection` | `RepoWrite` | **—** |
+| DELETE | `/api/v1/repos/{owner}/{name}/tags/protection` | `RepoWrite` | **—** |
 | GET | `/api/v1/imports/{id}` | `User` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/boards/{id}/columns` | `RepoWrite` | rust |
 | PATCH | `/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}` | `RepoWrite` | rust |

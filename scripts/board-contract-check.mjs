@@ -8,7 +8,6 @@ import { productionTsSource, tsFunctionBody } from './lib/ts-source.mjs';
 const files = {
   client: 'web/src/lib/api/boards.ts',
   boardsPage: 'web/src/routes/[owner]/[repo]/boards/+page.svelte',
-  issueBoardPage: 'web/src/routes/[owner]/[repo]/issues/board/+page.svelte',
   asyncStateOwnership: 'web/src/lib/asyncStateOwnership.ts',
   backend: 'crates/rg-http/src/api/boards.rs',
   backendService: 'crates/rg-core/src/board/service.rs',
@@ -62,22 +61,13 @@ const reorderDb = rustFnBlock(
   'update_card_position_if_still_in_column',
 );
 const boardMutationOwner = tsFunctionBody(source.boardsPage, 'runBoardMutation');
-const issueBoardMutationOwner = tsFunctionBody(source.issueBoardPage, 'runBoardMutation');
 const standaloneBoardControlsBusy =
   /let boardControlsBusy = \$derived\(boardMutationBusy \|\| boardSelectionBusy\)/.test(
     source.boardsPage,
   );
-const issueBoardControlsBusy =
-  /let boardControlsBusy = \$derived\(boardMutationBusy \|\| boardSelectionBusy\)/.test(
-    source.issueBoardPage,
-  );
 const standaloneReorder = tsFunctionBody(source.boardsPage, 'reorderCard');
-const issueReorder = tsFunctionBody(source.issueBoardPage, 'reorderCard');
-const issueDrop = tsFunctionBody(source.issueBoardPage, 'onDrop');
 const standaloneBoardLoad = tsFunctionBody(source.boardsPage, 'loadBoards');
-const issueBoardLoad = tsFunctionBody(source.issueBoardPage, 'loadBoards');
 const standaloneSelection = tsFunctionBody(source.boardsPage, 'selectBoard');
-const issueBoardSelection = tsFunctionBody(source.issueBoardPage, 'loadBoard');
 const standaloneRefresh = tsFunctionBody(source.boardsPage, 'refreshBoard');
 const standaloneRouteMutations = [
   'createBoard',
@@ -95,15 +85,6 @@ const standaloneRouteMutations = [
   .map((name) => ({ name, body: tsFunctionBody(source.boardsPage, name) }));
 const standaloneCardMutations = ['addCard', 'deleteCard', 'saveCard', 'moveCard', 'reorderCard']
   .map((name) => ({ name, body: tsFunctionBody(source.boardsPage, name) }));
-const issueBoardMutations = [
-  'handleCreateBoard',
-  'handleAddColumn',
-  'handleDeleteColumn',
-  'handleAddCard',
-  'handleDeleteCard',
-  'onDrop',
-]
-  .map((name) => ({ name, body: tsFunctionBody(source.issueBoardPage, name) }));
 
 const checks = [
   {
@@ -128,15 +109,13 @@ const checks = [
     ok: /moveCard:[\s\S]*data: \{ column_id: number; position: number \}/.test(source.client),
   },
   {
-    name: 'reorder contract carries the source column from both board pages to the backend',
+    name: 'reorder contract carries the source column from the board page to the backend',
     ok:
       /reorderCards:[\s\S]*data: \{ column_id: number; positions: \[number, number\]\[\] \}/.test(source.client) &&
       reorderRequest !== null &&
       /pub column_id: Option<i64>/.test(reorderRequest) &&
       standaloneReorder !== null &&
-      /boards\.reorderCards\(route\.owner, route\.repo, boardId, \{[\s\S]*column_id: column\.id,[\s\S]*positions,/.test(standaloneReorder) &&
-      issueReorder !== null &&
-      /boards\.reorderCards\(route\.owner, route\.repo, boardId, \{[\s\S]*column_id: colId,[\s\S]*positions,/.test(issueReorder),
+      /boards\.reorderCards\(route\.owner, route\.repo, boardId, \{[\s\S]*column_id: column\.id,[\s\S]*positions,/.test(standaloneReorder),
   },
   {
     name: 'API client board deletes model backend 204 responses as void',
@@ -168,24 +147,15 @@ const checks = [
       /pub cards: Vec<CardFull>/.test(columnFull),
   },
   {
-    name: 'issue board links cards by issue number, not database issue_id',
+    name: 'board card creation sends a note payload',
     ok:
-      /href=\{`\/\$\{owner\}\/\$\{repo\}\/issues\/\$\{card\.issue\.number\}`\}/.test(source.issueBoardPage) &&
-      !/href=\{`\/\$\{owner\}\/\$\{repo\}\/issues\/\$\{card\.issue_id\}`\}/.test(source.issueBoardPage),
+      /createCard\(route\.owner, route\.repo, boardId, colId, \{\s*note,\s*\}\)/.test(source.boardsPage),
   },
   {
-    name: 'board card creation pages send note payloads',
-    ok:
-      /createCard\(route\.owner, route\.repo, boardId, colId, \{\s*note,\s*\}\)/.test(source.boardsPage) &&
-      /createCard\(route\.owner, route\.repo, boardId, colId, \{ note \}\)/.test(source.issueBoardPage),
-  },
-  {
-    name: 'both board pages publish complete same-column card orders',
+    name: 'the board page publishes complete same-column card orders',
     ok:
       standaloneReorder !== null &&
-      /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(route\.owner, route\.repo, boardId, \{[\s\S]*column_id: column\.id,[\s\S]*positions,/.test(standaloneReorder) &&
-      issueReorder !== null &&
-      /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(route\.owner, route\.repo, boardId, \{[\s\S]*column_id: colId,[\s\S]*positions,/.test(issueReorder),
+      /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(route\.owner, route\.repo, boardId, \{[\s\S]*column_id: column\.id,[\s\S]*positions,/.test(standaloneReorder),
   },
   {
     name: 'standalone board owns parent load and mutations by repository-route generation',
@@ -214,47 +184,17 @@ const checks = [
       /isCurrentRoute\(route\)/.test(standaloneRefresh),
   },
   {
-    name: 'issue board owns parent load and mutations by repository-route generation',
-    ok:
-      /let routeGeneration = 0/.test(source.issueBoardPage) &&
-      /\$effect\(\(\) => \{[\s\S]*routeGeneration \+= 1;[\s\S]*boardMutationBusy = false;[\s\S]*void loadBoards\(expectedOwner, expectedRepo, routeGeneration\)/.test(source.issueBoardPage) &&
-      issueBoardLoad !== null &&
-      /boardListRequests\.begin\(expectedOwner, expectedRepo\)/.test(issueBoardLoad) &&
-      /boards\.list\(expectedOwner, expectedRepo\)/.test(issueBoardLoad) &&
-      /isCurrentRoute\(route\)/.test(issueBoardLoad) &&
-      issueBoardMutationOwner !== null &&
-      /const route = currentRoute\(\)/.test(issueBoardMutationOwner) &&
-      /await operation\(route\)/.test(issueBoardMutationOwner) &&
-      /catch[\s\S]*if \(isCurrentRoute\(route\)\) error/.test(issueBoardMutationOwner) &&
-      /finally[\s\S]*if \(isCurrentRoute\(route\)\) boardMutationBusy = false/.test(issueBoardMutationOwner) &&
-      issueBoardMutations.every(({ body }) =>
-        body !== null &&
-        /runBoardMutation\(async \(route\)/.test(body) &&
-        /route\.owner/.test(body) &&
-        /route\.repo/.test(body) &&
-        /isCurrentRoute\(route\)/.test(body)
-      ) &&
-      issueReorder !== null &&
-      /async function reorderCard\(\s*route: BoardRoute,/.test(source.issueBoardPage) &&
-      /if \(isCurrentRoute\(route\)\) setColumnCards\(colId, cards\)/.test(issueReorder) &&
-      /reload: \(\) => loadBoard\(boardId, route\)/.test(issueReorder),
-  },
-  {
-    name: 'both board pages use one fail-closed owner for conflicting mutations',
+    name: 'the board page uses one fail-closed owner for conflicting mutations',
     ok:
       standaloneBoardControlsBusy &&
       boardMutationOwner !== null &&
       /if \(boardControlsBusy\) return false/.test(boardMutationOwner) &&
       /boardMutationBusy = true/.test(boardMutationOwner) &&
       /finally[\s\S]*boardMutationBusy = false/.test(boardMutationOwner) &&
-      issueBoardControlsBusy &&
-      issueBoardMutationOwner !== null &&
-      /if \(boardControlsBusy\) return false/.test(issueBoardMutationOwner) &&
-      standaloneCardMutations.every(({ body }) => body !== null && /runBoardMutation\(/.test(body)) &&
-      issueBoardMutations.every(({ body }) => body !== null && /runBoardMutation\(/.test(body)),
+      standaloneCardMutations.every(({ body }) => body !== null && /runBoardMutation\(/.test(body)),
   },
   {
-    name: 'both board pages fence detail publication by repository and board identity',
+    name: 'the board page fences detail publication by repository and board identity',
     ok:
       /class LatestRepositoryResourceRequestFence/.test(source.asyncStateOwnership) &&
       /claim\.resource === resource/.test(source.asyncStateOwnership) &&
@@ -263,23 +203,14 @@ const checks = [
       /boardSelectionRequests\.begin\(expectedOwner, expectedRepo, board\.id\)/.test(standaloneSelection) &&
       /activeBoard = null;[\s\S]*await boards\.get\(expectedOwner, expectedRepo, board\.id\)/.test(standaloneSelection) &&
       /isCurrentRoute\(route\)/.test(standaloneSelection) &&
-      /boardSelectionRequests\.owns\(claim, owner, repo, board\.id\)/.test(standaloneSelection) &&
-      issueBoardSelection !== null &&
-      /async function loadBoard\(id: number, route = currentRoute\(\)\)/.test(source.issueBoardPage) &&
-      /boardSelectionRequests\.begin\(expectedOwner, expectedRepo, id\)/.test(issueBoardSelection) &&
-      /activeBoard = null;[\s\S]*await boards\.get\(expectedOwner, expectedRepo, id\)/.test(issueBoardSelection) &&
-      /isCurrentRoute\(route\)/.test(issueBoardSelection) &&
-      /boardSelectionRequests\.owns\(claim, owner, repo, id\)/.test(issueBoardSelection),
+      /boardSelectionRequests\.owns\(claim, owner, repo, board\.id\)/.test(standaloneSelection),
   },
   {
-    name: 'both board mutation owners reject controls during an unconfirmed selection',
+    name: 'the board mutation owner rejects controls during an unconfirmed selection',
     ok:
       standaloneBoardControlsBusy &&
       boardMutationOwner !== null &&
-      /if \(boardControlsBusy\) return false/.test(boardMutationOwner) &&
-      issueBoardControlsBusy &&
-      issueBoardMutationOwner !== null &&
-      /if \(boardControlsBusy\) return false/.test(issueBoardMutationOwner),
+      /if \(boardControlsBusy\) return false/.test(boardMutationOwner),
   },
   {
     name: 'backend rejects a reorder that loses to a card move instead of overwriting it',
@@ -289,14 +220,6 @@ const checks = [
       /rows_affected == 1/.test(reorderDb.body) &&
       reorderService !== null &&
       /ReorderOutcome::Moved[\s\S]*crate::error::conflict/.test(reorderService.body),
-  },
-  {
-    name: 'issue board routes same-column drops through the reorder path',
-    ok:
-      issueDrop !== null &&
-      /if \(fromColId === colId\) \{[\s\S]*await reorderCard\(route, boardId, colId, cardId, position\)/.test(issueDrop) &&
-      !/if \(fromColId === colId\) \{\s*draggingCardId = null;\s*return;\s*\}/.test(issueDrop) &&
-      /draggingFromColId === column\.id \? cardIndex : undefined/.test(source.issueBoardPage),
   },
 ];
 

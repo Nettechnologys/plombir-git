@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Component } from 'svelte';
 
 import StandaloneBoardPage from '../../routes/[owner]/[repo]/boards/+page.svelte';
-import IssueBoardPage from '../../routes/[owner]/[repo]/issues/board/+page.svelte';
 import { LatestRepositoryResourceRequestFence } from '../asyncStateOwnership';
 import { fetchUser, logout } from '../stores/auth.svelte';
 import { setTestPage } from '../test/app';
@@ -67,13 +66,6 @@ const surfaces: BoardSurface[] = [
 		path: '/alice/demo/boards',
 		tabSelector: '.tab',
 		deleteSelector: '.card-actions button[title="Delete"]',
-	},
-	{
-		name: 'issue board',
-		component: IssueBoardPage,
-		path: '/alice/demo/issues/board',
-		tabSelector: '.board-tab',
-		deleteSelector: '.card-delete',
 	},
 ];
 
