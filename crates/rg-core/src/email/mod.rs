@@ -83,15 +83,31 @@ pub async fn send_html_notification(
     message: &str,
     action_url: Option<&str>,
 ) -> Result<()> {
+    let html_body = notification_html(title, message, action_url)?;
+    send_notification_email(config, to, title, &html_body).await
+}
+
+/// The body [`send_html_notification`] mails.
+///
+/// `title` and `message` are text, never markup: callers put names a pushing
+/// collaborator chose into them (a branch called `<a href=…>Confirm your
+/// login</a>` is a valid ref), so both are escaped and a line break in the
+/// message is the only formatting it gets. The action link is an `http(s)`
+/// URL or nothing is sent — every caller builds it from the instance's own
+/// address, so anything else is a bug to surface, not a link to mail.
+fn notification_html(title: &str, message: &str, action_url: Option<&str>) -> Result<String> {
     let action_html = match action_url {
-        Some(url) => format!(
-            r#"<div style="margin-top: 16px;"><a href="{}" style="background: #4f46e5; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none; display: inline-block;">View Details</a></div>"#,
-            url
-        ),
+        Some(url) => {
+            let href = http_link(url)
+                .ok_or_else(|| anyhow::anyhow!("refusing to mail a non-http(s) action link"))?;
+            format!(
+                r#"<div style="margin-top: 16px;"><a href="{href}" style="background: #4f46e5; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none; display: inline-block;">View Details</a></div>"#
+            )
+        }
         None => String::new(),
     };
 
-    let html_body = format!(
+    Ok(format!(
         r#"<html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f6f8fa; margin: 0; padding: 20px;">
 <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 8px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
   <div style="border-bottom: 2px solid #4f46e5; padding-bottom: 12px; margin-bottom: 16px;">
@@ -104,11 +120,22 @@ pub async fn send_html_notification(
 </div>
 </body></html>"#,
         title = html_escape(title),
-        message = html_escape(message),
+        message = html_escape(message).replace('\n', "<br/>"),
         action_html = action_html,
-    );
+    ))
+}
 
-    send_notification_email(config, to, title, &html_body).await
+/// `url` escaped for an `href`, when it is an `http(s)` URL; `None` for any
+/// other scheme, so a `javascript:` or `data:` value never becomes a link.
+fn http_link(url: &str) -> Option<String> {
+    let url = url.trim();
+    let scheme_ok = url
+        .get(..8)
+        .is_some_and(|head| head.eq_ignore_ascii_case("https://"))
+        || url
+            .get(..7)
+            .is_some_and(|head| head.eq_ignore_ascii_case("http://"));
+    scheme_ok.then(|| html_escape(url))
 }
 
 /// Send one notification mail: one entry per notification that piled up for
@@ -123,10 +150,9 @@ pub async fn send_digest(
         .entries
         .iter()
         .map(|entry| {
-            let title = match entry.url.as_deref() {
-                Some(url) => format!(
-                    r#"<a href="{}" style="color: #4f46e5; text-decoration: none;">{}</a>"#,
-                    html_escape(url),
+            let title = match entry.url.as_deref().and_then(http_link) {
+                Some(href) => format!(
+                    r#"<a href="{href}" style="color: #4f46e5; text-decoration: none;">{}</a>"#,
                     html_escape(&entry.title)
                 ),
                 None => html_escape(&entry.title),
@@ -144,10 +170,9 @@ pub async fn send_digest(
             format!(r#"<li style="margin-bottom: 12px;"><strong>{title}</strong>{body}</li>"#)
         })
         .collect();
-    let footer = match mail.settings_url.as_deref() {
-        Some(url) => format!(
-            r#"You received this email because of your notification settings: <a href="{}" style="color: #9ca3af;">change what is mailed to you</a>."#,
-            html_escape(url)
+    let footer = match mail.settings_url.as_deref().and_then(http_link) {
+        Some(href) => format!(
+            r#"You received this email because of your notification settings: <a href="{href}" style="color: #9ca3af;">change what is mailed to you</a>."#
         ),
         None => "You received this email because of your notification settings on Plombir Git \
                  (Settings → Notifications)."
@@ -171,4 +196,52 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{http_link, notification_html};
+
+    #[test]
+    fn a_branch_name_made_of_markup_reaches_the_mail_as_text() {
+        let html = notification_html(
+            "CI pipeline triggered",
+            "on branch refs/heads/<a href=\"https://evil.example\">Confirm your login</a>",
+            None,
+        )
+        .expect("render");
+        assert!(
+            !html.contains(r#"<a href="https://evil.example""#),
+            "{html}"
+        );
+        assert!(
+            html.contains("&lt;a href=&quot;https://evil.example&quot;&gt;"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn line_breaks_in_the_message_are_the_only_markup_it_gets() {
+        let html = notification_html("t", "first\n\nsecond", None).expect("render");
+        assert!(html.contains("first<br/><br/>second"), "{html}");
+        assert!(!html.contains("&lt;br/&gt;"), "{html}");
+    }
+
+    #[test]
+    fn only_an_http_link_becomes_a_button() {
+        let html = notification_html("t", "m", Some("https://git.example/reset?token=a\"b"))
+            .expect("render");
+        assert!(
+            html.contains(r#"href="https://git.example/reset?token=a&quot;b""#),
+            "{html}"
+        );
+        for hostile in ["javascript:alert(1)", "data:text/html,x", " JaVaScRiPt:x"] {
+            assert!(
+                notification_html("t", "m", Some(hostile)).is_err(),
+                "{hostile}"
+            );
+            assert!(http_link(hostile).is_none(), "{hostile}");
+        }
+        assert!(http_link("HTTP://git.example/").is_some());
+    }
 }
