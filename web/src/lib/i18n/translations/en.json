@@ -70,7 +70,8 @@
     "home_label": "Plombir Git Home",
     "user_menu": "User menu",
     "notification_settings": "Notification settings",
-    "menu": "Menu"
+    "menu": "Menu",
+    "profile": "Profile"
   },
   "author": {
     "bot": "bot",
@@ -207,7 +208,8 @@
       "footer": "Already have an account? {link}",
       "footer_link": "Sign in",
       "failed": "Registration failed",
-      "closed": "Self-service sign-up is closed on this instance. Ask an administrator for an account."
+      "closed": "Self-service sign-up is closed on this instance. Ask an administrator for an account.",
+      "confirmation_sent": "Check your inbox: we sent a link to confirm the address. The account is created when you follow it."
     },
     "back_to_login": "Back to Login",
     "password_rules": {
@@ -266,7 +268,17 @@
       "server_error": "Something went wrong on the server while signing in with {provider}. Please try again later.",
       "failed": "Signing in with {provider} failed. Please try again."
     },
-    "password_policy": "At least {min} characters, with an uppercase and a lowercase letter, a digit and a symbol. Not your username, and not a common password."
+    "password_policy": "At least {min} characters, with an uppercase and a lowercase letter, a digit and a symbol. Not your username, and not a common password.",
+    "verify_email": {
+      "confirm": "Confirm address",
+      "explain": "Confirm that this address is yours to finish.",
+      "moved": "Your account now uses this address:",
+      "no_token": "This link carries no confirmation token. Open the link from the mail again.",
+      "title": "Confirm your email address",
+      "to_settings": "Back to your profile",
+      "verified": "This address is confirmed:",
+      "working": "Confirming…"
+    }
   },
   "dashboard": {
     "title": "Dashboard",
@@ -1056,7 +1068,8 @@
     "help_state": "Filter by issue state",
     "help_label": "Filter by label",
     "help_tip": "Example: bug fix repo:owner/name state:open",
-    "keyboard_hint": "Tip: Press Ctrl+K to focus search"
+    "keyboard_hint": "Tip: Press Ctrl+K to focus search",
+    "load_failed": "Search failed"
   },
   "releases": {
     "title": "Releases",
@@ -1467,6 +1480,42 @@
     "access": {
       "admin_required": "This page is for the repository’s administrators.",
       "write_required": "This page is for people who can write to the repository."
+    },
+    "profile": {
+      "avatar": "Avatar",
+      "avatar_hint": "PNG, JPEG, GIF or WebP, at most 512 KiB.",
+      "bio": "Bio",
+      "change_password": "Change password",
+      "confirm_current_email": "Mail me a confirmation link",
+      "confirm_password": "Repeat the new password",
+      "current_email": "Current address:",
+      "current_password": "Current password",
+      "delete": "Delete account",
+      "delete_button": "Delete my account",
+      "delete_confirm": "Delete this account and every repository it owns? This cannot be undone.",
+      "delete_hint": "Deletes the account and every repository it owns. Organizations it owns must be transferred or deleted first.",
+      "delete_password": "Your password",
+      "delete_username": "Type your username to confirm",
+      "display_name": "Display name",
+      "email": "Email address",
+      "email_unconfirmable": "Not confirmed: this instance cannot send mail, so addresses here are not confirmed.",
+      "email_unverified": "Not confirmed yet.",
+      "email_verified": "Confirmed",
+      "external_account": "This account signs in through an identity provider, which holds its password and email address.",
+      "new_email": "New address",
+      "new_password": "New password",
+      "password": "Password",
+      "password_changed": "Password changed. Every other session was signed out; access tokens and SSH keys still work.",
+      "password_to_confirm": "Your password",
+      "passwords_differ": "The two new passwords differ.",
+      "profile": "Profile",
+      "remove_avatar": "Remove",
+      "retry": "Retry",
+      "save": "Save profile",
+      "saved": "Profile saved.",
+      "send_confirmation": "Send confirmation link",
+      "title": "Profile and account",
+      "upload_avatar": "Upload a picture"
     }
   },
   "commit": {

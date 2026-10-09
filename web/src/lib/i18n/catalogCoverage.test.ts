@@ -331,14 +331,20 @@ describe('translation catalogs', () => {
 });
 
 describe('translation catalog coverage', () => {
-	it('keeps every static translation without an explicit fallback in both catalogs', () => {
+	// A string fallback is not an exemption. It is what renders while a key is
+	// missing, so a key that lives *only* in its fallback renders in English in
+	// every locale and nothing turns red: the profile settings page and the
+	// email confirmation page shipped that way, every line of them, to zh-CN
+	// users (card_0c8035b42097). The fallback stays legitimate as a guard for a
+	// catalog that has not loaded; the key still has to exist in both.
+	it('keeps every static translation in both catalogs, with a fallback or without', () => {
 		const catalogs = [
 			['en', en],
 			['zh-CN', zhCN]
 		] as const;
 		const missing = calls
 			.filter((call): call is TranslationCall & { key: string } =>
-				call.key !== null && !call.hasStringFallback
+				call.key !== null
 			)
 			.flatMap((call) =>
 				catalogs

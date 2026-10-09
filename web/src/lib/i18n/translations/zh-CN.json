@@ -70,7 +70,8 @@
     "home_label": "Plombir Git 首页",
     "user_menu": "用户菜单",
     "notification_settings": "通知设置",
-    "menu": "菜单"
+    "menu": "菜单",
+    "profile": "个人资料"
   },
   "author": {
     "bot": "机器人",
@@ -207,7 +208,8 @@
       "footer": "已有账号？{link}",
       "footer_link": "登录",
       "failed": "注册失败",
-      "closed": "此实例已关闭自助注册。请联系管理员为您创建账户。"
+      "closed": "此实例已关闭自助注册。请联系管理员为您创建账户。",
+      "confirmation_sent": "请查收邮件：我们已发送一个确认该地址的链接。打开链接后账户才会创建。"
     },
     "back_to_login": "返回登录",
     "password_rules": {
@@ -266,7 +268,17 @@
       "server_error": "使用 {provider} 登录时服务器出错。请稍后重试。",
       "failed": "使用 {provider} 登录失败。请重试。"
     },
-    "password_policy": "至少 {min} 个字符，需包含大写字母、小写字母、数字和符号；不能是用户名，也不能是常见密码。"
+    "password_policy": "至少 {min} 个字符，需包含大写字母、小写字母、数字和符号；不能是用户名，也不能是常见密码。",
+    "verify_email": {
+      "confirm": "确认地址",
+      "explain": "请确认此地址属于您，以完成操作。",
+      "moved": "您的账户现在使用此地址：",
+      "no_token": "此链接不包含确认令牌。请重新打开邮件中的链接。",
+      "title": "确认您的邮箱地址",
+      "to_settings": "返回个人资料",
+      "verified": "此地址已确认：",
+      "working": "确认中…"
+    }
   },
   "dashboard": {
     "title": "仪表板",
@@ -1056,7 +1068,8 @@
     "help_state": "按问题状态筛选",
     "help_label": "按标签筛选",
     "help_tip": "示例：bug fix repo:owner/name state:open",
-    "keyboard_hint": "提示：按 Ctrl+K 聚焦搜索框"
+    "keyboard_hint": "提示：按 Ctrl+K 聚焦搜索框",
+    "load_failed": "搜索失败"
   },
   "releases": {
     "title": "发布",
@@ -1467,6 +1480,42 @@
     "access": {
       "admin_required": "此页面仅供仓库管理员使用。",
       "write_required": "此页面仅供对仓库有写权限的用户使用。"
+    },
+    "profile": {
+      "avatar": "头像",
+      "avatar_hint": "PNG、JPEG、GIF 或 WebP，最大 512 KiB。",
+      "bio": "简介",
+      "change_password": "修改密码",
+      "confirm_current_email": "向我发送确认链接",
+      "confirm_password": "再次输入新密码",
+      "current_email": "当前地址：",
+      "current_password": "当前密码",
+      "delete": "删除账户",
+      "delete_button": "删除我的账户",
+      "delete_confirm": "删除此账户及其拥有的所有仓库？此操作无法撤销。",
+      "delete_hint": "删除账户及其拥有的所有仓库。其拥有的组织必须先转让或删除。",
+      "delete_password": "您的密码",
+      "delete_username": "输入您的用户名以确认",
+      "display_name": "显示名称",
+      "email": "邮箱地址",
+      "email_unconfirmable": "未确认：此实例无法发送邮件，因此这里的地址不会被确认。",
+      "email_unverified": "尚未确认。",
+      "email_verified": "已确认",
+      "external_account": "此账户通过身份提供方登录，其密码和邮箱地址由该提供方管理。",
+      "new_email": "新地址",
+      "new_password": "新密码",
+      "password": "密码",
+      "password_changed": "密码已修改。其他所有会话均已退出；访问令牌和 SSH 密钥仍然有效。",
+      "password_to_confirm": "您的密码",
+      "passwords_differ": "两次输入的新密码不一致。",
+      "profile": "个人资料",
+      "remove_avatar": "移除",
+      "retry": "重试",
+      "save": "保存个人资料",
+      "saved": "个人资料已保存。",
+      "send_confirmation": "发送确认链接",
+      "title": "个人资料与账户",
+      "upload_avatar": "上传图片"
     }
   },
   "commit": {
