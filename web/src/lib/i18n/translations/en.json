@@ -205,7 +205,9 @@
       "footer": "Already have an account? {link}",
       "footer_link": "Sign in",
       "failed": "Registration failed",
-      "closed": "Self-service sign-up is closed on this instance. Ask an administrator for an account."
+      "closed": "Self-service sign-up is closed on this instance. Ask an administrator for an account.",
+      "setup_token": "Setup token",
+      "setup_token_hint": "This instance has no account yet. Paste the one-time setup token printed in the server's startup log (also kept beside the encryption key as setup_token); the first account becomes the administrator."
     },
     "back_to_login": "Back to Login",
     "password_rules": {

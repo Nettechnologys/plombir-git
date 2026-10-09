@@ -62,6 +62,15 @@ pub struct InstanceInfo {
     /// the repository without claiming a commit, and the UI can say the commit
     /// is unknown instead of linking a wrong one.
     pub source_commit: Option<String>,
+    /// Whether this instance is still waiting for its first account, which
+    /// `POST /users/register` admits only with the one-time setup token from
+    /// the server's startup log. The register page shows the token field on
+    /// the strength of this flag.
+    ///
+    /// Anonymous on purpose: it tells a visitor nothing the register endpoint
+    /// would not — the refusal names the token too — and the only party who
+    /// can act on it is the operator who has the log.
+    pub setup_required: bool,
     /// Whether self-service sign-up would be accepted right now: `false` on a
     /// `[auth].registration = "closed"` instance once its first account exists.
     ///
@@ -84,6 +93,20 @@ pub struct InstanceInfo {
 pub async fn get_instance(State(state): State<AppState>) -> impl IntoResponse {
     let settings = state.instance_settings.get(&state.db).await;
     let source_commit = build_info::source_commit().known();
+    // An unreadable user table answers "no setup pending": the page then shows
+    // no token field, and the register endpoint — which refuses outright when
+    // it cannot count — stays the authority.
+    let setup_required =
+        match rg_core::user::registration::setup_required(&state.db, &state.setup_token).await {
+            Ok(required) => required,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "could not tell whether the instance is waiting for its first account"
+                );
+                false
+            }
+        };
     // Only a closed instance has to ask the database, and a read that failed
     // hides the link rather than offering a door the route would refuse.
     let registration_open =
@@ -108,6 +131,7 @@ pub async fn get_instance(State(state): State<AppState>) -> impl IntoResponse {
             attestation_enabled: state.attestation_enabled,
             source_url: build_info::source_link(&state.source_url, source_commit),
             source_commit: source_commit.map(str::to_string),
+            setup_required,
             registration_open,
         }),
     )

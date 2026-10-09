@@ -15,6 +15,9 @@
 
 [server]
 repo_root = "/data/repos"
+# Every interface *of the container* — the only way the published port reaches
+# it. The built-in default is 127.0.0.1:8080; docker-compose.yml is what keeps
+# this on the host's loopback (`127.0.0.1:8080:8080`).
 http_addr = "0.0.0.0:8080"
 ssh_addr = "0.0.0.0:2222"
 # The SSH host key is generated on first start and kept in the data directory,
@@ -44,13 +47,16 @@ url = "sqlite:///data/plombir-git.db?mode=rwc"
 # encryption_key = "..."
 # key_file = "/data/encryption_key"
 #
-# Whether strangers may create accounts on this instance. "closed" makes
-# POST /api/v1/users/register answer 403 — the first account (on an empty
-# instance) and LDAP/SSO auto-provision still go through. [rate_limit].auth_max
-# below only throttles sign-up; this is what refuses it. Set it to "closed"
-# before exposing the HTTP port to anything you do not control.
+# Whether strangers may create accounts on this instance. "closed" (the
+# built-in default) makes POST /api/v1/users/register answer 403 — the first
+# account on an empty instance still goes through, but only with the one-time
+# setup token from the container's first-start log (`docker compose logs`),
+# or via `docker compose exec plombir-git plombir-git create-admin …`; LDAP/SSO
+# auto-provision is unaffected. [rate_limit].auth_max below only throttles
+# sign-up; this is what refuses it. Say "open" only once a TLS proxy is in
+# front and strangers are meant to sign up.
 # Also settable as PLOMBIR_GIT_REGISTRATION in deploy/.env, which wins.
-registration = "open"
+registration = "closed"
 
 # Keep custom OIDC discovery, client secrets and access tokens on HTTPS. A
 # legacy IdP without TLS must be named by exact HTTP origin; paths, wildcards,

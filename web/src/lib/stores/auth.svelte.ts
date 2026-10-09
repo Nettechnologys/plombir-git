@@ -227,11 +227,12 @@ export async function register(
   username: string,
   email: string,
   password: string,
+  setupToken?: string,
 ): Promise<boolean | 'confirmation_sent'> {
   isLoading = true;
   error = null;
   try {
-    const res = await auth.register(username, email, password);
+    const res = await auth.register(username, email, password, setupToken);
     if ('status' in res && res.status === 'confirmation_sent') {
       return 'confirmation_sent';
     }

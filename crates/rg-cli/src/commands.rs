@@ -114,6 +114,154 @@ pub(crate) fn cmd_gen_secret() {
     println!("{}", admin::generate_jwt_secret());
 }
 
+/// `plombir-git create-admin` — the host-side way to the first administrator.
+///
+/// Security audit finding #13: the first registration on an empty instance
+/// becomes its administrator, so until the setup token existed the first start
+/// was a race against whoever reached the port first. The token closes the
+/// race over HTTP; this command is the other door, for the operator who has the
+/// database in hand and no browser. It also promotes an existing account, which
+/// is what an instance whose only administrator left needs.
+///
+/// The password is never an argument: `ps` shows argv to every account on the
+/// host for as long as the process runs. It is read from the terminal with echo
+/// off, or from stdin for scripts (`--password-stdin`).
+pub(crate) async fn cmd_create_admin(
+    username: String,
+    email: String,
+    password_stdin: bool,
+    db_url: Option<String>,
+    cfg: Option<&config::ConfigFile>,
+) -> anyhow::Result<()> {
+    use rg_core::user::service::AdminBootstrap;
+
+    init_cli_logging();
+    let db_url = config::resolve_db_url(db_url, cfg);
+    // The setup token the running server may be waiting for lives beside the
+    // encryption key; creating the first account retires it.
+    let setup_token_path =
+        rg_core::user::registration::SetupToken::path_beside(&config::resolve_encryption_key_file(
+            cfg,
+            cfg.and_then(|config| config.server.host_key.as_deref()),
+        ));
+
+    // An ordinary pool, on purpose: this writes one row through one statement
+    // (an insert, or the admin flag on an existing row), and the usual moment
+    // to run it is while the server is up and waiting for its first account.
+    let db = dbconn::connect_online(
+        &db_url,
+        "plombir-git create-admin",
+        dbconn::OnlineAccess::SingleRowWrite,
+    )
+    .await?;
+
+    let was_empty = !rg_db::ops::user_ops::has_any(&db).await?;
+    let outcome = match rg_db::ops::user_ops::find_by_username(&db, &username).await? {
+        Some(existing) => rg_core::user::service::promote_to_admin(&db, existing).await?,
+        None => {
+            let password = read_new_password(password_stdin)?;
+            rg_core::user::service::create_admin_account(&db, &username, &email, &password).await?;
+            AdminBootstrap::Created
+        }
+    };
+
+    if was_empty {
+        match std::fs::remove_file(&setup_token_path) {
+            Ok(()) => tracing::info!(
+                path = %setup_token_path.display(),
+                "the one-time setup token was removed; the instance has its administrator"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %setup_token_path.display(),
+                error = %error,
+                "could not remove the setup token; it opens nothing any more, delete it by hand"
+            ),
+        }
+    }
+
+    match outcome {
+        AdminBootstrap::Created => println!("created instance administrator '{username}'"),
+        AdminBootstrap::Promoted => println!("promoted '{username}' to instance administrator"),
+        AdminBootstrap::AlreadyAdmin => {
+            println!("'{username}' is an instance administrator already; nothing changed")
+        }
+    }
+    Ok(())
+}
+
+/// The password for a new account: the first line of stdin, or two matching
+/// entries typed at the terminal with echo off.
+fn read_new_password(from_stdin: bool) -> anyhow::Result<String> {
+    use std::io::{BufRead, Write};
+
+    if from_stdin {
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .context("read the password from stdin")?;
+        let password = line.trim_end_matches(['\r', '\n']).to_owned();
+        anyhow::ensure!(
+            !password.is_empty(),
+            "--password-stdin: standard input held no password"
+        );
+        return Ok(password);
+    }
+
+    let mut stderr = std::io::stderr();
+    write!(stderr, "Password for the new administrator: ")?;
+    stderr.flush()?;
+    let first = read_line_without_echo()?;
+    write!(stderr, "Repeat the password: ")?;
+    stderr.flush()?;
+    let second = read_line_without_echo()?;
+    anyhow::ensure!(first == second, "the two passwords differ; nothing created");
+    anyhow::ensure!(!first.is_empty(), "an empty password; nothing created");
+    Ok(first)
+}
+
+/// One line from the terminal with echo switched off for its duration. Falls
+/// back to a plain read when stdin is not a terminal, which is the
+/// `--password-stdin` case spelled without the flag.
+fn read_line_without_echo() -> anyhow::Result<String> {
+    use std::io::BufRead;
+
+    #[cfg(unix)]
+    let restore = {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stdin().as_raw_fd();
+        // SAFETY: `termios` is plain data; both calls take a valid fd and a
+        // pointer to this stack value, and the result is checked.
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } == 0 {
+            let original = unsafe { original.assume_init() };
+            let mut quiet = original;
+            quiet.c_lflag &= !libc::ECHO;
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } == 0 {
+                Some((fd, original))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+
+    #[cfg(unix)]
+    if let Some((fd, original)) = restore {
+        // SAFETY: restoring the attributes read above on the same fd.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+        eprintln!();
+    }
+
+    read.context("read the password from the terminal")?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+}
+
 /// `plombir-git rotate-instance-key` — replace this instance's provenance
 /// signing key.
 ///

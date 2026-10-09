@@ -25574,7 +25574,7 @@
         {
           "tag": "form",
           "label": ")}",
-          "line": 61,
+          "line": 83,
           "via": null,
           "href": null,
           "handler": "handleSubmit",
@@ -25584,7 +25584,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.register.submitting",
-          "line": 86,
+          "line": 116,
           "via": null,
           "href": null,
           "handler": null,
@@ -25594,7 +25594,7 @@
         {
           "tag": "a",
           "label": "i18n:auth.register.footer_link",
-          "line": 94,
+          "line": 124,
           "via": null,
           "href": "/login",
           "handler": null,
@@ -25602,7 +25602,22 @@
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "instance.get",
+          "method": "GET",
+          "url": "/api/v1/instance",
+          "opaque": false,
+          "routeUrl": "/api/v1/instance",
+          "access": "Public",
+          "handler": "api::instance::get_instance",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/reset-password",
@@ -27051,7 +27066,7 @@
       "outsider"
     ],
     "scenarios": 46,
-    "inventoryEntries": 762,
+    "inventoryEntries": 763,
     "coveredEntries": 171,
     "coveredRoutes": 162,
     "maxUiRoutesWithoutFrontendTest": 26

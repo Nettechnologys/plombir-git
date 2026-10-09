@@ -142,6 +142,11 @@ fn ensure_key_file(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn ensure_setup_token_file(path: &Path) -> anyhow::Result<()> {
+    rg_core::platform::fs::create_dir_all_owner_only(parent)?;
+    Ok(())
+}
+
 pub(crate) async fn run_serve() -> anyhow::Result<()> {
     std::fs::create_dir_all(&repo_root)?;
     Ok(())
@@ -246,7 +251,7 @@ pub(crate) async fn cmd_list_tombstones(repo_root: Option<String>) -> anyhow::Re
 }
 `,
       }),
-    contains: 'DIRECTORY_CREATORS says 3',
+    contains: 'DIRECTORY_CREATORS says 4',
   },
   {
     name: 'an extra site spelled the owner-only way is still a site',
@@ -280,7 +285,7 @@ pub(crate) async fn cmd_list_tombstones(repo_root: Option<String>) -> anyhow::Re
 }
 `,
       }),
-    contains: 'serve.rs creates directories at 4 site(s)',
+    contains: 'serve.rs creates directories at 5 site(s)',
   },
   {
     name: 'a `#[cfg(test)]` directory is not an inventory entry',

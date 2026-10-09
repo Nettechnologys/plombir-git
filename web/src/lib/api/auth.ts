@@ -60,10 +60,16 @@ export interface SsoLink {
 }
 
 export const auth = {
-  register: (username: string, email: string, password: string) =>
+  // `setupToken` is the one-time secret the first account on an empty
+  // instance has to present (`GET /instance` says when: `setup_required`).
+  // Left out of the body entirely when absent, so an ordinary registration
+  // looks exactly as it always did.
+  register: (username: string, email: string, password: string, setupToken?: string) =>
     request<RegisterResponse>('/users/register', {
       method: 'POST',
-      body: JSON.stringify({ username, email, password }),
+      body: JSON.stringify(
+        setupToken ? { username, email, password, setup_token: setupToken } : { username, email, password },
+      ),
     }),
   login: (username: string, password: string) =>
     request<AuthLoginResponse>('/users/login', {

@@ -578,7 +578,13 @@ pub(crate) fn write_test_config(
 /// were silently ignored, first by `plombir-git serve --config …` and then by
 /// every other subcommand.
 pub(crate) const DEFAULT_REPO_ROOT: &str = "./repos";
-pub(crate) const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8080";
+// Loopback, not every interface: a server that is reachable from the network
+// before its operator has read the config is the deployment the security audit
+// found (finding #13). A reverse proxy on the same host reaches it; anything
+// else is an explicit `http_addr = "0.0.0.0:8080"`. The Docker template keeps
+// `0.0.0.0` because inside the container that is the only way out, and the
+// compose file publishes the port on `127.0.0.1`.
+pub(crate) const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
 pub(crate) const DEFAULT_SSH_ADDR: &str = "0.0.0.0:2222";
 pub(crate) const DEFAULT_DB_URL: &str = "sqlite://./plombir-git.db?mode=rwc";
 pub(crate) const DEFAULT_SMTP_PORT: u16 = 587;
@@ -2131,7 +2137,7 @@ mod tests {
     /// rows that happen to be right today — a new `key = 42` line is either
     /// paired with the code that produces the 42, or declared here with a
     /// reason.
-    const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 31] = [
+    const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 32] = [
         (
             "plombir-git.example.toml",
             "observability",
@@ -2263,6 +2269,15 @@ mod tests {
             "host_key",
             "a path inside the container: the host key has to live on the volume so \
              client known_hosts entries survive a rebuild",
+        ),
+        (
+            "deploy/plombir-git.docker.toml",
+            "server",
+            "http_addr",
+            "every interface of the container, deliberately against the loopback code \
+             default (security audit finding #13): a published port cannot reach a \
+             server bound to the container's 127.0.0.1, and docker-compose.yml is what \
+             keeps the port on the host's loopback",
         ),
         (
             "deploy/plombir-git.docker.toml",
@@ -3383,7 +3398,7 @@ max_files = 7
 
         assert_eq!(resolved.repo_root, "./repos");
         assert_eq!(resolved.db_url, "sqlite://./plombir-git.db?mode=rwc");
-        assert_eq!(resolved.http_addr, "0.0.0.0:8080");
+        assert_eq!(resolved.http_addr, "127.0.0.1:8080");
         assert_eq!(resolved.ssh_addr, "0.0.0.0:2222");
     }
 
