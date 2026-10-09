@@ -56,6 +56,8 @@ function artifact() {
 beforeEach(() => {
 	vi.clearAllMocks();
 	resetTestClient();
+	// The write controls under test are offered to writers only (card_270a0a77fd79).
+	routeRepos.get.mockResolvedValue({ default_branch: 'main', viewer_permission: 'admin' });
 	setTestPage('/alice/demo/pipelines', { owner: 'alice', repo: 'demo' });
 	routePipelines.list.mockResolvedValue({
 		data: [pipelineDetail().pipeline],

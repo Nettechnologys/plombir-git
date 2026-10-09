@@ -717,7 +717,6 @@ pub(crate) fn stamp_security(
             crate::api::sso::SsoProviderInfo,
             crate::api::sso::SsoLinkInfo,
             crate::api::sso::SsoLinkStart,
-            crate::api::sso::LoginResponse,
             crate::api::webhooks_external::ExternalCiWebhook,
             crate::api::webhooks_external::ExternalCiResponse,
             crate::api::audit::AuditLogEntry,

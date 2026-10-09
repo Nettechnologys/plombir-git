@@ -62,6 +62,14 @@ pub struct InstanceInfo {
     /// the repository without claiming a commit, and the UI can say the commit
     /// is unknown instead of linking a wrong one.
     pub source_commit: Option<String>,
+    /// Whether self-service sign-up would be accepted right now: `false` on a
+    /// `[auth].registration = "closed"` instance once its first account exists.
+    ///
+    /// Anonymous on purpose: it decides whether the sign-in page offers a
+    /// "Create an account" link at all, which a visitor without an account is
+    /// the one to see (card_e1baa94866ed). It says nothing the register route
+    /// does not already answer with its `403`.
+    pub registration_open: bool,
 }
 
 /// GET /api/v1/instance — the public announcement of this instance.
@@ -76,6 +84,21 @@ pub struct InstanceInfo {
 pub async fn get_instance(State(state): State<AppState>) -> impl IntoResponse {
     let settings = state.instance_settings.get(&state.db).await;
     let source_commit = build_info::source_commit().known();
+    // Only a closed instance has to ask the database, and a read that failed
+    // hides the link rather than offering a door the route would refuse.
+    let registration_open =
+        match rg_core::user::registration::accepts_registrations(&state.db, state.registration)
+            .await
+        {
+            Ok(open) => open,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "could not tell whether registration is open; the sign-up link stays hidden"
+                );
+                false
+            }
+        };
     (
         StatusCode::OK,
         Json(InstanceInfo {
@@ -85,6 +108,7 @@ pub async fn get_instance(State(state): State<AppState>) -> impl IntoResponse {
             attestation_enabled: state.attestation_enabled,
             source_url: build_info::source_link(&state.source_url, source_commit),
             source_commit: source_commit.map(str::to_string),
+            registration_open,
         }),
     )
         .into_response()

@@ -1015,10 +1015,6 @@ enum AuthenticationFinalization {
     /// A non-interactive password door succeeded. Clear its strikes, but do not
     /// claim that a human browser login completed.
     FailuresOnly,
-    /// A standing credential or a capability derived from one was proved.
-    /// Touch no account state, but contend with retirement on the user row and
-    /// return the fresh owner which won that ordering.
-    StandingCredential,
 }
 
 async fn finalize_authentication_state_if_open(
@@ -1030,7 +1026,6 @@ async fn finalize_authentication_state_if_open(
         AuthenticationFinalization::PrimaryFactor => "primary login",
         AuthenticationFinalization::Completed => "completed login",
         AuthenticationFinalization::FailuresOnly => "login-failure reset",
-        AuthenticationFinalization::StandingCredential => "standing credential owner finalization",
     };
     crate::contention::retry_transaction(operation, || async move {
         let transaction = db
@@ -1089,15 +1084,6 @@ async fn finalize_authentication_state_if_open(
                     .col_expr(
                         user::Column::LockedUntil,
                         Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
-                    ),
-                // A self-assignment is deliberate. It takes the same row-level
-                // write lock as `begin_user_retirement` without claiming that
-                // credential use edited the account. MySQL may report zero for
-                // it; the scoped re-read below is the portable success test.
-                AuthenticationFinalization::StandingCredential => UserEntity::update_many()
-                    .col_expr(
-                        user::Column::SessionVersion,
-                        Expr::col(user::Column::SessionVersion).into(),
                     ),
             };
             let update = update
@@ -1169,22 +1155,33 @@ pub async fn reset_login_failures_if_open(
 /// Finalize a standing credential or derived-capability proof while its owner
 /// remains open.
 ///
-/// PAT, SSH-key, LFS action-URL and OCI scoped-token verification happen before
-/// an authenticated continuation is published. This conditional no-op update
-/// contends with account retirement between those acts and returns the fresh
-/// owner from the same retryable transaction. `None` is retirement or physical
-/// deletion; database failure is still `Err`. No login counters, timestamps,
-/// or session generation change.
+/// PAT, SSH-key and LFS action-URL verification, and the job-log socket's
+/// periodic re-check, happen before an authenticated continuation is
+/// published, and the owner may be retired or
+/// deleted in between. This is the fresh read of the owner that decides it:
+/// `None` is retirement or physical deletion, a database failure is still
+/// `Err`, and nothing about the account changes.
+///
+/// It is a read on purpose (card_b83b9bc36e3a). It used to be a no-op
+/// `UPDATE … SET session_version = session_version` so it would take the row
+/// lock `begin_user_retirement` takes — which made every `git clone`, LFS
+/// object, registry layer and bot call a write transaction serialised on
+/// SQLite's single writer. The lock bought no ordering a read does not give:
+/// retirement claims the account with one autocommit `UPDATE`, so the read
+/// either sees that claim committed and refuses, or runs before it and the
+/// request is ordered ahead of the retirement — exactly the two outcomes the
+/// update had, since it too released its lock before the request went on.
+/// Nothing in retirement waits for, or re-checks, requests that already
+/// passed this point under either design.
 pub async fn finalize_standing_credential_owner(
     db: &DatabaseConnection,
     user_id: i64,
 ) -> Result<Option<User>> {
-    finalize_authentication_state_if_open(
-        db,
-        user_id,
-        AuthenticationFinalization::StandingCredential,
-    )
-    .await
+    UserEntity::find_by_id(user_id)
+        .filter(user::Column::DeletedAt.is_null())
+        .one(db)
+        .await
+        .context("db: read standing credential owner")
 }
 
 /// Increment failed login attempts and lock account if threshold exceeded.

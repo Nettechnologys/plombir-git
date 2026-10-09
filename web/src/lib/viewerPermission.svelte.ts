@@ -14,6 +14,10 @@ import { canWriteRepo, isRepoAdmin, loadViewerPermission } from '$lib/repoPermis
  */
 export function viewerPermission(owner: () => string, repo: () => string) {
   let current = $state<RepoPermission | null>(null);
+  // Whether the answer for the current repository has arrived. `current` is
+  // `null` both while asking and for an anonymous reader; a page that has to
+  // choose between "wait" and "you may not" reads this.
+  let settled = $state(false);
   const requests = new LatestRepositoryRequestFence();
 
   $effect(() => {
@@ -21,14 +25,21 @@ export function viewerPermission(owner: () => string, repo: () => string) {
     const expectedRepo = repo();
     const claim = requests.begin(expectedOwner, expectedRepo);
     current = null;
+    settled = false;
     void loadViewerPermission(expectedOwner, expectedRepo).then((permission) => {
-      if (requests.owns(claim, owner(), repo())) current = permission;
+      if (requests.owns(claim, owner(), repo())) {
+        current = permission;
+        settled = true;
+      }
     });
   });
 
   return {
     get current() {
       return current;
+    },
+    get settled() {
+      return settled;
     },
     get canWrite() {
       return canWriteRepo(current);

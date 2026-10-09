@@ -7,7 +7,12 @@ import {
   buildColumnUpdatePayload,
 } from './boardForm';
 import { setTestPage } from '../test/app';
-import { boards, issues, resetTestClient } from '../test/client';
+import {
+	boards,
+	issues,
+	resetTestClient,
+	repos,
+} from '../test/client';
 import {
 	change,
 	click,
@@ -42,6 +47,8 @@ const boardResponse = {
 
 beforeEach(() => {
 	resetTestClient();
+	// The write controls under test are offered to writers only (card_270a0a77fd79).
+	repos.get.mockResolvedValue({ default_branch: 'main', viewer_permission: 'admin' });
 	setTestPage('/alice/demo/boards', { owner: 'alice', repo: 'demo' });
 	boards.list.mockResolvedValue([board]);
 	boards.get.mockResolvedValue(boardResponse);

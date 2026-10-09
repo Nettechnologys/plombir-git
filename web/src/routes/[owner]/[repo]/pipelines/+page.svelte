@@ -13,11 +13,19 @@
     type RepositoryResourceRequestClaim,
   } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
+  import { getUser } from '$lib/stores/auth.svelte';
 
   const t = createT();
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
+  // Running, retrying, cancelling, playing a manual job and deleting an
+  // artifact are `RepoWrite`; approving an environment is `RepoAuthRead` and
+  // the server checks the reviewer list itself (card_270a0a77fd79).
+  const permission = viewerPermission(() => owner, () => repo);
+  const canWrite = $derived(permission.canWrite);
+  const signedIn = $derived(Boolean(getUser()));
   let pipelineList = $state<any[]>([]);
   let selectedPipeline = $state<any>(null);
   let selectedPipelineId = $state<number | null>(null);
@@ -720,6 +728,7 @@
 <div class="page-container">
   <RepoHeader {owner} {repo} activeTab="pipelines" />
 
+  {#if canWrite}
   <form class="pipeline-trigger" onsubmit={handleTrigger}>
     <div class="trigger-field">
       <label for="pipeline-trigger-ref">{t('pipeline.run_ref')}</label>
@@ -800,6 +809,7 @@
       {triggering ? t('pipeline.starting') : t('pipeline.run_pipeline')}
     </button>
   </form>
+  {/if}
 
   {#if error}
     <div class="error-banner">{error}</div>
@@ -847,10 +857,10 @@
             <h2>{t('pipeline.detail_title', { id: String(selectedPipeline.id) })}</h2>
             <PipelineBadge status={selectedPipeline.status} />
             <div class="detail-actions">
-              {#if selectedPipeline.status === 'failed' || selectedPipeline.status === 'failure' || selectedPipeline.status === 'error'}
+              {#if canWrite && (selectedPipeline.status === 'failed' || selectedPipeline.status === 'failure' || selectedPipeline.status === 'error')}
                 <button class="btn-outline" disabled={busyPipelineIds.has(selectedPipeline.id)} onclick={() => handleRetry(selectedPipeline.id)}>{t('pipeline.retry')}</button>
               {/if}
-              {#if selectedPipeline.status === 'running' || selectedPipeline.status === 'pending' || selectedPipeline.status === 'manual' || selectedPipeline.status === 'waiting_approval'}
+              {#if canWrite && (selectedPipeline.status === 'running' || selectedPipeline.status === 'pending' || selectedPipeline.status === 'manual' || selectedPipeline.status === 'waiting_approval')}
                 <button class="btn-outline btn-danger" disabled={busyPipelineIds.has(selectedPipeline.id)} onclick={() => handleCancel(selectedPipeline.id)}>{t('pipeline.cancel')}</button>
               {/if}
             </div>
@@ -910,10 +920,10 @@
                         {#if job.exit_code !== null}
                           <span class="exit-code">{job.exit_code}</span>
                         {/if}
-                        {#if job.status === 'manual'}
+                        {#if job.status === 'manual' && canWrite}
                           <button class="play-job" disabled={busyJobIds.has(job.id)} onclick={(event) => { event.stopPropagation(); handlePlay(job.id); }}>{t('pipeline.play_manual')}</button>
                         {/if}
-                        {#if job.status === 'waiting_approval'}
+                        {#if job.status === 'waiting_approval' && signedIn}
                           <button class="play-job" disabled={busyJobIds.has(job.id) || approvedJobs.includes(job.id)} onclick={(event) => { event.stopPropagation(); handleApprove(job.id); }}>{approvedJobs.includes(job.id) ? t('pipeline.approval_recorded') : t('pipeline.approve_environment')}</button>
                         {/if}
                       </div>
@@ -955,11 +965,13 @@
                       disabled={downloadingArtifactId !== null || deletingArtifactId === artifact.id}
                       onclick={() => downloadArtifact(artifact)}
                     >{downloadingArtifactId === artifact.id ? t('pipeline.artifact_downloading') : t('pipeline.artifact_download')}</button>
-                    <button
-                      class="btn-outline artifact-delete"
-                      disabled={deletingArtifactId !== null || downloadingArtifactId === artifact.id}
-                      onclick={() => deleteArtifact(artifact)}
-                    >{deletingArtifactId === artifact.id ? t('pipeline.artifact_deleting') : t('pipeline.artifact_delete')}</button>
+                    {#if canWrite}
+                      <button
+                        class="btn-outline artifact-delete"
+                        disabled={deletingArtifactId !== null || downloadingArtifactId === artifact.id}
+                        onclick={() => deleteArtifact(artifact)}
+                      >{deletingArtifactId === artifact.id ? t('pipeline.artifact_deleting') : t('pipeline.artifact_delete')}</button>
+                    {/if}
                   </li>
                 {/each}
               </ul>

@@ -1005,6 +1005,10 @@ pub(crate) async fn run_serve(
         .as_ref()
         .map(|c| c.timeouts.db_idle_secs)
         .unwrap_or_else(default_db_idle_timeout);
+    let resolved_db_max_connections = match cfg.as_ref().and_then(|c| c.database.max_connections) {
+        Some(configured) => configured,
+        None => rg_db::default_max_connections(&resolved_db_url)?,
+    };
 
     // Range-check the numeric knobs before anything consumes them: reject a
     // silently-accepted `0` (e.g. `db_connect_secs = 0`) with a clear message
@@ -1019,6 +1023,10 @@ pub(crate) async fn run_serve(
     require_positive(
         "rate_limit.agent_window_secs",
         resolved_rate_limit_agent_window,
+    )?;
+    require_positive(
+        "database.max_connections",
+        u64::from(resolved_db_max_connections),
     )?;
 
     // ── Initialize logging + tracing ───────────────────────────
@@ -1183,6 +1191,7 @@ pub(crate) async fn run_serve(
         &repo_root,
         resolved_db_connect_timeout,
         resolved_db_idle_timeout,
+        resolved_db_max_connections,
     )
     .await?;
     let db = server_db.connection().clone();

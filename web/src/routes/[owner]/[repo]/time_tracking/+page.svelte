@@ -7,11 +7,15 @@
     LatestRepositoryResourceRequestFence,
   } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
 
   const t = createT();
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
+  // Logging and deleting time are `RepoWrite` (card_270a0a77fd79).
+  const permission = viewerPermission(() => owner, () => repo);
+  const canWrite = $derived(permission.canWrite);
 
   // Issue selector
   let issueList = $state<any[]>([]);
@@ -310,7 +314,7 @@
     </aside>
 
     <!-- Main panel -->
-    <main class="main-panel">
+    <div class="main-panel">
       {#if !selectedIssue}
         <div class="select-hint">
           <p>{t('time_tracking.select_hint')}</p>
@@ -342,6 +346,7 @@
         </div>
 
         <!-- Add entry form -->
+        {#if canWrite}
         <div class="form-card">
           <h3>{t('repo.time_tracking.add_entry')}</h3>
           <div class="form-row">
@@ -360,6 +365,7 @@
             </div>
           </div>
         </div>
+        {/if}
 
         <!-- Entries table -->
         {#if entriesLoading}
@@ -383,7 +389,7 @@
                   <td class="note-cell">{entry.description || '—'}</td>
                   <td class="date-cell">{entry.created_at?.slice(0, 10) || ''}</td>
                   <td class="act-cell">
-                    <button class="btn-danger btn-sm" onclick={() => handleDelete(entry.id)} disabled={mutationBusy}>{t('common.delete')}</button>
+                    {#if canWrite}<button class="btn-danger btn-sm" onclick={() => handleDelete(entry.id)} disabled={mutationBusy}>{t('common.delete')}</button>{/if}
                   </td>
                 </tr>
               {/each}
@@ -401,7 +407,7 @@
           {/if}
         {/if}
       {/if}
-    </main>
+    </div>
   </div>
 </div>
 

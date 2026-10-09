@@ -128,3 +128,23 @@ describe('linking an SSO provider from the account', () => {
 		expect(assign).toHaveBeenCalledWith('https://idp.example/authorize?state=s');
 	});
 });
+
+describe('a refused link coming back from the provider', () => {
+	// card_0d7c54cae647: the callback of a link started here redirects back
+	// here with `sso_error=<code>` instead of showing the browser JSON.
+	it('says the identity belongs to another account, by provider name', async () => {
+		routeAuth.listSsoProviders.mockResolvedValue([
+			{ slug: 'corp', name: 'Corporate SSO', provider_type: 'oidc', icon_url: null },
+		]);
+		vi.stubGlobal('location', {
+			...window.location,
+			search: '?sso_error=linked_elsewhere&provider=corp',
+		});
+
+		rendered = await renderComponent(SecurityPage);
+
+		expect(rendered.container.querySelector('[role="alert"]')?.textContent).toBe(
+			'This Corporate SSO identity is already linked to another account.',
+		);
+	});
+});

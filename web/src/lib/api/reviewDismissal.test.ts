@@ -19,6 +19,7 @@ import {
 	pulls as routePulls,
 	reviews as routeReviews,
 	resetTestClient,
+	repos,
 } from '../test/client';
 import { click, element, input, renderComponent, type RenderedComponent } from '../test/render';
 import { reviews } from './pulls';
@@ -71,6 +72,8 @@ function timelineEvent(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
 	vi.clearAllMocks();
 	resetTestClient();
+	// The write controls under test are offered to writers only (card_270a0a77fd79).
+	repos.get.mockResolvedValue({ default_branch: 'main', viewer_permission: 'admin' });
 	setTestPage('/alice/demo/pulls/7', { owner: 'alice', repo: 'demo', number: '7' });
 	routePulls.get.mockResolvedValue(pullRequest());
 	routePulls.diff.mockResolvedValue(null);

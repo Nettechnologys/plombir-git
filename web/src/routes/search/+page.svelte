@@ -753,4 +753,9 @@
     border-radius: 2px;
     font-weight: 600;
   }
+
+  /* Phone widths (card_c30077df5603): the type tabs scroll in one row. */
+  @media (max-width: 700px) {
+    .type-tabs { overflow-x: auto; }
+  }
 </style>

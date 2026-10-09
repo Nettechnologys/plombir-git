@@ -94,10 +94,7 @@ pub async fn list_stargazers(
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<Stargazer>, i64)> {
-    let base = RepoStarEntity::find()
-        .filter(repo_star::Column::RepoId.eq(repo_id))
-        .order_by_desc(repo_star::Column::CreatedAt)
-        .order_by_desc(repo_star::Column::Id);
+    let base = stargazers_query(repo_id);
 
     let total = base
         .clone()
@@ -126,6 +123,15 @@ pub async fn list_stargazers(
         .collect::<Result<Vec<_>>>()?;
 
     Ok((stargazers, total))
+}
+
+/// The ordered selection [`list_stargazers`] cuts a page from, kept apart so
+/// `query_plan_tests` explains the statement the server sends.
+pub(crate) fn stargazers_query(repo_id: i64) -> Select<RepoStarEntity> {
+    RepoStarEntity::find()
+        .filter(repo_star::Column::RepoId.eq(repo_id))
+        .order_by_desc(repo_star::Column::CreatedAt)
+        .order_by_desc(repo_star::Column::Id)
 }
 
 /// List the repositories this account has starred, one id per repository.

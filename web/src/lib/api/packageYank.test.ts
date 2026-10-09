@@ -19,7 +19,11 @@ import {
 } from './packageYank';
 import { packages } from './packages';
 import { setTestPage } from '../test/app';
-import { packages as routePackages, resetTestClient } from '../test/client';
+import {
+	packages as routePackages,
+	resetTestClient,
+	repos,
+} from '../test/client';
 import { button, click, element, renderComponent, type RenderedComponent } from '../test/render';
 
 let rendered: RenderedComponent | undefined;
@@ -30,6 +34,8 @@ const yankedVersion = { ...liveVersion, is_yanked: true };
 beforeEach(() => {
 	vi.clearAllMocks();
 	resetTestClient();
+	// The write controls under test are offered to writers only (card_270a0a77fd79).
+	repos.get.mockResolvedValue({ default_branch: 'main', viewer_permission: 'admin' });
 	setTestPage('/acme/tools/packages/npm/widget', {
 		owner: 'acme',
 		repo: 'tools',
