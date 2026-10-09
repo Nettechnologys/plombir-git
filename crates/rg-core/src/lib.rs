@@ -56,6 +56,7 @@ pub mod lfs;
 pub mod namespace; // Which first path segments the application already answers for
 pub mod net; // SSRF-hardened outbound HTTP for user-supplied URLs
 pub mod platform;
+pub mod retention; // Bounded windows for the tables every event appends to
 pub mod search; // Cross-platform abstractions
 pub mod staging; // The `.tmp/` spools of in-flight uploads, and the startup sweep that retires them
 pub mod task_tracker; // Drain-aware tracker for detached fire-and-forget delivery tasks

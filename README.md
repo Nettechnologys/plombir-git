@@ -651,6 +651,14 @@ monitoring alert on "the last backup is older than N hours". It covers the
 database only — repositories under `repo_root` need a volume snapshot of their
 own. See `deploy/README.md` for the details.
 
+Three tables grow with every event — webhook deliveries (each with its full
+payload and response), notifications, and login attempts (each with the
+client's IP address). `[retention]` keeps each to a window: by default 30 days
+of deliveries, 90 days of read and 365 of unread notifications, 180 days of
+login attempts. A notification still owed an e-mail is never deleted. The sweep
+deletes in bounded batches so it never holds the database's write lock for a
+whole backlog; `[retention].enabled = false` keeps every row.
+
 Run `plombir-git <command> --help` for the full flag list.
 
 `plombir-git package publish --token ...` follows the same boundary as the

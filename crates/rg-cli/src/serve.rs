@@ -24,7 +24,7 @@ use crate::config::{
     DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX, DEFAULT_AUTH_RATE_LIMIT_WINDOW,
     DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER, DEFAULT_CI_DOCKER,
     DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_METRICS_ENABLED,
-    DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
+    DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS, DEFAULT_RETENTION_ENABLED,
 };
 use crate::dbconn;
 use crate::telemetry;
@@ -1395,6 +1395,58 @@ pub(crate) async fn run_serve(
             "Scheduled database backups are OFF ([backup].enabled): this database is only backed \
              up when someone runs `plombir-git backup-db`. Note that repositories under repo_root \
              are never covered by a database backup — snapshot the data volume for those."
+        );
+        None
+    };
+
+    // ── Retention of append-only tables ───────────────────────────
+    // Webhook deliveries, notifications and login attempts are written on
+    // every event and nothing else ever deletes them. The windows are
+    // range-checked here, so a 0 fails the start rather than the first pass.
+    let retention_config = cfg.as_ref().map(|config| &config.retention);
+    let _retention_handle = if retention_config
+        .and_then(|config| config.enabled)
+        .unwrap_or(DEFAULT_RETENTION_ENABLED)
+    {
+        let defaults = rg_core::retention::RetentionConfig::default();
+        let config = rg_core::retention::RetentionConfig {
+            webhook_delivery_days: retention_config
+                .and_then(|config| config.webhook_delivery_days)
+                .unwrap_or(defaults.webhook_delivery_days),
+            notification_read_days: retention_config
+                .and_then(|config| config.notification_read_days)
+                .unwrap_or(defaults.notification_read_days),
+            notification_unread_days: retention_config
+                .and_then(|config| config.notification_unread_days)
+                .unwrap_or(defaults.notification_unread_days),
+            login_log_days: retention_config
+                .and_then(|config| config.login_log_days)
+                .unwrap_or(defaults.login_log_days),
+            interval_minutes: retention_config
+                .and_then(|config| config.interval_minutes)
+                .unwrap_or(defaults.interval_minutes),
+            batch_size: retention_config
+                .and_then(|config| config.batch_size)
+                .unwrap_or(defaults.batch_size),
+        };
+        tracing::info!(
+            webhook_delivery_days = config.webhook_delivery_days,
+            notification_read_days = config.notification_read_days,
+            notification_unread_days = config.notification_unread_days,
+            login_log_days = config.login_log_days,
+            "Retention sweep enabled"
+        );
+        Some(rg_core::retention::spawn_retention_with_shutdown(
+            db.clone(),
+            config,
+            Some(shutdown_rx.clone()),
+        )?)
+    } else {
+        // Said out loud, as for backups: "does this instance ever trim these
+        // tables?" should be answerable from the log.
+        tracing::info!(
+            "Retention sweep is OFF ([retention].enabled): webhook deliveries, notifications \
+             and login attempts are kept forever"
         );
         None
     };

@@ -235,6 +235,25 @@ archive_after_days = 90
 interval_minutes = 60
 batch_size = 1000
 
+[retention]
+# Webhook deliveries, notifications and login attempts are written on every
+# event and were never deleted. This sweep keeps each to a window; set
+# `enabled = false` to keep every row. Each value is a number of days (> 0).
+enabled = true
+# A delivery keeps the full request payload and the receiver's response body;
+# a hook's page shows the latest 50.
+webhook_delivery_days = 30
+# A read notification has done its job. An unread one is kept longer — it may
+# be the only record of something its recipient has not seen — but not
+# forever. A notification still owed an e-mail is never deleted.
+notification_read_days = 90
+notification_unread_days = 365
+# Each login attempt records the client's IP address and user agent.
+login_log_days = 180
+interval_minutes = 60
+# Rows deleted per statement (1-10000); a pass repeats batches until done.
+batch_size = 1000
+
 [backup]
 # In-process scheduled backups of the SQLite database (`VACUUM INTO`, safe to
 # take while the server is running). With this on, "are there backups?" is

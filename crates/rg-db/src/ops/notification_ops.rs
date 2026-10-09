@@ -333,3 +333,78 @@ pub async fn delete_for_subject(
         .context("db: delete notifications for subject")?;
     Ok(result.rows_affected)
 }
+
+/// Delete up to `limit` notifications nobody needs any more, oldest first, and
+/// return how many went.
+///
+/// "Nobody needs" is two ages, because the two states mean different things:
+///
+/// - a **read** notification has done its job; it stays visible in the "all"
+///   tab until `read_before`, and then goes;
+/// - an **unread** one may still be the only record of something its recipient
+///   has not seen, so it is kept much longer (`unread_before`) — but not
+///   forever: an abandoned account or a bot that never reads would otherwise
+///   accumulate rows for as long as the instance lives.
+///
+/// A row the mail dispatcher still owes a message for (`email_pending`) is
+/// never deleted, whatever its age: deleting it would silently cancel a mail
+/// the recipient asked for. Age is the later of `created_at` and `updated_at`,
+/// since a thread row that a new event folded into yesterday is yesterday's
+/// news, not last year's.
+///
+/// The sweep's batch: ids first, then a delete by key — see
+/// [`crate::ops::webhook_ops::delete_deliveries_before`]. The caller bounds
+/// `limit`.
+pub async fn delete_stale(
+    db: &DatabaseConnection,
+    read_before: chrono::DateTime<chrono::Utc>,
+    unread_before: chrono::DateTime<chrono::Utc>,
+    limit: u64,
+) -> Result<u64> {
+    use notification::Column;
+    let older_than = |cutoff: chrono::DateTime<chrono::Utc>| {
+        Condition::all().add(Column::CreatedAt.lt(cutoff)).add(
+            Condition::any()
+                .add(Column::UpdatedAt.is_null())
+                .add(Column::UpdatedAt.lt(cutoff)),
+        )
+    };
+    let stale = || {
+        Condition::all().add(Column::EmailPending.eq(false)).add(
+            Condition::any()
+                .add(
+                    Condition::all()
+                        .add(Column::IsRead.eq(true))
+                        .add(older_than(read_before)),
+                )
+                .add(
+                    Condition::all()
+                        .add(Column::IsRead.eq(false))
+                        .add(older_than(unread_before)),
+                ),
+        )
+    };
+    let ids: Vec<i64> = notification::Entity::find()
+        .select_only()
+        .column(Column::Id)
+        .filter(stale())
+        .order_by_asc(Column::CreatedAt)
+        .order_by_asc(Column::Id)
+        .limit(limit)
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list stale notifications")?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let result = notification::Entity::delete_many()
+        .filter(Column::Id.is_in(ids))
+        // Re-checked at delete time: a row read for this batch may have been
+        // folded into by a new event, or picked up a pending mail, since.
+        .filter(stale())
+        .exec(db)
+        .await
+        .context("db: delete stale notifications")?;
+    Ok(result.rows_affected)
+}

@@ -2254,7 +2254,7 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 19] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 20] = [
         (
             "DEFAULT_SOURCE_URL",
             "config-file-only: `[server].source_url` has no CLI flag, so no help text names it",
@@ -2321,6 +2321,10 @@ const AFTER: &str = "after";
             "config-file-only: `[audit].archive_dir` has no CLI flag, and this constant is \
              only the fallback for a relative repo_root — an absolute one puts the archive \
              beside it instead",
+        ),
+        (
+            "DEFAULT_RETENTION_ENABLED",
+            "config-file-only: `[retention].enabled` has no CLI flag",
         ),
         (
             "DEFAULT_BACKUP_ENABLED",

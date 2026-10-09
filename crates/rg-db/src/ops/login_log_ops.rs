@@ -71,3 +71,37 @@ pub async fn list_paginated(
         .await?;
     Ok((logs, total))
 }
+
+/// Delete up to `limit` login attempts recorded before `cutoff`, oldest first,
+/// and return how many went.
+///
+/// The retention sweep's batch. Each row carries the client's IP address and
+/// user agent; the admin view pages through them, and nothing decides anything
+/// from rows this old — so keeping them forever is cost and exposure with no
+/// use. Ids first, then a delete by key — see
+/// [`crate::ops::webhook_ops::delete_deliveries_before`]. The caller bounds
+/// `limit`.
+pub async fn delete_before(
+    db: &DatabaseConnection,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    limit: u64,
+) -> Result<u64, DbErr> {
+    let ids: Vec<i64> = Entity::find()
+        .select_only()
+        .column(login_log::Column::Id)
+        .filter(login_log::Column::CreatedAt.lt(cutoff))
+        .order_by_asc(login_log::Column::CreatedAt)
+        .order_by_asc(login_log::Column::Id)
+        .limit(limit)
+        .into_tuple()
+        .all(db)
+        .await?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let result = Entity::delete_many()
+        .filter(login_log::Column::Id.is_in(ids))
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected)
+}

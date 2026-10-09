@@ -42,6 +42,8 @@ pub(crate) struct ConfigFile {
     #[serde(default)]
     pub(crate) backup: BackupConfig,
     #[serde(default)]
+    pub(crate) retention: RetentionConfig,
+    #[serde(default)]
     pub(crate) mirror: MirrorConfig,
     #[serde(default)]
     pub(crate) imports: ImportConfig,
@@ -287,6 +289,20 @@ pub(crate) struct AuditConfig {
     pub(crate) enabled: Option<bool>,
     pub(crate) archive_dir: Option<String>,
     pub(crate) archive_after_days: Option<i64>,
+    pub(crate) interval_minutes: Option<u64>,
+    pub(crate) batch_size: Option<u64>,
+}
+
+/// `[retention]` — how long the tables every event appends to keep their rows:
+/// webhook deliveries, notifications, login attempts. See `rg_core::retention`.
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetentionConfig {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) webhook_delivery_days: Option<i64>,
+    pub(crate) notification_read_days: Option<i64>,
+    pub(crate) notification_unread_days: Option<i64>,
+    pub(crate) login_log_days: Option<i64>,
     pub(crate) interval_minutes: Option<u64>,
     pub(crate) batch_size: Option<u64>,
 }
@@ -679,6 +695,11 @@ pub(crate) const DEFAULT_AUDIT_ENABLED: bool = true;
 /// `[observability].metrics_enabled`: on by default, the historical behaviour —
 /// the shipped Prometheus scrapes it. Exposure is `metrics_token`'s job.
 pub(crate) const DEFAULT_METRICS_ENABLED: bool = true;
+
+/// `[retention].enabled`: on by default, for the reason `[audit].enabled` is —
+/// a table that is never trimmed grows until the disk does, and the windows are
+/// generous enough that no page anyone reads loses a row it shows.
+pub(crate) const DEFAULT_RETENTION_ENABLED: bool = true;
 
 /// `[backup].enabled`: off by default so an upgrade never starts consuming
 /// `keep_last` × database-size of disk unannounced. Both shipped templates turn
@@ -1992,6 +2013,48 @@ mod tests {
                 "batch_size",
                 "audit::archiver::DEFAULT_BATCH_SIZE",
                 rg_core::audit::archiver::DEFAULT_BATCH_SIZE.to_string(),
+            ),
+            row(
+                "retention",
+                "enabled",
+                "DEFAULT_RETENTION_ENABLED",
+                super::DEFAULT_RETENTION_ENABLED.to_string(),
+            ),
+            row(
+                "retention",
+                "webhook_delivery_days",
+                "retention::DEFAULT_WEBHOOK_DELIVERY_DAYS",
+                rg_core::retention::DEFAULT_WEBHOOK_DELIVERY_DAYS.to_string(),
+            ),
+            row(
+                "retention",
+                "notification_read_days",
+                "retention::DEFAULT_NOTIFICATION_READ_DAYS",
+                rg_core::retention::DEFAULT_NOTIFICATION_READ_DAYS.to_string(),
+            ),
+            row(
+                "retention",
+                "notification_unread_days",
+                "retention::DEFAULT_NOTIFICATION_UNREAD_DAYS",
+                rg_core::retention::DEFAULT_NOTIFICATION_UNREAD_DAYS.to_string(),
+            ),
+            row(
+                "retention",
+                "login_log_days",
+                "retention::DEFAULT_LOGIN_LOG_DAYS",
+                rg_core::retention::DEFAULT_LOGIN_LOG_DAYS.to_string(),
+            ),
+            row(
+                "retention",
+                "interval_minutes",
+                "retention::DEFAULT_INTERVAL_MINUTES",
+                rg_core::retention::DEFAULT_INTERVAL_MINUTES.to_string(),
+            ),
+            row(
+                "retention",
+                "batch_size",
+                "retention::DEFAULT_BATCH_SIZE",
+                rg_core::retention::DEFAULT_BATCH_SIZE.to_string(),
             ),
             row(
                 "backup",

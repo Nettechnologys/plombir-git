@@ -154,3 +154,42 @@ pub async fn find_delivery_by_id(
         .await
         .context("db: find webhook delivery by id")
 }
+
+/// Delete up to `limit` deliveries recorded before `cutoff`, oldest first, and
+/// return how many went.
+///
+/// The retention sweep's batch. A delivery keeps its full request payload and
+/// the receiver's response body, the hook's page shows the latest fifty, and
+/// nothing else reads the rest — so without a bound the table grows by a full
+/// payload per event per hook for as long as the instance lives. Two short
+/// statements per batch rather than one unbounded `DELETE`: the ids are read
+/// first and deleted by key, so no single statement holds the write lock for
+/// the whole backlog (and MySQL refuses `LIMIT` inside an `IN` subquery). The
+/// caller bounds `limit`.
+pub async fn delete_deliveries_before(
+    db: &DatabaseConnection,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    limit: u64,
+) -> Result<u64> {
+    use crate::entities::webhook_delivery::Column;
+    let ids: Vec<i64> = DeliveryEntity::find()
+        .select_only()
+        .column(Column::Id)
+        .filter(Column::CreatedAt.lt(cutoff))
+        .order_by_asc(Column::CreatedAt)
+        .order_by_asc(Column::Id)
+        .limit(limit)
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list expired webhook deliveries")?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let result = DeliveryEntity::delete_many()
+        .filter(Column::Id.is_in(ids))
+        .exec(db)
+        .await
+        .context("db: delete expired webhook deliveries")?;
+    Ok(result.rows_affected)
+}
