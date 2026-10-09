@@ -1056,6 +1056,175 @@ async fn a_manifest_whose_body_media_type_contradicts_its_header_is_refused() {
     );
 }
 
+/// An image index is only meaningful if every child it names can be pulled.
+///
+/// The children are separate manifests pushed in advance, and a pull of the
+/// index is followed by a pull of each child by digest. Nothing checked that
+/// the children existed: an index naming a digest no push ever wrote was
+/// accepted, and the failure only surfaced on the client, halfway through a
+/// pull, as a 404 that reads like a broken registry. The digest in a
+/// descriptor is a lookup here, and the declared size has to be the stored
+/// manifest's own.
+#[tokio::test]
+async fn an_image_index_must_name_child_manifests_the_repository_holds() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_index_child", "oci_index_child@example.com")
+        .await;
+    create_repo(&base, &token, "child-check").await;
+
+    let config = br#"{"architecture":"arm64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_index_child", "child-check", config).await;
+
+    let child = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [],
+    })
+    .to_string();
+    let child_digest = sha256(child.as_bytes());
+
+    // The index names the child's digest, but no push has written the child.
+    let missing_child_index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX_V1,
+        "manifests": [{
+            "mediaType": OCI_MANIFEST_V1,
+            "size": child.len(),
+            "digest": child_digest,
+            "platform": { "architecture": "arm64", "os": "linux" },
+        }],
+    })
+    .to_string();
+
+    let refused = client
+        .put(format!("{base}/v2/oci_index_child/child-check/manifests/unbuilt"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_INDEX_V1)
+        .body(missing_child_index.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        400,
+        "an index naming a child the repository does not hold must be refused"
+    );
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+    let refusal_message = refusal["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        refusal_message.contains(&child_digest),
+        "the refusal must name the missing child, got: {refusal_message}"
+    );
+
+    // Now publish the child, and prepare the same index with a size that
+    // contradicts what was stored.
+    let child_pushed = client
+        .put(format!(
+            "{base}/v2/oci_index_child/child-check/manifests/{child_digest}"
+        ))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(child.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(child_pushed.status(), 201);
+
+    let wrong_size_index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX_V1,
+        "manifests": [{
+            "mediaType": OCI_MANIFEST_V1,
+            "size": child.len() + 1,
+            "digest": child_digest,
+            "platform": { "architecture": "arm64", "os": "linux" },
+        }],
+    })
+    .to_string();
+    let refused = client
+        .put(format!("{base}/v2/oci_index_child/child-check/manifests/stale"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_INDEX_V1)
+        .body(wrong_size_index)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        400,
+        "an index descriptor whose size is not the child's size must be refused"
+    );
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["errors"][0]["code"], "MANIFEST_INVALID");
+
+    // Neither refusal published anything, and the honest index over the child
+    // that is now stored is accepted.
+    for tag in ["unbuilt", "stale"] {
+        let pulled = client
+            .get(format!(
+                "{base}/v2/oci_index_child/child-check/manifests/{tag}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pulled.status(), 404, "refused index {tag} must not exist");
+    }
+
+    let honest_index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX_V1,
+        "manifests": [{
+            "mediaType": OCI_MANIFEST_V1,
+            "size": child.len(),
+            "digest": child_digest,
+            "platform": { "architecture": "arm64", "os": "linux" },
+        }],
+    })
+    .to_string();
+    let pushed = client
+        .put(format!("{base}/v2/oci_index_child/child-check/manifests/latest"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_INDEX_V1)
+        .body(honest_index.clone())
+        .send()
+        .await
+        .unwrap();
+    let status = pushed.status();
+    let body = pushed.text().await.unwrap();
+    assert_eq!(status, 201, "the honest index must publish: {body}");
+
+    let served = client
+        .get(format!(
+            "{base}/v2/oci_index_child/child-check/manifests/latest"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.text().await.unwrap(), honest_index);
+
+    // Every descriptor a client follows from the index resolves, which is what
+    // the push-time check was for.
+    let child_served = client
+        .get(format!(
+            "{base}/v2/oci_index_child/child-check/manifests/{child_digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(child_served.status(), 200);
+}
+
 /// A reference the registry cannot address is refused — it is never published
 /// under a name no client can use.
 ///

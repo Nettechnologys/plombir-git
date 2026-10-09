@@ -1362,7 +1362,70 @@ pub async fn put_manifest(
             return oci_err(
                 StatusCode::BAD_REQUEST,
                 error_codes::MANIFEST_BLOB_UNKNOWN,
-                &format!("blob {} not found", blob_digest),
+                &format!("blob {} not found", descriptor.digest),
+            );
+        }
+
+        // A blob with bytes but no row is refused by the reference claim inside
+        // the manifest write below, exactly as it was before this check; until
+        // that row exists there is nothing to compare the declared size to.
+        match rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, &descriptor.digest).await {
+            Ok(Some(stored)) if stored.size as u64 != descriptor.size => {
+                return oci_err(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::MANIFEST_INVALID,
+                    &format!(
+                        "blob {} is {} byte(s) but its manifest descriptor declares {} byte(s)",
+                        descriptor.digest, stored.size, descriptor.size
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
+        }
+    }
+
+    // An image index names child manifests rather than blobs, and pulling one
+    // means pulling the index and then each child by digest. A child the
+    // repository does not hold used to publish cleanly and was only discovered
+    // by a client halfway through a pull, where it reads as a broken registry
+    // rather than a bad push — and a push is the only place the mistake can
+    // still be retried. Clients publish the children before the index for this
+    // reason; the check is what makes that order load-bearing rather than
+    // conventional.
+    for child in &parsed.manifest.manifests {
+        let stored = match rg_db::ops::oci_ops::find_manifest_by_digest(
+            &state.db,
+            oci_repo.id,
+            &child.digest,
+        )
+        .await
+        {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                return oci_err(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::MANIFEST_BLOB_UNKNOWN,
+                    &format!(
+                        "image index references child manifest {} which this repository does not \
+                         hold",
+                        child.digest
+                    ),
+                );
+            }
+            Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
+        };
+        // The descriptor's digest is what the lookup matched on; its size is
+        // the other half of the claim and has to agree with what was stored.
+        if stored.size as u64 != child.size {
+            return oci_err(
+                StatusCode::BAD_REQUEST,
+                error_codes::MANIFEST_INVALID,
+                &format!(
+                    "image index descriptor for {} declares {} byte(s), but the stored manifest \
+                     is {} byte(s)",
+                    child.digest, child.size, stored.size
+                ),
             );
         }
     }
