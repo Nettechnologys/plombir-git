@@ -173,30 +173,6 @@ impl std::error::Error for ProcessOutputError {
     }
 }
 
-/// Run `command` while owning its whole descendant tree.
-///
-/// Dropping this future (for example when `tokio::time::timeout` elapses) kills
-/// the direct child and every process it started. The tree is also torn down
-/// after normal completion, so a background process cannot outlive the job that
-/// launched it.
-pub async fn output_in_process_tree(
-    command: &mut tokio::process::Command,
-) -> std::io::Result<Output> {
-    // Match `Command::output`: no inherited stdin, captured stdout/stderr. The
-    // direct-child guard remains defense in depth if platform setup fails after
-    // spawn but before the tree owner is returned.
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let (child, tree) = platform::spawn_async(command)?;
-    let output = child.wait_with_output().await;
-    drop(tree);
-    output
-}
-
 /// What a child printed, kept under a ceiling the caller declared.
 ///
 /// Produced by [`output_in_process_tree_bounded`] and
@@ -291,7 +267,11 @@ async fn read_retaining<R: tokio::io::AsyncRead + Unpin>(
     use tokio::io::AsyncReadExt as _;
     let mut kept = Vec::new();
     let mut dropped = 0u64;
-    let mut chunk = [0u8; 8192];
+    // On the heap, not in the future: this reader is awaited inside the
+    // embedded runner's deeply nested job future, which lives on a 2 MiB test
+    // thread stack, and two inline 8 KiB arrays there were enough to overflow
+    // it for the largest of those tests.
+    let mut chunk = vec![0u8; 8192];
     loop {
         let n = reader.read(&mut chunk).await?;
         if n == 0 {
@@ -340,16 +320,24 @@ pub async fn wait_with_bounded_output(
     })
 }
 
-/// [`output_in_process_tree`] under a ceiling on what is kept.
+/// Run `command` while owning its whole descendant tree, keeping at most
+/// `retain_limit_bytes` of what it prints.
 ///
-/// Same ownership — dropping the future kills the direct child and every
-/// process it started — with [`wait_with_bounded_output`] in place of
-/// `wait_with_output`, so a job whose shell prints without end costs this
+/// Dropping this future (for example when `tokio::time::timeout` elapses) kills
+/// the direct child and every process it started. The tree is also torn down
+/// after normal completion, so a background process cannot outlive the job that
+/// launched it. The output goes through [`wait_with_bounded_output`] rather
+/// than `wait_with_output`, so a job whose shell prints without end costs this
 /// process `retain_limit_bytes` of memory and not the size of what it printed.
+/// The unbounded twin is gone rather than deprecated, for the reason given on
+/// [`output_in_process_tree_with_timeout_and_limit`].
 pub async fn output_in_process_tree_bounded(
     command: &mut tokio::process::Command,
     retain_limit_bytes: usize,
 ) -> std::io::Result<BoundedOutput> {
+    // Match `Command::output`: no inherited stdin, captured stdout/stderr. The
+    // direct-child guard remains defense in depth if platform setup fails after
+    // spawn but before the tree owner is returned.
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1059,7 +1047,7 @@ mod windows_tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            output_in_process_tree(&mut command),
+            output_in_process_tree_bounded(&mut command, usize::MAX),
         )
         .await;
         assert!(
