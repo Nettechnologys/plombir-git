@@ -65,6 +65,7 @@ async fn fixture() -> Fixture {
         host_key_path: dir.path().join("host_ed25519"),
         listen_addr: "127.0.0.1:0".to_string(),
         repo_root,
+        db_write: db.clone(),
         db,
         instance_settings: Default::default(),
         git_stream_timeout_secs: 300,

@@ -140,6 +140,7 @@ async fn harness(username: &str) -> Harness {
         listen_addr: "127.0.0.1:0".to_string(),
         repo_root,
         db: db.clone(),
+        db_write: db.clone(),
         instance_settings: Default::default(),
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,

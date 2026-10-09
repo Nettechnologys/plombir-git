@@ -813,6 +813,7 @@ enum BasicIdentity {
 /// — and loops instead of surfacing the outage.
 async fn authenticate_basic(
     db: &DatabaseConnection,
+    db_write: &DatabaseConnection,
     headers: &HeaderMap,
 ) -> anyhow::Result<BasicIdentity> {
     let anonymous = || Ok(BasicIdentity::Anonymous);
@@ -845,7 +846,7 @@ async fn authenticate_basic(
         if candidate.is_empty() {
             continue;
         }
-        let Some((token, owner)) = crate::pat_auth::resolve_pat(db, candidate)
+        let Some((token, owner)) = crate::pat_auth::resolve_pat(db, db_write, candidate)
             .await
             .with_context(|| format!("registry basic auth: resolving a token for '{user}'"))?
         else {
@@ -1043,7 +1044,13 @@ pub async fn get_token(
         .unwrap_or_else(|| "plombir-git-registry".to_string());
     let scope = params.get("scope").cloned().unwrap_or_default();
 
-    let (username, authenticated_user_id) = match authenticate_basic(&state.db, &headers).await {
+    let (username, authenticated_user_id) = match authenticate_basic(
+        &state.db,
+        &state.db_write,
+        &headers,
+    )
+    .await
+    {
         Ok(BasicIdentity::Anonymous) => (ANONYMOUS_SUBJECT.to_string(), None),
         Ok(BasicIdentity::Authenticated { username, user_id }) => (username, Some(user_id)),
         Ok(BasicIdentity::Rejected) => {

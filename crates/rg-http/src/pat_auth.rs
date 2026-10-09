@@ -20,6 +20,7 @@ use crate::AppState;
 /// the REST middleware, git-over-HTTP and the registry's Basic auth at once.
 pub(crate) async fn resolve_pat(
     db: &DatabaseConnection,
+    db_write: &DatabaseConnection,
     token: &str,
 ) -> anyhow::Result<
     Option<(
@@ -70,7 +71,14 @@ pub(crate) async fn resolve_pat(
     // write-only failure into either an invalid-token answer or an auth
     // outage. Lookup failures above still propagate because they leave the
     // credential's validity unknown.
-    if let Err(error) = rg_db::ops::token_ops::touch_last_used(db, tok.id, tok.last_used_at).await {
+    //
+    // The stamp is a write on every authenticated door, so it queues on the
+    // write pool rather than parking a reader's connection in SQLite's busy
+    // handler (card_a84b25c9efbe). One statement, no transaction: nothing
+    // here holds `db_write` while reaching for it again.
+    if let Err(error) =
+        rg_db::ops::token_ops::touch_last_used(db_write, tok.id, tok.last_used_at).await
+    {
         tracing::warn!(
             token_id = tok.id,
             user_id = tok.user_id,
@@ -286,7 +294,7 @@ async fn pat_to_bearer_jwt(
                 grant: None,
             }));
         }
-        if let Some((pat, owner)) = resolve_pat(&state.db, &cand)
+        if let Some((pat, owner)) = resolve_pat(&state.db, &state.db_write, &cand)
             .await
             .map_err(error::AppError::from)?
         {
@@ -354,6 +362,7 @@ pub(crate) struct GitCredential {
 /// of here with it and the git handlers apply it themselves.
 pub(crate) async fn extract_git_credential(
     db: &DatabaseConnection,
+    db_write: &DatabaseConnection,
     headers: &axum::http::HeaderMap,
     jwt_secret: &str,
 ) -> anyhow::Result<Option<GitCredential>> {
@@ -381,6 +390,7 @@ pub(crate) async fn extract_git_credential(
         // the username (`token:x-oauth-basic`) field — try both, JWT then PAT.
         return git_credential_from(
             db,
+            db_write,
             jwt_secret,
             [password, username]
                 .into_iter()
@@ -390,11 +400,12 @@ pub(crate) async fn extract_git_credential(
     } else {
         Vec::new()
     };
-    git_credential_from(db, jwt_secret, candidates.into_iter()).await
+    git_credential_from(db, db_write, jwt_secret, candidates.into_iter()).await
 }
 
 async fn git_credential_from<'a>(
     db: &DatabaseConnection,
+    db_write: &DatabaseConnection,
     jwt_secret: &str,
     candidates: impl Iterator<Item = &'a str>,
 ) -> anyhow::Result<Option<GitCredential>> {
@@ -406,7 +417,7 @@ async fn git_credential_from<'a>(
                 grant: None,
             }));
         }
-        if let Some((pat, owner)) = resolve_pat(db, candidate).await? {
+        if let Some((pat, owner)) = resolve_pat(db, db_write, candidate).await? {
             if rg_core::auth::pat_scope::has_scope(&pat.scopes, "repo") {
                 let user_id = pat.user_id;
                 let grant = crate::agent_scope::TokenGrant::load(db, pat, owner).await?;
@@ -456,7 +467,6 @@ mod tests {
 
     async fn pat_fixture() -> (rg_db::DatabaseConnection, String, i64) {
         use sea_orm::{ConnectOptions, Database};
-        use sha2::{Digest, Sha256};
 
         let mut options = ConnectOptions::new("sqlite::memory:");
         options.max_connections(1);
@@ -464,6 +474,14 @@ mod tests {
             .await
             .expect("connect to in-memory db");
         rg_db::run_migrations(&db).await.expect("run migrations");
+        let (raw, token_id) = seed_pat(&db).await;
+        (db, raw, token_id)
+    }
+
+    /// A PAT owner and a never-used token in `db`: the raw token and its id.
+    async fn seed_pat(db: &rg_db::DatabaseConnection) -> (String, i64) {
+        use sha2::{Digest, Sha256};
+
         let now = chrono::Utc::now();
         rg_db::entities::user::ActiveModel {
             id: Set(1),
@@ -476,14 +494,14 @@ mod tests {
             updated_at: Set(now),
             ..Default::default()
         }
-        .insert(&db)
+        .insert(db)
         .await
         .expect("insert PAT owner");
 
         let raw = "ifp_touch_failure_fixture".to_string();
         let hash = format!("{:x}", Sha256::digest(raw.as_bytes()));
         let token = rg_db::ops::token_ops::create(
-            &db,
+            db,
             rg_db::entities::access_token::ActiveModel {
                 id: NotSet,
                 user_id: Set(1),
@@ -499,7 +517,61 @@ mod tests {
         )
         .await
         .expect("create PAT");
-        (db, raw, token.id)
+        (raw, token.id)
+    }
+
+    /// card_a84b25c9efbe: the usage stamp is a write on every door a PAT opens,
+    /// so it queues on the write pool; the credential lookups stay on the
+    /// shared one. On a file-backed SQLite database the two are separate pools.
+    #[tokio::test]
+    async fn the_usage_stamp_is_written_through_the_write_pool() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("pat.db").display());
+        let mut db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+            .await
+            .expect("open the shared pool");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        let (raw, _) = seed_pat(&db).await;
+        let mut db_write = rg_db::open_write_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, &db)
+            .await
+            .expect("open the write pool");
+
+        let record = |pool: &mut rg_db::DatabaseConnection| {
+            let sent: Arc<Mutex<Vec<String>>> = Arc::default();
+            let sink = Arc::clone(&sent);
+            pool.set_metric_callback(move |info| {
+                sink.lock().unwrap().push(info.statement.sql.clone());
+            });
+            sent
+        };
+        let on_shared = record(&mut db);
+        let on_write = record(&mut db_write);
+
+        resolve_pat(&db, &db_write, &raw)
+            .await
+            .expect("resolve")
+            .expect("a valid PAT");
+
+        let writes = |sent: &Arc<Mutex<Vec<String>>>| -> Vec<String> {
+            sent.lock()
+                .unwrap()
+                .iter()
+                .filter(|sql| sql.trim_start().to_ascii_uppercase().starts_with("UPDATE"))
+                .cloned()
+                .collect()
+        };
+        let stamped = writes(&on_write);
+        assert!(
+            stamped.iter().any(|sql| sql.contains("access_tokens")),
+            "the usage stamp did not go through the write pool: {stamped:?}"
+        );
+        assert_eq!(
+            writes(&on_shared),
+            Vec::<String>::new(),
+            "a write on the shared pool"
+        );
     }
 
     /// A write-only failure cannot invalidate a credential that was already
@@ -521,7 +593,9 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let resolved = resolve_pat(&db, &raw).await.expect("resolve valid PAT");
+        let resolved = resolve_pat(&db, &db, &raw)
+            .await
+            .expect("resolve valid PAT");
 
         assert!(
             resolved.is_some(),
@@ -562,7 +636,7 @@ mod tests {
         .await
         .expect("arm PAT owner-finalization failure");
 
-        let error = resolve_pat(&db, &raw)
+        let error = resolve_pat(&db, &db, &raw)
             .await
             .expect_err("owner-finalization failure became an invalid PAT");
         assert!(
@@ -597,7 +671,7 @@ mod tests {
             .expect("retire or delete the PAT owner");
 
             assert!(
-                resolve_pat(&db, &raw)
+                resolve_pat(&db, &db, &raw)
                     .await
                     .expect("lifecycle loss is not a database failure")
                     .is_none(),
@@ -630,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn a_repeated_pat_request_writes_nothing() {
         let (db, raw, token_id) = pat_fixture().await;
-        resolve_pat(&db, &raw)
+        resolve_pat(&db, &db, &raw)
             .await
             .expect("first use")
             .expect("first use resolves");
@@ -657,7 +731,7 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let resolved = resolve_pat(&db, &raw)
+        let resolved = resolve_pat(&db, &db, &raw)
             .await
             .expect("a repeated PAT request must not need a write");
         assert!(resolved.is_some(), "the repeated request was refused");

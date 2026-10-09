@@ -186,6 +186,13 @@ pub struct SshServerConfig {
     /// the handle mandatory moves the guarantee from five hand-written
     /// `if let Some(db)` sites to the type.
     pub db: DatabaseConnection,
+    /// The pool steady writers queue on — `rg_db::open_write_pool`. The key
+    /// usage stamps that every accepted login writes go through it, so they
+    /// wait in its queue rather than in SQLite's busy handler on a connection
+    /// an authentication read needs (card_a84b25c9efbe). Without a separate
+    /// write pool it is `db` itself — never optional, for the reason `db` is
+    /// not.
+    pub db_write: DatabaseConnection,
     /// Shared instance settings cache. In the normal HTTP+SSH process this is
     /// the same handle the HTTP admin API updates, so maintenance mode reaches
     /// SSH pushes without a restart.
@@ -253,6 +260,8 @@ pub struct SshLfsConfig {
 struct SharedState {
     repo_root: Arc<PathBuf>,
     db: Arc<DatabaseConnection>,
+    /// See [`SshServerConfig::db_write`].
+    db_write: Arc<DatabaseConnection>,
     instance_settings: rg_core::instance::InstanceSettingsCache,
     /// Wall-clock bound (seconds) applied around each git streaming handler.
     /// 0 = disabled. See [`SshServerConfig::git_stream_timeout_secs`].
@@ -564,6 +573,7 @@ impl SshServer {
 
         let shared = Arc::new(SharedState {
             repo_root: Arc::new(ssh_config.repo_root),
+            db_write: Arc::new(ssh_config.db_write),
             db: Arc::new(ssh_config.db),
             instance_settings: ssh_config.instance_settings,
             git_stream_timeout_secs: ssh_config.git_stream_timeout_secs,
@@ -1000,8 +1010,12 @@ impl Handler for SshHandler {
                     user_id: key.user_id,
                     credential: UserCredential::SshKey { key_id: key.id },
                 });
-                if let Err(error) =
-                    rg_db::ops::ssh_key_ops::touch_last_used(db, key.id, key.last_used_at).await
+                if let Err(error) = rg_db::ops::ssh_key_ops::touch_last_used(
+                    &self.shared.db_write,
+                    key.id,
+                    key.last_used_at,
+                )
+                .await
                 {
                     tracing::warn!(
                         key_id = key.id,
@@ -1016,9 +1030,12 @@ impl Handler for SshHandler {
                 Ok(Some(key)) => {
                     self.authenticated_identity =
                         Some(AuthenticatedIdentity::DeployKey { key_id: key.id });
-                    if let Err(error) =
-                        rg_db::ops::deploy_key_ops::touch_last_used(db, key.id, key.last_used_at)
-                            .await
+                    if let Err(error) = rg_db::ops::deploy_key_ops::touch_last_used(
+                        &self.shared.db_write,
+                        key.id,
+                        key.last_used_at,
+                    )
+                    .await
                     {
                         tracing::warn!(
                             key_id = key.id,
@@ -2885,6 +2902,7 @@ mod tests {
                 host_key_path: dir.path().join("host_ed25519"),
                 listen_addr: "127.0.0.1:0".to_string(),
                 repo_root: dir.path().join("repos"),
+                db_write: db.clone(),
                 db,
                 instance_settings: Default::default(),
                 git_stream_timeout_secs: 300,
@@ -2926,6 +2944,7 @@ mod tests {
             host_key_path: dir.path().join("host_ed25519"),
             listen_addr: "127.0.0.1:0".to_string(),
             repo_root: dir.path().join("repos"),
+            db_write: db.clone(),
             db,
             instance_settings: Default::default(),
             git_stream_timeout_secs: 300,

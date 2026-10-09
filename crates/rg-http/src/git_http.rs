@@ -998,10 +998,12 @@ pub(crate) async fn handle_info_refs_following_renames(
             return response;
         }
     };
-    let credential = match extract_git_credential(&state.db, &headers, &state.jwt_secret).await {
-        Ok(credential) => credential,
-        Err(_) => return response,
-    };
+    let credential =
+        match extract_git_credential(&state.db, &state.db_write, &headers, &state.jwt_secret).await
+        {
+            Ok(credential) => credential,
+            Err(_) => return response,
+        };
     let actor_id = credential.as_ref().map(|credential| credential.user_id);
     if let Err(refusal) = git_grant_refusal(
         &state,
@@ -1076,16 +1078,18 @@ pub(crate) async fn handle_info_refs(
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
     // Extract actor from auth header
-    let credential = match extract_git_credential(&state.db, &headers, &state.jwt_secret).await {
-        Ok(credential) => credential,
-        Err(e) => {
-            return (
-                git_db_status(&e),
-                [(header::CONTENT_TYPE, "text/plain")],
-                git_failure_body("resolve git credential", &e),
-            );
-        }
-    };
+    let credential =
+        match extract_git_credential(&state.db, &state.db_write, &headers, &state.jwt_secret).await
+        {
+            Ok(credential) => credential,
+            Err(e) => {
+                return (
+                    git_db_status(&e),
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    git_failure_body("resolve git credential", &e),
+                );
+            }
+        };
     let require_write = service == "git-receive-pack";
     let actor_id = credential.as_ref().map(|credential| credential.user_id);
     if let Err(resp) = git_grant_refusal(&state, credential.as_ref(), &owner, &repo, &headers).await
@@ -1271,17 +1275,19 @@ pub(crate) async fn handle_git_upload_pack(
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
     // Check read access
-    let credential = match extract_git_credential(&state.db, &headers, &state.jwt_secret).await {
-        Ok(credential) => credential,
-        Err(e) => {
-            return (
-                git_db_status(&e),
-                [(header::CONTENT_TYPE, "text/plain")],
-                Body::from(git_failure_body("resolve git credential", &e)),
-            )
-                .into_response();
-        }
-    };
+    let credential =
+        match extract_git_credential(&state.db, &state.db_write, &headers, &state.jwt_secret).await
+        {
+            Ok(credential) => credential,
+            Err(e) => {
+                return (
+                    git_db_status(&e),
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    Body::from(git_failure_body("resolve git credential", &e)),
+                )
+                    .into_response();
+            }
+        };
     let actor_id = credential.as_ref().map(|credential| credential.user_id);
     if let Err(resp) = git_grant_refusal(&state, credential.as_ref(), &owner, &repo, &headers).await
     {
@@ -1428,17 +1434,19 @@ pub(crate) async fn handle_git_receive_pack(
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
 
     // Check write access
-    let credential = match extract_git_credential(&state.db, &headers, &state.jwt_secret).await {
-        Ok(credential) => credential,
-        Err(e) => {
-            return (
-                git_db_status(&e),
-                [(header::CONTENT_TYPE, "text/plain")],
-                Body::from(git_failure_body("resolve git credential", &e)),
-            )
-                .into_response();
-        }
-    };
+    let credential =
+        match extract_git_credential(&state.db, &state.db_write, &headers, &state.jwt_secret).await
+        {
+            Ok(credential) => credential,
+            Err(e) => {
+                return (
+                    git_db_status(&e),
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    Body::from(git_failure_body("resolve git credential", &e)),
+                )
+                    .into_response();
+            }
+        };
     let actor_id = credential.as_ref().map(|credential| credential.user_id);
     if let Err(resp) = git_grant_refusal(&state, credential.as_ref(), &owner, &repo, &headers).await
     {

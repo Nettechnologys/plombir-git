@@ -27,3 +27,4 @@ mod ssh_push_policy_tests;
 mod ssh_push_tests;
 mod ssh_resource_limit_tests;
 mod ssh_shutdown_tests;
+mod ssh_write_pool_tests;
