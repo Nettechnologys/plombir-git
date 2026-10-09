@@ -102,11 +102,12 @@ agent_window_secs = 60
 # Left unset on purpose: with no `file`, the server logs to stdout, which is
 # where `docker compose logs -f` and every Docker log driver read from. Setting
 # a file here silently empties `docker compose logs`.
-# Uncomment to log into the data directory instead (rotated daily,
-# max_files caps how many are kept):
+# Uncomment to log into the data directory instead (rotated daily unless
+# max_size_mb asks for size rotation; max_files caps how many are kept):
 # file = "/data/logs/plombir-git.log"
 max_files = 5
-# "text" for people; "json" writes one JSON object per line, for a log driver
+# Uncomment to rotate by size instead of by day (app.log.1, app.log.2, …):
+# max_size_mb = 10
 # or shipper (Loki, Elasticsearch) that would otherwise parse the text back apart.
 format = "text"
 

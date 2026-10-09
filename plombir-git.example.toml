@@ -214,10 +214,11 @@ agent_window_secs = 60
 # file = "/var/log/plombir-git/plombir-git.log"
 # "text" for people, "json" for a log shipper (one JSON object per line).
 format = "text"
-# Files rotate DAILY; max_files is how many are kept.
+# max_files is how many rotated files are kept.
 max_files = 5
-# max_size_mb is accepted so older configs still start, and NOT enforced —
-# there is no size-based rotation. The server warns at startup when it is set.
+# Setting max_size_mb switches the file appender from daily rotation to size
+# rotation: the live file moves to app.log.1 (then .2, … up to max_files) once
+# it reaches this many MB.
 # max_size_mb = 10
 
 [audit]
