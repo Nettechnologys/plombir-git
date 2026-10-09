@@ -101,7 +101,15 @@ if (!clientImport) {
   }
 }
 expect(page, /mfa\.setup\(\)/, 'Security page must call mfa.setup() for QR enrollment');
-expect(page, /mfa\.enable\(verificationCode\.trim\(\)\)/, 'Security page must enable MFA with the entered code');
+// The password travels with the code on every enable, a first enrolment
+// included: a stolen session must not be enough to arm a second factor only
+// the thief can pass (security audit finding #6).
+expect(
+  page,
+  /mfa\.enable\(verificationCode\.trim\(\), enablePassword\)/,
+  'Security page must enable MFA with the entered code and the current password',
+);
+expect(client, /enable: \(code: string, password: string\)/, 'API client mfa.enable must carry the password');
 expect(page, /mfa\.backup\(\)/, 'Security page must load backup code status');
 expect(page, /mfa\.disable\(disablePassword\)/, 'Security page must disable MFA with current password');
 expect(

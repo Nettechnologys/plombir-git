@@ -214,6 +214,21 @@
     }
   }
 
+  async function handleResetMfa(user: AdminUser) {
+    if (!confirm(t('admin.users.reset_mfa_confirm', { username: user.username }))) return;
+    const userId = user.id;
+    if (!claimUser(userId)) return;
+    try {
+      error = '';
+      await admin.resetUserMfa(userId);
+      await loadUsers();
+    } catch (e: any) {
+      error = e.message;
+    } finally {
+      releaseUser(userId);
+    }
+  }
+
   function prevPage() {
     if (page > 1) { page--; loadUsers(); }
   }
@@ -320,6 +335,9 @@
                 <button class="btn-sm" disabled={isUserBusy(u.id)} onclick={() => openEdit(u)}>{t('common.edit')}</button>
                 {#if u.auth_provider === 'local' && u.id !== getUser()?.id}
                   <button class="btn-sm reset-password" disabled={isUserBusy(u.id)} onclick={() => handleResetPassword(u)}>{t('admin.users.reset_password')}</button>
+                {/if}
+                {#if u.mfa_enabled && u.id !== getUser()?.id}
+                  <button class="btn-sm reset-mfa" disabled={isUserBusy(u.id)} onclick={() => handleResetMfa(u)}>{t('admin.users.reset_mfa')}</button>
                 {/if}
                 {#if u.id !== getUser()?.id}
                   <button class="btn-danger" disabled={isUserBusy(u.id)} onclick={() => confirmDelete(u)}>{t('common.delete')}</button>

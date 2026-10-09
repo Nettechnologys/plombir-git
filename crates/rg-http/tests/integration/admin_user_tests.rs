@@ -376,6 +376,164 @@ async fn admin_users_delete_target() {
     assert_eq!(get_after.status(), 404);
 }
 
+async fn unused_backup_codes(db: &rg_db::DatabaseConnection, user_id: i64) -> usize {
+    rg_db::ops::mfa_backup_code_ops::list_codes(db, user_id)
+        .await
+        .expect("list backup codes")
+        .into_iter()
+        .filter(|code| !code.used)
+        .count()
+}
+
+/// `POST /admin/users/{id}/mfa/reset`: the administrator's way back into an
+/// account whose second factor its owner can no longer pass (security audit
+/// finding #6). Admin-only like its siblings; `404` for an account that is not
+/// there; `409` for one with no factor to reset; `400` for the administrator's
+/// own account; and on success the factor, its backup codes and every session
+/// the account had are gone, with one journal row saying who did it.
+#[tokio::test]
+async fn admin_can_reset_a_users_mfa_and_the_action_is_audited() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (admin_token, admin_id) =
+        register_full(&base, "mfa_reset_admin", "mfa_reset_admin@example.com").await;
+    let (target_token, target_id) =
+        register_full(&base, "mfa_reset_target", "mfa_reset_target@example.com").await;
+    let (bystander_token, bystander_id) = register_full(
+        &base,
+        "mfa_reset_bystander",
+        "mfa_reset_bystander@example.com",
+    )
+    .await;
+    promote_user_to_admin(&db, admin_id).await;
+
+    // The target stands on a second factor with a full recovery set — the
+    // state a stolen session leaves an account in.
+    rg_db::ops::user_ops::enable_mfa(&db, target_id)
+        .await
+        .expect("enable mfa");
+    let codes = rg_db::ops::mfa_backup_code_ops::generate_codes(
+        rg_db::ops::mfa_backup_code_ops::BACKUP_CODE_COUNT,
+    );
+    rg_db::ops::mfa_backup_code_ops::reissue_codes(&db, target_id, &codes)
+        .await
+        .expect("issue backup codes");
+    assert_eq!(unused_backup_codes(&db, target_id).await, codes.len());
+
+    let reset_url = |id: i64| format!("{base}/api/v1/admin/users/{id}/mfa/reset");
+
+    let forbidden = client
+        .post(reset_url(target_id))
+        .bearer_auth(&bystander_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), 403, "a non-admin reset somebody's MFA");
+
+    let missing = client
+        .post(reset_url(999_999))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+
+    let own = client
+        .post(reset_url(admin_id))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        own.status(),
+        400,
+        "an administrator's own factor comes off with a password, not from here"
+    );
+
+    let nothing_to_reset = client
+        .post(reset_url(bystander_id))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        nothing_to_reset.status(),
+        409,
+        "an account with no second factor was 'reset' — and its sessions revoked for nothing"
+    );
+
+    // Nothing above touched the target.
+    let untouched = rg_db::ops::user_ops::find_by_id(&db, target_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(untouched.mfa_enabled);
+    assert_eq!(unused_backup_codes(&db, target_id).await, codes.len());
+
+    let reset = client
+        .post(reset_url(target_id))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), 200);
+    let body: serde_json::Value = reset.json().await.unwrap();
+    assert_eq!(body["id"], target_id);
+    assert_eq!(body["mfa_enabled"], false);
+
+    let after = rg_db::ops::user_ops::find_by_id(&db, target_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!after.mfa_enabled, "the factor is still on");
+    assert!(
+        after.totp_secret.is_none(),
+        "the secret outlived the factor"
+    );
+    assert_eq!(
+        unused_backup_codes(&db, target_id).await,
+        0,
+        "backup codes outlived the factor"
+    );
+
+    // The session that enrolled the wrong authenticator is the one that must
+    // not survive its removal.
+    let old_session = client
+        .get(format!("{base}/api/v1/users/me"))
+        .bearer_auth(&target_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        old_session.status(),
+        401,
+        "a session the account held before the reset still works"
+    );
+
+    let audit = client
+        .get(format!(
+            "{base}/api/v1/admin/audit/logs?action=admin.reset_mfa"
+        ))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(audit.status(), 200);
+    let audit_body: serde_json::Value = audit.json().await.unwrap();
+    assert_eq!(audit_body["total"], 1, "exactly one reset is journalled");
+    assert_eq!(audit_body["logs"][0]["resource_id"], target_id);
+    assert_eq!(audit_body["logs"][0]["user_id"], admin_id);
+    assert_eq!(audit_body["logs"][0]["username"], "mfa_reset_admin");
+
+    let again = client
+        .post(reset_url(target_id))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 409, "a second reset has nothing to reset");
+}
+
 #[tokio::test]
 async fn admin_can_unlock_user_and_action_is_audited() {
     let (base, db) = spawn_test_app_with_db().await;

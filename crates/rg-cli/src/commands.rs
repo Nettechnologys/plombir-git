@@ -198,6 +198,66 @@ pub(crate) async fn cmd_rotate_instance_key(
     Ok(())
 }
 
+/// Take the second factor off one account, from the shell.
+///
+/// The operator's door for the case `POST /admin/users/{id}/mfa/reset` cannot
+/// reach: the instance whose only administrator is the account locked out. It
+/// runs the same `rg_core::user::account::reset_mfa` the handler runs, and it
+/// journals the same `admin.reset_mfa` row — with no actor, which is the
+/// honest encoding for a shell, and `via: "cli"` in the details so a review
+/// can tell the two doors apart (security audit finding #6).
+pub(crate) async fn cmd_reset_mfa(
+    username: String,
+    db_url: Option<String>,
+    cfg: Option<&config::ConfigFile>,
+) -> anyhow::Result<()> {
+    init_cli_logging();
+
+    let db_url = config::resolve_db_url(db_url, cfg);
+    // On the ordinary pool: this is exactly what the live handler does on
+    // request — three short row writes — and demanding a stopped server for
+    // it would keep the one administrator who needs it waiting on an outage.
+    let db = dbconn::connect_online(
+        &db_url,
+        "plombir-git reset-mfa",
+        dbconn::OnlineAccess::SameWorkAsALiveHandler,
+    )
+    .await?;
+
+    let user = rg_db::ops::user_ops::find_by_username(&db, &username)
+        .await
+        .context("look the account up")?
+        .ok_or_else(|| anyhow::anyhow!("no account named `{username}`"))?;
+    let reset = rg_core::user::account::reset_mfa(&db, user.id)
+        .await
+        .with_context(|| format!("reset the MFA of `{username}`"))?;
+
+    rg_core::audit::record(
+        &db,
+        &rg_core::audit::AuditActor::none(),
+        "admin.reset_mfa",
+        Some("user"),
+        Some(reset.id),
+        Some(&reset.username),
+        None,
+        Some(serde_json::json!({
+            "method": "totp",
+            "sessions_revoked": true,
+            "backup_codes_revoked": true,
+            "via": "cli",
+        })),
+    )
+    .await;
+
+    println!(
+        "MFA reset for `{}` (id {}): the second factor and every unused backup code are gone, \
+         and every session is signed out. The account signs in with its password alone until \
+         its owner enrols an authenticator again.",
+        reset.username, reset.id
+    );
+    Ok(())
+}
+
 /// `plombir-git rotate-encryption-key` — move every at-rest secret onto a new
 /// at-rest encryption key.
 ///

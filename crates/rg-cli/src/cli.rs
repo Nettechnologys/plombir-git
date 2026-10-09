@@ -578,6 +578,29 @@ pub(crate) enum Commands {
         ref_name: Option<String>,
     },
 
+    /// Take the second factor off an account whose owner can no longer pass it
+    ///
+    /// For an authenticator that is gone — or one a stolen session enrolled
+    /// and the owner never held. A password reset ends at the second factor,
+    /// so this is the way back in. Every session the account has is signed
+    /// out, the TOTP secret and every unused backup code are dropped, and the
+    /// action is journalled. The same work as `POST /admin/users/{id}/mfa/reset`,
+    /// for the instance whose only administrator is the one locked out.
+    ResetMfa {
+        /// The account's username
+        username: String,
+
+        /// Database URL (sqlite://, postgres://, or mysql://)
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
+    },
+
     /// List the tombstones interrupted deletions left in the storage root
     ///
     /// Reports and decides nothing: nothing is moved, removed or created. A
@@ -628,7 +651,8 @@ impl Commands {
             | Self::RestoreDb { config, .. }
             | Self::CreateRepo { config, .. }
             | Self::Import { config, .. }
-            | Self::IndexRepo { config, .. } => StateCreationContract::ServerOwned {
+            | Self::IndexRepo { config, .. }
+            | Self::ResetMfa { config, .. } => StateCreationContract::ServerOwned {
                 config: config.as_deref(),
             },
             Self::Package {
@@ -904,7 +928,8 @@ const AFTER: &str = "after";
             | Commands::BackupDb { db_url, config, .. }
             | Commands::RestoreDb { db_url, config, .. }
             | Commands::RotateInstanceKey { db_url, config, .. }
-            | Commands::RotateEncryptionKey { db_url, config, .. } => {
+            | Commands::RotateEncryptionKey { db_url, config, .. }
+            | Commands::ResetMfa { db_url, config, .. } => {
                 (db_url.as_deref(), None, config.as_deref())
             }
             Commands::CreateRepo {
@@ -966,6 +991,7 @@ const AFTER: &str = "after";
         &["plombir-git", "index-repo", "alice/site"],
         &["plombir-git", "list-tombstones"],
         &["plombir-git", "package", "list", "alice", "site", "cargo"],
+        &["plombir-git", "reset-mfa", "alice"],
     ];
 
     /// The root cause of the ignored-config bug: a clap `default_value` on
@@ -1138,6 +1164,54 @@ const AFTER: &str = "after";
     /// loader and the real resolver: `plombir-git migrate --config <file>` with no
     /// `--db-url` must reach the Postgres URL from the file, not the built-in
     /// SQLite default — and an explicit `--db-url` must still win.
+    /// `reset-mfa` names its account positionally and its database the way
+    /// every other DB-touching subcommand does: a config file, or `--db-url`,
+    /// and neither invented when absent. An operator locked out of their only
+    /// administrator account runs this once, from a shell, under some stress —
+    /// the surface has to be the one the deploy guide's recipes already use.
+    #[test]
+    fn reset_mfa_takes_a_username_and_the_shared_database_knobs() {
+        let cli = Cli::try_parse_from(["plombir-git", "reset-mfa", "alice"]).expect("parse");
+        let Commands::ResetMfa {
+            username,
+            db_url,
+            config,
+        } = &cli.command
+        else {
+            panic!("`reset-mfa alice` parsed as another subcommand");
+        };
+        assert_eq!(username, "alice");
+        assert_eq!(db_url.as_deref(), None);
+        assert_eq!(config.as_deref(), None);
+
+        let cli = Cli::try_parse_from([
+            "plombir-git",
+            "reset-mfa",
+            "alice",
+            "--config",
+            "/app/plombir-git.toml",
+            "--db-url",
+            "sqlite:///data/plombir-git.db",
+        ])
+        .expect("parse with knobs");
+        let Commands::ResetMfa {
+            username,
+            db_url,
+            config,
+        } = &cli.command
+        else {
+            panic!("`reset-mfa` with knobs parsed as another subcommand");
+        };
+        assert_eq!(username, "alice");
+        assert_eq!(db_url.as_deref(), Some("sqlite:///data/plombir-git.db"));
+        assert_eq!(config.as_deref(), Some("/app/plombir-git.toml"));
+
+        assert!(
+            Cli::try_parse_from(["plombir-git", "reset-mfa"]).is_err(),
+            "the username is the whole point; it must not be optional"
+        );
+    }
+
     #[test]
     fn migrate_resolves_the_database_url_from_the_config_file() {
         let dir = tempfile::tempdir().unwrap();

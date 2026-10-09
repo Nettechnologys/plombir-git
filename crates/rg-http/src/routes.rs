@@ -2736,6 +2736,11 @@ pub(crate) fn build_all_routes(
             "/admin/users/{id}/unlock",
             api::admin::unlock_user,
         )
+        .post(
+            InstanceAdmin,
+            "/admin/users/{id}/mfa/reset",
+            api::admin::reset_user_mfa,
+        )
         .get(InstanceAdmin, "/admin/orgs", api::admin::list_orgs)
         .get(InstanceAdmin, "/admin/orgs/{name}", api::admin::get_org)
         .delete(InstanceAdmin, "/admin/orgs/{name}", api::admin::delete_org)

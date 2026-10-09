@@ -223,10 +223,12 @@ async fn db_outage_in_mfa_setup_returns_503_after_live_handler_probe() {
     std::fs::create_dir_all(&repo_root).expect("create test repo root");
     let state = build_test_app_state(db.clone(), repo_root);
 
-    let healthy =
-        rg_http::api::mfa::setup_mfa(State(state.clone()), rg_http::api::auth::AuthUser(user.id))
-            .await
-            .into_response();
+    let healthy = rg_http::api::mfa::setup_mfa(
+        State(state.clone()),
+        rg_http::api::auth::SessionUser(user.id),
+    )
+    .await
+    .into_response();
     assert_eq!(healthy.status(), StatusCode::OK);
     let healthy_body = axum::body::to_bytes(healthy.into_body(), usize::MAX)
         .await
@@ -242,9 +244,10 @@ async fn db_outage_in_mfa_setup_returns_503_after_live_handler_probe() {
 
     db.close().await.expect("close MFA fixture pool");
 
-    let outage = rg_http::api::mfa::setup_mfa(State(state), rg_http::api::auth::AuthUser(user.id))
-        .await
-        .into_response();
+    let outage =
+        rg_http::api::mfa::setup_mfa(State(state), rg_http::api::auth::SessionUser(user.id))
+            .await
+            .into_response();
     assert_eq!(
         outage.status(),
         StatusCode::SERVICE_UNAVAILABLE,

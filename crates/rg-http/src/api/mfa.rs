@@ -17,6 +17,15 @@
 //! `enable` promotes it once a code proves somebody holds it. An enrolment that
 //! is abandoned in between therefore costs the account nothing — which it used
 //! to cost everything (card_08400088bb40).
+//!
+//! Every route that changes the factor takes [`SessionUser`], never a PAT, and
+//! every route that arms or removes it asks for the account password. A second
+//! factor is what a stolen credential is stopped by, so it must not be
+//! something a stolen credential can set: a `user`-scoped token that enrols an
+//! authenticator its owner never held locks the owner out for good, because a
+//! password reset of an MFA account ends at the second factor (security audit
+//! finding #6). The administrator's way back in is
+//! `POST /admin/users/{id}/mfa/reset` and `plombir-git reset-mfa`.
 
 use anyhow::Context as _;
 use axum::{
@@ -30,7 +39,7 @@ use tracing;
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{AuthUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{AuthUser, SessionUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -160,13 +169,14 @@ const PENDING_ENROLMENT_TTL: chrono::Duration = chrono::Duration::minutes(30);
     responses(
         (status = 200, description = "TOTP secret and QR code generated", body = SetupMfaResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "A personal access token cannot change the second factor"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
     ),
 )]
 pub async fn setup_mfa(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    SessionUser(user_id): SessionUser,
 ) -> Result<Json<SetupMfaResponse>, AppError> {
     // Get username to include in TOTP label
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
@@ -213,15 +223,21 @@ pub async fn setup_mfa(
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct EnableMfaRequest {
     code: String,
-    /// The account password, required only when this call would *replace* a
-    /// second factor that is currently protecting the account.
+    /// The account password. Required on every enable — a first enrolment as
+    /// much as a rotation.
     ///
-    /// Optional on a first enrolment: there the caller is adding a protection,
-    /// not removing one, and the session they already hold is what authorises
-    /// it. On a rotation the same call retires the authenticator the account is
-    /// standing on, which is the event `POST /users/mfa/disable` asks for a
-    /// password before allowing — a stolen session must not be enough to move
-    /// the second factor onto the thief's own phone.
+    /// A first enrolment used to be deliberately password-less, on the
+    /// reasoning that the caller was adding a protection rather than removing
+    /// one. It was the other way round: the factor a stolen session arms is
+    /// *the attacker's* protection against the owner. The owner's password
+    /// reset then ends at a second factor only the thief can pass, and nothing
+    /// short of an administrator gets the account back (security audit finding
+    /// #6). The password is what the thief does not have, so it is asked for
+    /// at the moment the factor is armed, exactly as `POST /users/mfa/disable`
+    /// asks for it at the moment the factor comes off.
+    ///
+    /// Still deserialised as optional so that a missing field is a `400` that
+    /// names what is missing, not a generic body-shape rejection.
     #[serde(default)]
     password: Option<String>,
 }
@@ -241,15 +257,17 @@ pub struct EnableMfaResponse {
     request_body = EnableMfaRequest,
     responses(
         (status = 200, description = "MFA enabled successfully with backup codes", body = EnableMfaResponse),
-        (status = 400, description = "Invalid TOTP code, no setup in flight, or a replacement without the account password"),
-        (status = 401, description = "Unauthorized"),
+        (status = 400, description = "Invalid TOTP code, no setup in flight, the account password missing, or an account with no password here"),
+        (status = 401, description = "Unauthorized, invalid password, or account temporarily locked"),
+        (status = 403, description = "A personal access token cannot change the second factor"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
+        (status = 503, description = "Password verification is at capacity — retry shortly"),
     ),
 )]
 pub async fn enable_mfa(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    SessionUser(user_id): SessionUser,
     headers: HeaderMap,
     Json(req): Json<EnableMfaRequest>,
 ) -> Result<Json<EnableMfaResponse>, AppError> {
@@ -273,18 +291,24 @@ pub async fn enable_mfa(
         ));
     }
 
-    // The step that retires the live factor, so it is the step that asks for a
-    // password — the same question `POST /users/mfa/disable` asks, for the same
-    // event. A first enrolment protects an account that has no second factor
-    // yet and answers no such question.
-    if user.mfa_enabled {
-        let Some(password) = req.password.as_deref().filter(|p| !p.is_empty()) else {
-            return Err(AppError::bad_request(
-                "replacing the current authenticator requires the account password",
-            ));
-        };
-        confirm_account_password(&state, &user, password, "mfa-rotate", &headers).await?;
-    }
+    // The step that arms a factor, so it is the step that asks for a password
+    // — the same question `POST /users/mfa/disable` asks, for the mirror
+    // event. Asked on a first enrolment as much as on a rotation: see the
+    // field doc on `EnableMfaRequest::password`. The channel keeps the two
+    // apart in `login_log`, as `replaced_existing_factor` does in the journal.
+    let Some(password) = req.password.as_deref().filter(|p| !p.is_empty()) else {
+        return Err(AppError::bad_request(if user.mfa_enabled {
+            "replacing the current authenticator requires the account password"
+        } else {
+            "enabling MFA requires the account password"
+        }));
+    };
+    let channel = if user.mfa_enabled {
+        "mfa-rotate"
+    } else {
+        "mfa-enable"
+    };
+    confirm_account_password(&state, &user, password, channel, &headers).await?;
 
     // Decrypt the staged TOTP secret
     let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
@@ -590,6 +614,20 @@ pub(crate) async fn confirm_account_password(
     channel: &'static str,
     headers: &HeaderMap,
 ) -> Result<(), AppError> {
+    // An account that signs in through an identity provider or a directory
+    // has no password here to confirm: the column is empty, and handing an
+    // empty string to the verifier is an unusable-hash *error* — a `500` that
+    // reads, to the operator, as a broken hash on a healthy row. Nothing is
+    // wrong with the row; the door is simply not one this account can open,
+    // and the answer is a `400` that says so. No strike either: nothing was
+    // guessed.
+    if user.password_hash.is_empty() {
+        return Err(AppError::bad_request(format!(
+            "this account signs in through {} and has no password here to confirm",
+            user.auth_provider
+        )));
+    }
+
     // `map_err(|_| unauthorized(...))` would answer "invalid password" to a
     // hash the verifier could not use and throw the reason away — the caller
     // here is already authenticated, so that tells a legitimate user their own
@@ -661,8 +699,9 @@ pub struct RegenerateBackupCodesResponse {
     request_body = RegenerateBackupCodesRequest,
     responses(
         (status = 200, description = "New backup codes, shown once", body = RegenerateBackupCodesResponse),
-        (status = 400, description = "MFA is not enabled for this account"),
+        (status = 400, description = "MFA is not enabled for this account, or the account has no password here"),
         (status = 401, description = "Unauthorized, invalid password, or account temporarily locked"),
+        (status = 403, description = "A personal access token cannot change the second factor"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Password verification is at capacity — retry shortly"),
@@ -670,7 +709,7 @@ pub struct RegenerateBackupCodesResponse {
 )]
 pub async fn regenerate_backup_codes(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    SessionUser(user_id): SessionUser,
     headers: HeaderMap,
     Json(req): Json<RegenerateBackupCodesRequest>,
 ) -> Result<Json<RegenerateBackupCodesResponse>, AppError> {
@@ -733,7 +772,9 @@ pub async fn regenerate_backup_codes(
     request_body = DisableMfaRequest,
     responses(
         (status = 200, description = "MFA disabled successfully"),
+        (status = 400, description = "The account has no password here to confirm"),
         (status = 401, description = "Unauthorized, invalid password, or account temporarily locked"),
+        (status = 403, description = "A personal access token cannot change the second factor"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Password verification is at capacity — retry shortly"),
@@ -741,7 +782,7 @@ pub async fn regenerate_backup_codes(
 )]
 pub async fn disable_mfa(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    SessionUser(user_id): SessionUser,
     headers: HeaderMap,
     Json(req): Json<DisableMfaRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {

@@ -13,6 +13,8 @@ export interface AdminUser {
   last_login_at: string | null;
   login_attempts: number;
   locked_until: string | null;
+  /** Whether a second factor protects the account — when a reset is the thing to offer. */
+  mfa_enabled: boolean;
   created_at: string;
 }
 
@@ -176,6 +178,11 @@ export const admin = {
     }),
   unlockUser: (id: number) =>
     request<AdminUser>(`/admin/users/${id}/unlock`, { method: 'POST' }),
+  // Takes the second factor off an account whose owner can no longer pass it
+  // (an authenticator that is gone, or one a stolen session enrolled). Every
+  // session the account has is signed out with it.
+  resetUserMfa: (id: number) =>
+    request<AdminUser>(`/admin/users/${id}/mfa/reset`, { method: 'POST' }),
   deleteUser: (id: number) =>
     request<{ deleted: boolean }>(`/admin/users/${id}`, { method: 'DELETE' }),
   listOrgs: (page?: number, perPage?: number) =>

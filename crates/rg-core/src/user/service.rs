@@ -47,6 +47,10 @@ pub struct UserInfo {
     pub last_login_at: Option<chrono::DateTime<Utc>>,
     pub login_attempts: i32,
     pub locked_until: Option<chrono::DateTime<Utc>>,
+    /// Whether a second factor protects the account. An administrator reads it
+    /// to know when a reset is the thing to offer; the owner reads it from
+    /// their own row. Never the secret, never a backup code.
+    pub mfa_enabled: bool,
     pub created_at: chrono::DateTime<Utc>,
 }
 
@@ -988,6 +992,7 @@ impl From<rg_db::entities::user::Model> for UserInfo {
             last_login_at: u.last_login_at,
             login_attempts: u.login_attempts,
             locked_until: u.locked_until,
+            mfa_enabled: u.mfa_enabled,
             created_at: u.created_at,
         }
     }

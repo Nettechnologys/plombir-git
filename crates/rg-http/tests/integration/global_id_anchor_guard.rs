@@ -586,8 +586,10 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// `rg_core::lfs::locks::unlock` receives the gated repository's id beside it
 /// and finds the lock only by both. 132 since card_9f18b657580b:
 /// `api::admin::reset_user_password` takes a user id behind `InstanceAdmin`,
-/// whose scope is the whole instance — every account is its to reset.
-const CENSUS_TOTAL: usize = 136;
+/// whose scope is the whole instance — every account is its to reset. 137
+/// since security audit finding #6: `api::admin::reset_user_mfa` takes a user
+/// id behind the same `InstanceAdmin`, for the same reason.
+const CENSUS_TOTAL: usize = 137;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

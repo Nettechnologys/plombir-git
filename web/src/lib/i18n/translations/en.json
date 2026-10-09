@@ -1499,6 +1499,8 @@
       "unlock": "Unlock",
       "reset_password": "Reset password",
       "reset_password_confirm": "Give {username} a new password? Every session they have is signed out.",
+      "reset_mfa": "Reset MFA",
+      "reset_mfa_confirm": "Take the second factor off {username}'s account? Their authenticator and backup codes stop working and every session they have is signed out. Only do this for someone who can no longer pass it.",
       "display_name": "Display Name",
       "bio": "Bio"
     },
@@ -1916,6 +1918,7 @@
       "qr_label": "Authenticator QR code",
       "hint": "Scan the QR code with an authenticator app, then enter the six-digit code.",
       "code": "Authentication code",
+      "password": "Current password",
       "verifying": "Verifying...",
       "enable": "Enable MFA"
     },

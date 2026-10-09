@@ -22,8 +22,10 @@
 //!     which authenticator stopped working and when;
 //!   * a secret handed out and left lying around cannot arm a factor forever.
 //!
-//! A first enrolment — the account has no second factor to lose — is unchanged,
-//! and `mfa_enable_atomicity_tests` still holds that path.
+//! A first enrolment asks for the password too, since security audit finding
+//! #6: the factor a stolen session arms is the thief's protection against the
+//! owner. `mfa_enrolment_password_tests` holds that path; the helpers here send
+//! the password on every enable so the rotation tests stay about rotation.
 
 use rg_db::sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
@@ -101,7 +103,13 @@ async fn enable(
 /// Enrol TOTP over the real endpoints and hand back the live secret.
 async fn enrol(base: &str, token: &str) -> String {
     let secret = setup(base, token).await;
-    let (status, body) = enable(base, token, &code_for_step(&secret, current_step()), None).await;
+    let (status, body) = enable(
+        base,
+        token,
+        &code_for_step(&secret, current_step()),
+        Some(PASSWORD),
+    )
+    .await;
     assert_eq!(status, 200, "first enrolment must succeed: {body}");
     secret
 }
@@ -371,7 +379,13 @@ async fn a_stale_setup_cannot_arm_a_factor() {
         .await
         .expect("age the pending enrolment");
 
-    let (status, body) = enable(&base, &token, &code_for_step(&staged, current_step()), None).await;
+    let (status, body) = enable(
+        &base,
+        &token,
+        &code_for_step(&staged, current_step()),
+        Some(PASSWORD),
+    )
+    .await;
     assert_eq!(
         status, 400,
         "a setup from another day still armed the account: {body}"
@@ -387,6 +401,12 @@ async fn a_stale_setup_cannot_arm_a_factor() {
     // And starting again works: the window is a bound on one enrolment, not a
     // way to wedge the account out of ever getting a second factor.
     let fresh = setup(&base, &token).await;
-    let (retried, body) = enable(&base, &token, &code_for_step(&fresh, current_step()), None).await;
+    let (retried, body) = enable(
+        &base,
+        &token,
+        &code_for_step(&fresh, current_step()),
+        Some(PASSWORD),
+    )
+    .await;
     assert_eq!(retried, 200, "a restarted enrolment must succeed: {body}");
 }
