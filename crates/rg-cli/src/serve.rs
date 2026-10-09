@@ -1171,16 +1171,15 @@ pub(crate) async fn run_serve(
     }
 
     // ── Git CLI gateway (seed configured command timeout) ─────────
-    if let Err(e) = rg_git::cli_gateway::init_global_gateway(std::time::Duration::from_secs(
-        resolved_git_timeout,
-    )) {
-        tracing::warn!(
-            error = %format!("{e:#}"),
-            "git gateway init failed — git-dependent features may be unavailable"
-        );
-    } else {
-        tracing::info!(git_cmd_secs = resolved_git_timeout, "Git CLI gateway ready");
-    }
+    // Fatal, not a warning. The constructor is also the git version floor
+    // (`rg_git::cli_gateway::MIN_GIT_VERSION`): a git that does not know
+    // `http.curloptResolve` would clone imports and mirrors through its own
+    // resolver — after the SSRF guard looked, with the stored credential
+    // attached — so a server on such a host, or on one with no git at all,
+    // must not come up and wait for the first import to find out.
+    rg_git::cli_gateway::init_global_gateway(std::time::Duration::from_secs(resolved_git_timeout))
+        .context("git is required to serve: install git 2.38 or newer and put it on PATH")?;
+    tracing::info!(git_cmd_secs = resolved_git_timeout, "Git CLI gateway ready");
 
     // ── Database ──────────────────────────────────────────────────
     tracing::info!(

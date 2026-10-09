@@ -189,6 +189,7 @@ failures, prints the uid to `chown` to.
 | `SSH host key path … is a directory` | bind-mounted a host key file that did not exist | remove the directory and let the server generate the key |
 | `audit archive_dir … is unusable` | `[audit].archive_dir` not writable by the container uid | `chown` it as above, point the key elsewhere, or set `[audit].enabled = false` |
 | `backup dir … is unusable` | `[backup].dir` not writable by the container uid | as above, or set `[backup].enabled = false` |
+| `git 2.34.1 is too old: Plombir Git needs git 2.38.0 or newer` | binary run outside the image on a host whose git predates `http.curloptResolve` | install git ≥ 2.38 (Debian 12+, Ubuntu 24.04+, the `git-core` PPA) or use the image |
 | `scheduled database backups … cannot run on the Postgres backend` | `[backup].enabled = true` on a non-SQLite database | set `[backup].enabled = false` and schedule `pg_dump` / `mysqldump` instead |
 | HTTP works, SSH silent | SSH failed on its own; HTTP is unaffected by design | `docker compose logs \| grep 'SSH server error'` |
 
@@ -422,6 +423,16 @@ The Docker image includes all runtime binaries:
 | `plombir-git` | Main server and admin CLI |
 | `plombir-git-runner` | Standalone CI runner agent |
 | `plombir-git-mcp` | MCP stdio server |
+
+The server needs **git 2.38 or newer** on its `PATH` and refuses to start on
+anything older: import and mirror clones pin the remote's checked address
+through `http.curloptResolve`, a key git before 2.38 silently ignores, which
+would let the clone resolve the host itself and bypass the SSRF guard. The
+image's runtime stage is Debian bookworm, whose git (2.39) satisfies this. When
+running the binary outside the image, check `git --version` — Debian 12 and
+Ubuntu 24.04 are fine, Ubuntu 22.04 (2.34) is not without the `git-core` PPA.
+The runner does not need git at all: it receives workspaces from the server as
+archives.
 
 ### SQLite Backup / Restore
 
