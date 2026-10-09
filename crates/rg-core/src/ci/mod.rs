@@ -147,6 +147,20 @@ pub fn is_builtin_ci_variable(name: &str) -> bool {
     BUILTIN_CI_VARIABLES.contains(&name)
 }
 
+pub use rg_process::job_environment::{docker_cli_environment, is_host_sensitive_variable};
+
+/// A name no user-supplied variable may take: the runner's vocabulary above,
+/// plus every name that would reconfigure the host process a job is launched
+/// from ([`is_host_sensitive_variable`]).
+///
+/// Enforced where a name enters — the committed CI config, the secrets API,
+/// the poll response — and again where it leaves, in both executors, so a row
+/// written before the rule existed is still filtered (security audit finding
+/// #2).
+pub fn is_reserved_ci_variable(name: &str) -> bool {
+    is_builtin_ci_variable(name) || is_host_sensitive_variable(name)
+}
+
 /// The outcome a runner may report for a job it took.
 ///
 /// `pipeline_job.status` is a string column whose domain was expressed nowhere:

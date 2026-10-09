@@ -1485,6 +1485,29 @@ fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
                 )));
             }
         }
+        // A job's variables (`variables:` here, `env:` in an Actions workflow)
+        // are read into the environment of the host `docker` CLI, where
+        // `LD_PRELOAD` or `DOCKER_HOST` act on the host and not in the
+        // container, and where the runner's own `CI_*` names would be
+        // overwritten. The runner drops such names at run time; refusing them
+        // here is what tells the author (security audit finding #2). A matrix
+        // key becomes a variable too, so it is held to the same rule; the
+        // derived `MATRIX_<KEY>` cannot collide and is not checked.
+        let matrix_keys = job.matrix.iter().flat_map(|matrix| matrix.keys());
+        for variable in job
+            .variables
+            .iter()
+            .flat_map(|variables| variables.keys())
+            .chain(matrix_keys)
+        {
+            if rg_core::ci::is_reserved_ci_variable(variable) {
+                return Err(rg_core::error::invalid_request(format!(
+                    "job '{name}' sets variable '{variable}', which is reserved: a job may not \
+                     set the runner's CI_* variables or names that configure the host (PATH, \
+                     HOME, TMPDIR, LANG, LC_*, LD_*, DYLD_*, DOCKER_*, GO*, SSL_CERT_*, *_PROXY)"
+                )));
+            }
+        }
         if let Some(condition) = job.condition.as_deref() {
             // The parser's complaint ("unsupported condition function 'foo'")
             // is the half that says what to fix, so it is folded into the
@@ -6536,6 +6559,80 @@ mod matrix_tests {
             actions_workflow: false,
         };
         assert!(validate_execution_semantics(&config).is_err());
+    }
+
+    /// A job's variables are read into the environment of the host `docker`
+    /// CLI, so a name like `LD_PRELOAD` or `DOCKER_HOST` acts on the host and
+    /// not in the container (security audit finding #2). The committed file is
+    /// where the author can read the refusal, so it is refused there, by job
+    /// and by name, for `variables:`, for a matrix key, and for an Actions
+    /// workflow's `env:`.
+    #[test]
+    fn variables_that_configure_the_runner_host_are_refused_by_name() {
+        let with_variable = |name: &str| {
+            let mut job = config(BTreeMap::new());
+            job.variables = Some(HashMap::from([(name.to_owned(), "x".to_owned())]));
+            CiConfig {
+                stages: Some(vec!["test".into()]),
+                concurrency: None,
+                jobs: HashMap::from([("deploy".into(), job)]),
+                actions_workflow: false,
+            }
+        };
+        for name in [
+            "LD_PRELOAD",
+            "DOCKER_HOST",
+            "GODEBUG",
+            "https_proxy",
+            "SSL_CERT_FILE",
+            "PATH",
+            "HOME",
+            "LC_ALL",
+            "CI_JOB_TOKEN",
+        ] {
+            let error = validate_execution_semantics(&with_variable(name))
+                .expect_err("a variable that configures the host must be refused");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("deploy") && message.contains(name),
+                "the rejection must name the job and the variable: {message}"
+            );
+        }
+        validate_execution_semantics(&with_variable("DEPLOY_TARGET"))
+            .expect("an ordinary variable is still accepted");
+
+        // A matrix key becomes a variable of the same name.
+        let matrix = CiConfig {
+            stages: Some(vec!["test".into()]),
+            concurrency: None,
+            jobs: HashMap::from([(
+                "deploy".into(),
+                config(BTreeMap::from([(
+                    "DOCKER_HOST".to_owned(),
+                    vec!["tcp://attacker:2375".to_owned()],
+                )])),
+            )]),
+            actions_workflow: false,
+        };
+        let error = validate_execution_semantics(&matrix)
+            .expect_err("a matrix key that configures the host must be refused");
+        assert!(format!("{error:#}").contains("DOCKER_HOST"), "{error:#}");
+
+        // An Actions workflow's `env:` arrives here as the job's variables.
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/ci.yml",
+            b"on: push\nenv:\n  LD_PRELOAD: /workspace/evil.so\njobs:\n  build:\n    steps:\n      - run: echo hi\n",
+        )]);
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect("the workflow itself parses; the name is judged by the validator");
+        let error = validate_execution_semantics(&config)
+            .expect_err("a workflow env: that configures the host must be refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ci/build") && message.contains("LD_PRELOAD"),
+            "{message}"
+        );
     }
 
     /// `tags:` names the labels a runner must carry, and the only code that ever

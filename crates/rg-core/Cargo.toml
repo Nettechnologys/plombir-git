@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 rg-db = { path = "../rg-db" }
 rg-git = { path = "../rg-git" }
+rg-process = { path = "../rg-process" }
 gix = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

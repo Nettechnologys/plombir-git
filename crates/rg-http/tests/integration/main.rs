@@ -222,6 +222,7 @@ mod runner_artifact_publication_tests;
 mod runner_auth_tests;
 mod runner_lookup_failure_status_tests;
 mod runner_repository_scope_tests;
+mod runner_reserved_variable_names_tests;
 mod runner_route_coverage_tests;
 mod runner_shutdown_tests;
 mod runner_workspace_tests;

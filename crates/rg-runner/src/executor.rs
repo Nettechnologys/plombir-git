@@ -198,8 +198,57 @@ pub(crate) async fn run_job_docker(
     workspace: &std::path::Path,
     job_id: i64,
 ) -> (i32, String) {
+    run_job_docker_with(
+        std::path::Path::new("docker"),
+        image,
+        script,
+        variables,
+        workspace,
+        job_id,
+    )
+    .await
+}
+
+/// A Docker client that starts from an empty environment.
+///
+/// The runner process carries its own token and whatever else the operator's
+/// shell exported; none of it belongs to a `docker` child. The CLI gets back
+/// only what it needs to find and reach the daemon
+/// (`rg_process::job_environment::docker_cli_environment`).
+fn docker_command(program: &std::path::Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .kill_on_drop(true)
+        .env_clear()
+        .envs(rg_process::job_environment::docker_cli_environment());
+    command
+}
+
+/// The job variables that may enter the container.
+///
+/// Everything the server sent minus the names that would act on the host
+/// `docker` CLI they pass through — `LD_PRELOAD` loads a library out of the
+/// workspace into the runner's own process, `DOCKER_HOST` hands the whole
+/// command, secrets included, to another daemon. The server strips them too;
+/// this runner does not rely on that (security audit finding #2). `PATH`,
+/// `LANG` and `HOME` are among them: they are the local executor's, and the
+/// container keeps its image's own.
+fn container_variables(variables: &[(String, String)]) -> impl Iterator<Item = &(String, String)> {
+    variables
+        .iter()
+        .filter(|(name, _)| !rg_process::job_environment::is_host_sensitive_variable(name))
+}
+
+async fn run_job_docker_with(
+    docker: &std::path::Path,
+    image: &str,
+    script: &str,
+    variables: &[(String, String)],
+    workspace: &std::path::Path,
+    job_id: i64,
+) -> (i32, String) {
     // Check if Docker daemon is running
-    let docker_ok = tokio::process::Command::new("docker")
+    let docker_ok = docker_command(docker)
         .arg("info")
         .output()
         .await
@@ -215,15 +264,15 @@ pub(crate) async fn run_job_docker(
     let container_name = job_container_name(job_id);
     let args = docker_run_args(image, script, variables, workspace, &container_name);
 
-    let mut command = tokio::process::Command::new("docker");
+    let mut command = docker_command(docker);
     command.args(&args);
     // Only the variable name is passed on the command line above; the value is
     // inherited from the Docker CLI environment so secrets are not exposed in the
-    // host process arguments.
-    for (key, value) in variables {
+    // host process arguments. Same filter as the `-e` list, so a name that is
+    // dropped there is not in the environment either.
+    for (key, value) in container_variables(variables) {
         command.env(key, value);
     }
-    command.kill_on_drop(true);
     match command.output().await {
         Ok(o) => {
             let code = o.status.code().unwrap_or(-1);
@@ -256,7 +305,9 @@ pub(crate) async fn run_job_docker(
 /// The Docker socket is deliberately NOT mounted and `--privileged` is never
 /// passed, so the job has no path to the daemon or host devices. Only variable
 /// *names* are placed on the command line; values are inherited from the CLI
-/// environment so secrets never appear in the host process arguments.
+/// environment so secrets never appear in the host process arguments. Names
+/// that would configure the CLI itself are not placed at all
+/// ([`container_variables`]).
 fn docker_run_args(
     image: &str,
     script: &str,
@@ -284,7 +335,7 @@ fn docker_run_args(
         "-w".to_string(),
         "/workspace".to_string(),
     ];
-    for (key, _) in variables {
+    for (key, _) in container_variables(variables) {
         args.push("-e".to_string());
         args.push(key.clone());
     }
@@ -344,7 +395,19 @@ mod tests {
 
     #[test]
     fn docker_run_args_apply_sandbox_hardening() {
-        let variables = vec![("CI_JOB_TOKEN".to_string(), "secret".to_string())];
+        let variables = vec![
+            ("CI_JOB_TOKEN".to_string(), "secret".to_string()),
+            // What a job or a compromised server could send: names the host
+            // `docker` CLI itself reads (security audit finding #2), and the
+            // runner's own shell variables that mean nothing in the container.
+            ("LD_PRELOAD".to_string(), "/workspace/evil.so".to_string()),
+            ("DOCKER_HOST".to_string(), "tcp://attacker:2375".to_string()),
+            ("GODEBUG".to_string(), "http2debug=2".to_string()),
+            ("https_proxy".to_string(), "http://attacker".to_string()),
+            ("PATH".to_string(), "/runner/bin".to_string()),
+            ("HOME".to_string(), "/runner/home".to_string()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+        ];
         let args = docker_run_args(
             "alpine:3.20",
             "echo hi",
@@ -382,11 +445,26 @@ mod tests {
         );
 
         // Secret values must not appear on the command line — only the name.
-        assert!(args.iter().any(|a| a == "CI_JOB_TOKEN"));
+        assert!(window("-e", "CI_JOB_TOKEN"));
         assert!(
             !args.iter().any(|a| a == "secret"),
             "secret value leaked into argv"
         );
+        // Names that configure the host CLI are not even named.
+        for denied in [
+            "LD_PRELOAD",
+            "DOCKER_HOST",
+            "GODEBUG",
+            "https_proxy",
+            "PATH",
+            "HOME",
+            "LANG",
+        ] {
+            assert!(
+                !window("-e", denied),
+                "{denied} reached the container argument list: {args:?}"
+            );
+        }
 
         // Image and script still terminate the invocation.
         assert_eq!(
@@ -397,6 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_executor_injects_polled_variables_with_a_clean_environment() {
+        std::env::set_var("PLOMBIR_GIT_HOST_SECRET", "runner-host-only");
         let variables = vec![("RUNNER_MESSAGE".into(), "hello".into())];
         let (code, log) = run_job_local(
             "test \"$RUNNER_MESSAGE\" = hello && test -z \"$PLOMBIR_GIT_HOST_SECRET\" && echo ok",
@@ -406,6 +485,105 @@ mod tests {
         .await;
         assert_eq!(code, 0, "{log}");
         assert!(log.contains("ok"));
+    }
+
+    /// The host `docker` CLI runs outside the container's `--cap-drop`, so
+    /// what reaches its environment is what runs on the runner host. Its
+    /// environment must be the operator's allow-list plus the job's harmless
+    /// variables: not the runner process's own (the canary), and not a
+    /// job-supplied `LD_PRELOAD` or `DOCKER_HOST` (security audit finding #2).
+    /// Values still travel in the environment, never in `argv`, so a
+    /// multi-line value keeps working.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_executor_starts_the_cli_from_a_clean_filtered_environment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("docker-fixture");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+state=$(dirname "$0")
+case "$1" in
+  info) exit 0 ;;
+  run)
+    printf '%s\n' "$@" > "$state/run.args"
+    env > "$state/run.env"
+    exit 0
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("PLOMBIR_GIT_RUNNER_CANARY", "runner-host-only");
+
+        let variables = vec![
+            ("CI_JOB_TOKEN".to_string(), "job-token".to_string()),
+            ("MULTI_LINE".to_string(), "first\nsecond".to_string()),
+            (
+                "LD_PRELOAD".to_string(),
+                temp.path().join("evil.so").display().to_string(),
+            ),
+            ("DOCKER_HOST".to_string(), "tcp://attacker:2375".to_string()),
+            ("GODEBUG".to_string(), "http2debug=2".to_string()),
+            ("http_proxy".to_string(), "http://attacker".to_string()),
+            ("PATH".to_string(), "/job/bin".to_string()),
+        ];
+        let (code, log) = run_job_docker_with(
+            &program,
+            "alpine:3.20",
+            "echo hi",
+            &variables,
+            temp.path(),
+            7,
+        )
+        .await;
+        assert_eq!(code, 0, "{log}");
+
+        let env = std::fs::read_to_string(temp.path().join("run.env")).unwrap();
+        let has = |line: &str| env.lines().any(|candidate| candidate == line);
+        assert!(has("CI_JOB_TOKEN=job-token"), "{env}");
+        assert!(
+            env.contains("MULTI_LINE=first\nsecond\n"),
+            "multi-line values must survive the trip: {env}"
+        );
+        for denied in [
+            "PLOMBIR_GIT_RUNNER_CANARY=",
+            "LD_PRELOAD=",
+            "DOCKER_HOST=",
+            "GODEBUG=",
+            "http_proxy=",
+            "PATH=/job/bin",
+        ] {
+            assert!(
+                !env.lines().any(|line| line.starts_with(denied)),
+                "{denied} reached the docker CLI environment: {env}"
+            );
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            assert!(
+                has(&format!("PATH={}", path.to_string_lossy())),
+                "the CLI must keep the operator's PATH: {env}"
+            );
+        }
+
+        let args = std::fs::read_to_string(temp.path().join("run.args")).unwrap();
+        assert!(args.lines().any(|line| line == "MULTI_LINE"), "{args}");
+        for leaked in [
+            "job-token",
+            "first",
+            "LD_PRELOAD",
+            "DOCKER_HOST",
+            "/job/bin",
+        ] {
+            assert!(
+                !args.lines().any(|line| line == leaked),
+                "{leaked} appeared on the docker command line: {args}"
+            );
+        }
     }
 
     #[cfg(unix)]
