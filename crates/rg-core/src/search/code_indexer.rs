@@ -205,6 +205,43 @@ const SNAPSHOTS: &str = "code_index_snapshots";
 const PUBLISHED_KEY: &str =
     "COALESCE((SELECT s.published_key FROM code_index_snapshots s WHERE s.repo_id = ?), ?)";
 
+/// The predicate that selects the `code_fts` rows stored under the key `key_sql`
+/// evaluates to, and how many times the caller binds that key's parameters.
+///
+/// SQLite's `code_fts` is an FTS5 table, which has no B-tree on any column:
+/// `repo_id = ?` alone reads the stored row of every file of every repository
+/// on the instance to keep one repository's. `repo_id` is, however, one of the
+/// table's *indexed* columns, so the rows of one key are a single token lookup
+/// in the full-text index — `MATCH 'repo_id : <digits>'`. The tokenizer drops
+/// the sign of a generation key and so cannot tell `41` from `-41`; the
+/// equality that follows runs only over the rows that lookup returned and
+/// keeps them apart (card_9ca44c148b8f).
+///
+/// The two `BETWEEN` ranges — every generation of a deleted repository, and
+/// the abandoned generations a rebuild retires — stay scans: a range of keys is
+/// no token, and both run once per deletion or rebuild, not per read or push.
+fn under_key(backend: DatabaseBackend, key_sql: &str) -> (String, usize) {
+    match backend {
+        DatabaseBackend::Sqlite => (
+            format!(
+                "code_fts MATCH ('repo_id : ' || abs({key_sql})) AND code_fts.repo_id = {key_sql}"
+            ),
+            2,
+        ),
+        DatabaseBackend::Postgres | DatabaseBackend::MySql => {
+            (format!("code_fts.repo_id = {key_sql}"), 1)
+        }
+    }
+}
+
+/// `values`, once for every time [`under_key`] spelled the key out.
+fn key_values(values: &[Value], times: usize) -> Vec<Value> {
+    std::iter::repeat_n(values, times)
+        .flatten()
+        .cloned()
+        .collect()
+}
+
 /// Low bits of a generation key that carry the generation; the rest is the
 /// repository id. Keys are negative so they can never be mistaken for the
 /// positive repository ids the pre-generation layout used as keys.
@@ -722,16 +759,17 @@ impl CodeIndexer {
     /// repository reads is this module's decision.
     pub async fn indexed_file_count(&self, repo_id: i64) -> Result<i64> {
         let backend = self.db.get_database_backend();
+        let (published, times) = under_key(backend, PUBLISHED_KEY);
         let sql = rg_db::prepare_sql(
             backend,
-            &format!("SELECT COUNT(*) FROM code_fts WHERE code_fts.repo_id = {PUBLISHED_KEY}"),
+            &format!("SELECT COUNT(*) FROM code_fts WHERE {published}"),
         );
         let row = self
             .db
             .query_one(Statement::from_sql_and_values(
                 backend,
                 &sql,
-                [repo_id.into(), repo_id.into()],
+                key_values(&[repo_id.into(), repo_id.into()], times),
             ))
             .await
             .with_context(|| format!("count code index rows for repository {repo_id}"))?
@@ -1305,15 +1343,20 @@ impl CodeIndexer {
     /// The row ids stored under `key`.
     async fn stored_row_ids(&self, key: i64) -> Result<Vec<i64>> {
         let backend = self.db.get_database_backend();
+        let (under, times) = under_key(backend, "?");
         let sql = rg_db::prepare_sql(
             backend,
             &format!(
-                "SELECT {} FROM code_fts WHERE repo_id = ?",
+                "SELECT {} FROM code_fts WHERE {under}",
                 row_id_column(backend)
             ),
         );
         self.db
-            .query_all(Statement::from_sql_and_values(backend, &sql, [key.into()]))
+            .query_all(Statement::from_sql_and_values(
+                backend,
+                &sql,
+                key_values(&[key.into()], times),
+            ))
             .await
             .with_context(|| format!("list code index rows under key {key}"))?
             .into_iter()
@@ -1327,16 +1370,16 @@ impl CodeIndexer {
         let mut stored = Vec::new();
         for batch in paths.chunks(ID_BATCH) {
             let placeholders = vec!["?"; batch.len()].join(", ");
+            let (under, times) = under_key(backend, "?");
             let sql = rg_db::prepare_sql(
                 backend,
                 &format!(
-                    "SELECT {}, {} FROM code_fts WHERE repo_id = ? AND file_path IN ({placeholders})",
+                    "SELECT {}, {} FROM code_fts WHERE {under} AND file_path IN ({placeholders})",
                     row_id_column(backend),
                     content_bytes_expr(backend)
                 ),
             );
-            let mut values: Vec<Value> = Vec::with_capacity(batch.len() + 1);
-            values.push(key.into());
+            let mut values = key_values(&[key.into()], times);
             values.extend(batch.iter().map(|path| Value::from(path.clone())));
             let rows = self
                 .db
@@ -1414,8 +1457,9 @@ impl CodeIndexer {
 
         let snippet_expr = code_fts_snippet_expr(backend, "code_fts", has_query);
 
+        let (published, key_times) = under_key(backend, PUBLISHED_KEY);
         let generation_filter = match repo_id {
-            Some(_) => format!("code_fts.repo_id = {PUBLISHED_KEY}"),
+            Some(_) => published,
             // Generation keys are negative; a positive key is the
             // pre-generation layout, readable while no snapshot row moved it.
             None => format!(
@@ -1430,7 +1474,7 @@ impl CodeIndexer {
             format!("{} AND {}", match_pred, generation_filter)
         };
         let repo_values: Vec<Value> = repo_id
-            .map(|rid| vec![Value::from(rid), Value::from(rid)])
+            .map(|rid| key_values(&[Value::from(rid), Value::from(rid)], key_times))
             .unwrap_or_default();
 
         // Parameter order follows SQL order: match predicate, repo filter,
@@ -2449,6 +2493,190 @@ mod tests {
             .map(|(path, content)| (path.as_str(), content.as_slice()))
             .collect::<Vec<_>>();
         committed_repository(&borrowed)
+    }
+
+    async fn search_paths(indexer: &CodeIndexer, query: &str, repo_id: Option<i64>) -> Vec<String> {
+        let (rows, total) = indexer
+            .search_code(query, repo_id, 100, 0)
+            .await
+            .expect("search the code index");
+        let mut paths = rows
+            .into_iter()
+            .map(|row| row.file_path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(
+            total,
+            i64::try_from(paths.len()).unwrap(),
+            "count and page disagree"
+        );
+        paths
+    }
+
+    /// card_9ca44c148b8f: `repo_id` is an indexed column of the SQLite FTS5
+    /// table, and an unfiltered `MATCH` matched it — a search for `41` inside
+    /// repository 41 returned every file it has, and a search for the digits of
+    /// a generation key returned that whole generation.
+    #[tokio::test]
+    async fn a_search_matches_file_text_and_never_the_repository_key() {
+        let indexer = test_indexer().await;
+        // The layout from before generations: rows keyed by the repository id.
+        for (path, content) in [
+            ("forty_one.rs", "const ANSWER: u32 = 41;"),
+            ("other.rs", "fn main() {}"),
+        ] {
+            indexer
+                .db
+                .execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO code_fts(repo_id, file_path, file_name, content, language) \
+                     VALUES (?, ?, ?, ?, 'Rust')",
+                    [
+                        TEST_REPO_ID.into(),
+                        path.into(),
+                        path.into(),
+                        content.into(),
+                    ],
+                ))
+                .await
+                .expect("seed a pre-generation row");
+        }
+        assert_eq!(
+            search_paths(&indexer, &TEST_REPO_ID.to_string(), Some(TEST_REPO_ID)).await,
+            ["forty_one.rs"]
+        );
+        assert_eq!(
+            search_paths(&indexer, &TEST_REPO_ID.to_string(), None).await,
+            ["forty_one.rs"]
+        );
+
+        build(
+            &indexer,
+            TEST_REPO_ID,
+            "tree-one",
+            &generation_entries("one", 3),
+        )
+        .await;
+        let key = state(&indexer, TEST_REPO_ID).await.published_key;
+        assert!(key < 0, "the build did not publish a generation key");
+        let digits = key.unsigned_abs().to_string();
+        assert_eq!(
+            search_paths(&indexer, &digits, Some(TEST_REPO_ID)).await,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            search_paths(&indexer, &digits, None).await,
+            Vec::<String>::new()
+        );
+        // The file text is still what a query finds.
+        assert_eq!(
+            search_paths(&indexer, "one_1", Some(TEST_REPO_ID)).await,
+            ["one/0001.rs"]
+        );
+    }
+
+    /// The other half of card_9ca44c148b8f. FTS5 has no B-tree on a column, so
+    /// `WHERE repo_id = ?` on SQLite read every stored file of every repository
+    /// to keep one repository's. Every statement a read or an incremental push
+    /// sends to `code_fts` has to find its rows through the full-text index —
+    /// an FTS5 plan whose index string is empty is that full scan.
+    #[tokio::test]
+    async fn per_repository_reads_find_their_rows_through_the_full_text_index() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1).sqlx_logging(false);
+        let mut db = Database::connect(options).await.expect("connect");
+        rg_db::run_migrations(&db).await.expect("migrate");
+        seed_repository(&db, Some(TEST_OWNER_ID), Some(TEST_REPO_ID), "plan").await;
+        let other = seed_repository(&db, None, None, "plan-other").await;
+
+        type Sent = Vec<(String, Vec<Value>)>;
+        let statements: Arc<Mutex<Sent>> = Arc::default();
+        let recorder = Arc::clone(&statements);
+        db.set_metric_callback(move |info: &sea_orm::metric::Info<'_>| {
+            let values = info
+                .statement
+                .values
+                .as_ref()
+                .map(|values| values.0.clone())
+                .unwrap_or_default();
+            recorder
+                .lock()
+                .unwrap()
+                .push((info.statement.sql.clone(), values));
+        });
+        let indexer = CodeIndexer::new(db.clone());
+        build(
+            &indexer,
+            TEST_REPO_ID,
+            "tree-one",
+            &generation_entries("one", 3),
+        )
+        .await;
+        build(
+            &indexer,
+            other,
+            "tree-other",
+            &generation_entries("other", 3),
+        )
+        .await;
+        let key = state(&indexer, TEST_REPO_ID).await.published_key;
+
+        statements.lock().unwrap().clear();
+        assert_eq!(indexer.indexed_file_count(TEST_REPO_ID).await.unwrap(), 3);
+        assert_eq!(
+            search_paths(&indexer, "one_1", Some(TEST_REPO_ID)).await,
+            ["one/0001.rs"]
+        );
+        assert_eq!(
+            search_paths(&indexer, "", Some(TEST_REPO_ID)).await.len(),
+            3
+        );
+        assert_eq!(indexer.stored_row_ids(key).await.unwrap().len(), 3);
+        assert_eq!(
+            indexer
+                .stored_rows_at_paths(key, &["one/0000.rs".to_string()])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let sent: Sent = statements
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter(|(sql, _)| sql.contains("code_fts"))
+            .collect();
+        assert!(
+            sent.len() >= 6,
+            "the reads sent no code_fts statement: {sent:?}"
+        );
+
+        for (sql, values) in sent {
+            let plan = db
+                .query_all(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    format!("EXPLAIN QUERY PLAN {sql}"),
+                    values,
+                ))
+                .await
+                .expect("explain a code_fts statement");
+            let details: Vec<String> = plan
+                .iter()
+                .map(|row| row.try_get_by_index::<String>(3).expect("plan detail"))
+                .collect();
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("VIRTUAL TABLE INDEX")),
+                "no code_fts step in the plan of {sql}: {details:?}"
+            );
+            assert!(
+                !details
+                    .iter()
+                    .any(|detail| detail.ends_with("VIRTUAL TABLE INDEX 0:")),
+                "{sql} scans every repository's rows: {details:?}"
+            );
+        }
     }
 
     /// The card's acceptance: a push that changes one file of many rewrites

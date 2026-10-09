@@ -16,8 +16,9 @@
 
 use sea_orm::DatabaseBackend;
 
-/// Column sets per FTS table. Used for MySQL `MATCH (...)` and as documentation
-/// of the indexed columns for the other backends.
+/// Column sets per FTS table: what a user's query is matched against. MySQL's
+/// `MATCH (...)` names them and SQLite's FTS5 column filter confines the query
+/// to them; Postgres builds its `tsv` from the same columns.
 pub const REPOS_FTS_COLS: &[&str] = &["name", "description"];
 pub const ISSUES_FTS_COLS: &[&str] = &["title", "body"];
 pub const WIKI_FTS_COLS: &[&str] = &["title", "content"];
@@ -47,10 +48,19 @@ pub fn fts_match(
     raw_query: &str,
 ) -> (String, String, Vec<String>) {
     match backend {
+        // The query is confined to `columns`. An FTS5 table indexes every
+        // column it declares, and `code_fts` declares `repo_id` among them:
+        // an unfiltered `MATCH '"41"'` matched the key of every row of
+        // repository 41, so a search for `41` inside it returned all of its
+        // files (card_9ca44c148b8f).
         DatabaseBackend::Sqlite => (
             format!("{table} MATCH ?"),
             "ORDER BY rank".to_string(),
-            vec![fts_phrase_escape(raw_query)],
+            vec![format!(
+                "{{{}}} : {}",
+                columns.join(" "),
+                fts_phrase_escape(raw_query)
+            )],
         ),
         DatabaseBackend::Postgres => (
             format!("{table}.tsv @@ plainto_tsquery('simple', ?)"),
