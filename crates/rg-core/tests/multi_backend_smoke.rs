@@ -1239,9 +1239,10 @@ async fn exercise_embedded_ci_graph_transitions(
 }
 
 async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i64, actor_id: i64) {
-    let created = rg_db::ops::ci_secret_ops::upsert(
+    let created = rg_db::ops::ci_secret_ops::upsert_in_environment(
         db,
         repo_id,
+        None,
         "PORTABLE_DEPLOY_TOKEN",
         "ciphertext-initial",
         actor_id,
@@ -1249,9 +1250,10 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     .await
     .expect("create the smoke-test CI secret")
     .expect("a first PUT creates the CI secret");
-    let updated = rg_db::ops::ci_secret_ops::upsert(
+    let updated = rg_db::ops::ci_secret_ops::upsert_in_environment(
         db,
         repo_id,
+        None,
         "PORTABLE_DEPLOY_TOKEN",
         "ciphertext-rotated",
         actor_id,
@@ -1274,13 +1276,16 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     .expect("a MySQL zero-change result is not a missing row");
     assert_eq!(unchanged.id, updated.id);
 
-    assert!(rg_db::ops::ci_secret_ops::delete_by_repo_and_name(
-        db,
-        repo_id,
-        "PORTABLE_DEPLOY_TOKEN",
-    )
-    .await
-    .expect("delete the smoke-test CI secret"));
+    assert!(
+        rg_db::ops::ci_secret_ops::delete_by_repo_environment_and_name(
+            db,
+            repo_id,
+            None,
+            "PORTABLE_DEPLOY_TOKEN",
+        )
+        .await
+        .expect("delete the smoke-test CI secret")
+    );
     assert!(
         rg_db::ops::ci_secret_ops::update_existing(
             db,

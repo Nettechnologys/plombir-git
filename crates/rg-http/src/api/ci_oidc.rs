@@ -98,15 +98,34 @@ pub async fn token(
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
+    let (owner, repository) =
+        match rg_core::repo::service::repository_identity(&state.db, pipeline.repo_id).await {
+            Ok(identity) => identity,
+            Err(error) => return AppError::from(error).into_response(),
+        };
+    let actor = match pipeline.triggered_by {
+        Some(user_id) => rg_db::ops::user_ops::find_by_id(&state.db, user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|user| user.username),
+        None => None,
+    };
     let (value, expires_at) = match rg_core::auth::ci_oidc::issue(
         &state.instance_key,
         &issuer,
         &query.audience,
-        pipeline.repo_id,
-        pipeline.id,
-        job.id,
-        &pipeline.ref_name,
-        &pipeline.commit_sha,
+        &rg_core::auth::ci_oidc::JobIdentity {
+            owner: &owner,
+            repository: &repository,
+            repository_id: pipeline.repo_id,
+            pipeline_id: pipeline.id,
+            job_id: job.id,
+            ref_name: &pipeline.ref_name,
+            sha: &pipeline.commit_sha,
+            environment: job.environment_name.as_deref(),
+            actor: actor.as_deref(),
+        },
     ) {
         Ok(value) => value,
         Err(error) => return AppError::from(error).into_response(),

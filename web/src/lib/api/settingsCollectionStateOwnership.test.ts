@@ -54,6 +54,10 @@ let rendered: RenderedComponent | undefined;
 
 beforeEach(() => {
 	resetTestClient();
+	// The CI-secrets page reads the environment list next to the secrets; the
+	// shared client mock stubs every call to `undefined`, and the page awaits
+	// this one before it can render any row.
+	ciEnvironments.list.mockResolvedValue([]);
 	setTestPage('/alice/demo/settings', { owner: 'alice', repo: 'demo' });
 	vi.stubGlobal('confirm', vi.fn(() => true));
 });

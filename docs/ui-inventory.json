@@ -18740,7 +18740,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.ci_secrets.name",
-          "line": 94,
+          "line": 101,
           "via": null,
           "href": null,
           "handler": "save",
@@ -18780,14 +18780,38 @@
               "browserScenarios": [
                 "repo-ci-secrets"
               ]
+            },
+            {
+              "symbol": "ciEnvironments.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/actions/environments",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/actions/environments",
+              "access": "RepoRead",
+              "handler": "api::ci_environments::list",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
         },
         {
+          "tag": "select",
+          "label": "i18n:settings.ci_secrets.environment_repository_wide",
+          "line": 101,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
           "tag": "button",
           "label": "i18n:settings.ci_secrets.save",
-          "line": 94,
+          "line": 101,
           "via": null,
           "href": null,
           "handler": null,
@@ -18797,7 +18821,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 94,
+          "line": 101,
           "via": null,
           "href": null,
           "handler": "() => remove(item)",
@@ -18828,6 +18852,20 @@
               "routeUrl": "/api/v1/repos/{owner}/{name}/actions/secrets",
               "access": "RepoAdmin",
               "handler": "api::ci_secrets::list",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "ciEnvironments.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/actions/environments",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/actions/environments",
+              "access": "RepoRead",
+              "handler": "api::ci_environments::list",
               "matched": true,
               "testedIn": [
                 "rust",
@@ -27051,7 +27089,7 @@
       "outsider"
     ],
     "scenarios": 46,
-    "inventoryEntries": 762,
+    "inventoryEntries": 764,
     "coveredEntries": 171,
     "coveredRoutes": 162,
     "maxUiRoutesWithoutFrontendTest": 26

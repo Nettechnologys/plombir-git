@@ -1382,14 +1382,18 @@
     },
     "ci_secrets": {
       "title": "CI secrets",
-      "desc": "Encrypted repository secrets are injected into jobs and masked from stored logs.",
+      "desc": "Encrypted repository secrets are injected into jobs and masked from stored logs. Environment-scoped secrets reach only jobs that passed that environment's gate.",
       "add_title": "Add or replace a secret",
       "name": "Name",
       "value": "Value",
+      "environment": "Environment",
+      "environment_repository_wide": "Repository-wide (all jobs)",
+      "environment_scoped": "Environment: {environment}",
       "save": "Save secret",
       "list_title": "Configured secrets",
       "empty": "No secrets configured.",
-      "delete_confirm": "Delete {name}?"
+      "delete_confirm": "Delete {name}?",
+      "delete_confirm_scoped": "Delete {name} from the {environment} environment?"
     },
     "retention": {
       "title": "CI retention",

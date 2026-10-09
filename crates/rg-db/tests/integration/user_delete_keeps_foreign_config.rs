@@ -134,9 +134,16 @@ async fn deleting_an_account_keeps_the_configuration_it_left_in_another_reposito
     let guest = seed_user(&db, "config-guest").await;
     let repo = seed_repo(&db, host, "shared").await;
 
-    rg_db::ops::ci_secret_ops::upsert(&db, repo, "DEPLOY_TOKEN", "ciphertext", guest)
-        .await
-        .expect("seed the CI secret the guest set on the host's repository");
+    rg_db::ops::ci_secret_ops::upsert_in_environment(
+        &db,
+        repo,
+        None,
+        "DEPLOY_TOKEN",
+        "ciphertext",
+        guest,
+    )
+    .await
+    .expect("seed the CI secret the guest set on the host's repository");
 
     let key = rg_db::ops::deploy_key_ops::create(
         &db,
@@ -273,13 +280,18 @@ async fn deleting_an_account_keeps_the_configuration_it_left_in_another_reposito
         "the guest row was not there to delete"
     );
 
-    let secret = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo, "DEPLOY_TOKEN")
-        .await
-        .expect("read the CI secret after its author was deleted")
-        .expect(
-            "the CI secret died with the account that set it — the host's pipelines now fail on \
+    let secret = rg_db::ops::ci_secret_ops::find_by_repo_environment_and_name(
+        &db,
+        repo,
+        None,
+        "DEPLOY_TOKEN",
+    )
+    .await
+    .expect("read the CI secret after its author was deleted")
+    .expect(
+        "the CI secret died with the account that set it — the host's pipelines now fail on \
              an empty variable",
-        );
+    );
     assert_eq!(secret.created_by_id, None, "the author was not ghosted");
     assert_eq!(
         secret.encrypted_value, "ciphertext",
