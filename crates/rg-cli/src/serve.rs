@@ -42,10 +42,12 @@ fn configured_ci_engine(
     job_timeout_secs: u64,
     runner_labels: Vec<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    write_pool: rg_db::DatabaseConnection,
 ) -> rg_ci::CiEngine {
     rg_ci::CiEngine::with_notifications_and_job_timeout(notifications, job_timeout_secs)
         .with_runner_labels(runner_labels)
         .with_shutdown(shutdown)
+        .with_write_pool(write_pool)
 }
 
 fn publish_listen_addresses(
@@ -1483,6 +1485,18 @@ pub(crate) async fn run_serve(
         "Package upload artifact ceiling configured"
     );
 
+    // Steady background writers queue on their own pool (card_bb685235de6f):
+    // the CI log queue, the runner heartbeat, the embedded runner and the
+    // credential usage stamps (card_a84b25c9efbe).
+    let db_write = rg_db::open_write_pool(
+        &resolved_db_url,
+        resolved_db_connect_timeout,
+        resolved_db_idle_timeout,
+        &db,
+    )
+    .await
+    .map_err(|e| dbconn::annotate_db_open_error(e, &resolved_db_url))?;
+
     // One CI engine and one WebSocket hub for the whole process: the SSH
     // transport's post-push hooks trigger pipelines and push `ci_triggered` /
     // `push` events to the very clients the HTTP server's sockets belong to, so
@@ -1501,6 +1515,7 @@ pub(crate) async fn run_serve(
         resolved_job_timeout,
         resolved_runner_labels.clone(),
         shutdown_rx.clone(),
+        db_write.clone(),
     );
     tracing::info!(
         job_timeout_secs = ci_engine.job_timeout_secs(),
@@ -1511,15 +1526,6 @@ pub(crate) async fn run_serve(
         std::sync::Arc::new(ci_engine);
     let instance_settings = rg_core::instance::InstanceSettingsCache::default();
 
-    // Steady background writers queue on their own pool (card_bb685235de6f).
-    let db_write = rg_db::open_write_pool(
-        &resolved_db_url,
-        resolved_db_connect_timeout,
-        resolved_db_idle_timeout,
-        &db,
-    )
-    .await
-    .map_err(|e| dbconn::annotate_db_open_error(e, &resolved_db_url))?;
     let http_config = rg_http::HttpServerConfig {
         listen_addr: resolved_http_addr,
         repo_root: repo_root.clone(),
@@ -2652,6 +2658,7 @@ mod serve_tests {
             config.timeouts.job_secs,
             rg_core::ci::default_runner_labels(),
             shutdown_rx,
+            rg_db::DatabaseConnection::Disconnected,
         );
 
         assert_eq!(engine.job_timeout_secs(), 731);

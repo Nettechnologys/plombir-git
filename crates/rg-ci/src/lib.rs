@@ -99,6 +99,10 @@ pub struct CiEngine {
     /// pipeline is triggered, and whether the embedded runner will execute a
     /// job that carries labels at all.
     runner_labels: Vec<String>,
+    /// The pool the embedded runners it spawns write through
+    /// (`rg_db::open_write_pool`, card_a84b25c9efbe). Process configuration
+    /// like the rest; `None` writes through the database the trigger hands in.
+    write_pool: Option<sea_orm::DatabaseConnection>,
 }
 
 impl Default for CiEngine {
@@ -108,6 +112,7 @@ impl Default for CiEngine {
             job_timeout_secs: rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
             shutdown: None,
             runner_labels: rg_core::ci::default_runner_labels(),
+            write_pool: None,
         }
     }
 }
@@ -165,6 +170,13 @@ impl CiEngine {
     /// here anyway.
     pub fn with_runner_labels(mut self, labels: Vec<String>) -> Self {
         self.runner_labels = labels;
+        self
+    }
+
+    /// Send the writes of every embedded runner this engine spawns through
+    /// `write_pool` — see [`crate::runner::PipelineRunner::set_write_pool`].
+    pub fn with_write_pool(mut self, write_pool: sea_orm::DatabaseConnection) -> Self {
+        self.write_pool = Some(write_pool);
         self
     }
 
@@ -1293,6 +1305,9 @@ fn build_internal_runner(
         runner.set_oidc_token_url(url);
     }
     runner.set_shutdown(engine.shutdown.clone());
+    if let Some(write_pool) = &engine.write_pool {
+        runner.set_write_pool(write_pool.clone());
+    }
     runner
 }
 

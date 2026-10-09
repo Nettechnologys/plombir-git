@@ -118,6 +118,15 @@ pub(crate) fn job_container_name(job_id: i64) -> String {
 /// Pipeline runner that executes stages/jobs sequentially.
 pub struct PipelineRunner {
     db: DatabaseConnection,
+    /// Where the runner's own writes go — the job heartbeat, `running`, the
+    /// result and the graph roll-up it makes due. A runner with a job in hand
+    /// writes steadily, and on the shared pool every one of those writes waits
+    /// in SQLite's busy handler on a connection a reader needs; on the write
+    /// pool it waits in the pool's queue (card_a84b25c9efbe). Every write
+    /// moved here is one statement, or a transaction whose body only ever
+    /// sees its own `tx`, so nothing holds this pool while asking it for a
+    /// second connection. `db` itself until [`Self::set_write_pool`].
+    db_write: DatabaseConnection,
     repo_path: std::path::PathBuf,
     pipeline_id: i64,
     repo_id: i64,
@@ -185,6 +194,7 @@ impl PipelineRunner {
         job_timeout_secs: u64,
     ) -> Self {
         Self {
+            db_write: db.clone(),
             db,
             repo_path: repo_path.to_path_buf(),
             pipeline_id,
@@ -224,6 +234,7 @@ impl PipelineRunner {
         job_timeout_secs: u64,
     ) -> Self {
         Self {
+            db_write: db.clone(),
             db,
             repo_path: repo_path.to_path_buf(),
             pipeline_id,
@@ -287,6 +298,11 @@ impl PipelineRunner {
     /// as the same merge made over REST (card_85b8d59246b5).
     pub fn set_notifications(&mut self, notifications: crate::CiNotifications) {
         self.notifications = notifications;
+    }
+
+    /// Send the runner's own writes through `db_write` — see the field.
+    pub fn set_write_pool(&mut self, db_write: DatabaseConnection) {
+        self.db_write = db_write;
     }
 
     /// Tell this runner about the process's graceful-shutdown signal.
@@ -423,7 +439,7 @@ impl PipelineRunner {
         if job.image.is_some() {
             self.remove_job_container(job.id).await;
         }
-        match pipeline_ops::hand_back_active_job(&self.db, job.id).await {
+        match pipeline_ops::hand_back_active_job(&self.db_write, job.id).await {
             Ok(true) => tracing::info!(
                 job_id = job.id,
                 pipeline_id = self.pipeline_id,
@@ -455,7 +471,7 @@ impl PipelineRunner {
             // for. One transaction, because three writes in a row can stop
             // between two of them (card_944be22fcd3c).
             let log = format!("runner could not prepare the workspace: {error:#}");
-            match pipeline_ops::fail_pipeline_chain(&self.db, self.pipeline_id, &log).await {
+            match pipeline_ops::fail_pipeline_chain(&self.db_write, self.pipeline_id, &log).await {
                 Ok(true) => {
                     rg_core::metrics_hook::record_ci_pipeline_finished("failed");
                     rg_core::notification::thread::notify_ci_failed(&self.db, self.pipeline_id);
@@ -487,7 +503,7 @@ impl PipelineRunner {
             .filter(|pipeline| pipeline.started_at.is_none())
             .map(|_| now);
         if !pipeline_ops::settle_pipeline_if_active(
-            &self.db,
+            &self.db_write,
             self.pipeline_id,
             "running",
             pipeline_started_at,
@@ -554,7 +570,7 @@ impl PipelineRunner {
         let pipeline_end = chrono::Utc::now().naive_utc();
         let pipeline_status = if pipeline_failed { "failed" } else { "success" };
         if !pipeline_ops::settle_pipeline_if_active(
-            &self.db,
+            &self.db_write,
             self.pipeline_id,
             pipeline_status,
             None,
@@ -598,7 +614,7 @@ impl PipelineRunner {
     /// middle left a `skipped` stage owning `pending` jobs that no pass of this
     /// runner walks again.
     async fn skip_stage(&self, stage: &rg_db::entities::pipeline_stage::Model) -> Result<()> {
-        pipeline_ops::skip_embedded_stage(&self.db, self.pipeline_id, stage.id).await?;
+        pipeline_ops::skip_embedded_stage(&self.db_write, self.pipeline_id, stage.id).await?;
         Ok(())
     }
 
@@ -615,7 +631,7 @@ impl PipelineRunner {
         // Mark stage as running
         let stage_start = chrono::Utc::now().naive_utc();
         if !pipeline_ops::settle_stage_if_active(
-            &self.db,
+            &self.db_write,
             stage.id,
             "running",
             stage.started_at.is_none().then_some(stage_start),
@@ -653,7 +669,7 @@ impl PipelineRunner {
             }
             if job.status == "manual" {
                 if !pipeline_ops::pause_embedded_stage_at_gate(
-                    &self.db,
+                    &self.db_write,
                     self.pipeline_id,
                     stage.id,
                     "manual",
@@ -671,7 +687,7 @@ impl PipelineRunner {
             }
             if job.status == "waiting_approval" {
                 if !pipeline_ops::pause_embedded_stage_at_gate(
-                    &self.db,
+                    &self.db_write,
                     self.pipeline_id,
                     stage.id,
                     "waiting_approval",
@@ -741,7 +757,7 @@ impl PipelineRunner {
         let stage_end = chrono::Utc::now().naive_utc();
         let stage_status = if stage_failed { "failed" } else { "success" };
         if !pipeline_ops::settle_embedded_stage(
-            &self.db,
+            &self.db_write,
             self.pipeline_id,
             stage.id,
             stage_status,
@@ -823,7 +839,7 @@ impl PipelineRunner {
         };
 
         let transition = pipeline_ops::finish_embedded_job(
-            &self.db,
+            &self.db_write,
             self.pipeline_id,
             job.stage_id,
             job.id,
@@ -970,7 +986,7 @@ impl PipelineRunner {
         // a start that never landed left the row `pending` under a job that was
         // executing — which the liveness check below now reads, correctly, as
         // "not this runner's to run".
-        if !pipeline_ops::start_job_if_active(&self.db, job_id, Some(job_start))
+        if !pipeline_ops::start_job_if_active(&self.db_write, job_id, Some(job_start))
             .await
             .with_context(|| format!("failed to mark CI job {job_id} running"))?
         {
@@ -1094,7 +1110,7 @@ impl PipelineRunner {
             }
         };
         let result = with_job_heartbeat(execution, self.job_heartbeat_interval, || async {
-            match pipeline_ops::touch_running_job(&self.db, job_id).await {
+            match pipeline_ops::touch_running_job(&self.db_write, job_id).await {
                 Ok(true) => true,
                 Ok(false) => {
                     tracing::info!(
@@ -1131,7 +1147,7 @@ impl PipelineRunner {
         // Asked only where it matters — before a success publishes anything.
         let mut publish = matches!(result, Ok((0, _)));
         if publish && (cache.is_some() || artifacts.is_some()) {
-            match pipeline_ops::touch_running_job(&self.db, job_id).await {
+            match pipeline_ops::touch_running_job(&self.db_write, job_id).await {
                 Ok(true) => {}
                 Ok(false) => {
                     tracing::info!(
@@ -3250,6 +3266,79 @@ esac
             format!("rm -f {}", job_container_name(job.id))
         );
         assert!(!fixture.root.join("container.live").exists());
+    }
+
+    /// card_a84b25c9efbe: everything the embedded runner writes about the job
+    /// it holds — `running`, the heartbeat, the result, the stage and pipeline
+    /// roll-up — goes through the write pool, and nothing it writes about the
+    /// graph lands on the shared pool. The write pool here is one connection
+    /// that gives up after two seconds, so a transaction that reached for the
+    /// pool again from inside itself would fail this run instead of hanging.
+    #[tokio::test]
+    async fn the_embedded_runner_writes_the_graph_through_the_write_pool() {
+        use std::sync::{Arc, Mutex};
+
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, db, job) =
+            runner_with_one_job(temp.path(), "write-pool", "sleep 1; echo built", None, 60).await;
+        let url = format!("sqlite://{}?mode=rwc", temp.path().join("ci.db").display());
+        let mut shared = rg_db::connect_with_pool(&url, 2, 60, 2).await.unwrap();
+        let mut write = rg_db::open_write_pool(&url, 2, 60, &shared).await.unwrap();
+        let record = |pool: &mut rg_db::DatabaseConnection| {
+            let sent: Arc<Mutex<Vec<String>>> = Arc::default();
+            let sink = Arc::clone(&sent);
+            pool.set_metric_callback(move |info| {
+                let sql = info.statement.sql.clone();
+                if sql.trim_start().to_ascii_uppercase().starts_with("UPDATE") {
+                    sink.lock().unwrap().push(sql);
+                }
+            });
+            sent
+        };
+        let on_shared = record(&mut shared);
+        let on_write = record(&mut write);
+        runner.db = shared.clone();
+        runner.set_write_pool(write.clone());
+        runner.set_job_heartbeat_interval(std::time::Duration::from_millis(100));
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), runner.run())
+            .await
+            .expect("the runner hung on its own write pool")
+            .expect("the pipeline ran");
+
+        let finished = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.status, "success", "{:?}", finished.log);
+        let graph_tables = ["\"pipeline_jobs\"", "\"pipeline_stages\"", "\"pipelines\""];
+        let written = on_write.lock().unwrap().clone();
+        for table in graph_tables {
+            assert!(
+                written.iter().any(|sql| sql.contains(table)),
+                "no {table} write went through the write pool: {written:?}"
+            );
+        }
+        let heartbeats = written
+            .iter()
+            .filter(|sql| sql.contains("SET \"updated_at\" = ? WHERE \"pipeline_jobs\""))
+            .count();
+        assert!(
+            heartbeats >= 2,
+            "the heartbeat did not write through the write pool: {written:?}"
+        );
+        let leaked: Vec<String> = on_shared
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|sql| graph_tables.iter().any(|table| sql.contains(table)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            leaked,
+            Vec::<String>::new(),
+            "graph writes on the shared pool"
+        );
     }
 
     /// The timeout cleanup is exceptional: a normal Docker completion must
