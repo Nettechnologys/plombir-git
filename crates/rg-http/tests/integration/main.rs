@@ -270,6 +270,7 @@ mod webhook_external_body_limit_tests;
 mod webhook_external_hmac_tests;
 mod webhook_secret_at_rest_tests;
 mod webhook_transport_policy_tests;
+mod websocket_query_token_tests;
 mod websocket_session_revocation_tests;
 mod wiki_authz_tests;
 mod wiki_tests;

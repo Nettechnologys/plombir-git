@@ -987,12 +987,11 @@ async fn callback_inner(
         (Some(returned), Some(expected)) if returned == expected => {
             // Valid
         }
-        (Some(returned), Some(expected)) => {
-            tracing::warn!(
-                "SSO CSRF state mismatch: expected={}, got={}",
-                expected,
-                returned
-            );
+        (Some(_), Some(_)) => {
+            // Neither value is logged: the expected one is the anti-CSRF
+            // secret the cookie carries, and the returned one is whatever the
+            // caller chose to send — a log line is not the place for either.
+            tracing::warn!(provider = %slug, "SSO CSRF state mismatch");
             return Err(state_invalid("CSRF state mismatch — possible attack"));
         }
         (Some(_), None) => {

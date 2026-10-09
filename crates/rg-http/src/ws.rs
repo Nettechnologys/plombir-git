@@ -2,9 +2,11 @@
 //!
 //! Clients connect to `ws://host/api/v1/ws/notifications` and authenticate with
 //! the HttpOnly session cookie (what a browser sends on a same-origin upgrade)
-//! or a `Sec-WebSocket-Protocol: bearer.<jwt>` subprotocol. The query-parameter
-//! fallback (`?token=<jwt>`) is retained for backward compatibility but should
-//! not be used by new clients.
+//! or a `Sec-WebSocket-Protocol: bearer.<jwt>` subprotocol. The legacy
+//! `?token=<jwt>` query parameter is no longer accepted: a URL is copied into
+//! access logs, proxy logs, browser history and `Referer` headers, and the
+//! request span used to carry it into every log line the server wrote
+//! (security audit finding #9).
 //!
 //! Reading a session out of a handshake is not this module's job — it belongs to
 //! [`crate::api::auth::ws_session`], which owns the cookie's name and is shared
@@ -16,13 +18,13 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        Path, Query, State, WebSocketUpgrade,
+        Path, State, WebSocketUpgrade,
     },
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use futures::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -284,17 +286,9 @@ impl NotificationHub {
     }
 }
 
-/// Query params for WebSocket upgrade (backward-compatible token fallback).
-#[derive(Deserialize)]
-pub struct WsQuery {
-    /// JWT token for authentication (legacy — prefer Sec-WebSocket-Protocol).
-    token: Option<String>,
-}
-
 /// GET /api/v1/ws/notifications — WebSocket upgrade handler.
 pub async fn ws_notifications_handler(
     ws: WebSocketUpgrade,
-    Query(query): Query<WsQuery>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
@@ -303,7 +297,7 @@ pub async fn ws_notifications_handler(
     let WsSession {
         protocol_echo,
         user,
-    } = ws_session(&headers, query.token.as_deref(), &state.jwt_secret);
+    } = ws_session(&headers, &state.jwt_secret);
 
     let Some(session) = user else {
         return crate::error::AppError::unauthorized("authentication required").into_response();
@@ -460,13 +454,12 @@ fn job_not_found() -> crate::error::AppError {
 
 /// GET /api/v1/ws/job/:job_id — WebSocket for real-time job log streaming.
 ///
-/// Authenticates via the HttpOnly cookie, a `Sec-WebSocket-Protocol:
-/// bearer.<jwt>` subprotocol, or a `?token=<jwt>` query parameter (legacy).
+/// Authenticates via the HttpOnly cookie or a `Sec-WebSocket-Protocol:
+/// bearer.<jwt>` subprotocol; a `?token=<jwt>` query parameter is not read.
 /// Frontend subscribes to receive `job_log` events filtered by the specified job_id.
 pub async fn ws_job_log_handler(
     ws: WebSocketUpgrade,
     Path(job_id): Path<i64>,
-    Query(query): Query<WsQuery>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
@@ -475,7 +468,7 @@ pub async fn ws_job_log_handler(
     let WsSession {
         protocol_echo,
         user,
-    } = ws_session(&headers, query.token.as_deref(), &state.jwt_secret);
+    } = ws_session(&headers, &state.jwt_secret);
 
     let Some(session) = user else {
         return crate::error::AppError::unauthorized("authentication required").into_response();
@@ -503,8 +496,8 @@ pub async fn ws_job_log_handler(
         Ok(None) => return job_not_found().into_response(),
         Err(error) => return crate::error::AppError::from(error).into_response(),
     };
-    // The handshake resolved *who* is calling out of the subprotocol / query
-    // token, because a browser cannot set `Authorization` on a WebSocket. What
+    // The handshake resolved *who* is calling out of the cookie or the
+    // subprotocol, because a browser cannot set `Authorization` on a WebSocket. What
     // that user may read is the shared repository gate's decision, exactly as
     // it would be on the REST route serving the same logs.
     //

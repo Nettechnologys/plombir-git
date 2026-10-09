@@ -135,7 +135,7 @@ const SIGNED_OFF: &[(&str, &str)] = &[
     ),
     (
         "ws.rs",
-        "job-log WebSocket: the token arrives in `Sec-WebSocket-Protocol` or `?token=`, not in \
+        "job-log WebSocket: the token arrives in the cookie or `Sec-WebSocket-Protocol`, not in \
          `Authorization`, so a headers-based gate does not reach it",
     ),
 ];

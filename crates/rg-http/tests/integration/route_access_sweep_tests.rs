@@ -3064,6 +3064,11 @@ const ROUTE_CALL_SIGNED_OFF: &[(&str, RouteCallSignOff, &str)] = &[
         RouteCallSignOff::TestScaffold,
         "a one-route scaffold inside `#[cfg(test)]`, to drive the client-address middleware",
     ),
+    (
+        "log_redaction.rs",
+        RouteCallSignOff::TestScaffold,
+        "a one-route scaffold inside `#[cfg(test)]`, to drive the request-span trace layer",
+    ),
 ];
 
 /// `crates/rg-http/src`, the tree both route-call guards walk.

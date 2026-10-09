@@ -105,7 +105,7 @@ const CI_JOB_TOKEN: Access = Foreign(Handler {
 const WS_SESSION: Access = Foreign(Handler {
     module: "ws.rs",
     gates: &["ws_session"],
-    note: "WebSocket: session from the HttpOnly cookie, `Sec-WebSocket-Protocol` or `?token=`",
+    note: "WebSocket: session from the HttpOnly cookie or `Sec-WebSocket-Protocol`",
 });
 /// The job-log socket: the ticket says who is calling, and what that user may
 /// read is the shared repository gate's decision, exactly as on the REST route
@@ -348,6 +348,36 @@ fn build_router(
 /// difference either side is allowed is the `rate_limiter`, and that difference
 /// is this argument.
 ///
+/// The `http_request` span every request runs under.
+///
+/// Both log layers print this span's fields on every event emitted inside it
+/// and the OTLP layer exports them, so what goes in here goes everywhere. The
+/// URI is therefore split: the path is recorded as it is, and the query only
+/// after [`crate::log_redaction::redact_query`] has replaced every credential
+/// in it — the SSO callback's `code` and `state`, a reset `token`, a presigned
+/// signature — with a marker. Before the split the whole URI was recorded and
+/// every such secret was copied into each log line the request wrote. A
+/// request without a query records no `query` field at all.
+pub(crate) fn request_span(request: &axum::http::Request<axum::body::Body>) -> tracing::Span {
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let span = tracing::info_span!(
+        "http_request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        query = tracing::field::Empty,
+        status = tracing::field::Empty,
+        request_id = %request_id,
+    );
+    if let Some(query) = request.uri().query() {
+        span.record("query", crate::log_redaction::redact_query(query).as_str());
+    }
+    span
+}
+
 /// Layer order is bottom-up — the last `.layer()` runs first.
 fn apply_middleware(
     router: Router<AppState>,
@@ -366,22 +396,7 @@ fn apply_middleware(
             middleware::http_metrics_middleware,
         ))
         .layer(axum::middleware::from_fn(middleware::request_id_middleware))
-        .layer(TraceLayer::new_for_http().make_span_with(
-            |request: &axum::http::Request<axum::body::Body>| {
-                let request_id = request
-                    .headers()
-                    .get("x-request-id")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("-");
-                tracing::info_span!(
-                    "http_request",
-                    method = %request.method(),
-                    uri = %request.uri(),
-                    status = tracing::field::Empty,
-                    request_id = %request_id,
-                )
-            },
-        ))
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
         .layer(build_cors_layer());
 
     // The per-IP limiter reads `ConnectInfo`, which only a real `axum::serve`

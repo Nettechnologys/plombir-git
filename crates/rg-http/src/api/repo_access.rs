@@ -18,8 +18,8 @@
 //!
 //! The non-REST transports — git LFS, the OCI registry, the job-log WebSocket —
 //! cannot use either layer: each carries its credentials in a shape of its own
-//! (an LFS action signature, an OCI-scoped bearer token, a `?token=` query
-//! parameter), so they resolve *who is calling* themselves. What they must not
+//! (an LFS action signature, an OCI-scoped bearer token, a `bearer.<jwt>`
+//! subprotocol), so they resolve *who is calling* themselves. What they must not
 //! also decide is *who is allowed*: [`check_read_for`] / [`check_write_for`]
 //! take the actor the transport already resolved and answer that question here,
 //! so there is still exactly one implementation of the rule.

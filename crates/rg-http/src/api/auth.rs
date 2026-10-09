@@ -237,8 +237,8 @@ pub(crate) struct WsSessionUser {
 /// The session a WebSocket handshake presented, and the subprotocol to echo.
 pub(crate) struct WsSession {
     /// The `Sec-WebSocket-Protocol` value to select in the upgrade response,
-    /// when the token arrived as one. `None` for the cookie and query shapes,
-    /// which offer no subprotocol to echo.
+    /// when the token arrived as one. `None` for the cookie shape, which offers
+    /// no subprotocol to echo.
     pub(crate) protocol_echo: Option<String>,
     /// The session this handshake authenticated, or `None` when no shape carried
     /// a valid user session.
@@ -247,10 +247,13 @@ pub(crate) struct WsSession {
 
 /// Resolve the session a WebSocket handshake presents.
 ///
-/// Three spellings are accepted, in this order: the HttpOnly cookie (what a
+/// Two spellings are accepted, in this order: the HttpOnly cookie (what a
 /// browser sends on a same-origin upgrade, and the *only* shape it can offer on
-/// `/ws/notifications`), a `bearer.<jwt>` subprotocol, and a legacy `?token=`
-/// query parameter.
+/// `/ws/notifications`) and a `bearer.<jwt>` subprotocol. The legacy `?token=`
+/// query parameter is deliberately not one of them: a URL is written to access
+/// logs, proxy logs, browser history and `Referer` headers, and the request
+/// span carried it into every log line the server wrote (security audit
+/// finding #9). A handshake offering only that shape is anonymous.
 ///
 /// This lives here rather than in [`crate::ws`] because it is a reading of a
 /// session, and the copy that lived there had already drifted: it spelled the
@@ -261,16 +264,12 @@ pub(crate) struct WsSession {
 /// frame (card_24a8ef566056). Both WebSocket handlers now share this one
 /// resolution, and it sits next to [`presented_session_versions`], which has to
 /// agree with it about what counts as a presented session.
-pub(crate) fn ws_session(
-    headers: &HeaderMap,
-    query_token: Option<&str>,
-    jwt_secret: &str,
-) -> WsSession {
+pub(crate) fn ws_session(headers: &HeaderMap, jwt_secret: &str) -> WsSession {
     let (protocol_echo, token) = match extract_token_from_cookie(headers) {
         Some(token) => (None, Some(token)),
         None => match bearer_subprotocols(headers).into_iter().next() {
             Some((protocol, token)) => (Some(protocol), Some(token)),
-            None => (None, query_token.map(str::to_string)),
+            None => (None, None),
         },
     };
 
@@ -297,36 +296,29 @@ pub(crate) fn ws_session(
 /// cookie, `Authorization: Bearer`, the `token ` spelling some clients use,
 /// HTTP Basic with the JWT in either field (how git clients carry it), and —
 /// because a browser cannot set headers on a WebSocket handshake — the
-/// `bearer.<jwt>` subprotocol or a `?token=` query parameter. All of them are
-/// collected here, because a gate that reads one shape is a gate with a
-/// documented way around it. A request normally presents exactly one session;
-/// duplicates are folded.
+/// `bearer.<jwt>` subprotocol. All of them are collected here, because a gate
+/// that reads one shape is a gate with a documented way around it. A request
+/// normally presents exactly one session; duplicates are folded.
+///
+/// The query string is not read: no handler accepts a session from it any
+/// more (see [`ws_session`]), so a `?token=` there is not a presentation but
+/// noise, and a gate that resolved it would be the one place on the server
+/// still treating a URL as a credential.
 ///
 /// Anything that is not a valid *user* JWT yields nothing: a Personal Access
 /// Token, a CI job token, an OCI registry token and an MFA challenge all fail
 /// `validate_token` (different claim shape or a domain-separated key), and each
 /// carries its own owner check where it is resolved.
-fn presented_session_versions(
-    headers: &HeaderMap,
-    query: Option<&str>,
-    jwt_secret: &str,
-) -> Vec<(i64, i64)> {
+fn presented_session_versions(headers: &HeaderMap, jwt_secret: &str) -> Vec<(i64, i64)> {
     let mut candidates: Vec<String> = Vec::new();
 
     if let Some(token) = extract_token_from_cookie(headers) {
         candidates.push(token);
     }
 
-    // WebSocket handshake shapes — `ws::ws_notifications_handler` accepts both.
+    // The WebSocket handshake shape a browser client uses — see `ws_session`.
     for (_, token) in bearer_subprotocols(headers) {
         candidates.push(token);
-    }
-    if let Some(query) = query {
-        for pair in query.split('&') {
-            if let Some(token) = pair.strip_prefix("token=") {
-                candidates.push(token.to_string());
-            }
-        }
     }
 
     if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
@@ -396,7 +388,7 @@ pub(crate) async fn session_standing_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let presented = presented_session_versions(req.headers(), req.uri().query(), &state.jwt_secret);
+    let presented = presented_session_versions(req.headers(), &state.jwt_secret);
     for (user_id, session_version) in presented {
         match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
             Ok(Some(user)) if user.is_usable() && user.session_version == session_version => {}
@@ -593,7 +585,7 @@ mod tests {
     /// Every shape this server accepts has to reach the revocation gate. A
     /// shape the gate cannot read is a way to keep using a revoked session —
     /// the WebSocket handshake is the sharp edge here, since a browser cannot
-    /// set headers on it and the handler grew two header-free spellings.
+    /// set headers on it and the handler grew a header-free spelling.
     #[test]
     fn every_presentation_of_a_session_is_seen() {
         let jwt = session(42);
@@ -614,17 +606,11 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                presented_session_versions(&headers(name, value), None, SECRET),
+                presented_session_versions(&headers(name, value), SECRET),
                 vec![(42, 0)],
                 "a session presented as {shape} is invisible to the gate"
             );
         }
-
-        assert_eq!(
-            presented_session_versions(&HeaderMap::new(), Some(&format!("token={jwt}")), SECRET),
-            vec![(42, 0)],
-            "a session presented as a WebSocket query parameter is invisible to the gate"
-        );
     }
 
     /// One session presented twice is still one account to look up — the gate
@@ -637,10 +623,7 @@ mod tests {
             "cookie",
             format!("{AUTH_COOKIE_NAME}={jwt}").parse().unwrap(),
         );
-        assert_eq!(
-            presented_session_versions(&h, Some(&format!("token={jwt}")), SECRET),
-            vec![(7, 0)]
-        );
+        assert_eq!(presented_session_versions(&h, SECRET), vec![(7, 0)]);
     }
 
     /// Credentials that are not user sessions carry their own owner check where
@@ -661,7 +644,6 @@ mod tests {
             assert!(
                 presented_session_versions(
                     &headers("authorization", format!("Bearer {token}")),
-                    None,
                     SECRET
                 )
                 .is_empty(),
@@ -683,7 +665,7 @@ mod tests {
             "Negotiate whatever".to_string(),
         ] {
             assert!(
-                presented_session_versions(&headers("authorization", value.clone()), None, SECRET)
+                presented_session_versions(&headers("authorization", value.clone()), SECRET)
                     .is_empty(),
                 "{value} was read as a session"
             );
@@ -720,7 +702,6 @@ mod tests {
         let jwt = session(42);
         let resolved = ws_session(
             &headers("cookie", format!("{AUTH_COOKIE_NAME}={jwt}")),
-            None,
             SECRET,
         );
         assert_eq!(resolved.user, ws_user(42, 0));
@@ -737,20 +718,10 @@ mod tests {
         let jwt = session(7);
         let resolved = ws_session(
             &headers("sec-websocket-protocol", format!("bearer.{jwt}")),
-            None,
             SECRET,
         );
         assert_eq!(resolved.user, ws_user(7, 0));
         assert_eq!(resolved.protocol_echo, Some(format!("bearer.{jwt}")));
-    }
-
-    /// The legacy `?token=` shape still resolves, and still echoes nothing.
-    #[test]
-    fn a_query_token_handshake_is_a_session() {
-        let jwt = session(9);
-        let resolved = ws_session(&HeaderMap::new(), Some(&jwt), SECRET);
-        assert_eq!(resolved.user, ws_user(9, 0));
-        assert!(resolved.protocol_echo.is_none());
     }
 
     /// The generation the token was minted under has to survive the handshake,
@@ -759,14 +730,13 @@ mod tests {
     /// account alone, becomes invisible to them (card_7898025803a6).
     #[test]
     fn a_handshake_carries_the_session_generation_it_was_minted_under() {
-        for (shape, headers_in, query) in [
+        for (shape, headers_in) in [
             (
                 "a cookie",
                 headers(
                     "cookie",
                     format!("{AUTH_COOKIE_NAME}={}", session_at(42, 3)),
                 ),
-                None,
             ),
             (
                 "a subprotocol",
@@ -774,16 +744,10 @@ mod tests {
                     "sec-websocket-protocol",
                     format!("bearer.{}", session_at(42, 3)),
                 ),
-                None,
-            ),
-            (
-                "a query parameter",
-                HeaderMap::new(),
-                Some(session_at(42, 3)),
             ),
         ] {
             assert_eq!(
-                ws_session(&headers_in, query.as_deref(), SECRET).user,
+                ws_session(&headers_in, SECRET).user,
                 ws_user(42, 3),
                 "a handshake presenting {shape} dropped its session generation"
             );
@@ -794,27 +758,23 @@ mod tests {
     /// invalid token must not be mistaken for one either.
     #[test]
     fn a_handshake_without_a_valid_session_authenticates_nobody() {
-        for (what, headers_in, query) in [
-            ("nothing at all", HeaderMap::new(), None),
+        for (what, headers_in) in [
+            ("nothing at all", HeaderMap::new()),
             (
                 "an empty cookie",
                 headers("cookie", format!("{AUTH_COOKIE_NAME}=")),
-                None,
             ),
             (
                 "a cookie under another name",
                 headers("cookie", format!("some_other_token={}", session(1))),
-                None,
             ),
             (
                 "a garbage subprotocol token",
                 headers("sec-websocket-protocol", "bearer.not-a-jwt".to_string()),
-                None,
             ),
-            ("a garbage query token", HeaderMap::new(), Some("not-a-jwt")),
         ] {
             assert_eq!(
-                ws_session(&headers_in, query, SECRET).user,
+                ws_session(&headers_in, SECRET).user,
                 None,
                 "a handshake presenting {what} was read as a session"
             );
@@ -834,7 +794,7 @@ mod tests {
             format!("bearer.{protocol_session}").parse().unwrap(),
         );
 
-        let resolved = ws_session(&h, None, SECRET);
+        let resolved = ws_session(&h, SECRET);
         assert_eq!(resolved.user, ws_user(1, 0));
         assert!(
             resolved.protocol_echo.is_none(),
