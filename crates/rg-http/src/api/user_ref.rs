@@ -21,11 +21,14 @@
 //! which failures are the caller's, and on what it can say back about who was
 //! added.
 //!
-//! The e-mail is read and **refused** (card_9e97b992d4a6): the instance does not
-//! confirm addresses, so an address identifies the person who typed it first,
-//! and a grant addressed to it can land in a stranger's account. It comes back
-//! only together with address confirmation, and then only for confirmed
-//! addresses.
+//! The e-mail is read and **refused** (card_9e97b992d4a6). An unconfirmed
+//! address identifies the person who typed it first, so a grant addressed to it
+//! can land in a stranger's account. Addresses can now be confirmed
+//! (`users.email_verified_at`, card_2296f052332b), and a confirmed one is still
+//! refused, deliberately: anyone who creates a repository administers it, so
+//! resolving "add bob@corp.example" would let every account learn which
+//! username holds any address it guesses. The username is public; the address
+//! is not, and naming people by it stays off.
 
 use serde::Deserialize;
 
@@ -34,8 +37,9 @@ use rg_db::entities::user::Model as User;
 /// Why an e-mail does not name a person here. Shared so every surface that
 /// reads a [`UserRef`] gives the same reason.
 pub(crate) const EMAIL_NOT_ACCEPTED: &str =
-    "a person cannot be named by e-mail address here: addresses are not confirmed on this \
-     instance, so an address names whoever registered it first; use the username";
+    "a person cannot be named by e-mail address here: an unconfirmed address names whoever \
+     registered it first, and resolving a confirmed one would tell anyone which account holds \
+     it; use the username";
 
 /// The ways a request body may name an account: `user_id` or `username`, and
 /// an `email` that is refused with a reason (see the module note).

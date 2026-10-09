@@ -107,7 +107,8 @@ async fn an_email_is_refused_and_a_bare_id_is_still_accepted() {
     assert_eq!(by_email.status(), 400);
     let body: serde_json::Value = by_email.json().await.expect("json body");
     assert!(
-        body.to_string().contains("addresses are not confirmed"),
+        body.to_string()
+            .contains("cannot be named by e-mail address"),
         "the refusal has to say why, got: {body}"
     );
 

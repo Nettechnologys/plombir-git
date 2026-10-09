@@ -501,6 +501,17 @@
     },
     {
       "method": "POST",
+      "url": "/api/v1/users/me/email/verify",
+      "access": "User",
+      "handler": "api::account::request_email_verification",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
       "url": "/api/v1/users/verify-email",
       "access": "Public",
       "handler": "api::account::confirm_email",
@@ -25940,7 +25951,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.retry",
-          "line": 203,
+          "line": 232,
           "via": null,
           "href": null,
           "handler": "load",
@@ -25959,6 +25970,20 @@
                 "web",
                 "smoke"
               ]
+            },
+            {
+              "symbol": "instance.get",
+              "method": "GET",
+              "url": "/api/v1/instance",
+              "opaque": false,
+              "routeUrl": "/api/v1/instance",
+              "access": "Public",
+              "handler": "api::instance::get_instance",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -25966,7 +25991,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.profile.display_name",
-          "line": 210,
+          "line": 239,
           "via": null,
           "href": null,
           "handler": "saveProfile",
@@ -25991,7 +26016,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 217,
+          "line": 246,
           "via": null,
           "href": null,
           "handler": null,
@@ -26001,7 +26026,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.save",
-          "line": 221,
+          "line": 250,
           "via": null,
           "href": null,
           "handler": null,
@@ -26011,7 +26036,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 235,
+          "line": 264,
           "via": null,
           "href": null,
           "handler": "uploadAvatar",
@@ -26036,7 +26061,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.remove_avatar",
-          "line": 244,
+          "line": 273,
           "via": null,
           "href": null,
           "handler": "removeAvatar",
@@ -26061,7 +26086,7 @@
         {
           "tag": "form",
           "label": ")}",
-          "line": 256,
+          "line": 285,
           "via": null,
           "href": null,
           "handler": "changePassword",
@@ -26086,7 +26111,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.change_password",
-          "line": 280,
+          "line": 309,
           "via": null,
           "href": null,
           "handler": null,
@@ -26094,9 +26119,34 @@
           "unresolved": false
         },
         {
+          "tag": "button",
+          "label": "i18n:settings.profile.confirm_current_email",
+          "line": 323,
+          "via": null,
+          "href": null,
+          "handler": "requestVerification",
+          "calls": [
+            {
+              "symbol": "auth.requestEmailVerification",
+              "method": "POST",
+              "url": "/api/v1/users/me/email/verify",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/email/verify",
+              "access": "User",
+              "handler": "api::account::request_email_verification",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
           "tag": "form",
           "label": "i18n:settings.profile.new_email",
-          "line": 289,
+          "line": 337,
           "via": null,
           "href": null,
           "handler": "changeEmail",
@@ -26121,7 +26171,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.send_confirmation",
-          "line": 300,
+          "line": 348,
           "via": null,
           "href": null,
           "handler": null,
@@ -26131,7 +26181,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.profile.delete_password",
-          "line": 324,
+          "line": 372,
           "via": null,
           "href": null,
           "handler": "deleteAccount",
@@ -26156,7 +26206,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.profile.delete_button",
-          "line": 337,
+          "line": 385,
           "via": null,
           "href": null,
           "handler": null,
@@ -26947,7 +26997,17 @@
         {
           "tag": "a",
           "label": "i18n:auth.verify_email.to_settings",
-          "line": 55,
+          "line": 58,
+          "via": null,
+          "href": "/settings/profile",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "i18n:auth.verify_email.to_settings",
+          "line": 64,
           "via": null,
           "href": "/settings/profile",
           "handler": null,
@@ -26957,7 +27017,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.verify_email.working",
-          "line": 58,
+          "line": 67,
           "via": null,
           "href": null,
           "handler": "confirm",
@@ -26989,7 +27049,7 @@
       "outsider"
     ],
     "scenarios": 46,
-    "inventoryEntries": 741,
+    "inventoryEntries": 743,
     "coveredEntries": 171,
     "coveredRoutes": 162,
     "maxUiRoutesWithoutFrontendTest": 26

@@ -8,8 +8,9 @@
  *
  * A bare run of digits is read as an id, which keeps working for anyone who
  * genuinely has one; anything containing `@` is sent as an e-mail, which the
- * server refuses with the reason (addresses are not confirmed on the instance,
- * so an address names whoever registered it first); everything else is a
+ * server refuses with the reason (an unconfirmed address names whoever
+ * registered it first, and resolving a confirmed one would reveal which
+ * account holds it); everything else is a
  * username. `null` means the field was empty, which is the one case the caller
  * has to refuse locally instead of sending.
  */

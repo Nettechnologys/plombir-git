@@ -566,12 +566,63 @@ pub async fn request_email_change(
     Ok(())
 }
 
+/// Mail `user` a link that proves it receives mail at the address it already
+/// has (card_2296f052332b). For an account registered on an open instance, by
+/// an administrator, or before addresses were proved at all.
+///
+/// An address already proved is refused rather than mailed again. Inside the
+/// per-address cooldown nothing is written or sent, as for every other link:
+/// the one already in the inbox stays the live one.
+pub async fn request_email_verification(
+    db: &DatabaseConnection,
+    mailer: Mailer<'_>,
+    user: &User,
+) -> Result<()> {
+    if user.email_verified_at.is_some() {
+        return Err(crate::error::invalid_request(
+            "this account's address is already confirmed",
+        ));
+    }
+    if user.email.trim().is_empty() {
+        return Err(crate::error::invalid_request(
+            "this account has no address to confirm",
+        ));
+    }
+    if in_cooldown(db, &user.email).await? {
+        return Ok(());
+    }
+    let (token, token_hash) = new_link_token();
+    rg_db::ops::email_confirmation_ops::replace_pending_email_verification(
+        db,
+        user.id,
+        &user.email,
+        &token_hash,
+        Utc::now() + EMAIL_CONFIRMATION_LIFETIME,
+    )
+    .await?;
+    send_detached(
+        mailer,
+        &user.email,
+        "Confirm your email address",
+        format!(
+            "Follow the link below to confirm that this address belongs to the account {}. \
+             The link works once, for 24 hours. If you did not ask for this, ignore this \
+             message.",
+            user.username
+        ),
+        Some(confirmation_link(mailer, &token)),
+    );
+    Ok(())
+}
+
 /// What following a confirmation link did.
 pub enum Confirmed {
     /// A pending registration became an account — `user` is the new row.
     Registered(User),
     /// An account moved to a new address; `previous_email` is the one it left.
     EmailChanged { user: User, previous_email: String },
+    /// An account proved the address it already had.
+    EmailVerified(User),
 }
 
 /// Follow the link `token` names: create the account a registration was
@@ -588,7 +639,9 @@ pub async fn confirm(
     permit: Option<super::registration::RegistrationPermit>,
     token: &str,
 ) -> Result<Confirmed> {
-    use rg_db::entities::email_confirmation::{PURPOSE_EMAIL_CHANGE, PURPOSE_REGISTRATION};
+    use rg_db::entities::email_confirmation::{
+        PURPOSE_EMAIL_CHANGE, PURPOSE_EMAIL_VERIFY, PURPOSE_REGISTRATION,
+    };
 
     let Some(row) = rg_db::ops::email_confirmation_ops::take_live(db, &token_hash(token)).await?
     else {
@@ -628,6 +681,7 @@ pub async fn confirm(
                 &username,
                 &row.email,
                 password_hash,
+                true,
             )
             .await?;
             Ok(Confirmed::Registered(user))
@@ -655,6 +709,22 @@ pub async fn confirm(
                 user,
                 previous_email: before.email,
             })
+        }
+        PURPOSE_EMAIL_VERIFY => {
+            let user_id = row
+                .user_id
+                .with_context(|| format!("email verification {} names no account", row.id))?;
+            // Conditional on the address being the one the link was mailed
+            // to: a change made after the mail went out is not proved by it.
+            let user = user_ops::mark_email_verified(db, user_id, &row.email)
+                .await?
+                .ok_or_else(|| {
+                    crate::error::conflict(
+                        "the account's address changed after this link was sent; request a \
+                         new one",
+                    )
+                })?;
+            Ok(Confirmed::EmailVerified(user))
         }
         other => anyhow::bail!(
             "email confirmation {} has unknown purpose {other:?}",

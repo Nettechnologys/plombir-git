@@ -13,13 +13,16 @@
   let working = $state(false);
   let error = $state('');
   let movedTo = $state<string | null>(null);
+  let verified = $state<string | null>(null);
 
   async function confirm() {
     working = true;
     error = '';
     try {
       const res = await auth.confirmEmail(token);
-      if ('email' in res) {
+      if ('email' in res && res.email_verified) {
+        verified = res.email;
+      } else if ('email' in res) {
         movedTo = res.email;
       } else {
         await adoptConfirmedSession(res.token);
@@ -47,6 +50,12 @@
 
     {#if !token}
       <p>{t('auth.verify_email.no_token', 'This link carries no confirmation token. Open the link from the mail again.')}</p>
+    {:else if verified}
+      <p class="done" role="status">
+        {t('auth.verify_email.verified', 'This address is confirmed:')}
+        <strong>{verified}</strong>
+      </p>
+      <a href="/settings/profile">{t('auth.verify_email.to_settings', 'Back to your profile')}</a>
     {:else if movedTo}
       <p class="done" role="status">
         {t('auth.verify_email.moved', 'Your account now uses this address:')}

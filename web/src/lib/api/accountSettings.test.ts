@@ -15,7 +15,7 @@ import AdminUsersPage from '../../routes/admin/users/+page.svelte';
 import VerifyEmailPage from '../../routes/verify-email/+page.svelte';
 import { adoptConfirmedSession, forgetDeletedAccount } from '../stores/auth.svelte';
 import { setTestPage } from '../test/app';
-import { admin, auth, resetTestClient } from '../test/client';
+import { admin, auth, instance, resetTestClient } from '../test/client';
 import {
 	answerConfirm,
 	button,
@@ -109,6 +109,36 @@ describe('profile and account settings', () => {
 		await submit(element<HTMLFormElement>(page, 'form.email-form'));
 		expect(auth.requestEmailChange).toHaveBeenCalledWith('new@example.com', 'Old-pass1');
 		expect(page.textContent).toContain('Follow the link we mailed');
+	});
+
+	// card_2296f052332b: an address typed into an open registration is
+	// confirmed from here, and an instance without mail says it cannot.
+	it('offers to confirm an unconfirmed address when the instance can mail', async () => {
+		instance.get.mockResolvedValue({ email_confirmation: true });
+		auth.requestEmailVerification.mockResolvedValue({
+			status: 'confirmation_sent',
+			message: 'Follow the link we mailed to your address to confirm it.',
+		});
+		const page = await openProfile();
+		expect(page.textContent).toContain('Not confirmed yet.');
+		await click(element(page, '.confirm-current-email'));
+		expect(auth.requestEmailVerification).toHaveBeenCalledOnce();
+		expect(page.textContent).toContain('Follow the link we mailed to your address');
+	});
+
+	it('says an instance without mail confirms no address', async () => {
+		instance.get.mockResolvedValue({ email_confirmation: false });
+		const page = await openProfile();
+		expect(page.querySelector('.confirm-current-email')).toBeNull();
+		expect(page.textContent).toContain('this instance cannot send mail');
+	});
+
+	it('shows a confirmed address as confirmed', async () => {
+		instance.get.mockResolvedValue({ email_confirmation: true });
+		auth.me.mockResolvedValue({ ...me, email_verified_at: '2026-10-09T12:00:00Z' });
+		const page = await openProfile();
+		expect(page.querySelector('.confirm-current-email')).toBeNull();
+		expect(element(page, '.email-status.verified').textContent).toContain('Confirmed');
 	});
 
 	it('uploads and removes a picture', async () => {
@@ -229,6 +259,15 @@ describe('confirming an address', () => {
 		await click(element(rendered.container, '.confirm-email'));
 		expect(auth.confirmEmail).toHaveBeenCalledWith('abc123');
 		expect(adoptConfirmedSession).toHaveBeenCalledWith('session');
+	});
+
+	it('reports a confirmed address', async () => {
+		window.history.replaceState({}, '', '/verify-email?token=ghi789');
+		auth.confirmEmail.mockResolvedValue({ email: 'alice@example.com', email_verified: true });
+		rendered = await renderComponent(VerifyEmailPage);
+		await click(element(rendered.container, '.confirm-email'));
+		expect(rendered.container.textContent).toContain('This address is confirmed');
+		expect(rendered.container.textContent).not.toContain('now uses this address');
 	});
 
 	it('reports a moved address', async () => {

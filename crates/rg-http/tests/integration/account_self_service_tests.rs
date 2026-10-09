@@ -277,7 +277,7 @@ async fn an_address_change_needs_mail_to_confirm_it() {
         .send()
         .await
         .unwrap();
-    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
 }
 
 /// With mail, the address changes only once the link is followed.
@@ -306,6 +306,10 @@ async fn an_address_moves_when_its_link_is_followed() {
         user.email, "frank@example.com",
         "nothing moves before the link"
     );
+    assert_eq!(
+        user.email_verified_at, None,
+        "an address typed into an open registration is not proved"
+    );
 
     // The token itself only ever leaves in the mail; re-issue the pending row
     // with one this test knows, the way the request above wrote it.
@@ -331,6 +335,10 @@ async fn an_address_moves_when_its_link_is_followed() {
         .unwrap()
         .unwrap();
     assert_eq!(user.email, "frank@new.example");
+    assert!(
+        user.email_verified_at.is_some(),
+        "the followed link proved the new address"
+    );
 
     let again = client()
         .post(format!("{base}/api/v1/users/verify-email"))
@@ -619,5 +627,133 @@ async fn the_link_creates_the_account() {
     assert!(
         !user.is_admin,
         "only the bootstrap account is an administrator"
+    );
+    assert!(
+        user.email_verified_at.is_some(),
+        "an account created by its confirmation link has a proved address"
+    );
+}
+
+// ── card_2296f052332b ────────────────────────────────────────────────────
+
+/// An account whose address was only typed — an open registration — proves it
+/// by a mailed link: the link marks `email_verified_at`, a second request is
+/// refused as needless, and a link that outlived an address change proves
+/// nothing. Without outbound mail the instance says so instead of pretending.
+#[tokio::test]
+async fn an_existing_account_proves_its_address_by_a_link() {
+    let (base, _db) = spawn_test_app_with_overrides(StateOverrides::default()).await;
+    let token = register_user(&base, "nomail", "nomail@example.com", PW).await;
+    let refused = client()
+        .post(format!("{base}/api/v1/users/me/email/verify"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        StatusCode::CONFLICT,
+        "no outbound mail, no proof — the instance's state, not the caller's rights"
+    );
+
+    let (base, db) = spawn_test_app_with_overrides(StateOverrides {
+        smtp_config: Some(unreachable_smtp()),
+        external_url: Some("https://git.example.test".to_string()),
+        ..Default::default()
+    })
+    .await;
+    let (token, user_id) = register_full(&base, "olga", "olga@example.com").await;
+    let me = |token: String| {
+        let base = base.clone();
+        async move {
+            client()
+                .get(format!("{base}/api/v1/users/me"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    assert!(
+        me(token.clone()).await["email_verified_at"].is_null(),
+        "an open registration's address is not proved"
+    );
+    let asked = client()
+        .post(format!("{base}/api/v1/users/me/email/verify"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(asked.status(), StatusCode::ACCEPTED);
+    let pending = rg_db::entities::email_confirmation::Entity::find()
+        .all(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| {
+            row.user_id == Some(user_id)
+                && row.purpose == rg_db::entities::email_confirmation::PURPOSE_EMAIL_VERIFY
+        })
+        .count();
+    assert_eq!(pending, 1, "the request recorded one live link");
+
+    // A link for an address the account has since left proves nothing.
+    let stale_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"stale-link"));
+    rg_db::ops::email_confirmation_ops::replace_pending_email_verification(
+        &db,
+        user_id,
+        "olga@old.example",
+        &stale_hash,
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    )
+    .await
+    .unwrap();
+    let stale = client()
+        .post(format!("{base}/api/v1/users/verify-email"))
+        .json(&serde_json::json!({ "token": "stale-link" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert!(me(token.clone()).await["email_verified_at"].is_null());
+
+    // The token only ever leaves in the mail; re-issue the row with a known one.
+    let token_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"olga-link"));
+    rg_db::ops::email_confirmation_ops::replace_pending_email_verification(
+        &db,
+        user_id,
+        "olga@example.com",
+        &token_hash,
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    )
+    .await
+    .unwrap();
+    let confirmed = client()
+        .post(format!("{base}/api/v1/users/verify-email"))
+        .json(&serde_json::json!({ "token": "olga-link" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(confirmed.status(), StatusCode::OK);
+    let body: serde_json::Value = confirmed.json().await.unwrap();
+    assert_eq!(body["email_verified"], true);
+    assert!(
+        me(token.clone()).await["email_verified_at"].is_string(),
+        "the followed link proved the address"
+    );
+
+    let again = client()
+        .post(format!("{base}/api/v1/users/me/email/verify"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        again.status(),
+        StatusCode::BAD_REQUEST,
+        "a proved address needs no new link"
     );
 }

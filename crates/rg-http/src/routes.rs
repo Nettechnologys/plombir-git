@@ -1167,6 +1167,11 @@ pub(crate) fn build_all_routes(
             &auth_rl,
         )
         .post(User, "/users/me/email", api::account::request_email_change)
+        .post(
+            User,
+            "/users/me/email/verify",
+            api::account::request_email_verification,
+        )
         .post_with(
             Public,
             "/users/verify-email",

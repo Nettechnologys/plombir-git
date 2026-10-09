@@ -23,12 +23,12 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 408 |
-| Из них достижимы из браузера | 282 (69%) |
+| Роутов в роутере (с объявленным `Access`) | 409 |
+| Из них достижимы из браузера | 283 (69%) |
 | Layout-модулей | 2 |
 | Страниц | 69 |
-| Интерактивных элементов | 991 |
-| — из них дёргают API | 347 |
+| Интерактивных элементов | 993 |
+| — из них дёргают API | 348 |
 | — приходят из общих компонентов | 395 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 46 / 171 / 162 |
 | **UI-роутов без единого web/smoke/browser-теста** | **26** |
@@ -40,7 +40,7 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 106 | 68 | 4 | 0 |
 | `RepoWrite` | 85 | 66 | 13 | 2 |
-| `User` | 51 | 40 | 6 | 0 |
+| `User` | 52 | 41 | 6 | 0 |
 | `RepoAdmin` | 39 | 38 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
 | `InstanceAdmin` | 25 | 21 | 0 | 0 |
@@ -91,9 +91,9 @@
 | `/imports` | 16 | 3 | 2 |
 | `/[owner]/[repo]/settings/branches` | 15 | 2 | 2 |
 | `/[owner]/[repo]/wiki/[title]/history` | 15 | 5 | 11 |
+| `/settings/profile` | 15 | 8 | 2 |
 | `/[owner]/[repo]/commits/[sha]` | 14 | 6 | 11 |
 | `/dashboard` | 14 | 3 | 0 |
-| `/settings/profile` | 14 | 7 | 2 |
 | `/[owner]/[repo]/compare/[...spec]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/settings/webhooks` | 13 | 6 | 2 |
@@ -127,7 +127,7 @@
 | `/explore` | 3 | 2 | 0 |
 | `/forgot-password` | 3 | 1 | 0 |
 | `/register` | 3 | 0 | 0 |
-| `/verify-email` | 2 | 1 | 0 |
+| `/verify-email` | 3 | 1 | 0 |
 | `/[owner]/[repo]/settings/runners` | 1 | 0 | 0 |
 | `/settings/notifications` | 1 | 1 | 0 |
 
@@ -1150,13 +1150,15 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.profile.retry | :203 | `GET /api/v1/users/me` | `User` | rust+web+smoke |
-| i18n:settings.profile.display_name | :210 | `PATCH /api/v1/users/me` | `User` | rust+web |
-| uploadAvatar | :235 | `PUT /api/v1/users/me/avatar` | `User` | rust+web |
-| i18n:settings.profile.remove_avatar | :244 | `DELETE /api/v1/users/me/avatar` | `User` | rust+web |
-| )} | :256 | `PUT /api/v1/users/me/password` | `User` | rust+web |
-| i18n:settings.profile.new_email | :289 | `POST /api/v1/users/me/email` | `User` | rust+web |
-| i18n:settings.profile.delete_password | :324 | `DELETE /api/v1/users/me` | `User` | rust+web |
+| i18n:settings.profile.retry | :232 | `GET /api/v1/users/me` | `User` | rust+web+smoke |
+| i18n:settings.profile.retry | :232 | `GET /api/v1/instance` | `Public` | rust+web |
+| i18n:settings.profile.display_name | :239 | `PATCH /api/v1/users/me` | `User` | rust+web |
+| uploadAvatar | :264 | `PUT /api/v1/users/me/avatar` | `User` | rust+web |
+| i18n:settings.profile.remove_avatar | :273 | `DELETE /api/v1/users/me/avatar` | `User` | rust+web |
+| )} | :285 | `PUT /api/v1/users/me/password` | `User` | rust+web |
+| i18n:settings.profile.confirm_current_email | :323 | `POST /api/v1/users/me/email/verify` | `User` | rust+web |
+| i18n:settings.profile.new_email | :337 | `POST /api/v1/users/me/email` | `User` | rust+web |
+| i18n:settings.profile.delete_password | :372 | `DELETE /api/v1/users/me` | `User` | rust+web |
 
 ### `/settings/security`
 
@@ -1207,7 +1209,7 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:auth.verify_email.working | :58 | `POST /api/v1/users/verify-email` | `Public` | rust+web |
+| i18n:auth.verify_email.working | :67 | `POST /api/v1/users/verify-email` | `Public` | rust+web |
 
 ## Роуты, недостижимые из браузера
 

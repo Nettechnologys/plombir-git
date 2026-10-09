@@ -33,6 +33,11 @@ export interface InstanceInfo {
    * send it, and then the sign-up links stay.
    */
   registration_open?: boolean;
+  /**
+   * Whether this instance can confirm an address by mail. Optional: an older
+   * server does not send it, and then no confirmation is offered.
+   */
+  email_confirmation?: boolean;
 }
 
 export const instance = {

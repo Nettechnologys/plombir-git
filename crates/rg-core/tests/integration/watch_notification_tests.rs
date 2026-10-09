@@ -364,6 +364,7 @@ async fn every_subscriber_is_notified_past_the_old_page_limit() {
                 deleted_at: Set(None),
                 bot_owner_id: Set(None),
                 password_change_required: Set(false),
+                email_verified_at: Set(None),
             })
             .collect();
         rg_db::entities::user::Entity::insert_many(users)

@@ -8,6 +8,9 @@ use sea_orm::entity::prelude::*;
 pub const PURPOSE_REGISTRATION: &str = "registration";
 /// [`Model::purpose`] of an account moving to a new address.
 pub const PURPOSE_EMAIL_CHANGE: &str = "email_change";
+/// [`Model::purpose`] of an account proving the address it already has —
+/// one registered before addresses were confirmed, or on an open instance.
+pub const PURPOSE_EMAIL_VERIFY: &str = "email_verify";
 /// [`Model::purpose`] of a notice that carried no link — "someone tried to
 /// register with your address". Its row holds no usable token; it exists so
 /// the per-address mail cooldown counts notices too.

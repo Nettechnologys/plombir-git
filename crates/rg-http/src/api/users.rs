@@ -83,6 +83,9 @@ pub struct UserProfile {
     pub avatar_url: Option<String>,
     pub is_admin: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When the account proved, by a mailed link, that it receives mail at
+    /// `email`; `null` when it has not (card_2296f052332b).
+    pub email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[utoipa::path(
@@ -220,6 +223,27 @@ pub async fn register(
             )
             .await;
 
+            // An open instance takes the typed address as is; where it can
+            // mail, it offers the new account the proof straight away. Best
+            // effort: the account exists and the request succeeded, and the
+            // holder can ask again from the settings.
+            if let Some(mailer) = super::account::mailer(&state) {
+                let proved = async {
+                    let user = rg_db::ops::user_ops::find_by_id(&state.db, resp.user_id)
+                        .await?
+                        .ok_or_else(|| rg_core::error::not_found("user"))?;
+                    rg_core::user::account::request_email_verification(&state.db, mailer, &user)
+                        .await
+                }
+                .await;
+                if let Err(error) = proved {
+                    tracing::warn!(
+                        user_id = resp.user_id,
+                        error = %format!("{error:#}"),
+                        "the address-confirmation link for a new account was not sent"
+                    );
+                }
+            }
             crate::metrics::recorder::user_registered();
             crate::metrics::recorder::auth_event("register", "success");
             (StatusCode::CREATED, Json(serde_json::json!(resp))).into_response()
@@ -644,6 +668,7 @@ pub async fn me(State(state): State<AppState>, AuthUser(user_id): AuthUser) -> i
                 "auth_provider": user.auth_provider,
                 "is_admin": user.is_admin,
                 "created_at": user.created_at,
+                "email_verified_at": user.email_verified_at,
             })),
         )
             .into_response(),

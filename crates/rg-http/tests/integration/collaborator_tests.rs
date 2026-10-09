@@ -49,7 +49,7 @@ async fn add_collaborator_accepts_a_username_and_refuses_an_email() {
     assert!(
         email_body
             .to_string()
-            .contains("addresses are not confirmed"),
+            .contains("cannot be named by e-mail address"),
         "the refusal has to say why an e-mail is not enough, got: {email_body}"
     );
 

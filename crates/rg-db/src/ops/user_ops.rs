@@ -408,6 +408,7 @@ pub(crate) fn oauth_user_model(
         deleted_at: Set(None),
         bot_owner_id: Set(None),
         password_change_required: Set(false),
+        email_verified_at: Set(None),
     }
 }
 
@@ -454,6 +455,7 @@ pub async fn create_bot(
             deleted_at: Set(None),
             bot_owner_id: Set(Some(owner_id)),
             password_change_required: Set(false),
+            email_verified_at: Set(None),
         },
     )
     .await
@@ -512,6 +514,7 @@ pub async fn create_ldap_user(
             deleted_at: Set(None),
             bot_owner_id: Set(None),
             password_change_required: Set(false),
+            email_verified_at: Set(None),
         },
     )
     .await
@@ -1424,7 +1427,8 @@ async fn write_password(
     .await
 }
 
-/// Move `user_id` to `email`, an address its holder has just proved.
+/// Move `user_id` to `email`, an address its holder has just proved — so the
+/// same write marks it proved.
 ///
 /// `None` when the account is gone or retiring. Another account holding the
 /// address surfaces as the unique violation it is, for the caller to answer.
@@ -1433,15 +1437,44 @@ pub async fn update_email(
     user_id: i64,
     email: &str,
 ) -> Result<Option<User>> {
+    let now = chrono::Utc::now();
     let updated = UserEntity::update_many()
         .col_expr(user::Column::Email, Expr::value(email.to_string()))
-        .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+        .col_expr(user::Column::EmailVerifiedAt, Expr::value(now))
+        .col_expr(user::Column::UpdatedAt, Expr::value(now))
         .filter(user::Column::Id.eq(user_id))
         .filter(user::Column::IsActive.eq(true))
         .filter(user::Column::DeletedAt.is_null())
         .exec(db)
         .await
         .context("db: change a user's email")?;
+    if updated.rows_affected == 0 {
+        return Ok(None);
+    }
+    find_by_id(db, user_id).await
+}
+
+/// Record that `user_id` proved it receives mail at `email`.
+///
+/// Conditional on the address still being `email`: a link mailed to the old
+/// address must not mark a new one proved. `None` when nothing matched — the
+/// account is gone, retiring, or its address changed since the link was sent.
+pub async fn mark_email_verified(
+    db: &DatabaseConnection,
+    user_id: i64,
+    email: &str,
+) -> Result<Option<User>> {
+    let now = chrono::Utc::now();
+    let updated = UserEntity::update_many()
+        .col_expr(user::Column::EmailVerifiedAt, Expr::value(now))
+        .col_expr(user::Column::UpdatedAt, Expr::value(now))
+        .filter(user::Column::Id.eq(user_id))
+        .filter(user::Column::Email.eq(email))
+        .filter(user::Column::IsActive.eq(true))
+        .filter(user::Column::DeletedAt.is_null())
+        .exec(db)
+        .await
+        .context("db: mark a user's email verified")?;
     if updated.rows_affected == 0 {
         return Ok(None);
     }

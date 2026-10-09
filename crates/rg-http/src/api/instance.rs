@@ -70,6 +70,14 @@ pub struct InstanceInfo {
     /// the one to see (card_e1baa94866ed). It says nothing the register route
     /// does not already answer with its `403`.
     pub registration_open: bool,
+    /// Whether this instance can prove an address — outbound mail
+    /// (`[smtp]`) and a public address for the link (`[server].external_url`).
+    ///
+    /// Without it nothing marks an address confirmed, and the settings page
+    /// says so instead of offering a button that can only fail
+    /// (card_2296f052332b). The same fact the operator reads from `/health`'s
+    /// SMTP check, as a yes or no.
+    pub email_confirmation: bool,
 }
 
 /// GET /api/v1/instance — the public announcement of this instance.
@@ -109,6 +117,7 @@ pub async fn get_instance(State(state): State<AppState>) -> impl IntoResponse {
             source_url: build_info::source_link(&state.source_url, source_commit),
             source_commit: source_commit.map(str::to_string),
             registration_open,
+            email_confirmation: super::account::mailer(&state).is_some(),
         }),
     )
         .into_response()

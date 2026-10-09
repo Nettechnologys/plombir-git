@@ -242,7 +242,7 @@ pub async fn register(
         .await
         .context("failed to hash password")?;
 
-    let user = create_registered_account(db, permit, username, email, password_hash).await?;
+    let user = create_registered_account(db, permit, username, email, password_hash, false).await?;
     let token = jwt::generate_token(user.id, &user.username, user.session_version, jwt_secret, 7)?;
 
     Ok(AuthResponse {
@@ -264,11 +264,15 @@ pub(crate) async fn create_registered_account(
     username: &str,
     email: &str,
     password_hash: String,
+    email_proved: bool,
 ) -> Result<rg_db::entities::user::Model> {
     let now = Utc::now();
     let model = UserActiveModel {
         username: Set(username.to_string()),
         email: Set(email.to_string()),
+        // Proved when the account is the end of a followed confirmation link;
+        // an address typed into an open registration is not.
+        email_verified_at: Set(email_proved.then_some(now)),
         password_hash: Set(password_hash),
         is_admin: Set(permit.grants_instance_admin()),
         is_active: Set(true),

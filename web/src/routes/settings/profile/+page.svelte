@@ -1,6 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { auth, type Me } from '$lib/api/client.svelte';
+  import { auth, instance, type Me } from '$lib/api/client.svelte';
   import {
     fetchUser,
     forgetDeletedAccount,
@@ -40,6 +40,13 @@
   let emailMessage = $state('');
   let emailError = $state('');
 
+  // Whether the instance can mail a confirmation link at all; without outbound
+  // mail no address is ever confirmed, and the page says so.
+  let canConfirmEmail = $state(false);
+  let verifyBusy = $state(false);
+  let verifyMessage = $state('');
+  let verifyError = $state('');
+
   let deleteConfirmation = $state('');
   let deleteBusy = $state(false);
   let deleteError = $state('');
@@ -60,8 +67,16 @@
   async function load() {
     loadError = '';
     try {
-      const profile = await auth.me();
+      const [profile, info] = await Promise.all([
+        auth.me(),
+        // The capability is a nicety: a failure here hides the button rather
+        // than the whole page.
+        Promise.resolve()
+          .then(() => instance.get())
+          .catch(() => null),
+      ]);
       me = profile;
+      canConfirmEmail = info?.email_confirmation === true;
       displayName = profile.display_name ?? '';
       bio = profile.bio ?? '';
     } catch (cause: unknown) {
@@ -159,6 +174,20 @@
       emailError = message(cause);
     } finally {
       emailBusy = false;
+    }
+  }
+
+  async function requestVerification() {
+    verifyBusy = true;
+    verifyMessage = '';
+    verifyError = '';
+    try {
+      const res = await auth.requestEmailVerification();
+      verifyMessage = res.message;
+    } catch (cause: unknown) {
+      verifyError = message(cause);
+    } finally {
+      verifyBusy = false;
     }
   }
 
@@ -286,6 +315,25 @@
       <section class="section">
         <h2>{t('settings.profile.email', 'Email address')}</h2>
         <p class="muted">{t('settings.profile.current_email', 'Current address:')} <strong>{me.email}</strong></p>
+        {#if me.email_verified_at}
+          <p class="email-status verified">{t('settings.profile.email_verified', 'Confirmed')}</p>
+        {:else if canConfirmEmail}
+          <div class="email-status unverified">
+            <span>{t('settings.profile.email_unverified', 'Not confirmed yet.')}</span>
+            <button type="button" class="btn confirm-current-email" onclick={requestVerification} disabled={verifyBusy}>
+              {t('settings.profile.confirm_current_email', 'Mail me a confirmation link')}
+            </button>
+          </div>
+          {#if verifyError}<p class="error" role="alert">{verifyError}</p>{/if}
+          {#if verifyMessage}<p class="success" role="status">{verifyMessage}</p>{/if}
+        {:else}
+          <p class="email-status unverified muted">
+            {t(
+              'settings.profile.email_unconfirmable',
+              'Not confirmed: this instance cannot send mail, so addresses here are not confirmed.',
+            )}
+          </p>
+        {/if}
         <form class="email-form" onsubmit={changeEmail}>
           <label>
             {t('settings.profile.new_email', 'New address')}
@@ -408,4 +456,12 @@
   .error { color: var(--red, #da3633); }
 
   .success { color: var(--green, #3fb950); }
+  .email-status {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 0 0 12px;
+    font-size: 13px;
+  }
+  .email-status.verified { color: var(--green); }
 </style>

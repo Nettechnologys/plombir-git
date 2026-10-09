@@ -1,5 +1,5 @@
 //! Links mailed out to prove an address: a registration waiting for its
-//! address, an account moving to a new one. See
+//! address, an account moving to a new one, an account proving the one it has. See
 //! [`crate::entities::email_confirmation`].
 //!
 //! A link works once and only while it is fresh: [`take_live`] deletes the row
@@ -11,7 +11,8 @@ use chrono::{DateTime, Utc};
 use sea_orm::*;
 
 use crate::entities::email_confirmation::{
-    self, Entity, Model, PURPOSE_EMAIL_CHANGE, PURPOSE_NOTICE, PURPOSE_REGISTRATION,
+    self, Entity, Model, PURPOSE_EMAIL_CHANGE, PURPOSE_EMAIL_VERIFY, PURPOSE_NOTICE,
+    PURPOSE_REGISTRATION,
 };
 
 /// Whether any mail — a link or a notice — went to `email` after `since`.
@@ -82,18 +83,58 @@ pub async fn replace_pending_email_change(
     token_hash: &str,
     expires_at: DateTime<Utc>,
 ) -> Result<()> {
+    replace_pending_for_account(
+        db,
+        PURPOSE_EMAIL_CHANGE,
+        user_id,
+        email,
+        token_hash,
+        expires_at,
+    )
+    .await
+}
+
+/// Record the link that proves `user_id` receives mail at the address it
+/// already has, replacing an earlier one that was not followed.
+pub async fn replace_pending_email_verification(
+    db: &DatabaseConnection,
+    user_id: i64,
+    email: &str,
+    token_hash: &str,
+    expires_at: DateTime<Utc>,
+) -> Result<()> {
+    replace_pending_for_account(
+        db,
+        PURPOSE_EMAIL_VERIFY,
+        user_id,
+        email,
+        token_hash,
+        expires_at,
+    )
+    .await
+}
+
+/// One live link per account and purpose: the newest replaces the rest.
+async fn replace_pending_for_account(
+    db: &DatabaseConnection,
+    purpose: &'static str,
+    user_id: i64,
+    email: &str,
+    token_hash: &str,
+    expires_at: DateTime<Utc>,
+) -> Result<()> {
     // The same delete-then-insert as a registration, and the same retry.
-    crate::contention::retry_transaction("record a pending email change", || async {
-        let transaction = db.begin().await.context("db: begin pending email change")?;
+    crate::contention::retry_transaction("record a pending account link", || async {
+        let transaction = db.begin().await.context("db: begin pending account link")?;
         Entity::delete_many()
-            .filter(email_confirmation::Column::Purpose.eq(PURPOSE_EMAIL_CHANGE))
+            .filter(email_confirmation::Column::Purpose.eq(purpose))
             .filter(email_confirmation::Column::UserId.eq(user_id))
             .exec(&transaction)
             .await
-            .context("db: drop the earlier pending email change")?;
+            .context("db: drop the earlier pending account link")?;
         insert(
             &transaction,
-            PURPOSE_EMAIL_CHANGE,
+            purpose,
             email,
             Some(user_id),
             None,
@@ -105,7 +146,7 @@ pub async fn replace_pending_email_change(
         transaction
             .commit()
             .await
-            .context("db: commit pending email change")
+            .context("db: commit pending account link")
     })
     .await
 }

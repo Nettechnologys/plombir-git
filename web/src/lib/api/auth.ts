@@ -32,10 +32,17 @@ export interface Me {
   bio: string | null;
   /** `local` accounts have a password and an address of their own here. */
   auth_provider: string;
+  /** When the address was proved by a mailed link; `null` when it was not. */
+  email_verified_at?: string | null;
 }
 
-/** Following a mailed confirmation link: a new account, or a moved address. */
-export type ConfirmEmailResponse = AuthLoginResponse | { email: string };
+/**
+ * Following a mailed confirmation link: a new account, a moved address, or
+ * (`email_verified`) the account's own address proved.
+ */
+export type ConfirmEmailResponse =
+  | AuthLoginResponse
+  | { email: string; email_verified?: boolean };
 
 export interface PublicSsoProvider {
   slug: string;
@@ -99,6 +106,10 @@ export const auth = {
     request<{ status: string; message: string }>('/users/me/email', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
+    }),
+  requestEmailVerification: () =>
+    request<{ status: string; message: string }>('/users/me/email/verify', {
+      method: 'POST',
     }),
   confirmEmail: (token: string) =>
     request<ConfirmEmailResponse>('/users/verify-email', {

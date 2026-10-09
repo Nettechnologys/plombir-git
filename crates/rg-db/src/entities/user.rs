@@ -90,6 +90,13 @@ pub struct Model {
     /// Cleared by the holder's own password change.
     #[sea_orm(default_value = false)]
     pub password_change_required: bool,
+    /// When the account last proved, by following a mailed link, that it
+    /// receives mail at `email`. `None` is "not proved": an address typed at
+    /// registration on an open instance, set by an administrator, or brought
+    /// by a directory or identity provider. Any change of `email` resets it,
+    /// except the confirmed change that proves the new address in the same
+    /// write (card_2296f052332b).
+    pub email_verified_at: Option<DateTimeUtc>,
 }
 
 impl Model {

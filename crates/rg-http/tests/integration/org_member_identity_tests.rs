@@ -217,7 +217,7 @@ async fn an_email_grants_nothing_to_the_account_that_claimed_it() {
         let body = added.text().await.expect("body");
         assert_eq!(status, 400, "{url}: an e-mail must be refused, got: {body}");
         assert!(
-            body.contains("addresses are not confirmed"),
+            body.contains("cannot be named by e-mail address"),
             "{url}: the refusal has to say why, got: {body}"
         );
 

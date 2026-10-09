@@ -306,6 +306,7 @@ pub(crate) fn stamp_security(
         crate::api::account::set_initial_password,
         crate::api::account::update_profile,
         crate::api::account::request_email_change,
+        crate::api::account::request_email_verification,
         crate::api::account::confirm_email,
         crate::api::account::delete_account,
         crate::api::account::upload_avatar,

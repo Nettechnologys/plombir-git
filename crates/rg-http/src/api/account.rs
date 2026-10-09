@@ -44,7 +44,7 @@ fn directories(state: &AppState) -> rg_core::user::service::LdapDirectories<'_> 
 
 /// The mail an address confirmation goes out through — `None` on an
 /// instance that cannot send one with a link only it chose.
-fn mailer(state: &AppState) -> Option<rg_core::user::account::Mailer<'_>> {
+pub(crate) fn mailer(state: &AppState) -> Option<rg_core::user::account::Mailer<'_>> {
     Some(rg_core::user::account::Mailer {
         smtp: state.smtp_config.as_ref()?,
         base_url: state.external_url.as_deref()?,
@@ -382,7 +382,7 @@ pub struct ChangeEmailRequest {
         (status = 202, description = "A confirmation link was mailed to the new address, if it can take one", body = serde_json::Value),
         (status = 400, description = "Not an address, the current one, or an account whose address comes from its identity provider", body = serde_json::Value),
         (status = 401, description = "The password is wrong, or the account is locked", body = serde_json::Value),
-        (status = 403, description = "This instance has no outbound mail to confirm an address with", body = serde_json::Value),
+        (status = 409, description = "This instance has no outbound mail to confirm an address with", body = serde_json::Value),
     ),
 )]
 pub async fn request_email_change(
@@ -391,11 +391,12 @@ pub async fn request_email_change(
     headers: HeaderMap,
     Json(body): Json<ChangeEmailRequest>,
 ) -> Response {
+    // `409`, not `403`: nothing about the caller is refused — the instance
+    // cannot do this for anyone until its operator configures mail.
     let Some(mailer) = mailer(&state) else {
-        return AppError::Forbidden(
+        return AppError::conflict(
             "changing the address needs outbound mail to confirm it, and this instance has none \
-             configured ([smtp] and [server].external_url); ask an administrator"
-                .to_string(),
+             configured ([smtp] and [server].external_url); ask an administrator",
         )
         .into_response();
     };
@@ -435,6 +436,53 @@ pub async fn request_email_change(
     }
 }
 
+/// POST /api/v1/users/me/email/verify
+///
+/// Mail a link that proves the account receives mail at the address it already
+/// has — one registered on an open instance, by an administrator, or before
+/// addresses were proved (card_2296f052332b). Inside the per-address cooldown
+/// nothing new is sent; the link already in the inbox stays the live one.
+#[utoipa::path(
+    post,
+    path = "/users/me/email/verify",
+    tag = "Users",
+    responses(
+        (status = 202, description = "A confirmation link was mailed to the account's address", body = serde_json::Value),
+        (status = 400, description = "The address is already confirmed", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "This instance has no outbound mail to confirm an address with", body = serde_json::Value),
+    ),
+)]
+pub async fn request_email_verification(
+    State(state): State<AppState>,
+    SessionUser(user_id): SessionUser,
+) -> Response {
+    // `409`, as for an address change: the instance, not the caller, is what
+    // cannot do this.
+    let Some(mailer) = mailer(&state) else {
+        return AppError::conflict(
+            "confirming an address needs outbound mail, and this instance has none configured \
+             ([smtp] and [server].external_url); addresses here are not confirmed",
+        )
+        .into_response();
+    };
+    let user = match load_user(&state, user_id).await {
+        Ok(user) => user,
+        Err(error) => return error.into_response(),
+    };
+    match rg_core::user::account::request_email_verification(&state.db, mailer, &user).await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "confirmation_sent",
+                "message": "Follow the link we mailed to your address to confirm it.",
+            })),
+        )
+            .into_response(),
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
 #[derive(Deserialize, ToSchema)]
 pub struct ConfirmEmailRequest {
     pub token: String,
@@ -448,10 +496,10 @@ pub struct ConfirmEmailRequest {
     request_body = ConfirmEmailRequest,
     responses(
         (status = 201, description = "The registration this address was waiting for is now an account, signed in", body = serde_json::Value),
-        (status = 200, description = "The account moved to the confirmed address", body = serde_json::Value),
+        (status = 200, description = "The account moved to the confirmed address, or confirmed the one it has", body = serde_json::Value),
         (status = 400, description = "The link is invalid, already used, or expired", body = serde_json::Value),
         (status = 403, description = "Registration was closed after the link was sent", body = serde_json::Value),
-        (status = 409, description = "The name or the address was taken before the link was followed", body = serde_json::Value),
+        (status = 409, description = "The name or the address was taken, or the account's address changed, before the link was followed", body = serde_json::Value),
     ),
 )]
 pub async fn confirm_email(
@@ -510,6 +558,24 @@ pub async fn confirm_email(
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "email": user.email })),
+            )
+                .into_response()
+        }
+        Ok(Confirmed::EmailVerified(user)) => {
+            let actor =
+                rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, user.id).await;
+            record_credential(
+                &state,
+                &actor,
+                "user.verify_email",
+                user.id,
+                &headers,
+                serde_json::json!({ "confirmed_by_link": true }),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "email": user.email, "email_verified": true })),
             )
                 .into_response()
         }
