@@ -1342,11 +1342,19 @@ pub async fn put_manifest(
 
     let referenced_blobs = parsed.referenced_blobs();
 
-    // Verify all referenced blobs exist
-    for blob_digest in &referenced_blobs {
+    // Every descriptor must name a blob the repository holds, and the size it
+    // declares has to be the size the registry stored.
+    //
+    // Existence alone is not enough: the `size` in a manifest is what a
+    // pre-allocating puller reserves, what a mirror compares its progress
+    // against and what a size-based quota counts. A layer of 2 KiB declared as
+    // 2 GiB published cleanly and was served, or refused, according to a number
+    // nothing had compared to the bytes. The `oci_blob` row is the registry's
+    // own record of those bytes, written from the file at finalize time.
+    for descriptor in parsed.blob_descriptors() {
         let exists = match state
             .oci_storage
-            .blob_exists(&owner, &repo, blob_digest)
+            .blob_exists(&owner, &repo, &descriptor.digest)
             .await
         {
             Ok(exists) => exists,

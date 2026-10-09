@@ -123,6 +123,21 @@ impl ParsedManifest {
         blobs
     }
 
+    /// Every config and layer descriptor this manifest references, in the
+    /// order the manifest lists them.
+    ///
+    /// [`Self::referenced_blobs`] answers *which* blobs a manifest needs; a
+    /// push also has to check *what the manifest claims about them*, and a
+    /// claim is a size and a media type as much as it is a digest.
+    pub fn blob_descriptors(&self) -> Vec<&ManifestLayer> {
+        let mut descriptors = Vec::new();
+        if let Some(ref config) = self.manifest.config {
+            descriptors.push(config);
+        }
+        descriptors.extend(self.manifest.layers.iter());
+        descriptors
+    }
+
     /// `true` if this is a manifest list / image index.
     pub fn is_manifest_list(&self) -> bool {
         !self.manifest.manifests.is_empty()

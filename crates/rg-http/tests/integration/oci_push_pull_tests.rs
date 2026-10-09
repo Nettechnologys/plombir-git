@@ -1225,6 +1225,141 @@ async fn an_image_index_must_name_child_manifests_the_repository_holds() {
     assert_eq!(child_served.status(), 200);
 }
 
+/// A manifest's config and layer descriptors must declare the size of the blob
+/// the registry actually stored.
+///
+/// `size` is not metadata a client can shrug at: a puller pre-allocates from
+/// it, a mirror compares its progress against it and a size-based quota counts
+/// it. The push only checked that a blob with the digest existed, so a
+/// descriptor could declare a size the bytes never had and the number was
+/// published with the manifest.
+#[tokio::test]
+async fn a_manifest_descriptor_whose_size_contradicts_the_blob_is_refused() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_size", "oci_size@example.com").await;
+    create_repo(&base, &token, "size-check").await;
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_size", "size-check", config).await;
+    let layer = b"plombir-git-size-check-layer";
+    let layer_digest = push_blob(&base, &token, "oci_size", "size-check", layer).await;
+
+    // The config descriptor overstates the stored config.
+    let lying_config = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len() + 1024,
+            "digest": config_digest,
+        },
+        "layers": [],
+    })
+    .to_string();
+    let refused = client
+        .put(format!("{base}/v2/oci_size/size-check/manifests/lying-config"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(lying_config)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        400,
+        "a config descriptor whose size is not the stored blob's size must be refused"
+    );
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["errors"][0]["code"], "MANIFEST_INVALID");
+    let refusal_message = refusal["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        refusal_message.contains(&config_digest)
+            && refusal_message.contains(&config.len().to_string())
+            && refusal_message.contains(&(config.len() + 1024).to_string()),
+        "the refusal must name the blob and both sizes, got: {refusal_message}"
+    );
+
+    // The same holds for a layer, not just the config.
+    let lying_layer = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "size": layer.len() - 1,
+            "digest": layer_digest,
+        }],
+    })
+    .to_string();
+    let refused = client
+        .put(format!("{base}/v2/oci_size/size-check/manifests/lying-layer"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(lying_layer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        400,
+        "a layer descriptor whose size is not the stored blob's size must be refused"
+    );
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["errors"][0]["code"], "MANIFEST_INVALID");
+
+    for tag in ["lying-config", "lying-layer"] {
+        let pulled = client
+            .get(format!("{base}/v2/oci_size/size-check/manifests/{tag}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pulled.status(), 404, "refused manifest {tag} must not exist");
+    }
+
+    // The honest manifest over the same stored blobs is accepted.
+    let honest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "size": layer.len(),
+            "digest": layer_digest,
+        }],
+    })
+    .to_string();
+    let pushed = client
+        .put(format!("{base}/v2/oci_size/size-check/manifests/agreed"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(honest.clone())
+        .send()
+        .await
+        .unwrap();
+    let status = pushed.status();
+    let body = pushed.text().await.unwrap();
+    assert_eq!(status, 201, "the honest manifest must publish: {body}");
+
+    let served = client
+        .get(format!("{base}/v2/oci_size/size-check/manifests/agreed"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.text().await.unwrap(), honest);
+}
+
 /// A reference the registry cannot address is refused — it is never published
 /// under a name no client can use.
 ///
