@@ -119,6 +119,12 @@ export { sshKeys, type SshKey } from './sshKeys';
 export { deployKeys, type DeployKey } from './deployKeys';
 export { lfsLocks, type LfsLock } from './lfsLocks';
 export { lfsStorage, type LfsObject, type LfsPruneOutcome, type LfsUsage } from './lfsStorage';
+export {
+  repoStorage,
+  type RepoStorageLimits,
+  type RepoStorageReport,
+  type RepoStorageUsage,
+} from './repoStorage';
 export { ciSecrets, type CiSecret } from './ciSecrets';
 export { tagProtections, type TagProtection, type TagProtectionPayload } from './tagProtections';
 export { buildTagProtectionPayload, type TagProtectionFormState } from './tagProtectionForm';

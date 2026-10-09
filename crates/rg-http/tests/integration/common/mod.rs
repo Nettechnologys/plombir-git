@@ -328,6 +328,13 @@ pub struct StateOverrides {
     pub webhook_transport_policy: Option<rg_core::webhook::transport::WebhookTransportPolicy>,
     /// Overrides the decoded package artifact ceiling for boundary tests.
     pub package_upload_max_bytes: Option<usize>,
+    /// Replaces the `[limits]` storage ceilings.
+    ///
+    /// The default is small on purpose (see [`test_storage_limits`]): every
+    /// upload path in every suite runs against a finite budget, so a path that
+    /// forgot to consult it is only caught if some test drives it past the
+    /// ceiling. A test that needs a *different* ceiling passes one here.
+    pub storage_limits: Option<rg_core::storage_quota::StorageLimits>,
     /// Replaces the bot-account limiter, which the harness leaves disabled so
     /// no test trips over a budget it did not ask for.
     pub agent_rate_limiter: Option<rg_http::rate_limit::RateLimiter>,
@@ -371,6 +378,21 @@ pub const TEST_INSTANCE_KEY_SECRET: &str = "test-instance-key";
 /// shipped default, so a handler that ignored the configured value and served
 /// the default would be caught.
 pub const TEST_SOURCE_URL: &str = "https://source.example.test/fork/plombir";
+
+/// The `[limits]` ceilings a test app runs with.
+///
+/// Smaller than production so the budget is a boundary a test can reach, but
+/// large enough that no existing fixture (128 MiB package publishes, the OCI
+/// suites' chunked layers, the attachment quota suite) trips it on the way to
+/// what it is actually testing.
+pub fn test_storage_limits() -> rg_core::storage_quota::StorageLimits {
+    rg_core::storage_quota::StorageLimits {
+        repo_quota_bytes: 512 * 1024 * 1024,
+        oci_blob_max_bytes: 256 * 1024 * 1024,
+        ci_cache_max_entries_per_repo: 200,
+        release_assets_max_per_release: 100,
+    }
+}
 
 pub fn build_test_app_state(
     db: rg_db::DatabaseConnection,
@@ -442,6 +464,7 @@ pub fn build_test_app_state_with(
         package_upload_max_bytes: overrides
             .package_upload_max_bytes
             .unwrap_or(rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES),
+        storage_limits: overrides.storage_limits.unwrap_or_else(test_storage_limits),
         notification_hub: rg_http::ws::NotificationHub::new(),
         smtp_config: overrides.smtp_config,
         oci_storage: Arc::new(OciStorage::from_backend(

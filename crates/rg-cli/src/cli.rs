@@ -2254,7 +2254,7 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 19] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 23] = [
         (
             "DEFAULT_SOURCE_URL",
             "config-file-only: `[server].source_url` has no CLI flag, so no help text names it",
@@ -2342,6 +2342,26 @@ const AFTER: &str = "after";
         (
             "DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP",
             "config-file-only: `[webhooks].allow_insecure_http` has no CLI flag",
+        ),
+        (
+            "DEFAULT_REPO_QUOTA_MB",
+            "config-file-only: `[limits].repo_quota_mb` has no CLI flag; the shipped \
+             templates state the value and its arithmetic",
+        ),
+        (
+            "DEFAULT_OCI_BLOB_MAX_MB",
+            "config-file-only: `[limits].oci_blob_max_mb` has no CLI flag; the shipped \
+             templates state the value",
+        ),
+        (
+            "DEFAULT_CI_CACHE_MAX_ENTRIES_PER_REPO",
+            "config-file-only: `[limits].ci_cache_max_entries_per_repo` has no CLI flag; \
+             the shipped templates state the value",
+        ),
+        (
+            "DEFAULT_RELEASE_ASSETS_MAX_PER_RELEASE",
+            "config-file-only: `[limits].release_assets_max_per_release` has no CLI flag; \
+             the shipped templates state the value",
         ),
     ];
 

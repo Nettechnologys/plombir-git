@@ -134,6 +134,43 @@ pub async fn list_storage_paths_by_repo(
         .await
 }
 
+/// How many package files `repo_id` holds, and how many bytes they declare.
+///
+/// The walk is repo → package_registry → packages → package_versions →
+/// package_files, the same path [`list_storage_paths_by_repo`] takes; it is a
+/// join rather than four id-only statements because the caller wants a sum, and
+/// materialising the id lists would cost a query whose result it cannot use.
+pub async fn repo_usage(db: &DatabaseConnection, repo_id: i64) -> Result<(u64, i64), DbErr> {
+    #[derive(Debug, sea_orm::FromQueryResult)]
+    struct Usage {
+        count: i64,
+        bytes: Option<i64>,
+    }
+    let usage = PackageFile::find()
+        .join(
+            JoinType::InnerJoin,
+            package_file::Relation::PackageVersion.def(),
+        )
+        .join(
+            JoinType::InnerJoin,
+            package_version::Relation::Package.def(),
+        )
+        .join(
+            JoinType::InnerJoin,
+            package::Relation::PackageRegistry.def(),
+        )
+        .filter(package_registry::Column::RepoId.eq(repo_id))
+        .select_only()
+        .column_as(package_file::Column::Id.count(), "count")
+        .column_as(package_file::Column::Size.sum(), "bytes")
+        .into_model::<Usage>()
+        .one(db)
+        .await?;
+    Ok(usage.map_or((0, 0), |usage| {
+        (usage.count.max(0) as u64, usage.bytes.unwrap_or(0))
+    }))
+}
+
 /// Find a file by id.
 pub async fn find_by_id(
     db: &DatabaseConnection,

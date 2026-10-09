@@ -64,6 +64,7 @@ export const collaborators = namespace();
 export const deployKeys = namespace();
 export const lfsLocks = namespace();
 export const lfsStorage = namespace();
+export const repoStorage = namespace();
 export const imports = namespace();
 export const instance = namespace();
 export const issues = namespace();

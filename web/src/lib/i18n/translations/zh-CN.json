@@ -1151,6 +1151,13 @@
       "kept": "保留 {oid}：{reason}",
       "remove_failed": "删除对象失败：{message}"
     },
+    "storage": {
+      "title": "存储",
+      "desc": "此仓库占用的全部存储，以及它所受的配额。",
+      "usage": "已用 {used}，上限 {limit}",
+      "breakdown": "LFS {lfs} · 发布 {releases} · 附件 {attachments} · CI 缓存 {ci} · 软件包 {packages} · OCI {oci}",
+      "load_failed": "加载存储用量失败"
+    },
     "deploy_keys": {
       "title": "部署密钥",
       "desc": "授予自动化密钥仅访问此仓库的权限。",

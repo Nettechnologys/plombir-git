@@ -891,6 +891,7 @@ pub(crate) async fn run_serve(
         .and_then(|c| c.rate_limit.agent_window_secs)
         .unwrap_or(DEFAULT_AGENT_RATE_LIMIT_WINDOW);
     let resolved_package_upload_max_bytes = resolve_package_upload_max_bytes(cfg.as_ref())?;
+    let resolved_storage_limits = crate::config::resolve_storage_limits(cfg.as_ref())?;
     let resolved_trusted_import_origins = resolve_trusted_import_origins(cfg.as_ref())?;
     let resolved_import_transport_policy = resolve_import_transport_policy(cfg.as_ref())?;
     if resolved_import_transport_policy.allows_insecure_http() {
@@ -1479,6 +1480,7 @@ pub(crate) async fn run_serve(
         mirror_transport_policy: resolved_mirror_transport_policy,
         webhook_transport_policy: resolved_webhook_transport_policy,
         package_upload_max_bytes: resolved_package_upload_max_bytes,
+        storage_limits: resolved_storage_limits,
         rate_limit_max: resolved_rate_limit_max,
         rate_limit_window_secs: resolved_rate_limit_window,
         rate_limit_trusted_proxies: resolved_rate_limit_trusted_proxies,

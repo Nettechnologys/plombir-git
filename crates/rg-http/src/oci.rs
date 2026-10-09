@@ -148,7 +148,13 @@ pub(crate) async fn oci_transport_refusal_envelope(response: Response) -> Respon
 }
 
 fn oci_body_error(error: anyhow::Error) -> Response {
-    if crate::body_limit::is_length_limit_error(error.as_ref()) {
+    if let Some(too_large) = error.downcast_ref::<UploadSessionTooLarge>() {
+        oci_err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_codes::SIZE_INVALID,
+            &too_large.message,
+        )
+    } else if crate::body_limit::is_length_limit_error(error.as_ref()) {
         oci_err(
             StatusCode::PAYLOAD_TOO_LARGE,
             error_codes::SIZE_INVALID,
@@ -162,6 +168,26 @@ fn oci_body_error(error: anyhow::Error) -> Response {
         )
     }
 }
+
+/// A single upload session reached its cumulative ceiling.
+///
+/// Distinct from the request-body limit on purpose: the body limit says this
+/// *request* was too large, while this says the bytes already accepted plus
+/// this chunk passed the session's budget. The client's next move differs —
+/// here the layer itself is too large for the instance, and resuming will not
+/// help.
+#[derive(Debug)]
+struct UploadSessionTooLarge {
+    message: String,
+}
+
+impl std::fmt::Display for UploadSessionTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UploadSessionTooLarge {}
 
 /// Answer a `{reference}` the registry will not address.
 ///
@@ -2223,7 +2249,13 @@ pub async fn chunk_upload(
 
     // The request is the next chunk. Stream only after every offset check, so
     // a refusal cannot change the staging file.
-    match stream_body_to_file(body, &file_path).await {
+    match stream_body_to_file(
+        body,
+        &file_path,
+        Some(state.storage_limits.oci_blob_max_bytes),
+    )
+    .await
+    {
         Ok(staged) => {
             let total_size = staged.total;
             if let Some(range) = requested_range {
@@ -2237,6 +2269,61 @@ pub async fn chunk_upload(
                              {total_size} byte(s)",
                             range.start, range.end, staged.written
                         ),
+                    );
+                }
+            }
+
+            // The cap inside `stream_body_to_file` bounded this one session;
+            // this is the repository's shared budget, checked once the total is
+            // known. Refusing truncates staging back to the acknowledged
+            // offset rather than leaving the bytes: a file holding more than
+            // the row records would fail the accountability check on the next
+            // request and the digest at finalize, which reports as the client's
+            // corruption instead of the refusal that actually happened.
+            match repository_id_of_session(&state, upload.oci_repository_id).await {
+                Ok(repo_id) => {
+                    match rg_core::storage_quota::check_room(
+                        &state.db,
+                        repo_id,
+                        total_size as u64,
+                        &state.storage_limits,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(rg_core::storage_quota::QuotaError::Exceeded(exceeded)) => {
+                            if let Err(error) =
+                                truncate_staged_upload(&file_path, recorded_size).await
+                            {
+                                return oci_err(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "UNKNOWN",
+                                    &format!(
+                                        "refused an over-quota chunk but could not roll staging \
+                                         back: {error:#}"
+                                    ),
+                                );
+                            }
+                            return oci_err(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                error_codes::SIZE_INVALID,
+                                &exceeded.message,
+                            );
+                        }
+                        Err(rg_core::storage_quota::QuotaError::Db(error)) => {
+                            return oci_err(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "UNKNOWN",
+                                &format!("{error:#}"),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    return oci_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "UNKNOWN",
+                        &format!("{error:#}"),
                     );
                 }
             }
@@ -2624,7 +2711,13 @@ pub async fn complete_upload(
                 total: staged_size,
             }
         }
-        Some(range) => match stream_body_to_file(body, &file_path).await {
+        Some(range) => match stream_body_to_file(
+            body,
+            &file_path,
+            Some(state.storage_limits.oci_blob_max_bytes),
+        )
+        .await
+        {
             Ok(staged) if staged.written == range.len() && staged.total == range.end + 1 => staged,
             Ok(staged) => {
                 return oci_err(
@@ -2639,7 +2732,13 @@ pub async fn complete_upload(
             }
             Err(error) => return oci_body_error(error),
         },
-        None => match stream_body_to_file(body, &file_path).await {
+        None => match stream_body_to_file(
+            body,
+            &file_path,
+            Some(state.storage_limits.oci_blob_max_bytes),
+        )
+        .await
+        {
             Ok(staged) => staged,
             Err(error) => return oci_body_error(error),
         },
@@ -2664,6 +2763,73 @@ pub async fn complete_upload(
     // The repository the session was anchored to, not a second lookup that
     // could resolve — or create — a different one.
     let oci_repo_id = upload.oci_repository_id;
+
+    // The session's own ceiling, against what the file holds rather than what
+    // this request appended: a replay PUT writes nothing and must still not
+    // finalize a session that is over the limit.
+    if staged.total.max(0) as u64 > state.storage_limits.oci_blob_max_bytes {
+        return oci_err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_codes::SIZE_INVALID,
+            &format!(
+                "OCI blob upload session holds {} byte(s), beyond the {}-byte cumulative limit \
+                 (limits.oci_blob_max_mb)",
+                staged.total, state.storage_limits.oci_blob_max_bytes
+            ),
+        );
+    }
+
+    // The repository's shared budget, before the blob row is created: publishing
+    // first and accounting after would leave the over-quota blob reachable. A
+    // blob whose digest is already stored is skipped — finalizing it adds no
+    // bytes, and a re-push at quota must not be refused for the size of data
+    // the repository already has.
+    match rg_db::ops::oci_ops::find_blob(&state.db, oci_repo_id, &expected_digest).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let repo_id = match repository_id_of_session(&state, oci_repo_id).await {
+                Ok(repo_id) => repo_id,
+                Err(error) => {
+                    return oci_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "UNKNOWN",
+                        &format!("{error:#}"),
+                    );
+                }
+            };
+            match rg_core::storage_quota::check_room(
+                &state.db,
+                repo_id,
+                staged.total.max(0) as u64,
+                &state.storage_limits,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(rg_core::storage_quota::QuotaError::Exceeded(exceeded)) => {
+                    return oci_err(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        error_codes::SIZE_INVALID,
+                        &exceeded.message,
+                    );
+                }
+                Err(rg_core::storage_quota::QuotaError::Db(error)) => {
+                    return oci_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "UNKNOWN",
+                        &format!("{error:#}"),
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            return oci_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                &format!("{error:#}"),
+            );
+        }
+    }
 
     // Finalize and publish: hash the staged file, move it to its
     // content-addressed key, and record the row that makes it reachable — all
@@ -2845,9 +3011,19 @@ async fn rollback_staged_append(
 /// This is the write path of every `docker push`: the staging path is derived
 /// from `repo_root` plus a generated upload UUID, so a bare `?` on the io error
 /// hands the client an errno and nothing else. Every failure names the file.
+/// Stream a request body into the staging file, refusing to let the file pass
+/// `max_total` bytes.
+///
+/// `max_total` is the session's cumulative ceiling, not this request's: the
+/// caller passes what the *file* may hold when the append finishes, so a PATCH
+/// sequence each within the HTTP body limit can no longer add up past it. It is
+/// checked before each write, and an over-limit chunk is rolled back like any
+/// other failed append — a refused append must leave the session exactly where
+/// the client last saw it.
 async fn stream_body_to_file(
     body: Body,
     file_path: &std::path::Path,
+    max_total: Option<u64>,
 ) -> anyhow::Result<StagedWrite> {
     let staged = |error: &std::io::Error| upload_file_error(file_path, error);
 
@@ -2879,6 +3055,23 @@ async fn stream_body_to_file(
                 );
             }
         };
+        if let Some(max_total) = max_total {
+            let after = original_len
+                .saturating_add(written.max(0) as u64)
+                .saturating_add(data.len() as u64);
+            if after > max_total {
+                let error = anyhow::Error::new(UploadSessionTooLarge {
+                    message: format!(
+                        "OCI blob upload session exceeds the {max_total}-byte cumulative limit \
+                         (limits.oci_blob_max_mb); {after} byte(s) would be staged"
+                    ),
+                })
+                .context("OCI upload session exceeds its cumulative limit");
+                return Err(
+                    rollback_staged_append(file, file_path, existed, original_len, error).await,
+                );
+            }
+        }
         if let Err(error) = file.write_all(&data).await {
             let error = staged(&error);
             return Err(
@@ -2934,6 +3127,37 @@ async fn find_oci_repo(
         }
         None => Ok(None),
     }
+}
+
+/// The Plombir Git repository an OCI upload session belongs to.
+///
+/// A session row carries `oci_repository_id`; the storage budget is keyed by
+/// the forge repository, and this is that one hop. A missing row is an
+/// inconsistency rather than a client mistake — the session was validated a
+/// statement ago — so it surfaces as an internal error.
+async fn repository_id_of_session(state: &AppState, oci_repository_id: i64) -> anyhow::Result<i64> {
+    rg_db::ops::oci_ops::find_repo_row_by_id(&state.db, oci_repository_id)
+        .await
+        .context("failed to resolve the repository of an OCI upload session")?
+        .map(|repo| repo.repo_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("OCI repository {oci_repository_id} of an upload session is missing")
+        })
+}
+
+/// Cut a staging file back to `len` after a refused append.
+///
+/// Not a delete: the session's acknowledged offset is `len`, and the row must
+/// keep describing exactly what the file holds.
+async fn truncate_staged_upload(file_path: &std::path::Path, len: i64) -> anyhow::Result<()> {
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(file_path)
+        .await
+        .map_err(|error| upload_file_error(file_path, &error))?;
+    file.set_len(len.max(0) as u64)
+        .await
+        .map_err(|error| upload_file_error(file_path, &error))
 }
 
 /// The `oci_repository` row for `owner/repo`, created on the first push.
@@ -3007,7 +3231,7 @@ mod upload_body_error_tests {
         let path = root.path().join("upload");
         tokio::fs::write(&path, b"acknowledged").await.unwrap();
 
-        let error = stream_body_to_file(limited_body(&[b"12", b"34"], 3), &path)
+        let error = stream_body_to_file(limited_body(&[b"12", b"34"], 3), &path, None)
             .await
             .unwrap_err();
         let response = oci_body_error(error);
@@ -3021,7 +3245,7 @@ mod upload_body_error_tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("new-upload");
 
-        let error = stream_body_to_file(limited_body(&[b"12", b"34"], 3), &path)
+        let error = stream_body_to_file(limited_body(&[b"12", b"34"], 3), &path, None)
             .await
             .unwrap_err();
         let response = oci_body_error(error);
@@ -3034,6 +3258,27 @@ mod upload_body_error_tests {
     }
 
     #[tokio::test]
+    async fn a_session_past_its_cumulative_cap_is_413_and_restores_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("upload");
+        tokio::fs::write(&path, b"acknowledged").await.unwrap();
+
+        // 12 acknowledged + 4 incoming = 16 > 14, although the chunk itself is
+        // far below any request-body limit. The cap must count the session, not
+        // the request.
+        let body = Body::from_stream(futures::stream::iter([Ok::<_, std::convert::Infallible>(
+            Bytes::from_static(b"more"),
+        )]));
+        let error = stream_body_to_file(body, &path, Some(14))
+            .await
+            .unwrap_err();
+        let response = oci_body_error(error);
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"acknowledged");
+    }
+
+    #[tokio::test]
     async fn ordinary_body_failure_stays_500_and_restores_staging() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("upload");
@@ -3043,7 +3288,7 @@ mod upload_body_error_tests {
             Err(std::io::Error::other("connection reset")),
         ]));
 
-        let error = stream_body_to_file(body, &path).await.unwrap_err();
+        let error = stream_body_to_file(body, &path, None).await.unwrap_err();
         let response = oci_body_error(error);
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);

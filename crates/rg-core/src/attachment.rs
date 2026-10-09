@@ -1,7 +1,8 @@
 //! Durable Issue, pull-request and comment attachments.
 
 use crate::blob_storage::{BlobKey, BlobStorage};
-use crate::error::{invalid_request, not_found};
+use crate::error::{invalid_request, not_found, payload_too_large};
+use crate::storage_quota::{self, QuotaError, StorageLimits};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rg_db::entities::attachment::{ActiveModel, Model as Attachment};
@@ -12,7 +13,6 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 pub const MAX_ATTACHMENT_SIZE: usize = 100 * 1024 * 1024;
-pub const DEFAULT_REPO_ATTACHMENT_QUOTA: i64 = 1024 * 1024 * 1024;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "avif",
@@ -95,6 +95,7 @@ async fn create_attachment(
         content_type,
         AttachmentSource::Buffered(data),
         data.len() as u64,
+        &StorageLimits::default(),
     )
     .await
 }
@@ -112,6 +113,7 @@ pub async fn create_attachment_from_file(
     content_type: &str,
     source: &Path,
     size: u64,
+    limits: &StorageLimits,
 ) -> Result<Attachment> {
     let actual_size = tokio::fs::metadata(source)
         .await
@@ -130,6 +132,7 @@ pub async fn create_attachment_from_file(
         content_type,
         AttachmentSource::File(source),
         size,
+        limits,
     )
     .await
 }
@@ -174,8 +177,9 @@ async fn create_attachment_from_source(
     content_type: &str,
     source: AttachmentSource<'_>,
     size: u64,
+    limits: &StorageLimits,
 ) -> Result<Attachment> {
-    let prepared = prepare_attachment(db, repo_id, filename, size).await?;
+    let prepared = prepare_attachment(db, repo_id, filename, size, limits).await?;
     let sha256 = source.sha256().await?;
     let publication_id = Uuid::new_v4().simple().to_string();
     crate::deletion_recovery::open_attachment_creation(storage, &publication_id, &prepared.key)
@@ -186,7 +190,8 @@ async fn create_attachment_from_source(
         return Err(error).context("failed to store attachment blob");
     }
 
-    persist_attachment(
+    let key = prepared.key.clone();
+    let attachment = persist_attachment(
         db,
         storage,
         repo_id,
@@ -197,7 +202,63 @@ async fn create_attachment_from_source(
         Some(sha256),
         &publication_id,
     )
-    .await
+    .await?;
+
+    // The pre-write check read the budget and then wrote, so two requests that
+    // both saw room can both commit. Re-reading after the row is in narrows the
+    // window to one upload: the loser is rolled back here, blob first so a
+    // crash between the two leaves an unreferenced blob rather than a row whose
+    // bytes are gone. The refusal carries what the repository now holds, which
+    // is the number the loser's operator needs.
+    match storage_quota::check_room(db, repo_id, 0, limits).await {
+        Ok(()) => {}
+        // The row is committed and the bytes are stored; a database that
+        // cannot answer the budget question must not fail an upload that has
+        // already happened. Nothing is rolled back on a question that was
+        // never answered.
+        Err(QuotaError::Db(error)) => {
+            tracing::warn!(
+                repo_id,
+                error = %format!("{error:#}"),
+                "attachment committed, but the post-write storage budget recheck failed"
+            );
+        }
+        Err(QuotaError::Exceeded(exceeded)) => {
+            if let Err(error) = storage.delete(&key).await {
+                tracing::warn!(
+                    repo_id,
+                    blob_key = %key,
+                    error = %format!("{error:#}"),
+                    "attachment over quota could not be rolled back; its bytes remain referenced \
+                     nowhere"
+                );
+                return Err(anyhow::anyhow!(exceeded.message)
+                    .context("attachment over quota and its blob could not be removed"));
+            }
+            if let Err(error) = rg_db::ops::attachment_ops::delete_by_id(db, attachment.id).await {
+                tracing::warn!(
+                    attachment_id = attachment.id,
+                    repo_id,
+                    error = %format!("{error:#}"),
+                    "attachment over quota: blob removed, row could not be"
+                );
+            }
+            crate::deletion_recovery::close(storage, &publication_id).await;
+            return Err(payload_too_large(exceeded.message));
+        }
+    }
+
+    Ok(attachment)
+}
+
+/// One refusal shape for both checks: a repository budget that was hit is a
+/// 413 (the uploader must make room), and a database that could not answer the
+/// question stays a 5xx.
+fn attachment_quota_error(error: QuotaError) -> anyhow::Error {
+    match error {
+        QuotaError::Exceeded(exceeded) => payload_too_large(exceeded.message),
+        QuotaError::Db(error) => error.context("failed to check the repository storage budget"),
+    }
 }
 
 /// Compute the hex-encoded SHA-256 of a file by streaming it in bounded chunks,
@@ -228,6 +289,7 @@ async fn prepare_attachment(
     repo_id: i64,
     filename: &str,
     size: u64,
+    limits: &StorageLimits,
 ) -> Result<PreparedAttachment> {
     let filename = validate_filename(filename)?;
     if size == 0 {
@@ -238,10 +300,14 @@ async fn prepare_attachment(
     }
     let size = i64::try_from(size)
         .map_err(|_| invalid_request("attachment exceeds the 100 MiB file limit"))?;
-    let current_size = rg_db::ops::attachment_ops::repo_size(db, repo_id).await?;
-    if current_size.saturating_add(size) > DEFAULT_REPO_ATTACHMENT_QUOTA {
-        return Err(invalid_request("repository attachment quota exceeded"));
-    }
+    // One shared budget, not a per-store one: the old per-repository attachment
+    // ceiling counted 1 GiB against the repository while the other stores
+    // counted nothing, so an account could fill the volume through releases or
+    // packages instead. This refuses before the blob is written; the recheck
+    // after the commit narrows the read-then-insert window.
+    storage_quota::check_room(db, repo_id, size as u64, limits)
+        .await
+        .map_err(attachment_quota_error)?;
 
     let uuid = Uuid::new_v4().to_string();
     let repo_segment = repo_id.to_string();
@@ -529,6 +595,7 @@ mod tests {
         BlobKey, BlobMetadata, BlobStorage, BlobStorageError, LocalBlobStorage,
     };
     use crate::staging::SiblingSpool;
+    use crate::storage_quota::StorageLimits;
     use futures::future::BoxFuture;
     use sea_orm::{ActiveValue::Set, ConnectOptions, ConnectionTrait, Database};
     use std::collections::BTreeMap;
@@ -972,6 +1039,7 @@ mod tests {
             "text/plain",
             &source,
             22,
+            &StorageLimits::default(),
         )
         .await
         .unwrap();

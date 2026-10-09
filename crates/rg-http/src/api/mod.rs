@@ -44,6 +44,7 @@ pub mod search;
 pub(crate) mod sign_in_methods;
 pub mod ssh_keys;
 pub mod sso;
+pub mod storage;
 pub mod tag_protection;
 pub mod time_tracking;
 pub mod user_ref;

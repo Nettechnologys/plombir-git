@@ -23,8 +23,8 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 404 |
-| Из них достижимы из браузера | 282 (70%) |
+| Роутов в роутере (с объявленным `Access`) | 405 |
+| Из них достижимы из браузера | 283 (70%) |
 | Layout-модулей | 2 |
 | Страниц | 70 |
 | Интерактивных элементов | 969 |
@@ -38,7 +38,7 @@
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 106 | 68 | 4 | 0 |
+| `RepoRead` | 107 | 69 | 4 | 0 |
 | `RepoWrite` | 83 | 66 | 13 | 0 |
 | `User` | 51 | 40 | 6 | 0 |
 | `RepoAdmin` | 38 | 38 | 0 | 0 |
@@ -765,11 +765,12 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.repository_info.description | :342 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web+browser |
-| i18n:settings.transfer.confirm | :514 | `POST /api/v1/repos/{owner}/{name}/transfer` | `RepoOwner` | rust+web+browser |
-| i18n:settings.delete.confirm_button | :528 | `DELETE /api/v1/repos/{owner}/{name}` | `RepoOwner` | rust+web |
-| i18n:common.saving | :546 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web |
-| i18n:settings.rename.renaming | :563 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web |
+| i18n:settings.repository_info.description | :377 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web+browser |
+| i18n:settings.transfer.confirm | :578 | `POST /api/v1/repos/{owner}/{name}/transfer` | `RepoOwner` | rust+web+browser |
+| i18n:settings.delete.confirm_button | :592 | `DELETE /api/v1/repos/{owner}/{name}` | `RepoOwner` | rust+web |
+| i18n:common.saving | :610 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web |
+| i18n:settings.rename.renaming | :627 | `PATCH /api/v1/repos/{owner}/{name}` | `RepoAdmin` | web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/storage` | `RepoRead` | rust+web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | web |
 

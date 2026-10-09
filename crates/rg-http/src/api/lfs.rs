@@ -532,6 +532,7 @@ pub async fn batch(
         &req,
         state.jwt_secret.as_bytes(),
         actor,
+        &state.storage_limits,
     )
     .await
     {
@@ -654,6 +655,31 @@ pub async fn upload_object(
                 }
                 Ok(_) => {}
                 Err(error) => {
+                    discard_file_async("LFS staging file", &temp_path).await;
+                    return AppError::from(error).into_response();
+                }
+            }
+
+            // The batch check ran before the upload URL was handed out; this is
+            // the other side of the window it opened. Two PUTs of different
+            // objects can both have passed a batch, and the bytes are already on
+            // disk here, so the recheck can only refuse — the spool is dropped
+            // with the response and nothing is published.
+            match rg_core::storage_quota::check_room(
+                &state.db,
+                repo_id,
+                staged.written as u64,
+                &state.storage_limits,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(rg_core::storage_quota::QuotaError::Exceeded(exceeded)) => {
+                    discard_file_async("LFS staging file", &temp_path).await;
+                    return AppError::from(rg_core::error::payload_too_large(exceeded.message))
+                        .into_response();
+                }
+                Err(rg_core::storage_quota::QuotaError::Db(error)) => {
                     discard_file_async("LFS staging file", &temp_path).await;
                     return AppError::from(error).into_response();
                 }
