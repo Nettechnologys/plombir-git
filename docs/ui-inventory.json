@@ -479,6 +479,18 @@
     },
     {
       "method": "POST",
+      "url": "/api/v1/users/me/sudo",
+      "access": "User",
+      "handler": "api::sudo::step_up",
+      "testedIn": [
+        "rust",
+        "web",
+        "smoke"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "POST",
       "url": "/api/v1/users/password/initial",
       "access": "Public",
       "handler": "api::account::set_initial_password",

@@ -18,7 +18,8 @@ use crate::common::{
 
 const PASSWORD: &str = "Qz7$wRtm";
 
-const TEST_SSH_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMLnUZTOEZ6vRQedOGoTgsxZ5HGkmNVaERGBsVPZkTDe sudo-step-up";
+const TEST_SSH_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMLnUZTOEZ6vRQedOGoTgsxZ5HGkmNVaERGBsVPZkTDe sudo-step-up";
 
 /// Every route behind `SudoUser`, with the body and headers that reach it.
 ///
@@ -195,7 +196,9 @@ async fn the_step_up_answers_like_the_login_and_keeps_the_session() {
     assert_eq!(after.session_version, before.session_version);
     assert_eq!(after.exp, before.exp, "stepping up is not a new login");
     let now = chrono::Utc::now().timestamp();
-    let until = after.sudo_exp.expect("the re-issued session is in sudo mode");
+    let until = after
+        .sudo_exp
+        .expect("the re-issued session is in sudo mode");
     assert!(until > now, "{until} <= {now}");
     assert!(
         until <= now + rg_core::auth::jwt::SUDO_TTL.num_seconds(),
@@ -239,12 +242,15 @@ async fn an_expired_sudo_window_is_an_ordinary_session_again() {
     let plain = register_user_plain(&base, "sudostale", "sudostale@example.com", PASSWORD).await;
     let claims = rg_core::auth::jwt::validate_token(&plain, &state.jwt_secret).unwrap();
     let now = chrono::Utc::now().timestamp();
-    let stale = rg_core::auth::jwt::encode_claims_as_is(
+    // Minted by hand: nothing in production issues a window that has already
+    // closed, and nothing should.
+    let stale = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
         &rg_core::auth::jwt::Claims {
             sudo_exp: Some(now - 1),
             ..claims
         },
-        &state.jwt_secret,
+        &jsonwebtoken::EncodingKey::from_secret(state.jwt_secret.as_bytes()),
     )
     .unwrap();
 
@@ -276,7 +282,10 @@ async fn a_wrong_password_is_refused_and_strikes_the_shared_lockout() {
 
     // A malformed request is not a guess.
     let (status, _) = sudo_attempt(&base, &plain, serde_json::json!({})).await;
-    assert_eq!(status, 422, "a body without a password is malformed, not wrong");
+    assert_eq!(
+        status, 422,
+        "a body without a password is malformed, not wrong"
+    );
     assert_eq!(user(&db, user_id).await.login_attempts, 0);
 
     for attempt in 1..=rg_core::auth::lockout::MAX_FAILED_PASSWORD_ATTEMPTS {
@@ -299,7 +308,8 @@ async fn a_wrong_password_is_refused_and_strikes_the_shared_lockout() {
     );
 
     // The lock holds against the right password, here and at the login.
-    let (status, body) = sudo_attempt(&base, &plain, serde_json::json!({ "password": PASSWORD })).await;
+    let (status, body) =
+        sudo_attempt(&base, &plain, serde_json::json!({ "password": PASSWORD })).await;
     assert_eq!(status, 401, "{body}");
     assert!(
         body["error"]["message"]
@@ -314,7 +324,11 @@ async fn a_wrong_password_is_refused_and_strikes_the_shared_lockout() {
         .send()
         .await
         .unwrap();
-    assert_eq!(login.status(), 401, "the lock is the account's, not the door's");
+    assert_eq!(
+        login.status(),
+        401,
+        "the lock is the account's, not the door's"
+    );
 
     // The attempts are filed under the door they arrived at.
     let filed = rg_db::ops::login_log_ops::Entity::find()
@@ -347,7 +361,8 @@ async fn a_personal_access_token_cannot_step_up() {
         .unwrap()
         .to_string();
 
-    let (status, body) = sudo_attempt(&base, &pat, serde_json::json!({ "password": PASSWORD })).await;
+    let (status, body) =
+        sudo_attempt(&base, &pat, serde_json::json!({ "password": PASSWORD })).await;
     assert_eq!(status, 403, "{body}");
     assert!(
         body["error"]["message"]
@@ -458,7 +473,8 @@ async fn an_mfa_enrolled_account_needs_the_second_factor_to_step_up() {
     let (secret, backup_codes) = enrol(&base, &plain).await;
 
     // The password alone is not enough, and saying so is not a strike.
-    let (status, body) = sudo_attempt(&base, &plain, serde_json::json!({ "password": PASSWORD })).await;
+    let (status, body) =
+        sudo_attempt(&base, &plain, serde_json::json!({ "password": PASSWORD })).await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(user(&db, user_id).await.login_attempts, 0);
 
@@ -539,7 +555,10 @@ async fn an_mfa_enrolled_account_needs_the_second_factor_to_step_up() {
                 .clone()
         })
         .collect();
-    assert_eq!(factors, vec![serde_json::json!("totp"), serde_json::json!("backup_code")]);
+    assert_eq!(
+        factors,
+        vec![serde_json::json!("totp"), serde_json::json!("backup_code")]
+    );
 }
 
 #[tokio::test]

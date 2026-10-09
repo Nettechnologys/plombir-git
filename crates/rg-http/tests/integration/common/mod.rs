@@ -855,7 +855,12 @@ pub async fn login(base: &str, login: &str, password: &str) -> String {
 /// `POST /users/me/sudo` with `token`: the same session re-issued in sudo
 /// mode. `totp_code` is the authenticator's current code for an account with
 /// MFA enrolled.
-pub async fn sudo_session(base: &str, token: &str, password: &str, totp_code: Option<&str>) -> String {
+pub async fn sudo_session(
+    base: &str,
+    token: &str,
+    password: &str,
+    totp_code: Option<&str>,
+) -> String {
     let mut body = serde_json::json!({ "password": password });
     if let Some(code) = totp_code {
         body["totp_code"] = serde_json::Value::String(code.to_string());

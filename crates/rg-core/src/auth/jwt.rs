@@ -177,18 +177,6 @@ pub fn reissue_with_sudo(claims: &Claims, secret: &str) -> Result<String> {
     .context("sudo jwt encode failed")
 }
 
-/// Encode `claims` as they are. Test fixtures use this to mint a session whose
-/// `sudo_exp` is already in the past; production code goes through
-/// [`generate_token`] / [`reissue_with_sudo`], which choose the timestamps.
-pub fn encode_claims_as_is(claims: &Claims, secret: &str) -> Result<String> {
-    encode(
-        &Header::default(),
-        claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .context("jwt encode failed")
-}
-
 /// Validate and decode a JWT. Returns `None` if invalid/expired.
 pub fn validate_token(token: &str, secret: &str) -> Option<Claims> {
     decode::<Claims>(
@@ -309,7 +297,10 @@ mod tests {
         let claims = validate_token(&token, secret).unwrap();
         assert_eq!(claims.sudo_exp, None);
         assert!(!claims.sudo_active_at(Utc::now().timestamp()));
-        assert!(!token.contains("sudo_exp"), "an absent claim is not serialized");
+        assert!(
+            !token.contains("sudo_exp"),
+            "an absent claim is not serialized"
+        );
 
         let elevated = reissue_with_sudo(&claims, secret).unwrap();
         let sudo = validate_token(&elevated, secret).unwrap();
@@ -355,8 +346,6 @@ mod tests {
     /// Tokens minted before the claim existed keep validating, as `None`.
     #[test]
     fn a_token_without_the_sudo_claim_still_validates() {
-        use jsonwebtoken::{encode, EncodingKey, Header};
-
         #[derive(Serialize)]
         struct Legacy<'a> {
             sub: &'a str,
@@ -387,7 +376,12 @@ mod tests {
             sudo_exp: Some(now - 1),
             ..claims
         };
-        let token = encode_claims_as_is(&expired, "legacy").unwrap();
+        let token = encode(
+            &Header::default(),
+            &expired,
+            &EncodingKey::from_secret(b"legacy"),
+        )
+        .unwrap();
         let decoded = validate_token(&token, "legacy").unwrap();
         assert_eq!(decoded.sudo_exp, Some(now - 1));
         assert!(!decoded.sudo_active_at(now));

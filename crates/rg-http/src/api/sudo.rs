@@ -132,7 +132,10 @@ pub async fn step_up(
     let is_https = crate::public_url::request_is_https(&state, &headers);
     (
         StatusCode::OK,
-        [(axum::http::header::SET_COOKIE, build_auth_cookie(&token, is_https))],
+        [(
+            axum::http::header::SET_COOKIE,
+            build_auth_cookie(&token, is_https),
+        )],
         Json(AuthResponse {
             token,
             user_id: user.id,
@@ -177,7 +180,11 @@ async fn confirm_first_factor(
             {
                 return Err(AppError::unauthorized("account is temporarily locked"));
             }
-            tracing::debug!(user_id = user.id, provider, "sudo: confirming by second factor only");
+            tracing::debug!(
+                user_id = user.id,
+                provider,
+                "sudo: confirming by second factor only"
+            );
             Ok("second_factor_only")
         }
         provider => Err(AppError::forbidden(format!(
