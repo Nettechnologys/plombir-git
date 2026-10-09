@@ -5,6 +5,7 @@
   import { setToken } from '$lib/api/client.svelte';
   import { fetchUser } from '$lib/stores/auth.svelte';
   import { createT } from '$lib/i18n';
+  import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from '$lib/passwordPolicy';
 
   const t = createT();
 
@@ -110,8 +111,8 @@
             type="password"
             bind:value={password}
             required
-            minlength={8}
-            maxlength={128}
+            minlength={PASSWORD_MIN_LENGTH}
+            maxlength={PASSWORD_MAX_LENGTH}
             pattern={passwordPattern}
             placeholder={t('auth.reset_password.new_password_placeholder')}
             autocomplete="new-password"

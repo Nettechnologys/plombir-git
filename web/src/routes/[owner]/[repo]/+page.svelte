@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from '$lib/clipboard';
   import { page } from '$app/stores';
   import { browser } from '$app/environment';
   import { goto } from '$app/navigation';
@@ -8,6 +9,7 @@
   import { repos, type RepoTreeEntry } from '$lib/api/client.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
+  import { canWriteRepo } from '$lib/repoPermission';
 
   const t = createT();
   const RECENT_COMMITS = 5;
@@ -42,8 +44,8 @@
   let sshCopied = $state(false);
 
   function copyUrl(url: string) {
-    return () => {
-      navigator.clipboard.writeText(url);
+    return async () => {
+      if (!(await copyToClipboard(url))) return;
       if (url === httpCloneUrl) { httpCopied = true; setTimeout(() => httpCopied = false, 2000); }
       else { sshCopied = true; setTimeout(() => sshCopied = false, 2000); }
     };
@@ -194,15 +196,10 @@
     }
   }
 
-  function navigateToPath(entryName: string) {
-    const nextPath = path ? `${path}/${entryName}` : entryName;
-    syncLocation(ref, nextPath);
-  }
-
-  function navigateUp() {
-    const parts = path.split('/');
+  function parentPath(current: string) {
+    const parts = current.split('/');
     parts.pop();
-    syncLocation(ref, parts.join('/'));
+    return parts.join('/');
   }
 
   function selectBranch(branchName: string, close: () => void) {
@@ -353,9 +350,11 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
         <a href={`/${owner}/${repo}/tags`} class="btn-outline btn-sm tags-link">
           {t('repo.tags.title')}
         </a>
-        <a href={`/${owner}/${repo}/new`} class="btn-outline btn-sm">
-          ➕ {t('repo.new_file', 'New file')}
-        </a>
+        {#if canWriteRepo(repoInfo?.viewer_permission)}
+          <a href={`/${owner}/${repo}/new`} class="btn-outline btn-sm">
+            ➕ {t('repo.new_file', 'New file')}
+          </a>
+        {/if}
       </div>
 
       <div class="breadcrumb">
@@ -372,20 +371,20 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
     <div class="content-grid">
       <!-- File tree -->
       <div class="gh-card tree-panel">
+        <!-- Directories are links (card_61e77c8abec1): Enter, a middle click and
+             the back button work, which a `div role="button"` gave none of. -->
         {#if path}
-          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-          <div class="entry" onclick={navigateUp} role="button" tabindex="0">
+          <a href={buildTreeHref(ref, parentPath(path))} class="entry">
             <span class="entry-icon">📁</span>
             <span class="entry-name up">..</span>
-          </div>
+          </a>
         {/if}
         {#each entries as entry}
           {#if entry.kind === 'tree'}
-            <!-- svelte-ignore a11y_click_events_have_key_events -->
-            <div class="entry" onclick={() => navigateToPath(entry.name)} role="button" tabindex="0">
+            <a href={buildTreeHref(ref, path ? `${path}/${entry.name}` : entry.name)} class="entry">
               <span class="entry-icon">📁</span>
               <span class="entry-name dir">{entry.name}</span>
-            </div>
+            </a>
           {:else if entry.kind === 'blob'}
             <a href={buildBlobHref(path ? path + '/' + entry.name : entry.name)} class="entry file-entry">
               <span class="entry-icon">📄</span>

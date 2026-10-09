@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from '$lib/clipboard';
   import { createT } from '$lib/i18n';
   import { getUser, isLoggedIn } from '$lib/stores/auth.svelte';
   import { repos } from '$lib/api/client.svelte';
@@ -6,6 +7,8 @@
   import { isUnavailable, optionalSection } from '$lib/optionalSection';
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
+  import { canWriteRepo } from '$lib/repoPermission';
+  import type { RepoPermission } from '$lib/api/client.svelte';
 
   const t = createT();
 
@@ -18,6 +21,10 @@
   }
 
   let { owner, repo, activeTab = 'code', starsCount = 0, defaultBranch }: Props = $props();
+  // The viewer's level, read from the same `GET /repos/{owner}/{name}` that
+  // settles the archive ref — one request per visit, not two
+  // (card_270a0a77fd79). `null` until it arrives and for an anonymous reader.
+  let viewerLevel = $state<RepoPermission | null>(null);
 
   // Action button states
   type WatchState = 'not_watching' | 'watching' | 'ignoring';
@@ -68,8 +75,9 @@
   let httpCloneUrl = $derived(buildHttpCloneUrl(owner, repo));
   let sshCloneUrl = $derived(browser ? buildSshCloneUrl(owner, repo, location.hostname) : '');
 
-  function copyUrl(url: string) {
-    navigator.clipboard.writeText(url);
+  async function copyUrl(url: string) {
+    // "Copied" only for a copy that happened (card_c30077df5603).
+    if (!(await copyToClipboard(url))) return;
     if (cloneTab === 'http') {
       httpCopied = true;
       setTimeout(() => httpCopied = false, 2000);
@@ -121,9 +129,8 @@
     const fallbackRef = defaultBranch || 'main';
     const archiveOwner = ++archiveRefStateOwner;
     archiveRef = fallbackRef;
-    if (!defaultBranch) {
-      void loadArchiveRef(expectedOwner, expectedRepo, fallbackRef, archiveOwner);
-    }
+    viewerLevel = null;
+    void loadArchiveRef(expectedOwner, expectedRepo, fallbackRef, archiveOwner);
   });
 
   async function loadArchiveRef(
@@ -136,10 +143,16 @@
       const repoInfo = await repos.get(expectedOwner, expectedRepo);
       if (
         archiveRefStateOwner === archiveOwner &&
-        isCurrentRepo(expectedOwner, expectedRepo) &&
-        repoInfo.default_branch
+        isCurrentRepo(expectedOwner, expectedRepo)
       ) {
-        archiveRef = repoInfo.default_branch;
+        // One answer, two uses: the viewer's level rides on the same read.
+        // A `defaultBranch` the page passed wins over the server's; changing
+        // it re-runs the effect and claims a new owner, so this read cannot
+        // apply to a prop it did not see.
+        viewerLevel = repoInfo?.viewer_permission ?? null;
+        if (!defaultBranch && repoInfo?.default_branch) {
+          archiveRef = repoInfo.default_branch;
+        }
       }
     } catch {
       if (
@@ -362,7 +375,9 @@
     { id: 'board', label: t('repo.tabs.board'), icon: '◫', path: 'boards' },
     { id: 'time_tracking', label: t('repo.tabs.time_tracking'), icon: '⏱' },
     { id: 'commits', label: t('repo.tabs.commits'), icon: '📜' },
-    { id: 'settings', label: t('repo.tabs.settings'), icon: '⚙' },
+    // Settings holds sections for writers (labels, mirror, LFS locks) and
+    // for administrators; a reader has none (card_270a0a77fd79).
+    ...(canWriteRepo(viewerLevel) ? [{ id: 'settings', label: t('repo.tabs.settings'), icon: '⚙' }] : []),
   ]);
 
   function tabHref(tab: { id: string; path?: string }) {
@@ -655,11 +670,14 @@
     white-space: nowrap;
   }
 
+  /* Thirteen tabs do not fit a phone; they scroll sideways in one row
+     instead of wrapping into three (card_c30077df5603). */
   .repo-tabs {
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     gap: 0;
-    overflow: visible;
+    overflow-x: auto;
+    scrollbar-width: thin;
   }
 
   .tab {

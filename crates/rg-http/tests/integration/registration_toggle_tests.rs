@@ -211,3 +211,55 @@ async fn an_open_instance_still_registers_freely() {
 
     assert_eq!(user_count(&db).await, 3);
 }
+
+async fn instance_says_registration_is_open(base: &str) -> bool {
+    let info: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/instance"))
+        .send()
+        .await
+        .expect("request instance info")
+        .json()
+        .await
+        .expect("instance info is JSON");
+    info["registration_open"]
+        .as_bool()
+        .expect("instance info names whether registration is open")
+}
+
+/// card_e1baa94866ed: the sign-in page offered "Create an account" on an
+/// instance that answers every sign-up with 403. `/instance` now says what the
+/// register route would decide — including the one account a closed instance
+/// still takes, the one that initialises it.
+#[tokio::test]
+async fn instance_info_says_what_the_register_route_would_decide() {
+    let (base, _db) = spawn_test_app_with_overrides(closed_instance()).await;
+    assert!(
+        instance_says_registration_is_open(&base).await,
+        "an empty closed instance still takes its first account"
+    );
+    assert_eq!(
+        post_register(&base, "founder", "founder@example.com")
+            .await
+            .status(),
+        201
+    );
+    assert!(
+        !instance_says_registration_is_open(&base).await,
+        "a closed instance with an account advertised sign-up"
+    );
+    assert_eq!(
+        post_register(&base, "late", "late@example.com")
+            .await
+            .status(),
+        403
+    );
+
+    let (base, _db) = spawn_test_app_with_overrides(StateOverrides::default()).await;
+    assert_eq!(
+        post_register(&base, "founder", "founder@example.com")
+            .await
+            .status(),
+        201
+    );
+    assert!(instance_says_registration_is_open(&base).await);
+}

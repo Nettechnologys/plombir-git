@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import { createT } from '$lib/i18n';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
 
   const t = createT();
 
@@ -11,24 +12,33 @@
   const repo = $derived($page.params.repo!);
   const currentPath = $derived($page.url.pathname);
 
+  // Each section names the level its server routes require (card_270a0a77fd79):
+  // labels, the mirror and LFS locks are `RepoWrite`, everything else here is
+  // `RepoAdmin`. A section the viewer may not use is neither listed nor
+  // rendered — rendering it only asked the server for a 403 on load.
+  type Level = 'write' | 'admin';
   const navItems = $derived([
-    { path: `/${owner}/${repo}/settings`, label: t('settings.general'), icon: '⚙️' },
-    { path: `/${owner}/${repo}/settings/labels`, label: t('settings.labels'), icon: '🏷️' },
-    { path: `/${owner}/${repo}/settings/branches`, label: t('settings.branch_protection.title'), icon: '🛡️' },
-    { path: `/${owner}/${repo}/settings/deploy-keys`, label: t('settings.deploy_keys.title', 'Deploy keys'), icon: '🔑' },
-    { path: `/${owner}/${repo}/settings/ci-secrets`, label: t('settings.ci_secrets.title', 'CI secrets'), icon: '🔒' },
-    { path: `/${owner}/${repo}/settings/environments`, label: t('settings.environments.title', 'Environments'), icon: '🚀' },
-    { path: `/${owner}/${repo}/settings/retention`, label: t('settings.retention.title', 'CI retention'), icon: '🧹' },
-    { path: `/${owner}/${repo}/settings/tags`, label: t('settings.tag_protection.title', 'Tag protection'), icon: '🏷️' },
-    { path: `/${owner}/${repo}/settings/mirror`, label: t('settings.mirror.title'), icon: '🔁' },
-    { path: `/${owner}/${repo}/settings/lfs-locks`, label: t('settings.lfs_locks.title'), icon: '🔐' },
-    { path: `/${owner}/${repo}/settings/lfs-storage`, label: t('settings.lfs_storage.title'), icon: '📦' },
-    { path: `/${owner}/${repo}/settings/webhooks`, label: t('settings.webhooks.title', 'Webhooks'), icon: '🔔' },
-    { path: `/${owner}/${repo}/settings/collaborators`, label: t('settings.collaborators.title'), icon: '👥' },
-    { path: `/${owner}/${repo}/settings/runners`, label: t('admin.runners.title'), icon: '🏃' }
+    { path: `/${owner}/${repo}/settings`, label: t('settings.general'), icon: '⚙️', level: 'admin' as Level },
+    { path: `/${owner}/${repo}/settings/labels`, label: t('settings.labels'), icon: '🏷️', level: 'write' as Level },
+    { path: `/${owner}/${repo}/settings/branches`, label: t('settings.branch_protection.title'), icon: '🛡️', level: 'admin' as Level },
+    { path: `/${owner}/${repo}/settings/deploy-keys`, label: t('settings.deploy_keys.title', 'Deploy keys'), icon: '🔑', level: 'admin' as Level },
+    { path: `/${owner}/${repo}/settings/ci-secrets`, label: t('settings.ci_secrets.title', 'CI secrets'), icon: '🔒', level: 'admin' as Level },
+    { path: `/${owner}/${repo}/settings/environments`, label: t('settings.environments.title', 'Environments'), icon: '🚀', level: 'admin' as Level },
+    { path: `/${owner}/${repo}/settings/retention`, label: t('settings.retention.title', 'CI retention'), icon: '🧹', level: 'admin' as Level },
+    { path: `/${owner}/${repo}/settings/tags`, label: t('settings.tag_protection.title', 'Tag protection'), icon: '🏷️', level: 'admin' as Level },
+    { path: `/${owner}/${repo}/settings/mirror`, label: t('settings.mirror.title'), icon: '🔁', level: 'write' as Level },
+    { path: `/${owner}/${repo}/settings/lfs-locks`, label: t('settings.lfs_locks.title'), icon: '🔐', level: 'write' as Level },
+    { path: `/${owner}/${repo}/settings/lfs-storage`, label: t('settings.lfs_storage.title'), icon: '📦', level: 'admin' as Level },
+    { path: `/${owner}/${repo}/settings/webhooks`, label: t('settings.webhooks.title', 'Webhooks'), icon: '🔔', level: 'admin' as Level },
+    { path: `/${owner}/${repo}/settings/collaborators`, label: t('settings.collaborators.title'), icon: '👥', level: 'admin' as Level },
+    { path: `/${owner}/${repo}/settings/runners`, label: t('admin.runners.title'), icon: '🏃', level: 'admin' as Level }
   ]);
 
+  const permission = viewerPermission(() => owner, () => repo);
+  const allows = (level: Level) => (level === 'admin' ? permission.isAdmin : permission.canWrite);
+  const visibleItems = $derived(navItems.filter((item) => allows(item.level)));
   const currentSection = $derived(navItems.find((item) => item.path === currentPath));
+  const sectionAllowed = $derived(!currentSection || allows(currentSection.level));
 </script>
 
 <div class="page-container">
@@ -37,7 +47,7 @@
   <div class="settings-layout">
     <aside class="sidebar">
       <nav>
-        {#each navItems as item}
+        {#each visibleItems as item}
           <a
             href={item.path}
             class="nav-item"
@@ -50,7 +60,7 @@
       </nav>
     </aside>
 
-    <main class="content">
+    <div class="content">
       <div class="breadcrumb">
         <a href={`/${owner}/${repo}`}>{owner}/{repo}</a>
         <span class="separator">/</span>
@@ -61,12 +71,29 @@
         {/if}
       </div>
 
-      {@render children()}
-    </main>
+      {#if !permission.settled}
+        <p class="text-secondary">{t('common.loading')}</p>
+      {:else if sectionAllowed}
+        {@render children()}
+      {:else}
+        <div class="no-access" role="status">
+          {currentSection?.level === 'admin'
+            ? t('settings.access.admin_required', 'This page is for the repository’s administrators.')
+            : t('settings.access.write_required', 'This page is for people who can write to the repository.')}
+        </div>
+      {/if}
+    </div>
   </div>
 </div>
 
 <style>
+  .no-access {
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+  }
+
   .settings-layout {
     display: flex;
     gap: 2rem;

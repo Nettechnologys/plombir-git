@@ -16,7 +16,11 @@ let rendered: RenderedComponent | undefined;
 beforeEach(() => {
 	vi.clearAllMocks();
 	vi.useFakeTimers();
-	vi.stubGlobal('confirm', vi.fn(() => true));
+	// No native dialog may stand in for the page's own confirmation: a
+	// `confirm()` call now fails the test instead of answering it.
+	vi.stubGlobal('confirm', vi.fn(() => {
+		throw new Error('window.confirm() was called');
+	}));
 	resetTestClient();
 	setTestPage('/alice/demo/settings', { owner: 'alice', repo: 'demo' });
 	repos.get.mockResolvedValue({
@@ -48,6 +52,7 @@ async function renderSettings(): Promise<void> {
 async function transferTo(destinationOwner: string): Promise<void> {
 	await input(element<HTMLInputElement>(rendered!.container, '#new-owner'), destinationOwner);
 	await click(element(rendered!.container, '.transfer-repo'));
+	await click(element(document.body, '.confirm-transfer'));
 }
 
 describe('repository settings resource lifetime', () => {
@@ -78,10 +83,28 @@ describe('repository settings resource lifetime', () => {
 		expect(navigation.goto).not.toHaveBeenCalled();
 	});
 
+	it('names both ends of a transfer and does nothing until it is confirmed', async () => {
+		await renderSettings();
+		await input(element<HTMLInputElement>(rendered!.container, '#new-owner'), 'bob');
+		await click(element(rendered!.container, '.transfer-repo'));
+
+		expect(repos.transfer).not.toHaveBeenCalled();
+		expect(document.body.querySelector('[role="dialog"]')?.textContent).toContain('alice/demo → bob/demo');
+		const cancel = Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')).find(
+			(candidate) => candidate.textContent?.trim() === 'Cancel',
+		)!;
+		await click(cancel);
+
+		expect(document.body.querySelector('.confirm-transfer')).toBeNull();
+		expect(repos.transfer).not.toHaveBeenCalled();
+	});
+
 	it('keeps repository deletion redirect immediate', async () => {
 		await renderSettings();
 		await input(element<HTMLInputElement>(rendered!.container, '#delete-confirm'), 'alice/demo');
 		await click(element(rendered!.container, '.btn-danger'));
+		expect(repos.delete).not.toHaveBeenCalled();
+		await click(element(document.body, '.confirm-delete-repo'));
 
 		expect(repos.delete).toHaveBeenCalledWith('alice', 'demo');
 		expect(navigation.goto).toHaveBeenCalledOnce();

@@ -236,12 +236,32 @@
     }
   }
   
+  // Transfer and delete confirm in a `Modal` rather than `window.confirm()`
+  // (card_270a0a77fd79): the native dialog cannot say which repository and
+  // which destination it is about, is styled by the browser, and a browser
+  // set to suppress dialogs answers it `false` without asking anybody.
+  let transferConfirmOpen = $state(false);
+  // The repository's name goes in as text, not through `{@html}`: the sentence
+  // is split around its placeholder and the name is rendered between.
+  const deleteInstruction = $derived(
+    t('settings.delete.confirm_instruction', { repo: '\u0001' }).split('\u0001'),
+  );
+  let deleteConfirmOpen = $state(false);
+
+  function askTransfer() {
+    if (!newOwner.trim() || transferring) return;
+    transferConfirmOpen = true;
+  }
+
+  function askDelete() {
+    if (deleteConfirm !== repositoryPath || deleting) return;
+    deleteConfirmOpen = true;
+  }
+
   async function handleTransfer() {
     const destinationOwner = newOwner.trim();
+    transferConfirmOpen = false;
     if (!destinationOwner) return;
-
-    const confirmed = confirm(t('settings.transfer.warning'));
-    if (!confirmed) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -279,10 +299,8 @@
   });
   
   async function handleDelete() {
+    deleteConfirmOpen = false;
     if (deleteConfirm !== repositoryPath) return;
-    
-    const confirmed = confirm(t('settings.delete.desc'));
-    if (!confirmed) return;
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRoute = routeGeneration;
@@ -443,7 +461,7 @@
           />
           <button 
             class="btn btn-warning transfer-repo"
-            onclick={handleTransfer}
+            onclick={askTransfer}
             disabled={!newOwner.trim() || transferring}
           >
             {transferring ? t('settings.transfer.confirming') : t('settings.transfer.confirm')}
@@ -465,7 +483,7 @@
         {/if}
         
         <div class="form-group">
-          <label for="delete-confirm">{@html t('settings.delete.confirm_instruction', { repo: repositoryPath })}</label>
+          <label for="delete-confirm">{deleteInstruction[0]}<strong>{repositoryPath}</strong>{deleteInstruction[1] ?? ''}</label>
           <input 
             id="delete-confirm"
             type="text" 
@@ -477,7 +495,7 @@
         
         <button 
           class="btn btn-danger"
-          onclick={handleDelete}
+          onclick={askDelete}
           disabled={deleteConfirm !== repositoryPath || deleting}
         >
           {deleting ? t('settings.delete.confirming') : t('settings.delete.confirm_button')}
@@ -486,6 +504,34 @@
     </section>
   {/if}
 </div>
+
+{#if transferConfirmOpen && repository}
+  <Modal onclose={() => (transferConfirmOpen = false)} labelledby="transfer-confirm-title">
+    <h2 id="transfer-confirm-title">{t('settings.transfer.title')}</h2>
+    <p class="confirm-target"><strong>{repositoryPath}</strong> → <strong>{newOwner.trim()}/{repo}</strong></p>
+    <p>{t('settings.transfer.warning')}</p>
+    <div class="modal-actions">
+      <button class="btn btn-warning confirm-transfer" onclick={handleTransfer} disabled={transferring}>
+        {t('settings.transfer.confirm')}
+      </button>
+      <button class="btn" onclick={() => (transferConfirmOpen = false)} data-autofocus>{t('common.cancel')}</button>
+    </div>
+  </Modal>
+{/if}
+
+{#if deleteConfirmOpen && repository}
+  <Modal onclose={() => (deleteConfirmOpen = false)} labelledby="delete-confirm-title">
+    <h2 id="delete-confirm-title">{t('settings.delete.title')}</h2>
+    <p class="confirm-target"><strong>{repositoryPath}</strong></p>
+    <p>{t('settings.delete.desc')}</p>
+    <div class="modal-actions">
+      <button class="btn btn-danger confirm-delete-repo" onclick={handleDelete} disabled={deleting}>
+        {t('settings.delete.confirm_button')}
+      </button>
+      <button class="btn" onclick={() => (deleteConfirmOpen = false)} data-autofocus>{t('common.cancel')}</button>
+    </div>
+  </Modal>
+{/if}
 
 {#if visibilityOpen && repository}
   <Modal onclose={closeVisibility} labelledby="visibility-title">

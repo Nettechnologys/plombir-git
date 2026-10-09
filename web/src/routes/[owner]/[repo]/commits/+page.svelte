@@ -236,8 +236,9 @@
   }
 
   .error-banner {
-    background: var(--error-bg, #fee);
-    border: 1px solid var(--error-border, #fcc);
+    background: var(--error-bg);
+    border: 1px solid var(--error-border);
+    color: var(--red);
     border-radius: 6px;
     padding: 12px 16px;
     margin-bottom: 16px;

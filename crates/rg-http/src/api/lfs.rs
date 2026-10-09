@@ -89,11 +89,12 @@ fn lfs_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) ->
 /// Fails closed and keeps the two answers apart: `401` for an account that is
 /// gone or disabled or a session that has been revoked, `503` for a database
 /// that could not be asked — a client is right to retry the second and wrong to
-/// retry the first. The final owner read is a conditional no-op update rather
-/// than a snapshot: it contends with account retirement/DELETE and returns the
-/// fresh row from that ordering before this capability may publish success.
+/// retry the first. The final owner read is the fresh one
+/// [`finalize_standing_credential_owner`](rg_db::ops::user_ops::finalize_standing_credential_owner)
+/// makes, after the credential's own check, so a retirement or DELETE committed
+/// since the URL was signed is what it sees.
 async fn signer_still_stands(
-    state: &AppState,
+    db: &sea_orm::DatabaseConnection,
     user_id: i64,
     credential: rg_core::lfs::service::LfsCredential,
 ) -> Result<(), AppError> {
@@ -106,42 +107,38 @@ async fn signer_still_stands(
     // standing credential as a PAT: deleting it is what revokes it.
     let token_stands = match credential {
         LfsCredential::Session { .. } => true,
-        LfsCredential::SshKey { id } => {
-            match rg_db::ops::ssh_key_ops::find_by_id(&state.db, id).await {
-                Ok(key) => key.is_some_and(|key| key.user_id == user_id),
-                Err(error) => {
-                    tracing::error!(
-                        user_id,
-                        ssh_key_id = id,
-                        error = %format!("{error:#}"),
-                        "could not verify SSH key standing for an LFS credential"
-                    );
-                    return Err(AppError::service_unavailable(
-                        "could not verify account standing",
-                    ));
-                }
+        LfsCredential::SshKey { id } => match rg_db::ops::ssh_key_ops::find_by_id(db, id).await {
+            Ok(key) => key.is_some_and(|key| key.user_id == user_id),
+            Err(error) => {
+                tracing::error!(
+                    user_id,
+                    ssh_key_id = id,
+                    error = %format!("{error:#}"),
+                    "could not verify SSH key standing for an LFS credential"
+                );
+                return Err(AppError::service_unavailable(
+                    "could not verify account standing",
+                ));
             }
-        }
-        LfsCredential::Token { id } => {
-            match rg_db::ops::token_ops::find_by_id(&state.db, id).await {
-                Ok(Some(token)) => {
-                    token.user_id == user_id
-                        && token.expires_at.is_none_or(|at| at > chrono::Utc::now())
-                }
-                Ok(None) => false,
-                Err(error) => {
-                    tracing::error!(
-                        user_id,
-                        token_id = id,
-                        error = %format!("{error:#}"),
-                        "could not verify token standing for a signed LFS action URL"
-                    );
-                    return Err(AppError::service_unavailable(
-                        "could not verify account standing",
-                    ));
-                }
+        },
+        LfsCredential::Token { id } => match rg_db::ops::token_ops::find_by_id(db, id).await {
+            Ok(Some(token)) => {
+                token.user_id == user_id
+                    && token.expires_at.is_none_or(|at| at > chrono::Utc::now())
             }
-        }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::error!(
+                    user_id,
+                    token_id = id,
+                    error = %format!("{error:#}"),
+                    "could not verify token standing for a signed LFS action URL"
+                );
+                return Err(AppError::service_unavailable(
+                    "could not verify account standing",
+                ));
+            }
+        },
     };
 
     if !token_stands {
@@ -155,7 +152,7 @@ async fn signer_still_stands(
     }
 
     let account_stands =
-        match rg_db::ops::user_ops::finalize_standing_credential_owner(&state.db, user_id).await {
+        match rg_db::ops::user_ops::finalize_standing_credential_owner(db, user_id).await {
             Ok(Some(user)) => user,
             Ok(None) => {
                 tracing::warn!(
@@ -297,7 +294,7 @@ async fn actor_still_may(
             user_id,
             credential,
         }) => {
-            signer_still_stands(state, user_id, credential).await?;
+            signer_still_stands(&state.db, user_id, credential).await?;
             Some(user_id)
         }
         None => None,
@@ -1318,5 +1315,93 @@ mod staging_path_tests {
             .await
             .unwrap();
         assert_eq!(body.as_ref(), LFS_OBJECT_PAYLOAD);
+    }
+}
+
+/// The owner finalizer's two refusals, kept apart (card_b83b9bc36e3a). An
+/// integration test cannot fail this read alone — resolving the repository
+/// reads `users` first — so the branches are pinned here, on the function.
+#[cfg(test)]
+mod owner_finalization_tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use rg_core::lfs::service::LfsCredential;
+
+    async fn owner_db() -> (sea_orm::DatabaseConnection, rg_db::entities::user::Model) {
+        use sea_orm::{ActiveModelTrait, ConnectOptions, Database, Set};
+
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options)
+            .await
+            .expect("connect to in-memory db");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        let now = chrono::Utc::now();
+        let owner = rg_db::entities::user::ActiveModel {
+            username: Set("capability-owner".to_string()),
+            email: Set("capability-owner@example.test".to_string()),
+            password_hash: Set("x".to_string()),
+            is_admin: Set(false),
+            is_active: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert capability owner");
+        (db, owner)
+    }
+
+    /// The fault: a column the owner read selects. Nothing on this path reads
+    /// `users` before the finalizer, so the failure lands there and only there.
+    async fn break_owner_reads(db: &sea_orm::DatabaseConnection) {
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared(
+            "ALTER TABLE users RENAME COLUMN deleted_at TO deleted_at_unreadable",
+        )
+        .await
+        .expect("break owner reads");
+    }
+
+    async fn retire(db: &sea_orm::DatabaseConnection, user_id: i64) {
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared(&format!(
+            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP WHERE id = {user_id}"
+        ))
+        .await
+        .expect("retire owner");
+    }
+
+    /// A finalizer that could not establish an ordering is an unavailable
+    /// service, not evidence that the signed capability or its owner is invalid.
+    #[tokio::test]
+    async fn a_failed_owner_read_is_503_not_a_credential_verdict() {
+        let (db, owner) = owner_db().await;
+        let credential = LfsCredential::Session {
+            version: owner.session_version,
+        };
+        signer_still_stands(&db, owner.id, credential)
+            .await
+            .expect("the healthy signer stands");
+
+        break_owner_reads(&db).await;
+        let error = signer_still_stands(&db, owner.id, credential)
+            .await
+            .expect_err("an owner that could not be read was accepted");
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_retired_owner_is_401() {
+        let (db, owner) = owner_db().await;
+        let credential = LfsCredential::Session {
+            version: owner.session_version,
+        };
+        retire(&db, owner.id).await;
+        let error = signer_still_stands(&db, owner.id, credential)
+            .await
+            .expect_err("a retired owner's capability was accepted");
+        assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
     }
 }

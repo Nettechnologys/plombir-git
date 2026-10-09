@@ -1000,7 +1000,9 @@ impl Handler for SshHandler {
                     user_id: key.user_id,
                     credential: UserCredential::SshKey { key_id: key.id },
                 });
-                if let Err(error) = rg_db::ops::ssh_key_ops::touch_last_used(db, key.id).await {
+                if let Err(error) =
+                    rg_db::ops::ssh_key_ops::touch_last_used(db, key.id, key.last_used_at).await
+                {
                     tracing::warn!(
                         key_id = key.id,
                         error = %format!("{error:#}"),
@@ -1015,7 +1017,8 @@ impl Handler for SshHandler {
                     self.authenticated_identity =
                         Some(AuthenticatedIdentity::DeployKey { key_id: key.id });
                     if let Err(error) =
-                        rg_db::ops::deploy_key_ops::touch_last_used(db, key.id).await
+                        rg_db::ops::deploy_key_ops::touch_last_used(db, key.id, key.last_used_at)
+                            .await
                     {
                         tracing::warn!(
                             key_id = key.id,

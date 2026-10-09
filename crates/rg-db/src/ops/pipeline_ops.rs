@@ -117,10 +117,7 @@ pub async fn list_pipelines_by_repo_paginated(
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<pipeline::Model>, i64)> {
-    let base = pipeline::Entity::find()
-        .filter(pipeline::Column::RepoId.eq(repo_id))
-        .order_by_desc(pipeline::Column::CreatedAt)
-        .order_by_desc(pipeline::Column::Id);
+    let base = pipelines_page_query(repo_id);
 
     let total = base
         .clone()
@@ -135,6 +132,16 @@ pub async fn list_pipelines_by_repo_paginated(
         .context("db: list pipelines by repo (paginated)")?;
 
     Ok((pipelines, total))
+}
+
+/// The ordered selection [`list_pipelines_by_repo_paginated`] cuts a page
+/// from, kept apart so `query_plan_tests` explains the statement the server
+/// sends.
+pub(crate) fn pipelines_page_query(repo_id: i64) -> Select<pipeline::Entity> {
+    pipeline::Entity::find()
+        .filter(pipeline::Column::RepoId.eq(repo_id))
+        .order_by_desc(pipeline::Column::CreatedAt)
+        .order_by_desc(pipeline::Column::Id)
 }
 
 /// Every job id owned by `repo_id`, walked repo → pipeline → stage → job.
@@ -1043,25 +1050,47 @@ pub async fn find_pending_job_matching_labels(
     // Keep the capability boundary in the database query. Apart from being the
     // narrowest place to enforce it, this prevents another repository's backlog
     // from turning every poll into an instance-wide scan.
-    let all_pending: Vec<pipeline_job::Model> = pipeline_job::Entity::find()
-        .join(
-            JoinType::InnerJoin,
-            pipeline_job::Relation::PipelineStage.def(),
-        )
-        .join(
-            JoinType::InnerJoin,
-            pipeline_stage::Relation::Pipeline.def(),
-        )
-        .filter(pipeline::Column::RepoId.eq(repo_id))
-        .filter(pipeline_job::Column::Status.eq("pending"))
-        .filter(pipeline_job::Column::RunnerId.is_null())
-        .order_by_asc(pipeline_job::Column::Id)
+    let candidates: Vec<pipeline_job::Model> = pending_jobs_query(repo_id)
         .all(db)
         .await
         .context("db: find pending jobs")?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
 
-    for job in all_pending {
-        if !job_is_schedulable(db, &job).await? {
+    // A job of a later stage stays `pending` while the earlier stages run, so
+    // a busy pipeline keeps many candidates. Their stages are read once, for
+    // every candidate pipeline together, rather than three queries per job on
+    // every poll of every runner.
+    let mut stage_ids: Vec<i64> = candidates.iter().map(|job| job.stage_id).collect();
+    stage_ids.sort_unstable();
+    stage_ids.dedup();
+    let candidate_stages = pipeline_stage::Entity::find()
+        .filter(pipeline_stage::Column::Id.is_in(stage_ids))
+        .all(db)
+        .await
+        .context("db: load stages of pending jobs")?;
+    let mut pipeline_ids: Vec<i64> = candidate_stages
+        .iter()
+        .map(|stage| stage.pipeline_id)
+        .collect();
+    pipeline_ids.sort_unstable();
+    pipeline_ids.dedup();
+    let sibling_stages = pipeline_stage::Entity::find()
+        .filter(pipeline_stage::Column::PipelineId.is_in(pipeline_ids))
+        .all(db)
+        .await
+        .context("db: load stages of pending pipelines")?;
+    let stages_by_id: std::collections::HashMap<i64, &pipeline_stage::Model> = sibling_stages
+        .iter()
+        .map(|stage| (stage.id, stage))
+        .collect();
+
+    for job in candidates {
+        let Some(stage) = stages_by_id.get(&job.stage_id) else {
+            continue;
+        };
+        if !earlier_stages_succeeded(stage, &sibling_stages) {
             continue;
         }
         let job_tags = match decode_job_tags(job.tags.as_deref()) {
@@ -1083,27 +1112,50 @@ pub async fn find_pending_job_matching_labels(
     Ok(None)
 }
 
-async fn job_is_schedulable(db: &DatabaseConnection, job: &pipeline_job::Model) -> Result<bool> {
-    let Some(stage) = get_stage_by_id(db, job.stage_id).await? else {
-        return Ok(false);
-    };
-    if matches!(
-        stage.status.as_str(),
-        "manual" | "waiting_approval" | "canceled"
-    ) {
-        return Ok(false);
-    }
-    let Some(pipeline) = get_pipeline(db, stage.pipeline_id).await? else {
-        return Ok(false);
-    };
-    if !matches!(pipeline.status.as_str(), "pending" | "running") {
-        return Ok(false);
-    }
-    let stages = list_stages_by_pipeline(db, stage.pipeline_id).await?;
-    Ok(stages
+/// Pending, unassigned jobs of one repository whose stage and pipeline would
+/// let them run, oldest first.
+///
+/// A stage that waits for a person (`manual`, `waiting_approval`) or was
+/// `canceled` holds its jobs back, and so does a pipeline that has left
+/// `pending`/`running`. Those are filtered here rather than per job afterwards
+/// so the poll reads only rows it may hand out; what is left for Rust is the
+/// stage order, which needs the job's sibling stages.
+///
+/// The `(status, runner_id)` index on `pipeline_jobs` lets the engine start
+/// from the handful of pending jobs instead of walking every pipeline the
+/// repository ever ran; `query_plan_tests` holds it to that.
+pub(crate) fn pending_jobs_query(repo_id: i64) -> Select<pipeline_job::Entity> {
+    pipeline_job::Entity::find()
+        .join(
+            JoinType::InnerJoin,
+            pipeline_job::Relation::PipelineStage.def(),
+        )
+        .join(
+            JoinType::InnerJoin,
+            pipeline_stage::Relation::Pipeline.def(),
+        )
+        .filter(pipeline_job::Column::Status.eq("pending"))
+        .filter(pipeline_job::Column::RunnerId.is_null())
+        .filter(pipeline::Column::RepoId.eq(repo_id))
+        .filter(pipeline::Column::Status.is_in(["pending", "running"]))
+        .filter(pipeline_stage::Column::Status.is_not_in([
+            "manual",
+            "waiting_approval",
+            "canceled",
+        ]))
+        .order_by_asc(pipeline_job::Column::Id)
+}
+
+/// Whether every stage that comes before `stage` in its pipeline succeeded.
+fn earlier_stages_succeeded(
+    stage: &pipeline_stage::Model,
+    stages: &[pipeline_stage::Model],
+) -> bool {
+    stages
         .iter()
+        .filter(|candidate| candidate.pipeline_id == stage.pipeline_id)
         .filter(|candidate| candidate.stage_order < stage.stage_order)
-        .all(|candidate| candidate.status == "success"))
+        .all(|candidate| candidate.status == "success")
 }
 
 #[cfg(test)]
@@ -1163,6 +1215,109 @@ mod job_tag_matching_tests {
         .await
         .expect("create job");
         (db, job.id)
+    }
+
+    /// The scheduling gates the poll applies besides labels: a stage waiting
+    /// for a person, a canceled stage, an unfinished earlier stage and a
+    /// pipeline that left `pending`/`running` each hold a pending job back.
+    /// The poll moved these checks from per-job Rust into its query
+    /// (card_6eba06ebef97); nothing else held them before this test.
+    #[tokio::test]
+    async fn only_jobs_whose_stage_and_pipeline_may_run_are_handed_out() {
+        let (db, first_job) = setup_with_job(None).await;
+        let first = get_job(&db, first_job)
+            .await
+            .expect("load first job")
+            .expect("first job exists");
+        let first_stage = get_stage_by_id(&db, first.stage_id)
+            .await
+            .expect("load first stage")
+            .expect("first stage exists");
+        let pipeline_id = first_stage.pipeline_id;
+        let later_stage = create_stage(&db, pipeline_id, "deploy", 1)
+            .await
+            .expect("create later stage");
+        let later_job = create_job(
+            &db,
+            later_stage.id,
+            "ship",
+            "echo ship",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create later job")
+        .id;
+
+        let set_job = |id: i64, status: &'static str| {
+            let db = &db;
+            async move {
+                db.execute(Statement::from_string(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    format!("UPDATE pipeline_jobs SET status = '{status}' WHERE id = {id}"),
+                ))
+                .await
+                .expect("set job status");
+            }
+        };
+        let handed_out = || async {
+            find_pending_job_matching_labels(&db, 1, &[])
+                .await
+                .expect("poll for work")
+                .map(|job| job.id)
+        };
+
+        assert_eq!(
+            handed_out().await,
+            Some(first_job),
+            "oldest runnable job first"
+        );
+
+        set_job(first_job, "running").await;
+        assert_eq!(
+            handed_out().await,
+            None,
+            "a later stage's job was handed out while the earlier stage runs"
+        );
+        set_job(first_job, "pending").await;
+
+        for held in ["manual", "waiting_approval", "canceled"] {
+            update_stage_status(&db, first_stage.id, held, None, None)
+                .await
+                .expect("hold the first stage");
+            assert_eq!(
+                handed_out().await,
+                None,
+                "a job was handed out from, or after, a `{held}` stage"
+            );
+        }
+
+        set_job(first_job, "success").await;
+        update_stage_status(&db, first_stage.id, "success", None, None)
+            .await
+            .expect("finish the first stage");
+        assert_eq!(
+            handed_out().await,
+            Some(later_job),
+            "the later stage's job was held after the earlier stage succeeded"
+        );
+
+        update_pipeline_status(&db, pipeline_id, "failed", None, None)
+            .await
+            .expect("fail the pipeline");
+        assert_eq!(
+            handed_out().await,
+            None,
+            "a job was handed out from a pipeline that is no longer running"
+        );
     }
 
     #[tokio::test]
@@ -1654,7 +1809,7 @@ pub async fn cancel_pipeline_chain_in_transaction(
 /// it started — `prepare_workspace` could not lay down a worktree, so not one
 /// job will execute. Settling only the pipeline row leaves `failed` standing
 /// over stages and jobs that still call themselves `pending`: nothing will ever
-/// pick them up (`job_is_schedulable` refuses a job whose pipeline left
+/// pick them up (`pending_jobs_query` refuses a job whose pipeline left
 /// `pending`/`running`), so the API and the UI show work as waiting that no
 /// longer exists, and the job carries no reason a reader can act on.
 ///

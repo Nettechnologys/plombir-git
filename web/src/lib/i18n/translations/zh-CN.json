@@ -36,7 +36,8 @@
     "prev_arrow": "← 上一页",
     "next_arrow": "下一页 →",
     "page_info": "第 {page} 页，共 {total} 页",
-    "deleting": "正在删除..."
+    "deleting": "正在删除...",
+    "copy_failed": "复制失败。请选中文本后手动复制。"
   },
   "nav": {
     "dashboard": "仪表板",
@@ -67,7 +68,8 @@
     "agents": "智能体",
     "home_label": "Plombir Git 首页",
     "user_menu": "用户菜单",
-    "notification_settings": "通知设置"
+    "notification_settings": "通知设置",
+    "menu": "菜单"
   },
   "author": {
     "bot": "机器人",
@@ -104,7 +106,7 @@
   },
   "home": {
     "tagline": "轻量级自托管 Git 服务",
-    "description": "Plombir Git 是用 Rust 构建的轻量级 Git 托管平台，作为 Gitea 的现代替代品。单二进制部署，内存高效，功能完整。",
+    "description": "Plombir Git 是用 Rust 编写的自托管 Git 平台：在 SQLite、PostgreSQL 或 MySQL 上提供仓库、问题、拉取请求、Wiki、CI/CD 与包注册表。",
     "sign_up": "注册",
     "sign_in": "登录",
     "cta": {
@@ -122,7 +124,7 @@
       "cicd_desc": "内置流水线引擎",
       "lightweight": {
         "title": "轻量级",
-        "desc": "内存占用 <50MB，最小化资源消耗"
+        "desc": "单个服务进程，可使用 SQLite、PostgreSQL 或 MySQL"
       },
       "all_in_one": {
         "title": "一站式",
@@ -130,7 +132,7 @@
       },
       "security": {
         "title": "安全",
-        "desc": "Argon2 + JWT 认证，企业级安全"
+        "desc": "Argon2 密码、通行密钥与双因素登录"
       },
       "self_hosted": {
         "title": "自托管",
@@ -146,9 +148,9 @@
       }
     },
     "stats": {
-      "memory": "内存占用",
-      "binary": "单二进制",
-      "compatible": "Git 兼容",
+      "protocols": "通过智能 HTTP v2 和 SSH 访问 Git",
+      "lfs": "支持文件锁定的 Git LFS",
+      "ci": "内置流水线与运行器",
       "language": "构建语言"
     },
     "public_repos": "公开仓库",
@@ -202,7 +204,8 @@
       "submitting": "创建中...",
       "footer": "已有账号？{link}",
       "footer_link": "登录",
-      "failed": "注册失败"
+      "failed": "注册失败",
+      "closed": "此实例已关闭自助注册。请联系管理员为您创建账户。"
     },
     "back_to_login": "返回登录",
     "password_rules": {
@@ -238,7 +241,30 @@
       "email_required": "请输入邮箱",
       "sent": "如果该邮箱存在，重置链接已发送。",
       "failed": "申请密码重置失败"
-    }
+    },
+    "sso_error": {
+      "state_invalid": "使用 {provider} 登录已过期，或是在另一个窗口中发起的。请重试。",
+      "provider_unavailable": "{provider} 当前不可用。请稍后重试，或使用其他方式登录。",
+      "code_rejected": "{provider} 未接受此次登录，通常是因为耗时过长。请重新开始。",
+      "profile_no_id": "{provider} 未说明您登录的是哪个账户。请联系管理员检查该提供方的设置。",
+      "profile_no_email": "{provider} 未共享您的邮箱地址。请允许其共享（GitHub 上为 user:email 权限）后重试。",
+      "profile_bad_email": "{provider} 返回的邮箱地址无效。",
+      "profile_unverified_email": "{provider} 报告您的邮箱地址尚未确认。请在 {provider} 确认后重新登录。",
+      "profile_no_username": "无法根据您的 {provider} 资料生成用户名。请联系管理员为您创建账户。",
+      "link_required": "此处已有账户使用该邮箱地址。请登录该账户，并在“设置 → 安全”中关联 {provider}。",
+      "auto_provision_disabled": "{provider} 无法在此创建新账户。如果您已有账户，请登录后在“设置 → 安全”中关联 {provider}；否则请联系管理员为您创建账户。",
+      "email_domain_not_allowed": "{provider} 无法为您的邮箱域名在此创建账户。如果您已有账户，请登录后在“设置 → 安全”中关联 {provider}；否则请联系管理员为您创建账户。",
+      "email_not_verified": "{provider} 仅为已确认的地址在此创建账户，而它未确认您的地址。请在 {provider} 确认地址，或登录已有账户并在“设置 → 安全”中关联 {provider}。",
+      "account_disabled": "该账户已被停用。",
+      "account_locked": "由于失败次数过多，该账户已被暂时锁定。请稍后重试。",
+      "linked_elsewhere": "此 {provider} 身份已关联到另一个账户。",
+      "provider_already_linked": "您的账户已关联一个 {provider} 身份。如需关联其他身份，请先解除关联。",
+      "session_ended": "关联完成前您的会话已结束。请登录后重新开始关联。",
+      "retry": "使用 {provider} 登录时与另一次尝试冲突。请重试。",
+      "server_error": "使用 {provider} 登录时服务器出错。请稍后重试。",
+      "failed": "使用 {provider} 登录失败。请重试。"
+    },
+    "password_policy": "至少 {min} 个字符，需包含大写字母、小写字母、数字和符号；不能是用户名，也不能是常见密码。"
   },
   "dashboard": {
     "title": "仪表板",
@@ -986,7 +1012,15 @@
     "backend_unreachable": "无法连接后端，请确认 8080 服务已启动。",
     "session_check_failed": "Plombir Git 无法验证当前会话。您尚未退出登录。",
     "session_check_retry": "重试",
-    "session_check_retrying": "正在重试..."
+    "session_check_retrying": "正在重试...",
+    "page": {
+      "not_found_title": "页面不存在",
+      "not_found": "此地址没有内容。它可能已被移动，或者您没有访问权限。",
+      "failed_title": "无法加载此页面",
+      "failed": "加载此页面时出错。请稍后重试。",
+      "home": "返回首页",
+      "explore": "探索仓库"
+    }
   },
   "search": {
     "title": "搜索",
@@ -1302,7 +1336,7 @@
     "delete": {
       "title": "删除此仓库",
       "desc": "一旦删除仓库，将无法恢复。",
-      "confirm_instruction": "输入 <strong>{repo}</strong> 以确认：",
+      "confirm_instruction": "输入 {repo} 以确认：",
       "confirm_placeholder": "输入 owner/repository",
       "confirm_button": "删除此仓库",
       "confirming": "删除中...",
@@ -1406,6 +1440,10 @@
       "confirm_title": "重命名此仓库？",
       "confirm_body": "{from} 将变为 {to}。",
       "no_redirect": "旧的网页链接和克隆地址将失效：旧名称不会重定向。所有克隆过它的人都需要将远程地址改为新的 URL。"
+    },
+    "access": {
+      "admin_required": "此页面仅供仓库管理员使用。",
+      "write_required": "此页面仅供对仓库有写权限的用户使用。"
     }
   },
   "commit": {

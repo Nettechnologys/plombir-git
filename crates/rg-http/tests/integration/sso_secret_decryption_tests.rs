@@ -316,12 +316,10 @@ async fn every_sso_door_answers_an_unreadable_client_secret_the_same_way() {
 
     // The cookies from the baseline start are still in the jar, so the CSRF
     // check passes and the callback reaches the secret.
+    // The callback answers a browser, so it redirects to the login page
+    // either way; the reason is what classifies the unreadable secret as ours.
     let callback = app.callback(&csrf_state).await;
-    assert!(
-        callback.status().is_server_error(),
-        "the callback must classify the unreadable secret as ours: {}",
-        callback.status()
-    );
+    crate::common::SsoCallbackOutcome::of(&callback).assert_refused("/login", "server_error");
 
     // The other half of the same defect, and the half a status code cannot
     // show: a door must stop at the unreadable secret, not ask the provider to

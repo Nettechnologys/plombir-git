@@ -124,13 +124,24 @@ pub async fn list_deliveries_by_webhook(
     db: &DatabaseConnection,
     webhook_id: i64,
 ) -> Result<Vec<WebhookDelivery>> {
-    DeliveryEntity::find()
-        .filter(crate::entities::webhook_delivery::Column::WebhookId.eq(webhook_id))
-        .order_by_desc(crate::entities::webhook_delivery::Column::CreatedAt)
-        .limit(50)
+    deliveries_query(webhook_id)
         .all(db)
         .await
         .context("db: list webhook deliveries")
+}
+
+/// The newest 50 deliveries of one webhook, newest first.
+///
+/// `id` breaks ties between deliveries recorded in the same instant — a burst
+/// of pushes fans out faster than the timestamp's resolution — and lets the
+/// `(webhook_id, created_at, id)` index hand the rows over in order, so the
+/// engine reads 50 payloads instead of every payload the webhook ever sent.
+pub(crate) fn deliveries_query(webhook_id: i64) -> Select<DeliveryEntity> {
+    DeliveryEntity::find()
+        .filter(crate::entities::webhook_delivery::Column::WebhookId.eq(webhook_id))
+        .order_by_desc(crate::entities::webhook_delivery::Column::CreatedAt)
+        .order_by_desc(crate::entities::webhook_delivery::Column::Id)
+        .limit(50)
 }
 
 /// Find a delivery by id.

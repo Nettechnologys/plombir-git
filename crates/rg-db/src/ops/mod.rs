@@ -60,3 +60,43 @@ pub mod webauthn_ceremony_ops;
 pub mod webhook_ops;
 pub mod wiki_page_ops;
 pub mod wiki_revision_ops;
+
+/// How far a credential's `last_used_at` may lag behind its latest use.
+///
+/// The stamp is observability — "this token was used today" — and writing it
+/// on every request made each `git clone`, LFS object or registry layer a write
+/// transaction on SQLite's single writer (card_b83b9bc36e3a). A minute is far
+/// below anything a person reads off that column.
+pub(crate) const LAST_USED_RESOLUTION: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Whether a credential last stamped at `previous` should be stamped at `now`.
+pub(crate) fn last_used_is_due(
+    previous: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    previous.is_none_or(|stamped| now - stamped >= LAST_USED_RESOLUTION)
+}
+
+#[cfg(test)]
+mod last_used_tests {
+    use super::*;
+
+    #[test]
+    fn a_stamp_is_due_once_per_resolution_window() {
+        let now = chrono::Utc::now();
+        assert!(last_used_is_due(None, now), "never used");
+        assert!(!last_used_is_due(Some(now), now), "just stamped");
+        assert!(
+            !last_used_is_due(Some(now - chrono::Duration::seconds(59)), now),
+            "inside the window"
+        );
+        assert!(
+            last_used_is_due(Some(now - LAST_USED_RESOLUTION), now),
+            "the window has passed"
+        );
+        assert!(
+            !last_used_is_due(Some(now + chrono::Duration::seconds(5)), now),
+            "a stamp from a clock slightly ahead is not rewritten backwards"
+        );
+    }
+}

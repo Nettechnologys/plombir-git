@@ -299,7 +299,7 @@
       </aside>
 
       <!-- Main content -->
-      <main class="wiki-main">
+      <div class="wiki-main">
         <div class="wiki-header">
           <h1>{title}</h1>
           <div class="header-actions">
@@ -363,7 +363,7 @@
         <div class="wiki-footer">
           <a href={`/${owner}/${repo}/wiki`} class="back-link">← {t('wiki.back', 'Back to Wiki')}</a>
         </div>
-      </main>
+      </div>
     </div>
   {:else}
     <div class="empty"><p>{t('wiki.not_found', 'Page not found')}</p></div>

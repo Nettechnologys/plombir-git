@@ -91,6 +91,11 @@ pub(crate) struct ServerConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct DatabaseConfig {
     pub(crate) url: Option<String>,
+    /// Connections the server's pool may open. Unset takes the backend's
+    /// default ([`rg_db::default_max_connections`]): SQLite keeps a small pool
+    /// because writers serialise on one lock whatever the pool size, while a
+    /// PostgreSQL or MySQL server runs queries side by side.
+    pub(crate) max_connections: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -2083,6 +2088,16 @@ mod tests {
                 "db_idle_secs",
                 "default_db_idle_timeout",
                 super::default_db_idle_timeout().to_string(),
+            ),
+            // The shipped template points at SQLite, so its default is the
+            // SQLite pool size; PostgreSQL and MySQL get a wider one.
+            row(
+                "database",
+                "max_connections",
+                "rg_db::default_max_connections",
+                rg_db::default_max_connections("sqlite://./plombir-git.db?mode=rwc")
+                    .expect("the template's SQLite URL is a known backend")
+                    .to_string(),
             ),
             // `{:?}` rather than `to_string()`: TOML spells a string with its
             // quotes and a float with its point, and `1.0f64.to_string()` is

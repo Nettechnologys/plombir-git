@@ -221,7 +221,7 @@ async fn a_spent_ceremony_is_refused_and_a_fresh_one_is_still_accepted() {
 /// table that only grows.
 #[tokio::test]
 async fn the_record_outlives_the_challenge_and_no_longer() {
-    let (db, _temp) = setup("retention").await;
+    let (db, temp) = setup("retention").await;
     let live_ceremony = ceremony("live");
     let dead_ceremony = ceremony("dead");
 
@@ -243,7 +243,14 @@ async fn the_record_outlives_the_challenge_and_no_longer() {
     let swept = webauthn_ceremony_ops::delete_expired(&db)
         .await
         .expect("sweep expired spend records");
-    assert_eq!(swept, 1, "the sweep took the wrong number of records");
+    // The sweep is instance-wide. On the shared database the PostgreSQL and
+    // MySQL steps point every test at, a neighbouring test's `spend` may have
+    // swept this record first, or this sweep may take a neighbour's — so the
+    // count is only this test's own on a private database. The two record
+    // checks below hold either way.
+    if temp.is_some() {
+        assert_eq!(swept, 1, "the sweep took the wrong number of records");
+    }
     assert_eq!(
         spend_count(&db, &dead_ceremony).await,
         0,

@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { goto } from '$app/navigation';
+  import { copyToClipboard } from '$lib/clipboard';
+  import { goto, replaceState } from '$app/navigation';
+  import { tick } from 'svelte';
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { repos } from '$lib/api/client.svelte';
@@ -8,7 +10,9 @@
     type RepositoryResourceRequestClaim,
   } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
+  import { viewerPermission } from '$lib/viewerPermission.svelte';
   import { renderMarkdown } from '$lib/utils/markdown';
+  import { formatLineHash, parseLineHash, selectLine, type LineRange } from '$lib/lineAnchors';
 
   const t = createT();
   const MAX_EDITABLE_SIZE = 1024 * 1024;
@@ -38,6 +42,9 @@
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
+  // Editing and deleting a file are `RepoWrite` (card_e1baa94866ed); a reader
+  // is offered neither, rather than a button that ends in a 403.
+  const permission = viewerPermission(() => owner, () => repo);
   let filePath = $derived($page.params.path!);
   let queryRef = $derived($page.url.searchParams.get('ref') || '');
 
@@ -66,13 +73,59 @@
   let renderedMarkdown = $derived(
     isMarkdown && isText && blobData?.content ? renderMarkdown(blobData.content) : '',
   );
-  let contentLines = $derived(
-    lfsView?.kind === 'text'
-      ? getLineNumbers(lfsView.content)
-      : isText && blobData
-        ? getLineNumbers(blobData.content)
-        : [],
+  // The text the code view shows: an LFS object's own text, or the blob's.
+  let sourceText = $derived(
+    lfsView?.kind === 'text' ? lfsView.content : isText && blobData ? blobData.content : null,
   );
+  let contentLines = $derived(sourceText === null ? [] : getLineNumbers(sourceText));
+
+  // The file highlighted as one text and cut into lines (card_61e77c8abec1);
+  // `null` until the grammar module has loaded, and the lines show plain
+  // meanwhile. A result for text that has since changed is dropped.
+  let highlightedLines = $state<string[] | null>(null);
+  let highlightRequest = 0;
+  $effect(() => {
+    const text = sourceText;
+    const path = filePath;
+    const request = ++highlightRequest;
+    highlightedLines = null;
+    if (text === null || (isMarkdown && viewMode === 'rendered' && lfsView?.kind !== 'text')) return;
+    void import('$lib/highlight')
+      .then(({ highlightLines, languageForPath }) => {
+        if (request === highlightRequest) highlightedLines = highlightLines(text, languageForPath(path));
+      })
+      .catch(() => {
+        // Highlighting is optional: the plain lines stay.
+      });
+  });
+
+  // `#L10` / `#L10-L20`: the selected lines, read from the URL and written
+  // back to it on a click, so the address names what is highlighted.
+  let selectedLines = $state<LineRange | null>(null);
+  let scrolledToSelection = false;
+  $effect(() => {
+    selectedLines = parseLineHash($page.url.hash);
+  });
+  $effect(() => {
+    // Once per page: bring the linked line into view when the code arrives.
+    if (scrolledToSelection || !selectedLines || contentLines.length === 0) return;
+    scrolledToSelection = true;
+    const first = selectedLines.start;
+    void tick().then(() => {
+      document.getElementById(`L${first}`)?.scrollIntoView?.({ block: 'center' });
+    });
+  });
+
+  function lineSelected(line: number): boolean {
+    return selectedLines !== null && line >= selectedLines.start && line <= selectedLines.end;
+  }
+
+  function clickLine(event: MouseEvent, line: number) {
+    event.preventDefault();
+    const next = selectLine(selectedLines, line, event.shiftKey);
+    selectedLines = next;
+    replaceState(`${$page.url.pathname}${$page.url.search}${formatLineHash(next)}`, {});
+  }
 
   function buildRepoQuery(nextRef: string, nextPath: string) {
     const params = new URLSearchParams();
@@ -143,12 +196,6 @@
     deleting = false;
     copyStatus = '';
     void loadBlob(expectedOwner, expectedRepo, expectedPath, expectedRef, expectedRoute);
-  });
-
-  $effect(() => {
-    if (blobData && (!isMarkdown || viewMode === 'source')) {
-      setTimeout(highlightCode, 0);
-    }
   });
 
   function blobResource(path: string, activeRef: string) {
@@ -313,19 +360,6 @@
     }
   }
 
-  function highlightCode() {
-    try {
-      import('highlight.js').then((hljs) => {
-        const blocks = document.querySelectorAll('.code-view code.hljs-code');
-        blocks.forEach((block) => {
-          hljs.default.highlightElement(block as HTMLElement);
-        });
-      }).catch(() => {});
-    } catch {
-      // Optional highlighting should never block file viewing.
-    }
-  }
-
   function formatFileSize(size: number) {
     if (size < 1024) return size + t('repo.file_size.b');
     if (size < 1024 * 1024) return (size / 1024).toFixed(1) + t('repo.file_size.kb');
@@ -336,26 +370,10 @@
     return content.split('\n').map((line, i) => ({ num: i + 1, text: line }));
   }
 
-  function getLangClass(): string {
-    const ext = filePath.split('.').pop()?.toLowerCase();
-    const map: Record<string, string> = {
-      c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp', cxx: 'cpp', hpp: 'cpp',
-      rs: 'rust', go: 'go', py: 'python', js: 'javascript', ts: 'typescript',
-      jsx: 'javascript', tsx: 'typescript', java: 'java', rb: 'ruby',
-      php: 'php', swift: 'swift', kt: 'kotlin', dart: 'dart',
-      html: 'html', css: 'css', scss: 'scss', json: 'json', xml: 'xml',
-      yaml: 'yaml', yml: 'yaml', toml: 'ini', md: 'markdown',
-      sh: 'bash', bash: 'bash', zsh: 'bash', sql: 'sql',
-      dockerfile: 'dockerfile', makefile: 'makefile',
-    };
-    return map[ext || ''] || '';
-  }
-
-  let langClass = $derived(getLangClass());
 
   async function copyText(value: string, label: string) {
     try {
-      await navigator.clipboard.writeText(value);
+      if (!(await copyToClipboard(value))) throw new Error(t('common.copy_failed', 'Copying failed. Select the text and copy it yourself.'));
       copyStatus = label;
       setTimeout(() => {
         copyStatus = '';
@@ -494,18 +512,20 @@
             {t('repo.blob.download')}
           </button>
         {/if}
-        {#if canEdit}
-          <a href={buildEditHref()} class="btn-outline btn-sm">
-            {t('repo.edit_file')}
-          </a>
-        {:else}
-          <span class="btn-outline btn-sm disabled" title={t('repo.blob.edit_unavailable')}>
-            {t('repo.edit_file')}
-          </span>
+        {#if permission.canWrite}
+          {#if canEdit}
+            <a href={buildEditHref()} class="btn-outline btn-sm">
+              {t('repo.edit_file')}
+            </a>
+          {:else}
+            <span class="btn-outline btn-sm disabled" title={t('repo.blob.edit_unavailable')}>
+              {t('repo.edit_file')}
+            </span>
+          {/if}
+          <button type="button" class="btn-outline btn-sm danger" onclick={() => deleteOpen = !deleteOpen}>
+            {t('repo.blob.delete_file')}
+          </button>
         {/if}
-        <button type="button" class="btn-outline btn-sm danger" onclick={() => deleteOpen = !deleteOpen}>
-          {t('repo.blob.delete_file')}
-        </button>
       </div>
     </div>
 
@@ -524,7 +544,7 @@
       <div class="warning-banner">{t('repo.blob.large_file')}</div>
     {/if}
 
-    {#if deleteOpen}
+    {#if deleteOpen && permission.canWrite}
       <div class="delete-panel">
         <div>
           <strong>{t('repo.blob.delete_title')}</strong>
@@ -560,20 +580,7 @@
       {:else if lfsView?.kind === 'loading'}
         <div class="empty-state">{t('common.loading')}</div>
       {:else if lfsView?.kind === 'text'}
-        <div class="code-view">
-          <table class="code-table">
-            <tbody>
-              {#each contentLines as line}
-                <tr>
-                  <td class="line-number">{line.num}</td>
-                  <td class="line-content">
-                    <code class="hljs-code {langClass}">{line.text || ' '}</code>
-                  </td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
+        {@render codeTable()}
       {:else if lfsView?.kind === 'download'}
         <div class="empty-state">
           <p>{t('repo.blob.lfs_download_hint')}</p>
@@ -590,26 +597,37 @@
           {@html renderedMarkdown || `<p>${t('repo.blob.empty')}</p>`}
         </div>
       {:else if blobData.content}
-        <div class="code-view">
-          <table class="code-table">
-            <tbody>
-              {#each contentLines as line}
-                <tr>
-                  <td class="line-number">{line.num}</td>
-                  <td class="line-content">
-                    <code class="hljs-code {langClass}">{line.text || ' '}</code>
-                  </td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
+        {@render codeTable()}
       {:else}
         <div class="empty-state">{t('repo.blob.empty')}</div>
       {/if}
     </div>
   {/if}
 </div>
+
+{#snippet codeTable()}
+  <div class="code-view">
+    <table class="code-table">
+      <tbody>
+        {#each contentLines as line, index (line.num)}
+          <tr class:selected={lineSelected(line.num)}>
+            <td class="line-number">
+              <a id={`L${line.num}`} href={`#L${line.num}`} onclick={(event) => clickLine(event, line.num)}>{line.num}</a>
+            </td>
+            <td class="line-content">
+              {#if highlightedLines}
+                <!-- highlight.js escapes the source; the markup is its own spans. -->
+                <code class="hljs-code">{@html highlightedLines[index] || ' '}</code>
+              {:else}
+                <code class="hljs-code">{line.text || ' '}</code>
+              {/if}
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
+{/snippet}
 
 <style>
   .blob-breadcrumb {
@@ -815,6 +833,23 @@
     padding: 0 16px;
     white-space: pre;
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  .line-number a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .line-number a:hover {
+    color: var(--text-primary);
+  }
+
+  tr.selected td {
+    background: rgba(187, 128, 9, 0.15);
+  }
+
+  tr.selected .line-number a {
+    color: var(--text-primary);
   }
 
   .hljs-code {

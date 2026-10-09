@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from '$lib/clipboard';
   import { goto } from '$app/navigation';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
@@ -15,6 +16,7 @@
     type SsoLink,
   } from '$lib/api/client.svelte';
   import { createT, formatDate } from '$lib/i18n';
+  import { readSsoError, ssoErrorMessage, type SsoError } from '$lib/ssoError';
 
   const t = createT();
 
@@ -50,6 +52,16 @@
   let ssoLinks = $state<SsoLink[] | Unknown>([]);
   let ssoProviders = $state<PublicSsoProvider[] | Unknown>([]);
   let ssoBusy = $state(false);
+  // A link the provider's callback refused comes back as `?sso_error=<code>`;
+  // kept apart from `error`, which every reload of this page clears.
+  let ssoError = $state<SsoError | null>(null);
+  const ssoErrorText = $derived.by(() => {
+    if (!ssoError) return '';
+    const slug = ssoError.provider;
+    const known = ssoProviders === UNKNOWN ? [] : ssoProviders;
+    const name = known.find((provider) => provider.slug === slug)?.name ?? (slug || 'SSO');
+    return ssoErrorMessage(t, ssoError.code, name);
+  });
   const securityRequests = new LatestRequestFence<'security-load'>();
   const backupStatusRequests = new LatestRequestFence<'backup-status'>();
   const passkeyRequests = new LatestRequestFence<'passkeys'>();
@@ -81,6 +93,7 @@
     if (new URLSearchParams(window.location.search).has('sso_linked')) {
       success = t('account_security.sso.linked_notice');
     }
+    ssoError = readSsoError(window.location.search);
     loadSecurity();
   });
 
@@ -318,8 +331,8 @@
 
   async function copyBackupCodes() {
     if (newBackupCodes.length === 0) return;
-    await navigator.clipboard.writeText(newBackupCodes.join('\n'));
-    success = t('account_security.backup.copied');
+    if (await copyToClipboard(newBackupCodes.join('\n'))) success = t('account_security.backup.copied');
+    else error = t('common.copy_failed', 'Copying failed. Select the text and copy it yourself.');
   }
 </script>
 
@@ -334,6 +347,10 @@
       <p>{t('account_security.description')}</p>
     </div>
   </header>
+
+  {#if ssoErrorText}
+    <div class="error-box" role="alert">{ssoErrorText}</div>
+  {/if}
 
   {#if error}
     <div class="error-box">{error}</div>
