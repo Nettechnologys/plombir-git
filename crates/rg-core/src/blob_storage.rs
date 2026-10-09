@@ -30,7 +30,20 @@ impl BlobKey {
     /// Segments are percent-encoded so user-controlled names cannot introduce
     /// separators, traversal components or backend-specific path syntax.
     pub fn from_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> Result<Self> {
-        let encoded: Vec<String> = segments.into_iter().map(encode_segment).collect();
+        let raw: Vec<&str> = segments.into_iter().collect();
+        let last = raw.len().saturating_sub(1);
+        let encoded: Vec<String> = raw
+            .iter()
+            .enumerate()
+            .map(|(index, segment)| {
+                let limit = if index == last {
+                    MAX_FILE_SEGMENT_LEN
+                } else {
+                    MAX_DIRECTORY_SEGMENT_LEN
+                };
+                encode_segment(segment, limit)
+            })
+            .collect();
         if encoded.is_empty() || encoded.iter().any(String::is_empty) {
             return Err(BlobStorageError::InvalidKey(
                 "blob key requires non-empty segments".to_string(),
@@ -624,7 +637,46 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn encode_segment(segment: &str) -> String {
+/// The longest encoded directory segment: one file name on every filesystem
+/// the local backend runs on.
+const MAX_DIRECTORY_SEGMENT_LEN: usize = 255;
+
+/// The longest encoded final segment. A write lands in a spool sibling first,
+/// `.{name}.{uuid}.tmp` (`staging::blob_write_spool_name`), which adds 42
+/// bytes — so this is the longest name a write has ever been able to finish.
+const MAX_FILE_SEGMENT_LEN: usize = MAX_DIRECTORY_SEGMENT_LEN - 42;
+
+/// How much of an over-long segment survives in front of its digest, so the
+/// stored name still says what the blob was.
+const LONG_SEGMENT_PREFIX_LEN: usize = 120;
+
+/// One key segment, percent-encoded and short enough to be a file name.
+///
+/// Encoding triples every byte outside `[A-Za-z0-9._-]`, so a 255-byte upload
+/// name — 85 Cyrillic letters — became a 510-byte segment, and the write
+/// failed with ENAMETOOLONG: a 500 for a name every validator had accepted.
+/// A segment past `limit` keeps a readable prefix and appends a digest of the
+/// whole raw segment, so it stays deterministic (a read rebuilds the same key
+/// from the stored name) and two long names that share a prefix stay apart.
+/// The limits are exactly where writes used to start failing, so every
+/// segment a write could ever store is untouched, byte for byte, and keys
+/// already in storage still resolve.
+fn encode_segment(segment: &str, limit: usize) -> String {
+    let encoded = percent_encode_segment(segment);
+    if encoded.len() <= limit {
+        return encoded;
+    }
+    use sha2::Digest as _;
+    let digest = hex::encode(sha2::Sha256::digest(segment.as_bytes()));
+    // Never cut through a `%XX` escape.
+    let mut cut = LONG_SEGMENT_PREFIX_LEN;
+    while encoded[..cut].ends_with('%') || encoded[..cut - 1].ends_with('%') {
+        cut -= 1;
+    }
+    format!("{}-{digest}", &encoded[..cut])
+}
+
+fn percent_encode_segment(segment: &str) -> String {
     let mut encoded = String::with_capacity(segment.len());
     for (index, byte) in segment.as_bytes().iter().enumerate() {
         if byte.is_ascii_alphanumeric()
@@ -747,6 +799,81 @@ mod tests {
         let key = BlobKey::from_segments(["packages", "alice", "@scope/pkg", "a b.tgz"])
             .expect("encoded key");
         assert_eq!(key.as_str(), "packages/alice/%40scope%2Fpkg/a%20b.tgz");
+    }
+
+    #[tokio::test]
+    async fn a_long_non_ascii_name_is_a_key_the_local_backend_can_write() {
+        // 120 Cyrillic letters: 240 bytes, inside every 255-byte name limit,
+        // and 720 once percent-encoded.
+        let long = format!("{}.tar.gz", "ж".repeat(120));
+        let key = BlobKey::from_segments(["releases", "alice", "app", "1", "2", &long])
+            .expect("a long name still makes a key");
+        assert!(
+            key.as_str().split('/').all(|segment| segment.len() <= 213),
+            "{key}"
+        );
+        assert_eq!(
+            key,
+            BlobKey::from_segments(["releases", "alice", "app", "1", "2", &long]).unwrap(),
+            "a read must rebuild the key the write used"
+        );
+        let sibling = format!("{}.zip", "ж".repeat(120));
+        assert_ne!(
+            key,
+            BlobKey::from_segments(["releases", "alice", "app", "1", "2", &sibling]).unwrap(),
+            "two long names sharing a prefix must not share a blob"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalBlobStorage::new(dir.path());
+        storage
+            .put(&key, b"bytes")
+            .await
+            .expect("write under the long name");
+        assert_eq!(storage.get(&key).await.unwrap(), b"bytes");
+    }
+
+    #[tokio::test]
+    async fn every_name_a_write_could_store_keeps_its_old_key() {
+        // The longest final segment a write has always been able to finish is
+        // left exactly as it was — keys already in storage depend on it — and
+        // one byte more is the first to be shortened.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalBlobStorage::new(dir.path());
+        let longest = "a".repeat(213);
+        let key = BlobKey::from_segments(["x", &longest]).unwrap();
+        assert_eq!(key.as_str(), format!("x/{longest}"));
+        storage
+            .put(&key, b"ok")
+            .await
+            .expect("the longest old name still writes");
+
+        let over = "a".repeat(214);
+        let key = BlobKey::from_segments(["x", &over]).unwrap();
+        assert_ne!(key.as_str(), format!("x/{over}"));
+        storage
+            .put(&key, b"ok")
+            .await
+            .expect("one byte more writes too, shortened");
+
+        // A directory segment may be a whole file name long.
+        let directory = "d".repeat(255);
+        let key = BlobKey::from_segments([directory.as_str(), "f"]).unwrap();
+        assert_eq!(key.as_str(), format!("{directory}/f"));
+    }
+
+    #[test]
+    fn a_shortened_segment_never_splits_an_escape() {
+        for filler in ["a", "ab", ""] {
+            let name = format!("{filler}{}", "ж".repeat(150));
+            let key = BlobKey::from_segments(["x", &name]).unwrap();
+            let segment = key.as_str().rsplit('/').next().unwrap();
+            let prefix = segment.rsplit_once('-').unwrap().0.as_bytes();
+            assert!(
+                prefix[prefix.len() - 1] != b'%' && prefix[prefix.len() - 2] != b'%',
+                "{filler:?}: the prefix ends inside a `%XX` escape: {segment}"
+            );
+        }
     }
 
     #[tokio::test]
