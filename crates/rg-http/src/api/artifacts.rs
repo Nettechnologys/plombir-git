@@ -623,17 +623,17 @@ pub async fn download_artifact(
                 }
             };
             let mut headers = HeaderMap::new();
-            headers.insert(
-                header::CONTENT_TYPE,
+            // Bytes a job produced, served from the application's origin:
+            // always `application/octet-stream`, sandboxed and named
+            // (security audit finding #8).
+            crate::content_disposition::apply_download_headers(
+                &mut headers,
                 HeaderValue::from_static("application/octet-stream"),
+                Some(&artifact.name),
             );
             if let Ok(value) = HeaderValue::from_str(&size.to_string()) {
                 headers.insert(header::CONTENT_LENGTH, value);
             }
-            headers.insert(
-                header::CONTENT_DISPOSITION,
-                crate::content_disposition::attachment(&artifact.name),
-            );
             if let Ok(value) = HeaderValue::from_str(&sha256) {
                 headers.insert(header::HeaderName::from_static("x-checksum-sha256"), value);
             }
@@ -664,17 +664,14 @@ pub async fn download_artifact(
                 }
             }
             let mut headers = HeaderMap::new();
-            headers.insert(
-                header::CONTENT_TYPE,
+            crate::content_disposition::apply_download_headers(
+                &mut headers,
                 HeaderValue::from_static("application/octet-stream"),
+                Some(&artifact.name),
             );
             if let Ok(value) = HeaderValue::from_str(&bytes.len().to_string()) {
                 headers.insert(header::CONTENT_LENGTH, value);
             }
-            headers.insert(
-                header::CONTENT_DISPOSITION,
-                crate::content_disposition::attachment(&artifact.name),
-            );
             if let Ok(value) = HeaderValue::from_str(&sha256) {
                 headers.insert(header::HeaderName::from_static("x-checksum-sha256"), value);
             }

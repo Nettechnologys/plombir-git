@@ -7,7 +7,7 @@ use crate::AppState;
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 
@@ -252,13 +252,17 @@ fn archive_response(name: &str, sha: &str, ext: &str, mime: &'static str, body: 
     let short: String = sha.chars().take(7).collect();
     let filename = format!("{}-{}.{}", name, short, ext);
 
-    let mut response = (StatusCode::OK, [(header::CONTENT_TYPE, mime)], body).into_response();
+    let mut response = (StatusCode::OK, body).into_response();
     // The archive name is built from the repository name and a ref, both of
     // which may be non-ASCII, and a `format!` into a header array made that a
-    // `500` on a repository that is otherwise perfectly downloadable.
-    response.headers_mut().insert(
-        header::CONTENT_DISPOSITION,
-        crate::content_disposition::attachment(&filename),
+    // `500` on a repository that is otherwise perfectly downloadable. The
+    // bytes are the repository's, so the archive is served under the same
+    // sandbox as every other download of user content (security audit
+    // finding #8).
+    crate::content_disposition::apply_download_headers(
+        response.headers_mut(),
+        HeaderValue::from_static(mime),
+        Some(&filename),
     );
     response
 }

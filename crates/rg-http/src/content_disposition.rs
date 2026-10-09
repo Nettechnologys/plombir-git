@@ -26,7 +26,7 @@
 //! stored under the ASCII fallback on one endpoint and under its real name on
 //! the other.
 
-use axum::http::HeaderValue;
+use axum::http::{header, HeaderMap, HeaderValue};
 
 /// The name used when a caller supplies one that survives neither form.
 const FALLBACK: &str = "download";
@@ -66,21 +66,62 @@ const PASSIVE_UPLOAD_TYPES: &[&str] = &[
 /// file route serves committed content under.
 pub(crate) const UPLOAD_SANDBOX_CSP: &str = "default-src 'none'; sandbox";
 
-/// The `Content-Type` a user-uploaded file is served with, given the one it
-/// was stored with. See [`PASSIVE_UPLOAD_TYPES`].
-pub(crate) fn served_upload_type(stored: &str) -> HeaderValue {
+/// The type a user-uploaded file is kept and served under, given the one the
+/// uploader sent. See [`PASSIVE_UPLOAD_TYPES`].
+///
+/// Applied on the way in as well as on the way out: a row that never carried
+/// an active type cannot be served under one by a reader that forgot to ask.
+pub(crate) fn passive_upload_type(stored: &str) -> &'static str {
     let essence = stored
         .split(';')
         .next()
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    match PASSIVE_UPLOAD_TYPES
+    PASSIVE_UPLOAD_TYPES
         .iter()
         .find(|passive| **passive == essence)
-    {
-        Some(passive) => HeaderValue::from_static(passive),
-        None => HeaderValue::from_static("application/octet-stream"),
+        .copied()
+        .unwrap_or("application/octet-stream")
+}
+
+/// The `Content-Type` a user-uploaded file is served with, given the one it
+/// was stored with. See [`passive_upload_type`].
+pub(crate) fn served_upload_type(stored: &str) -> HeaderValue {
+    HeaderValue::from_static(passive_upload_type(stored))
+}
+
+/// The headers every download of bytes this server did not write is served
+/// under — one place, so a route cannot carry half of the set.
+///
+/// `content_type` is what the body is served as ([`served_upload_type`] for
+/// anything an uploader chose). `Some(filename)` makes the response an
+/// `attachment` named through [`attachment`]; `None` leaves the disposition
+/// to the caller — the raw route shows raster images `inline`, and an OCI
+/// client has no use for a name at all.
+///
+/// `nosniff` is also set by the global middleware, but a download must not
+/// depend on which router it was mounted under to be safe. The sandboxing
+/// policy covers what `nosniff` does not: a browser that *does* render the
+/// bytes — a PDF, an SVG opened directly — runs nothing and reaches nothing
+/// of this origin. The application's own policy is `script-src 'self'`, so
+/// any same-origin response without this is a candidate script.
+pub(crate) fn apply_download_headers(
+    headers: &mut HeaderMap,
+    content_type: HeaderValue,
+    filename: Option<&str>,
+) {
+    headers.insert(header::CONTENT_TYPE, content_type);
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(UPLOAD_SANDBOX_CSP),
+    );
+    if let Some(filename) = filename {
+        headers.insert(header::CONTENT_DISPOSITION, attachment(filename));
     }
 }
 
@@ -285,7 +326,10 @@ fn hex_value(byte: u8) -> Result<u8, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{attachment, filename_from_disposition, served_upload_type};
+    use super::{
+        apply_download_headers, attachment, filename_from_disposition, served_upload_type,
+    };
+    use axum::http::{header, HeaderMap, HeaderValue};
 
     fn header(filename: &str) -> String {
         attachment(filename)
@@ -469,6 +513,60 @@ mod tests {
         assert_eq!(
             served_upload_type("text/plain; charset=utf-8"),
             "text/plain"
+        );
+    }
+
+    /// Security audit finding #8: the set is one thing. A route that reaches
+    /// the helper gets the type, `nosniff`, the sandbox and the name together,
+    /// and whatever it had set before for any of them is replaced.
+    #[test]
+    fn a_download_carries_the_whole_header_set() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/javascript"),
+        );
+        apply_download_headers(
+            &mut headers,
+            HeaderValue::from_static("application/zip"),
+            Some("пакет.zip"),
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/zip"
+        );
+        assert_eq!(
+            headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "default-src 'none'; sandbox"
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_DISPOSITION).unwrap(),
+            "attachment; filename=\"_____.zip\"; filename*=UTF-8''%D0%BF%D0%B0%D0%BA%D0%B5%D1%82.zip"
+        );
+    }
+
+    /// Without a name the disposition is the caller's: an OCI client never
+    /// reads one, and the raw route's inline image must stay inline.
+    #[test]
+    fn a_download_without_a_name_sets_no_disposition() {
+        let mut headers = HeaderMap::new();
+        apply_download_headers(
+            &mut headers,
+            HeaderValue::from_static("application/vnd.oci.image.manifest.v1+json"),
+            None,
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert!(headers.get(header::CONTENT_DISPOSITION).is_none());
+        assert_eq!(
+            headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "default-src 'none'; sandbox"
         );
     }
 }

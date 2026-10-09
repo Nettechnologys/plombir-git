@@ -548,11 +548,17 @@ pub async fn upload_asset(
         return AppError::from(error).into_response();
     }
 
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
+    // Stored already normalised (security audit finding #8): the row never
+    // carries a type a browser would run, so a reader that forgets
+    // `served_upload_type` — or any other consumer of the column — cannot
+    // turn a `.js` asset back into a script of this origin.
+    let content_type = crate::content_disposition::passive_upload_type(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream"),
+    )
+    .to_string();
 
     let staged =
         match stage_release_upload(body, &state.repo_root, RELEASE_ASSET_UPLOAD_MAX_BYTES).await {
@@ -663,22 +669,15 @@ pub async fn download_asset(
 
     let mut resp_headers = HeaderMap::new();
     // Never the uploader's type verbatim: a `.js` asset uploaded as
-    // `text/javascript` was a script of this origin (card_36b620ab3467).
-    resp_headers.insert(
-        header::CONTENT_TYPE,
+    // `text/javascript` was a script of this origin (card_36b620ab3467). The
+    // name is unconditional: the old `if let Ok(..)` around a plain
+    // `filename="…"` dropped the header entirely for an asset whose name is
+    // not ASCII, and the browser then saved the file under whatever the URL
+    // suggested — a `200` that quietly did not do what the endpoint documents.
+    crate::content_disposition::apply_download_headers(
+        &mut resp_headers,
         crate::content_disposition::served_upload_type(&asset.content_type),
-    );
-    resp_headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(crate::content_disposition::UPLOAD_SANDBOX_CSP),
-    );
-    // Unconditional: the old `if let Ok(..)` around a plain `filename="…"`
-    // dropped the header entirely for an asset whose name is not ASCII, and the
-    // browser then saved the file under whatever the URL suggested — a `200`
-    // that quietly did not do what the endpoint documents.
-    resp_headers.insert(
-        header::CONTENT_DISPOSITION,
-        crate::content_disposition::attachment(&asset.filename),
+        Some(&asset.filename),
     );
 
     match source {

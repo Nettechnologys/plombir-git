@@ -1193,11 +1193,23 @@ async fn get_manifest_impl(
             .unwrap_or(&manifest.digest)
     );
 
-    if head_only {
+    // The media type is one of `media_types::MANIFEST_TYPES`, checked on push;
+    // a row that says otherwise is the registry's own inconsistency, and the
+    // header array this replaced answered it with a `500` too.
+    let Ok(media_type) = HeaderValue::from_str(&manifest.media_type) else {
+        return oci_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "UNKNOWN",
+            &format!(
+                "stored manifest media type {:?} is not a valid header value",
+                manifest.media_type
+            ),
+        );
+    };
+    let mut response = if head_only {
         (
             StatusCode::OK,
             [
-                (header::CONTENT_TYPE, manifest.media_type.as_str()),
                 (header::CONTENT_LENGTH, manifest.size.to_string().as_str()),
                 (DOCKER_CONTENT_DIGEST, docker_digest.as_str()),
             ],
@@ -1207,14 +1219,26 @@ async fn get_manifest_impl(
     } else {
         (
             StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, manifest.media_type.as_str()),
-                (DOCKER_CONTENT_DIGEST, docker_digest.as_str()),
-            ],
+            [(DOCKER_CONTENT_DIGEST, docker_digest.as_str())],
             manifest.manifest_json,
         )
             .into_response()
-    }
+    };
+    oci_content_headers(&mut response, media_type);
+    response
+}
+
+/// The headers a pulled manifest or blob is served under.
+///
+/// A registry client reads `Content-Type`, `Content-Length` and
+/// `Docker-Content-Digest` and ignores the rest. The rest is for a browser
+/// pointed at the same URL: `/v2/` is served from the application's origin,
+/// and a config blob or a manifest is JSON a user chose, so it goes out under
+/// the sandbox every other download of user content carries (security audit
+/// finding #8). No `Content-Disposition`: the spec does not name one and a
+/// client has no use for it.
+fn oci_content_headers(response: &mut Response, content_type: HeaderValue) {
+    crate::content_disposition::apply_download_headers(response.headers_mut(), content_type, None);
 }
 
 /// `PUT /v2/{owner}/{repo}/manifests/{reference}` — push manifest.
@@ -1770,16 +1794,20 @@ pub async fn get_blob(
                     http_body_util::StreamBody::new(futures::StreamExt::map(stream, |item| {
                         item.map(http_body::Frame::data)
                     }));
-                (
+                let mut response = (
                     StatusCode::OK,
                     [
-                        (header::CONTENT_TYPE, "application/octet-stream"),
                         (header::CONTENT_LENGTH, size.to_string().as_str()),
                         (DOCKER_CONTENT_DIGEST, digest.as_str()),
                     ],
                     Body::new(stream_body),
                 )
-                    .into_response()
+                    .into_response();
+                oci_content_headers(
+                    &mut response,
+                    HeaderValue::from_static("application/octet-stream"),
+                );
+                response
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 oci_not_found(error_codes::BLOB_UNKNOWN, "blob not found")
@@ -1799,16 +1827,20 @@ pub async fn get_blob(
                 // in server memory until the kernel resets the dead connection
                 // (card_444e03f1ca15).
                 let len = data.len();
-                (
+                let mut response = (
                     StatusCode::OK,
                     [
-                        (header::CONTENT_TYPE, "application/octet-stream"),
                         (header::CONTENT_LENGTH, len.to_string().as_str()),
                         (DOCKER_CONTENT_DIGEST, digest.as_str()),
                     ],
                     crate::http_stream::buffered_body_with_idle(data, state.git_idle_timeout_secs),
                 )
-                    .into_response()
+                    .into_response();
+                oci_content_headers(
+                    &mut response,
+                    HeaderValue::from_static("application/octet-stream"),
+                );
+                response
             }
             // Only a blob the registry genuinely does not have is BLOB_UNKNOWN.
             // Discarding the error made a blob store that is present but

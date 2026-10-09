@@ -3728,10 +3728,7 @@ async fn serve_package_file(
                     }
                     (
                         StatusCode::OK,
-                        [
-                            (header::CONTENT_TYPE, content_type),
-                            (header::CONTENT_LENGTH, size.to_string()),
-                        ],
+                        [(header::CONTENT_LENGTH, size.to_string())],
                         crate::http_stream::file_body_with_idle(file, state.git_idle_timeout_secs),
                     )
                         .into_response()
@@ -3740,10 +3737,7 @@ async fn serve_package_file(
                     let len = data.len();
                     (
                         StatusCode::OK,
-                        [
-                            (header::CONTENT_TYPE, content_type),
-                            (header::CONTENT_LENGTH, len.to_string()),
-                        ],
+                        [(header::CONTENT_LENGTH, len.to_string())],
                         crate::http_stream::buffered_body_with_idle(
                             data,
                             state.git_idle_timeout_secs,
@@ -3754,11 +3748,15 @@ async fn serve_package_file(
             };
             // Built rather than formatted: a package whose file name is not
             // ASCII — `пакет-1.0.tgz` — used to produce a value `HeaderValue`
-            // refuses, and this array turns that into a `500`. The package
-            // published fine and then could never be downloaded.
-            response.headers_mut().insert(
-                header::CONTENT_DISPOSITION,
-                crate::content_disposition::attachment(filename),
+            // refuses, and an array turns that into a `500`. The package
+            // published fine and then could never be downloaded. The type the
+            // registry guessed from the name is passed through the same filter
+            // as an uploader's: a package file is user content on this origin
+            // like any other download (security audit finding #8).
+            crate::content_disposition::apply_download_headers(
+                response.headers_mut(),
+                crate::content_disposition::served_upload_type(&content_type),
+                Some(filename),
             );
             // The digest the bytes were just verified against, advertised the way
             // the release-asset, CI-artifact and CI-cache handlers advertise
