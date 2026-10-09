@@ -113,7 +113,9 @@ describe('sudo_required interception', () => {
 		const prompt = vi.fn(async () => true);
 		setSudoPrompt(prompt);
 
-		const error = await request('/users/tokens', { method: 'POST', body: '{}' }).catch((e) => e);
+		const error = (await request('/users/tokens', { method: 'POST', body: '{}' }).catch(
+			(e: unknown) => e,
+		)) as ApiError;
 
 		expect(error).toBeInstanceOf(ApiError);
 		expect(isSudoRequired(error)).toBe(false);
