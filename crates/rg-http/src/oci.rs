@@ -2249,7 +2249,13 @@ pub async fn chunk_upload(
 
     // The request is the next chunk. Stream only after every offset check, so
     // a refusal cannot change the staging file.
-    match stream_body_to_file(body, &file_path, Some(state.storage_limits.oci_blob_max_bytes)).await {
+    match stream_body_to_file(
+        body,
+        &file_path,
+        Some(state.storage_limits.oci_blob_max_bytes),
+    )
+    .await
+    {
         Ok(staged) => {
             let total_size = staged.total;
             if let Some(range) = requested_range {
@@ -2286,7 +2292,8 @@ pub async fn chunk_upload(
                     {
                         Ok(()) => {}
                         Err(rg_core::storage_quota::QuotaError::Exceeded(exceeded)) => {
-                            if let Err(error) = truncate_staged_upload(&file_path, recorded_size).await
+                            if let Err(error) =
+                                truncate_staged_upload(&file_path, recorded_size).await
                             {
                                 return oci_err(
                                     StatusCode::INTERNAL_SERVER_ERROR,

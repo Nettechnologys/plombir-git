@@ -783,7 +783,10 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
         .send()
         .await
         .unwrap();
-    assert_eq!(quota_rejected.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        quota_rejected.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE
+    );
     let quota_message = quota_rejected.text().await.unwrap();
     assert!(
         quota_message.contains("repository storage quota exceeded"),

@@ -1370,16 +1370,11 @@ pub async fn upload_cache(
     // an eviction picks a victim the uploader was not asking about, and there is
     // no route that lists caches, so the owner would have no way to learn which
     // key disappeared. A refusal names the number and lets them remove one.
-    let existing = match rg_db::ops::ci_retention_ops::find_cache_entry(
-        &state.db,
-        repo_id,
-        &key_hash,
-    )
-    .await
-    {
-        Ok(entry) => entry,
-        Err(error) => return AppError::from(error).into_response(),
-    };
+    let existing =
+        match rg_db::ops::ci_retention_ops::find_cache_entry(&state.db, repo_id, &key_hash).await {
+            Ok(entry) => entry,
+            Err(error) => return AppError::from(error).into_response(),
+        };
     if existing.is_none() {
         let count = match rg_db::ops::ci_retention_ops::repo_cache_usage(&state.db, repo_id).await {
             Ok((count, _bytes)) => count,

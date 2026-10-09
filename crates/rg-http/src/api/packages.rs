@@ -3044,7 +3044,8 @@ async fn persist_package(
         info,
         &state.storage_limits,
     )
-    .await {
+    .await
+    {
         Ok(result) => {
             let status = if result.existing {
                 StatusCode::OK

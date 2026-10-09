@@ -568,13 +568,8 @@ pub async fn upload_asset(
     // The shared repository budget: releases used to count their per-file
     // ceiling and nothing else, so this store was another way to fill the
     // volume the quota exists to protect.
-    match rg_core::storage_quota::check_room(
-        &state.db,
-        repo.id,
-        staged.len,
-        &state.storage_limits,
-    )
-    .await
+    match rg_core::storage_quota::check_room(&state.db, repo.id, staged.len, &state.storage_limits)
+        .await
     {
         Ok(()) => {}
         Err(rg_core::storage_quota::QuotaError::Exceeded(exceeded)) => {
