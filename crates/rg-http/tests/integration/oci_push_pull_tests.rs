@@ -909,6 +909,153 @@ async fn an_oci_image_index_pushes_without_layers() {
     assert_eq!(pulled.text().await.unwrap(), index);
 }
 
+/// A manifest whose `Content-Type` header and whose body `mediaType` disagree
+/// is refused, and the type that gets stored is the one the body declares.
+///
+/// The two are the same claim written twice, and nothing compared them: the
+/// header was the only value `oci_manifest.media_type` ever saw, so a client
+/// could PUT bytes that declare `application/vnd.oci.image.manifest.v1+json`
+/// under `application/vnd.docker.distribution.manifest.v2+json` and every
+/// later pull was handed the header's type for a body that says otherwise.
+/// Pullers dispatch on that type — a registry that returns a type no parser
+/// checks turns a type-confusion into a parse a client did not agree to.
+#[tokio::test]
+async fn a_manifest_whose_body_media_type_contradicts_its_header_is_refused() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_media", "oci_media@example.com").await;
+    create_repo(&base, &token, "media-type").await;
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_media", "media-type", config).await;
+
+    // The header says Docker, the body says OCI. Both are valid on their own;
+    // the pair is not.
+    let contradictory = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [],
+    })
+    .to_string();
+
+    let refused = client
+        .put(format!("{base}/v2/oci_media/media-type/manifests/contradiction"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, DOCKER_MANIFEST_V2)
+        .body(contradictory.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        400,
+        "a Content-Type that contradicts the body's mediaType must be refused"
+    );
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["errors"][0]["code"], "MANIFEST_INVALID");
+    let refusal_message = refusal["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        refusal_message.contains(DOCKER_MANIFEST_V2)
+            && refusal_message.contains(OCI_MANIFEST_V1),
+        "the refusal must name both declared types, got: {refusal_message}"
+    );
+
+    // Nothing was published under the contradicting tag — the refusal has to be
+    // a refusal, not a write the client is told about with a 400.
+    let pulled = client
+        .get(format!(
+            "{base}/v2/oci_media/media-type/manifests/contradiction"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pulled.status(),
+        404,
+        "the refused push must leave nothing behind"
+    );
+
+    // The honest push of the same bytes is accepted, and the type served back
+    // is the document's own `mediaType`.
+    let accepted = client
+        .put(format!("{base}/v2/oci_media/media-type/manifests/agreed"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(contradictory.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 201);
+    let served = client
+        .get(format!("{base}/v2/oci_media/media-type/manifests/agreed"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(served.status(), 200);
+    assert_eq!(
+        served
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some(OCI_MANIFEST_V1),
+        "the stored and served type must be the body's mediaType"
+    );
+    assert_eq!(served.text().await.unwrap(), contradictory);
+
+    // A body that carries no `mediaType` at all still publishes under the
+    // header it arrived with: older `docker push` builds omit the field, and
+    // refusing them would be a compatibility break, not a check.
+    let header_only = serde_json::json!({
+        "schemaVersion": 2,
+        "config": {
+            "mediaType": DOCKER_CONFIG_V1,
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [],
+    })
+    .to_string();
+    let accepted = client
+        .put(format!(
+            "{base}/v2/oci_media/media-type/manifests/header-only"
+        ))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, DOCKER_MANIFEST_V2)
+        .body(header_only)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted.status(),
+        201,
+        "a body without mediaType must still publish under the header"
+    );
+    let served = client
+        .get(format!(
+            "{base}/v2/oci_media/media-type/manifests/header-only"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(served.status(), 200);
+    assert_eq!(
+        served
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some(DOCKER_MANIFEST_V2),
+        "a body without mediaType is stored under its Content-Type"
+    );
+}
+
 /// A reference the registry cannot address is refused — it is never published
 /// under a name no client can use.
 ///

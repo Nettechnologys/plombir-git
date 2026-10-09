@@ -1284,6 +1284,31 @@ pub async fn put_manifest(
         }
     };
 
+    // The header and the body both name the manifest's type. When the body
+    // carries one it has to be the same document the header claims: the header
+    // used to be the only value anything stored or audited, so a client could
+    // publish bytes under a type they do not claim and every later pull was
+    // handed a `Content-Type` nothing had verified. Both are the client's
+    // claim, and they have to agree before anything is written.
+    if let Some(body_media_type) = parsed.manifest.media_type.as_deref() {
+        if body_media_type != content_type {
+            return oci_err(
+                StatusCode::BAD_REQUEST,
+                error_codes::MANIFEST_INVALID,
+                &format!(
+                    "manifest Content-Type {content_type} does not match the mediaType \
+                     {body_media_type} in its body"
+                ),
+            );
+        }
+    }
+
+    // What gets stored and audited is the type the document declares. They are
+    // equal when the body carries one (checked above); a body without a
+    // `mediaType` is stored under the header it arrived with, which is the only
+    // type the request has left.
+    let media_type = parsed.manifest.media_type.as_deref().unwrap_or(content_type);
+
     // A push addressed by digest is a claim about the bytes, and the bytes
     // answer it themselves.
     //
@@ -1373,7 +1398,7 @@ pub async fn put_manifest(
         &repo,
         &rf,
         &parsed,
-        content_type,
+        media_type,
         &body,
         oci_repo.id,
         user_id,
@@ -1395,7 +1420,7 @@ async fn put_manifest_under_lease(
     repo: &str,
     reference: &Reference,
     parsed: &ParsedManifest,
-    content_type: &str,
+    media_type: &str,
     body: &str,
     oci_repo_id: i64,
     user_id: Option<i64>,
@@ -1432,7 +1457,7 @@ async fn put_manifest_under_lease(
             oci_repo_id,
             tag,
             &parsed.digest,
-            content_type,
+            media_type,
             parsed.size as i64,
             body,
             parsed.manifest.schema_version as i32,
@@ -1445,7 +1470,7 @@ async fn put_manifest_under_lease(
             &state.db,
             oci_repo_id,
             &parsed.digest,
-            content_type,
+            media_type,
             parsed.size as i64,
             body,
             parsed.manifest.schema_version as i32,
@@ -1487,7 +1512,7 @@ async fn put_manifest_under_lease(
         repo,
         reference,
         parsed,
-        content_type,
+        media_type,
         oci_repo_id,
         user_id,
     )
@@ -1541,7 +1566,7 @@ async fn record_manifest_push(
     repo: &str,
     reference: &Reference,
     parsed: &ParsedManifest,
-    content_type: &str,
+    media_type: &str,
     oci_repo_id: i64,
     user_id: Option<i64>,
 ) {
@@ -1591,7 +1616,7 @@ async fn record_manifest_push(
         Some(headers),
         Some(serde_json::json!({
             "digest": parsed.digest,
-            "media_type": content_type,
+            "media_type": media_type,
             "size": parsed.size,
             "reference": reference.as_str(),
         })),
