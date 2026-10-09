@@ -164,6 +164,24 @@ pub async fn authorize(
     }
 }
 
+/// Whether a self-service registration would be let through now — what the
+/// sign-up link and page show (card_e1baa94866ed).
+///
+/// The same answer [`authorize`] gives, without its lock: a closed instance
+/// still takes the account that initialises it, and only that one. It is a
+/// hint for the UI, not a permit — the register route asks [`authorize`]
+/// again, so a race between this read and a first sign-up costs a `403`, not
+/// an account.
+pub async fn accepts_registrations(
+    db: &DatabaseConnection,
+    mode: RegistrationMode,
+) -> Result<bool> {
+    if !mode.is_closed() {
+        return Ok(true);
+    }
+    Ok(!rg_db::ops::user_ops::has_any(db).await?)
+}
+
 #[cfg(test)]
 mod tests {
     fn no_directories() -> super::super::service::LdapDirectories<'static> {

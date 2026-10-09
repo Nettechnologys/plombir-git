@@ -1,7 +1,19 @@
 <script lang="ts">
+  import { buildHttpCloneUrl, buildSshCloneUrl } from '$lib/api/_base';
   import { createT } from '$lib/i18n';
 
   const t = createT();
+
+  // The addresses this instance actually serves, built by the same helpers
+  // the repository page's clone box uses — not `localhost:8080`, which was
+  // right only on the developer's machine (card_e34af7255aa6). The SSH one
+  // is absent when the instance names no SSH host and the page has none.
+  const httpExample = buildHttpCloneUrl('OWNER', 'REPO');
+  const sshExample = buildSshCloneUrl(
+    'OWNER',
+    'REPO',
+    typeof window === 'undefined' ? undefined : window.location.hostname,
+  );
 </script>
 
 <svelte:head>
@@ -17,8 +29,10 @@
   <section class="help-section">
     <h2>{t('help.clone_title')}</h2>
     <div class="command-list">
-      <code>git clone http://localhost:8080/git/OWNER/REPO</code>
-      <code>git clone ssh://git@localhost:2222/OWNER/REPO</code>
+      <code>git clone {httpExample}</code>
+      {#if sshExample}
+        <code>git clone {sshExample}</code>
+      {/if}
     </div>
   </section>
 

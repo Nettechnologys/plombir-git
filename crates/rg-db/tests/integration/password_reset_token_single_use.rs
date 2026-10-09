@@ -167,7 +167,7 @@ async fn concurrent_spends_of_one_reset_link_leave_exactly_one_winner() {
 /// gate is still a convention that every future call site must remember.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_first_spend_lands_and_spent_or_expired_links_are_refused() {
-    let (db, _temp, user_id) = setup("states").await;
+    let (db, temp, user_id) = setup("states").await;
 
     let live = issue(&db, user_id, "live", 15).await;
     assert!(
@@ -191,8 +191,24 @@ async fn a_first_spend_lands_and_spent_or_expired_links_are_refused() {
             .expect("spending an expired link is a refusal, not an error"),
         "an expired link must be refused by the statement itself",
     );
+    // On the shared database the PostgreSQL and MySQL smokes point every test
+    // at, a neighbouring test's `create` sweeps every expired link — this one
+    // included — so the row may be gone by now; a row that is gone was not
+    // marked. On this test's own SQLite file nothing else sweeps, and the row
+    // has to be there, unmarked.
+    let stale_row = rg_db::entities::password_reset_token::Entity::find()
+        .filter(rg_db::entities::password_reset_token::Column::Id.eq(stale))
+        .one(&db)
+        .await
+        .expect("reload the expired link");
+    if temp.is_some() {
+        assert!(
+            stale_row.is_some(),
+            "the expired link vanished on a private database"
+        );
+    }
     assert!(
-        !is_spent(&db, stale).await,
+        !stale_row.is_some_and(|row| row.used),
         "a refused spend must not mark the row",
     );
 

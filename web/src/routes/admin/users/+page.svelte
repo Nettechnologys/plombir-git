@@ -481,4 +481,12 @@
   .btn-primary { background: var(--accent); color: white; border: none; border-radius: 6px; padding: 0.5rem 1rem; cursor: pointer; font-size: 0.9rem; }
   .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
   .btn-secondary { background: var(--bg-primary); border: 1px solid var(--border); color: var(--text-primary); border-radius: 6px; padding: 0.5rem 1rem; cursor: pointer; font-size: 0.9rem; }
+
+  /* Phone widths (card_c30077df5603): the create form and the issued password
+     wrap; the table already scrolls inside .table-wrap. */
+  @media (max-width: 700px) {
+    .create-user-form,
+    .issued-password,
+    .actions { flex-wrap: wrap; }
+  }
 </style>

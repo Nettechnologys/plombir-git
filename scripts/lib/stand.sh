@@ -268,10 +268,18 @@ stand_register_founder() {
   }
 }
 
+# vite colours its banner whenever `CI` is set, TTY or not (picocolors reads
+# the variable), and the colour codes land INSIDE the URL: on GitHub Actions
+# the line is `http://127.0.0.1:\e[1m40523\e[22m/`. A pattern over the raw log
+# never matched there, and the browser sweep timed out "waiting for vite
+# preview to publish its URL" next to a log that showed the URL. The preview
+# runs with NO_COLOR, and the codes are stripped here as well, so neither half
+# alone decides whether the stand comes up.
 stand_frontend_published() {
   [[ -s "${STAND_FRONTEND_LOG}" ]] || return 1
   local url
-  url="$(grep -oE 'http://(127\.0\.0\.1|localhost):[0-9]+' "${STAND_FRONTEND_LOG}" | head -1)"
+  url="$(sed 's/\x1b\[[0-9;]*m//g' "${STAND_FRONTEND_LOG}" \
+    | grep -oE 'http://(127\.0\.0\.1|localhost):[0-9]+' | head -1)"
   [[ -n "${url}" ]] || return 1
   STAND_FRONTEND_URL="${url/localhost/127.0.0.1}"
   return 0
@@ -309,7 +317,7 @@ stand_start_frontend() {
   STAND_FRONTEND_LOG="${STAND_WORK_DIR}/frontend.log"
   export PLOMBIR_GIT_BACKEND_ORIGIN="${STAND_BACKEND_URL}"
   stand_spawn "${STAND_FRONTEND_LOG}" "${web_dir}" \
-    node "${vite_bin}" preview --host 127.0.0.1 --port "${STAND_FRONTEND_PORT:-0}"
+    env NO_COLOR=1 node "${vite_bin}" preview --host 127.0.0.1 --port "${STAND_FRONTEND_PORT:-0}"
   STAND_FRONTEND_PID="${STAND_LAST_PID}"
 
   stand_wait_for "${STAND_FRONTEND_PID}" "vite preview to publish its URL" \

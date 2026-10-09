@@ -21,6 +21,8 @@ pub mod migration_lock;
 pub mod migrations;
 pub mod ops;
 pub mod package_version_key;
+#[cfg(test)]
+mod query_plan_tests;
 mod serialized_user_grants;
 pub mod sqlite_process_guard;
 #[cfg(test)]
@@ -389,6 +391,24 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
 /// is still appropriate for an embedded-style deployment.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
+/// Default pool size for a PostgreSQL or MySQL server.
+///
+/// Unlike SQLite, a database server executes writes from several connections
+/// side by side, so a pool of five turns a burst of requests — the explore
+/// page's per-repository lookups, an LFS batch — into a queue for no reason
+/// the database imposes. Ten is sqlx's own default.
+pub const DEFAULT_SERVER_MAX_CONNECTIONS: u32 = 10;
+
+/// The pool size the server opens for `db_url` when `[database].max_connections`
+/// is unset: [`DEFAULT_MAX_CONNECTIONS`] for SQLite,
+/// [`DEFAULT_SERVER_MAX_CONNECTIONS`] for PostgreSQL and MySQL.
+pub fn default_max_connections(db_url: &str) -> Result<u32> {
+    Ok(match detect_backend(db_url)? {
+        DbBackend::Sqlite => DEFAULT_MAX_CONNECTIONS,
+        DbBackend::Postgres | DbBackend::MySql => DEFAULT_SERVER_MAX_CONNECTIONS,
+    })
+}
+
 /// Connect to the database selected by `db_url`'s scheme (SQLite / Postgres / MySQL).
 /// URL example: `sqlite:///path/to/db?mode=rwc`, `postgres://user@localhost/plombir_git`.
 pub async fn connect(db_url: &str) -> Result<DatabaseConnection> {
@@ -730,6 +750,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_database_server_gets_a_wider_default_pool_than_sqlite() {
+        assert_eq!(
+            default_max_connections("sqlite://./plombir-git.db?mode=rwc").unwrap(),
+            DEFAULT_MAX_CONNECTIONS
+        );
+        for url in ["postgres://u@h/db", "mysql://u@h/db"] {
+            assert_eq!(
+                default_max_connections(url).unwrap(),
+                DEFAULT_SERVER_MAX_CONNECTIONS,
+                "{url}"
+            );
+        }
+        assert!(default_max_connections("redis://h").is_err());
+    }
 
     #[allow(
         clippy::let_underscore_must_use,

@@ -232,11 +232,7 @@ pub async fn list_public_paginated(
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<Repo>, i64)> {
-    let base = RepoEntity::find()
-        .filter(repository::Column::IsPrivate.eq(false))
-        .filter(repository::Column::DeletedAt.is_null())
-        .order_by_desc(repository::Column::UpdatedAt)
-        .order_by_desc(repository::Column::Id);
+    let base = public_page_query();
 
     let total = base
         .clone()
@@ -251,6 +247,18 @@ pub async fn list_public_paginated(
         .context("db: list public repos (paginated)")?;
 
     Ok((repos, total))
+}
+
+/// The ordered selection [`list_public_paginated`] cuts a page from, kept
+/// apart so `query_plan_tests` explains the statement the server sends. This
+/// listing answers anonymous visitors, so a full-table sort here is a cost
+/// anyone on the internet can make the server pay.
+pub(crate) fn public_page_query() -> sea_orm::Select<RepoEntity> {
+    RepoEntity::find()
+        .filter(repository::Column::IsPrivate.eq(false))
+        .filter(repository::Column::DeletedAt.is_null())
+        .order_by_desc(repository::Column::UpdatedAt)
+        .order_by_desc(repository::Column::Id)
 }
 
 /// Create a new repo.

@@ -65,11 +65,12 @@ pub(crate) async fn resolve_pat(
         return Ok(None);
     }
     // Usage time is observability, not part of the credential proof. Match the
-    // SSH/deploy-key contract: record every accepted credential, but do not
-    // turn a write-only failure into either an invalid-token answer or an auth
+    // SSH/deploy-key contract: record accepted use — at most once a minute per
+    // token, so a burst of requests stays reads only — but do not turn a
+    // write-only failure into either an invalid-token answer or an auth
     // outage. Lookup failures above still propagate because they leave the
     // credential's validity unknown.
-    if let Err(error) = rg_db::ops::token_ops::touch_last_used(db, tok.id).await {
+    if let Err(error) = rg_db::ops::token_ops::touch_last_used(db, tok.id, tok.last_used_at).await {
         tracing::warn!(
             token_id = tok.id,
             user_id = tok.user_id,
@@ -546,15 +547,17 @@ mod tests {
     }
 
     /// Owner finalization is part of the credential proof, unlike usage
-    /// bookkeeping. A failed database write must therefore remain an error and
+    /// bookkeeping. A failed database read must therefore remain an error and
     /// must happen before `last_used_at` is touched.
+    ///
+    /// The fault is a column the owner read selects and nothing before it does:
+    /// the token lookup reads `access_tokens` only, so the failure lands on the
+    /// finalizer and on nothing else.
     #[tokio::test]
     async fn failed_owner_finalization_is_not_an_invalid_pat() {
         let (db, raw, token_id) = pat_fixture().await;
         db.execute_unprepared(
-            "CREATE TRIGGER fail_pat_owner_finalization \
-             BEFORE UPDATE OF session_version ON users \
-             BEGIN SELECT RAISE(ABORT, 'injected PAT owner finalization failure'); END;",
+            "ALTER TABLE users RENAME COLUMN deleted_at TO deleted_at_unreadable",
         )
         .await
         .expect("arm PAT owner-finalization failure");
@@ -563,8 +566,8 @@ mod tests {
             .await
             .expect_err("owner-finalization failure became an invalid PAT");
         assert!(
-            format!("{error:#}").contains("injected PAT owner finalization failure"),
-            "unexpected error: {error:#}"
+            format!("{error:#}").contains("read standing credential owner"),
+            "the error did not come from the owner finalizer: {error:#}"
         );
         let stored = rg_db::ops::token_ops::find_by_id(&db, token_id)
             .await
@@ -576,26 +579,22 @@ mod tests {
         );
     }
 
-    /// SQLite triggers put each lifecycle loss inside the real conditional
-    /// owner update. The resolver must publish neither its stale owner nor a
-    /// successful usage timestamp after either outcome.
+    /// The token lookup does not read the owner; the finalizer is the first
+    /// and only read of it. A retirement or deletion committed before that read
+    /// is therefore exactly the loss the finalizer has to catch, and the
+    /// resolver must publish neither the owner nor a usage timestamp after it.
     #[tokio::test]
     async fn retirement_or_delete_wins_pat_owner_finalization() {
-        for (index, delete) in [false, true].into_iter().enumerate() {
+        for delete in [false, true] {
             let (db, raw, token_id) = pat_fixture().await;
-            let mutation = if delete {
-                "DELETE FROM users WHERE id = OLD.id;"
+            db.execute_unprepared(if delete {
+                "DELETE FROM users WHERE id = 1"
             } else {
                 "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
-                 WHERE id = OLD.id;"
-            };
-            db.execute_unprepared(&format!(
-                "CREATE TRIGGER lose_pat_owner_{index} \
-                 BEFORE UPDATE OF session_version ON users WHEN OLD.id = 1 \
-                 BEGIN {mutation} SELECT RAISE(IGNORE); END;"
-            ))
+                 WHERE id = 1"
+            })
             .await
-            .expect("install competing PAT-owner lifecycle mutation");
+            .expect("retire or delete the PAT owner");
 
             assert!(
                 resolve_pat(&db, &raw)
@@ -622,5 +621,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// card_b83b9bc36e3a: a PAT used again within the usage-stamp window is
+    /// served from reads alone. Any write on `users` or `access_tokens` after
+    /// the first use aborts here, so a fence that takes the owner's row lock,
+    /// or a stamp written on every request, turns this red.
+    #[tokio::test]
+    async fn a_repeated_pat_request_writes_nothing() {
+        let (db, raw, token_id) = pat_fixture().await;
+        resolve_pat(&db, &raw)
+            .await
+            .expect("first use")
+            .expect("first use resolves");
+        let stamped = rg_db::ops::token_ops::find_by_id(&db, token_id)
+            .await
+            .expect("reload PAT")
+            .expect("PAT exists")
+            .last_used_at;
+        assert!(stamped.is_some(), "the first use was not recorded");
+
+        for table in ["users", "access_tokens"] {
+            db.execute_unprepared(&format!(
+                "CREATE TRIGGER no_write_{table} BEFORE UPDATE ON {table} \
+                 BEGIN SELECT RAISE(ABORT, 'a repeated PAT request wrote {table}'); END;"
+            ))
+            .await
+            .expect("forbid writes");
+        }
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let resolved = resolve_pat(&db, &raw)
+            .await
+            .expect("a repeated PAT request must not need a write");
+        assert!(resolved.is_some(), "the repeated request was refused");
+        let rendered = logs.text();
+        assert!(
+            !rendered.contains("wrote"),
+            "a repeated PAT request attempted a write: {rendered}"
+        );
     }
 }

@@ -1030,3 +1030,75 @@ pub async fn assert_blob_push_created(finish: reqwest::Response, payload_len: us
          body: {body}"
     );
 }
+
+/// What an SSO callback answered a browser (card_0d7c54cae647).
+///
+/// The callback is a top-level navigation, so it always redirects: a success
+/// to the page that follows a sign-in, a refusal to the page the round trip
+/// started from with `sso_error=<code>`. The outcome is therefore where it
+/// went and whether a session came with it — never a status code or a body.
+pub struct SsoCallbackOutcome {
+    pub status: reqwest::StatusCode,
+    pub location: String,
+    pub session_issued: bool,
+}
+
+impl SsoCallbackOutcome {
+    pub fn of(response: &reqwest::Response) -> Self {
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let session_issued = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|cookie| {
+                cookie
+                    .strip_prefix("plombir_git_token=")
+                    .is_some_and(|rest| !rest.starts_with(';') && !rest.is_empty())
+            });
+        Self {
+            status: response.status(),
+            location,
+            session_issued,
+        }
+    }
+
+    /// The `sso_error` code of a refusal; `None` for a success.
+    pub fn refusal(&self) -> Option<&str> {
+        let (_, query) = self.location.split_once('?')?;
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("sso_error="))
+    }
+
+    /// A refusal: a redirect to `page` naming `code`, and no session.
+    #[track_caller]
+    pub fn assert_refused(&self, page: &str, code: &str) {
+        assert_eq!(
+            self.status,
+            reqwest::StatusCode::TEMPORARY_REDIRECT,
+            "the callback answered a browser with something other than a redirect: {}",
+            self.location
+        );
+        assert!(
+            self.location.starts_with(&format!("{page}?")),
+            "the refusal went to `{}`, not back to {page}",
+            self.location
+        );
+        assert_eq!(
+            self.refusal(),
+            Some(code),
+            "wrong refusal reason in `{}`",
+            self.location
+        );
+        assert!(
+            !self.session_issued,
+            "a refused callback issued a session cookie"
+        );
+    }
+}

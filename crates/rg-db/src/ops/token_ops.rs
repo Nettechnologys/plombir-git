@@ -103,13 +103,23 @@ pub async fn repository_ids_by_token(
     Ok(by_token)
 }
 
-/// Record that a Personal Access Token was successfully authenticated.
-pub async fn touch_last_used(db: &DatabaseConnection, id: i64) -> Result<()> {
+/// Record that a Personal Access Token was used, at most once per
+/// [`LAST_USED_RESOLUTION`](super::LAST_USED_RESOLUTION).
+///
+/// `previous` is the `last_used_at` the caller just read with the credential.
+/// Within the window this returns without touching the database, so a burst
+/// of requests on one credential is reads only.
+pub async fn touch_last_used(
+    db: &DatabaseConnection,
+    id: i64,
+    previous: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    if !super::last_used_is_due(previous, now) {
+        return Ok(());
+    }
     TokenEntity::update_many()
-        .col_expr(
-            access_token::Column::LastUsedAt,
-            Expr::value(chrono::Utc::now()),
-        )
+        .col_expr(access_token::Column::LastUsedAt, Expr::value(now))
         .filter(access_token::Column::Id.eq(id))
         .exec(db)
         .await

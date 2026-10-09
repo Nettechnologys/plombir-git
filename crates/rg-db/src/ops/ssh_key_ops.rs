@@ -41,10 +41,23 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<SshKe
     model.insert(db).await.context("db: create ssh key")
 }
 
-/// Record that an SSH key was successfully used for authentication.
-pub async fn touch_last_used(db: &DatabaseConnection, id: i64) -> Result<()> {
+/// Record that an SSH key was used, at most once per
+/// [`LAST_USED_RESOLUTION`](super::LAST_USED_RESOLUTION).
+///
+/// `previous` is the `last_used_at` the caller just read with the credential.
+/// Within the window this returns without touching the database, so a burst
+/// of requests on one credential is reads only.
+pub async fn touch_last_used(
+    db: &DatabaseConnection,
+    id: i64,
+    previous: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    if !super::last_used_is_due(previous, now) {
+        return Ok(());
+    }
     SshKeyEntity::update_many()
-        .col_expr(ssh_key::Column::LastUsedAt, Expr::value(chrono::Utc::now()))
+        .col_expr(ssh_key::Column::LastUsedAt, Expr::value(now))
         .filter(ssh_key::Column::Id.eq(id))
         .exec(db)
         .await

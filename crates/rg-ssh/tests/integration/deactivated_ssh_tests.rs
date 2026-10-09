@@ -225,9 +225,10 @@ async fn deactivating_an_account_rejects_its_ssh_key() {
     h.server.abort();
 }
 
-/// A matching key is not yet an authenticated identity. Retirement or physical
-/// deletion can still win at the conditional owner finalizer which follows the
-/// fingerprint lookup, and neither outcome may produce `Auth::Accept`.
+/// A matching key is not yet an authenticated identity. The fingerprint lookup
+/// does not read the owner; retirement or physical deletion committed since
+/// the key last worked is caught by the owner finalizer that follows it, and
+/// neither outcome may produce `Auth::Accept`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_key_losing_to_retirement_or_delete_is_rejected() {
     for (index, delete) in [false, true].into_iter().enumerate() {
@@ -244,23 +245,20 @@ async fn ssh_key_losing_to_retirement_or_delete_is_rejected() {
             "baseline: a registered key must authenticate"
         );
 
-        let mutation = if delete {
-            "DELETE FROM users WHERE id = OLD.id;"
-        } else {
-            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
-             WHERE id = OLD.id;"
-        };
         h.db.execute(Statement::from_string(
             h.db.get_database_backend(),
-            format!(
-                "CREATE TRIGGER lose_ssh_key_owner_{index} \
-                 BEFORE UPDATE OF session_version ON users WHEN OLD.id = {} \
-                 BEGIN {mutation} SELECT RAISE(IGNORE); END",
-                h.user_id
-            ),
+            if delete {
+                format!("DELETE FROM users WHERE id = {}", h.user_id)
+            } else {
+                format!(
+                    "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, \
+                     updated_at = CURRENT_TIMESTAMP WHERE id = {}",
+                    h.user_id
+                )
+            },
         ))
         .await
-        .expect("install competing SSH-key owner lifecycle mutation");
+        .expect("retire or delete the SSH key owner");
 
         let mut losing = h.server.connect().await;
         assert!(
@@ -366,23 +364,20 @@ async fn retirement_or_delete_wins_open_ssh_exec_owner_finalization() {
             "baseline: a healthy owner must pass the exec finalizer"
         );
 
-        let mutation = if delete {
-            "DELETE FROM users WHERE id = OLD.id;"
-        } else {
-            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
-             WHERE id = OLD.id;"
-        };
         h.db.execute(Statement::from_string(
             h.db.get_database_backend(),
-            format!(
-                "CREATE TRIGGER lose_ssh_exec_owner_{index} \
-                 BEFORE UPDATE OF session_version ON users WHEN OLD.id = {} \
-                 BEGIN {mutation} SELECT RAISE(IGNORE); END",
-                h.user_id
-            ),
+            if delete {
+                format!("DELETE FROM users WHERE id = {}", h.user_id)
+            } else {
+                format!(
+                    "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, \
+                     updated_at = CURRENT_TIMESTAMP WHERE id = {}",
+                    h.user_id
+                )
+            },
         ))
         .await
-        .expect("install competing SSH-exec owner lifecycle mutation");
+        .expect("retire or delete the SSH key owner");
 
         assert!(
             !upload_pack_allowed(&session, &h.username).await,

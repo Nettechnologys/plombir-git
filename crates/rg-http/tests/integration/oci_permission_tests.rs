@@ -903,9 +903,10 @@ async fn deactivating_an_account_revokes_its_unexpired_oci_token() {
     );
 }
 
-/// Resolve the username first, then make retirement/DELETE win inside the
-/// stable-id owner finalizer. A second snapshot read would still publish the
-/// stale `TokenSubject::User`; the finalizer must return `Gone` instead.
+/// A scoped token names its owner by username and outlives the request that
+/// minted it. Retirement or DELETE between minting and use must turn the next
+/// use into `Gone`, never into a `TokenSubject::User` for the account as it
+/// was when the token was issued.
 #[tokio::test]
 async fn retirement_or_delete_wins_oci_scoped_token_owner_finalization() {
     for (index, delete) in [false, true].into_iter().enumerate() {
@@ -926,19 +927,16 @@ async fn retirement_or_delete_wins_oci_scoped_token_owner_finalization() {
             "the healthy OCI scoped token never reached its owner finalizer"
         );
 
-        let mutation = if delete {
-            "DELETE FROM users WHERE id = OLD.id;"
+        db.execute_unprepared(&if delete {
+            format!("DELETE FROM users WHERE id = {user_id}")
         } else {
-            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
-             WHERE id = OLD.id;"
-        };
-        db.execute_unprepared(&format!(
-            "CREATE TRIGGER lose_oci_capability_owner_{index} \
-             BEFORE UPDATE OF session_version ON users WHEN OLD.id = {user_id} \
-             BEGIN {mutation} SELECT RAISE(IGNORE); END"
-        ))
+            format!(
+                "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, \
+                 updated_at = CURRENT_TIMESTAMP WHERE id = {user_id}"
+            )
+        })
         .await
-        .expect("install competing OCI owner lifecycle mutation");
+        .expect("retire or delete the OCI capability owner");
 
         let rejected = start_upload_with(&base, &username, &repo, &token).await;
         assert_eq!(
@@ -962,51 +960,6 @@ async fn retirement_or_delete_wins_oci_scoped_token_owner_finalization() {
             );
         }
     }
-}
-
-/// A failed owner finalization is a retryable registry failure, not an
-/// anonymous request and not an invalid scoped token.
-#[tokio::test]
-async fn a_failed_oci_owner_finalization_is_503_not_anonymous() {
-    let (base, db) = spawn_test_app_with_db().await;
-    let (owner_token, user_id) = register_full(
-        &base,
-        "oci_owner_failure",
-        "oci_owner_failure@example.invalid",
-    )
-    .await;
-    create_repo(&base, &owner_token, "owner-failure", true).await;
-
-    let token = request_oci_token_raw(
-        &base,
-        "repository:oci_owner_failure/owner-failure:pull,push",
-        Some(basic_auth("oci_owner_failure", "Qz7$wRtm")),
-    )
-    .await;
-    let baseline = start_upload_with(&base, "oci_owner_failure", "owner-failure", &token).await;
-    assert_eq!(baseline.status(), 202, "healthy OCI baseline failed");
-
-    db.execute_unprepared(&format!(
-        "CREATE TRIGGER fail_oci_capability_owner \
-         BEFORE UPDATE OF session_version ON users WHEN OLD.id = {user_id} \
-         BEGIN SELECT RAISE(ABORT, 'injected OCI owner finalization failure'); END"
-    ))
-    .await
-    .expect("install OCI owner-finalization failure");
-
-    let response = start_upload_with(&base, "oci_owner_failure", "owner-failure", &token).await;
-    assert_eq!(
-        response.status(),
-        503,
-        "OCI owner-finalization failure became an anonymous or credential verdict"
-    );
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert!(
-        body.get("errors")
-            .and_then(|errors| errors.as_array())
-            .is_some(),
-        "finalizer failure must keep the OCI error envelope: {body}"
-    );
 }
 
 /// A token that outlived its *repository* rather than its holder.

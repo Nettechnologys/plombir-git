@@ -46,6 +46,10 @@ package_upload_max_mb = 512
 
 [database]
 url = "sqlite://./plombir-git.db?mode=rwc"
+# Connections the server's pool may open. Unset: 5 for SQLite, whose writers
+# take turns on one lock however many connections wait for it, and 10 for
+# PostgreSQL / MySQL, which run queries side by side.
+# max_connections = 5
 
 [auth]
 # Signs session tokens, PAT-derived tokens and CI job tokens. Generate one with

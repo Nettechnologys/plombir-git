@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from '$lib/clipboard';
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { packages } from '$lib/api/client.svelte';
@@ -112,7 +113,7 @@
 
           <div class="install-section">
             <pre><code>{getInstallCommand(pkg)}</code></pre>
-            <button class="copy-btn" onclick={() => navigator.clipboard.writeText(getInstallCommand(pkg))}>
+            <button class="copy-btn" onclick={() => void copyToClipboard(getInstallCommand(pkg))}>
               {t('common.copy', 'Copy')}
             </button>
           </div>
