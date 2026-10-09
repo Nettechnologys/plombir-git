@@ -86,6 +86,16 @@ export const orgs = {
   },
   removeMember: (name: string, userId: number) =>
     request<{ removed: boolean }>(`/orgs/${name}/members/${userId}`, { method: 'DELETE' }),
+  // Owner-only. The target must already be a member; they are raised to the
+  // `owner` role and become the owner of record, the caller keeps their role.
+  transferOwnership: (name: string, user: string | number) => {
+    const ref = buildUserRef(user);
+    if (ref === null) return Promise.reject(new Error('A user is required.'));
+    return request<Organization>(`/orgs/${name}/transfer-ownership`, {
+      method: 'POST',
+      body: JSON.stringify(ref),
+    });
+  },
   listTeams: (name: string) =>
     request<OrganizationTeam[]>(`/orgs/${name}/teams`),
   createTeam: (name: string, teamName: string, description?: string, permission?: TeamPermission) =>

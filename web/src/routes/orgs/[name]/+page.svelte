@@ -55,25 +55,36 @@
   const teamMemberRequests = new LatestRequestFence<string>();
   let routeGeneration = 0;
 
-  const canManage = $derived(
-    org !== null &&
-      getUser() !== null &&
-      (org.owner_id === getUser()?.id ||
-        members.some(
-          (member) =>
-            member.user_id === getUser()?.id && (member.role === 'owner' || member.role === 'admin'),
-        )),
+  // Every right here is a membership *role*, never `org.owner_id`: that column
+  // names the creator (or the last transfer's target) and stays on the row after
+  // they are removed from the organization, so a page keyed on it offered the
+  // removed creator controls the server now refuses (security audit #5).
+  const myMembership = $derived(
+    org !== null ? members.find((member) => member.user_id === getUser()?.id) ?? null : null,
   );
+
+  const canManage = $derived(
+    myMembership !== null && (myMembership.role === 'owner' || myMembership.role === 'admin'),
+  );
+
+  // Deleting the organization and handing it over are owner-only — an admin
+  // runs it, an owner disposes of it.
+  const isOwner = $derived(myMembership?.role === 'owner');
+
+  // The server refuses to remove the last owner (409); the control says so up
+  // front instead of letting the click find out.
+  const ownerCount = $derived(members.filter((member) => member.role === 'owner').length);
 
   // Creating a repository here is a *member's* right, not an admin's: the API
   // gate (`NamespaceCreate`) admits anyone on the membership roll. The form
   // used to be rendered for everybody, including a stranger reading a public
   // organization, whose only feedback was a 403 on submit.
-  const canCreateRepo = $derived(
-    org !== null &&
-      getUser() !== null &&
-      (org.owner_id === getUser()?.id ||
-        members.some((member) => member.user_id === getUser()?.id)),
+  const canCreateRepo = $derived(myMembership !== null);
+
+  let transferringOwnership = $state(false);
+  let transferTarget = $state('');
+  const transferCandidates = $derived(
+    members.filter((member) => member.user_id !== getUser()?.id && member.username !== null),
   );
 
   $effect(() => {
@@ -106,6 +117,8 @@
     newTeamMemberRole = 'member';
     newRepoName = '';
     newRepoPrivate = false;
+    transferringOwnership = false;
+    transferTarget = '';
   }
 
   function isCurrentRoute(expectedName: string, expectedRoute: number): boolean {
@@ -299,6 +312,49 @@
       if (isCurrentRoute(expectedName, expectedRoute)) await goto('/orgs');
     } catch (cause: unknown) {
       actionError(cause, t('orgs.delete_failed'), expectedName, expectedRoute);
+      if (isCurrentRoute(expectedName, expectedRoute)) busyAction = null;
+    }
+  }
+
+  function startTransferOwnership() {
+    transferTarget = transferCandidates[0]?.username ?? '';
+    transferringOwnership = true;
+    error = '';
+  }
+
+  async function transferOwnership(event: SubmitEvent) {
+    event.preventDefault();
+    if (busyAction !== null || !org) return;
+    const target = transferTarget.trim();
+    if (!target) {
+      error = t('orgs.transfer_ownership_target_required');
+      return;
+    }
+    if (!confirm(t('orgs.transfer_ownership_confirm', { name: org.name, user: target }))) return;
+
+    const expectedName = name;
+    const expectedRoute = routeGeneration;
+    const claim = organizationRequests.begin(expectedName);
+    memberRequests.begin(expectedName);
+    busyAction = 'transfer-ownership';
+    error = '';
+    try {
+      const nextOrganization = await orgs.transferOwnership(expectedName, target);
+      if (
+        organizationRequests.owns(claim, name) &&
+        isCurrentRoute(expectedName, expectedRoute)
+      ) {
+        org = nextOrganization;
+        transferringOwnership = false;
+        transferTarget = '';
+      }
+      // The target's role changed; the member list is what shows it.
+      await refreshMembers(expectedName, expectedRoute);
+    } catch (cause: unknown) {
+      if (organizationRequests.owns(claim, name)) {
+        actionError(cause, t('orgs.transfer_ownership_failed'), expectedName, expectedRoute);
+      }
+    } finally {
       if (isCurrentRoute(expectedName, expectedRoute)) busyAction = null;
     }
   }
@@ -524,12 +580,44 @@
           <button type="button" class="btn-secondary" onclick={startEditingOrganization} disabled={busyAction !== null}>
             {t('common.edit')}
           </button>
-          <button type="button" class="btn-danger" onclick={deleteOrganization} disabled={busyAction !== null}>
-            {busyAction === 'delete-org' ? t('common.loading') : t('orgs.delete_organization')}
-          </button>
+          {#if isOwner}
+            <button type="button" class="btn-secondary" onclick={startTransferOwnership} disabled={busyAction !== null}>
+              {t('orgs.transfer_ownership')}
+            </button>
+            <button type="button" class="btn-danger" onclick={deleteOrganization} disabled={busyAction !== null}>
+              {busyAction === 'delete-org' ? t('common.loading') : t('orgs.delete_organization')}
+            </button>
+          {/if}
         </div>
       {/if}
     </div>
+
+    {#if transferringOwnership}
+      <form class="section transfer-ownership" onsubmit={transferOwnership}>
+        <h2>{t('orgs.transfer_ownership')}</h2>
+        <p class="hint">{t('orgs.transfer_ownership_hint')}</p>
+        {#if transferCandidates.length === 0}
+          <p class="empty">{t('orgs.transfer_ownership_no_candidates')}</p>
+        {:else}
+          <label>
+            <span>{t('orgs.transfer_ownership_target')}</span>
+            <select bind:value={transferTarget} disabled={busyAction !== null}>
+              {#each transferCandidates as candidate (candidate.id)}
+                <option value={candidate.username}>{candidate.username}</option>
+              {/each}
+            </select>
+          </label>
+        {/if}
+        <div class="form-actions">
+          <button type="submit" class="btn-danger" disabled={busyAction !== null || transferCandidates.length === 0}>
+            {busyAction === 'transfer-ownership' ? t('common.loading') : t('orgs.transfer_ownership_submit')}
+          </button>
+          <button type="button" class="btn-secondary" onclick={() => transferringOwnership = false} disabled={busyAction !== null}>
+            {t('common.cancel')}
+          </button>
+        </div>
+      </form>
+    {/if}
 
     {#if editingOrg}
       <form class="section edit-organization" onsubmit={saveOrganization}>
@@ -740,7 +828,8 @@
                     type="button"
                     class="btn-danger"
                     onclick={() => removeOrganizationMember(member)}
-                    disabled={busyAction !== null}
+                    disabled={busyAction !== null || (member.role === 'owner' && ownerCount <= 1)}
+                    title={member.role === 'owner' && ownerCount <= 1 ? t('orgs.last_owner_hint') : undefined}
                   >
                     {busyAction === `remove-org-member-${member.user_id}` ? t('common.loading') : t('common.delete')}
                   </button>
@@ -823,8 +912,25 @@
 
   .repositories-section,
   .edit-organization,
+  .transfer-ownership,
   .page-error {
     margin-bottom: 1.5rem;
+  }
+
+  .transfer-ownership label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    margin-bottom: 1rem;
+    max-width: 24rem;
+  }
+
+  .hint {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    margin: -0.5rem 0 1rem;
   }
 
   h2,

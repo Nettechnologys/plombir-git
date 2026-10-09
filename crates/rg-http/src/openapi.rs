@@ -500,6 +500,7 @@ pub(crate) fn stamp_security(
         crate::api::orgs::list_orgs,
         crate::api::orgs::update_org,
         crate::api::orgs::delete_org,
+        crate::api::orgs::transfer_ownership,
         crate::api::orgs::list_org_members,
         crate::api::orgs::add_org_member,
         crate::api::orgs::remove_org_member,

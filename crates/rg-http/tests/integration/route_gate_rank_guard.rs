@@ -146,6 +146,7 @@ const NON_REPO: &[(&str, &[&str])] = &[
             "AuthUser",
             "SessionUser",
             "OrgAdmin",
+            "OrgOwner",
             "InstanceAdmin",
             "RepoAuthRead",
             "RepoWrite",
@@ -155,8 +156,12 @@ const NON_REPO: &[(&str, &[&str])] = &[
             "NamespaceWrite",
         ],
     ),
-    ("OrgRead", &["OrgRead", "OrgAdmin"]),
-    ("OrgAdmin", &["OrgAdmin"]),
+    ("OrgRead", &["OrgRead", "OrgAdmin", "OrgOwner"]),
+    // `OrgOwner` is `OrgAdmin` plus the `owner` role: it runs the same session,
+    // resolution and visibility steps and then refuses admins too, so it proves
+    // every level `OrgAdmin` proves. The route table has no `OrgOwner` level —
+    // the two owner-only rows declare `OrgAdmin` as their floor.
+    ("OrgAdmin", &["OrgAdmin", "OrgOwner"]),
     ("InstanceAdmin", &["InstanceAdmin"]),
 ];
 

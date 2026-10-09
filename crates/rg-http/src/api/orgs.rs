@@ -318,15 +318,13 @@ pub async fn update_org(
 )]
 pub async fn delete_org(
     State(state): State<AppState>,
-    // `OrgAdmin` is the level the route declares, and taking it here is what
-    // makes that declaration enforced rather than merely written down. It is a
-    // *floor*, not the whole rule: deleting an organization is owner-only, and
-    // `rg_core::org::delete_org` still enforces exactly that below — an admin
-    // who is not the owner passes this gate and is refused there, as before.
-    // The gate is not redundant for it, though. Without it the level was carried
-    // by `require_user` plus whatever the service happened to check, so lowering
-    // the service's rule to admin would have widened the route silently.
-    OrgAdmin { org, actor_id }: OrgAdmin,
+    // `OrgAdmin` is the level the route declares — the floor. Deleting an
+    // organization is owner-only, and the owner is a *role* on a membership row:
+    // `rg_core::org::delete_org` used to compare `org.owner_id` instead, which
+    // let the creator delete an organization they had been removed from while
+    // refusing the members who actually held the role (security audit #5).
+    // Membership is decided in this module alone, so the rule is this extractor.
+    OrgOwner { org, actor_id }: OrgOwner,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // The organization is the *resource*, never the actor. This file used to
@@ -364,10 +362,83 @@ pub async fn delete_org(
             .await;
             Json(serde_json::json!({"deleted": true})).into_response()
         }
-        // Only the owner-mismatch branch is a refusal; it carries
-        // `rg_core::error::Forbidden` and still answers 403. A failed lookup
-        // or a dead pool underneath is ours, and must not be reported as "you
-        // are not allowed to delete this organization".
+        // The refusal happened in the extractor; what is left is a lost race
+        // (typed `NotFound`) or a failure of ours, and neither must be reported
+        // as "you are not allowed to delete this organization".
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+/// Who the organization is handed to. Same [`UserRef`] as
+/// [`AddOrgMemberRequest`]: `username` is the spelling the page sends.
+#[derive(Deserialize)]
+pub struct TransferOwnershipRequest {
+    #[serde(flatten)]
+    user: UserRef,
+}
+
+/// POST /api/v1/orgs/:name/transfer-ownership
+///
+/// Hands the organization to another *member*, who is raised to the `owner`
+/// role; the caller keeps theirs. One transaction rewrites the membership row,
+/// `organizations.owner_id` and the `owner_id` of every repository of the
+/// organization that still mirrored the previous owner — see
+/// `rg_db::ops::org_ops::transfer_ownership` for why the three move together.
+#[utoipa::path(
+    post,
+    path = "/orgs/{name}/transfer-ownership",
+    tag = "Organizations",
+    params(
+        ("name" = String, Path, description = "name"),
+    ),
+    request_body(content = serde_json::Value),
+    responses(
+        (status = 200, description = "Ownership transferred; the organization as it now reads", body = serde_json::Value),
+        (status = 400, description = "The named account does not exist", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Only an owner-role member may transfer ownership", body = serde_json::Value),
+        (status = 404, description = "Organization not found", body = serde_json::Value),
+        (status = 409, description = "The target is not a member, or already the owner", body = serde_json::Value),
+    ),
+)]
+pub async fn transfer_ownership(
+    State(state): State<AppState>,
+    OrgOwner { org, actor_id }: OrgOwner,
+    headers: HeaderMap,
+    Json(body): Json<TransferOwnershipRequest>,
+) -> impl IntoResponse {
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    // Resolved first so an unknown name is a 400 here rather than a membership
+    // miss reported as a 409.
+    let target = match body.user.resolve(&state.db).await {
+        Ok(user) => user,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+
+    match rg_core::org::transfer_ownership(&state.db, org.id, target.id).await {
+        Ok(updated) => {
+            let details = serde_json::json!({
+                "org_name": org.name,
+                "previous_owner_id": org.owner_id,
+                "new_owner_id": target.id,
+                "new_owner_username": target.username,
+            });
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                "org.transfer_ownership",
+                Some("org"),
+                Some(org.id),
+                Some(&org.name),
+                Some(&headers),
+                Some(details),
+            )
+            .await;
+            Json(org_to_response(&updated)).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -452,6 +523,22 @@ pub async fn add_org_member(
         Err(error) => return AppError::from(error).into_response(),
     };
     let role = body.role.as_deref().unwrap_or("member");
+    // Handing out the `owner` role is handing out the organization: `OrgOwner`
+    // admits owners — and only owners — to delete and transfer, so an `admin`
+    // who could mint one (for a confederate; the unique `(org_id, user_id)`
+    // index rules out raising their own row) would capture exactly the
+    // disposal rights reserved to owners. Admins keep `member` and `admin`.
+    // Unknown role strings are refused by `rg_core::org::add_org_member`.
+    if role == "owner" {
+        match is_org_owner(&state.db, &org, actor_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return AppError::forbidden("only organization owners can grant the owner role")
+                    .into_response();
+            }
+            Err(error) => return AppError::from(error).into_response(),
+        }
+    }
     // Resolving before the insert is also what keeps a mistyped identifier a
     // 400: `organization_members.user_id` is a foreign key, so an id naming
     // nobody used to reach the database and come back as a constraint failure.
@@ -987,19 +1074,51 @@ async fn resolve_org(
     }
 }
 
-/// Whether `user_id` may administer `org`: its owner, or a member holding the
-/// `owner` / `admin` role.
+/// Whether `user_id` may administer `org`: a member holding the `owner` or
+/// `admin` role.
+///
+/// `org.owner_id` is deliberately not consulted — here, in
+/// [`require_org_visible`], or anywhere else a right is decided. The column
+/// names the account that created the organization (or last received it through
+/// `transfer_ownership`); it stays on the row when that account is removed from
+/// the organization, and reading it as a grant kept the removed creator in full
+/// control while the members actually holding the `owner` role were refused
+/// (security audit #5). Rights come from membership rows and nothing else.
 async fn is_org_admin(
     db: &sea_orm::DatabaseConnection,
     org: &rg_db::entities::organization::Model,
     user_id: i64,
 ) -> anyhow::Result<bool> {
-    if org.owner_id == user_id {
-        return Ok(true);
-    }
     Ok(rg_core::org::find_org_member(db, org.id, user_id)
         .await?
         .is_some_and(|m| m.role == "owner" || m.role == "admin"))
+}
+
+/// Whether `user_id` *owns* `org`: a member holding the `owner` role. The
+/// `admin` role is not enough — see [`is_org_admin`] for the column that is not
+/// consulted either.
+async fn is_org_owner(
+    db: &sea_orm::DatabaseConnection,
+    org: &rg_db::entities::organization::Model,
+    user_id: i64,
+) -> anyhow::Result<bool> {
+    Ok(rg_core::org::find_org_member(db, org.id, user_id)
+        .await?
+        .is_some_and(|m| m.role == "owner"))
+}
+
+/// Authorization gate for the two things only an owner may do with an
+/// organization: delete it, and hand its ownership to somebody else.
+async fn require_org_owner(
+    db: &sea_orm::DatabaseConnection,
+    org: &rg_db::entities::organization::Model,
+    user_id: i64,
+) -> Result<(), AppError> {
+    match is_org_owner(db, org, user_id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AppError::forbidden("only organization owners can do this")),
+        Err(e) => Err(AppError::from(e)),
+    }
 }
 
 /// Authorization gate for every org mutation — membership changes and the whole
@@ -1050,9 +1169,7 @@ async fn require_org_visible(
     let Some(user_id) = user_id else {
         return Err(AppError::not_found("organization not found"));
     };
-    if org.owner_id == user_id {
-        return Ok(());
-    }
+    // Membership only — not `org.owner_id`, for the reason on `is_org_admin`.
     match rg_core::org::is_org_member(db, org.id, user_id).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(AppError::not_found("organization not found")),
@@ -1153,6 +1270,38 @@ impl axum::extract::FromRequestParts<AppState> for OrgAdmin {
         let org = resolve_org(&state.db, &name).await?;
         require_org_visible(&state.db, &org, Some(actor_id)).await?;
         require_org_admin(&state.db, &org, actor_id).await?;
+        Ok(Self { org, actor_id })
+    }
+}
+
+/// An authenticated *owner* of the organization named by `{name}` — a member
+/// holding the `owner` role.
+///
+/// The rung above [`OrgAdmin`], for the two operations that dispose of the
+/// organization rather than run it: `DELETE /orgs/{name}` and
+/// `POST /orgs/{name}/transfer-ownership`. Same order and same answers as
+/// [`OrgAdmin`] up to the last step — `401` without a session, `404` for an
+/// unknown or private-and-foreign organization — and then `403` for a member
+/// who is not an owner, admins included. The route table declares these rows
+/// `OrgAdmin`, which is the floor the sweep measures a stranger against; this
+/// extractor is the stricter rule the handler actually runs.
+pub struct OrgOwner {
+    pub org: rg_db::entities::organization::Model,
+    pub actor_id: i64,
+}
+
+impl axum::extract::FromRequestParts<AppState> for OrgOwner {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let actor_id = require_user(&parts.headers, &state.jwt_secret)?;
+        let name = org_name_in_path(parts, state).await?;
+        let org = resolve_org(&state.db, &name).await?;
+        require_org_visible(&state.db, &org, Some(actor_id)).await?;
+        require_org_owner(&state.db, &org, actor_id).await?;
         Ok(Self { org, actor_id })
     }
 }

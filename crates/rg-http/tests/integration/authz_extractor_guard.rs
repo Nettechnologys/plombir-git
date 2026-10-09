@@ -180,6 +180,12 @@ const PREDICATES: &[&str] = &[
     "can_read_repo",
     "can_write_repo",
     "can_admin_repo",
+    // The ownership rung — delete and transfer. `require_owner` used to compare
+    // `repo.owner_id` by hand, which on an organization repository is not a
+    // grant at all (security audit #5); the rule is a predicate now, and a
+    // handler re-deriving it from `owner_id` or `find_org_member` is the copy
+    // this list exists to refuse.
+    "can_own_repo",
     "can_read",
     "can_write",
     "deploy_key_permits",
