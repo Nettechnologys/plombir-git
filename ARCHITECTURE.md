@@ -356,8 +356,8 @@ which is what lets the server enforce what the CLI cannot:
 Configuration is resolved as **CLI args > config file > defaults**. The config
 file is TOML (`plombir-git.toml`; see `plombir-git.example.toml` for the operator
 template). Model sections include `server`, `database`, `auth`, `ci`, `releases`,
-`rate_limit`, `smtp`, `tls`, `logging`, `audit`, `backup`, `mirror`, `imports`,
-`timeouts`, `webhooks`, and `observability`. The model and the resolution live in
+`limits`, `rate_limit`, `smtp`, `tls`, `logging`, `audit`, `backup`, `mirror`,
+`imports`, `timeouts`, `webhooks`, and `observability`. The model and the resolution live in
 `rg-cli/src/config.rs` and are shared by **every** subcommand, not just `serve`:
 `migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,
 `rotate-encryption-key`, `create-repo`, `import`, `index-repo`,
