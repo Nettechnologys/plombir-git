@@ -128,10 +128,13 @@ async fn reserved_variable_names_are_refused_as_secrets_and_stripped_from_polls(
         "tcp://attacker:2375",
     )
     .await;
+    // A secret row whose name cannot even be an environment entry: `getenv`
+    // would read it as the name before the first `=` (finding #2, follow-up).
+    stored_secret(&db, encryption_key, repo_id, owner_id, "PATH=/tmp", "y").await;
     let job_id = pending_job(
         &db,
         repo_id,
-        r#"{"LD_PRELOAD":"/workspace/evil.so","GODEBUG":"http2debug=2","http_proxy":"http://attacker","CI_JOB_TOKEN":"forged","SAFE_VALUE":"first\nsecond"}"#,
+        r#"{"LD_PRELOAD":"/workspace/evil.so","GODEBUG":"http2debug=2","http_proxy":"http://attacker","CI_JOB_TOKEN":"forged","PATH=/tmp":"y","HTTPS_PROXY=http://attacker:8080":"x","GOFLAGS":"-mod=vendor","SAFE_VALUE":"first\nsecond"}"#,
     )
     .await;
 
@@ -176,6 +179,21 @@ async fn reserved_variable_names_are_refused_as_secrets_and_stripped_from_polls(
             "{denied} reached the runner: {body}"
         );
     }
+    // A name carrying `=` cannot be an environment entry: `getenv` reads the
+    // entry up to the first `=`, so `PATH=/tmp` would arrive as a job-chosen
+    // `PATH` (security audit finding #2, follow-up).
+    for malformed in ["PATH=/tmp", "HTTPS_PROXY=http://attacker:8080"] {
+        assert!(
+            !variables.contains_key(malformed),
+            "{malformed} reached the runner: {body}"
+        );
+    }
+    assert!(
+        variables.keys().all(|name| !name.contains('=')),
+        "a malformed variable name reached the runner: {body}"
+    );
+    // The narrowed deny list lets Go toolchain/application names through.
+    assert_eq!(variables["GOFLAGS"], "-mod=vendor", "{body}");
     assert_eq!(variables["SAFE_VALUE"], "first\nsecond");
     assert_eq!(variables["DEPLOY_TOKEN"], "secret-value");
     assert_ne!(

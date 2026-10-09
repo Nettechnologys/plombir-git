@@ -15,6 +15,10 @@ use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 
 use rg_db::ops::pipeline_ops;
+// One shape predicate and one reserved-name predicate, shared with the config
+// validator, the secrets API and the external runner (security audit finding
+// #2, `=`-name follow-up).
+use rg_core::ci::{is_reserved_ci_variable, valid_environment_name};
 
 /// A healthy embedded job must report liveness well inside the HTTP watchdog's
 /// ten-minute stale window. External runners do the same through their 30s
@@ -1959,18 +1963,10 @@ fn cache_spec(
     Ok(Some((key, paths)))
 }
 
-fn valid_environment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
-        && chars.all(|ch| matches!(ch, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
-}
-
-/// What a job may not name: the runner's own variables and everything that
-/// would configure the host process the job is launched from. One predicate
-/// with the config validator, the secrets API and the external-runner poll.
-fn is_reserved_ci_variable(name: &str) -> bool {
-    rg_core::ci::is_reserved_ci_variable(name)
-}
+// `valid_environment_name` and `is_reserved_ci_variable` live in
+// `rg_process::job_environment` / `rg_core::ci`: one shape predicate and one
+// reserved-name predicate for the config validator, the secrets API and both
+// executors (security audit finding #2).
 
 #[cfg(test)]
 mod tests {
@@ -2247,14 +2243,19 @@ mod tests {
         assert!(valid_environment_name("DEPLOY_TARGET_2"));
         assert!(!valid_environment_name("2TARGET"));
         assert!(!valid_environment_name("BAD-NAME"));
+        // A name carrying `=` cannot be an environment name: libc/Go `getenv`
+        // reads the entry up to the first `=`, so `PATH=/tmp` would become an
+        // effective job-supplied `PATH` (security audit finding #2, follow-up).
+        assert!(!valid_environment_name("PATH=/tmp"));
+        assert!(!valid_environment_name("HTTPS_PROXY=http://attacker:8080"));
         assert!(is_reserved_ci_variable("CI_JOB_TOKEN"));
         assert!(is_reserved_ci_variable("CI_REPOSITORY"));
         assert!(is_reserved_ci_variable("CI_REPOSITORY_OWNER"));
         assert!(!is_reserved_ci_variable("PROJECT_MODE"));
         // Names that act on the host `docker` CLI rather than in the container
         // (security audit finding #2): the loader, the client's own
-        // configuration, the Go runtime, TLS trust, proxies, and the shell's
-        // basics in both spellings Windows accepts.
+        // configuration, the Go runtime knobs, TLS trust, proxies, and the
+        // shell's basics in both spellings Windows accepts.
         for name in [
             "LD_PRELOAD",
             "LD_LIBRARY_PATH",
@@ -2265,6 +2266,7 @@ mod tests {
             "DOCKER_TLS_VERIFY",
             "GODEBUG",
             "GOTRACEBACK",
+            "GOMAXPROCS",
             "SSL_CERT_FILE",
             "HTTP_PROXY",
             "https_proxy",
@@ -2278,7 +2280,15 @@ mod tests {
         ] {
             assert!(is_reserved_ci_variable(name), "{name} must be reserved");
         }
-        for name in ["DEPLOY_TOKEN", "LANGUAGE", "MY_LD_FLAGS", "PROXY_USER"] {
+        for name in [
+            "DEPLOY_TOKEN",
+            "LANGUAGE",
+            "MY_LD_FLAGS",
+            "PROXY_USER",
+            "GOFLAGS",
+            "GOPROXY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ] {
             assert!(!is_reserved_ci_variable(name), "{name} must stay usable");
         }
     }
@@ -3214,6 +3224,12 @@ esac
                     "GODEBUG": "http2debug=2",
                     "http_proxy": "http://attacker",
                     "PATH": "/job/bin",
+                    // A name with `=` in it: `getenv` stops at the first `=`,
+                    // so these would read back as an effective `HTTPS_PROXY`
+                    // and `PATH` chosen by the job (security audit finding #2,
+                    // `=`-name follow-up).
+                    "HTTPS_PROXY=http://attacker:8080": "x",
+                    "PATH=/tmp": "y",
                     "MULTI_LINE": "first\nsecond",
                 })
                 .to_string(),
@@ -3255,10 +3271,34 @@ esac
             "GODEBUG=",
             "http_proxy=",
             "PATH=/job/bin",
+            // The malformed entries would show up literally as
+            // `HTTPS_PROXY=http://attacker:8080=x` and `PATH=/tmp=y`; an
+            // environment entry's effective name is what precedes its first
+            // `=`, and both of those are host-sensitive.
+            "HTTPS_PROXY=http://attacker:8080=",
+            "PATH=/tmp=",
         ] {
             assert!(
                 !env.lines().any(|line| line.starts_with(denied)),
                 "{denied} reached the docker CLI environment: {env}"
+            );
+        }
+        // Whatever host-sensitive name still appears by its effective name
+        // (the first `=` splits name from value) may only carry the operator's
+        // value: the job cannot express a denied name through a `=`-carrying
+        // one.
+        for line in env.lines() {
+            let Some((effective_name, value)) = line.split_once('=') else {
+                continue;
+            };
+            if !rg_core::ci::is_host_sensitive_variable(effective_name) {
+                continue;
+            }
+            let operator_value = std::env::var(effective_name).ok();
+            assert_eq!(
+                Some(value.to_string()),
+                operator_value,
+                "the job overrode `{effective_name}` in the docker CLI environment: {env}"
             );
         }
         if let Some(path) = std::env::var_os("PATH") {

@@ -12,8 +12,8 @@ use crate::config::{
     ResolvedRunner, RunnerCliArgs, RunnerIdentity,
 };
 use crate::executor::{
-    job_container_name, job_variables, pack_artifact, resolved_artifacts, resolved_cache,
-    run_job_docker, run_job_local,
+    docker_command, job_container_name, job_variables, pack_artifact, resolved_artifacts,
+    resolved_cache, run_job_docker, run_job_local,
 };
 use crate::workspace::{
     job_artifact_path, sweep_stale_job_entries, MAX_EXTERNAL_JOB_TIMEOUT_SECS, STALE_JOB_ENTRY_AGE,
@@ -509,9 +509,13 @@ const CONTAINER_REMOVAL_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// but the failure is named, because what it leaves behind is a container that
 /// keeps holding CPU, memory and the job's workspace mount.
 async fn remove_job_container(job_id: i64) {
-    let removal = tokio::process::Command::new("docker")
-        .args(["rm", "-f", &job_container_name(job_id)])
-        .output();
+    // The same empty-plus-allow-list environment as every other `docker`
+    // client this runner spawns: no job data flows here, but the runner
+    // process's own token and secrets have no business in a `docker rm`
+    // child either.
+    let mut command = docker_command(std::path::Path::new("docker"));
+    command.args(["rm", "-f", &job_container_name(job_id)]);
+    let removal = command.output();
     match tokio::time::timeout(CONTAINER_REMOVAL_TIMEOUT, removal).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {

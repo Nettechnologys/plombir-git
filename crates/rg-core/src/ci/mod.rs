@@ -147,7 +147,9 @@ pub fn is_builtin_ci_variable(name: &str) -> bool {
     BUILTIN_CI_VARIABLES.contains(&name)
 }
 
-pub use rg_process::job_environment::{docker_cli_environment, is_host_sensitive_variable};
+pub use rg_process::job_environment::{
+    docker_cli_environment, is_host_sensitive_variable, valid_environment_name,
+};
 
 /// A name no user-supplied variable may take: the runner's vocabulary above,
 /// plus every name that would reconfigure the host process a job is launched

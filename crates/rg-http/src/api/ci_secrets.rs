@@ -35,6 +35,12 @@ pub(crate) fn valid_secret_name(name: &str) -> bool {
     matches!(chars.next(), Some('_' | 'A'..='Z'))
         && chars.all(|ch| matches!(ch, '_' | 'A'..='Z' | '0'..='9'))
         && name.len() <= 100
+        // The `[A-Z_][A-Z0-9_]*` check above is narrower than, and therefore
+        // implies, the shared `[A-Za-z_][A-Za-z0-9_]*` environment-name shape.
+        // Stated here too so a future widening cannot silently admit a name
+        // that `execve`/`getenv` reads as something else (`PATH=/tmp` reads
+        // back as `PATH`) — security audit finding #2, `=`-name follow-up.
+        && rg_core::ci::valid_environment_name(name)
         // The runner's own names and every name that would reconfigure the
         // host `docker` CLI the secret passes through (`LD_PRELOAD`,
         // `DOCKER_HOST`, proxies…): security audit finding #2.
@@ -73,7 +79,7 @@ pub async fn put(
         Err(error) => return error.into_response(),
     };
     if !valid_secret_name(&secret_name) {
-        return AppError::bad_request("secret names must match [A-Z_][A-Z0-9_]*, be at most 100 characters, and not use reserved CI names or names that configure the host (PATH, HOME, LD_*, DOCKER_*, GO*, *_PROXY, SSL_CERT_*, LC_*, TMPDIR, LANG)").into_response();
+        return AppError::bad_request("secret names must match [A-Z_][A-Z0-9_]*, be at most 100 characters, and not use reserved CI names or names that configure the host (PATH, HOME, LD_*, DYLD_*, DOCKER_*, the Go runtime knobs GODEBUG/GOTRACEBACK/GOMEMLIMIT/GOMAXPROCS/GOGC/GOTMPDIR/GOENV/GORACE, SSL_CERT_*, *_PROXY, LC_*, TMPDIR, LANG)").into_response();
     }
     if body.value.len() < 4 || body.value.len() > 65_536 {
         return AppError::bad_request("secret value must contain 4-65536 bytes").into_response();
@@ -183,5 +189,19 @@ mod tests {
         }
         assert!(valid_secret_name("AWS_SECRET_ACCESS_KEY"));
         assert!(valid_secret_name("PROXY_PASSWORD"));
+        // Go toolchain/application names pass: they never reach the Docker CLI
+        // process (security audit finding #2, follow-up review).
+        assert!(valid_secret_name("GOFLAGS"));
+        assert!(valid_secret_name("GOPROXY"));
+        assert!(valid_secret_name("GOOGLE_APPLICATION_CREDENTIALS"));
+        // And the shape the shared predicate enforces is implied here: a name
+        // with `=` (or any other non-NAME byte) never passes.
+        for name in [
+            "PATH=/tmp",
+            "HTTPS_PROXY=http://attacker:8080",
+            "LD_PRELOAD=/workspace/evil.so",
+        ] {
+            assert!(!valid_secret_name(name), "{name} must be refused");
+        }
     }
 }

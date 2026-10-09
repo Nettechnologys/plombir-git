@@ -215,7 +215,7 @@ pub(crate) async fn run_job_docker(
 /// shell exported; none of it belongs to a `docker` child. The CLI gets back
 /// only what it needs to find and reach the daemon
 /// (`rg_process::job_environment::docker_cli_environment`).
-fn docker_command(program: &std::path::Path) -> tokio::process::Command {
+pub(crate) fn docker_command(program: &std::path::Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(program);
     command
         .kill_on_drop(true)
@@ -229,14 +229,17 @@ fn docker_command(program: &std::path::Path) -> tokio::process::Command {
 /// Everything the server sent minus the names that would act on the host
 /// `docker` CLI they pass through — `LD_PRELOAD` loads a library out of the
 /// workspace into the runner's own process, `DOCKER_HOST` hands the whole
-/// command, secrets included, to another daemon. The server strips them too;
-/// this runner does not rely on that (security audit finding #2). `PATH`,
-/// `LANG` and `HOME` are among them: they are the local executor's, and the
-/// container keeps its image's own.
+/// command, secrets included, to another daemon — and minus names that are not
+/// `[A-Za-z_][A-Za-z0-9_]*`: `getenv` stops at the first `=`, so a variable
+/// called `PATH=/tmp` would read back as a job-chosen `PATH` (security audit
+/// finding #2, `=`-name follow-up). The server strips them too; this runner
+/// does not rely on that. `PATH`, `LANG` and `HOME` are among them: they are
+/// the local executor's, and the container keeps its image's own.
 fn container_variables(variables: &[(String, String)]) -> impl Iterator<Item = &(String, String)> {
-    variables
-        .iter()
-        .filter(|(name, _)| !rg_process::job_environment::is_host_sensitive_variable(name))
+    variables.iter().filter(|(name, _)| {
+        rg_process::job_environment::valid_environment_name(name)
+            && !rg_process::job_environment::is_host_sensitive_variable(name)
+    })
 }
 
 async fn run_job_docker_with(
@@ -367,6 +370,19 @@ pub(crate) fn job_variables(value: Option<&serde_json::Value>) -> Vec<(String, S
                         serde_json::Value::Bool(value) => value.to_string(),
                         _ => return None,
                     };
+                    // An environment entry is `NAME=VALUE` and `getenv` stops
+                    // at the first `=`: a variable the server called
+                    // `PATH=/tmp` would act as a job-chosen `PATH` on the
+                    // runner host. The server strips these from polls; this is
+                    // the runner's own last line (security audit finding #2,
+                    // `=`-name follow-up).
+                    if !rg_process::job_environment::valid_environment_name(key) {
+                        tracing::warn!(
+                            variable = %key,
+                            "dropping job variable with a malformed name"
+                        );
+                        return None;
+                    }
                     Some((key.clone(), value))
                 })
                 .collect::<Vec<_>>()
@@ -393,6 +409,30 @@ mod tests {
         assert!(msg.contains("Refusing to fall back to local execution"));
     }
 
+    /// A polled variable whose name carries `=` cannot be expressed as an
+    /// environment entry: `getenv` reads up to the first `=`. It is dropped
+    /// before either executor sees it (security audit finding #2, follow-up).
+    #[test]
+    fn malformed_job_variable_names_are_dropped_before_execution() {
+        let variables = job_variables(Some(&serde_json::json!({
+            "PATH=/tmp": "y",
+            "HTTPS_PROXY=http://attacker:8080": "x",
+            "LD_PRELOAD=/workspace/evil.so": "z",
+            "GOFLAGS": "-mod=vendor",
+            "SAFE": "yes",
+        })));
+        let names: Vec<&str> = variables.iter().map(|(name, _)| name.as_str()).collect();
+        for dropped in [
+            "PATH=/tmp",
+            "HTTPS_PROXY=http://attacker:8080",
+            "LD_PRELOAD=/workspace/evil.so",
+        ] {
+            assert!(!names.contains(&dropped), "{dropped} survived: {names:?}");
+        }
+        assert!(names.contains(&"GOFLAGS"), "{names:?}");
+        assert!(names.contains(&"SAFE"), "{names:?}");
+    }
+
     #[test]
     fn docker_run_args_apply_sandbox_hardening() {
         let variables = vec![
@@ -407,6 +447,16 @@ mod tests {
             ("PATH".to_string(), "/runner/bin".to_string()),
             ("HOME".to_string(), "/runner/home".to_string()),
             ("LANG".to_string(), "C.UTF-8".to_string()),
+            // `getenv` reads the entry up to the first `=`, so these would act
+            // as a job-chosen `HTTPS_PROXY`/`PATH` (finding #2, follow-up).
+            (
+                "HTTPS_PROXY=http://attacker:8080".to_string(),
+                "x".to_string(),
+            ),
+            ("PATH=/tmp".to_string(), "y".to_string()),
+            // Legitimate Go configuration still reaches the container: it is
+            // the toolchain, not the Docker CLI, that reads it.
+            ("GOFLAGS".to_string(), "-mod=vendor".to_string()),
         ];
         let args = docker_run_args(
             "alpine:3.20",
@@ -446,6 +496,7 @@ mod tests {
 
         // Secret values must not appear on the command line — only the name.
         assert!(window("-e", "CI_JOB_TOKEN"));
+        assert!(window("-e", "GOFLAGS"));
         assert!(
             !args.iter().any(|a| a == "secret"),
             "secret value leaked into argv"
@@ -463,6 +514,20 @@ mod tests {
             assert!(
                 !window("-e", denied),
                 "{denied} reached the container argument list: {args:?}"
+            );
+        }
+        // Every name that did reach `-e` is well-formed and non-sensitive by
+        // its effective name (`getenv` reads up to the first `=`).
+        for pair in args.windows(2) {
+            if pair[0] != "-e" {
+                continue;
+            }
+            let effective = pair[1]
+                .split_once('=')
+                .map_or(pair[1].as_str(), |(name, _)| name);
+            assert!(
+                !rg_process::job_environment::is_host_sensitive_variable(effective),
+                "`{effective}` reached -e: {args:?}"
             );
         }
 
@@ -541,6 +606,15 @@ esac
             ("GODEBUG".to_string(), "http2debug=2".to_string()),
             ("http_proxy".to_string(), "http://attacker".to_string()),
             ("PATH".to_string(), "/job/bin".to_string()),
+            // A name with `=` in it: `getenv` would read back the name before
+            // the first `=` (security audit finding #2, follow-up).
+            (
+                "HTTPS_PROXY=http://attacker:8080".to_string(),
+                "x".to_string(),
+            ),
+            ("PATH=/tmp".to_string(), "y".to_string()),
+            // A legitimate Go variable must keep working.
+            ("GOFLAGS".to_string(), "-mod=vendor".to_string()),
         ];
         let (code, log) = run_job_docker_with(
             &program,
@@ -567,12 +641,34 @@ esac
             "GODEBUG=",
             "http_proxy=",
             "PATH=/job/bin",
+            // The crafted names would appear literally as
+            // `HTTPS_PROXY=http://attacker:8080=x` and `PATH=/tmp=y`.
+            "HTTPS_PROXY=http://attacker:8080=",
+            "PATH=/tmp=",
         ] {
             assert!(
                 !env.lines().any(|line| line.starts_with(denied)),
                 "{denied} reached the docker CLI environment: {env}"
             );
         }
+        // Whatever host-sensitive name still appears by its effective name
+        // (the first `=` splits name from value) carries only the operator's
+        // value: a job cannot express a denied name through a `=`-carrying one.
+        for line in env.lines() {
+            let Some((effective, value)) = line.split_once('=') else {
+                continue;
+            };
+            if !rg_process::job_environment::is_host_sensitive_variable(effective) {
+                continue;
+            }
+            assert_eq!(
+                Some(value.to_string()),
+                std::env::var(effective).ok(),
+                "the job overrode `{effective}` in the docker CLI environment: {env}"
+            );
+        }
+        // A Go variable the CLI does not read still arrives.
+        assert!(has("GOFLAGS=-mod=vendor"), "{env}");
         if let Some(path) = std::env::var_os("PATH") {
             assert!(
                 has(&format!("PATH={}", path.to_string_lossy())),
@@ -582,12 +678,15 @@ esac
 
         let args = std::fs::read_to_string(temp.path().join("run.args")).unwrap();
         assert!(args.lines().any(|line| line == "MULTI_LINE"), "{args}");
+        assert!(args.lines().any(|line| line == "GOFLAGS"), "{args}");
         for leaked in [
             "job-token",
             "first",
             "LD_PRELOAD",
             "DOCKER_HOST",
             "/job/bin",
+            "PATH=/tmp",
+            "HTTPS_PROXY=http://attacker:8080",
         ] {
             assert!(
                 !args.lines().any(|line| line == leaked),

@@ -1500,11 +1500,26 @@ fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
             .flat_map(|variables| variables.keys())
             .chain(matrix_keys)
         {
+            // A name that is not `[A-Za-z_][A-Za-z0-9_]*` cannot survive
+            // `execve`: libc/Go `getenv` stops at the first `=`, so a variable
+            // called `PATH=/tmp` would read back as a job-chosen `PATH`
+            // (security audit finding #2, follow-up). A malformed name is a
+            // config error, not something to silently drop, so the trigger is
+            // refused with a 400 the author can act on.
+            if !rg_core::ci::valid_environment_name(variable) {
+                return Err(rg_core::error::invalid_request(format!(
+                    "job '{name}' sets variable '{variable}', which is not a valid environment \
+                     name: names must match [A-Za-z_][A-Za-z0-9_]* (a name containing '=' would \
+                     be read as the variable before the first '=')"
+                )));
+            }
             if rg_core::ci::is_reserved_ci_variable(variable) {
                 return Err(rg_core::error::invalid_request(format!(
                     "job '{name}' sets variable '{variable}', which is reserved: a job may not \
                      set the runner's CI_* variables or names that configure the host (PATH, \
-                     HOME, TMPDIR, LANG, LC_*, LD_*, DYLD_*, DOCKER_*, GO*, SSL_CERT_*, *_PROXY)"
+                     HOME, TMPDIR, LANG, LC_*, LD_*, DYLD_*, DOCKER_*, the Go runtime knobs \
+                     GODEBUG, GOTRACEBACK, GOMEMLIMIT, GOMAXPROCS, GOGC, GOTMPDIR, GOENV, \
+                     GORACE, SSL_CERT_*, *_PROXY)"
                 )));
             }
         }
@@ -6600,6 +6615,33 @@ mod matrix_tests {
         }
         validate_execution_semantics(&with_variable("DEPLOY_TARGET"))
             .expect("an ordinary variable is still accepted");
+        // A name that cannot be an `execve` entry — libc/Go `getenv` stops at
+        // the first `=` — is a config error at trigger time, not something to
+        // silently drop (security audit finding #2, follow-up).
+        for name in ["PATH=/tmp", "HTTPS_PROXY=http://attacker:8080", "BAD-NAME"] {
+            let error = validate_execution_semantics(&with_variable(name))
+                .expect_err("a malformed name must be refused");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("deploy")
+                    && message.contains(name)
+                    && message.contains("not a valid environment name"),
+                "the rejection must name the job, the variable and the reason: {message}"
+            );
+        }
+        // Go toolchain/application configuration is legitimate: only the
+        // runtime knobs that act on the host Docker CLI are refused
+        // (security audit finding #2, follow-up review).
+        for name in [
+            "GOFLAGS",
+            "GOPROXY",
+            "GOPRIVATE",
+            "GOTOOLCHAIN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ] {
+            validate_execution_semantics(&with_variable(name))
+                .expect("a Go toolchain or application variable must be accepted");
+        }
 
         // A matrix key becomes a variable of the same name.
         let matrix = CiConfig {
@@ -6618,6 +6660,27 @@ mod matrix_tests {
             .expect_err("a matrix key that configures the host must be refused");
         assert!(format!("{error:#}").contains("DOCKER_HOST"), "{error:#}");
 
+        // The same holds for a matrix key shaped like `PATH=/tmp`: it becomes a
+        // variable of that name.
+        let matrix = CiConfig {
+            stages: Some(vec!["test".into()]),
+            concurrency: None,
+            jobs: HashMap::from([(
+                "deploy".into(),
+                config(BTreeMap::from([(
+                    "PATH=/tmp".to_owned(),
+                    vec!["y".to_owned()],
+                )])),
+            )]),
+            actions_workflow: false,
+        };
+        let error = validate_execution_semantics(&matrix)
+            .expect_err("a malformed matrix key must be refused");
+        assert!(
+            format!("{error:#}").contains("not a valid environment name"),
+            "{error:#}"
+        );
+
         // An Actions workflow's `env:` arrives here as the job's variables.
         let (temp, sha) = commit_repo(&[(
             ".gitea/workflows/ci.yml",
@@ -6633,6 +6696,33 @@ mod matrix_tests {
             message.contains("ci/build") && message.contains("LD_PRELOAD"),
             "{message}"
         );
+
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/ci.yml",
+            b"on: push\nenv:\n  PATH=/tmp: y\njobs:\n  build:\n    steps:\n      - run: echo hi\n",
+        )]);
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect("the workflow itself parses; the name is judged by the validator");
+        let error = validate_execution_semantics(&config)
+            .expect_err("a workflow env: name that cannot be an execve entry must be refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ci/build")
+                && message.contains("PATH=/tmp")
+                && message.contains("not a valid environment name"),
+            "{message}"
+        );
+        // A Go name the host CLI does not read still passes.
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/ci.yml",
+            b"on: push\nenv:\n  GOFLAGS: -mod=vendor\njobs:\n  build:\n    steps:\n      - run: echo hi\n",
+        )]);
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect("the workflow itself parses");
+        validate_execution_semantics(&config)
+            .expect("GOFLAGS is a toolchain variable, not a Docker CLI one");
     }
 
     /// `tags:` names the labels a runner must carry, and the only code that ever

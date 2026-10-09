@@ -16,17 +16,50 @@
 ///
 /// Matched case-insensitively on purpose: Windows reads `path` and `PATH` as
 /// one variable, and the lowercase proxy spellings are the ones libcurl and
-/// Go honour. `GO*` is a prefix rather than a list because the Go runtime
-/// behind the Docker CLI grows new `GO…` knobs with every release.
+/// Go honour. The Go runtime knobs are an explicit list, not a `GO*` prefix:
+/// `GOFLAGS`, `GOPROXY`, `GOPRIVATE`, `GOTOOLCHAIN` and
+/// `GOOGLE_APPLICATION_CREDENTIALS` are read by the Go *toolchain* or by
+/// application code, never by the Docker CLI, so a job may legitimately set
+/// them.
 pub fn is_host_sensitive_variable(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     matches!(
         name.as_str(),
         "PATH" | "HOME" | "TMPDIR" | "TMP" | "TEMP" | "LANG"
-    ) || ["LD_", "DYLD_", "DOCKER_", "GO", "SSL_CERT_", "LC_"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
+    ) || [
+        // The names that make the *runtime* of a Go program — which the
+        // Docker CLI is — change behaviour (crashes, traces, temp files,
+        // memory and CPU limits, race detector settings).
+        "GODEBUG",
+        "GOTRACEBACK",
+        "GOMEMLIMIT",
+        "GOMAXPROCS",
+        "GOGC",
+        "GOTMPDIR",
+        "GOENV",
+        "GORACE",
+    ]
+    .iter()
+    .any(|knob| name == *knob)
+        || ["LD_", "DYLD_", "DOCKER_", "SSL_CERT_", "LC_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
         || name.ends_with("_PROXY")
+}
+
+/// Is this a name libc and Go `getenv` would read back as the same variable?
+///
+/// Unix environment entries are `NAME=VALUE` strings and both readers stop at
+/// the first `=`, so a *name* containing `=` cannot be expressed at all: a job
+/// variable called `PATH=/tmp` becomes the entry `PATH=/tmp=<value>`, whose
+/// effective `PATH` is the attacker's. A name that cannot survive the trip
+/// through `execve` is rejected wherever one enters the pipeline (workflow
+/// validation, the secrets API, the runner poll) and dropped again in both
+/// executors.
+pub fn valid_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
+        && chars.all(|ch| matches!(ch, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
 }
 
 /// Does the host `docker` CLI inherit this variable from the runner process?
@@ -103,7 +136,12 @@ mod tests {
             "DOCKER_TLS_VERIFY",
             "GODEBUG",
             "GOTRACEBACK",
-            "GOFLAGS",
+            "GOMEMLIMIT",
+            "GOMAXPROCS",
+            "GOGC",
+            "GOTMPDIR",
+            "GOENV",
+            "GORACE",
             "SSL_CERT_FILE",
             "SSL_CERT_DIR",
             "HTTP_PROXY",
@@ -144,6 +182,57 @@ mod tests {
             assert!(
                 !is_host_sensitive_variable(name),
                 "{name} is an ordinary job variable"
+            );
+        }
+    }
+
+    /// Legitimate Go configuration must keep reaching the container: these
+    /// names configure the toolchain or application code, not the Docker CLI
+    /// process. A blanket `GO*` prefix once refused them with a hard 400 and no
+    /// fallback (security audit finding #2, follow-up review).
+    #[test]
+    fn go_names_that_do_not_reconfigure_the_docker_cli_pass() {
+        for name in [
+            "GOFLAGS",
+            "GOPROXY",
+            "GOPRIVATE",
+            "GONOSUMDB",
+            "GOSUMDB",
+            "GOTOOLCHAIN",
+            "GOCACHE",
+            "GOMODCACHE",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GO111MODULE",
+            "goflags",
+        ] {
+            assert!(
+                !is_host_sensitive_variable(name),
+                "{name} configures the Go toolchain or an application, not the Docker CLI"
+            );
+        }
+    }
+
+    #[test]
+    fn environment_names_are_judged_by_their_execve_shape() {
+        for name in ["DEPLOY_TARGET_2", "a", "_PRIVATE", "x9", "Https_Proxy"] {
+            assert!(
+                valid_environment_name(name),
+                "{name} is a name execve can carry"
+            );
+        }
+        for name in [
+            "2TARGET",
+            "BAD-NAME",
+            "PATH=/tmp",
+            "LD_PRELOAD=/workspace/evil.so",
+            "HTTPS_PROXY=http://attacker:8080",
+            "WITH SPACE",
+            "HAS\nNEWLINE",
+            "",
+        ] {
+            assert!(
+                !valid_environment_name(name),
+                "{name:?} must not pass for an environment name"
             );
         }
     }
