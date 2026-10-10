@@ -391,6 +391,21 @@ fn require_positive(key: &str, value: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Turns a log-appender failure into an operator-facing error: the appender's
+/// own error names neither the directory nor the reason, and an unwritable
+/// bind-mounted log directory is the usual cause.
+fn log_appender_error(log_dir: &std::path::Path, error: impl std::fmt::Display) -> anyhow::Error {
+    let mut message = format!(
+        "failed to create log appender in {}: {error}\n  \
+         hint: point `--log-file` / `[logging].file` at a path the server can write to",
+        log_dir.display()
+    );
+    if let Some(hint) = rg_core::platform::fs::ownership_hint(log_dir) {
+        message.push_str(&format!("\n  hint: {hint}"));
+    }
+    anyhow::anyhow!(message)
+}
+
 /// Range-validate the always-consumed numeric timeout / rate-limit knobs, whose
 /// `0` values are silently accepted by serde `#[serde(default)]` but break the
 /// consumer. Extracted as a pure function so the boundary behaviour stays
@@ -767,8 +782,9 @@ pub(crate) async fn run_serve(
         None
     };
 
-    // `max_size_mb` is resolved like every other knob below, but nothing
-    // enforces it; whether anyone *asked* for it is what decides the warning.
+    // Whether anyone *asked* for a size cap decides the rotation strategy
+    // below: explicitly set means size rotation, absent means daily rotation
+    // (the built-in default is only ever a placeholder for the config table).
     let log_max_size_mb_was_set = log_max_size_mb.is_some()
         || cfg
             .as_ref()
@@ -1041,41 +1057,41 @@ pub(crate) async fn run_serve(
         BoxMakeWriter,
         Option<tracing_appender::non_blocking::WorkerGuard>,
     ) = if let Some(ref log_path) = resolved_log_file {
-        let log_dir = std::path::Path::new(log_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let log_prefix = std::path::Path::new(log_path)
+        let log_path = std::path::Path::new(log_path);
+        let log_dir = log_path.parent().unwrap_or(std::path::Path::new("."));
+        let log_prefix = log_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("plombir-git");
-        let log_suffix = std::path::Path::new(log_path)
+        let log_suffix = log_path
             .extension()
             .and_then(|s| s.to_str())
             .unwrap_or("log");
 
-        let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        if log_max_size_mb_was_set {
+            // A size cap was asked for: enforce it. The writer rotates the live
+            // file into `app.log.1` … `app.log.<max_files>` as it fills.
+            require_positive("logging.max_size_mb", resolved_log_max_size_mb)?;
+            let writer = crate::log_rotation::SizeRotatingWriter::new(
+                log_path,
+                resolved_log_max_size_mb.saturating_mul(1024 * 1024),
+                resolved_log_max_files,
+            )
+            .map_err(|e| log_appender_error(log_dir, e))?;
+            let (non_blocking, guard) = tracing_appender::non_blocking(writer);
+            (BoxMakeWriter::new(non_blocking), Some(guard))
+        } else {
+            let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
                 .rotation(tracing_appender::rolling::Rotation::DAILY)
                 .filename_prefix(log_prefix)
                 .filename_suffix(log_suffix)
                 .max_log_files(resolved_log_max_files)
                 .build(log_dir)
-                .map_err(|e| {
-                    // The appender error names neither the directory nor the
-                    // reason, and an unwritable bind-mounted log directory is
-                    // the usual cause — carry both.
-                    let mut message = format!(
-                        "failed to create log appender in {}: {e}\n  \
-                         hint: point `--log-file` / `[logging].file` at a path the server can write to",
-                        log_dir.display()
-                    );
-                    if let Some(hint) = rg_core::platform::fs::ownership_hint(log_dir) {
-                        message.push_str(&format!("\n  hint: {hint}"));
-                    }
-                    anyhow::anyhow!(message)
-                })?;
+                .map_err(|e| log_appender_error(log_dir, e))?;
 
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        (BoxMakeWriter::new(non_blocking), Some(guard))
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            (BoxMakeWriter::new(non_blocking), Some(guard))
+        }
     } else {
         (BoxMakeWriter::new(std::io::stdout), None)
     };
@@ -1100,23 +1116,24 @@ pub(crate) async fn run_serve(
     );
 
     match resolved_log_file {
-        Some(ref log_path) => tracing::info!(
-            file = %log_path,
-            format = resolved_log_format.as_str(),
-            "Logging to file with daily rotation"
-        ),
+        Some(ref log_path) => {
+            if log_max_size_mb_was_set {
+                tracing::info!(
+                    file = %log_path,
+                    format = resolved_log_format.as_str(),
+                    max_size_mb = resolved_log_max_size_mb,
+                    max_files = resolved_log_max_files,
+                    "Logging to file with size rotation"
+                );
+            } else {
+                tracing::info!(
+                    file = %log_path,
+                    format = resolved_log_format.as_str(),
+                    "Logging to file with daily rotation"
+                );
+            }
+        }
         None => tracing::info!(format = resolved_log_format.as_str(), "Logging to stdout"),
-    }
-    // Said whenever it is set, not only when it differs from the default: the
-    // example config used to carry `max_size_mb = 10`, which matched the
-    // default and so never warned — a size cap every reader believed in and
-    // nothing applied (card_0d7755e0dfe0).
-    if log_max_size_mb_was_set {
-        tracing::warn!(
-            max_size_mb = resolved_log_max_size_mb,
-            "[logging].max_size_mb / --log-max-size-mb is not enforced: log files rotate daily, \
-             not by size. Use max_files to cap how many are kept, and remove this setting."
-        );
     }
 
     // A half-written `[smtp]` or `[tls]` stops the start here, before the

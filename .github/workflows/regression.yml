@@ -10,6 +10,26 @@ on:
 env:
   CARGO_INCREMENTAL: "0"
 
+# Least privilege for every job in this workflow. The repository's CI only ever
+# reads its own contents: nothing here pushes an image (the docker-image job
+# builds and loads into the runner's daemon, `push: false`), comments on a pull
+# request, or writes a release. A job that later needs more must add its own
+# `permissions:` block naming exactly what it needs; keep this default as small
+# as it is so such an elevation is a visible diff in the job's own stanza.
+permissions:
+  contents: read
+
+# Every `uses:` below is pinned to a full commit SHA with the release tag in a
+# trailing comment, and a new one must be too. A floating tag (`@v4`) is a
+# mutable ref in somebody else's repository: whoever can retag it runs their
+# code in this workflow, with this token, on every push to main — and the
+# difference is invisible in review, where `@v4` looks the same before and
+# after. `contents: read` above bounds the damage; it does not remove the
+# execution. Update a pin by resolving the tag to its commit at the tag
+# (`git ls-remote --tags <repo>`, or the GitHub API) rather than by pasting a
+# SHA from a blog post, and leave the `# vX.Y.Z` comment so the next reader
+# knows which release is running.
+
 jobs:
   # Formatting is a ratchet, not a preference: before this gate existed the
   # workspace drifted to 51 non-rustfmt-clean files, and the working rule became
@@ -25,7 +45,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Every job installs the toolchain `rust-toolchain.toml` names, with the
       # components it lists, rather than whatever `stable` is on the day of the
@@ -61,7 +81,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install system dependencies
         run: |
@@ -74,7 +94,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # --all-targets so tests, examples and benches are linted too: the deny
       # lints are about code that runs, and test code holding a guard across an
@@ -99,7 +119,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install system dependencies
         run: |
@@ -110,7 +130,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build the workspace documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps -j 6
@@ -121,7 +141,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install system dependencies
         run: |
@@ -132,11 +152,11 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Prebuilt binary — no from-source compile, keeps the gate fast.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-nextest
 
@@ -173,14 +193,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust
         run: rustup toolchain install --no-self-update
 
       # Prebuilt binaries — no from-source compile, keeps the gate fast.
       - name: Install cargo-audit and cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-audit,cargo-deny
 
@@ -207,7 +227,7 @@ jobs:
       # continue-on-error to promote this to a blocking gate.
       - name: Install osv-scanner
         continue-on-error: true
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: osv-scanner
 
@@ -223,7 +243,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install system dependencies
         run: |
@@ -234,7 +254,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build Plombir Git
         run: cargo build -p rg-cli
@@ -255,7 +275,7 @@ jobs:
     timeout-minutes: 40
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install system dependencies
         run: |
@@ -266,10 +286,10 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -311,13 +331,13 @@ jobs:
       PLOMBIR_GIT_TEST_DATABASE_URL: postgres://plombir_git:plombir_git@127.0.0.1:5432/plombir_git
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # First, deliberately: this reproduces the original failure only while the
       # database is still empty, because that is when concurrent migrators race
@@ -388,13 +408,13 @@ jobs:
       PLOMBIR_GIT_TEST_DATABASE_URL: mysql://plombir_git:plombir_git@127.0.0.1:3306/plombir_git
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Allow the migration account to create triggers with binary logging
         run: >-
@@ -456,10 +476,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
@@ -499,10 +519,10 @@ jobs:
         working-directory: web
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -537,7 +557,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Globs deploy/docker-compose*.yml rather than naming the files, for the
       # same reason the contract-check runner does: the two named here used to
@@ -612,7 +632,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Grafana has no offline provisioning linter. Use the same real YAML
       # parser as the workflow contract gate, installed explicitly so a runner
@@ -754,7 +774,7 @@ jobs:
       - name: Checkout
         # Full history: the path gate diffs against the pull request's base
         # commit, which a depth-1 checkout does not have.
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -786,7 +806,7 @@ jobs:
 
       - name: Set up Buildx
         if: steps.scope.outputs.build == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       # cache-from/to type=gha is what keeps a source-only pull request
       # affordable: stage 2c compiles the whole dependency tree and only has to
@@ -804,7 +824,7 @@ jobs:
       # image stays inside buildx and never reaches the daemon.
       - name: Build the production image
         if: steps.scope.outputs.build == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: Dockerfile
@@ -871,7 +891,7 @@ jobs:
       # image detail that changes under it.
       - name: Install Node
         if: steps.scope.outputs.build == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 

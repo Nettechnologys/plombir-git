@@ -211,9 +211,9 @@ pub(crate) enum Commands {
         #[arg(long, value_enum)]
         log_format: Option<crate::config::LogFormat>,
 
-        /// Log rotation: nominal max log file size in MB. NOT ENFORCED: the
-        /// file appender rotates daily, not by size, and the server warns at
-        /// startup when this is set. Kept so older configs still start.
+        /// Log rotation: rotate the log file once it reaches this many MB
+        /// (keeping `max_files` older ones as app.log.1, app.log.2, …). Left
+        /// unset the file appender rotates daily instead.
         /// [config: [logging].max_size_mb] [default: 10]
         #[arg(long)]
         log_max_size_mb: Option<u64>,

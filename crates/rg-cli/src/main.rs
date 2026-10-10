@@ -18,6 +18,7 @@ mod cli;
 mod commands;
 mod config;
 mod dbconn;
+mod log_rotation;
 mod repo_root;
 mod runner;
 mod serve;
