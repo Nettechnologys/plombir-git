@@ -1,4 +1,5 @@
 import { request, qs, type PaginatedResponse } from './_base.svelte';
+import { repoPath } from './repoPath';
 
 /** Why a notification row reached the account (card_349c2b6a0d7c); `null` for repository-watch rows. */
 export type NotificationReason = 'review_requested' | 'assigned' | 'mention' | 'ci_failed' | 'participating';
@@ -69,16 +70,16 @@ export const notifications = {
   // every route stays statically visible to the API alignment checks.
   subscription: (owner: string, repo: string, kind: ThreadKind, number: number) =>
     kind === 'issues'
-      ? request<ThreadSubscription>(`/repos/${owner}/${repo}/issues/${number}/subscription`)
-      : request<ThreadSubscription>(`/repos/${owner}/${repo}/pulls/${number}/subscription`),
+      ? request<ThreadSubscription>(`${repoPath(owner, repo)}/issues/${number}/subscription`)
+      : request<ThreadSubscription>(`${repoPath(owner, repo)}/pulls/${number}/subscription`),
   /** Follow the thread; the answer carries `reason: 'manual'`. */
   subscribe: (owner: string, repo: string, kind: ThreadKind, number: number) =>
     kind === 'issues'
-      ? request<ThreadSubscription>(`/repos/${owner}/${repo}/issues/${number}/subscription`, { method: 'PUT' })
-      : request<ThreadSubscription>(`/repos/${owner}/${repo}/pulls/${number}/subscription`, { method: 'PUT' }),
+      ? request<ThreadSubscription>(`${repoPath(owner, repo)}/issues/${number}/subscription`, { method: 'PUT' })
+      : request<ThreadSubscription>(`${repoPath(owner, repo)}/pulls/${number}/subscription`, { method: 'PUT' }),
   /** Unfollow; an explicit unfollow survives commenting again. */
   unsubscribe: (owner: string, repo: string, kind: ThreadKind, number: number) =>
     kind === 'issues'
-      ? request<ThreadSubscription>(`/repos/${owner}/${repo}/issues/${number}/subscription`, { method: 'DELETE' })
-      : request<ThreadSubscription>(`/repos/${owner}/${repo}/pulls/${number}/subscription`, { method: 'DELETE' }),
+      ? request<ThreadSubscription>(`${repoPath(owner, repo)}/issues/${number}/subscription`, { method: 'DELETE' })
+      : request<ThreadSubscription>(`${repoPath(owner, repo)}/pulls/${number}/subscription`, { method: 'DELETE' }),
 };

@@ -1,4 +1,5 @@
 import { request } from './_base.svelte';
+import { repoPath } from './repoPath';
 
 export interface RepositoryMirror {
   id: number;
@@ -25,19 +26,19 @@ export interface MirrorPayload {
 
 export const mirrors = {
   get: (owner: string, repo: string) =>
-    request<RepositoryMirror>(`/repos/${owner}/${repo}/mirror`),
+    request<RepositoryMirror>(`${repoPath(owner, repo)}/mirror`),
   create: (owner: string, repo: string, payload: MirrorPayload) =>
-    request<RepositoryMirror>(`/repos/${owner}/${repo}/mirror`, {
+    request<RepositoryMirror>(`${repoPath(owner, repo)}/mirror`, {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
   update: (owner: string, repo: string, payload: Partial<MirrorPayload> & { status?: string }) =>
-    request<RepositoryMirror>(`/repos/${owner}/${repo}/mirror`, {
+    request<RepositoryMirror>(`${repoPath(owner, repo)}/mirror`, {
       method: 'PATCH',
       body: JSON.stringify(payload),
     }),
   remove: (owner: string, repo: string) =>
-    request<void>(`/repos/${owner}/${repo}/mirror`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/mirror`, { method: 'DELETE' }),
   sync: (owner: string, repo: string) =>
-    request<{ status: string }>(`/repos/${owner}/${repo}/mirror/sync`, { method: 'POST' }),
+    request<{ status: string }>(`${repoPath(owner, repo)}/mirror/sync`, { method: 'POST' }),
 };

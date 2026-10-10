@@ -1,4 +1,5 @@
 import { request } from './_base.svelte';
+import { repoPath } from './repoPath';
 
 export interface RepositoryWebhook {
   id: number;
@@ -35,23 +36,23 @@ export interface WebhookPayload {
 
 export const webhooks = {
   list: (owner: string, repo: string) =>
-    request<RepositoryWebhook[]>(`/repos/${owner}/${repo}/hooks`),
+    request<RepositoryWebhook[]>(`${repoPath(owner, repo)}/hooks`),
   create: (owner: string, repo: string, payload: WebhookPayload) =>
-    request<RepositoryWebhook>(`/repos/${owner}/${repo}/hooks`, {
+    request<RepositoryWebhook>(`${repoPath(owner, repo)}/hooks`, {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
   get: (owner: string, repo: string, id: number) =>
-    request<RepositoryWebhook>(`/repos/${owner}/${repo}/hooks/${id}`),
+    request<RepositoryWebhook>(`${repoPath(owner, repo)}/hooks/${id}`),
   update: (owner: string, repo: string, id: number, payload: Partial<WebhookPayload>) =>
-    request<RepositoryWebhook>(`/repos/${owner}/${repo}/hooks/${id}`, {
+    request<RepositoryWebhook>(`${repoPath(owner, repo)}/hooks/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(payload),
     }),
   remove: (owner: string, repo: string, id: number) =>
-    request<void>(`/repos/${owner}/${repo}/hooks/${id}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/hooks/${id}`, { method: 'DELETE' }),
   deliveries: (owner: string, repo: string, id: number) =>
-    request<WebhookDelivery[]>(`/repos/${owner}/${repo}/hooks/${id}/deliveries`),
+    request<WebhookDelivery[]>(`${repoPath(owner, repo)}/hooks/${id}/deliveries`),
   redeliver: (owner: string, repo: string, id: number, deliveryId: number) =>
-    request<{ message: string }>(`/repos/${owner}/${repo}/hooks/${id}/deliveries/${deliveryId}/redeliver`, { method: 'POST' }),
+    request<{ message: string }>(`${repoPath(owner, repo)}/hooks/${id}/deliveries/${deliveryId}/redeliver`, { method: 'POST' }),
 };

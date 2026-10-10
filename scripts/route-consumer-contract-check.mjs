@@ -297,6 +297,13 @@ function indexClientFile({ file, relative, rawSource }, moduleSources) {
   };
   for (const call of parseApiSurface(rawSource, relative, { moduleSources })) addCall(call);
   for (const call of extractBrowserTransportCalls(rawSource, relative)) addCall(call);
+  // A client may build its repository prefix through repoPath(...) rather
+  // than a literal starting with `/`. Such a transport call still supplies
+  // stronger shape evidence than the file-level literal fallback above.
+  for (const call of calls.values()) {
+    shapes.push(call.shape);
+    methods.add(call.method);
+  }
 
   return { file, shapes, methods, calls: [...calls.values()] };
 }

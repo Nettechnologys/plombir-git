@@ -1,4 +1,5 @@
 import { request } from './_base.svelte';
+import { repoPath } from './repoPath';
 
 export interface DeployKey {
   id: number;
@@ -14,12 +15,12 @@ export interface DeployKey {
 
 export const deployKeys = {
   list: (owner: string, repo: string) =>
-    request<DeployKey[]>(`/repos/${owner}/${repo}/keys`),
+    request<DeployKey[]>(`${repoPath(owner, repo)}/keys`),
   create: (owner: string, repo: string, title: string, public_key: string, read_only: boolean) =>
-    request<DeployKey>(`/repos/${owner}/${repo}/keys`, {
+    request<DeployKey>(`${repoPath(owner, repo)}/keys`, {
       method: 'POST',
       body: JSON.stringify({ title, public_key, read_only }),
     }),
   delete: (owner: string, repo: string, id: number) =>
-    request<void>(`/repos/${owner}/${repo}/keys/${id}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/keys/${id}`, { method: 'DELETE' }),
 };

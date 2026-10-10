@@ -1,5 +1,6 @@
 import { request } from './_base.svelte';
 import type { AllowedUser } from './userRef';
+import { repoPath } from './repoPath';
 
 export interface CiEnvironment {
   id: number; name: string; protected: boolean; required_approvals: number;
@@ -23,8 +24,8 @@ export interface CiEnvironmentPayload {
   name: string; protected: boolean; required_approvals: number; allowed_approvers: string[];
 }
 export const ciEnvironments = {
-  list: (owner: string, repo: string) => request<CiEnvironment[]>(`/repos/${owner}/${repo}/actions/environments`),
-  create: (owner: string, repo: string, payload: CiEnvironmentPayload) => request<CiEnvironment>(`/repos/${owner}/${repo}/actions/environments`, { method: 'POST', body: JSON.stringify(payload) }),
-  update: (owner: string, repo: string, id: number, payload: CiEnvironmentPayload) => request<CiEnvironment>(`/repos/${owner}/${repo}/actions/environments/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
-  delete: (owner: string, repo: string, id: number) => request<void>(`/repos/${owner}/${repo}/actions/environments/${id}`, { method: 'DELETE' }),
+  list: (owner: string, repo: string) => request<CiEnvironment[]>(`${repoPath(owner, repo)}/actions/environments`),
+  create: (owner: string, repo: string, payload: CiEnvironmentPayload) => request<CiEnvironment>(`${repoPath(owner, repo)}/actions/environments`, { method: 'POST', body: JSON.stringify(payload) }),
+  update: (owner: string, repo: string, id: number, payload: CiEnvironmentPayload) => request<CiEnvironment>(`${repoPath(owner, repo)}/actions/environments/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
+  delete: (owner: string, repo: string, id: number) => request<void>(`${repoPath(owner, repo)}/actions/environments/${id}`, { method: 'DELETE' }),
 };

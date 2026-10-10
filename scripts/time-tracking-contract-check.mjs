@@ -36,7 +36,7 @@ for (const route of [
   }
 }
 
-if (!/timeTracking\s*=\s*\{[\s\S]*request<PaginatedResponse<any>>\(`\/repos\/\$\{owner\}\/\$\{repo\}\/issues\/\$\{issueNumber\}\/time/.test(client)) {
+if (!/timeTracking\s*=\s*\{[\s\S]*request<PaginatedResponse<any>>\(`\$\{repoPath\(owner, repo\)\}\/issues\/\$\{issueNumber\}\/time/.test(client)) {
   failures.push('API client must list issue time entries from the backend time route');
 }
 
@@ -44,11 +44,11 @@ if (!/duration_minutes/.test(client)) {
   failures.push('API client timeTracking.add must send duration_minutes expected by the backend');
 }
 
-if (!/delete:\s*\([^)]*\)\s*=>\s*\n?\s*request<void>\(`\/repos\/\$\{owner\}\/\$\{repo\}\/issues\/\$\{issueNumber\}\/time\/\$\{id\}`,\s*\{\s*method:\s*'DELETE'\s*\}/.test(client)) {
+if (!/delete:\s*\([^)]*\)\s*=>\s*\n?\s*request<void>\(`\$\{repoPath\(owner, repo\)\}\/issues\/\$\{issueNumber\}\/time\/\$\{id\}`,\s*\{\s*method:\s*'DELETE'\s*\}/.test(client)) {
   failures.push('API client timeTracking.delete must model the backend 204 response as void');
 }
 
-if (/request<\{\s*deleted:\s*boolean\s*\}>\(`\/repos\/\$\{owner\}\/\$\{repo\}\/issues\/\$\{issueNumber\}\/time\/\$\{id\}`/.test(client)) {
+if (/request<\{\s*deleted:\s*boolean\s*\}>\(`\$\{repoPath\(owner, repo\)\}\/issues\/\$\{issueNumber\}\/time\/\$\{id\}`/.test(client)) {
   failures.push('API client timeTracking.delete still expects a JSON deleted envelope');
 }
 

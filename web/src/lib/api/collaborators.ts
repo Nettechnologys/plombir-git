@@ -1,5 +1,6 @@
 import { request } from './_base.svelte';
 import { buildUserRef } from './userRef';
+import { repoPath } from './repoPath';
 
 export interface Collaborator {
   id: number;
@@ -14,19 +15,19 @@ export interface Collaborator {
 
 export const collaborators = {
   list: (owner: string, repo: string) =>
-    request<Collaborator[]>(`/repos/${owner}/${repo}/collaborators`),
+    request<Collaborator[]>(`${repoPath(owner, repo)}/collaborators`),
   add: (owner: string, repo: string, userIdentifier: number | string, permission: string) => {
     // Same three keys, same reading of them, as every other place that hands
     // out access — see `buildUserRef`.
     const user = buildUserRef(userIdentifier);
     if (user === null) return Promise.reject(new Error('A user is required.'));
-    return request<any>(`/repos/${owner}/${repo}/collaborators`, {
+    return request<any>(`${repoPath(owner, repo)}/collaborators`, {
       method: 'POST',
       body: JSON.stringify({ ...user, permission }),
     });
   },
   updatePermission: (owner: string, repo: string, id: number, permission: string) =>
-    request<any>(`/repos/${owner}/${repo}/collaborators/${id}`, {
+    request<any>(`${repoPath(owner, repo)}/collaborators/${id}`, {
       method: 'PATCH',
       body: JSON.stringify({ permission }),
     }),
@@ -39,5 +40,5 @@ export const collaborators = {
   // Passing the wrong one is at least no longer silent: a delete that matches
   // no row answers 404 instead of 204, so this rejects rather than pretending.
   remove: (owner: string, repo: string, id: number) =>
-    request<void>(`/repos/${owner}/${repo}/collaborators/${id}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/collaborators/${id}`, { method: 'DELETE' }),
 };

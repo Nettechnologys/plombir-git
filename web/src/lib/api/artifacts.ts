@@ -1,4 +1,5 @@
 import { downloadApiFile, request } from './_base.svelte';
+import { repoPath } from './repoPath';
 
 /// One CI artifact as `GET /repos/{owner}/{repo}/pipelines/{id}/artifacts`
 /// returns it — the shape of `rg_http::api::artifacts::ArtifactResponse`.
@@ -18,7 +19,7 @@ export interface CiArtifact {
 export const artifacts = {
   list: (owner: string, repo: string, pipelineId: number) =>
     request<CiArtifact[]>(
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pipelines/${pipelineId}/artifacts`,
+      `${repoPath(owner, repo)}/pipelines/${pipelineId}/artifacts`,
     ),
   // The bytes are behind `RepoRead`, so a bare `<a href>` would fetch them
   // without the bearer token and get a 404 on any private repository. This is

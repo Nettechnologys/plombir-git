@@ -1,5 +1,6 @@
 import { request } from './_base.svelte';
 import type { AllowedUser } from './userRef';
+import { repoPath } from './repoPath';
 
 export interface BranchProtectionRule {
   id: number;
@@ -41,17 +42,17 @@ export interface BranchProtectionPayload {
 
 export const branchProtections = {
   list: (owner: string, repo: string) =>
-    request<BranchProtectionRule[]>(`/repos/${owner}/${repo}/branches/protection`),
+    request<BranchProtectionRule[]>(`${repoPath(owner, repo)}/branches/protection`),
   create: (owner: string, repo: string, payload: BranchProtectionPayload & { branch_name: string }) =>
-    request<BranchProtectionRule>(`/repos/${owner}/${repo}/branches/protection`, {
+    request<BranchProtectionRule>(`${repoPath(owner, repo)}/branches/protection`, {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
   update: (owner: string, repo: string, id: number, payload: Omit<BranchProtectionPayload, 'branch_name'>) =>
-    request<BranchProtectionRule>(`/repos/${owner}/${repo}/branches/protection/${id}`, {
+    request<BranchProtectionRule>(`${repoPath(owner, repo)}/branches/protection/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(payload),
     }),
   remove: (owner: string, repo: string, id: number) =>
-    request<void>(`/repos/${owner}/${repo}/branches/protection/${id}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/branches/protection/${id}`, { method: 'DELETE' }),
 };

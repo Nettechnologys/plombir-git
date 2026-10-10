@@ -1,4 +1,5 @@
 import { request } from './_base.svelte';
+import { repoPath } from './repoPath';
 
 export interface LabelPayload {
   name: string;
@@ -9,21 +10,21 @@ export interface LabelPayload {
 
 export const labels = {
   list: (owner: string, repo: string) =>
-    request<any[]>(`/repos/${owner}/${repo}/labels`),
+    request<any[]>(`${repoPath(owner, repo)}/labels`),
   get: (owner: string, repo: string, id: number) =>
-    request<any>(`/repos/${owner}/${repo}/labels/${id}`),
+    request<any>(`${repoPath(owner, repo)}/labels/${id}`),
   create: (owner: string, repo: string, payload: LabelPayload) =>
-    request<any>(`/repos/${owner}/${repo}/labels`, {
+    request<any>(`${repoPath(owner, repo)}/labels`, {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
   update: (owner: string, repo: string, id: number, payload: Partial<LabelPayload>) =>
-    request<any>(`/repos/${owner}/${repo}/labels/${id}`, {
+    request<any>(`${repoPath(owner, repo)}/labels/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(payload),
     }),
   delete: (owner: string, repo: string, id: number) =>
-    request<void>(`/repos/${owner}/${repo}/labels/${id}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/labels/${id}`, { method: 'DELETE' }),
   forIssue: (owner: string, repo: string, issueNumber: number) =>
-    request<any[]>(`/repos/${owner}/${repo}/issues/${issueNumber}/labels`),
+    request<any[]>(`${repoPath(owner, repo)}/issues/${issueNumber}/labels`),
 };

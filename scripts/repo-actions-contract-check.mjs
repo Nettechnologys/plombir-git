@@ -132,7 +132,7 @@ for (const clientPath of clientPaths) {
   const source = productionTsSource(readFileSync(clientPath, 'utf8'));
   const name = path.relative(root, clientPath);
 
-  if (!/starred:\s*\([^)]*\)\s*=>\s*\n?\s*request<\{\s*starred:\s*boolean\s*\}>\(`\/repos\/\$\{owner\}\/\$\{repo\}\/starred`,\s*\{\s*method:\s*'GET'\s*\}/.test(source)) {
+  if (!/starred:\s*\([^)]*\)\s*=>\s*\n?\s*request<\{\s*starred:\s*boolean\s*\}>\(`\$\{repoPath\(owner, repo\)\}\/starred`,\s*\{\s*method:\s*'GET'\s*\}/.test(source)) {
     failures.push(`${name} must expose repos.starred using GET /starred`);
   }
 
@@ -140,7 +140,7 @@ for (const clientPath of clientPaths) {
     failures.push(`${name} must expose repos.watchStatus with the backend watch-state union`);
   }
 
-  if (!/delete:\s*\([^)]*\)\s*=>\s*\n?\s*request<\{\s*deleted:\s*boolean\s*\}>\(`\/repos\/\$\{owner\}\/\$\{repo\}`,\s*\{\s*method:\s*'DELETE'\s*\}/.test(source)) {
+  if (!/delete:\s*\([^)]*\)\s*=>\s*\n?\s*request<\{\s*deleted:\s*boolean\s*\}>\(`\$\{repoPath\(owner, repo\)\}`,\s*\{\s*method:\s*'DELETE'\s*\}/.test(source)) {
     failures.push(`${name} must model repo delete as the backend JSON deleted envelope`);
   }
 

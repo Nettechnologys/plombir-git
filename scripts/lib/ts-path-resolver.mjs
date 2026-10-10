@@ -57,7 +57,7 @@ function stringUnions(text) {
 
 function pathReturnBody(text) {
   const returned = text.match(
-    /return\s+([`'"])(\/(?:[^\\`'"\n]|\\.|\$\{[^{}]*\})*)\1\s*;?\s*$/,
+    /return\s+([`'"])((?:\/|\$\{repoPath\([^{}]*\)\})(?:[^\\`'"\n]|\\.|\$\{[^{}]*\})*)\1\s*;?\s*$/,
   );
   if (!returned) return null;
 

@@ -1,4 +1,5 @@
 import { request } from './_base.svelte';
+import { repoPath } from './repoPath';
 
 export interface Milestone {
   id: number;
@@ -30,20 +31,20 @@ export const milestones = {
     const params = new URLSearchParams();
     if (state) params.set('state', state);
     const qs = params.toString() ? `?${params.toString()}` : '';
-    return request<Milestone[]>(`/repos/${owner}/${repo}/milestones${qs}`);
+    return request<Milestone[]>(`${repoPath(owner, repo)}/milestones${qs}`);
   },
   get: (owner: string, repo: string, id: number) =>
-    request<Milestone>(`/repos/${owner}/${repo}/milestones/${id}`),
+    request<Milestone>(`${repoPath(owner, repo)}/milestones/${id}`),
   create: (owner: string, repo: string, data: CreateMilestonePayload) =>
-    request<Milestone>(`/repos/${owner}/${repo}/milestones`, {
+    request<Milestone>(`${repoPath(owner, repo)}/milestones`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   update: (owner: string, repo: string, id: number, data: UpdateMilestonePayload) =>
-    request<Milestone>(`/repos/${owner}/${repo}/milestones/${id}`, {
+    request<Milestone>(`${repoPath(owner, repo)}/milestones/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
   delete: (owner: string, repo: string, id: number) =>
-    request<void>(`/repos/${owner}/${repo}/milestones/${id}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/milestones/${id}`, { method: 'DELETE' }),
 };

@@ -1,4 +1,5 @@
 import { request, qs, type PaginatedResponse } from './_base.svelte';
+import { repoPath } from './repoPath';
 
 export interface TriggerPipelineResponse {
   id: number;
@@ -33,26 +34,26 @@ export interface WorkflowDispatchSchemaResponse {
 
 export const pipelines = {
   list: (owner: string, repo: string, page?: number, perPage?: number) =>
-    request<PaginatedResponse<any>>(`/repos/${owner}/${repo}/pipelines${qs({ page, per_page: perPage })}`),
+    request<PaginatedResponse<any>>(`${repoPath(owner, repo)}/pipelines${qs({ page, per_page: perPage })}`),
   get: (owner: string, repo: string, id: number) =>
-    request<any>(`/repos/${owner}/${repo}/pipelines/${id}`),
+    request<any>(`${repoPath(owner, repo)}/pipelines/${id}`),
   workflowDispatchSchema: (owner: string, repo: string, ref?: string) =>
     request<WorkflowDispatchSchemaResponse>(
-      `/repos/${owner}/${repo}/pipelines/workflow-dispatch${qs({ ref })}`,
+      `${repoPath(owner, repo)}/pipelines/workflow-dispatch${qs({ ref })}`,
     ),
   trigger: (owner: string, repo: string, ref?: string, inputs: Record<string, string> = {}) =>
-    request<TriggerPipelineResponse>(`/repos/${owner}/${repo}/pipelines`, {
+    request<TriggerPipelineResponse>(`${repoPath(owner, repo)}/pipelines`, {
       method: 'POST',
       body: JSON.stringify({ ref, inputs }),
     }),
   retry: (owner: string, repo: string, id: number) =>
-    request<any>(`/repos/${owner}/${repo}/pipelines/${id}/retry`, { method: 'POST' }),
+    request<any>(`${repoPath(owner, repo)}/pipelines/${id}/retry`, { method: 'POST' }),
   cancel: (owner: string, repo: string, id: number) =>
-    request<any>(`/repos/${owner}/${repo}/pipelines/${id}/cancel`, { method: 'POST' }),
+    request<any>(`${repoPath(owner, repo)}/pipelines/${id}/cancel`, { method: 'POST' }),
   job: (owner: string, repo: string, pipelineId: number, jobId: number) =>
-    request<any>(`/repos/${owner}/${repo}/pipelines/${pipelineId}/jobs/${jobId}`),
+    request<any>(`${repoPath(owner, repo)}/pipelines/${pipelineId}/jobs/${jobId}`),
   play: (owner: string, repo: string, pipelineId: number, jobId: number) =>
-    request<any>(`/repos/${owner}/${repo}/pipelines/${pipelineId}/jobs/${jobId}/play`, { method: 'POST' }),
+    request<any>(`${repoPath(owner, repo)}/pipelines/${pipelineId}/jobs/${jobId}/play`, { method: 'POST' }),
   approve: (owner: string, repo: string, pipelineId: number, jobId: number) =>
-    request<any>(`/repos/${owner}/${repo}/pipelines/${pipelineId}/jobs/${jobId}/approve`, { method: 'POST' }),
+    request<any>(`${repoPath(owner, repo)}/pipelines/${pipelineId}/jobs/${jobId}/approve`, { method: 'POST' }),
 };

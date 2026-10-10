@@ -120,7 +120,7 @@ runFixture(
 
 const UPDATE_CARD =
   '  updateCard: (owner: string, repo: string, boardId: number, cardId: number, data: BoardCardUpdatePayload) =>\n' +
-  "    request<BoardCard>(`/repos/${owner}/${repo}/boards/${boardId}/cards/${cardId}`, { method: 'PATCH', body: JSON.stringify(data) }),\n";
+  "    request<BoardCard>(`${repoPath(owner, repo)}/boards/${boardId}/cards/${cardId}`, { method: 'PATCH', body: JSON.stringify(data) }),\n";
 
 // Deleting updateCard leaves a DELETE call for the exact same route template
 // and leaves unrelated PATCH methods in boards.ts. Combining method and path at
@@ -136,7 +136,7 @@ runFixture(
 // registration first, so /cards/reorder cannot fall through to /cards/{id}.
 const REORDER_CARD =
   '  reorderCards: (owner: string, repo: string, boardId: number, data: { column_id: number; positions: [number, number][] }) =>\n' +
-  "    request<{ status: string }>(`/repos/${owner}/${repo}/boards/${boardId}/cards/reorder`, { method: 'POST', body: JSON.stringify(data) }),\n";
+  "    request<{ status: string }>(`${repoPath(owner, repo)}/boards/${boardId}/cards/reorder`, { method: 'POST', body: JSON.stringify(data) }),\n";
 const PATCH_REORDER_CARD = REORDER_CARD
   .replace('  reorderCards:', '  reorderCardsPatchFixture:')
   .replace("method: 'POST'", "method: 'PATCH'");

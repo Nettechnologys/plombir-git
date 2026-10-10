@@ -6,6 +6,7 @@ import {
   withApiBase,
   type PaginatedResponse,
 } from './_base.svelte';
+import { repoPath, repoOwnerPath } from './repoPath';
 
 function encodeRepoPath(path: string): string {
   return path.split('/').map(encodeURIComponent).join('/');
@@ -148,17 +149,17 @@ function normalizeTagRef(tag: TagRefResponse): { name: string } {
 export const repos = {
   list: (owner: string, page?: number, perPage?: number) =>
     request<PaginatedResponse<{ id: number; name: string; description: string | null; is_private: boolean; created_at: string }>>(
-      `/repos/${owner}${qs({ page, per_page: perPage })}`
+      `${repoOwnerPath(owner)}${qs({ page, per_page: perPage })}`
     ),
   explore: (page?: number, perPage?: number) =>
     request<PaginatedResponse<{ id: number; owner_id: number; name: string; description: string | null; stars_count: number; updated_at: string }>>(
       `/repos/explore${qs({ page, per_page: perPage })}`
     ),
   get: (owner: string, name: string) =>
-    request<RepositoryDetail>(`/repos/${owner}/${name}`),
+    request<RepositoryDetail>(`${repoPath(owner, name)}`),
   /** The answer is the updated row; after a rename it carries the new `name`. */
   update: (owner: string, name: string, patch: RepoSettingsPatch) =>
-    request<RepositoryDetail>(`/repos/${owner}/${name}`, {
+    request<RepositoryDetail>(`${repoPath(owner, name)}`, {
       method: 'PATCH',
       body: JSON.stringify(patch),
     }),
@@ -185,19 +186,19 @@ export const repos = {
     labels: () => request<{ data: { key: string; name: string; description: string }[] }>('/repos/templates/labels'),
   },
   tree: (owner: string, repo: string, ref?: string, path?: string) => {
-    return request<{ entries: RepoTreeEntry[] }>(`/repos/${owner}/${repo}/tree${qs({ ref, path })}`);
+    return request<{ entries: RepoTreeEntry[] }>(`${repoPath(owner, repo)}/tree${qs({ ref, path })}`);
   },
   blob: (owner: string, repo: string, path: string, ref?: string) => {
-    return request<BlobResponse>(`/repos/${owner}/${repo}/blob/${encodeRepoPath(path)}${qs({ ref })}`);
+    return request<BlobResponse>(`${repoPath(owner, repo)}/blob/${encodeRepoPath(path)}${qs({ ref })}`);
   },
   /** The file's bytes — for an LFS pointer, the object — as an `<img src>`. */
   rawUrl: (owner: string, repo: string, path: string, ref?: string) =>
-    withApiBase(`/repos/${owner}/${repo}/raw/${encodeRepoPath(path)}${qs({ ref })}`),
+    withApiBase(`${repoPath(owner, repo)}/raw/${encodeRepoPath(path)}${qs({ ref })}`),
   rawBytes: (owner: string, repo: string, path: string, ref?: string) =>
-    requestBytes(`/repos/${owner}/${repo}/raw/${encodeRepoPath(path)}${qs({ ref })}`),
+    requestBytes(`${repoPath(owner, repo)}/raw/${encodeRepoPath(path)}${qs({ ref })}`),
   downloadRaw: (owner: string, repo: string, path: string, ref?: string) =>
     downloadApiFile(
-      `/repos/${owner}/${repo}/raw/${encodeRepoPath(path)}${qs({ ref })}`,
+      `${repoPath(owner, repo)}/raw/${encodeRepoPath(path)}${qs({ ref })}`,
       path.split('/').pop() || 'download',
     ),
   saveContent: (
@@ -206,7 +207,7 @@ export const repos = {
     path: string,
     data: { branch?: string; content: string; message: string; sha?: string }
   ) =>
-    request<FileOperationResponse>(`/repos/${owner}/${repo}/contents/${encodeRepoPath(path)}`, {
+    request<FileOperationResponse>(`${repoPath(owner, repo)}/contents/${encodeRepoPath(path)}`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
@@ -216,7 +217,7 @@ export const repos = {
     path: string,
     data: { branch?: string; message: string; sha: string }
   ) =>
-    request<FileOperationResponse>(`/repos/${owner}/${repo}/contents/${encodeRepoPath(path)}${qs({
+    request<FileOperationResponse>(`${repoPath(owner, repo)}/contents/${encodeRepoPath(path)}${qs({
       branch: data.branch,
       message: data.message,
       sha: data.sha,
@@ -230,12 +231,12 @@ export const repos = {
    * holds as `ref` (see the commits page).
    */
   log: (owner: string, repo: string, ref?: string, path?: string, limit?: number, skip?: number) => {
-    return request<{ commits: { sha: string; message: string; author: string; date: string }[] }>(`/repos/${owner}/${repo}/log${qs({ ref, path, limit, skip: skip || undefined })}`);
+    return request<{ commits: { sha: string; message: string; author: string; date: string }[] }>(`${repoPath(owner, repo)}/log${qs({ ref, path, limit, skip: skip || undefined })}`);
   },
   branches: (owner: string, repo: string) =>
-    request<BranchRefResponse[]>(`/repos/${owner}/${repo}/branches`),
+    request<BranchRefResponse[]>(`${repoPath(owner, repo)}/branches`),
   tags: (owner: string, repo: string) =>
-    request<TagRefResponse[]>(`/repos/${owner}/${repo}/tags`).then((tags) => tags.map(normalizeTagRef)),
+    request<TagRefResponse[]>(`${repoPath(owner, repo)}/tags`).then((tags) => tags.map(normalizeTagRef)),
   /**
    * Create a branch (card_2060696224ff). `from` is a branch, tag or SHA; the
    * server uses the default branch when it is left out. Held to the same rules
@@ -243,7 +244,7 @@ export const repos = {
    * token kept off protected branches, 409 exists or a push rule refuses it.
    */
   createBranch: (owner: string, repo: string, data: { name: string; from?: string }) =>
-    request<RefChange>(`/repos/${owner}/${repo}/branches`, {
+    request<RefChange>(`${repoPath(owner, repo)}/branches`, {
       method: 'POST',
       body: JSON.stringify(data.from ? { name: data.name, from: data.from } : { name: data.name }),
     }),
@@ -253,47 +254,47 @@ export const repos = {
    * branch, or it moved meanwhile.
    */
   deleteBranch: (owner: string, repo: string, branch: string) =>
-    request<RefChange>(`/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}`, { method: 'DELETE' }),
+    request<RefChange>(`${repoPath(owner, repo)}/branches/${encodeURIComponent(branch)}`, { method: 'DELETE' }),
   /** Delete a tag, encoded as one segment like `deleteBranch`. 409 a protected tag. */
   deleteTag: (owner: string, repo: string, tag: string) =>
-    request<RefChange>(`/repos/${owner}/${repo}/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' }),
+    request<RefChange>(`${repoPath(owner, repo)}/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' }),
   commitSignature: (owner: string, repo: string, sha: string) =>
-    request<CommitSignature>(`/repos/${owner}/${repo}/commits/${sha}/signature`),
+    request<CommitSignature>(`${repoPath(owner, repo)}/commits/${sha}/signature`),
   star: (owner: string, repo: string) =>
-    request<{ starred: boolean }>(`/repos/${owner}/${repo}/star`, { method: 'PUT' }),
+    request<{ starred: boolean }>(`${repoPath(owner, repo)}/star`, { method: 'PUT' }),
   starred: (owner: string, repo: string) =>
-    request<{ starred: boolean }>(`/repos/${owner}/${repo}/starred`, { method: 'GET' }),
+    request<{ starred: boolean }>(`${repoPath(owner, repo)}/starred`, { method: 'GET' }),
   unstar: async (owner: string, repo: string) => {
     const status = await repos.starred(owner, repo);
     if (!status.starred) return { starred: false };
     return repos.star(owner, repo);
   },
   stargazers: (owner: string, repo: string, page?: number, perPage?: number) =>
-    request<PaginatedResponse<Stargazer>>(`/repos/${owner}/${repo}/stargazers${qs({ page, per_page: perPage })}`),
+    request<PaginatedResponse<Stargazer>>(`${repoPath(owner, repo)}/stargazers${qs({ page, per_page: perPage })}`),
   watch: (owner: string, repo: string, state: string) =>
-    request<{ watch_state: string }>(`/repos/${owner}/${repo}/watch`, { method: 'PUT', body: JSON.stringify({ state }) }),
+    request<{ watch_state: string }>(`${repoPath(owner, repo)}/watch`, { method: 'PUT', body: JSON.stringify({ state }) }),
   watchStatus: (owner: string, repo: string) =>
-    request<{ watch_state: 'not_watching' | 'watching' | 'ignoring' }>(`/repos/${owner}/${repo}/watch`, { method: 'GET' }),
+    request<{ watch_state: 'not_watching' | 'watching' | 'ignoring' }>(`${repoPath(owner, repo)}/watch`, { method: 'GET' }),
   unwatch: (owner: string, repo: string) =>
-    request<{ watch_state: string }>(`/repos/${owner}/${repo}/watch`, { method: 'DELETE' }),
+    request<{ watch_state: string }>(`${repoPath(owner, repo)}/watch`, { method: 'DELETE' }),
   delete: (owner: string, repo: string) =>
-    request<{ deleted: boolean }>(`/repos/${owner}/${repo}`, { method: 'DELETE' }),
+    request<{ deleted: boolean }>(`${repoPath(owner, repo)}`, { method: 'DELETE' }),
   fork: (owner: string, repo: string, opts?: { org?: string }) =>
-    request<any>(`/repos/${owner}/${repo}/fork`, {
+    request<any>(`${repoPath(owner, repo)}/fork`, {
       method: 'POST',
       ...(opts ? { body: JSON.stringify(opts) } : {}),
     }),
   forks: (owner: string, repo: string, page?: number, perPage?: number) =>
-    request<PaginatedResponse<RepositoryFork>>(`/repos/${owner}/${repo}/forks${qs({ page, per_page: perPage })}`),
+    request<PaginatedResponse<RepositoryFork>>(`${repoPath(owner, repo)}/forks${qs({ page, per_page: perPage })}`),
   transfer: (owner: string, repo: string, newOwner: string) =>
-    request<any>(`/repos/${owner}/${repo}/transfer`, { method: 'POST', body: JSON.stringify({ new_owner: newOwner }) }),
+    request<any>(`${repoPath(owner, repo)}/transfer`, { method: 'POST', body: JSON.stringify({ new_owner: newOwner }) }),
   createCommitStatus: (owner: string, repo: string, sha: string, data: { state: string; context: string; description?: string; target_url?: string }) =>
-    request<any>(`/repos/${owner}/${repo}/statuses/${sha}`, {
+    request<any>(`${repoPath(owner, repo)}/statuses/${sha}`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   listCommitStatuses: (owner: string, repo: string, sha: string) =>
-    request<any[]>(`/repos/${owner}/${repo}/commits/${sha}/statuses`),
+    request<any[]>(`${repoPath(owner, repo)}/commits/${sha}/statuses`),
   getCombinedStatus: (owner: string, repo: string, sha: string) =>
-    request<any>(`/repos/${owner}/${repo}/commits/${sha}/status`),
+    request<any>(`${repoPath(owner, repo)}/commits/${sha}/status`),
 };

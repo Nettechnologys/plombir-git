@@ -1,5 +1,6 @@
 import { withApiBase, request, qs, type PaginationMeta } from './_base.svelte';
 import { buildPackageYankPayload, packageYankPath } from './packageYank';
+import { repoPath } from './repoPath';
 
 interface PackageSummaryResponse {
   id: number;
@@ -112,7 +113,7 @@ function filterPackagesByQuery(packages: PackageSummaryResponse[], query?: strin
 export const packages = {
   list: async (owner: string, repo: string, pkg_type?: string, page?: number, perPage?: number, query?: string): Promise<PackageListResponse> => {
     if (pkg_type) {
-      const res = await request<PackageListByTypeResponse>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/list`);
+      const res = await request<PackageListByTypeResponse>(`${repoPath(owner, repo)}/packages/${encodeURIComponent(pkg_type)}/list`);
       const list = filterPackagesByQuery(
         (res.packages || []).map((item) => ({ ...item, format: pkg_type })),
         query,
@@ -126,7 +127,7 @@ export const packages = {
       };
     }
 
-    const reg = await request<RegistryListResponse>(`/repos/${owner}/${repo}/packages`);
+    const reg = await request<RegistryListResponse>(`${repoPath(owner, repo)}/packages`);
     const regTypes = reg.registries.filter((r) => r.enabled).map((r) => r.package_type);
 
     if (regTypes.length === 0) {
@@ -140,7 +141,7 @@ export const packages = {
     const packByType = await Promise.allSettled(
       regTypes.map((pkg_type) =>
         request<PackageListByTypeResponse>(
-          `/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/list`,
+          `${repoPath(owner, repo)}/packages/${encodeURIComponent(pkg_type)}/list`,
         ),
       ),
     );
@@ -165,15 +166,15 @@ export const packages = {
     };
   },
   getFormat: (owner: string, repo: string, pkg_type: string) =>
-    request<PackageListByTypeResponse>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/list`),
+    request<PackageListByTypeResponse>(`${repoPath(owner, repo)}/packages/${encodeURIComponent(pkg_type)}/list`),
   get: (owner: string, repo: string, pkg_type: string, pkg_name: string) =>
-    request<any>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}`),
+    request<any>(`${repoPath(owner, repo)}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}`),
   getVersions: (owner: string, repo: string, pkg_type: string, pkg_name: string) =>
-    request<VersionListByTypeResponse>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/versions`),
+    request<VersionListByTypeResponse>(`${repoPath(owner, repo)}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/versions`),
   getVersion: (owner: string, repo: string, pkg_type: string, pkg_name: string, version: string) =>
-    request<any>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}`),
+    request<any>(`${repoPath(owner, repo)}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}`),
   downloadUrl: (owner: string, repo: string, pkg_type: string, pkg_name: string, version: string, file: string) =>
-    withApiBase(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}/${encodeRepoPath(file)}`),
+    withApiBase(`${repoPath(owner, repo)}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}/${encodeRepoPath(file)}`),
   publish: (owner: string, repo: string, pkg_type: string, body: Blob | string, metadata?: { name?: string; version?: string; description?: string; homepage?: string; repository_url?: string; semver?: string }) => {
     const query = qs({
       name: metadata?.name,
@@ -190,7 +191,7 @@ export const packages = {
       const filename = (body as File).name || 'package';
       headers['Content-Disposition'] = contentDispositionAttachment(filename);
     }
-    return request<PublishResponse>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/publish${query}`, {
+    return request<PublishResponse>(`${repoPath(owner, repo)}/packages/${encodeURIComponent(pkg_type)}/publish${query}`, {
       method: 'POST',
       body: body instanceof Blob ? body : (body as string),
       headers,
@@ -210,7 +211,7 @@ export const packages = {
     });
   },
   delete: (owner: string, repo: string, pkg_type: string, pkg_name: string, version: string) =>
-    request<void>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}`, { method: 'DELETE' }),
   /**
    * Set a version's yank state — the reversible counterpart of `delete`.
    *

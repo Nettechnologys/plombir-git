@@ -1,4 +1,5 @@
 import { getToken, request, withApiBase } from './_base.svelte';
+import { repoPath } from './repoPath';
 
 export type Attachment = {
   id: number;
@@ -15,7 +16,7 @@ export type Attachment = {
 export type AttachmentTarget = 'issues' | 'pulls' | 'issues/comments' | 'pulls/comments';
 
 function path(owner: string, repo: string, target: AttachmentTarget, targetId: number): string {
-  return `/repos/${owner}/${repo}/${target}/${targetId}/assets`;
+  return `${repoPath(owner, repo)}/${target}/${targetId}/assets`;
 }
 
 export const attachments = {

@@ -1,5 +1,6 @@
 import { request } from './_base.svelte';
 import type { AllowedUser } from './userRef';
+import { repoPath } from './repoPath';
 
 export interface TagProtection { id: number; pattern: string; allowed_user_ids: number[]; allowed_users: AllowedUser[]; created_at: string; updated_at: string; }
 
@@ -26,10 +27,10 @@ export interface TagProtectionPayload {
 }
 
 export const tagProtections = {
-  list: (owner: string, repo: string) => request<TagProtection[]>(`/repos/${owner}/${repo}/tags/protection`),
+  list: (owner: string, repo: string) => request<TagProtection[]>(`${repoPath(owner, repo)}/tags/protection`),
   create: (owner: string, repo: string, payload: TagProtectionPayload & { pattern: string }) =>
-    request<TagProtection>(`/repos/${owner}/${repo}/tags/protection`, { method: 'POST', body: JSON.stringify(payload) }),
+    request<TagProtection>(`${repoPath(owner, repo)}/tags/protection`, { method: 'POST', body: JSON.stringify(payload) }),
   update: (owner: string, repo: string, id: number, payload: Omit<TagProtectionPayload, 'pattern'>) =>
-    request<TagProtection>(`/repos/${owner}/${repo}/tags/protection/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
-  delete: (owner: string, repo: string, id: number) => request<void>(`/repos/${owner}/${repo}/tags/protection/${id}`, { method: 'DELETE' }),
+    request<TagProtection>(`${repoPath(owner, repo)}/tags/protection/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  delete: (owner: string, repo: string, id: number) => request<void>(`${repoPath(owner, repo)}/tags/protection/${id}`, { method: 'DELETE' }),
 };

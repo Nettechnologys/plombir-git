@@ -609,6 +609,16 @@ function normalizeTemplatePath(pathSource) {
     if (char === '$' && src[i + 1] === '{') {
       const expr = readTemplateExpr(src, i + 2);
       const nextIndex = expr?.next ?? (src.length - 1);
+      // The browser client keeps owner and repository values in encoded URL
+      // segments via repoPath. Preserve that known route shape for the static
+      // OpenAPI and UI-inventory checks instead of treating it as opaque.
+      const repoPathArgs = expr?.expr.trim().match(/^repoPath\(\s*(owner)\s*,\s*(repo|name)\s*\)$/);
+      const repoOwnerArgs = expr?.expr.trim().match(/^repoOwnerPath\(\s*(owner)\s*\)$/);
+      if (repoPathArgs || repoOwnerArgs) {
+        out += repoPathArgs ? `/repos/{owner}/{${repoPathArgs[2]}}` : '/repos/{owner}';
+        i = nextIndex;
+        continue;
+      }
       const restAfterExpr = src.slice(nextIndex + 1);
       const isQueryExpr = /^\s*\$\{\s*qs\s*\(/.test(restAfterExpr);
       const nextChar = isQueryExpr ? '?' : (restAfterExpr[0] || '');

@@ -1,4 +1,5 @@
 import { request, qs, type PaginatedResponse } from './_base.svelte';
+import { repoPath } from './repoPath';
 
 function parseIssueLabels(labels: string | string[] | undefined | null): string[] {
   if (Array.isArray(labels)) {
@@ -111,39 +112,39 @@ function labelFilterQuery(labels: string | string[] | undefined): string[] {
 
 export const issues = {
   templates: (owner: string, repo: string) =>
-    request<IssueTemplate[]>(`/repos/${owner}/${repo}/issue_templates`),
+    request<IssueTemplate[]>(`${repoPath(owner, repo)}/issue_templates`),
   templateConfig: (owner: string, repo: string) =>
-    request<IssueConfig>(`/repos/${owner}/${repo}/issue_config`),
+    request<IssueConfig>(`${repoPath(owner, repo)}/issue_config`),
   list: (owner: string, repo: string, state?: string, page?: number, perPage?: number, labels?: string | string[]) => {
     const scalar = qs({ state, page, per_page: perPage, labels: Array.isArray(labels) ? undefined : labels });
     const structural = labelFilterQuery(labels);
     const query = structural.length > 0
       ? `${scalar === '' ? '?' : `${scalar}&`}${structural.join('&')}`
       : scalar;
-    return request<PaginatedResponse<Issue>>(`/repos/${owner}/${repo}/issues${query}`)
+    return request<PaginatedResponse<Issue>>(`${repoPath(owner, repo)}/issues${query}`)
       .then((response) => ({
         ...response,
         data: response.data.map(normalizeIssue),
       }));
   },
   get: (owner: string, repo: string, number: number) =>
-    request<Issue>(`/repos/${owner}/${repo}/issues/${number}`).then(normalizeIssue),
+    request<Issue>(`${repoPath(owner, repo)}/issues/${number}`).then(normalizeIssue),
   create: (owner: string, repo: string, title: string, body?: string, labels?: string[]) =>
-    request<Issue>(`/repos/${owner}/${repo}/issues`, {
+    request<Issue>(`${repoPath(owner, repo)}/issues`, {
       method: 'POST',
       body: JSON.stringify({ title, body, labels }),
     }).then(normalizeIssue),
   update: (owner: string, repo: string, number: number, data: IssueUpdatePayload) =>
-    request<Issue>(`/repos/${owner}/${repo}/issues/${number}`, {
+    request<Issue>(`${repoPath(owner, repo)}/issues/${number}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
     }).then(normalizeIssue),
   comments: (owner: string, repo: string, number: number) =>
-    request<any[]>(`/repos/${owner}/${repo}/issues/${number}/comments`),
+    request<any[]>(`${repoPath(owner, repo)}/issues/${number}/comments`),
   labels: (owner: string, repo: string, number: number) =>
-    request<any[]>(`/repos/${owner}/${repo}/issues/${number}/labels`),
+    request<any[]>(`${repoPath(owner, repo)}/issues/${number}/labels`),
   addComment: (owner: string, repo: string, number: number, body: string) =>
-    request<any>(`/repos/${owner}/${repo}/issues/${number}/comments`, {
+    request<any>(`${repoPath(owner, repo)}/issues/${number}/comments`, {
       method: 'POST',
       body: JSON.stringify({ body }),
     }),
@@ -153,18 +154,18 @@ export const issues = {
    * carries no `author` name, so a caller merges it over the one it shows.
    */
   editComment: (owner: string, repo: string, commentId: number, body: string) =>
-    request<IssueComment>(`/repos/${owner}/${repo}/issues/comments/${commentId}`, {
+    request<IssueComment>(`${repoPath(owner, repo)}/issues/comments/${commentId}`, {
       method: 'PATCH',
       body: JSON.stringify({ body }),
     }),
   /** Same rule as `editComment`; 204. */
   deleteComment: (owner: string, repo: string, commentId: number) =>
-    request<void>(`/repos/${owner}/${repo}/issues/comments/${commentId}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/issues/comments/${commentId}`, { method: 'DELETE' }),
   /**
    * Delete the issue with its comments and attachments; repository
    * administrators only (403 otherwise), 204. Pull requests have no such
    * route on purpose.
    */
   delete: (owner: string, repo: string, number: number) =>
-    request<void>(`/repos/${owner}/${repo}/issues/${number}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/issues/${number}`, { method: 'DELETE' }),
 };

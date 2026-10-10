@@ -6,6 +6,7 @@ import {
   withApiBase,
   type PaginatedResponse,
 } from './_base.svelte';
+import { repoPath } from './repoPath';
 
 export interface ReleaseAsset {
   id: number;
@@ -130,37 +131,37 @@ function uploadReleaseAsset(
 
 export const releases = {
   list: (owner: string, repo: string, page?: number, perPage?: number) =>
-    request<PaginatedResponse<any>>(`/repos/${owner}/${repo}/releases${qs({ page, per_page: perPage })}`),
+    request<PaginatedResponse<any>>(`${repoPath(owner, repo)}/releases${qs({ page, per_page: perPage })}`),
   get: (owner: string, repo: string, id: number) =>
-    request<any>(`/repos/${owner}/${repo}/releases/${id}`),
+    request<any>(`${repoPath(owner, repo)}/releases/${id}`),
   create: (owner: string, repo: string, data: { tag_name: string; title: string; body?: string; target_commitish?: string; is_draft?: boolean; is_prerelease?: boolean }) =>
-    request<any>(`/repos/${owner}/${repo}/releases`, {
+    request<any>(`${repoPath(owner, repo)}/releases`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   update: (owner: string, repo: string, id: number, data: { title?: string; body?: string; is_draft?: boolean; is_prerelease?: boolean }) =>
-    request<any>(`/repos/${owner}/${repo}/releases/${id}`, {
+    request<any>(`${repoPath(owner, repo)}/releases/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
   delete: (owner: string, repo: string, id: number) =>
-    request<void>(`/repos/${owner}/${repo}/releases/${id}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/releases/${id}`, { method: 'DELETE' }),
   listAssets: (owner: string, repo: string, releaseId: number) =>
-    request<ReleaseAsset[]>(`/repos/${owner}/${repo}/releases/${releaseId}/assets`),
+    request<ReleaseAsset[]>(`${repoPath(owner, repo)}/releases/${releaseId}/assets`),
   uploadAsset: (
     owner: string,
     repo: string,
     releaseId: number,
     file: File,
     onProgress?: (progress: ReleaseAssetUploadProgress) => void,
-  ) => uploadReleaseAsset(`/repos/${owner}/${repo}/releases/${releaseId}/assets`, file, onProgress),
+  ) => uploadReleaseAsset(`${repoPath(owner, repo)}/releases/${releaseId}/assets`, file, onProgress),
   downloadAsset: (owner: string, repo: string, assetId: number, filename: string) =>
     downloadApiFile(
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/assets/${assetId}/download`,
+      `${repoPath(owner, repo)}/releases/assets/${assetId}/download`,
       filename || 'asset'
     ),
   deleteAsset: (owner: string, repo: string, assetId: number) =>
-    request<void>(`/repos/${owner}/${repo}/releases/assets/${assetId}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/releases/assets/${assetId}`, { method: 'DELETE' }),
 
   /// Release-asset provenance (card_5e52392a0274).
   ///
@@ -177,18 +178,18 @@ export const releases = {
     /** Sign the asset with the instance key. `RepoWrite`. */
     sign: (owner: string, repo: string, assetId: number) =>
       request<AttestationEnvelope>(
-        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/assets/${assetId}/attestation`,
+        `${repoPath(owner, repo)}/releases/assets/${assetId}/attestation`,
         { method: 'POST' },
       ),
     /** Read the stored DSSE envelope. `RepoRead`. */
     get: (owner: string, repo: string, assetId: number) =>
       request<AttestationEnvelope>(
-        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/assets/${assetId}/attestation`,
+        `${repoPath(owner, repo)}/releases/assets/${assetId}/attestation`,
       ),
     /** Re-check the signature against the asset's current bytes. `RepoRead`. */
     verify: (owner: string, repo: string, assetId: number) =>
       request<AttestationReport>(
-        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/assets/${assetId}/attestation/verify`,
+        `${repoPath(owner, repo)}/releases/assets/${assetId}/attestation/verify`,
         { method: 'POST' },
       ),
   },

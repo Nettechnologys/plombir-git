@@ -1,5 +1,6 @@
 import { request, qs, type PaginatedResponse } from './_base.svelte';
 import { formatHeadRef } from '../pullHeadRef';
+import { repoPath } from './repoPath';
 
 export type DiffLine = {
   kind: 'meta' | 'context' | 'addition' | 'deletion';
@@ -64,12 +65,12 @@ export type MergeQueueEntry = {
 
 export const pulls = {
   template: (owner: string, repo: string) =>
-    request<{ content: string; file_name: string } | undefined>(`/repos/${owner}/${repo}/pull_request_template`),
+    request<{ content: string; file_name: string } | undefined>(`${repoPath(owner, repo)}/pull_request_template`),
   list: (owner: string, repo: string, state?: string, page?: number, perPage?: number) => {
-    return request<PaginatedResponse<any>>(`/repos/${owner}/${repo}/pulls${qs({ state, page, per_page: perPage })}`);
+    return request<PaginatedResponse<any>>(`${repoPath(owner, repo)}/pulls${qs({ state, page, per_page: perPage })}`);
   },
   get: (owner: string, repo: string, number: number) =>
-    request<any>(`/repos/${owner}/${repo}/pulls/${number}`),
+    request<any>(`${repoPath(owner, repo)}/pulls/${number}`),
   /**
    * Open a pull request. `head_owner` names the fork holding `head_branch`
    * (card_87f9b1c97489); it is sent as `head: "<owner>:<branch>"`, the form
@@ -81,7 +82,7 @@ export const pulls = {
     repo: string,
     data: { title: string; body?: string; head_branch: string; head_owner?: string | null; base_branch: string; draft?: boolean },
   ) =>
-    request<any>(`/repos/${owner}/${repo}/pulls`, {
+    request<any>(`${repoPath(owner, repo)}/pulls`, {
       method: 'POST',
       body: JSON.stringify({
         title: data.title,
@@ -100,15 +101,15 @@ export const pulls = {
    */
   compare: (owner: string, repo: string, base: string, head: string) =>
     request<CompareResult>(
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare${qs({ base, head })}`,
+      `${repoPath(owner, repo)}/compare${qs({ base, head })}`,
     ),
   update: (owner: string, repo: string, number: number, data: { title?: string; body?: string; state?: string; draft?: boolean }) =>
-    request<any>(`/repos/${owner}/${repo}/pulls/${number}`, {
+    request<any>(`${repoPath(owner, repo)}/pulls/${number}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
   diff: (owner: string, repo: string, number: number) =>
-    request<PrDiff>(`/repos/${owner}/${repo}/pulls/${number}/diff`),
+    request<PrDiff>(`${repoPath(owner, repo)}/pulls/${number}/diff`),
   /**
    * Merge. With `deleteHeadBranch` the server deletes the head branch once the
    * merge has landed and reports it beside the merge: `head_branch_deleted`,
@@ -120,28 +121,28 @@ export const pulls = {
    * (card_ee4f318c50f1). A merged one, or one the queue is merging, is `409`.
    */
   delete: (owner: string, repo: string, number: number) =>
-    request<void>(`/repos/${owner}/${repo}/pulls/${number}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/pulls/${number}`, { method: 'DELETE' }),
   merge: (owner: string, repo: string, number: number, strategy: string, opts: { deleteHeadBranch?: boolean } = {}) =>
-    request<MergeOutcome>(`/repos/${owner}/${repo}/pulls/${number}/merge`, {
+    request<MergeOutcome>(`${repoPath(owner, repo)}/pulls/${number}/merge`, {
       method: 'POST',
       body: JSON.stringify({ strategy, delete_head_branch: opts.deleteHeadBranch ?? false }),
     }),
   enableAutoMerge: (owner: string, repo: string, number: number, strategy: string) =>
     request<{ status: 'disabled' | 'pending' | 'merged'; reason?: string; merge?: any }>(
-      `/repos/${owner}/${repo}/pulls/${number}/auto-merge`,
+      `${repoPath(owner, repo)}/pulls/${number}/auto-merge`,
       { method: 'PUT', body: JSON.stringify({ strategy }) },
     ),
   disableAutoMerge: (owner: string, repo: string, number: number) =>
-    request<any>(`/repos/${owner}/${repo}/pulls/${number}/auto-merge`, { method: 'DELETE' }),
+    request<any>(`${repoPath(owner, repo)}/pulls/${number}/auto-merge`, { method: 'DELETE' }),
   mergeQueue: (owner: string, repo: string) =>
-    request<MergeQueueEntry[]>(`/repos/${owner}/${repo}/merge-queue`),
+    request<MergeQueueEntry[]>(`${repoPath(owner, repo)}/merge-queue`),
   enqueueMerge: (owner: string, repo: string, number: number, strategy: string) =>
-    request<any>(`/repos/${owner}/${repo}/pulls/${number}/merge-queue`, {
+    request<any>(`${repoPath(owner, repo)}/pulls/${number}/merge-queue`, {
       method: 'PUT',
       body: JSON.stringify({ strategy }),
     }),
   cancelQueuedMerge: (owner: string, repo: string, number: number) =>
-    request<void>(`/repos/${owner}/${repo}/pulls/${number}/merge-queue`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/pulls/${number}/merge-queue`, { method: 'DELETE' }),
   /**
    * Let a fork PR's head run CI under this repository's secrets.
    *
@@ -157,16 +158,16 @@ export const pulls = {
    */
   approveCi: (owner: string, repo: string, number: number) =>
     request<any>(
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}/ci-approval`,
+      `${repoPath(owner, repo)}/pulls/${number}/ci-approval`,
       { method: 'POST' },
     ),
 };
 
 export const reviews = {
   list: (owner: string, repo: string, number: number) =>
-    request<any[]>(`/repos/${owner}/${repo}/pulls/${number}/reviews`),
+    request<any[]>(`${repoPath(owner, repo)}/pulls/${number}/reviews`),
   submit: (owner: string, repo: string, number: number, body: string, verdict: string) =>
-    request<any>(`/repos/${owner}/${repo}/pulls/${number}/reviews`, {
+    request<any>(`${repoPath(owner, repo)}/pulls/${number}/reviews`, {
       method: 'POST',
       body: JSON.stringify({ body, action: verdict }),
     }),
@@ -185,11 +186,11 @@ export const reviews = {
    */
   dismiss: (owner: string, repo: string, number: number, id: number, message: string) =>
     request<any>(
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}/reviews/${id}/dismiss`,
+      `${repoPath(owner, repo)}/pulls/${number}/reviews/${id}/dismiss`,
       { method: 'POST', body: JSON.stringify({ message }) },
     ),
   comments: (owner: string, repo: string, number: number) =>
-    request<any[]>(`/repos/${owner}/${repo}/pulls/${number}/comments`),
+    request<any[]>(`${repoPath(owner, repo)}/pulls/${number}/comments`),
   timeline: (owner: string, repo: string, number: number) =>
     request<Array<{
       id: string;
@@ -198,7 +199,7 @@ export const reviews = {
       created_at: string;
       body: string | null;
       metadata: Record<string, any>;
-    }>>(`/repos/${owner}/${repo}/pulls/${number}/timeline`),
+    }>>(`${repoPath(owner, repo)}/pulls/${number}/timeline`),
   addComment: (owner: string, repo: string, number: number, data: {
     body: string;
     path: string;
@@ -211,7 +212,7 @@ export const reviews = {
     reply_to_id?: number;
     suggestion?: string;
   }) =>
-    request<any>(`/repos/${owner}/${repo}/pulls/${number}/comments`, {
+    request<any>(`${repoPath(owner, repo)}/pulls/${number}/comments`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
@@ -220,38 +221,38 @@ export const reviews = {
    * administrator, 403 for anyone else. The answer is the comment row.
    */
   editComment: (owner: string, repo: string, number: number, commentId: number, body: string) =>
-    request<any>(`/repos/${owner}/${repo}/pulls/${number}/comments/${commentId}`, {
+    request<any>(`${repoPath(owner, repo)}/pulls/${number}/comments/${commentId}`, {
       method: 'PATCH',
       body: JSON.stringify({ body }),
     }),
   /** Same rule as `editComment`; 204, or 409 when others replied to it. */
   deleteComment: (owner: string, repo: string, number: number, commentId: number) =>
-    request<void>(`/repos/${owner}/${repo}/pulls/${number}/comments/${commentId}`, { method: 'DELETE' }),
+    request<void>(`${repoPath(owner, repo)}/pulls/${number}/comments/${commentId}`, { method: 'DELETE' }),
   setThreadResolved: (owner: string, repo: string, number: number, commentId: number, resolved: boolean) =>
-    request<any>(`/repos/${owner}/${repo}/pulls/${number}/comments/${commentId}/resolution`, {
+    request<any>(`${repoPath(owner, repo)}/pulls/${number}/comments/${commentId}/resolution`, {
       method: 'PATCH',
       body: JSON.stringify({ resolved }),
     }),
   applySuggestion: (owner: string, repo: string, number: number, commentId: number) =>
-    request<any>(`/repos/${owner}/${repo}/pulls/${number}/comments/${commentId}/suggestion/apply`, {
+    request<any>(`${repoPath(owner, repo)}/pulls/${number}/comments/${commentId}/suggestion/apply`, {
       method: 'POST',
     }),
   applySuggestions: (owner: string, repo: string, number: number, commentIds: number[]) =>
-    request<{ comments: any[]; commit_sha: string }>(`/repos/${owner}/${repo}/pulls/${number}/suggestions/apply`, {
+    request<{ comments: any[]; commit_sha: string }>(`${repoPath(owner, repo)}/pulls/${number}/suggestions/apply`, {
       method: 'POST',
       body: JSON.stringify({ comment_ids: commentIds }),
     }),
   requestedReviewers: (owner: string, repo: string, number: number) =>
     request<Array<{ id: number; reviewer_id: number; username: string; requested_by_id: number; created_at: string }>>(
-      `/repos/${owner}/${repo}/pulls/${number}/reviewers`,
+      `${repoPath(owner, repo)}/pulls/${number}/reviewers`,
     ),
   requestReviewer: (owner: string, repo: string, number: number, username: string) =>
     request<{ id: number; reviewer_id: number; username: string; requested_by_id: number; created_at: string }>(
-      `/repos/${owner}/${repo}/pulls/${number}/reviewers`,
+      `${repoPath(owner, repo)}/pulls/${number}/reviewers`,
       { method: 'POST', body: JSON.stringify({ username }) },
     ),
   removeRequestedReviewer: (owner: string, repo: string, number: number, username: string) =>
-    request<void>(`/repos/${owner}/${repo}/pulls/${number}/reviewers/${encodeURIComponent(username)}`, {
+    request<void>(`${repoPath(owner, repo)}/pulls/${number}/reviewers/${encodeURIComponent(username)}`, {
       method: 'DELETE',
     }),
 };
