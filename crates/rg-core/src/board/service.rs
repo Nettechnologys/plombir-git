@@ -15,13 +15,14 @@ use sea_orm::{ActiveValue::Set, DatabaseConnection};
 
 /// Create a new project board.
 pub async fn create_board(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     name: String,
     description: Option<String>,
     repo_id: Option<i64>,
     org_id: Option<i64>,
     created_by: i64,
 ) -> Result<Board> {
+    let db = db.write();
     let now = Utc::now();
     let model = BoardAM {
         name: Set(name),
@@ -114,7 +115,7 @@ pub async fn list_boards_by_repo(db: &DatabaseConnection, repo_id: i64) -> Resul
 
 /// Update a board's metadata.
 pub async fn update_board(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     id: i64,
     name: Option<String>,
     description: Option<String>,
@@ -128,7 +129,7 @@ pub async fn update_board(
 /// while the regression commits a delete after this service has observed the
 /// row and before the conditional update runs.
 async fn update_board_after_read<F, Fut>(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     id: i64,
     name: Option<String>,
     description: Option<String>,
@@ -138,31 +139,32 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    rg_db::ops::board_ops::find_board_by_id(db, id)
+    rg_db::ops::board_ops::find_board_by_id(db.read(), id)
         .await?
         .ok_or_else(|| crate::error::not_found("board"))?;
     after_read().await?;
 
-    rg_db::ops::board_ops::update_board(db, id, name, description, Utc::now())
+    rg_db::ops::board_ops::update_board(db.write(), id, name, description, Utc::now())
         .await?
         .ok_or_else(|| crate::error::not_found("board"))
 }
 
 /// Delete a board. `false` means the row was already gone — see
 /// [`rg_db::ops::board_ops::delete_board_by_id`].
-pub async fn delete_board(db: &DatabaseConnection, id: i64) -> Result<bool> {
-    rg_db::ops::board_ops::delete_board_by_id(db, id).await
+pub async fn delete_board(db: &impl crate::db::DbPools, id: i64) -> Result<bool> {
+    rg_db::ops::board_ops::delete_board_by_id(db.write(), id).await
 }
 
 // ── Column CRUD ──────────────────────────────────────────────────────────
 
 /// Create a new column.
 pub async fn create_column(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     board_id: i64,
     name: String,
     color: Option<String>,
 ) -> Result<Column> {
+    let db = db.write();
     let now = Utc::now();
     let model = ColumnAM {
         board_id: Set(board_id),
@@ -182,7 +184,7 @@ pub async fn create_column(
 
 /// Update a column.
 pub async fn update_column(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     id: i64,
     name: Option<String>,
     color: Option<String>,
@@ -192,7 +194,7 @@ pub async fn update_column(
 
 /// Testable read/write boundary behind [`update_column`].
 async fn update_column_after_read<F, Fut>(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     id: i64,
     name: Option<String>,
     color: Option<String>,
@@ -202,30 +204,31 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    rg_db::ops::board_ops::find_column_by_id(db, id)
+    rg_db::ops::board_ops::find_column_by_id(db.read(), id)
         .await?
         .ok_or_else(|| crate::error::not_found("board column"))?;
     after_read().await?;
 
-    rg_db::ops::board_ops::update_column(db, id, name, color)
+    rg_db::ops::board_ops::update_column(db.write(), id, name, color)
         .await?
         .ok_or_else(|| crate::error::not_found("board column"))
 }
 
 /// Delete a column. `false` means the row was already gone.
-pub async fn delete_column(db: &DatabaseConnection, id: i64) -> Result<bool> {
-    rg_db::ops::board_ops::delete_column_by_id(db, id).await
+pub async fn delete_column(db: &impl crate::db::DbPools, id: i64) -> Result<bool> {
+    rg_db::ops::board_ops::delete_column_by_id(db.write(), id).await
 }
 
 // ── Card CRUD ────────────────────────────────────────────────────────────
 
 /// Create a new card.
 pub async fn create_card(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     column_id: i64,
     issue_id: Option<i64>,
     note: Option<String>,
 ) -> Result<Card> {
+    let db = db.write();
     let now = Utc::now();
 
     let model = CardAM {
@@ -244,24 +247,24 @@ pub async fn create_card(
 
 /// Update a card's note or issue link.
 pub async fn update_card(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     id: i64,
     note: Option<String>,
     issue_id: Option<Option<i64>>,
 ) -> Result<Card> {
-    rg_db::ops::board_ops::update_card_fields(db, id, note, issue_id, Utc::now())
+    rg_db::ops::board_ops::update_card_fields(db.write(), id, note, issue_id, Utc::now())
         .await?
         .ok_or_else(|| crate::error::not_found("board card"))
 }
 
 /// Move a card to another column with a specific position.
 pub async fn move_card(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     card_id: i64,
     new_column_id: i64,
     new_position: i32,
 ) -> Result<Card> {
-    rg_db::ops::board_ops::move_card(db, card_id, new_column_id, new_position, Utc::now())
+    rg_db::ops::board_ops::move_card(db.write(), card_id, new_column_id, new_position, Utc::now())
         .await?
         .ok_or_else(|| crate::error::not_found("board card"))
 }
@@ -272,12 +275,14 @@ pub async fn move_card(
 /// between the caller's scope check and the write is the same answer as no such
 /// card — not a batch that applied the positions it managed to reach first.
 pub async fn reorder_cards(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     board_id: i64,
     column_id: Option<i64>,
     positions: Vec<(i64, i32)>,
 ) -> Result<()> {
-    match rg_db::ops::board_ops::update_card_positions(db, board_id, column_id, &positions).await? {
+    match rg_db::ops::board_ops::update_card_positions(db.write(), board_id, column_id, &positions)
+        .await?
+    {
         rg_db::ops::board_ops::ReorderOutcome::Applied => Ok(()),
         rg_db::ops::board_ops::ReorderOutcome::NotOnBoard(_) => {
             Err(crate::error::not_found("board card"))
@@ -289,8 +294,8 @@ pub async fn reorder_cards(
 }
 
 /// Delete a card. `false` means the row was already gone.
-pub async fn delete_card(db: &DatabaseConnection, id: i64) -> Result<bool> {
-    rg_db::ops::board_ops::delete_card_by_id(db, id).await
+pub async fn delete_card(db: &impl crate::db::DbPools, id: i64) -> Result<bool> {
+    rg_db::ops::board_ops::delete_card_by_id(db.write(), id).await
 }
 
 // ── Full response types ──────────────────────────────────────────────────

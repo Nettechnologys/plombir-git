@@ -962,7 +962,7 @@ async fn process_repository_into(
         // enqueuer is durable provenance, not a durable grant: `merge_pr`
         // revalidates that actor's standing and current write permission.
         match service::merge_pr(
-            db,
+            &crate::db::Db::new(db.clone(), ci.write_pool.unwrap_or(db).clone()),
             repo_root,
             &namespace,
             &repository.name,
@@ -1063,7 +1063,7 @@ enum MergeGroupState {
 /// back to the caller untouched: it is retryable, it is not the author's typo,
 /// and its text may name operator paths that must not cross into a repository.
 async fn settle_refused_merge_group_config(
-    db: &DatabaseConnection,
+    pools: &impl crate::db::DbPools,
     repo_root: &Path,
     entry: &merge_queue_entry::Model,
     group_sha: &str,
@@ -1071,6 +1071,7 @@ async fn settle_refused_merge_group_config(
     base_branch: &str,
     error: anyhow::Error,
 ) -> Result<MergeGroupState> {
+    let db = pools.read();
     let Some(reason) = error
         .downcast_ref::<crate::error::InvalidRequest>()
         .map(|invalid| invalid.message.clone())
@@ -1081,6 +1082,7 @@ async fn settle_refused_merge_group_config(
     if let Err(publish_error) = crate::ci::publish_configuration_failure(
         crate::ci::ConfigurationFailureParams {
             db,
+            write_pool: Some(pools.write()),
             repo_id: entry.repo_id,
             commit_sha: group_sha,
             ref_name: group_ref,
@@ -1692,7 +1694,7 @@ async fn ensure_merge_group_ci(
                 }
                 Err(error) => {
                     return settle_refused_merge_group_config(
-                        db,
+                        &crate::db::Db::new(db.clone(), ci.write_pool.unwrap_or(db).clone()),
                         repo_root,
                         entry,
                         &group_sha,
@@ -2629,6 +2631,7 @@ mod merge_group_config_refusal_tests {
     pub(super) fn ci(trigger: &dyn CiTrigger) -> PipelineCi<'_> {
         PipelineCi {
             trigger,
+            write_pool: None,
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,
@@ -3036,6 +3039,7 @@ mod merge_group_conflict_reason_tests {
     fn ci(trigger: &dyn CiTrigger) -> PipelineCi<'_> {
         PipelineCi {
             trigger,
+            write_pool: None,
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,
@@ -4158,6 +4162,7 @@ mod merge_group_strategy_fidelity_tests {
     fn ci(trigger: &dyn CiTrigger) -> PipelineCi<'_> {
         PipelineCi {
             trigger,
+            write_pool: None,
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,

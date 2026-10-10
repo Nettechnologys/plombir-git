@@ -5,9 +5,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sea_orm::{DatabaseConnection, NotSet, Set, TransactionTrait};
+use sea_orm::{NotSet, Set, TransactionTrait};
 
 use crate::committed_blob;
+use crate::db::DbPools;
 use rg_db::entities::pr_reviewer_request;
 use rg_db::entities::repository::Model as Repository;
 use rg_db::ops::{pr_reviewer_request_ops, user_ops};
@@ -201,7 +202,7 @@ pub fn load_codeowners(repo_path: &Path, base_branch: &str) -> Result<Option<Par
 /// only when the team has write/admin permission.
 #[allow(clippy::too_many_arguments)]
 pub async fn request_codeowners(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_path: &Path,
     base_branch: &str,
     changed_paths: &[String],
@@ -210,6 +211,8 @@ pub async fn request_codeowners(
     author_id: i64,
     requested_by_id: i64,
 ) -> Result<CodeownerRequestOutcome> {
+    let pools = db.owned();
+    let db = pools.read();
     let repo_path = repo_path.to_path_buf();
     let base_branch = base_branch.to_string();
     let changed_paths = changed_paths.to_vec();
@@ -389,7 +392,12 @@ pub async fn request_codeowners(
                 .commit()
                 .await
                 .context("db: commit CODEOWNER reviewer request")?;
-            crate::review::service::notify_review_requested(db, pr_id, user.id, requested_by_id);
+            crate::review::service::notify_review_requested(
+                &pools,
+                pr_id,
+                user.id,
+                requested_by_id,
+            );
             requested.push(user.username);
         }
     }

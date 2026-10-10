@@ -496,7 +496,7 @@ pub async fn create_issue(
     }
 
     match rg_core::issue::create_issue(
-        &state.db,
+        &state.db_pools(),
         repo_model.id,
         user_id,
         req.title,
@@ -625,7 +625,7 @@ pub async fn update_issue(
     let closing = req.state.as_deref() == Some("closed") && existing.state != "closed";
 
     match rg_core::issue::update_issue(
-        &state.db,
+        &state.db_pools(),
         &owner,
         &repo,
         number,
@@ -713,7 +713,9 @@ pub async fn add_comment(
     }: RepoAuthRead,
     Json(req): Json<CreateCommentRequest>,
 ) -> impl IntoResponse {
-    match rg_core::issue::add_comment(&state.db, &owner, &repo, number, user_id, req.body).await {
+    match rg_core::issue::add_comment(&state.db_pools(), &owner, &repo, number, user_id, req.body)
+        .await
+    {
         Ok(comment) => {
             let comment = match comment_with_author(&state.db, comment).await {
                 Ok(comment) => comment,

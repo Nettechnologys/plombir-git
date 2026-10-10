@@ -202,7 +202,7 @@ pub async fn create_board(
     // any repository, private ones included.
 
     match rg_core::board::service::create_board(
-        &state.db,
+        &state.db_pools(),
         body.name,
         body.description,
         Some(repo.id),
@@ -309,7 +309,9 @@ pub async fn update_board(
         return e.into_response();
     }
 
-    match rg_core::board::service::update_board(&state.db, id, body.name, body.description).await {
+    match rg_core::board::service::update_board(&state.db_pools(), id, body.name, body.description)
+        .await
+    {
         Ok(board) => (StatusCode::OK, Json(serde_json::json!(board))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
@@ -341,7 +343,7 @@ pub async fn delete_board(
         return e.into_response();
     }
 
-    match rg_core::board::service::delete_board(&state.db, id).await {
+    match rg_core::board::service::delete_board(&state.db_pools(), id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         // The repository-scoping lookup above is a separate statement from the
         // DELETE, so a request that removed nothing must not confirm a deletion
@@ -381,7 +383,9 @@ pub async fn create_column(
         return e.into_response();
     }
 
-    match rg_core::board::service::create_column(&state.db, board_id, body.name, body.color).await {
+    match rg_core::board::service::create_column(&state.db_pools(), board_id, body.name, body.color)
+        .await
+    {
         Ok(column) => (StatusCode::CREATED, Json(serde_json::json!(column))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
@@ -420,7 +424,9 @@ pub async fn update_column(
         return e.into_response();
     }
 
-    match rg_core::board::service::update_column(&state.db, col_id, body.name, body.color).await {
+    match rg_core::board::service::update_column(&state.db_pools(), col_id, body.name, body.color)
+        .await
+    {
         Ok(column) => (StatusCode::OK, Json(serde_json::json!(column))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
@@ -457,7 +463,7 @@ pub async fn delete_column(
         return e.into_response();
     }
 
-    match rg_core::board::service::delete_column(&state.db, col_id).await {
+    match rg_core::board::service::delete_column(&state.db_pools(), col_id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => AppError::not_found("column not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -504,7 +510,9 @@ pub async fn create_card(
         }
     }
 
-    match rg_core::board::service::create_card(&state.db, col_id, body.issue_id, body.note).await {
+    match rg_core::board::service::create_card(&state.db_pools(), col_id, body.issue_id, body.note)
+        .await
+    {
         Ok(card) => (StatusCode::CREATED, Json(serde_json::json!(card))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
@@ -548,7 +556,9 @@ pub async fn update_card(
         }
     }
 
-    match rg_core::board::service::update_card(&state.db, card_id, body.note, body.issue_id).await {
+    match rg_core::board::service::update_card(&state.db_pools(), card_id, body.note, body.issue_id)
+        .await
+    {
         Ok(card) => (StatusCode::OK, Json(serde_json::json!(card))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
@@ -592,8 +602,13 @@ pub async fn move_card(
         return e.into_response();
     }
 
-    match rg_core::board::service::move_card(&state.db, card_id, body.column_id, body.position)
-        .await
+    match rg_core::board::service::move_card(
+        &state.db_pools(),
+        card_id,
+        body.column_id,
+        body.position,
+    )
+    .await
     {
         Ok(card) => (StatusCode::OK, Json(serde_json::json!(card))).into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -648,7 +663,7 @@ pub async fn reorder_cards(
     }
 
     match rg_core::board::service::reorder_cards(
-        &state.db,
+        &state.db_pools(),
         board.id,
         body.column_id,
         body.positions,
@@ -691,7 +706,7 @@ pub async fn delete_card(
         return e.into_response();
     }
 
-    match rg_core::board::service::delete_card(&state.db, card_id).await {
+    match rg_core::board::service::delete_card(&state.db_pools(), card_id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => AppError::not_found("card not found").into_response(),
         Err(e) => AppError::from(e).into_response(),

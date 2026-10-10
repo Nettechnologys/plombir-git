@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set, TransactionTrait};
 
+use crate::db::DbPools;
 use crate::db_retry::{classify, classify_anyhow};
 use rg_db::entities::issue::{self, Model as Issue};
 use rg_db::entities::issue_comment::{self, Model as Comment};
@@ -103,7 +104,7 @@ pub async fn issue_with_labels(db: &DatabaseConnection, issue: Issue) -> Result<
 
 /// Create a new issue in the given repo.
 pub async fn create_issue(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     author_id: i64,
     title: String,
@@ -111,6 +112,8 @@ pub async fn create_issue(
     labels: Option<Vec<String>>,
     milestone_id: Option<i64>,
 ) -> Result<Issue> {
+    let pools = db.owned();
+    let db = pools.read();
     // `InvalidRequest`, not a bare `bail!`: this is the one outcome here the
     // caller *did* cause, and it is the only one allowed to become a 400. Every
     // other failure below is a query of ours and stays a 5xx.
@@ -163,7 +166,7 @@ pub async fn create_issue(
     // The author follows their issue; whoever the text mentions is told.
     // Watchers hear about every new issue, as they hear about pull requests.
     crate::notification::thread::spawn(
-        db,
+        &pools,
         crate::notification::thread::ThreadEvent::new(
             issue_subject(&issue),
             Some(author_id),
@@ -172,7 +175,7 @@ pub async fn create_issue(
         .mentions_in(issue_text(&issue))
         .actor_subscribes("author"),
     );
-    spawn_notify_watchers_issue_opened(db, &issue, author_id).await;
+    spawn_notify_watchers_issue_opened(&pools, &issue, author_id).await;
 
     Ok(issue)
 }
@@ -199,15 +202,21 @@ fn issue_text(issue: &Issue) -> String {
 
 /// Tell the repository's watchers that `issue` was opened.
 async fn spawn_notify_watchers_issue_opened(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     issue: &Issue,
     author_id: i64,
 ) {
-    let author_name =
-        crate::notification::best_effort_user_by_id(db, author_id, issue.repo_id, "issue", "actor")
-            .await
-            .map(|user| user.username)
-            .unwrap_or_default();
+    let read = db.read();
+    let author_name = crate::notification::best_effort_user_by_id(
+        read,
+        author_id,
+        issue.repo_id,
+        "issue",
+        "actor",
+    )
+    .await
+    .map(|user| user.username)
+    .unwrap_or_default();
     let body = if author_name.is_empty() {
         format!("Issue #{} opened: {}", issue.number, issue.title)
     } else {
@@ -502,7 +511,7 @@ pub async fn get_issue(
 /// [`crate::notification::spawn_notify_watchers`].
 #[allow(clippy::too_many_arguments)]
 pub async fn update_issue(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     owner: &str,
     repo_name: &str,
     number: i64,
@@ -515,6 +524,8 @@ pub async fn update_issue(
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
     actor_id: Option<i64>,
 ) -> Result<Issue> {
+    let pools = db.owned();
+    let db = pools.read();
     let existing = get_issue(db, owner, repo_name, number).await?;
     let previous_assignee = existing.assignee_id;
     let issue_id = existing.id;
@@ -609,7 +620,7 @@ pub async fn update_issue(
         .filter(|id| Some(*id) != previous_assignee)
     {
         crate::notification::thread::spawn(
-            db,
+            &pools,
             crate::notification::thread::ThreadEvent::new(
                 issue_subject(&updated),
                 actor_id,
@@ -640,7 +651,8 @@ pub async fn update_issue(
                 {
                     if remaining == 0 {
                         if let Err(e) =
-                            notify_milestone_closed(db, issue_repo_id, mid, delivery_tracker).await
+                            notify_milestone_closed(&pools, issue_repo_id, mid, delivery_tracker)
+                                .await
                         {
                             tracing::warn!(milestone_id = %mid, error = %format!("{e:#}"), "failed to notify milestone closed");
                         }
@@ -657,13 +669,15 @@ pub async fn update_issue(
 
 /// Add a comment to an issue.
 pub async fn add_comment(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     owner: &str,
     repo_name: &str,
     issue_number: i64,
     author_id: i64,
     body: String,
 ) -> Result<Comment> {
+    let pools = db.owned();
+    let db = pools.read();
     if body.trim().is_empty() {
         return Err(crate::error::invalid_request(
             "comment body cannot be empty",
@@ -707,7 +721,7 @@ pub async fn add_comment(
     }
 
     crate::notification::thread::spawn(
-        db,
+        &pools,
         crate::notification::thread::ThreadEvent::new(
             issue_subject(&issue),
             Some(author_id),
@@ -742,11 +756,13 @@ pub async fn list_comments(
 
 /// Notify watchers and trigger webhook when all issues in a milestone are closed.
 async fn notify_milestone_closed(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     milestone_id: i64,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<()> {
+    let pools = db.owned();
+    let db = pools.read();
     // Trigger milestone.closed webhook
     let payload = serde_json::json!({
         "id": milestone_id,
@@ -793,7 +809,7 @@ async fn notify_milestone_closed(
     // Detached: closing the last issue of a milestone answers an HTTP request,
     // and the fan-out below is a read check plus an insert for every subscriber.
     crate::notification::spawn_notify_watchers(
-        db,
+        &pools,
         delivery_tracker.unwrap_or_else(|| crate::task_tracker::delivery_tracker()),
         crate::notification::WatchEvent {
             repo_id,

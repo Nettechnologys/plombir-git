@@ -1770,7 +1770,7 @@ pub async fn finish_job(
         if transition.pipeline_completed_now {
             crate::metrics::recorder::ci_pipeline_finished(&pipeline.status);
             if pipeline.status == "failed" {
-                rg_core::notification::thread::notify_ci_failed(&state.db, pipeline.id);
+                rg_core::notification::thread::notify_ci_failed(&state.db_pools(), pipeline.id);
             }
         }
     }

@@ -1,5 +1,6 @@
 //! Code review service — submit reviews, add inline comments, approve / request changes.
 
+use crate::db::DbPools;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use sea_orm::{
@@ -108,7 +109,7 @@ impl ReviewAction {
 
 /// Submit a review on a pull request.
 pub async fn submit_review(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     pr_number: i64,
     reviewer_id: i64,
@@ -116,6 +117,8 @@ pub async fn submit_review(
     body: Option<String>,
     commit_id: Option<String>,
 ) -> Result<PrReview> {
+    let pools = db.owned();
+    let db = pools.read();
     // Validate PR exists
     let pr = pull_request_ops::find_by_repo_and_number(db, repo_id, pr_number)
         .await?
@@ -173,7 +176,7 @@ pub async fn submit_review(
     if let Some(body) = review.body.as_deref() {
         event = event.mentions_in(body);
     }
-    crate::notification::thread::spawn(db, event);
+    crate::notification::thread::spawn(&pools, event);
     Ok(review)
 }
 
@@ -181,14 +184,14 @@ pub async fn submit_review(
 /// — by `requested_by_id` directly or through CODEOWNERS. Detached; the
 /// request itself is already committed.
 pub fn notify_review_requested(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     pr_id: i64,
     reviewer_id: i64,
     requested_by_id: i64,
 ) {
-    let db = db.clone();
+    let db = db.owned();
     crate::task_tracker::delivery_tracker().spawn(async move {
-        let pr = match pull_request_ops::find_by_id(&db, pr_id).await {
+        let pr = match pull_request_ops::find_by_id(db.read(), pr_id).await {
             Ok(Some(pr)) => pr,
             Ok(None) => return,
             Err(error) => {
@@ -294,7 +297,7 @@ pub async fn dismiss_review(
 /// Create an inline review comment on a specific diff line.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_review_comment(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     pr_number: i64,
     review_id: Option<i64>,
@@ -309,6 +312,8 @@ pub async fn create_review_comment(
     commit_id: Option<String>,
     reply_to_id: Option<i64>,
 ) -> Result<ReviewComment> {
+    let pools = db.owned();
+    let db = pools.read();
     // Validate PR
     let pr = pull_request_ops::find_by_repo_and_number(db, repo_id, pr_number)
         .await?
@@ -439,7 +444,7 @@ pub async fn create_review_comment(
         .await
         .context("db: commit review comment creation")?;
     crate::notification::thread::spawn(
-        db,
+        &pools,
         crate::notification::thread::ThreadEvent::new(
             crate::pull_request::service::pr_subject(&pr),
             Some(author_id),

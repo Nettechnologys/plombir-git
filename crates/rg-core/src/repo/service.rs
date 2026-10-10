@@ -3936,7 +3936,7 @@ pub async fn get_combined_status(
 /// background task, and one repository's subscriber walk has no business
 /// delaying the CI trigger of the next ref in the same push.
 pub fn notify_watchers_push(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     tracker: &crate::task_tracker::TaskTracker,
     repo_id: i64,
     repo_name: &str,

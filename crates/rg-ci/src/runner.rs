@@ -474,7 +474,10 @@ impl PipelineRunner {
             match pipeline_ops::fail_pipeline_chain(&self.db_write, self.pipeline_id, &log).await {
                 Ok(true) => {
                     rg_core::metrics_hook::record_ci_pipeline_finished("failed");
-                    rg_core::notification::thread::notify_ci_failed(&self.db, self.pipeline_id);
+                    rg_core::notification::thread::notify_ci_failed(
+                        &rg_core::db::Db::new(self.db.clone(), self.db_write.clone()),
+                        self.pipeline_id,
+                    );
                 }
                 Ok(false) => {}
                 Err(update_error) => {
@@ -590,7 +593,10 @@ impl PipelineRunner {
         // not a second one.
         rg_core::metrics_hook::record_ci_pipeline_finished(pipeline_status);
         if pipeline_failed {
-            rg_core::notification::thread::notify_ci_failed(&self.db, self.pipeline_id);
+            rg_core::notification::thread::notify_ci_failed(
+                &rg_core::db::Db::new(self.db.clone(), self.db_write.clone()),
+                self.pipeline_id,
+            );
         }
 
         if pipeline_status == "success" {

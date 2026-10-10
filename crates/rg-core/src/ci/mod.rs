@@ -452,6 +452,7 @@ pub struct WorkflowDispatchInput {
 /// rejected before the normal pipeline graph could be published.
 pub struct ConfigurationFailureParams<'a> {
     pub db: &'a DatabaseConnection,
+    pub write_pool: Option<&'a DatabaseConnection>,
     pub repo_id: i64,
     pub commit_sha: &'a str,
     pub ref_name: &'a str,
@@ -510,6 +511,7 @@ pub async fn publish_configuration_failure(
 
     let ConfigurationFailureParams {
         db,
+        write_pool,
         repo_id,
         commit_sha,
         ref_name,
@@ -605,7 +607,10 @@ pub async fn publish_configuration_failure(
     tx.commit()
         .await
         .context("db: commit CI configuration failure graph")?;
-    crate::notification::thread::notify_ci_failed(params.db, pipeline_id);
+    crate::notification::thread::notify_ci_failed(
+        &crate::db::Db::new(db.clone(), write_pool.unwrap_or(db).clone()),
+        pipeline_id,
+    );
     Ok(Some(pipeline_id))
 }
 
@@ -830,6 +835,7 @@ mod configuration_failure_tests {
         let repo = repository(&db).await;
         let params = || ConfigurationFailureParams {
             db: &db,
+            write_pool: None,
             repo_id: repo.id,
             commit_sha: "0123456789012345678901234567890123456789",
             ref_name: "refs/pull/7/head",

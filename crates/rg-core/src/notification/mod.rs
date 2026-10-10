@@ -161,11 +161,11 @@ async fn best_effort_user_by_username(
 /// A caller already off the request path (the post-push hooks, which are
 /// themselves detached) can just await [`notify_watchers`] instead.
 pub fn spawn_notify_watchers(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     tracker: &crate::task_tracker::TaskTracker,
     event: WatchEvent,
 ) {
-    let db = db.clone();
+    let db = db.owned();
     tracker.spawn(async move {
         if let Err(e) = notify_watchers(&db, &event).await {
             tracing::warn!(
@@ -198,7 +198,9 @@ pub fn spawn_notify_watchers(
 /// failed check or insert costs that page — logged with its size — and the
 /// walk continues; only a failed *page query* aborts it, and the count reached
 /// by then is logged rather than lost.
-pub async fn notify_watchers(db: &DatabaseConnection, event: &WatchEvent) -> Result<()> {
+pub async fn notify_watchers(db: &impl crate::db::DbPools, event: &WatchEvent) -> Result<()> {
+    let write = db.write();
+    let db = db.read();
     let repo_id = event.repo_id;
     let mut page = watch_page(db, repo_id, 0).await?;
     if page.is_empty() {
@@ -266,7 +268,7 @@ pub async fn notify_watchers(db: &DatabaseConnection, event: &WatchEvent) -> Res
             })
             .collect();
         match notification_ops::create_notifications(
-            db,
+            write,
             &recipients,
             notification_type,
             &event.title,

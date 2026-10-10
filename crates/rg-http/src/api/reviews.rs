@@ -379,7 +379,7 @@ pub async fn submit_review(
     let should_attempt_auto_merge = action.as_str() == "approve";
 
     match rg_core::review::service::submit_review(
-        &state.db,
+        &state.db_pools(),
         repo_model.id,
         number,
         user_id,
@@ -397,7 +397,7 @@ pub async fn submit_review(
                 // card_73a1ec5b32f3 both ref moves here were dropped.
                 let mut merged = Vec::new();
                 match rg_core::pull_request::try_auto_merge(
-                    &state.db,
+                    &state.db_pools(),
                     &state.repo_root,
                     &owner,
                     &repo,
@@ -986,7 +986,7 @@ pub async fn create_review_comment(
     Json(req): Json<CreateReviewCommentRequest>,
 ) -> impl IntoResponse {
     match rg_core::review::service::create_review_comment(
-        &state.db,
+        &state.db_pools(),
         repo_model.id,
         number,
         req.review_id,
@@ -1291,7 +1291,7 @@ pub async fn request_reviewer(
                 return AppError::from(error).into_response();
             }
             rg_core::review::service::notify_review_requested(
-                &state.db,
+                &state.db_pools(),
                 pr.id,
                 request.reviewer_id,
                 actor_id,

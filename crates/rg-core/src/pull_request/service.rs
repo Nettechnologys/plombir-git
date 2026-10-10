@@ -7,6 +7,7 @@ use sea_orm::{
 };
 use std::collections::HashMap;
 
+use crate::db::DbPools;
 use crate::error::NotFound;
 use crate::lfs::service::LfsRepository;
 use rg_git::protocol::receive_pack::RefUpdate;
@@ -26,7 +27,7 @@ use rg_db::ops::pull_request_ops;
 /// see [`announce_pr_to_watchers`] for what `None` means.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_pr(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_root: &std::path::Path,
     repo_id: i64,
     author_id: i64,
@@ -38,6 +39,8 @@ pub async fn create_pr(
     is_draft: bool,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<PullRequest> {
+    let pools = db.owned();
+    let db = pools.read();
     // The two things the caller can get wrong here carry `InvalidRequest`;
     // everything after them is a query or a git read of ours, and a failure
     // there must not be reported as a malformed request.
@@ -169,7 +172,7 @@ pub async fn create_pr(
     }
 
     announce_pr_to_watchers(
-        db,
+        &pools,
         delivery_tracker,
         repo_id,
         &target_repo.name,
@@ -180,7 +183,7 @@ pub async fn create_pr(
     );
     // The author follows their pull request; whoever its text mentions is told.
     crate::notification::thread::spawn(
-        db,
+        &pools,
         crate::notification::thread::ThreadEvent::new(
             pr_subject(&pr),
             Some(author_id),
@@ -402,7 +405,7 @@ pub(super) async fn repository_namespace(
 /// instead of rendering a leading blank, and no recipient is excluded from the
 /// fan-out.
 async fn notify_watchers_pr(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     repo_name: &str,
     actor_name: Option<&str>,
@@ -453,7 +456,7 @@ async fn watch_actor_name(db: &DatabaseConnection, repo_id: i64, actor_id: i64) 
 /// request path (the merge queue, auto-merge).
 #[allow(clippy::too_many_arguments)]
 fn announce_pr_to_watchers(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     tracker: Option<&crate::task_tracker::TaskTracker>,
     repo_id: i64,
     repo_name: &str,
@@ -463,13 +466,13 @@ fn announce_pr_to_watchers(
     action: &str,
 ) {
     let tracker = tracker.unwrap_or_else(|| crate::task_tracker::delivery_tracker());
-    let db = db.clone();
+    let db = db.owned();
     let repo_name = repo_name.to_string();
     let pr_title = pr_title.to_string();
     let action = action.to_string();
     tracker.spawn(async move {
         let actor_name = match actor_id {
-            Some(actor_id) => watch_actor_name(&db, repo_id, actor_id).await,
+            Some(actor_id) => watch_actor_name(db.read(), repo_id, actor_id).await,
             None => None,
         };
         if let Err(e) = notify_watchers_pr(
@@ -531,7 +534,7 @@ pub async fn get_pr(
 /// see [`announce_pr_to_watchers`] for what `None` means.
 #[allow(clippy::too_many_arguments)]
 pub async fn update_pr(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     owner: &str,
     repo_name: &str,
     number: i64,
@@ -542,6 +545,8 @@ pub async fn update_pr(
     actor_id: i64,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<PullRequest> {
+    let pools = db.owned();
+    let db = pools.read();
     let mut pr = get_pr(db, owner, repo_name, number).await?;
     let previous_state = pr.state.clone();
     let previous_draft = pr.is_draft;
@@ -692,7 +697,7 @@ pub async fn update_pr(
         };
         if let Some(action) = action {
             announce_pr_to_watchers(
-                db,
+                &pools,
                 delivery_tracker,
                 updated.repo_id,
                 repo_name,
@@ -3833,12 +3838,14 @@ pub async fn disable_auto_merge(
 /// Git/DB failure — remains an error: "not yet" and "unknown" are different
 /// answers, and only the first is something the caller can wait out.
 pub async fn try_auto_merge(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_root: &std::path::Path,
     owner: &str,
     repo_name: &str,
     number: i64,
 ) -> Result<AutoMergeOutcome> {
+    let pools = db.owned();
+    let db = pools.read();
     let pr = get_pr(db, owner, repo_name, number).await?;
     if !pr.auto_merge_enabled {
         return Ok(AutoMergeOutcome {
@@ -3908,7 +3915,7 @@ pub async fn try_auto_merge(
     // that tip would merge a commit nothing above ever looked at
     // (card_9ff26bb95dc9).
     let merge = match merge_pr(
-        db,
+        &pools,
         repo_root,
         owner,
         repo_name,
@@ -3938,11 +3945,13 @@ pub async fn try_auto_merge(
 /// Attempt every enabled PR whose source now points at this commit. Used by
 /// push and CI-completion hooks for same-repository and fork pull requests.
 pub async fn try_auto_merges_for_head_commit(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_root: &std::path::Path,
     source_repo_id: i64,
     commit_sha: &str,
 ) -> Result<Vec<AutoMergeOutcome>> {
+    let pools = db.owned();
+    let db = pools.read();
     let prs =
         pull_request_ops::list_auto_merge_for_head_commit(db, source_repo_id, commit_sha).await?;
     let mut outcomes = Vec::with_capacity(prs.len());
@@ -3986,7 +3995,7 @@ pub async fn try_auto_merges_for_head_commit(
                 continue;
             }
         };
-        match try_auto_merge(db, repo_root, &namespace, &repository.name, pr.number).await {
+        match try_auto_merge(&pools, repo_root, &namespace, &repository.name, pr.number).await {
             Ok(outcome) => outcomes.push(outcome),
             Err(error) => tracing::warn!(
                 pr_id = pr.id,
@@ -4095,7 +4104,7 @@ fn base_ref_update(base_branch: &str, before: &str, after: &str) -> Option<RefUp
 /// `spawn_blocking` to avoid blocking the tokio async runtime.
 #[allow(clippy::too_many_arguments)]
 pub async fn merge_pr(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_root: &std::path::Path,
     owner: &str,
     repo_name: &str,
@@ -4105,6 +4114,8 @@ pub async fn merge_pr(
     expected_head_sha: Option<&str>,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<MergeResult> {
+    let pools = db.owned();
+    let db = pools.read();
     let mut pr = get_pr(db, owner, repo_name, number).await?;
 
     let actor = rg_db::ops::user_ops::find_by_id(db, actor_id).await?;
@@ -4164,7 +4175,7 @@ pub async fn merge_pr(
     }
 
     let result = merge_claimed_pr(
-        db,
+        &pools,
         repo_root,
         owner,
         repo_name,
@@ -4189,7 +4200,7 @@ pub async fn merge_pr(
 
 #[allow(clippy::too_many_arguments)]
 async fn merge_claimed_pr(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_root: &std::path::Path,
     owner: &str,
     repo_name: &str,
@@ -4199,6 +4210,8 @@ async fn merge_claimed_pr(
     expected_head_sha: Option<&str>,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<MergeResult> {
+    let pools = db.owned();
+    let db = pools.read();
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
     if !repo_path.exists() {
         bail!("repository path does not exist: {:?}", repo_path);
@@ -4348,7 +4361,7 @@ async fn merge_claimed_pr(
         .await??;
 
         return update_pr_merged(
-            db,
+            &pools,
             owner,
             repo_name,
             pr,
@@ -4379,7 +4392,7 @@ async fn merge_claimed_pr(
     };
 
     update_pr_merged(
-        db,
+        &pools,
         owner,
         repo_name,
         pr,
@@ -4452,7 +4465,7 @@ fn merge_head_rev(
 /// [`MergeResult::base_ref_update`], which is built from it.
 #[allow(clippy::too_many_arguments)]
 async fn update_pr_merged(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     owner: &str,
     repo_name: &str,
     mut pr: PullRequest,
@@ -4461,6 +4474,8 @@ async fn update_pr_merged(
     base_sha_before: Option<String>,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<MergeResult> {
+    let pools = db.owned();
+    let db = pools.read();
     pr.state = "merged".to_string();
     pr.merge_strategy = Some(format!("{:?}", strategy).to_lowercase());
     pr.merge_commit_sha = Some(merge_commit_sha.clone());
@@ -4546,7 +4561,7 @@ async fn update_pr_merged(
     // alike, and the last two have no user behind them. `merge_pr` does not
     // carry the caller's id, so naming one here would mean guessing.
     announce_pr_to_watchers(
-        db,
+        &pools,
         delivery_tracker,
         merged_pr.repo_id,
         repo_name,

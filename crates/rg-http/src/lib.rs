@@ -81,8 +81,8 @@ pub struct AppState {
     pub db: DatabaseConnection,
     /// The pool steady background writers queue on (card_bb685235de6f): on a
     /// file-backed SQLite instance a separate pool of one connection, so the
-    /// CI log queue and the runner heartbeat wait for it in the pool's queue
-    /// rather than in SQLite's busy handler on a connection a reader needs.
+    /// Background CI, notification and board writers wait for it in the pool's
+    /// queue rather than in SQLite's busy handler on a connection a reader needs.
     /// Elsewhere it is `db` itself. See [`rg_db::open_write_pool`] for what
     /// may and may not be moved onto it.
     pub db_write: DatabaseConnection,
@@ -217,6 +217,11 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Carry both pools into services that enqueue writes after the request.
+    pub fn db_pools(&self) -> rg_core::db::Db {
+        rg_core::db::Db::new(self.db.clone(), self.db_write.clone())
+    }
+
     /// Run every post-push hook for refs this process just moved, detached
     /// through the delivery tracker.
     ///
@@ -331,6 +336,7 @@ impl AppState {
     pub fn pipeline_ci(&self) -> rg_core::pull_request::ci::PipelineCi<'_> {
         rg_core::pull_request::ci::PipelineCi {
             trigger: &*self.ci_engine,
+            write_pool: Some(&self.db_write),
             docker_enabled: self.docker_enabled,
             external_runners: self.external_runners,
             allow_host_runner: self.allow_host_runner,

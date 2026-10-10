@@ -71,7 +71,7 @@ pub struct PostPushParams<'a> {
     pub external_url: Option<&'a str>,
     pub delivery_tracker: &'a crate::task_tracker::TaskTracker,
     /// The pool the hooks' steady writers queue on (`rg_db::open_write_pool`)
-    /// — today the code index refresh (card_a84b25c9efbe). `None` writes
+    /// — including code index refresh and notification fan-out. `None` writes
     /// through `db`.
     pub write_pool: Option<&'a DatabaseConnection>,
 }
@@ -82,6 +82,7 @@ impl PostPushParams<'_> {
     fn pipeline_ci(&self) -> crate::pull_request::ci::PipelineCi<'_> {
         crate::pull_request::ci::PipelineCi {
             trigger: self.ci_engine,
+            write_pool: self.write_pool,
             docker_enabled: self.docker_enabled,
             external_runners: self.external_runners,
             allow_host_runner: self.allow_host_runner,
@@ -218,6 +219,7 @@ impl PostPushContext {
     pub fn pipeline_ci(&self) -> crate::pull_request::ci::PipelineCi<'_> {
         crate::pull_request::ci::PipelineCi {
             trigger: &*self.ci_engine,
+            write_pool: self.write_pool.as_ref(),
             docker_enabled: self.docker_enabled,
             external_runners: self.external_runners,
             allow_host_runner: self.allow_host_runner,
@@ -341,7 +343,7 @@ pub async fn evaluate_merges_for_head_commit(
 ) -> Vec<crate::pull_request::MergedRef> {
     let mut merged_refs = Vec::new();
     match crate::pull_request::try_auto_merges_for_head_commit(
-        db,
+        &crate::db::Db::new(db.clone(), ci.write_pool.unwrap_or(db).clone()),
         repo_root,
         source_repo_id,
         commit_sha,
@@ -708,7 +710,10 @@ async fn run_ref_move_hooks(
         // pair per subscriber, and a repository with thousands of them would
         // otherwise hold up every later ref in this same push.
         crate::repo::service::notify_watchers_push(
-            params.db,
+            &crate::db::Db::new(
+                params.db.clone(),
+                params.write_pool.unwrap_or(params.db).clone(),
+            ),
             params.delivery_tracker,
             target.repo_id,
             &target.name,
@@ -1167,6 +1172,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
             match crate::ci::publish_configuration_failure(
                 crate::ci::ConfigurationFailureParams {
                     db: params.db,
+                    write_pool: params.write_pool,
                     repo_id: target.repo_id,
                     commit_sha: &update.new_sha,
                     ref_name: &update.refname,

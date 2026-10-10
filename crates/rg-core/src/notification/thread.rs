@@ -254,8 +254,8 @@ pub fn mentioned_usernames(text: &str) -> Vec<String> {
 /// Deliver `event` off the request path, through the delivery tracker that
 /// graceful shutdown drains. A failure is logged with the subject; the
 /// operation that caused the event has already committed and stays done.
-pub fn spawn(db: &DatabaseConnection, event: ThreadEvent) {
-    let db = db.clone();
+pub fn spawn(db: &impl crate::db::DbPools, event: ThreadEvent) {
+    let db = db.owned();
     crate::task_tracker::delivery_tracker().spawn(async move {
         if let Err(error) = deliver(&db, &event).await {
             tracing::warn!(
@@ -277,7 +277,9 @@ pub struct Delivered {
 }
 
 /// Deliver `event` now. See the module note for the order of things.
-pub async fn deliver(db: &DatabaseConnection, event: &ThreadEvent) -> Result<Delivered> {
+pub async fn deliver(db: &impl crate::db::DbPools, event: &ThreadEvent) -> Result<Delivered> {
+    let write = db.write();
+    let db = db.read();
     let subject = &event.subject;
     let subject_type = subject.kind.as_str();
     let Some(repo) = rg_db::ops::repo_ops::find_by_id(db, subject.repo_id).await? else {
@@ -305,7 +307,7 @@ pub async fn deliver(db: &DatabaseConnection, event: &ThreadEvent) -> Result<Del
 
     if let (Some(actor_id), Some(reason)) = (event.actor_id, event.actor_subscribes_as) {
         thread_subscription_ops::subscribe_if_absent(
-            db,
+            write,
             actor_id,
             subject.repo_id,
             subject_type,
@@ -342,7 +344,7 @@ pub async fn deliver(db: &DatabaseConnection, event: &ThreadEvent) -> Result<Del
             continue;
         }
         thread_subscription_ops::subscribe_if_absent(
-            db,
+            write,
             user_id,
             subject.repo_id,
             subject_type,
@@ -370,7 +372,7 @@ pub async fn deliver(db: &DatabaseConnection, event: &ThreadEvent) -> Result<Del
     };
     let mut delivered = Delivered::default();
     for page in recipients.chunks(THREAD_FANOUT_PAGE) {
-        deliver_page(db, &repo, event, page, &text, &mut delivered).await?;
+        deliver_page(db, write, &repo, event, page, &text, &mut delivered).await?;
     }
     if !delivered.mailed.is_empty() {
         super::mail::wake();
@@ -409,6 +411,7 @@ struct FoldGroup {
 /// Deliver `event` to one page of its recipients, in recipient order.
 async fn deliver_page(
     db: &DatabaseConnection,
+    write: &DatabaseConnection,
     repo: &rg_db::entities::repository::Model,
     event: &ThreadEvent,
     page: &[(i64, Reason)],
@@ -526,7 +529,7 @@ async fn deliver_page(
         outcome.push((user.id, reason, email));
     }
 
-    let transaction = db.begin().await?;
+    let transaction = write.begin().await?;
     for (group, row_ids) in &folds {
         let folded_note = note(0, group.reason, group.email);
         let folded = notification_ops::fold_many(
@@ -627,8 +630,8 @@ pub async fn set_subscription(
 /// their CI failed. Detached; called where a pipeline is settled `failed` —
 /// the internal runner, an external runner's last job, a configuration the
 /// engine refused.
-pub fn notify_ci_failed(db: &DatabaseConnection, pipeline_id: i64) {
-    let db = db.clone();
+pub fn notify_ci_failed(db: &impl crate::db::DbPools, pipeline_id: i64) {
+    let db = db.owned();
     crate::task_tracker::delivery_tracker().spawn(async move {
         if let Err(error) = deliver_ci_failed(&db, pipeline_id).await {
             tracing::warn!(
@@ -641,8 +644,9 @@ pub fn notify_ci_failed(db: &DatabaseConnection, pipeline_id: i64) {
 }
 
 /// [`notify_ci_failed`], awaited: how many authors were told.
-pub async fn deliver_ci_failed(db: &DatabaseConnection, pipeline_id: i64) -> Result<usize> {
-    let Some(pipeline) = rg_db::ops::pipeline_ops::get_pipeline(db, pipeline_id).await? else {
+pub async fn deliver_ci_failed(db: &impl crate::db::DbPools, pipeline_id: i64) -> Result<usize> {
+    let read = db.read();
+    let Some(pipeline) = rg_db::ops::pipeline_ops::get_pipeline(read, pipeline_id).await? else {
         return Ok(0);
     };
     if pipeline.status != "failed" {
@@ -651,7 +655,7 @@ pub async fn deliver_ci_failed(db: &DatabaseConnection, pipeline_id: i64) -> Res
     let short_sha: String = pipeline.commit_sha.chars().take(7).collect();
     let mut told = 0;
     for pr in rg_db::ops::pull_request_ops::list_open_for_pipeline_commit(
-        db,
+        read,
         pipeline.repo_id,
         &pipeline.commit_sha,
     )
@@ -866,6 +870,279 @@ mod tests {
             few.statements, many.statements,
             "an event for 3 subscribers sent {} statements, for 40 sent {}",
             few.statements, many.statements
+        );
+    }
+}
+
+#[cfg(test)]
+mod write_pool_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use sea_orm::{ActiveValue::Set, ConnectionTrait, DatabaseConnection, TransactionTrait};
+
+    use crate::db::Db;
+
+    fn record_writes(db: &mut DatabaseConnection) -> Arc<Mutex<Vec<String>>> {
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&recorded);
+        db.set_metric_callback(move |info| {
+            let sql = info.statement.sql.trim_start().to_ascii_lowercase();
+            if ["insert", "update", "delete"]
+                .iter()
+                .any(|verb| sql.starts_with(verb))
+            {
+                sink.lock().unwrap().push(sql);
+            }
+        });
+        recorded
+    }
+
+    #[tokio::test]
+    async fn notification_and_board_writes_use_only_the_write_pool() {
+        let temp = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("pool.db").display()
+        );
+        let bootstrap = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+            .await
+            .unwrap();
+        rg_db::run_migrations(&bootstrap).await.unwrap();
+        drop(bootstrap);
+
+        let mut read = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+            .await
+            .unwrap();
+        let owner = rg_db::ops::user_ops::create_user(
+            &read,
+            "pool-owner",
+            "pool-owner@example.test",
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+        let recipient = rg_db::ops::user_ops::create_user(
+            &read,
+            "pool-recipient",
+            "pool-recipient@example.test",
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &read,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(owner.id),
+                name: Set("pool-repo".to_string()),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        rg_db::ops::repo_watch_ops::set_watch_state(&read, recipient.id, repo.id, "watching")
+            .await
+            .unwrap();
+
+        let mut write = rg_db::open_write_pool(&url, 2, 60, &read).await.unwrap();
+        let on_read = record_writes(&mut read);
+        let on_write = record_writes(&mut write);
+        let pools = Db::new(read.clone(), write.clone());
+
+        let event = super::ThreadEvent::new(
+            super::Subject {
+                kind: super::SubjectKind::Issue,
+                id: 77,
+                number: 1,
+                repo_id: repo.id,
+                title: "pool event".to_string(),
+            },
+            None,
+            "changed",
+        )
+        .to(recipient.id, super::Reason::Assigned);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::deliver(&pools, &event),
+        )
+        .await
+        .expect("thread fan-out re-entered its one-connection write pool")
+        .unwrap();
+        crate::notification::notify_watchers(
+            &pools,
+            &crate::notification::WatchEvent {
+                repo_id: repo.id,
+                author_name: owner.username,
+                title: "push".to_string(),
+                notification_type: "push".to_string(),
+                body: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::board::service::create_board(
+            &pools,
+            "pool board".to_string(),
+            None,
+            Some(repo.id),
+            None,
+            owner.id,
+        )
+        .await
+        .unwrap();
+
+        let written = on_write.lock().unwrap().clone();
+        for table in [
+            "notifications",
+            "thread_subscriptions",
+            "boards",
+            "board_columns",
+        ] {
+            assert!(
+                written.iter().any(|sql| sql.contains(table)),
+                "no {table} write on the write pool: {written:?}"
+            );
+        }
+        let leaked = on_read.lock().unwrap().clone();
+        assert!(leaked.is_empty(), "writes on the shared pool: {leaked:?}");
+    }
+
+    async fn read_latency_during_fanout(
+        shared: &DatabaseConnection,
+        writers_use: &DatabaseConnection,
+        holder: &DatabaseConnection,
+        repo_id: i64,
+        recipients: &[i64],
+        subject_offset: i64,
+    ) -> Duration {
+        const LOCK_HELD: Duration = Duration::from_secs(2);
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let held = holder.clone();
+        let holder_task = tokio::spawn(async move {
+            let tx = held.begin().await.unwrap();
+            tx.execute_unprepared("UPDATE users SET updated_at = updated_at")
+                .await
+                .unwrap();
+            locked_tx.send(()).unwrap();
+            tokio::time::sleep(LOCK_HELD).await;
+            tx.commit().await.unwrap();
+        });
+        locked_rx.await.unwrap();
+
+        let mut deliveries = Vec::new();
+        for (index, &recipient) in recipients.iter().enumerate() {
+            let pools = Db::new(shared.clone(), writers_use.clone());
+            let event = super::ThreadEvent::new(
+                super::Subject {
+                    kind: super::SubjectKind::Issue,
+                    id: subject_offset + index as i64,
+                    number: index as i64 + 1,
+                    repo_id,
+                    title: "contended fan-out".to_string(),
+                },
+                None,
+                "changed",
+            )
+            .to(recipient, super::Reason::Assigned);
+            deliveries.push(tokio::spawn(async move {
+                super::deliver(&pools, &event).await.unwrap();
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        shared
+            .execute_unprepared("SELECT count(*) FROM repositories")
+            .await
+            .unwrap();
+        let latency = started.elapsed();
+        holder_task.await.unwrap();
+        for delivery in deliveries {
+            delivery.await.unwrap();
+        }
+        latency
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn queued_notification_fanouts_leave_the_shared_pool_available_to_readers() {
+        const LOCK_HELD: Duration = Duration::from_secs(2);
+        let temp = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("latency.db").display()
+        );
+        let bootstrap = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+            .await
+            .unwrap();
+        rg_db::run_migrations(&bootstrap).await.unwrap();
+        drop(bootstrap);
+        let shared = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+            .await
+            .unwrap();
+        let owner = rg_db::ops::user_ops::create_user(
+            &shared,
+            "latency-owner",
+            "latency-owner@example.test",
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+        let mut recipients = Vec::new();
+        for index in 0..3 {
+            let user = rg_db::ops::user_ops::create_user(
+                &shared,
+                &format!("latency-{index}"),
+                &format!("latency-{index}@example.test"),
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+            recipients.push(user.id);
+        }
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &shared,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(owner.id),
+                name: Set("latency-repo".to_string()),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let write = rg_db::open_write_pool(&url, 10, 60, &shared).await.unwrap();
+        let holder = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+            .await
+            .unwrap();
+
+        let starved =
+            read_latency_during_fanout(&shared, &shared, &holder, repo.id, &recipients, 100).await;
+        assert!(
+            starved >= LOCK_HELD / 2,
+            "control did not reproduce read starvation: {starved:?}"
+        );
+        let answered =
+            read_latency_during_fanout(&shared, &write, &holder, repo.id, &recipients, 200).await;
+        eprintln!("notification fan-out read latency: shared {starved:?}, write pool {answered:?}");
+        assert!(
+            answered < LOCK_HELD / 4,
+            "a read waited {answered:?} behind notification fan-outs on the write pool"
         );
     }
 }

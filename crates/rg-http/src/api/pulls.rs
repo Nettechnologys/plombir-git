@@ -256,7 +256,7 @@ pub async fn create_pr(
     {
         {
             match rg_core::pull_request::create_pr(
-                &state.db,
+                &state.db_pools(),
                 &state.repo_root,
                 repo_id,
                 user_id,
@@ -299,7 +299,7 @@ pub async fn create_pr(
                                 .collect::<Vec<_>>();
                             let repo_path = state.repo_root.join(format!("{owner}/{repo}.git"));
                             match rg_core::review::codeowners::request_codeowners(
-                                &state.db,
+                                &state.db_pools(),
                                 &repo_path,
                                 &pr.base_branch,
                                 &paths,
@@ -460,7 +460,7 @@ pub async fn update_pr(
     }
 
     match rg_core::pull_request::update_pr(
-        &state.db,
+        &state.db_pools(),
         &owner,
         &repo,
         number,
@@ -695,7 +695,7 @@ pub async fn merge_pr(
     }
 
     match rg_core::pull_request::merge_pr(
-        &state.db,
+        &state.db_pools(),
         &state.repo_root,
         &owner,
         &repo,
@@ -839,8 +839,14 @@ pub async fn enable_auto_merge(
         // and answer 409; an unknown PR is 404; the update behind them is ours.
         return AppError::from(error).into_response();
     }
-    match rg_core::pull_request::try_auto_merge(&state.db, &state.repo_root, &owner, &repo, number)
-        .await
+    match rg_core::pull_request::try_auto_merge(
+        &state.db_pools(),
+        &state.repo_root,
+        &owner,
+        &repo,
+        number,
+    )
+    .await
     {
         Ok(outcome) => {
             // Enabling auto-merge on a PR whose conditions are already met

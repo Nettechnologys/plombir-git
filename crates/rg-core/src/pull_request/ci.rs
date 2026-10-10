@@ -21,6 +21,8 @@ use rg_db::entities::{pull_request, repository};
 /// the same six values to `trigger_pipeline` and neither owns them.
 pub struct PipelineCi<'a> {
     pub trigger: &'a dyn crate::ci::CiTrigger,
+    /// The pool for notification fan-out after a failed configuration run.
+    pub write_pool: Option<&'a DatabaseConnection>,
     pub docker_enabled: bool,
     pub external_runners: bool,
     /// See [`crate::ci::TriggerPipelineParams::allow_host_runner`].
@@ -308,6 +310,7 @@ pub async fn trigger_pull_request_ci_best_effort(
                 crate::ci::publish_configuration_failure(
                     crate::ci::ConfigurationFailureParams {
                         db,
+                        write_pool: ci.write_pool,
                         repo_id: pr.repo_id,
                         commit_sha: head_sha,
                         ref_name: &ref_name,
@@ -581,6 +584,7 @@ mod configuration_failure_tests {
             Some(user.id),
             &PipelineCi {
                 trigger: &trigger,
+                write_pool: None,
                 docker_enabled: false,
                 external_runners: false,
                 allow_host_runner: false,
