@@ -67,6 +67,9 @@ pub(crate) struct ConfigFile {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServerConfig {
     pub(crate) repo_root: Option<String>,
+    /// Built SvelteKit SPA directory, relative to the server working directory
+    /// unless absolute. Defaults to `web/build`.
+    pub(crate) web_root: Option<String>,
     /// Process-wide creation policy for repository and service state. This is
     /// config-only because weakening owner-only is a deployment decision, not
     /// a convenient per-invocation switch.
@@ -1821,6 +1824,12 @@ mod tests {
                 "repo_root",
                 "DEFAULT_REPO_ROOT",
                 format!("{:?}", super::DEFAULT_REPO_ROOT),
+            ),
+            row(
+                "server",
+                "web_root",
+                "rg_http::DEFAULT_SPA_BUILD_DIR",
+                format!("{:?}", rg_http::DEFAULT_SPA_BUILD_DIR),
             ),
             row(
                 "server",

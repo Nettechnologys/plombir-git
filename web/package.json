@@ -13,6 +13,7 @@
 		"stand": "bash ../scripts/ephemeral-stand.sh",
 		"stand:smoke": "bash ../scripts/ephemeral-stand.sh --frontend -- npm run smoke:admin",
 		"e2e:first-user": "bash ../scripts/first-user-journey-e2e.sh",
+		"e2e:readme-quickstart": "node ../scripts/readme-quickstart-e2e.mjs",
 		"e2e:ui-access-sweep": "bash ../scripts/ui-access-sweep-e2e.sh",
 		"inventory:ui": "node ../scripts/ui-inventory.mjs",
 		"inventory:ui:check": "node ../scripts/ui-inventory-contract-check.mjs",

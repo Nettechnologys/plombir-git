@@ -271,16 +271,22 @@ fresh instance, then register at least one signing key.
   than clone through an unpinned resolver. Debian 12, Ubuntu 24.04 and current
   macOS ship a new enough git; Ubuntu 22.04 (2.34) needs the `git-core` PPA.
 - Linux or macOS
+- Node.js and npm (to build the web UI), plus `curl` and `jq` for the API examples
 
 ### Build
 
 ```bash
 git clone https://github.com/Nettechnologys/plombir-git.git
 cd plombir-git
-cargo build --release
+(cd web && npm ci && npm run build)
+cargo build --release -j 6
 ```
 
-The main binary is `target/release/plombir-git`. The workspace also produces
+The web bundle is `web/build/`; the server serves it from `[server].web_root`
+(default: `web/build` relative to its working directory). Run the commands
+below from the repository root, or set `web_root` to the bundle's absolute
+path in your config file. The main binary is `target/release/plombir-git`.
+The workspace also produces
 `plombir-git-runner` (standalone CI runner) and `plombir-git-mcp` (MCP server).
 
 ### Generate an SSH host key
@@ -293,21 +299,38 @@ ssh-keygen -t ed25519 -f ./plombir_git_host_key -N ""
 
 ### Run the server
 
+Create the config **once** and keep it with the database and host key. Running
+`gen-secret` on every start would invalidate existing sessions. The at-rest
+encryption key is a different key that the server creates beside the host key
+on first start; back it up with the database.
+
+```bash
+umask 077
+printf '[server]\nweb_root = "./web/build"\n\n[auth]\njwt_secret = "%s"\n' \
+  "$(./target/release/plombir-git gen-secret)" > plombir-git.toml
+```
+
+In a second terminal, from the repository root:
+
 ```bash
 ./target/release/plombir-git serve \
   --repo-root ./repos \
-  --http-addr 0.0.0.0:8080 \
-  --ssh-addr  0.0.0.0:2222 \
+  --http-addr 127.0.0.1:8080 \
+  --ssh-addr  127.0.0.1:2222 \
   --host-key  ./plombir_git_host_key \
   --db-url    "sqlite://./plombir-git.db?mode=rwc" \
-  --jwt-secret "$(plombir-git gen-secret)"
+  --config    ./plombir-git.toml
 ```
 
-`plombir-git gen-secret` prints a fresh 256-bit secret (the `openssl rand -base64
-32` equivalent). The server refuses to start with the shipped
-`change-me-in-production` placeholder, so generate your own and keep it out of
-version control. Database migrations run automatically on startup. Set the log
-level with `RUST_LOG` (e.g. `RUST_LOG=debug`).
+`gen-secret` prints a fresh 256-bit secret (the `openssl rand -base64 32`
+equivalent). The server refuses the shipped `change-me-in-production`
+placeholder. Keep `plombir-git.toml` out of version control. Database
+migrations run automatically on startup. Set the log level with `RUST_LOG`
+(e.g. `RUST_LOG=debug`). These loopback listeners are for a local trial; see
+[the deployment guide](deploy/README.md) before exposing an instance.
+
+`[server].web_root` is config-only; use it when the built UI is outside the
+server's working directory.
 
 Common `serve` flags:
 
@@ -396,7 +419,7 @@ Replace it only if the key itself is compromised, and knowing that every
 attestation signed with it stops verifying for good:
 
 ```bash
-plombir-git rotate-instance-key --config plombir-git.toml --yes
+./target/release/plombir-git rotate-instance-key --config plombir-git.toml --yes
 ```
 
 **Rotating the encryption key** is a different operation — the stored
@@ -408,8 +431,8 @@ write lock for its whole duration. Stop the server first, and look before you
 leap:
 
 ```bash
-plombir-git rotate-encryption-key --config plombir-git.toml \
-    --old "<the current key>" --new "$(plombir-git gen-secret)" --dry-run
+./target/release/plombir-git rotate-encryption-key --config plombir-git.toml \
+    --old "<the current key>" --new "$(./target/release/plombir-git gen-secret)" --dry-run
 ```
 
 The dry run reports, per column, how many stored values the old key opens and
@@ -439,11 +462,25 @@ clear them and have MFA re-enrolled and the stored credentials re-entered. That
 includes the instance signing key — `rotate-instance-key` mints a new identity,
 and attestations signed under the old one stay unverifiable.
 
-### Create a test repository
+### Create a repository and clone it
+
+Back in the first terminal, register a local test user, create a repository
+through the API (which records it in the database), and clone it. The password
+is generated once in this shell; save it if you intend to log in again.
 
 ```bash
-./target/release/plombir-git create-repo testuser testrepo --repo-root ./repos
-# → ./repos/testuser/testrepo.git
+BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
+PASSWORD="$(./target/release/plombir-git gen-secret)Aa1!"
+TOKEN="$(curl -fsS -X POST "$BASE_URL/api/v1/users/register" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg username testuser --arg email test@example.com \
+    --arg password "$PASSWORD" \
+    '{username:$username,email:$email,password:$password}')" | jq -er '.token')"
+curl -fsS -X POST "$BASE_URL/api/v1/repos" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"testrepo","auto_init":true}' > /dev/null
+git clone "$BASE_URL/git/testuser/testrepo" "${QUICKSTART_CLONE_DIR:-/tmp/plombir-git-testrepo}"
 ```
 
 ---
@@ -550,47 +587,46 @@ before it moves its ref.
 
 All endpoints live under `/api/v1/`. Authenticated routes expect an
 `Authorization: Bearer <token>` header, where the token is a JWT (from login)
-or a Personal Access Token.
+or a Personal Access Token. These examples continue the quick start above;
+`PASSWORD` is the value generated there. Save that password securely before
+closing its shell.
 
 ```bash
-# Register
-curl -X POST http://localhost:8080/api/v1/users/register \
-  -H "Content-Type: application/json" \
-  -d '{"username":"testuser","email":"test@example.com","password":"secret123"}'
-
 # Login → returns a JWT
-curl -X POST http://localhost:8080/api/v1/users/login \
+TOKEN="$(curl -fsS -X POST "$BASE_URL/api/v1/users/login" \
   -H "Content-Type: application/json" \
-  -d '{"login":"testuser","password":"secret123"}'
+  -d "$(jq -n --arg login testuser --arg password "$PASSWORD" \
+    '{login:$login,password:$password}')" | jq -er '.token')"
 
 # Create a repository
-curl -X POST http://localhost:8080/api/v1/repos \
-  -H "Authorization: Bearer <token>" \
+curl -X POST "$BASE_URL/api/v1/repos" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"name":"myrepo","description":"test repo"}'
+  -d '{"name":"myrepo","description":"test repo","auto_init":true}'
 
 # Open an issue
-curl -X POST http://localhost:8080/api/v1/repos/testuser/myrepo/issues \
-  -H "Authorization: Bearer <token>" \
+curl -X POST "$BASE_URL/api/v1/repos/testuser/myrepo/issues" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"title":"Bug report","body":"Something is wrong","labels":"bug"}'
+  -d '{"title":"Bug report","body":"Something is wrong","labels":[]}'
 
-# Open a pull request
-curl -X POST http://localhost:8080/api/v1/repos/testuser/myrepo/pulls \
-  -H "Authorization: Bearer <token>" \
+# Open a pull request after pushing a feature branch
+curl -X POST "$BASE_URL/api/v1/repos/testuser/myrepo/pulls" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"title":"Add feature","body":"Description","head_branch":"feature","base_branch":"main"}'
+  -d '{"title":"Add feature","body":"Description","head":"feature","base":"main"}'
 ```
 
 The full API is documented via OpenAPI. `/api-docs/*` (OpenAPI JSON + Swagger
 UI) is protected by default and requires a valid JWT or PAT:
 
 ```bash
-TOKEN="$(curl -s http://localhost:8080/api/v1/users/login \
+TOKEN="$(curl -fsS "$BASE_URL/api/v1/users/login" \
   -H 'Content-Type: application/json' \
-  -d '{"login":"testuser","password":"secret123"}' | jq -r '.token')"
+  -d "$(jq -n --arg login testuser --arg password "$PASSWORD" \
+    '{login:$login,password:$password}')" | jq -er '.token')"
 
-curl -H "Authorization: Bearer ${TOKEN}" http://localhost:8080/api-docs/openapi.json
+curl -H "Authorization: Bearer ${TOKEN}" "$BASE_URL/api-docs/openapi.json"
 ```
 
 ---
@@ -614,6 +650,15 @@ Beyond `serve`, the `plombir-git` binary offers:
 | `index-repo <owner/name>` | Index a repository for code search |
 | `package` | Manage the package registry (`package list` requires a stopped server on file-backed SQLite) |
 | `list-tombstones` | Report the bytes interrupted deletions left in the storage root (reports only — moves, removes and creates nothing) |
+
+`create-repo` creates only a bare Git directory, with **no database row**. Use
+it for filesystem-level testing, not to create a repository users can clone
+from a running instance. For the latter, use the API or web UI as in the quick
+start.
+
+```bash
+./target/release/plombir-git create-repo scratch fixture --repo-root ./repos
+```
 
 Every subcommand that touches the database or the repository directory
 (`migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,

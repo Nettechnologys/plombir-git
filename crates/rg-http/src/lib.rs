@@ -74,9 +74,9 @@ pub struct AppState {
     /// Maximum decoded package artifact size. Protocol envelopes receive only
     /// bounded encoding headroom; this remains the stored-file ceiling.
     pub package_upload_max_bytes: usize,
-    /// Directory holding the built SPA bundle. Production uses
-    /// [`DEFAULT_SPA_BUILD_DIR`]; tests can inject a temp fixture without
-    /// mutating process-global cwd or env.
+    /// Directory holding the built SPA bundle. Production resolves it from
+    /// `[server].web_root` or [`DEFAULT_SPA_BUILD_DIR`]; tests can inject a
+    /// temp fixture without mutating process-global cwd or env.
     pub spa_build_dir: Arc<PathBuf>,
     pub db: DatabaseConnection,
     /// The pool steady background writers queue on (card_bb685235de6f): on a
@@ -347,6 +347,9 @@ pub struct HttpServerConfig {
     pub listen_addr: String,
     /// Root directory for git repositories.
     pub repo_root: PathBuf,
+    /// Directory holding the built SvelteKit SPA. Relative paths use the
+    /// server working directory.
+    pub spa_build_dir: PathBuf,
     /// Database connection.
     pub db: DatabaseConnection,
     /// The pool steady background writers queue on — see
@@ -604,7 +607,7 @@ async fn run_with_listener(
 
     let state = AppState {
         repo_root: Arc::new(config.repo_root),
-        spa_build_dir: Arc::new(PathBuf::from(DEFAULT_SPA_BUILD_DIR)),
+        spa_build_dir: Arc::new(config.spa_build_dir),
         db: config.db,
         db_write,
         jwt_secret: Arc::new(config.jwt_secret),

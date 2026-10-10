@@ -730,6 +730,13 @@ async fn establish_encryption_key(
     rg_core::auth::key_check::ensure_encryption_key_check(db, &secrets.encryption_key).await
 }
 
+/// Resolve the SPA bundle path without mutating the server's working directory.
+fn resolve_spa_build_dir(cfg: Option<&crate::config::ConfigFile>) -> std::path::PathBuf {
+    cfg.and_then(|c| c.server.web_root.as_ref())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(rg_http::DEFAULT_SPA_BUILD_DIR))
+}
+
 /// Initialise and run the Plombir Git server (HTTP + SSH).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_serve(
@@ -1531,6 +1538,7 @@ pub(crate) async fn run_serve(
     let http_config = rg_http::HttpServerConfig {
         listen_addr: resolved_http_addr,
         repo_root: repo_root.clone(),
+        spa_build_dir: resolve_spa_build_dir(cfg.as_ref()),
         db: db.clone(),
         db_write: Some(db_write.clone()),
         jwt_secret: resolved_auth_secrets.jwt_secret.clone(),
@@ -1835,6 +1843,20 @@ mod serve_tests {
     use crate::config::{
         resolve_mirror_transport_policy, resolve_webhook_transport_policy, CliSettings, ConfigFile,
     };
+
+    #[test]
+    fn web_root_uses_configured_bundle_directory() {
+        let cfg: ConfigFile = toml::from_str("[server]\nweb_root = '/srv/plombir/web/build'\n")
+            .expect("web_root is a valid server setting");
+        assert_eq!(
+            super::resolve_spa_build_dir(Some(&cfg)),
+            PathBuf::from("/srv/plombir/web/build")
+        );
+        assert_eq!(
+            super::resolve_spa_build_dir(None),
+            PathBuf::from(rg_http::DEFAULT_SPA_BUILD_DIR)
+        );
+    }
 
     #[allow(dead_code)]
     mod rust_source {

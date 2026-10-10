@@ -20,9 +20,9 @@ pub(crate) const WEB_BUILD_DIR: &str = "web/build";
 pub(crate) struct SpaBuildDir(pub PathBuf);
 
 /// Remediation hint attached to every failure to serve the SPA shell. The bundle
-/// is resolved from the process CWD, so "file missing" and "wrong CWD" look
-/// identical from the outside — name both.
-const WEB_BUILD_HINT: &str = "the frontend bundle is expected in `web/build/` relative to the server's working directory (the docker image copies it to /app/web/build and runs with WORKDIR /app)";
+/// may be relative to the process CWD, so "file missing" and "wrong CWD" can
+/// look identical from the outside — name both.
+const WEB_BUILD_HINT: &str = "build the frontend with `npm ci && npm run build` in web/; the default bundle is `web/build/` relative to the server's working directory (or set `[server].web_root` to its path)";
 
 /// H-2: SPA fallback handler — serves `index.html` with a per-request CSP
 /// nonce injected into all `<script>` tags.

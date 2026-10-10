@@ -8,6 +8,8 @@
 
 [server]
 repo_root = "./repos"
+# Built SvelteKit SPA directory. Relative paths use the server working directory.
+# web_root = "web/build"
 # Files and directories created by the server default to owner-only, including
 # Git/gix and registry writers that do not expose a per-file mode. A backup
 # account that reaches this state through a shared group can opt into
