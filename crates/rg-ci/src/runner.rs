@@ -3283,7 +3283,9 @@ esac
         let (mut runner, db, job) =
             runner_with_one_job(temp.path(), "write-pool", "sleep 1; echo built", None, 60).await;
         let url = format!("sqlite://{}?mode=rwc", temp.path().join("ci.db").display());
-        let mut shared = rg_db::connect_with_pool(&url, 2, 60, 2).await.unwrap();
+        let mut shared = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+            .await
+            .unwrap();
         let mut write = rg_db::open_write_pool(&url, 2, 60, &shared).await.unwrap();
         let record = |pool: &mut rg_db::DatabaseConnection| {
             let sent: Arc<Mutex<Vec<String>>> = Arc::default();

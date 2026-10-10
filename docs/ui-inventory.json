@@ -1038,6 +1038,7 @@
       "access": "RepoAdmin",
       "handler": "api::repos::update_repo_handler",
       "testedIn": [
+        "rust",
         "web",
         "browser"
       ],
@@ -17808,6 +17809,7 @@
               "handler": "api::repos::update_repo_handler",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web",
                 "browser"
               ],
@@ -17980,6 +17982,7 @@
               "handler": "api::repos::update_repo_handler",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -18014,6 +18017,7 @@
               "handler": "api::repos::update_repo_handler",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             }

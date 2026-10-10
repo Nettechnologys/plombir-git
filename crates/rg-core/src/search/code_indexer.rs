@@ -2545,7 +2545,7 @@ mod tests {
             "sqlite://{}?mode=rwc",
             dir.path().join("index.db").display()
         );
-        let mut shared = rg_db::connect_with_pool(&url, 2, 60, 2)
+        let mut shared = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
             .await
             .expect("shared pool");
         rg_db::run_migrations(&shared).await.expect("migrate");
