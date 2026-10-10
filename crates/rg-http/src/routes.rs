@@ -1872,6 +1872,11 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}",
             api::ci::get_job,
         )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/log",
+            api::ci::get_job_log,
+        )
         .post(
             RepoWrite,
             "/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/play",

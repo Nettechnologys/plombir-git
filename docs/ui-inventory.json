@@ -2407,6 +2407,16 @@
       "access": "RepoRead",
       "handler": "api::ci::get_job",
       "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/log",
+      "access": "RepoRead",
+      "handler": "api::ci::get_job_log",
+      "testedIn": [
         "rust",
         "web",
         "browser"
@@ -12489,7 +12499,7 @@
         {
           "tag": "form",
           "label": "updateTriggerRef(event.currentTarget.value)} onchange= place",
-          "line": 739,
+          "line": 786,
           "via": null,
           "href": null,
           "handler": "handleTrigger",
@@ -12572,7 +12582,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 768,
+          "line": 815,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.checked ? 'true' : 'f",
@@ -12582,7 +12592,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 777,
+          "line": 824,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.value)",
@@ -12592,7 +12602,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.starting",
-          "line": 805,
+          "line": 852,
           "via": null,
           "href": null,
           "handler": null,
@@ -12602,7 +12612,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.retry",
-          "line": 868,
+          "line": 915,
           "via": null,
           "href": null,
           "handler": "() => handleRetry(selectedPipeline.id)",
@@ -12669,7 +12679,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.cancel",
-          "line": 871,
+          "line": 918,
           "via": null,
           "href": null,
           "handler": "() => handleCancel(selectedPipeline.id)",
@@ -12693,7 +12703,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.play_manual",
-          "line": 931,
+          "line": 978,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handlePlay(job.id); }",
@@ -12745,7 +12755,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.approval_recorded",
-          "line": 934,
+          "line": 981,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handleApprove(job.id); }",
@@ -12797,7 +12807,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_downloading",
-          "line": 970,
+          "line": 1017,
           "via": null,
           "href": null,
           "handler": "() => downloadArtifact(artifact)",
@@ -12822,7 +12832,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_deleting",
-          "line": 976,
+          "line": 1023,
           "via": null,
           "href": null,
           "handler": "() => deleteArtifact(artifact)",
@@ -12847,7 +12857,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 1013,
+          "line": 1060,
           "via": null,
           "href": null,
           "handler": "closeLog",
@@ -13133,24 +13143,6 @@
           ]
         },
         {
-          "symbol": "pipelines.job",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/pipelines/{pipelineId}/jobs/{jobId}",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}",
-          "access": "RepoRead",
-          "handler": "api::ci::get_job",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web",
-            "browser"
-          ],
-          "browserScenarios": [
-            "repo-read-surface"
-          ]
-        },
-        {
           "symbol": "connectJobLogWebSocket",
           "kind": "client",
           "transport": "websocket",
@@ -13164,6 +13156,24 @@
           "testedIn": [
             "rust",
             "web"
+          ]
+        },
+        {
+          "symbol": "pipelines.jobLog",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/pipelines/{pipelineId}/jobs/{jobId}/log",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/log",
+          "access": "RepoRead",
+          "handler": "api::ci::get_job_log",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web",
+            "browser"
+          ],
+          "browserScenarios": [
+            "repo-read-surface"
           ]
         },
         {

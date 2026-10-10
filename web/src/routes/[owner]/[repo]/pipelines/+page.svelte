@@ -41,6 +41,10 @@
   let logStreamError = $state('');
   let logContentEl = $state<HTMLPreElement | null>(null);
   let logSocket: WebSocket | null = null;
+  let logOffset = 0;
+  let logSyncingClaim: RepositoryResourceRequestClaim<string> | null = null;
+  let logSyncRequestedClaim: RepositoryResourceRequestClaim<string> | null = null;
+  let activeLogClaim: RepositoryResourceRequestClaim<string> | null = null;
   let approvedJobs = $state<number[]>([]);
   let artifactList = $state<CiArtifact[]>([]);
   let artifactsLoading = $state(false);
@@ -97,6 +101,8 @@
     selectedJob = null;
     showLogPanel = false;
     logContent = '';
+    logOffset = 0;
+    activeLogClaim = null;
     approvedJobs = [];
     artifactList = [];
     artifactsLoading = false;
@@ -141,6 +147,10 @@
             // while the pipeline is still running — polling only the pipeline
             // would leave the section empty until the user clicked away and back.
             void loadArtifacts(expectedOwner, expectedRepo, refreshingId);
+            if (showLogPanel && selectedJob && activeLogClaim) {
+              void syncJobLog(expectedOwner, expectedRepo, refreshingId, selectedJob.id,
+                expectedRoute, expectedSelection, activeLogClaim);
+            }
           }
         }, 5000);
       }
@@ -402,6 +412,8 @@
     if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
     selectionGeneration += 1;
     disconnectJobLogSocket();
+    activeLogClaim = null;
+    logOffset = 0;
     jobRequests.begin(expectedOwner, expectedRepo, `${id}:0`);
     const claim = pipelineDetailRequests.begin(expectedOwner, expectedRepo, id);
     selectedPipelineId = id;
@@ -548,13 +560,17 @@
     disconnectJobLogSocket();
     const claim = jobRequests.begin(expectedOwner, expectedRepo, jobIdentity);
     try {
-      const job = await pipelines.job(expectedOwner, expectedRepo, expectedPipelineId, jobId);
+      const job = selectedPipeline.stages.flatMap((stage: any) => stage.jobs || [])
+        .find((entry: any) => entry.id === jobId);
+      if (!job) throw new Error('job not found');
       if (
         !jobRequests.owns(claim, owner, repo, `${selectedPipelineId ?? 0}:${jobId}`)
         || !isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)
       ) return;
       selectedJob = job;
-      logContent = job.log || '';
+      logContent = '';
+      logOffset = 0;
+      activeLogClaim = claim;
       showLogPanel = true;
       startJobLogStream(
         expectedOwner,
@@ -565,6 +581,8 @@
         expectedSelection,
         claim,
       );
+      await syncJobLog(expectedOwner, expectedRepo, expectedPipelineId, jobId,
+        expectedRoute, expectedSelection, claim);
     } catch (e: any) {
       if (
         !jobRequests.owns(claim, owner, repo, `${selectedPipelineId ?? 0}:${jobId}`)
@@ -582,6 +600,7 @@
       jobRequests.begin(owner, repo, `${selectedPipelineId}:0`);
     }
     disconnectJobLogSocket();
+    activeLogClaim = null;
     showLogPanel = false;
     selectedJob = null;
   }
@@ -599,7 +618,7 @@
     logStreamError = '';
     logSocket = connectJobLogWebSocket(
       jobId,
-      (chunk) => appendLogChunk(
+      () => void syncJobLog(
         expectedOwner,
         expectedRepo,
         pipelineId,
@@ -607,11 +626,12 @@
         expectedRoute,
         expectedSelection,
         claim,
-        chunk,
       ),
       (status) => {
         if (!ownsJobIntent(claim, expectedOwner, expectedRepo, pipelineId, jobId, expectedRoute, expectedSelection)) return;
         logStreamStatus = status;
+        if (status === 'connected') void syncJobLog(expectedOwner, expectedRepo, pipelineId, jobId,
+          expectedRoute, expectedSelection, claim);
       },
       () => {
         if (!ownsJobIntent(claim, expectedOwner, expectedRepo, pipelineId, jobId, expectedRoute, expectedSelection)) return;
@@ -635,7 +655,7 @@
       && isCurrentSelection(expectedOwner, expectedRepo, pipelineId, expectedRoute, expectedSelection);
   }
 
-  function appendLogChunk(
+  async function syncJobLog(
     expectedOwner: string,
     expectedRepo: string,
     pipelineId: number,
@@ -643,9 +663,8 @@
     expectedRoute: number,
     expectedSelection: number,
     claim: RepositoryResourceRequestClaim<string>,
-    chunk: string,
   ) {
-    if (!chunk || !ownsJobIntent(
+    if (!ownsJobIntent(
       claim,
       expectedOwner,
       expectedRepo,
@@ -654,12 +673,40 @@
       expectedRoute,
       expectedSelection,
     )) return;
-    logContent += chunk;
-    requestAnimationFrame(() => {
-      if (logContentEl) {
-        logContentEl.scrollTop = logContentEl.scrollHeight;
+    if (logSyncingClaim === claim) { logSyncRequestedClaim = claim; return; }
+    logSyncingClaim = claim;
+    try {
+      do {
+        logSyncRequestedClaim = null;
+        let more = true;
+        while (more) {
+          const slice = await pipelines.jobLog(expectedOwner, expectedRepo, pipelineId, jobId, logOffset);
+          if (!ownsJobIntent(claim, expectedOwner, expectedRepo, pipelineId, jobId,
+            expectedRoute, expectedSelection)) return;
+          if (slice.total_length < logOffset) {
+            logOffset = 0;
+            logContent = '';
+            continue;
+          }
+          if (slice.next_offset < logOffset) throw new Error('invalid log offset');
+          logContent += slice.content;
+          logOffset = slice.next_offset;
+          more = logOffset < slice.total_length;
+          if (more && !slice.content) throw new Error('empty log slice');
+        }
+        requestAnimationFrame(() => {
+          if (logContentEl) logContentEl.scrollTop = logContentEl.scrollHeight;
+        });
+      } while (logSyncRequestedClaim === claim);
+    } catch (e: any) {
+      if (ownsJobIntent(claim, expectedOwner, expectedRepo, pipelineId, jobId,
+        expectedRoute, expectedSelection)) {
+        logStreamStatus = 'error';
+        logStreamError = e.message;
       }
-    });
+    } finally {
+      if (logSyncingClaim === claim) logSyncingClaim = null;
+    }
   }
 
   function disconnectJobLogSocket() {

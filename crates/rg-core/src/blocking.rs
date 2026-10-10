@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 /// Callers move every path, guarded remote and credential needed by the phase
 /// into `operation`. Inner Git errors pass through unchanged; a panic or a
 /// cancelled blocking task gains the name of the operation that was lost.
-pub(crate) async fn run_blocking_git<T, F>(what: &'static str, operation: F) -> Result<T>
+pub async fn run_blocking_git<T, F>(what: &'static str, operation: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,

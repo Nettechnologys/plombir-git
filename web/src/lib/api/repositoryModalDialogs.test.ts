@@ -124,7 +124,7 @@ describe('repository modal dialogs', () => {
 			pipeline,
 			stages: [{ id: 2, name: 'build', status: 'success', started_at: timestamp, finished_at: timestamp, jobs: [job] }],
 		});
-		pipelines.job.mockResolvedValue({ ...job, log: 'compiling' });
+		pipelines.jobLog.mockResolvedValue({ content: 'compiling', offset: 0, next_offset: 9, total_length: 9 });
 		repos.branches.mockResolvedValue([]);
 		artifacts.list.mockResolvedValue([]);
 		connectJobLogWebSocket.mockReturnValue({ close: vi.fn() });

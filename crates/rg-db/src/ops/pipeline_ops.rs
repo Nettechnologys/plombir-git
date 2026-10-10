@@ -726,6 +726,109 @@ pub async fn list_jobs_by_stage(
         .context("db: list jobs by stage")
 }
 
+/// Fields used by the frequently polled pipeline detail. The log column is
+/// deliberately absent from the SELECT; one running job can hold megabytes.
+#[derive(Debug, FromQueryResult)]
+pub struct PipelineJobSummary {
+    pub id: i64,
+    pub stage_id: i64,
+    pub name: String,
+    pub image: Option<String>,
+    pub script: String,
+    pub when_condition: String,
+    pub if_condition: Option<String>,
+    pub allow_failure: bool,
+    pub timeout_seconds: Option<i64>,
+    pub environment_id: Option<i64>,
+    pub environment_name: Option<String>,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub has_log: bool,
+    pub started_at: Option<chrono::NaiveDateTime>,
+    pub finished_at: Option<chrono::NaiveDateTime>,
+}
+
+/// Fetch every stage's job in one query, without materialising log bodies.
+pub async fn list_job_summaries_by_stage_ids(
+    db: &impl ConnectionTrait,
+    stage_ids: &[i64],
+) -> Result<Vec<PipelineJobSummary>> {
+    if stage_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    job_summaries_query()
+        .filter(pipeline_job::Column::StageId.is_in(stage_ids.iter().copied()))
+        .order_by_asc(pipeline_job::Column::Id)
+        .into_model::<PipelineJobSummary>()
+        .all(db)
+        .await
+        .context("db: list pipeline job summaries")
+}
+
+pub async fn get_job_summary(
+    db: &impl ConnectionTrait,
+    job_id: i64,
+) -> Result<Option<PipelineJobSummary>> {
+    job_summaries_query()
+        .filter(pipeline_job::Column::Id.eq(job_id))
+        .into_model::<PipelineJobSummary>()
+        .one(db)
+        .await
+        .context("db: get pipeline job summary")
+}
+
+fn job_summaries_query() -> Select<pipeline_job::Entity> {
+    pipeline_job::Entity::find()
+        .select_only()
+        .columns([
+            pipeline_job::Column::Id,
+            pipeline_job::Column::StageId,
+            pipeline_job::Column::Name,
+            pipeline_job::Column::Image,
+            pipeline_job::Column::Script,
+            pipeline_job::Column::WhenCondition,
+            pipeline_job::Column::IfCondition,
+            pipeline_job::Column::AllowFailure,
+            pipeline_job::Column::TimeoutSeconds,
+            pipeline_job::Column::EnvironmentId,
+            pipeline_job::Column::EnvironmentName,
+            pipeline_job::Column::Status,
+            pipeline_job::Column::ExitCode,
+            pipeline_job::Column::StartedAt,
+            pipeline_job::Column::FinishedAt,
+        ])
+        .column_as(Expr::cust("log IS NOT NULL"), "has_log")
+}
+
+#[derive(Debug, FromQueryResult)]
+pub struct JobLogSlice {
+    pub stage_id: i64,
+    pub content: Option<String>,
+    pub total_length: Option<i64>,
+}
+
+/// Offset and limit count Unicode characters, matching SQLite/Postgres
+/// `substr` and `length` on a TEXT log. Only this slice crosses the DB boundary.
+pub async fn get_job_log_slice(
+    db: &impl ConnectionTrait,
+    job_id: i64,
+    offset: i64,
+    limit: i64,
+) -> Result<Option<JobLogSlice>> {
+    pipeline_job::Entity::find_by_id(job_id)
+        .select_only()
+        .column(pipeline_job::Column::StageId)
+        .column_as(
+            Expr::cust_with_values("substr(log, ?, ?)", [offset + 1, limit]),
+            "content",
+        )
+        .column_as(Expr::cust("length(log)"), "total_length")
+        .into_model::<JobLogSlice>()
+        .one(db)
+        .await
+        .context("db: read job log slice")
+}
+
 pub async fn stage_has_job_status(
     db: &impl ConnectionTrait,
     stage_id: i64,

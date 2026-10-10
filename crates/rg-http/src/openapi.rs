@@ -469,6 +469,7 @@ pub(crate) fn stamp_security(
         crate::api::ci::list_pipelines,
         crate::api::ci::get_pipeline,
         crate::api::ci::get_job,
+        crate::api::ci::get_job_log,
         crate::api::ci::play_job,
         crate::api::ci_environments::list,
         crate::api::ci_environments::create,

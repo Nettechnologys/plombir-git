@@ -23,8 +23,8 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 412 |
-| Из них достижимы из браузера | 287 (70%) |
+| Роутов в роутере (с объявленным `Access`) | 413 |
+| Из них достижимы из браузера | 287 (69%) |
 | Layout-модулей | 2 |
 | Страниц | 70 |
 | Интерактивных элементов | 1004 |
@@ -38,7 +38,7 @@
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 106 | 68 | 4 | 0 |
+| `RepoRead` | 107 | 68 | 4 | 0 |
 | `RepoWrite` | 85 | 66 | 13 | 2 |
 | `User` | 55 | 44 | 6 | 0 |
 | `RepoAdmin` | 39 | 39 | 0 | 0 |
@@ -483,23 +483,23 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| updateTriggerRef(event.currentTarget.value)} onchange= place | :739 | `POST /api/v1/repos/{owner}/{name}/pipelines` | `RepoWrite` | rust+web+browser |
-| updateTriggerRef(event.currentTarget.value)} onchange= place | :739 | `GET /api/v1/repos/{owner}/{name}/pipelines` | `RepoRead` | rust+web+browser |
-| updateTriggerRef(event.currentTarget.value)} onchange= place | :739 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web+browser |
-| updateTriggerRef(event.currentTarget.value)} onchange= place | :739 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web+browser |
-| i18n:pipeline.retry | :868 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/retry` | `RepoWrite` | rust+web |
-| i18n:pipeline.retry | :868 | `GET /api/v1/repos/{owner}/{name}/pipelines` | `RepoRead` | rust+web |
-| i18n:pipeline.retry | :868 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
-| i18n:pipeline.retry | :868 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
-| i18n:pipeline.cancel | :871 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/cancel` | `RepoWrite` | rust |
-| i18n:pipeline.play_manual | :931 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/play` | `RepoWrite` | rust |
-| i18n:pipeline.play_manual | :931 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
-| i18n:pipeline.play_manual | :931 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
-| i18n:pipeline.approval_recorded | :934 | `POST /api/v1/repos/{owner}/{name}/pipelines/{pipeline_id}/jobs/{job_id}/approve` | `RepoAuthRead` | rust |
-| i18n:pipeline.approval_recorded | :934 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
-| i18n:pipeline.approval_recorded | :934 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
-| i18n:pipeline.artifact_downloading | :970 | `GET /api/v1/artifacts/{id}/download` | `RepoRead` | rust+web |
-| i18n:pipeline.artifact_deleting | :976 | `DELETE /api/v1/artifacts/{id}` | `RepoWrite` | rust+web |
+| updateTriggerRef(event.currentTarget.value)} onchange= place | :786 | `POST /api/v1/repos/{owner}/{name}/pipelines` | `RepoWrite` | rust+web+browser |
+| updateTriggerRef(event.currentTarget.value)} onchange= place | :786 | `GET /api/v1/repos/{owner}/{name}/pipelines` | `RepoRead` | rust+web+browser |
+| updateTriggerRef(event.currentTarget.value)} onchange= place | :786 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web+browser |
+| updateTriggerRef(event.currentTarget.value)} onchange= place | :786 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web+browser |
+| i18n:pipeline.retry | :915 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/retry` | `RepoWrite` | rust+web |
+| i18n:pipeline.retry | :915 | `GET /api/v1/repos/{owner}/{name}/pipelines` | `RepoRead` | rust+web |
+| i18n:pipeline.retry | :915 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
+| i18n:pipeline.retry | :915 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
+| i18n:pipeline.cancel | :918 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/cancel` | `RepoWrite` | rust |
+| i18n:pipeline.play_manual | :978 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/play` | `RepoWrite` | rust |
+| i18n:pipeline.play_manual | :978 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
+| i18n:pipeline.play_manual | :978 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
+| i18n:pipeline.approval_recorded | :981 | `POST /api/v1/repos/{owner}/{name}/pipelines/{pipeline_id}/jobs/{job_id}/approve` | `RepoAuthRead` | rust |
+| i18n:pipeline.approval_recorded | :981 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
+| i18n:pipeline.approval_recorded | :981 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
+| i18n:pipeline.artifact_downloading | :1017 | `GET /api/v1/artifacts/{id}/download` | `RepoRead` | rust+web |
+| i18n:pipeline.artifact_deleting | :1023 | `DELETE /api/v1/artifacts/{id}` | `RepoWrite` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -509,8 +509,8 @@
 | i18n:repo.download_zip | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/archive/{archive}` | `RepoRead` | rust+web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/pipelines/workflow-dispatch` | `RepoRead` | rust+web+browser |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}` | `RepoRead` | rust+web+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/ws/job/{job_id}` | `Foreign:ws.rs` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/log` | `RepoRead` | rust+web+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/pulls`
@@ -1286,6 +1286,7 @@
 | PUT | `/api/v1/repos/{owner}/{name}/lfs/objects/{oid}` | `Foreign:api/lfs.rs` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/lfs/locks` | `Foreign:api/lfs_locks.rs` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/lfs/locks/verify` | `Foreign:api/lfs_locks.rs` | **—** |
+| GET | `/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}` | `RepoRead` | rust |
 | GET | `/api/v1/ci/oidc/.well-known/openid-configuration` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/jwks` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/token` | `Foreign:api/ci_oidc.rs` | rust |

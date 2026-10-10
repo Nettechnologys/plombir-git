@@ -954,7 +954,9 @@ fn coverage(tail: &str, ids: &Ids) -> Coverage {
         | "/pipelines/{id}/retry"
         | "/pipelines/{id}/cancel"
         | "/pipelines/{id}/artifacts" => probe(&[("id", ids.pipeline)]),
-        "/pipelines/{id}/jobs/{job_id}" | "/pipelines/{id}/jobs/{job_id}/play" => {
+        "/pipelines/{id}/jobs/{job_id}"
+        | "/pipelines/{id}/jobs/{job_id}/log"
+        | "/pipelines/{id}/jobs/{job_id}/play" => {
             probe(&[("id", ids.pipeline), ("job_id", ids.job)])
         }
         "/pipelines/{pipeline_id}/jobs/{job_id}/approve" => {

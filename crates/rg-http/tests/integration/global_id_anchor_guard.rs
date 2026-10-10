@@ -594,7 +594,9 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// it reads only through `assigned_job`. 139 since card_b96fdb28ed1b:
 /// `api::commit_signing_keys::delete_signing_key` compares the fetched key's
 /// owner to the authenticated user and deletes with both id and user id.
-const CENSUS_TOTAL: usize = 139;
+/// 141 since the bounded CI job-log route takes a pipeline id and a job id;
+/// `pipeline_in_repo` and `job_belongs_to_pipeline` anchor both before reply.
+const CENSUS_TOTAL: usize = 141;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

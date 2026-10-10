@@ -14,7 +14,7 @@ use crate::AppState;
 
 // ── Response types ───────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct PipelineResponse {
     id: i64,
     repo_id: i64,
@@ -28,7 +28,7 @@ struct PipelineResponse {
     created_at: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct StageResponse {
     id: i64,
     pipeline_id: i64,
@@ -39,8 +39,8 @@ struct StageResponse {
     finished_at: Option<String>,
 }
 
-#[derive(Serialize)]
-struct JobResponse {
+#[derive(Serialize, utoipa::ToSchema)]
+struct JobSummaryResponse {
     id: i64,
     stage_id: i64,
     name: String,
@@ -54,22 +54,63 @@ struct JobResponse {
     environment_name: Option<String>,
     status: String,
     exit_code: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    log: Option<String>,
+    has_log: bool,
     started_at: Option<String>,
     finished_at: Option<String>,
 }
 
-#[derive(Serialize)]
+impl From<rg_db::ops::pipeline_ops::PipelineJobSummary> for JobSummaryResponse {
+    fn from(job: rg_db::ops::pipeline_ops::PipelineJobSummary) -> Self {
+        Self {
+            id: job.id,
+            stage_id: job.stage_id,
+            name: job.name,
+            image: job.image,
+            script: job.script,
+            when_condition: job.when_condition,
+            if_condition: job.if_condition,
+            allow_failure: job.allow_failure,
+            timeout_seconds: job.timeout_seconds,
+            environment_id: job.environment_id,
+            environment_name: job.environment_name,
+            status: job.status,
+            exit_code: job.exit_code,
+            has_log: job.has_log,
+            started_at: job.started_at.map(|t| t.to_string()),
+            finished_at: job.finished_at.map(|t| t.to_string()),
+        }
+    }
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
 struct PipelineDetailResponse {
     pipeline: PipelineResponse,
     stages: Vec<StageWithJobsResponse>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct StageWithJobsResponse {
     stage: StageResponse,
-    jobs: Vec<JobResponse>,
+    jobs: Vec<JobSummaryResponse>,
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct JobLogQuery {
+    /// Zero-based Unicode character offset within the stored text log.
+    #[serde(default)]
+    offset: Option<u64>,
+    /// Maximum characters to return, capped at 262144.
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct JobLogResponse {
+    content: String,
+    offset: u64,
+    next_offset: u64,
+    total_length: u64,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -306,7 +347,7 @@ pub async fn get_workflow_dispatch_schema(
         ("id" = i64, Path, description = "id"),
     ),
     responses(
-        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 200, description = "Pipeline stages and job metadata, without log bodies", body = PipelineDetailResponse),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
@@ -325,14 +366,26 @@ pub async fn get_pipeline(
         Err(e) => return AppError::from(e).into_response(),
     };
 
-    let mut stages_with_jobs: Vec<StageWithJobsResponse> = Vec::new();
-
+    let stage_ids: Vec<i64> = stages.iter().map(|stage| stage.id).collect();
+    let jobs = match rg_db::ops::pipeline_ops::list_job_summaries_by_stage_ids(
+        &state.db, &stage_ids,
+    )
+    .await
+    {
+        Ok(jobs) => jobs,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    let mut jobs_by_stage: std::collections::HashMap<i64, Vec<JobSummaryResponse>> =
+        std::collections::HashMap::new();
+    for job in jobs {
+        jobs_by_stage
+            .entry(job.stage_id)
+            .or_default()
+            .push(job.into());
+    }
+    let mut stages_with_jobs: Vec<StageWithJobsResponse> = Vec::with_capacity(stages.len());
     for stage in stages {
-        let jobs = match rg_db::ops::pipeline_ops::list_jobs_by_stage(&state.db, stage.id).await {
-            Ok(j) => j,
-            Err(e) => return AppError::from(e).into_response(),
-        };
-
+        let jobs = jobs_by_stage.remove(&stage.id).unwrap_or_default();
         stages_with_jobs.push(StageWithJobsResponse {
             stage: StageResponse {
                 id: stage.id,
@@ -343,27 +396,7 @@ pub async fn get_pipeline(
                 started_at: stage.started_at.map(|t| t.to_string()),
                 finished_at: stage.finished_at.map(|t| t.to_string()),
             },
-            jobs: jobs
-                .into_iter()
-                .map(|j| JobResponse {
-                    id: j.id,
-                    stage_id: j.stage_id,
-                    name: j.name,
-                    image: j.image,
-                    script: j.script,
-                    when_condition: j.when_condition,
-                    if_condition: j.if_condition,
-                    allow_failure: j.allow_failure,
-                    timeout_seconds: j.timeout_seconds,
-                    environment_id: j.environment_id,
-                    environment_name: j.environment_name,
-                    status: j.status,
-                    exit_code: j.exit_code,
-                    log: j.log,
-                    started_at: j.started_at.map(|t| t.to_string()),
-                    finished_at: j.finished_at.map(|t| t.to_string()),
-                })
-                .collect(),
+            jobs,
         });
     }
 
@@ -387,7 +420,7 @@ pub async fn get_pipeline(
 }
 
 /// GET /api/v1/repos/:owner/:name/pipelines/:id/jobs/:job_id
-/// Get job detail with log.
+/// Get job metadata. Read the log through the bounded `/log` endpoint.
 #[utoipa::path(
     get,
     path = "/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}",
@@ -399,7 +432,7 @@ pub async fn get_pipeline(
         ("job_id" = i64, Path, description = "job_id"),
     ),
     responses(
-        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 200, description = "Job metadata, without the log body", body = JobSummaryResponse),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
@@ -413,7 +446,7 @@ pub async fn get_job(
         Err(error) => return error.into_response(),
     };
 
-    match rg_db::ops::pipeline_ops::get_job(&state.db, job_id).await {
+    match rg_db::ops::pipeline_ops::get_job_summary(&state.db, job_id).await {
         Ok(Some(j)) => {
             let belongs = match job_belongs_to_pipeline(&state.db, pipeline.id, j.stage_id).await {
                 Ok(belongs) => belongs,
@@ -422,29 +455,72 @@ pub async fn get_job(
             if !belongs {
                 return AppError::not_found("job not found").into_response();
             }
-            Json(JobResponse {
-                id: j.id,
-                stage_id: j.stage_id,
-                name: j.name,
-                image: j.image,
-                script: j.script,
-                when_condition: j.when_condition,
-                if_condition: j.if_condition,
-                allow_failure: j.allow_failure,
-                timeout_seconds: j.timeout_seconds,
-                environment_id: j.environment_id,
-                environment_name: j.environment_name,
-                status: j.status,
-                exit_code: j.exit_code,
-                log: j.log,
-                started_at: j.started_at.map(|t| t.to_string()),
-                finished_at: j.finished_at.map(|t| t.to_string()),
-            })
-            .into_response()
+            Json(JobSummaryResponse::from(j)).into_response()
         }
         Ok(None) => AppError::not_found("job not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
+}
+
+/// Read a bounded slice of a job's text log. Offsets count Unicode characters.
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/log",
+    tag = "CI/CD",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("id" = i64, Path, description = "pipeline id"),
+        ("job_id" = i64, Path, description = "job id"),
+        JobLogQuery,
+    ),
+    responses(
+        (status = 200, description = "Bounded text log slice", body = JobLogResponse),
+        (status = 400, description = "Invalid offset or limit", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "Pipeline or job not found", body = serde_json::Value),
+    ),
+)]
+pub async fn get_job_log(
+    State(state): State<AppState>,
+    Path((_, _, pipeline_id, job_id)): Path<(String, String, i64, i64)>,
+    RepoRead { repo }: RepoRead,
+    Query(params): Query<JobLogQuery>,
+) -> impl IntoResponse {
+    let pipeline = match pipeline_in_repo(&state, &repo, pipeline_id).await {
+        Ok(pipeline) => pipeline,
+        Err(error) => return error.into_response(),
+    };
+    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(262_144);
+    if offset >= i64::MAX as u64 || limit == 0 {
+        return AppError::bad_request("invalid log offset or limit").into_response();
+    }
+    let slice = match rg_db::ops::pipeline_ops::get_job_log_slice(
+        &state.db,
+        job_id,
+        offset as i64,
+        limit.min(262_144) as i64,
+    )
+    .await
+    {
+        Ok(Some(slice)) => slice,
+        Ok(None) => return AppError::not_found("job not found").into_response(),
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    match job_belongs_to_pipeline(&state.db, pipeline.id, slice.stage_id).await {
+        Ok(true) => {}
+        Ok(false) => return AppError::not_found("job not found").into_response(),
+        Err(error) => return error.into_response(),
+    }
+    let content = slice.content.unwrap_or_default();
+    Json(JobLogResponse {
+        next_offset: offset + content.chars().count() as u64,
+        offset,
+        total_length: slice.total_length.unwrap_or(0) as u64,
+        content,
+    })
+    .into_response()
 }
 
 /// POST /api/v1/repos/:owner/:name/pipelines/:id/jobs/:job_id/play

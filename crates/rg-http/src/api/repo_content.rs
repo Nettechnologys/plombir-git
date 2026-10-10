@@ -319,10 +319,28 @@ pub async fn list_tree(
     let git_ref = params.r#ref.unwrap_or_else(|| "HEAD".to_string());
     let sub_path = params.path.unwrap_or_default();
 
-    let result = list_tree_entries(&repo_path, &git_ref, &sub_path);
+    let result = rg_core::blocking::run_blocking_git("list repository tree", {
+        let repo_path = repo_path.clone();
+        let git_ref = git_ref.clone();
+        move || {
+            let result = list_tree_entries(&repo_path, &git_ref, &sub_path);
+            let emptiness = match &result {
+                Err(error)
+                    if error
+                        .downcast_ref::<rg_core::error::InvalidRequest>()
+                        .is_none() =>
+                {
+                    Some(classify_repo_emptiness(&repo_path))
+                }
+                _ => None,
+            };
+            Ok((result, emptiness))
+        }
+    })
+    .await;
 
     match result {
-        Ok(entries) => (
+        Ok((Ok(entries), _)) => (
             StatusCode::OK,
             Json(serde_json::json!({ "entries": entries })),
         )
@@ -330,10 +348,10 @@ pub async fn list_tree(
         // A malformed ref is the caller's mistake whatever the repository
         // holds. Drawing the empty-repository 200 below for it would hide a
         // typed 400 behind a plausible-looking empty tree.
-        Err(e) if e.downcast_ref::<rg_core::error::InvalidRequest>().is_some() => {
+        Ok((Err(e), _)) if e.downcast_ref::<rg_core::error::InvalidRequest>().is_some() => {
             AppError::from(e).into_response()
         }
-        Err(e) => match classify_repo_emptiness(&repo_path) {
+        Ok((Err(e), Some(emptiness))) => match emptiness {
             // A freshly-created repo with no commits has an unborn HEAD, which
             // can't be resolved to a tree. That's not an error — return an
             // empty tree so the UI can render the empty-repo state.
@@ -353,6 +371,7 @@ pub async fn list_tree(
             // sit here logged a mistyped `?ref=` at error level on every miss.
             RepoEmptiness::NotEmpty => AppError::from(e).into_response(),
         },
+        Ok((Err(e), None)) | Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -530,7 +549,11 @@ pub async fn get_blob(
 
     let git_ref = params.r#ref.unwrap_or_else(|| "HEAD".to_string());
 
-    match get_blob_content(&repo_path, &git_ref, &path) {
+    match rg_core::blocking::run_blocking_git("read repository blob", move || {
+        get_blob_content(&repo_path, &git_ref, &path)
+    })
+    .await
+    {
         Ok(mut blob) => {
             if let Some(lfs) = blob.lfs.as_mut() {
                 lfs.available = match rg_core::lfs::service::object_claims_upload(
@@ -604,7 +627,13 @@ pub async fn get_raw(
     }
     let git_ref = params.r#ref.unwrap_or_else(|| "HEAD".to_string());
 
-    let raw = match read_raw_blob(&repo_path, &git_ref, &path) {
+    let raw = match rg_core::blocking::run_blocking_git("read raw repository blob", {
+        let repo_path = repo_path.clone();
+        let path = path.clone();
+        move || read_raw_blob(&repo_path, &git_ref, &path)
+    })
+    .await
+    {
         Ok(raw) => raw,
         Err(e) => return AppError::from(e).into_response(),
     };
@@ -841,9 +870,27 @@ pub async fn get_log(
     // unbounded skip would let one request walk a whole history for nothing.
     let skip = params.skip.unwrap_or(0).min(MAX_COMMIT_LOG_SKIP as u64) as usize;
 
-    match get_commit_log(&repo_path, &git_ref, &file_path, skip, limit) {
-        Ok(log) => (StatusCode::OK, Json(serde_json::json!({ "commits": log }))).into_response(),
-        Err(e) => {
+    let result = rg_core::blocking::run_blocking_git("read repository commit log", {
+        let repo_path = repo_path.clone();
+        let git_ref = git_ref.clone();
+        move || {
+            let result = get_commit_log(&repo_path, &git_ref, &file_path, skip, limit);
+            let emptiness = if result.is_err()
+                && (git_ref == "HEAD" || names_unborn_head(&repo_path, &git_ref))
+            {
+                Some(classify_repo_emptiness(&repo_path))
+            } else {
+                None
+            };
+            Ok((result, emptiness))
+        }
+    })
+    .await;
+    match result {
+        Ok((Ok(log), _)) => {
+            (StatusCode::OK, Json(serde_json::json!({ "commits": log }))).into_response()
+        }
+        Ok((Err(e), emptiness)) => {
             // An unborn HEAD is the one rev-parse failure that means a healthy
             // empty history. Keep that response distinct from a missing ref
             // (typed 404), a HEAD that lost its branch (typed 409 naming both
@@ -851,8 +898,8 @@ pub async fn get_log(
             // The branch an unborn `HEAD` names is the empty history too: a
             // page that asks for the default branch by name must not see an
             // error where `HEAD` sees "no commits yet" (card_2e320f5287d7).
-            if git_ref == "HEAD" || names_unborn_head(&repo_path, &git_ref) {
-                match classify_repo_emptiness(&repo_path) {
+            if let Some(emptiness) = emptiness {
+                match emptiness {
                     RepoEmptiness::Empty => {
                         return (
                             StatusCode::OK,
@@ -871,6 +918,7 @@ pub async fn get_log(
             // would turn every mistyped `?ref=` into an error-level event.
             AppError::from(e).into_response()
         }
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -910,7 +958,11 @@ pub async fn list_branches(
         return AppError::from(e).into_response();
     }
 
-    match list_branch_refs(&repo_path) {
+    match rg_core::blocking::run_blocking_git("list repository branches", move || {
+        list_branch_refs(&repo_path)
+    })
+    .await
+    {
         Ok(branches) => (StatusCode::OK, Json(branches)).into_response(),
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "list_branches failed");
@@ -955,7 +1007,11 @@ pub async fn list_tags(
         return AppError::from(e).into_response();
     }
 
-    match list_tag_names(&repo_path) {
+    match rg_core::blocking::run_blocking_git("list repository tags", move || {
+        list_tag_names(&repo_path)
+    })
+    .await
+    {
         Ok(tags) => (StatusCode::OK, Json(tags)).into_response(),
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "list_tags failed");
@@ -1064,7 +1120,7 @@ fn list_tree_entries(
             // fail the whole directory listing — but `.ok()` on its own made
             // the entry look like a file whose size simply was not recorded,
             // with nothing anywhere saying why (card_6f2a9ab1e623).
-            match get_blob_size(repo_path, &oid.to_string()) {
+            match get_blob_size(&repo, oid.to_owned()) {
                 Ok(size) => Some(size),
                 Err(e) => {
                     tracing::warn!(
@@ -1239,22 +1295,15 @@ fn get_blob_content(
     })
 }
 
-fn get_blob_size(repo_path: &std::path::Path, sha: &str) -> anyhow::Result<i64> {
-    let repo = rg_git::repository::open(repo_path)
-        .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
-
-    let oid = gix::ObjectId::from_hex(sha.as_bytes())
-        .map_err(|e| anyhow::anyhow!("invalid SHA: {}", e))?;
-
-    let object = repo
-        .find_object(oid)
-        .map_err(|e| anyhow::anyhow!("object not found: {}", e))?;
-
-    let blob = object
-        .try_into_blob()
-        .map_err(|e| anyhow::anyhow!("not a blob: {}", e))?;
-
-    Ok(blob.data.len() as i64)
+fn get_blob_size(repo: &gix::Repository, oid: gix::ObjectId) -> anyhow::Result<i64> {
+    let header = repo
+        .find_header(oid)
+        .with_context(|| format!("reading blob header {oid}"))?;
+    anyhow::ensure!(
+        header.kind() == gix::object::Kind::Blob,
+        "tree entry {oid} is not a blob"
+    );
+    i64::try_from(header.size()).context("blob size exceeds i64")
 }
 
 /// A tree entry located by [`lookup_tree_path`]. Only the two facts both
@@ -2562,6 +2611,36 @@ mod tests {
             "a healthy gitlink must not be logged as an unreadable blob: {}",
             logs.text()
         );
+    }
+
+    #[test]
+    fn tree_listing_reads_blob_header_without_decoding_its_payload() {
+        let (_dir, repo_path) = repository_with_submodule();
+        let readme = list_tree_entries(&repo_path, "HEAD", "")
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "README.md")
+            .expect("fixture README");
+        let oid = readme.sha.unwrap();
+        let object_path = repo_path.join("objects").join(&oid[..2]).join(&oid[2..]);
+        std::fs::remove_file(&object_path).unwrap();
+        let file = std::fs::File::create(object_path).unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(file, flate2::Compression::default());
+        encoder.write_all(b"blob 5000000\0short").unwrap();
+        encoder.finish().unwrap();
+
+        let repo = rg_git::repository::open(&repo_path).unwrap();
+        let oid = gix::ObjectId::from_hex(oid.as_bytes()).unwrap();
+        assert!(
+            repo.find_object(oid).is_err(),
+            "fixture payload must be unreadable"
+        );
+        let entries = list_tree_entries(&repo_path, "HEAD", "").unwrap();
+        let readme = entries
+            .iter()
+            .find(|entry| entry.name == "README.md")
+            .unwrap();
+        assert_eq!(readme.size, Some(5_000_000));
     }
 
     /// The independent read half of `card_5ebf6d40cdab`: classification must

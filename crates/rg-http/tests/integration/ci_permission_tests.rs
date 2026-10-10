@@ -76,6 +76,138 @@ async fn create_private_repo(base: &str, token: &str, name: &str) -> i64 {
 }
 
 #[tokio::test]
+async fn pipeline_poll_omits_logs_and_job_log_ranges_are_bounded() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "ci_log_reader", "ci_log_reader@example.com").await;
+    let repo_id = create_private_repo(&base, &token, "log-poll").await;
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo_id,
+        "0123456789012345678901234567890123456789",
+        "refs/heads/main",
+        "manual",
+        None,
+    )
+    .await
+    .unwrap();
+    let mut first_job = None;
+    let large_log = "x".repeat(1_000_000);
+    for stage_order in 0..2 {
+        let stage = rg_db::ops::pipeline_ops::create_stage(
+            &db,
+            pipeline.id,
+            &format!("stage-{stage_order}"),
+            stage_order,
+        )
+        .await
+        .unwrap();
+        for job_number in 0..5 {
+            let job = rg_db::ops::pipeline_ops::create_job(
+                &db,
+                stage.id,
+                &format!("job-{job_number}"),
+                "echo ok",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            first_job.get_or_insert(job.id);
+            rg_db::ops::pipeline_ops::update_job_log(&db, job.id, &large_log)
+                .await
+                .unwrap();
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{base}/api/v1/repos/ci_log_reader/log-poll/pipelines/{}",
+        pipeline.id
+    );
+    let response = client.get(&url).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.bytes().await.unwrap();
+    assert!(
+        body.len() < 30_000,
+        "10 MB of logs must not enter the poll response: {} bytes",
+        body.len()
+    );
+    let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let stages = detail["stages"].as_array().unwrap();
+    assert_eq!(stages.len(), 2);
+    for stage in stages {
+        assert_eq!(stage["jobs"].as_array().unwrap().len(), 5);
+        for job in stage["jobs"].as_array().unwrap() {
+            assert!(job.get("log").is_none());
+            assert_eq!(job["has_log"], true);
+        }
+    }
+
+    let job_id = first_job.unwrap();
+    let job_detail: serde_json::Value = client
+        .get(format!("{url}/jobs/{job_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(job_detail.get("log").is_none());
+    assert_eq!(job_detail["has_log"], true);
+    rg_db::ops::pipeline_ops::update_job_log(&db, job_id, "αβ🙂done")
+        .await
+        .unwrap();
+    let response = client
+        .get(format!("{url}/jobs/{job_id}/log?offset=1&limit=2"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let slice: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(slice["content"], "β🙂");
+    assert_eq!(slice["next_offset"], 3);
+    assert_eq!(slice["total_length"], 7);
+
+    let other_pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo_id,
+        "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "refs/heads/main",
+        "manual",
+        None,
+    )
+    .await
+    .unwrap();
+    let wrong_parent = client
+        .get(format!(
+            "{base}/api/v1/repos/ci_log_reader/log-poll/pipelines/{}/jobs/{job_id}/log",
+            other_pipeline.id,
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_parent.status(), 404);
+
+    let denied = client
+        .get(format!("{url}/jobs/{job_id}/log"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+}
+
+#[tokio::test]
 async fn private_pipeline_list_requires_read_access() {
     let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
