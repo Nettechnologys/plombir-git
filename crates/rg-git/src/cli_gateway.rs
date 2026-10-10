@@ -659,6 +659,18 @@ impl GitCommandGateway {
         args: &[&str],
         repo_path: Option<&Path>,
     ) -> Result<tokio::process::Child> {
+        self.spawn_async_with_env(args, repo_path, &[]).await
+    }
+
+    /// Spawn a streamed git command with request-scoped environment values.
+    /// The overrides are applied after host configuration is disarmed, just as
+    /// in `run_with_env`.
+    pub async fn spawn_async_with_env(
+        &self,
+        args: &[&str],
+        repo_path: Option<&Path>,
+        env: &[(&str, &str)],
+    ) -> Result<tokio::process::Child> {
         let full_cmd = self.build_command_line(args, repo_path);
         let command_str = full_cmd.join(" ");
 
@@ -673,6 +685,9 @@ impl GitCommandGateway {
             .kill_on_drop(true);
         disarm_host_configuration(&mut builder, &[]);
         disarm_enclosing_repository(&mut builder, args, repo_path);
+        for (key, value) in env {
+            builder.env(key, value);
+        }
 
         let child = builder
             .spawn()
@@ -1060,7 +1075,8 @@ mod tests {
         );
     }
 
-    /// Source-order guard: both spawn paths must disarm.
+    /// Source-order guard: both child builders must disarm. The public
+    /// `spawn_async` delegates to `spawn_async_with_env`.
     ///
     /// The behavioural halves live in `tests/host_configuration.rs`, which runs
     /// real `git` against a planted config. This one reddens in the file that
@@ -1070,7 +1086,7 @@ mod tests {
     #[test]
     fn both_spawn_paths_disarm_the_host_configuration() {
         let source = include_str!("cli_gateway.rs");
-        for spawner in ["run_inner", "spawn_async"] {
+        for spawner in ["run_inner", "spawn_async_with_env"] {
             let disarmed = rust_source::production_function_call_sites(
                 source,
                 spawner,
@@ -1084,6 +1100,16 @@ mod tests {
                 disarmed.len()
             );
         }
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "spawn_async",
+                &["spawn_async_with_env"],
+            )
+            .len(),
+            1,
+            "spawn_async must delegate to the disarmed child builder"
+        );
     }
 
     #[cfg(unix)]

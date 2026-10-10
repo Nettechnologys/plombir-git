@@ -13,6 +13,7 @@ gix = { workspace = true }
 thiserror = { workspace = true }
 rg-process = { path = "../rg-process" }
 tempfile = "3"
+fs2 = { workspace = true }
 
 [dev-dependencies]
 walkdir = "2"

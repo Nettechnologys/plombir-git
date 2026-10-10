@@ -58,6 +58,7 @@ pub mod cli_gateway;
 pub mod credentials;
 pub mod invocation;
 pub mod io_timeout;
+pub mod maintenance;
 pub mod pkt_line;
 pub mod protocol;
 pub mod ref_advertisement;

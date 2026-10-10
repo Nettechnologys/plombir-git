@@ -5223,6 +5223,7 @@ name = "rg-git"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fs2",
  "gix",
  "rg-process",
  "tempfile",

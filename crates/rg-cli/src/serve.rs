@@ -1301,6 +1301,8 @@ pub(crate) async fn run_serve(
         .and_then(|c| c.server.shutdown_grace_secs)
         .unwrap_or_else(default_shutdown_grace);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let _git_maintenance_handle =
+        rg_git::maintenance::spawn_daily(repo_root.clone(), shutdown_rx.clone());
     let signal_shutdown_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;

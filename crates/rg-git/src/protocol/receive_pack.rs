@@ -362,6 +362,88 @@ struct ReceivedPush {
     refusal: Option<String>,
 }
 
+/// Request-private object store. Git reads new objects here while policy is
+/// checked; only an accepted ref can cause its pack to enter the live store.
+struct IncomingObjects {
+    directory: tempfile::TempDir,
+    _active: std::fs::File,
+    objects: String,
+    live_objects: String,
+}
+
+impl IncomingObjects {
+    fn new(repo_path: &Path) -> Result<Self> {
+        let live = repo_path.join("objects").canonicalize()?;
+        let directory = tempfile::Builder::new()
+            .prefix(".receive-quarantine-")
+            .tempdir_in(&live)?;
+        let active = std::fs::File::create(directory.path().join("active.lock"))?;
+        fs2::FileExt::lock_exclusive(&active)?;
+        let objects = directory.path().join("objects");
+        std::fs::create_dir(&objects)?;
+        std::fs::create_dir(objects.join("pack"))?;
+        Ok(Self {
+            directory,
+            _active: active,
+            objects: objects
+                .to_str()
+                .context("repository quarantine path is not UTF-8")?
+                .to_owned(),
+            live_objects: live
+                .to_str()
+                .context("repository object path is not UTF-8")?
+                .to_owned(),
+        })
+    }
+
+    fn git_env(&self) -> [(&str, &str); 2] {
+        [
+            ("GIT_OBJECT_DIRECTORY", &self.objects),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", &self.live_objects),
+        ]
+    }
+
+    fn promote(&self) -> Result<()> {
+        let staged = self.directory.path().join("objects/pack");
+        let live = Path::new(&self.live_objects).join("pack");
+        let mut linked = Vec::new();
+        let result = (|| -> Result<()> {
+            for entry in std::fs::read_dir(&staged)? {
+                let source = entry?.path();
+                if source
+                    .extension()
+                    .is_none_or(|extension| extension != "idx")
+                {
+                    continue;
+                }
+                let pack = source.with_extension("pack");
+                if !pack.is_file() {
+                    anyhow::bail!("quarantined pack has no packfile");
+                }
+                // Readers discover a pack through its index. Publish the pack
+                // first and the index second, each with a no-replace link.
+                for path in [&pack, &source] {
+                    let target = live.join(path.file_name().context("pack has no filename")?);
+                    match std::fs::hard_link(path, &target) {
+                        Ok(()) => linked.push(target),
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            for path in linked.into_iter().rev() {
+                if let Err(error) = std::fs::remove_file(&path) {
+                    tracing::warn!(path = %path.display(), %error, "failed to undo pack publication");
+                }
+            }
+        }
+        result
+    }
+}
+
 /// The update commands of one push, as read off the wire.
 struct CommandList {
     updates: Vec<RefUpdate>,
@@ -728,7 +810,9 @@ where
         if pack_follows {
             drain_pack(reader).await?;
         }
+        updates = check_and_write_refs(repo_path, updates, policy, None).await?;
     } else {
+        let incoming = IncomingObjects::new(repo_path)?;
         // Receive the incoming pack and index it into the repository.
         //
         // Two implementations exist behind a flag (default: the git CLI):
@@ -742,13 +826,12 @@ where
         // native path passes the repo as the thin-pack base-object lookup. Omitting
         // either fails with "missing delta base object".
         if native_index_pack_enabled() {
-            index_pack_native(repo_path, reader).await?;
+            index_pack_native(repo_path, reader, &incoming).await?;
         } else {
-            index_pack_via_git(repo_path, reader).await?;
+            index_pack_via_git(repo_path, reader, &incoming).await?;
         }
+        updates = check_and_write_refs(repo_path, updates, policy, Some(&incoming)).await?;
     }
-
-    updates = check_and_write_refs(repo_path, updates, policy).await?;
 
     // Point of no return crossed: the refs above are written and the caller's
     // post-push hooks are owed. Everything after this line — the report-status
@@ -757,6 +840,9 @@ where
     // the updates go into a sink that outlives the drop (card_ca431156e7df).
     // No `.await` sits between the last `update_ref` and this call.
     applied.record(&updates);
+    if updates.iter().any(|update| update.status == "ok") {
+        crate::maintenance::after_push(repo_path);
+    }
 
     Ok(ReceivedPush {
         updates,
@@ -778,20 +864,42 @@ async fn check_and_write_refs(
     repo_path: &Path,
     mut updates: Vec<RefUpdate>,
     policy: &PushPolicy,
+    incoming: Option<&IncomingObjects>,
 ) -> Result<Vec<RefUpdate>> {
     if updates.iter().any(writes_an_object) {
         let repo = repo_path.to_path_buf();
         let fast_forward_only = policy.fast_forward_only_refs.clone();
         let signed = policy.require_signed_refs.clone();
+        let view =
+            incoming.map(|incoming| (incoming.objects.clone(), incoming.live_objects.clone()));
         updates = tokio::task::spawn_blocking(move || {
-            enforce_connectivity(&repo, &mut updates);
-            enforce_fast_forward_only(&repo, &mut updates, &fast_forward_only);
-            enforce_signed_commit_policies(&repo, &mut updates, &signed);
+            let env = view.as_ref().map(|(objects, live)| {
+                [
+                    ("GIT_OBJECT_DIRECTORY", objects.as_str()),
+                    ("GIT_ALTERNATE_OBJECT_DIRECTORIES", live.as_str()),
+                ]
+            });
+            let env = env.as_ref().map(|env| env.as_slice()).unwrap_or(&[]);
+            enforce_connectivity(&repo, &mut updates, env);
+            enforce_fast_forward_only(&repo, &mut updates, &fast_forward_only, env);
+            enforce_signed_commit_policies_with_env(&repo, &mut updates, &signed, env);
             updates
         })
         .await
         .context("receive-pack ref checks did not complete")?;
-        enforce_foreign_lfs_locks(repo_path, &mut updates, &policy.foreign_locks).await;
+        enforce_foreign_lfs_locks_with_env(
+            repo_path,
+            &mut updates,
+            &policy.foreign_locks,
+            &incoming.map(IncomingObjects::git_env).unwrap_or_default(),
+        )
+        .await;
+    }
+
+    if updates.iter().any(writes_an_object) {
+        if let Some(incoming) = incoming {
+            incoming.promote()?;
+        }
     }
 
     for update in &mut updates {
@@ -831,7 +939,7 @@ pub async fn apply_server_ref_updates(
         .map(|(old_sha, new_sha, refname)| checked_command(old_sha, new_sha, refname))
         .collect();
     enforce_ref_rules(repo_path, &mut updates, policy);
-    check_and_write_refs(repo_path, updates, policy).await
+    check_and_write_refs(repo_path, updates, policy, None).await
 }
 
 fn checked_receive_negotiation_bytes(
@@ -880,14 +988,22 @@ fn native_index_pack_enabled() -> bool {
 /// Index the incoming pack via the `git index-pack --fix-thin --stdin`
 /// subprocess (the default path). `--fix-thin` resolves delta bases that are in
 /// the repo but not in the pack, completing the thin pack before indexing.
-async fn index_pack_via_git<R>(repo_path: &Path, reader: &mut BufReader<R>) -> Result<()>
+async fn index_pack_via_git<R>(
+    repo_path: &Path,
+    reader: &mut BufReader<R>,
+    incoming: &IncomingObjects,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut index_pack = crate::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?
-        .spawn_async(&["index-pack", "--fix-thin", "--stdin"], Some(repo_path))
+        .spawn_async_with_env(
+            &["index-pack", "--fix-thin", "--stdin"],
+            Some(repo_path),
+            &incoming.git_env(),
+        )
         .await
         .context("failed to spawn git index-pack")?;
 
@@ -940,7 +1056,11 @@ impl Drop for InterruptOnDrop {
 ///     resolution. [`InterruptOnDrop`] flips it if this async scope is cancelled
 ///     (the A1 idle/wall-clock watchdog dropping the handler future), so a
 ///     runaway unpack is actually aborted rather than left running detached.
-async fn index_pack_native<R>(repo_path: &Path, reader: &mut BufReader<R>) -> Result<()>
+async fn index_pack_native<R>(
+    repo_path: &Path,
+    reader: &mut BufReader<R>,
+    incoming: &IncomingObjects,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
@@ -948,7 +1068,7 @@ where
     // a request-private file. This keeps memory flat while preserving the SSH
     // idle watchdog on each network read. The same byte ceiling as the CLI path
     // is enforced before gix sees the pack.
-    let pack_dir = repo_path.join("objects").join("pack");
+    let pack_dir = Path::new(&incoming.objects).join("pack");
     tokio::fs::create_dir_all(&pack_dir)
         .await
         .with_context(|| format!("failed to create {}", pack_dir.display()))?;
@@ -967,13 +1087,13 @@ where
     let pack = pack.into_std().await;
 
     let repo_path = repo_path.to_owned();
+    let pack_dir = pack_dir.to_owned();
     let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Held across the blocking join: on cancellation its Drop sets `interrupt`.
     let _guard = InterruptOnDrop(interrupt.clone());
 
     let join = tokio::task::spawn_blocking(move || -> Result<()> {
         let repo = crate::repository::open(&repo_path).context("failed to open repository")?;
-        let pack_dir = repo_path.join("objects").join("pack");
         // `write_to_directory` requires the target directory to already exist.
         std::fs::create_dir_all(&pack_dir)
             .with_context(|| format!("failed to create {}", pack_dir.display()))?;
@@ -1096,6 +1216,24 @@ pub fn unsigned_commit_for_required_signature(
     refname: &str,
     patterns: &[String],
 ) -> std::result::Result<Option<String>, RequiredSignatureError> {
+    unsigned_commit_for_required_signature_with_env(
+        repo_path,
+        old_sha,
+        new_sha,
+        refname,
+        patterns,
+        &[],
+    )
+}
+
+fn unsigned_commit_for_required_signature_with_env(
+    repo_path: &Path,
+    old_sha: &str,
+    new_sha: &str,
+    refname: &str,
+    patterns: &[String],
+    env: &[(&str, &str)],
+) -> std::result::Result<Option<String>, RequiredSignatureError> {
     if !patterns
         .iter()
         .any(|pattern| ref_matches_rejection_pattern(refname, pattern))
@@ -1113,7 +1251,7 @@ pub fn unsigned_commit_for_required_signature(
         args.push(&old_exclusion);
     }
     let commits = gateway
-        .run(&args, Some(repo_path))
+        .run_with_env(&args, Some(repo_path), env)
         .map_err(RequiredSignatureError::Enumeration)?;
     if !commits.success() {
         return Err(RequiredSignatureError::Enumeration(anyhow::anyhow!(
@@ -1124,7 +1262,7 @@ pub fn unsigned_commit_for_required_signature(
 
     for commit in commits.stdout_str().lines() {
         let verification = gateway
-            .run(&["log", "--format=%G?", "-1", commit], Some(repo_path))
+            .run_with_env(&["log", "--format=%G?", "-1", commit], Some(repo_path), env)
             .and_then(|output| signature_is_cryptographically_valid(&output))
             .map_err(|source| RequiredSignatureError::Verification {
                 commit: commit.to_string(),
@@ -1138,18 +1276,29 @@ pub fn unsigned_commit_for_required_signature(
     Ok(None)
 }
 
+#[cfg(test)]
 fn enforce_signed_commit_policies(
     repo_path: &Path,
     updates: &mut [RefUpdate],
     patterns: &[String],
 ) {
+    enforce_signed_commit_policies_with_env(repo_path, updates, patterns, &[]);
+}
+
+fn enforce_signed_commit_policies_with_env(
+    repo_path: &Path,
+    updates: &mut [RefUpdate],
+    patterns: &[String],
+    env: &[(&str, &str)],
+) {
     for update in updates.iter_mut().filter(|update| writes_an_object(update)) {
-        match unsigned_commit_for_required_signature(
+        match unsigned_commit_for_required_signature_with_env(
             repo_path,
             &update.old_sha,
             &update.new_sha,
             &update.refname,
             patterns,
+            env,
         ) {
             Ok(Some(commit)) => {
                 update.status = "error".into();
@@ -1198,36 +1347,32 @@ const CONNECTIVITY_BATCH: usize = 1_000;
 /// object kind git allows, but it has to exist and be complete.
 ///
 /// A check that cannot run refuses the ref, as the signature check does.
-fn enforce_connectivity(repo_path: &Path, updates: &mut [RefUpdate]) {
-    let repo = match crate::repository::open(repo_path) {
-        Ok(repo) => repo,
-        Err(error) => {
-            refuse_unchecked(
-                updates,
-                &anyhow::Error::from(error),
-                "open repository for connectivity check",
-            );
-            return;
+fn enforce_connectivity(repo_path: &Path, updates: &mut [RefUpdate], env: &[(&str, &str)]) {
+    let repo = if env.is_empty() {
+        match crate::repository::open(repo_path) {
+            Ok(repo) => Some(repo),
+            Err(error) => {
+                refuse_unchecked(
+                    updates,
+                    &anyhow::Error::from(error),
+                    "open repository for connectivity check",
+                );
+                return;
+            }
         }
+    } else {
+        None
     };
     for update in updates.iter_mut().filter(|update| writes_an_object(update)) {
-        let Ok(id) = gix::ObjectId::from_hex(update.new_sha.as_bytes()) else {
-            update.status = "error".into();
-            update.message = INCOMPLETE_PUSH.into();
-            continue;
-        };
         // Three-valued: a missing tip is the pusher's, an object store that
         // cannot answer is ours, and the two must not share a message.
-        match repo.try_find_header(id) {
-            Ok(Some(header)) => {
-                if update.refname.starts_with("refs/heads/")
-                    && header.kind() != gix::object::Kind::Commit
-                {
+        match pushed_tip_kind(repo.as_ref(), repo_path, &update.new_sha, env) {
+            Ok(Some(kind)) => {
+                if update.refname.starts_with("refs/heads/") && kind != "commit" {
                     update.status = "error".into();
                     update.message = format!(
                         "a branch must point at a commit, and {} is a {}",
-                        update.new_sha,
-                        header.kind()
+                        update.new_sha, kind
                     );
                 }
             }
@@ -1254,13 +1399,13 @@ fn enforce_connectivity(repo_path: &Path, updates: &mut [RefUpdate]) {
         .collect();
     let mut incomplete: Vec<String> = Vec::new();
     for batch in tips.chunks(CONNECTIVITY_BATCH) {
-        match tips_connected(repo_path, batch) {
+        match tips_connected(repo_path, batch, env) {
             Ok(true) => {}
             // One answer for the whole batch; ask tip by tip to name the
             // refs that are actually broken instead of failing the push.
             Ok(false) => {
                 for tip in batch {
-                    match tips_connected(repo_path, std::slice::from_ref(tip)) {
+                    match tips_connected(repo_path, std::slice::from_ref(tip), env) {
                         Ok(true) => {}
                         Ok(false) => incomplete.push(tip.clone()),
                         Err(error) => {
@@ -1284,9 +1429,37 @@ fn enforce_connectivity(repo_path: &Path, updates: &mut [RefUpdate]) {
     }
 }
 
+fn pushed_tip_kind(
+    repo: Option<&gix::Repository>,
+    repo_path: &Path,
+    sha: &str,
+    env: &[(&str, &str)],
+) -> Result<Option<String>> {
+    if let Some(repo) = repo {
+        let id = gix::ObjectId::from_hex(sha.as_bytes())?;
+        return Ok(repo
+            .try_find_header(id)?
+            .map(|header| header.kind().to_string()));
+    }
+    let output = crate::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .run_with_env(&["cat-file", "-t", sha], Some(repo_path), env)?;
+    if output.success() {
+        return Ok(Some(output.stdout_str().trim().to_owned()));
+    }
+    if output.stderr_str().contains("could not get object info") {
+        return Ok(None);
+    }
+    anyhow::bail!(
+        "git cat-file could not inspect pushed tip: {}",
+        output.stderr_str().trim()
+    )
+}
+
 /// `true` when every object reachable from `tips` and not from an existing ref
 /// is present and readable.
-fn tips_connected(repo_path: &Path, tips: &[String]) -> Result<bool> {
+fn tips_connected(repo_path: &Path, tips: &[String], env: &[(&str, &str)]) -> Result<bool> {
     // `--objects` alone asks the object database for every object it lists,
     // blobs included, and dies on a missing one — git's own `check_connected`
     // runs exactly this. `--verify-objects` would additionally inflate every
@@ -1297,7 +1470,7 @@ fn tips_connected(repo_path: &Path, tips: &[String]) -> Result<bool> {
     let output = crate::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{e}"))?
-        .run(&args, Some(repo_path))?;
+        .run_with_env(&args, Some(repo_path), env)?;
     Ok(output.success())
 }
 
@@ -1331,6 +1504,7 @@ fn enforce_fast_forward_only(
     repo_path: &Path,
     updates: &mut [RefUpdate],
     patterns: &[(String, String)],
+    env: &[(&str, &str)],
 ) {
     for update in updates.iter_mut().filter(|update| writes_an_object(update)) {
         if update.old_sha == NULL_SHA1 {
@@ -1342,7 +1516,7 @@ fn enforce_fast_forward_only(
         else {
             continue;
         };
-        match is_ancestor(repo_path, &update.old_sha, &update.new_sha) {
+        match is_ancestor(repo_path, &update.old_sha, &update.new_sha, env) {
             Ok(true) => {}
             Ok(false) => {
                 update.status = "error".into();
@@ -1363,13 +1537,19 @@ fn enforce_fast_forward_only(
 
 /// `git merge-base --is-ancestor`: exit 0 is yes, 1 is no, anything else is a
 /// check that did not run.
-fn is_ancestor(repo_path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+fn is_ancestor(
+    repo_path: &Path,
+    ancestor: &str,
+    descendant: &str,
+    env: &[(&str, &str)],
+) -> Result<bool> {
     let output = crate::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{e}"))?
-        .run(
+        .run_with_env(
             &["merge-base", "--is-ancestor", ancestor, descendant],
             Some(repo_path),
+            env,
         )?;
     match output.status.code() {
         Some(0) => Ok(true),
@@ -1402,17 +1582,27 @@ const LFS_LOCK_CHECK_UNAVAILABLE: &str = "LFS lock check could not run on the se
 /// A repository nobody else holds a lock in costs nothing: no git process is
 /// started. A check that cannot run refuses the ref rather than waving it
 /// through, exactly as the required-signature check does.
+#[cfg(test)]
 async fn enforce_foreign_lfs_locks(
     repo_path: &Path,
     updates: &mut [RefUpdate],
     locks: &[ForeignLock],
+) {
+    enforce_foreign_lfs_locks_with_env(repo_path, updates, locks, &[]).await;
+}
+
+async fn enforce_foreign_lfs_locks_with_env(
+    repo_path: &Path,
+    updates: &mut [RefUpdate],
+    locks: &[ForeignLock],
+    env: &[(&str, &str)],
 ) {
     if locks.is_empty() {
         return;
     }
     let locked = locked_paths(locks);
     for update in updates.iter_mut().filter(|update| writes_an_object(update)) {
-        match first_locked_path_changed(repo_path, &update.new_sha, &locked).await {
+        match first_locked_path_changed_with_env(repo_path, &update.new_sha, &locked, env).await {
             Ok(None) => {}
             Ok(Some(lock)) => {
                 update.status = "error".into();
@@ -1454,7 +1644,7 @@ pub async fn first_foreign_lock_changed(
     if locks.is_empty() {
         return Ok(None);
     }
-    first_locked_path_changed(repo_path, new_sha, &locked_paths(locks)).await
+    first_locked_path_changed_with_env(repo_path, new_sha, &locked_paths(locks), &[]).await
 }
 
 /// The first of `locks` whose path `commit` changes against its parent — or,
@@ -1512,17 +1702,18 @@ pub fn foreign_lock_changed_by_commit(
 /// an edit made in the merge itself — went through. The combined form names
 /// exactly the paths the merge result differs from every parent in, so a clean
 /// merge of work already checked still lists nothing.
-async fn first_locked_path_changed(
+async fn first_locked_path_changed_with_env(
     repo_path: &Path,
     new_sha: &str,
     locked: &std::collections::HashMap<&str, &ForeignLock>,
+    env: &[(&str, &str)],
 ) -> Result<Option<ForeignLock>> {
     use tokio::io::AsyncBufReadExt;
 
     let mut child = crate::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?
-        .spawn_async(
+        .spawn_async_with_env(
             &[
                 "log",
                 "--format=",
@@ -1537,6 +1728,7 @@ async fn first_locked_path_changed(
                 "--",
             ],
             Some(repo_path),
+            env,
         )
         .await
         .context("failed to spawn git log for the LFS lock check")?;
@@ -3273,22 +3465,28 @@ mod native_index_pack_tests {
             "expected a PACK stream"
         );
 
-        // Path 1 — git index-pack --fix-thin into t_git.
-        let (git_ok_status, _) =
-            git_stdin(&["index-pack", "--fix-thin", "--stdin"], &t_git, &thin).await;
-        assert!(git_ok_status, "git index-pack --fix-thin failed");
+        // Path 1 — git index-pack --fix-thin into quarantine, then publish.
+        let git_incoming = IncomingObjects::new(&t_git).unwrap();
+        let mut git_reader = BufReader::new(Cursor::new(thin.clone()));
+        index_pack_via_git(&t_git, &mut git_reader, &git_incoming)
+            .await
+            .expect("git index-pack --fix-thin failed in quarantine");
+        git_incoming.promote().unwrap();
 
         // Path 2 — native indexer into t_native.
         let mut reader = BufReader::new(Cursor::new(thin.clone()));
-        index_pack_native(&t_native, &mut reader)
+        let native_incoming = IncomingObjects::new(&t_native).unwrap();
+        index_pack_native(&t_native, &mut reader, &native_incoming)
             .await
             .expect("native index-pack should succeed against a repo holding the base");
+        native_incoming.promote().unwrap();
 
         // Thin-ness proof: same pack into a repo WITHOUT the base must fail — the
         // thin lookup cannot resolve the external delta base. This deterministically
         // proves both (a) the pack is genuinely thin and (b) our lookup is load-bearing.
         let mut reader_empty = BufReader::new(Cursor::new(thin.clone()));
-        let empty_res = index_pack_native(&t_empty, &mut reader_empty).await;
+        let empty_incoming = IncomingObjects::new(&t_empty).unwrap();
+        let empty_res = index_pack_native(&t_empty, &mut reader_empty, &empty_incoming).await;
         assert!(
             empty_res.is_err(),
             "indexing a thin pack without its base must fail; pack was not thin"
@@ -3514,6 +3712,122 @@ mod push_policy_tests {
                 .as_slice(),
         );
         stream
+    }
+
+    fn pack_from(work: &Path) -> Vec<u8> {
+        let output = crate::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(&["pack-objects", "--all", "--stdout"], Some(work))
+            .unwrap();
+        output.ensure_success().unwrap();
+        output.stdout
+    }
+
+    async fn push_real_pack(
+        repo: &Path,
+        old: &str,
+        new: &str,
+        pack: &[u8],
+        policy: &PushPolicy,
+    ) -> Vec<RefUpdate> {
+        let command = format!("{old} {new} refs/heads/main\0report-status\n");
+        let mut request = pkt(command.as_bytes());
+        request.extend_from_slice(b"0000");
+        request.extend_from_slice(pack);
+        let mut reader = BufReader::new(Cursor::new(request));
+        process_push_with_rejections(repo, &mut reader, policy, &AppliedRefUpdates::new())
+            .await
+            .unwrap()
+            .updates
+    }
+
+    #[tokio::test]
+    async fn refused_pack_is_not_visible_but_an_accepted_pack_is() {
+        let served = Served::new();
+        let next = commit(&served.work, "next.txt", "not signed\n");
+        let pack = pack_from(&served.work);
+        let signed_only = PushPolicy {
+            require_signed_refs: vec!["refs/heads/main".to_string()],
+            ..PushPolicy::default()
+        };
+        let refused = push_real_pack(&served.bare, &served.base, &next, &pack, &signed_only).await;
+        assert_eq!(outcome(&refused, "refs/heads/main").status, "error");
+        assert_eq!(branch(&served.bare, "main"), Some(served.base.clone()));
+        let lookup = crate::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(&["cat-file", "-e", &next], Some(&served.bare))
+            .unwrap();
+        assert!(!lookup.success(), "refused pack leaked into object store");
+
+        let lock_refused = push_real_pack(
+            &served.bare,
+            &served.base,
+            &next,
+            &pack,
+            &alice_holds("next.txt"),
+        )
+        .await;
+        assert_eq!(outcome(&lock_refused, "refs/heads/main").status, "error");
+        let lookup = crate::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(&["cat-file", "-e", &next], Some(&served.bare))
+            .unwrap();
+        assert!(
+            !lookup.success(),
+            "LFS-refused pack leaked into object store"
+        );
+
+        let accepted = push_real_pack(
+            &served.bare,
+            &served.base,
+            &next,
+            &pack,
+            &PushPolicy::default(),
+        )
+        .await;
+        assert_eq!(outcome(&accepted, "refs/heads/main").status, "ok");
+        assert_eq!(branch(&served.bare, "main"), Some(next));
+        assert!(std::fs::read_dir(served.bare.join("objects/pack"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "pack")));
+    }
+
+    #[tokio::test]
+    async fn a_hundred_pushes_are_consolidated_by_auto_gc() {
+        let served = Served::new();
+        let mut old = served.base.clone();
+        for number in 0..100 {
+            let new = commit(&served.work, "counter.txt", &format!("{number}\n"));
+            let pack = pack_from(&served.work);
+            let updates =
+                push_real_pack(&served.bare, &old, &new, &pack, &PushPolicy::default()).await;
+            assert_eq!(outcome(&updates, "refs/heads/main").status, "ok");
+            old = new;
+        }
+        let count_packs = || {
+            std::fs::read_dir(served.bare.join("objects/pack"))
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext == "pack")
+                })
+                .count()
+        };
+        assert!(count_packs() > 20, "fixture did not create enough packs");
+        crate::maintenance::run_auto(&served.bare).unwrap();
+        assert!(count_packs() <= 20, "auto-GC left too many packs");
+        assert_eq!(branch(&served.bare, "main"), Some(old));
     }
 
     async fn push(
