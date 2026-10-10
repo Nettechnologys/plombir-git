@@ -32,6 +32,8 @@ pub struct Model {
     pub status: String, // pending, running, success, failed, skipped
     pub exit_code: Option<i32>,
     pub log: Option<String>,
+    /// Unicode character count of the legacy base plus append-only chunks.
+    pub log_length: i64,
     pub started_at: Option<DateTime>,
     pub finished_at: Option<DateTime>,
     pub updated_at: Option<DateTime>,

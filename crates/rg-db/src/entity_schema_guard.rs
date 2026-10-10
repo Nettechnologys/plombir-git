@@ -89,6 +89,7 @@ probed_entities!(
     instance_settings,
     instance_signing_key,
     issue,
+    job_log_chunk,
     issue_comment,
     issue_label,
     label,

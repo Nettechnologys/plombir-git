@@ -2,29 +2,30 @@
 //!
 //! Serialises log writes through a single `tokio::sync::mpsc` channel so that
 //! concurrent pipeline jobs do not contend on SQLite writes.  A background
-//! consumer task receives log-update requests and executes each one against
-//! the database sequentially.
+//! consumer task receives log-update requests and commits them sequentially.
 //!
 //! # Usage
 //!
 //! ```ignore
 //! let queue = LogWriteQueue::spawn(db.clone());
-//! queue.write(job_id, &log_text).await;
+//! queue.write(job_id, &log_text).await?;
 //! ```
 //!
 //! # Stream-ready design
 //!
 //! The queue accepts any number of writes per job.  Future streaming log
 //! support (runner sends lines during execution) can call `write()` for each
-//! chunk without worrying about concurrent-write contention.
+//! chunk. A full queue returns an error to the caller for retry.
 
 use sea_orm::DatabaseConnection;
 use std::sync::Arc;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 /// Maximum buffered log writes before the channel exerts back-pressure.
 const CHANNEL_CAPACITY: usize = 4096;
+/// Maximum aggregate bytes held by requests waiting in the queue.
+const PENDING_BYTE_CAPACITY: usize = 32 * 1024 * 1024;
 
 /// A request to write (append) log text for a given job.
 struct LogWriteRequest {
@@ -32,6 +33,19 @@ struct LogWriteRequest {
     pub job_id: i64,
     /// Log text chunk to append.
     pub log_text: String,
+    pub replace: bool,
+    pub reply: oneshot::Sender<anyhow::Result<()>>,
+    _pending_bytes: OwnedSemaphorePermit,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LogWriteError {
+    #[error("log write queue is full")]
+    Full,
+    #[error("log write queue is closed")]
+    Closed,
+    #[error("job log could not be persisted: {0:#}")]
+    Persistence(#[source] anyhow::Error),
 }
 
 /// Cloneable handle to the log write queue.
@@ -40,6 +54,7 @@ struct LogWriteRequest {
 #[derive(Clone)]
 pub struct LogWriteQueue {
     tx: mpsc::Sender<LogWriteRequest>,
+    pending_bytes: Arc<Semaphore>,
 }
 
 impl LogWriteQueue {
@@ -53,7 +68,10 @@ impl LogWriteQueue {
 
         tokio::spawn(Self::consumer(db, rx));
 
-        Self { tx }
+        Self {
+            tx,
+            pending_bytes: Arc::new(Semaphore::new(PENDING_BYTE_CAPACITY)),
+        }
     }
 
     /// Spawn a consumer wired to a graceful-shutdown signal.
@@ -72,38 +90,56 @@ impl LogWriteQueue {
 
         let handle = tokio::spawn(Self::consumer_with_shutdown(db, rx, shutdown_rx));
 
-        (Self { tx }, handle)
+        (
+            Self {
+                tx,
+                pending_bytes: Arc::new(Semaphore::new(PENDING_BYTE_CAPACITY)),
+            },
+            handle,
+        )
     }
 
     /// Queue a log chunk for a given job.
     ///
-    /// This is fire-and-forget from the caller's perspective: the write will
-    /// happen asynchronously.  If the channel is full, the oldest pending
-    /// write for the same job is **dropped** so that new data always gets
-    /// through (like a sliding window).
-    pub async fn write(&self, job_id: i64, log_text: &str) {
-        if self.tx.is_closed() {
-            tracing::warn!("log write queue is closed, dropping log for job {job_id}");
-            return;
-        }
+    /// A successful return means the chunk is committed, not merely buffered.
+    /// A full queue is reported to the caller for a retry.
+    pub async fn write(&self, job_id: i64, log_text: &str) -> Result<(), LogWriteError> {
+        self.submit(job_id, log_text, false).await
+    }
 
+    /// Serialize a full-log replacement behind already accepted appends.
+    pub async fn replace(&self, job_id: i64, log_text: &str) -> Result<(), LogWriteError> {
+        self.submit(job_id, log_text, true).await
+    }
+
+    async fn submit(
+        &self,
+        job_id: i64,
+        log_text: &str,
+        replace: bool,
+    ) -> Result<(), LogWriteError> {
+        let bytes = u32::try_from(log_text.len().max(1)).map_err(|_| LogWriteError::Full)?;
+        let permit = self
+            .pending_bytes
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| LogWriteError::Full)?;
+        let (reply, received) = oneshot::channel();
         let req = LogWriteRequest {
             job_id,
             log_text: log_text.to_string(),
+            replace,
+            reply,
+            _pending_bytes: permit,
         };
-
-        // Try to send; if the channel is full, we drop the request instead
-        // of blocking the caller.  This is acceptable because:
-        // 1. The consumer processes writes in order
-        // 2. A later write for the same job supersedes the dropped one
-        // 3. The final complete log is written when the job finishes
-        if self.tx.try_send(req).is_err() {
-            tracing::debug!(
-                job_id,
-                "log write queue full ({}), dropping old entry",
-                CHANNEL_CAPACITY
-            );
-        }
+        self.tx.try_send(req).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => LogWriteError::Full,
+            mpsc::error::TrySendError::Closed(_) => LogWriteError::Closed,
+        })?;
+        received
+            .await
+            .map_err(|_| LogWriteError::Closed)?
+            .map_err(LogWriteError::Persistence)
     }
 
     /// Number of pending (buffered) log writes.
@@ -153,39 +189,24 @@ impl LogWriteQueue {
         tracing::info!("log write queue consumer stopped");
     }
 
-    /// Persist a single log-append request. Failures are logged and swallowed
-    /// so one bad write never tears down the consumer.
+    /// Persist one request and report its result to the waiting HTTP handler.
     async fn process_request(db: &DatabaseConnection, req: LogWriteRequest) {
-        // Read the current job to get the existing log
-        let existing_log = match rg_db::ops::pipeline_ops::get_job(db, req.job_id).await {
-            Ok(Some(job)) => job.log.unwrap_or_default(),
-            Ok(None) => {
-                tracing::warn!(job_id = req.job_id, "log write: job not found");
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    job_id = req.job_id,
-                    error = %format!("{e:#}"),
-                    "log write: failed to read current job log"
-                );
-                return;
-            }
-        };
-
-        // Append the new chunk
-        let combined = if existing_log.is_empty() {
-            req.log_text
+        let result = if req.replace {
+            rg_db::ops::pipeline_ops::update_job_log(db, req.job_id, &req.log_text).await
         } else {
-            format!("{}\n{}", existing_log, req.log_text)
+            rg_db::ops::pipeline_ops::append_job_log(db, req.job_id, &req.log_text).await
         };
-
-        // Write back
-        if let Err(e) = rg_db::ops::pipeline_ops::update_job_log(db, req.job_id, &combined).await {
+        if let Err(ref e) = result {
             tracing::warn!(
                 job_id = req.job_id,
                 error = %format!("{e:#}"),
                 "log write: failed to persist"
+            );
+        }
+        if req.reply.send(result).is_err() {
+            tracing::debug!(
+                job_id = req.job_id,
+                "log write: requester disconnected before acknowledgement"
             );
         }
     }
@@ -204,7 +225,10 @@ mod tests {
         let q2 = q.clone();
         drop(q2);
         // Queue should still accept writes
-        q.write(1, "test log").await;
+        assert!(matches!(
+            q.write(1, "test log").await,
+            Err(LogWriteError::Persistence(_))
+        ));
     }
 
     /// The shutdown-aware consumer must persist the buffered backlog and then
@@ -255,9 +279,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (queue, handle) = LogWriteQueue::spawn_with_shutdown(db.clone(), shutdown_rx);
 
-        // Buffer several writes, then signal shutdown.
+        // Every successful return already means durable. Shutdown then closes
+        // the consumer without dropping any acknowledged entry.
         for i in 0..5 {
-            queue.write(job.id, &format!("line {i}")).await;
+            queue.write(job.id, &format!("line {i}")).await.unwrap();
         }
         shutdown_tx.send(true).unwrap();
 
@@ -276,11 +301,11 @@ mod tests {
             .expect("consumer did not stop after shutdown")
             .expect("consumer task panicked");
 
-        let persisted = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+        let persisted = rg_db::ops::pipeline_ops::get_job_log_slice(&db, job.id, 0, 1000)
             .await
             .unwrap()
             .unwrap()
-            .log
+            .content
             .unwrap_or_default();
         // All five buffered writes survived the drain.
         for i in 0..5 {
@@ -315,11 +340,7 @@ mod tests {
         }
     }
 
-    /// This consumer swallows every write failure by design — the log line is the
-    /// *only* channel an operator has. `rg_db::ops` wraps each failure in
-    /// `.context("db: ...")`, so a bare `error = %e` would render that context and
-    /// nothing else, turning "the pipeline_job table is missing" into an
-    /// unactionable "log write: failed to read current job log / db: ...".
+    /// A failed write reaches the caller and the operator log with its cause.
     ///
     /// Asserts on the rendered line, not on the `Result`, because the rendering is
     /// exactly what regressed before.
@@ -336,18 +357,26 @@ mod tests {
         // Connected but un-migrated: every `pipeline_job` query fails at the
         // SQLite level, which is the cause we need to see in the log.
         let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let permit = Arc::new(Semaphore::new(100))
+            .try_acquire_many_owned(17)
+            .unwrap();
+        let (reply, received) = oneshot::channel();
         LogWriteQueue::process_request(
             &db,
             LogWriteRequest {
                 job_id: 42,
                 log_text: "some build output".to_string(),
+                replace: false,
+                reply,
+                _pending_bytes: permit,
             },
         )
         .await;
+        assert!(received.await.unwrap().is_err());
 
         let rendered = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
         assert!(
-            rendered.contains("log write: failed to read current job log"),
+            rendered.contains("log write: failed to persist"),
             "expected the write-failure warning, got: {rendered}"
         );
         // The `.context("db: ...")` layer — what a bare `%e` would have shown.
@@ -360,5 +389,65 @@ mod tests {
             rendered.contains("no such table"),
             "the underlying SQLite cause was dropped from the log line: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn full_queue_reports_pressure_without_acknowledging_a_chunk() {
+        let (tx, _rx) = mpsc::channel(1);
+        let queue = LogWriteQueue {
+            tx,
+            pending_bytes: Arc::new(Semaphore::new(PENDING_BYTE_CAPACITY)),
+        };
+        let permit = queue
+            .pending_bytes
+            .clone()
+            .try_acquire_many_owned(5)
+            .unwrap();
+        let (reply, _received) = oneshot::channel();
+        queue
+            .tx
+            .try_send(LogWriteRequest {
+                job_id: 1,
+                log_text: "first".to_owned(),
+                replace: false,
+                reply,
+                _pending_bytes: permit,
+            })
+            .unwrap();
+        assert!(matches!(
+            queue.write(1, "second").await,
+            Err(LogWriteError::Full)
+        ));
+        assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn byte_budget_reports_pressure_before_the_entry_limit() {
+        let (tx, _rx) = mpsc::channel(2);
+        let queue = LogWriteQueue {
+            tx,
+            pending_bytes: Arc::new(Semaphore::new(4)),
+        };
+        let permit = queue
+            .pending_bytes
+            .clone()
+            .try_acquire_many_owned(4)
+            .unwrap();
+        let (reply, _received) = oneshot::channel();
+        queue
+            .tx
+            .try_send(LogWriteRequest {
+                job_id: 1,
+                log_text: "four".to_owned(),
+                replace: false,
+                reply,
+                _pending_bytes: permit,
+            })
+            .unwrap();
+        assert!(matches!(
+            queue.write(1, "x").await,
+            Err(LogWriteError::Full)
+        ));
+        assert_eq!(queue.pending_count(), 1);
     }
 }

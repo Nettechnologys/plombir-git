@@ -966,6 +966,7 @@ pub async fn job_status(
         (status = 200, description = "Log uploaded", body = serde_json::Value),
         (status = 404, description = "Job not found", body = serde_json::Value),
         (status = 413, description = "Log above the 8 MiB per-request ceiling"),
+        (status = 503, description = "Log write queue is full or unavailable; retry the upload"),
     ),
 )]
 pub async fn upload_log(
@@ -991,27 +992,51 @@ pub async fn upload_log(
         }
     };
 
-    if headers
+    let result = if headers
         .get("x-job-log-mode")
         .is_some_and(|value| value == "replace")
     {
-        // A full-log retry must be safe even when the previous response was
-        // lost after commit. Wait for the write here, so 200 means durable.
-        if let Err(error) =
-            rg_db::ops::pipeline_ops::update_job_log(&state.db_write, job_id, &body).await
-        {
-            tracing::error!(job_id, error = %format!("{error:#}"), "failed to persist runner log");
-            return AppError::from(error).into_response();
-        }
+        state.log_write_queue.replace(job_id, &body).await
     } else {
-        // Legacy clients may send chunks. Keep their append contract intact.
-        state.log_write_queue.write(job_id, &body).await;
+        state.log_write_queue.write(job_id, &body).await
+    };
+    if let Err(error) = result {
+        tracing::warn!(job_id, error = %format!("{error:#}"), "failed to persist runner log");
+        return log_write_failure_response(error);
     }
 
     // Broadcast only the server-sanitized log via WebSocket to frontend.
     crate::ws::push_job_log(&state.notification_hub, job_id, &body).await;
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
+}
+
+fn log_write_failure_response(
+    error: rg_core::ci::log_write_queue::LogWriteError,
+) -> axum::response::Response {
+    match error {
+        rg_core::ci::log_write_queue::LogWriteError::Full
+        | rg_core::ci::log_write_queue::LogWriteError::Closed => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "log write queue unavailable",
+        )
+            .into_response(),
+        rg_core::ci::log_write_queue::LogWriteError::Persistence(error) => {
+            AppError::from(error).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod log_queue_failure_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_queue_is_retryable_instead_of_looking_like_a_saved_log() {
+        let response =
+            log_write_failure_response(rg_core::ci::log_write_queue::LogWriteError::Full);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 /// Download a tar snapshot of the exact commit assigned to an external job.

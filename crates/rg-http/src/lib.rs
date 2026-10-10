@@ -601,8 +601,8 @@ async fn run_with_listener(
     ));
 
     let db_write = config.db_write.clone().unwrap_or_else(|| config.db.clone());
-    // The log queue is the instance's busiest steady writer: one statement per
-    // chunk, no transaction held across a second acquire.
+    // The log queue serializes appends and full-log replacements, and each
+    // request receives its result after the database transaction commits.
     let log_queue_db = db_write.clone();
 
     let (log_write_queue, log_consumer_handle) =

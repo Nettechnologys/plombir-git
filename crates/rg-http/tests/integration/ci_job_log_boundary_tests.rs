@@ -70,21 +70,26 @@ async fn create_assigned_job(db: &DatabaseConnection, repo_id: i64, runner_id: i
     job.id
 }
 
-/// The route answers before the write lands: `LogWriteQueue` persists off the
-/// request path, so the assertion has to wait for the row rather than read it
-/// once and call an empty column a lost log.
+/// A 200 response means the append-only chunks have been committed.
 async fn stored_log(db: &DatabaseConnection, job_id: i64) -> String {
-    for _ in 0..200 {
-        let job = rg_db::ops::pipeline_ops::get_job(db, job_id)
+    let total = rg_db::ops::pipeline_ops::get_job(db, job_id)
+        .await
+        .unwrap()
+        .expect("the job the log was uploaded for")
+        .log_length;
+    let mut log = String::new();
+    let mut offset = 0;
+    while offset < total {
+        let slice = rg_db::ops::pipeline_ops::get_job_log_slice(db, job_id, offset, 262_144)
             .await
             .unwrap()
-            .expect("the job the log was uploaded for");
-        match job.log {
-            Some(log) if !log.is_empty() => return log,
-            _ => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
-        }
+            .unwrap();
+        let content = slice.content.unwrap();
+        assert!(!content.is_empty(), "log slice made no progress");
+        offset += content.chars().count() as i64;
+        log.push_str(&content);
     }
-    panic!("the log write never reached job {job_id}");
+    log
 }
 
 /// A repository, a runner holding a token for it, and a job assigned to that

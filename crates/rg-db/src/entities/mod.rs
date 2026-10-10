@@ -25,6 +25,7 @@ pub mod instance_signing_key;
 pub mod issue;
 pub mod issue_comment;
 pub mod issue_label;
+pub mod job_log_chunk;
 pub mod label;
 pub mod lfs_lock;
 pub mod lfs_object;

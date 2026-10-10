@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::*;
 
-use crate::entities::{pipeline, pipeline_concurrency_lock, pipeline_job, pipeline_stage};
+use crate::entities::{
+    job_log_chunk, pipeline, pipeline_concurrency_lock, pipeline_job, pipeline_stage,
+};
 
 // ── Pipeline ops ─────────────────────────────────────────────────
 
@@ -338,6 +340,7 @@ pub async fn create_job(
         tags: Set(tags.map(|s| s.to_string())),
         exit_code: Set(None),
         log: Set(None),
+        log_length: Set(0),
         started_at: Set(None),
         finished_at: Set(None),
         ..Default::default()
@@ -694,23 +697,120 @@ pub async fn finalize_ci_job_token_job(
     .await
 }
 
-/// Update the log and the watchdog liveness timestamp of a job.
+/// Replace a job's complete log and discard its prior streaming chunks.
 ///
 /// A log chunk is direct evidence that the owning runner is still executing
 /// this job. Keeping `updated_at` in the same write prevents the watchdog from
 /// handing a healthy, long-running job to a second runner.
 pub async fn update_job_log(db: &DatabaseConnection, id: i64, log: &str) -> Result<()> {
-    use sea_orm::ActiveModelTrait;
-    let model = pipeline_job::Entity::find_by_id(id)
-        .one(db)
+    let tx = db.begin().await.context("db: begin job log replacement")?;
+    // MySQL reports changed rows, not matched rows. Replacing the same log
+    // twice within one timestamp tick must still be acknowledged as success.
+    let locked = pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(id))
+        .col_expr(
+            pipeline_job::Column::LogLength,
+            Expr::col(pipeline_job::Column::LogLength).add(1),
+        )
+        .exec(&tx)
         .await
-        .context("db: find job for log update")?
-        .ok_or_else(|| anyhow::anyhow!("job {} not found", id))?;
+        .context("db: lock job for log replacement")?;
+    if locked.rows_affected != 1 {
+        anyhow::bail!("job {id} not found");
+    }
+    pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(id))
+        .col_expr(pipeline_job::Column::Log, Expr::value(log))
+        .col_expr(
+            pipeline_job::Column::LogLength,
+            Expr::value(i64::try_from(log.chars().count())?),
+        )
+        .col_expr(
+            pipeline_job::Column::UpdatedAt,
+            Expr::value(chrono::Utc::now().naive_utc()),
+        )
+        .exec(&tx)
+        .await
+        .context("db: replace job log")?;
+    job_log_chunk::Entity::delete_many()
+        .filter(job_log_chunk::Column::JobId.eq(id))
+        .exec(&tx)
+        .await
+        .context("db: delete replaced job log chunks")?;
+    tx.commit()
+        .await
+        .context("db: commit job log replacement")?;
+    Ok(())
+}
 
-    let mut active: pipeline_job::ActiveModel = model.into();
-    active.log = Set(Some(log.to_string()));
-    active.updated_at = Set(Some(chrono::Utc::now().naive_utc()));
-    active.update(db).await.context("db: update job log")?;
+/// Append one segment without reading or rewriting earlier log text.
+/// The row update takes the per-job write lock before reading its length, so
+/// concurrent servers cannot allocate the same character offset.
+pub async fn append_job_log(db: &DatabaseConnection, id: i64, text: &str) -> Result<()> {
+    let tx = db.begin().await.context("db: begin job log append")?;
+    let now = chrono::Utc::now().naive_utc();
+    let updated = pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(id))
+        .col_expr(
+            pipeline_job::Column::LogLength,
+            Expr::col(pipeline_job::Column::LogLength).add(1),
+        )
+        .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now))
+        .exec(&tx)
+        .await
+        .context("db: lock job for log append")?;
+    if updated.rows_affected != 1 {
+        anyhow::bail!("job {id} not found");
+    }
+    let old_length = pipeline_job::Entity::find_by_id(id)
+        .select_only()
+        .column(pipeline_job::Column::LogLength)
+        .into_tuple::<i64>()
+        .one(&tx)
+        .await
+        .context("db: read job log length")?
+        .ok_or_else(|| anyhow::anyhow!("job {id} disappeared during log append"))?
+        - 1;
+    let mut end_offset = old_length;
+    if !text.is_empty() {
+        let content = if old_length == 0 {
+            text.to_owned()
+        } else {
+            format!("\n{text}")
+        };
+        // MySQL TEXT has a 64 KiB byte ceiling. Keep every row well below it,
+        // including for a single upload at the HTTP route's 8 MiB ceiling.
+        const MAX_CHUNK_BYTES: usize = 32 * 1024;
+        let mut rest = content.as_str();
+        while !rest.is_empty() {
+            let mut bytes = rest.len().min(MAX_CHUNK_BYTES);
+            while !rest.is_char_boundary(bytes) {
+                bytes -= 1;
+            }
+            let part = &rest[..bytes];
+            let next = end_offset
+                .checked_add(i64::try_from(part.chars().count())?)
+                .context("job log character offset overflow")?;
+            job_log_chunk::ActiveModel {
+                job_id: Set(id),
+                start_offset: Set(end_offset),
+                end_offset: Set(next),
+                content: Set(part.to_owned()),
+            }
+            .insert(&tx)
+            .await
+            .context("db: insert job log chunk")?;
+            end_offset = next;
+            rest = &rest[bytes..];
+        }
+    }
+    pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(id))
+        .col_expr(pipeline_job::Column::LogLength, Expr::value(end_offset))
+        .exec(&tx)
+        .await
+        .context("db: advance job log length")?;
+    tx.commit().await.context("db: commit job log append")?;
     Ok(())
 }
 
@@ -797,7 +897,7 @@ fn job_summaries_query() -> Select<pipeline_job::Entity> {
             pipeline_job::Column::StartedAt,
             pipeline_job::Column::FinishedAt,
         ])
-        .column_as(Expr::cust("log IS NOT NULL"), "has_log")
+        .column_as(Expr::cust("log IS NOT NULL OR log_length > 0"), "has_log")
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -807,26 +907,79 @@ pub struct JobLogSlice {
     pub total_length: Option<i64>,
 }
 
-/// Offset and limit count Unicode characters, matching SQLite/Postgres
-/// `substr` and `length` on a TEXT log. Only this slice crosses the DB boundary.
+/// Offset and limit count Unicode characters. Fetch the legacy base by SQL
+/// substring and only the append-only chunks overlapping the requested range.
 pub async fn get_job_log_slice(
-    db: &impl ConnectionTrait,
+    db: &DatabaseConnection,
     job_id: i64,
     offset: i64,
     limit: i64,
 ) -> Result<Option<JobLogSlice>> {
-    pipeline_job::Entity::find_by_id(job_id)
+    #[derive(FromQueryResult)]
+    struct BaseSlice {
+        stage_id: i64,
+        content: Option<String>,
+        total_length: i64,
+    }
+    // The base and the chunks must be one snapshot: a full-log replacement
+    // deletes the old chunks while changing the base. PostgreSQL's default
+    // READ COMMITTED gives each SELECT a different snapshot, so request
+    // repeatable reads there (and on MySQL). SQLite already snapshots a read
+    // transaction; SeaORM warns if an isolation level is specified for it.
+    let tx = if db.get_database_backend() == DbBackend::Sqlite {
+        db.begin().await
+    } else {
+        db.begin_with_config(Some(IsolationLevel::RepeatableRead), None)
+            .await
+    }
+    .context("db: begin job log snapshot")?;
+    let Some(base) = pipeline_job::Entity::find_by_id(job_id)
         .select_only()
         .column(pipeline_job::Column::StageId)
         .column_as(
             Expr::cust_with_values("substr(log, ?, ?)", [offset + 1, limit]),
             "content",
         )
-        .column_as(Expr::cust("length(log)"), "total_length")
-        .into_model::<JobLogSlice>()
-        .one(db)
+        .column_as(Expr::col(pipeline_job::Column::LogLength), "total_length")
+        .into_model::<BaseSlice>()
+        .one(&tx)
         .await
-        .context("db: read job log slice")
+        .context("db: read job log base slice")?
+    else {
+        tx.commit()
+            .await
+            .context("db: close empty job log snapshot")?;
+        return Ok(None);
+    };
+    let end = offset.saturating_add(limit).min(base.total_length);
+    let mut content = base.content.unwrap_or_default();
+    if offset < end {
+        let chunks = job_log_chunk::Entity::find()
+            .filter(job_log_chunk::Column::JobId.eq(job_id))
+            .filter(job_log_chunk::Column::EndOffset.gt(offset))
+            .filter(job_log_chunk::Column::StartOffset.lt(end))
+            .order_by_asc(job_log_chunk::Column::StartOffset)
+            .all(&tx)
+            .await
+            .context("db: read job log chunks")?;
+        for chunk in chunks {
+            let first = offset.max(chunk.start_offset) - chunk.start_offset;
+            let last = end.min(chunk.end_offset) - chunk.start_offset;
+            content.extend(
+                chunk
+                    .content
+                    .chars()
+                    .skip(usize::try_from(first)?)
+                    .take(usize::try_from(last - first)?),
+            );
+        }
+    }
+    tx.commit().await.context("db: close job log snapshot")?;
+    Ok(Some(JobLogSlice {
+        stage_id: base.stage_id,
+        content: Some(content),
+        total_length: Some(base.total_length),
+    }))
 }
 
 pub async fn stage_has_job_status(
@@ -868,6 +1021,7 @@ pub async fn update_job_result(
     active.updated_at = Set(Some(chrono::Utc::now().naive_utc()));
     if log.is_some() {
         active.log = Set(log.map(|s| s.to_string()));
+        active.log_length = Set(i64::try_from(log.unwrap_or_default().chars().count())?);
     }
     if started_at.is_some() {
         active.started_at = Set(started_at);
@@ -2087,6 +2241,10 @@ pub async fn settle_job_if_active(
         .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now));
     if let Some(log) = log {
         update = update.col_expr(pipeline_job::Column::Log, Expr::value(log));
+        update = update.col_expr(
+            pipeline_job::Column::LogLength,
+            Expr::value(i64::try_from(log.chars().count())?),
+        );
     }
     if let Some(finished_at) = finished_at {
         update = update.col_expr(pipeline_job::Column::FinishedAt, Expr::value(finished_at));
