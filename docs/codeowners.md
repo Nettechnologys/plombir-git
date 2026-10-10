@@ -76,7 +76,7 @@ whitespace.
 /docs/   @tech-writers @acme/docs-team   # trailing note, ignored
 ```
 
-Four ways a line produces **no executable rule**:
+Five ways a line produces **no executable rule**:
 
 - It is blank, or a comment. This is intentional and produces no diagnostic.
 - It names no owner (`*` on its own). Plombir Git logs the line and reason.
@@ -87,6 +87,8 @@ Four ways a line produces **no executable rule**:
   unsupported owner is logged with the line number.
 - Its pattern ends with a backslash that has nothing left to escape — see
   below, it is what trying to escape a space leaves behind. This is logged too.
+- Its pattern exceeds 4096 bytes. The server logs the line and the
+  `4096-byte CODEOWNERS limit`; other rules in the file still apply.
 
 ### Backslashes
 

@@ -33,6 +33,9 @@ const CODEOWNERS_PATHS: &[&str] = &[".github/CODEOWNERS", "CODEOWNERS", "docs/CO
 /// way to learn why their reviewers stopped being requested.
 const MAX_CODEOWNERS_SIZE: u64 = 1024 * 1024;
 
+/// Bound the pattern factor of matching even when the whole file is below 1 MiB.
+const MAX_CODEOWNERS_PATTERN_BYTES: usize = 4096;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeownerRule {
     pub line: usize,
@@ -84,6 +87,14 @@ pub fn parse_codeowners(contents: &str) -> ParsedCodeowners {
         let Some(pattern) = fields.next() else {
             continue;
         };
+        if pattern.len() > MAX_CODEOWNERS_PATTERN_BYTES {
+            parsed.diagnostics.push(CodeownersDiagnostic::new(
+                line_number,
+                pattern,
+                format!("pattern exceeds the {MAX_CODEOWNERS_PATTERN_BYTES}-byte CODEOWNERS limit"),
+            ));
+            continue;
+        }
         if has_dangling_escape(pattern) {
             parsed.diagnostics.push(CodeownersDiagnostic::new(
                 line_number,
@@ -201,8 +212,15 @@ pub async fn request_codeowners(
 ) -> Result<CodeownerRequestOutcome> {
     let repo_path = repo_path.to_path_buf();
     let base_branch = base_branch.to_string();
-    let Some(parsed) =
-        tokio::task::spawn_blocking(move || load_codeowners(&repo_path, &base_branch)).await??
+    let changed_paths = changed_paths.to_vec();
+    let Some((parsed, owners)) = tokio::task::spawn_blocking(move || {
+        let Some(parsed) = load_codeowners(&repo_path, &base_branch)? else {
+            return Ok::<_, anyhow::Error>(None);
+        };
+        let owners = owners_for_paths_with_lines(&parsed.rules, &changed_paths);
+        Ok(Some((parsed, owners)))
+    })
+    .await??
     else {
         return Ok(CodeownerRequestOutcome::default());
     };
@@ -210,7 +228,7 @@ pub async fn request_codeowners(
     let mut requested = Vec::new();
     let mut diagnostics = parsed.diagnostics;
     let mut seen_users = HashSet::new();
-    for (line, owner) in owners_for_paths_with_lines(&parsed.rules, changed_paths) {
+    for (line, owner) in owners {
         let mut candidates = Vec::new();
         if let Some((org_name, team_name)) = owner.split_once('/') {
             if team_name.contains('/') {
@@ -441,57 +459,101 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 }
 
 fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
-    fn matches_from(
-        pattern: &[u8],
-        value: &[u8],
-        pattern_index: usize,
-        value_index: usize,
-        failed: &mut HashSet<(usize, usize)>,
-    ) -> bool {
-        if !failed.insert((pattern_index, value_index)) {
-            return false;
-        }
-        if pattern_index == pattern.len() {
-            return value_index == value.len();
-        }
-        match pattern[pattern_index] {
-            // The second half of the escape `strip_comment` grants: a
-            // backslash makes the next byte a literal, so `\#` reaches the
-            // file named `#` and `\*` reaches the one named `*`. Without this
-            // arm the backslash stayed in the pattern as an ordinary byte and
-            // the rule could only match a path that physically contained one —
-            // parsed, listed, and unable to win (card_3bb161c1337a).
-            b'\\' if pattern_index + 1 < pattern.len() => {
-                value.get(value_index) == Some(&pattern[pattern_index + 1])
-                    && matches_from(pattern, value, pattern_index + 2, value_index + 1, failed)
+    #[derive(Clone, Copy)]
+    enum Token {
+        Byte(u8),
+        Any,
+        Star,
+        DoubleStar,
+    }
+
+    struct States {
+        positions: Vec<usize>,
+        present: Vec<bool>,
+    }
+
+    impl States {
+        fn new(accept: usize) -> Self {
+            Self {
+                positions: Vec::new(),
+                present: vec![false; accept + 1],
             }
-            b'*' if pattern.get(pattern_index + 1) == Some(&b'*') => {
-                let mut next = pattern_index + 2;
-                while pattern.get(next) == Some(&b'*') {
-                    next += 1;
+        }
+
+        fn insert(&mut self, tokens: &[Token], mut position: usize) {
+            while !self.present[position] {
+                self.present[position] = true;
+                self.positions.push(position);
+                match tokens.get(position) {
+                    Some(Token::Star | Token::DoubleStar) => position += 1,
+                    _ => return,
                 }
-                (value_index..=value.len())
-                    .any(|index| matches_from(pattern, value, next, index, failed))
             }
-            b'*' => {
-                let end = value[value_index..]
-                    .iter()
-                    .position(|byte| *byte == b'/')
-                    .map_or(value.len(), |offset| value_index + offset);
-                (value_index..=end)
-                    .any(|index| matches_from(pattern, value, pattern_index + 1, index, failed))
+        }
+
+        fn clear(&mut self) {
+            for position in self.positions.drain(..) {
+                self.present[position] = false;
             }
-            b'?' if value_index < value.len() && value[value_index] != b'/' => {
-                matches_from(pattern, value, pattern_index + 1, value_index + 1, failed)
-            }
-            byte if value.get(value_index) == Some(&byte) => {
-                matches_from(pattern, value, pattern_index + 1, value_index + 1, failed)
-            }
-            _ => false,
         }
     }
 
-    matches_from(pattern, value, 0, 0, &mut HashSet::new())
+    // An escape consumes the following byte literally. Runs of at least two
+    // stars are one DoubleStar, as in the former matcher.
+    let mut tokens = Vec::with_capacity(pattern.len());
+    let mut at = 0;
+    while at < pattern.len() {
+        match pattern[at] {
+            b'\\' if at + 1 < pattern.len() => {
+                tokens.push(Token::Byte(pattern[at + 1]));
+                at += 2;
+            }
+            b'*' if pattern.get(at + 1) == Some(&b'*') => {
+                tokens.push(Token::DoubleStar);
+                at += 2;
+                while pattern.get(at) == Some(&b'*') {
+                    at += 1;
+                }
+            }
+            b'*' => {
+                tokens.push(Token::Star);
+                at += 1;
+            }
+            b'?' => {
+                tokens.push(Token::Any);
+                at += 1;
+            }
+            byte => {
+                tokens.push(Token::Byte(byte));
+                at += 1;
+            }
+        }
+    }
+
+    // Each active position is inserted at most once per input byte. A star
+    // also admits its successor without consuming input (epsilon closure).
+    let mut live = States::new(tokens.len());
+    let mut next = States::new(tokens.len());
+    live.insert(&tokens, 0);
+    for &byte in value {
+        next.clear();
+        for &position in &live.positions {
+            match tokens.get(position) {
+                Some(Token::Byte(expected)) if byte == *expected => {
+                    next.insert(&tokens, position + 1)
+                }
+                Some(Token::Any) if byte != b'/' => next.insert(&tokens, position + 1),
+                Some(Token::Star) if byte != b'/' => next.insert(&tokens, position),
+                Some(Token::DoubleStar) => next.insert(&tokens, position),
+                _ => {}
+            }
+        }
+        if next.positions.is_empty() {
+            return false;
+        }
+        std::mem::swap(&mut live, &mut next);
+    }
+    live.present[tokens.len()]
 }
 
 #[cfg(test)]
@@ -499,6 +561,125 @@ mod tests {
     use super::*;
     use sea_orm::ConnectionTrait as _;
     use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    // The former memoized backtracker is kept only as a small-input oracle.
+    // It must never receive an unbounded repository path.
+    fn old_glob_matches(pattern: &[u8], value: &[u8]) -> bool {
+        fn from(
+            pattern: &[u8],
+            value: &[u8],
+            p: usize,
+            v: usize,
+            failed: &mut HashSet<(usize, usize)>,
+        ) -> bool {
+            if !failed.insert((p, v)) {
+                return false;
+            }
+            if p == pattern.len() {
+                return v == value.len();
+            }
+            match pattern[p] {
+                b'\\' if p + 1 < pattern.len() => {
+                    value.get(v) == Some(&pattern[p + 1])
+                        && from(pattern, value, p + 2, v + 1, failed)
+                }
+                b'*' if pattern.get(p + 1) == Some(&b'*') => {
+                    let mut next = p + 2;
+                    while pattern.get(next) == Some(&b'*') {
+                        next += 1;
+                    }
+                    (v..=value.len()).any(|at| from(pattern, value, next, at, failed))
+                }
+                b'*' => {
+                    let end = value[v..]
+                        .iter()
+                        .position(|byte| *byte == b'/')
+                        .map_or(value.len(), |offset| v + offset);
+                    (v..=end).any(|at| from(pattern, value, p + 1, at, failed))
+                }
+                b'?' if v < value.len() && value[v] != b'/' => {
+                    from(pattern, value, p + 1, v + 1, failed)
+                }
+                byte if value.get(v) == Some(&byte) => from(pattern, value, p + 1, v + 1, failed),
+                _ => false,
+            }
+        }
+        from(pattern, value, 0, 0, &mut HashSet::new())
+    }
+
+    #[test]
+    fn iterative_glob_agrees_with_old_matcher_on_short_inputs() {
+        fn words(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
+            let mut all = vec![Vec::new()];
+            let mut level = vec![Vec::new()];
+            for _ in 0..max_len {
+                level = level
+                    .into_iter()
+                    .flat_map(|prefix| {
+                        alphabet.iter().map(move |&byte| {
+                            let mut word = prefix.clone();
+                            word.push(byte);
+                            word
+                        })
+                    })
+                    .collect();
+                all.extend(level.iter().cloned());
+            }
+            all
+        }
+        let patterns = words(b"a/*?\\b", 4);
+        let values = words(b"a/*?", 3);
+        for pattern in &patterns {
+            for value in &values {
+                assert_eq!(
+                    glob_matches(pattern, value),
+                    old_glob_matches(pattern, value),
+                    "pattern={pattern:?}, value={value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pathological_codeowners_pattern_finishes_within_deadline() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let pattern = format!("{}b", "**a".repeat(40));
+            let path = "a".repeat(2048);
+            sender
+                .send(glob_matches(pattern.as_bytes(), path.as_bytes()))
+                .unwrap();
+        });
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)), Ok(false));
+    }
+
+    #[test]
+    fn long_literal_does_not_recurse_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let literal = vec![b'a'; 32 * 1024];
+                assert!(glob_matches(&literal, &literal));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn oversized_codeowners_pattern_is_diagnosed_and_dropped() {
+        let at_limit = "a".repeat(MAX_CODEOWNERS_PATTERN_BYTES);
+        let too_long = "a".repeat(MAX_CODEOWNERS_PATTERN_BYTES + 1);
+        let parsed = parse_codeowners(&format!("{at_limit} @alice\n{too_long} @bob\n"));
+        assert_eq!(parsed.rules.len(), 1);
+        assert_eq!(parsed.rules[0].pattern, at_limit);
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].line, 2);
+        assert!(parsed.diagnostics[0]
+            .reason
+            .contains("4096-byte CODEOWNERS limit"));
+    }
 
     #[allow(dead_code)]
     mod rust_source {
