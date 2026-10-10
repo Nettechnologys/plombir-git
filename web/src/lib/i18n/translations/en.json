@@ -1443,6 +1443,7 @@
       "add_title": "Add or replace a secret",
       "name": "Name",
       "value": "Value",
+      "short_line_warning": "Lines shorter than 4 bytes cannot be safely masked if printed separately in a job log.",
       "save": "Save secret",
       "list_title": "Configured secrets",
       "empty": "No secrets configured.",

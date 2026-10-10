@@ -18388,7 +18388,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.ci_secrets.name",
-          "line": 101,
+          "line": 102,
           "via": null,
           "href": null,
           "handler": "save",
@@ -18435,7 +18435,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.ci_secrets.save",
-          "line": 101,
+          "line": 102,
           "via": null,
           "href": null,
           "handler": null,
@@ -18445,7 +18445,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 101,
+          "line": 102,
           "via": null,
           "href": null,
           "handler": "() => remove(item)",

@@ -108,6 +108,34 @@ async fn seed(base: &str, db: &DatabaseConnection, who: &str) -> (i64, i64, Stri
 }
 
 #[tokio::test]
+async fn retrying_a_complete_log_replaces_it_once_and_200_means_persisted() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (runner_id, job_id, runner_token) = seed(&base, &db, "joblog_retry").await;
+    let client = reqwest::Client::new();
+    let log = "one complete build log";
+
+    for _ in 0..2 {
+        let response = client
+            .post(format!(
+                "{base}/api/v1/runners/{runner_id}/jobs/{job_id}/log"
+            ))
+            .bearer_auth(&runner_token)
+            .header("x-job-log-mode", "replace")
+            .body(log)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let stored = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .log;
+        assert_eq!(stored.as_deref(), Some(log));
+    }
+}
+
+#[tokio::test]
 async fn a_log_above_axums_hidden_default_reaches_the_job() {
     let (base, db) = spawn_test_app_with_db().await;
     let (runner_id, job_id, runner_token) = seed(&base, &db, "joblog_big").await;

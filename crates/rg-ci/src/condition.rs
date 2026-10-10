@@ -258,12 +258,16 @@ impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
             Token::Eq => {
                 self.take();
                 let right = self.parse_unary()?;
-                Ok(Value::Bool(left == right || left.text() == right.text()))
+                Ok(Value::Bool(
+                    left == right || left.text().eq_ignore_ascii_case(&right.text()),
+                ))
             }
             Token::Ne => {
                 self.take();
                 let right = self.parse_unary()?;
-                Ok(Value::Bool(!(left == right || left.text() == right.text())))
+                Ok(Value::Bool(
+                    !(left == right || left.text().eq_ignore_ascii_case(&right.text())),
+                ))
             }
             _ => Ok(left),
         }
@@ -385,6 +389,12 @@ mod tests {
         )
         .unwrap());
         assert!(!evaluate_condition("contains(github.ref, 'tags') || false", &context).unwrap());
+    }
+    #[test]
+    fn string_comparisons_ignore_ascii_case() {
+        let context = HashMap::from([("github.ref_name".into(), "Release".into())]);
+        assert!(evaluate_condition("github.ref_name == 'release'", &context).unwrap());
+        assert!(!evaluate_condition("github.ref_name != 'RELEASE'", &context).unwrap());
     }
     #[test]
     fn rejects_unknown_context_functions_and_syntax() {

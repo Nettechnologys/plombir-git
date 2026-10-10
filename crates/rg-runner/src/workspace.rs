@@ -51,7 +51,10 @@ fn jobs_root_in(temp_root: &Path) -> PathBuf {
 }
 
 fn job_workspace_path_in(temp_root: &Path, job_id: i64) -> PathBuf {
-    jobs_root_in(temp_root).join(job_id.to_string())
+    // Job ids belong to one server, not to the host. A fresh, unguessable
+    // suffix also separates two processes registered as the same runner during
+    // a rolling restart; neither cleanup can name the other's live checkout.
+    jobs_root_in(temp_root).join(format!("{job_id}-{}", uuid::Uuid::new_v4()))
 }
 
 pub(crate) fn job_workspace_path(job_id: i64) -> PathBuf {
@@ -74,16 +77,22 @@ pub(crate) fn cache_archive_path(workspace: &Path) -> PathBuf {
     workspace.with_extension(CACHE_ARCHIVE_SUFFIX.trim_start_matches('.'))
 }
 
-fn is_job_id(value: &str) -> bool {
-    value
+fn is_owned_job_stem(value: &str) -> bool {
+    // Recognise old numeric names too, so work abandoned by a prior version
+    // remains recoverable. The UUID form is used for every new job.
+    let (job_id, nonce) = value.split_once('-').unwrap_or((value, ""));
+    let valid_id = job_id
         .parse::<i64>()
-        .is_ok_and(|job_id| job_id.to_string() == value)
+        .is_ok_and(|parsed| parsed.to_string() == job_id);
+    valid_id
+        && (nonce.is_empty()
+            || uuid::Uuid::parse_str(nonce).is_ok_and(|parsed| parsed.to_string() == nonce))
 }
 
 fn is_owned_file_name(name: &str) -> bool {
     OWNED_FILE_SUFFIXES
         .iter()
-        .any(|suffix| name.strip_suffix(suffix).is_some_and(is_job_id))
+        .any(|suffix| name.strip_suffix(suffix).is_some_and(is_owned_job_stem))
 }
 
 fn is_stale(metadata: &std::fs::Metadata, older_than: Duration) -> bool {
@@ -144,7 +153,7 @@ async fn sweep_stale_job_entries_in(temp_root: &Path, older_than: Duration) -> S
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let owned_directory = metadata.is_dir() && is_job_id(name);
+        let owned_directory = metadata.is_dir() && is_owned_job_stem(name);
         let owned_file = metadata.is_file() && is_owned_file_name(name);
         if (!owned_directory && !owned_file) || !is_stale(&metadata, older_than) {
             if owned_directory || owned_file {
@@ -201,6 +210,24 @@ mod tests {
             .expect("open runner job entry to backdate it");
         file.set_times(std::fs::FileTimes::new().set_modified(when))
             .expect("backdate runner job entry");
+    }
+
+    #[tokio::test]
+    async fn same_job_id_in_two_runner_processes_has_independent_work() {
+        let temp_root = tempfile::tempdir().expect("temporary root");
+        let first = job_workspace_path_in(temp_root.path(), 57);
+        let second = job_workspace_path_in(temp_root.path(), 57);
+        assert_ne!(first, second);
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("checkout"), b"first").unwrap();
+        std::fs::write(second.join("checkout"), b"second").unwrap();
+
+        tokio::fs::remove_dir_all(&first).await.unwrap();
+        assert_eq!(std::fs::read(second.join("checkout")).unwrap(), b"second");
+        let report = sweep_stale_job_entries_in(temp_root.path(), Duration::from_secs(0)).await;
+        assert_eq!(report.removed, 1);
+        assert!(!second.exists());
     }
 
     #[tokio::test]

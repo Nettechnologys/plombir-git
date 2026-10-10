@@ -155,9 +155,14 @@ const FINISH_JOB_REPORT: Report = Report {
     consequence: "the job stays 'running' on the server forever",
 };
 
-/// Attempts for [`finish_job`] — the one report whose loss corrupts server state
-/// irreversibly (nothing else ever moves that job out of `running`).
+/// Attempts for [`finish_job`] — a lost finish leaves the job running forever.
 const FINISH_JOB_ATTEMPTS: u32 = 3;
+
+/// The final log is sent as a replace operation, so repeating it after an
+/// ambiguous transport failure cannot append the same output twice.
+const LOG_UPLOAD_ATTEMPTS: u32 = 3;
+const LOG_UPLOAD_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+const LOG_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Backoff before the first retry of [`finish_job`]; doubled on each further
 /// attempt. Kept short: the runner is holding up its next poll while it retries.
@@ -514,14 +519,28 @@ pub async fn upload_log(
     token: &str,
     log: &str,
 ) {
-    let request = client
-        .post(format!(
-            "{}/api/v1/runners/{}/jobs/{}/log",
-            server, runner_id, job_id
-        ))
-        .header("Authorization", format!("Bearer {}", token))
-        .body(trim_log_for_upload(log).into_owned());
-    send_report(request, UPLOAD_LOG_REPORT, runner_id, Some(job_id)).await;
+    let url = format!("{server}/api/v1/runners/{runner_id}/jobs/{job_id}/log");
+    let body = trim_log_for_upload(log).into_owned();
+    let mut backoff = LOG_UPLOAD_RETRY_BACKOFF;
+    for attempt in 1..=LOG_UPLOAD_ATTEMPTS {
+        let request = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("x-job-log-mode", "replace")
+            .timeout(LOG_UPLOAD_TIMEOUT)
+            .body(body.clone());
+        match describe_send_failure(request).await {
+            None => return,
+            Some(failure) if failure.retryable && attempt < LOG_UPLOAD_ATTEMPTS => {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            Some(failure) => {
+                warn_report_lost(UPLOAD_LOG_REPORT, runner_id, Some(job_id), &failure);
+                return;
+            }
+        }
+    }
 }
 
 pub async fn download_workspace(
@@ -1428,6 +1447,34 @@ mod tests {
         assert!(logs.contains("413"), "{logs}");
         assert!(logs.contains("log exceeds the 5 MiB limit"), "{logs}");
         assert!(logs.contains("the job output is lost"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn upload_log_retries_transient_failures_but_not_client_refusals() {
+        let unavailable =
+            spawn_fake_server("503 Service Unavailable", "temporarily unavailable").await;
+        upload_log(
+            &reqwest::Client::new(),
+            &unavailable.url,
+            7,
+            42,
+            "token",
+            "complete log",
+        )
+        .await;
+        assert_eq!(unavailable.requests(), super::LOG_UPLOAD_ATTEMPTS as usize);
+
+        let refused = spawn_fake_server("413 Payload Too Large", "too large").await;
+        upload_log(
+            &reqwest::Client::new(),
+            &refused.url,
+            7,
+            42,
+            "token",
+            "complete log",
+        )
+        .await;
+        assert_eq!(refused.requests(), 1);
     }
 
     #[tokio::test]

@@ -54,6 +54,81 @@ const POLLED_TIMEOUT_MIN_SECS: i64 = 1;
 /// Fallback deadline for a `timeout` field the server should never have sent.
 const POLLED_TIMEOUT_FALLBACK_SECS: u64 = 3600;
 
+/// The external runner knows the exact CI token minted for this poll. Sanitize
+/// its captured output before upload, including a script's base64 encoding of
+/// the token. The server independently verifies and removes raw signed tokens.
+fn mask_polled_job_token(log: &str, variables: Option<&serde_json::Value>) -> String {
+    use base64::{
+        engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+        Engine as _,
+    };
+
+    let Some(token) = variables
+        .and_then(|value| value.get("CI_JOB_TOKEN"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| token.len() >= 4)
+    else {
+        return log.to_owned();
+    };
+    let mut variants = vec![token.to_owned()];
+    for bytes in [token.as_bytes().to_vec(), format!("{token}\n").into_bytes()] {
+        for encoded in [
+            STANDARD.encode(&bytes),
+            STANDARD_NO_PAD.encode(&bytes),
+            URL_SAFE.encode(&bytes),
+            URL_SAFE_NO_PAD.encode(&bytes),
+        ] {
+            if encoded.len() > 76 {
+                variants.push(
+                    encoded
+                        .as_bytes()
+                        .chunks(76)
+                        .map(|chunk| std::str::from_utf8(chunk).expect("base64 is ASCII"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+            variants.push(encoded);
+        }
+    }
+    variants.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    let mut masked = log.to_owned();
+    for variant in variants {
+        masked = masked.replace(&variant, "***");
+    }
+    masked
+}
+
+#[cfg(test)]
+mod token_mask_tests {
+    use super::mask_polled_job_token;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    #[test]
+    fn exact_polled_token_and_its_encoded_output_are_removed() {
+        let token = "eyJhbGciOiJIUzI1NiJ9.eyJqb2JfaWQiOjU3fQ.signed-job-token";
+        let variables = serde_json::json!({"CI_JOB_TOKEN": token});
+        let log = format!("token={token}\nbase64={}\nfinished", STANDARD.encode(token));
+        let masked = mask_polled_job_token(&log, Some(&variables));
+        assert_eq!(masked, "token=***\nbase64=***\nfinished");
+    }
+
+    #[test]
+    fn wrapped_base64_from_echoing_the_polled_token_is_removed() {
+        let token = "signed-job-token".repeat(12);
+        let variables = serde_json::json!({"CI_JOB_TOKEN": token});
+        let encoded = STANDARD.encode(format!("{token}\n"));
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wrapped.contains('\n'));
+        assert_eq!(mask_polled_job_token(&wrapped, Some(&variables)), "***");
+    }
+}
+
 /// Turn the polled `timeout` field into the deadline this job runs under.
 ///
 /// The server resolves and range-checks the value before it goes on the wire,
@@ -914,6 +989,7 @@ pub async fn run_jobs_until_shutdown_checking_every(
                     }
 
                     // Upload log
+                    let log = mask_polled_job_token(&log, job.variables.as_ref());
                     upload_log(&client, server, runner_id, job.job_id, token, &log).await;
 
                     // Finish
@@ -934,7 +1010,13 @@ pub async fn run_jobs_until_shutdown_checking_every(
                 }
                 Err(e) => {
                     tracing::error!("Poll error: {}", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    // Spread reconnects from runners that saw the same outage:
+                    // a fixed five-second retry synchronizes every process on
+                    // the host and can stampede a server as it comes back.
+                    let nonce = uuid::Uuid::new_v4();
+                    let jitter = u16::from_le_bytes([nonce.as_bytes()[0], nonce.as_bytes()[1]]);
+                    let delay = std::time::Duration::from_millis(4_000 + u64::from(jitter % 2_001));
+                    tokio::time::sleep(delay).await;
                 }
             }
         };

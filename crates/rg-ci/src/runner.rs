@@ -1472,6 +1472,7 @@ impl PipelineRunner {
         );
         env.insert("CI_REPOSITORY_OWNER".into(), repository_owner);
         if let Some(token) = ci_job_token {
+            secret_values.push(token.to_string());
             env.insert("CI_JOB_TOKEN".into(), token.to_string());
         }
         if let Some(url) = &self.oidc_token_url {

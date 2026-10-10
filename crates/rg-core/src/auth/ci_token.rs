@@ -108,6 +108,62 @@ pub fn validate_ci_token_signature(token: &str, secret: &str) -> Option<CiJobCla
     .map(|data| data.claims)
 }
 
+/// Redact this job's signed CI token from an externally supplied log.
+///
+/// The token sent in `poll_job` is minted at poll time and is not stored, so
+/// `upload_log` cannot recover its exact bytes from the job row. Verify bounded
+/// JWT-shaped words against the signing key instead. Expiry is deliberately
+/// ignored here: an expired token must still be kept out of a durable log.
+pub fn mask_job_tokens_in_log(input: &str, secret: &str, job_id: i64) -> String {
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+
+    fn append_word(out: &mut String, word: &str, secret: &str, job_id: i64) {
+        // A sentence's trailing full stop is not part of the JWT, though `.`
+        // is the separator inside it. Keep surrounding punctuation verbatim.
+        let candidate = word.trim_matches('.');
+        let signed_for_job = if (64..=4096).contains(&candidate.len())
+            && candidate.bytes().filter(|byte| *byte == b'.').count() == 2
+        {
+            let mut validation = Validation::new(Algorithm::HS256);
+            validation.set_issuer(&["plombir-git-ci"]);
+            validation.validate_exp = false;
+            decode::<CiJobClaims>(
+                candidate,
+                &DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            )
+            .ok()
+            .is_some_and(|decoded| {
+                decoded.claims.job_id == job_id && decoded.claims.sub == format!("ci:job:{job_id}")
+            })
+        } else {
+            false
+        };
+        if signed_for_job {
+            let leading = word.len() - word.trim_start_matches('.').len();
+            let trailing = word.len() - word.trim_end_matches('.').len();
+            out.push_str(&word[..leading]);
+            out.push_str("***");
+            out.push_str(&word[word.len() - trailing..]);
+        } else {
+            out.push_str(word);
+        }
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut start = 0;
+    for (index, ch) in input.char_indices() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            continue;
+        }
+        append_word(&mut out, &input[start..index], secret, job_id);
+        out.push(ch);
+        start = index + ch.len_utf8();
+    }
+    append_word(&mut out, &input[start..], secret, job_id);
+    out
+}
+
 /// Validate and decode a CI job token with scope and repo checking.
 ///
 /// Returns the claims only if:
@@ -134,6 +190,18 @@ pub fn validate_ci_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masks_only_the_signed_token_for_the_uploaded_job() {
+        let secret = "log-signing-key";
+        let own = generate_ci_job_token_with_ttl(1, 2, 3, "repo:read", secret, 3600).unwrap();
+        let other = generate_ci_job_token_with_ttl(1, 2, 4, "repo:read", secret, 3600).unwrap();
+        let log = format!("token={own}.\nother={other}\ntext remains");
+        let masked = mask_job_tokens_in_log(&log, secret, 3);
+        assert!(masked.starts_with("token=***.\n"), "{masked}");
+        assert!(masked.contains(&other), "{masked}");
+        assert!(masked.ends_with("text remains"), "{masked}");
+    }
 
     #[test]
     fn test_generate_and_validate() {

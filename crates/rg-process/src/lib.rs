@@ -318,8 +318,9 @@ pub async fn output_in_process_tree(
 ///
 /// The waiter thread owns the `Child`; this thread owns the process-group / Job
 /// Object guard. On timeout the guard is dropped first, terminating the tree,
-/// and only then is the waiter joined. No mutex needed by the waiter can delay
-/// teardown until the command exits naturally.
+/// and only then is the waiter joined if it has already finished. A descendant
+/// outside the process group can keep a pipe open after teardown; on timeout the
+/// waiter and its reader threads are detached so they cannot extend the deadline.
 ///
 /// The deadline used to be the *only* bound: a `git ls-tree` over a repository
 /// with a huge fan-out could answer with a listing hundreds of megabytes long —
@@ -394,7 +395,11 @@ pub fn output_in_process_tree_with_timeout_and_limit(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 drop(tree.take());
-                join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                // A process that called setsid may still own a pipe end. Its
+                // reader cannot be joined without losing the deadline. The
+                // waiter retains and eventually reaps the direct child; its
+                // threads exit when the escaped process closes the pipe.
+                drop(waiter);
                 return Ok(TimedOutput::TimedOut);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -707,6 +712,40 @@ mod bounded_tests {
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the run waited {:?} for a background `sleep` that held stdout",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_escaped_descendant_holding_stdout_cannot_extend_the_deadline() {
+        let started = std::time::Instant::now();
+        let marker_root = tempfile::tempdir().unwrap();
+        let marker = marker_root.path().join("escaped-child-ready");
+        let mut command = std::process::Command::new("sh");
+        // `setsid` leaves the group owned by the tree guard. A short-lived
+        // sleeper keeps the pipe open long enough to expose a blocking join,
+        // without leaving a long-lived orphan behind after the test. Wait for
+        // its marker before the shell exits, so the group kill cannot win the
+        // race against `setsid` and turn this into a false Completed result.
+        command.env("RG_PROCESS_MARKER", &marker).args([
+            "-c",
+            "setsid sh -c 'touch \"$RG_PROCESS_MARKER\"; sleep 4' & \
+             while [ ! -f \"$RG_PROCESS_MARKER\" ]; do sleep 0.01; done; echo done",
+        ]);
+
+        let result = output_in_process_tree_with_timeout_and_limit(
+            &mut command,
+            Duration::from_millis(200),
+            1024,
+            1024,
+        )
+        .expect("bounded run failed");
+
+        assert!(matches!(result, TimedOutput::TimedOut), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "escaped descendant held the caller for {:?}",
             started.elapsed()
         );
     }

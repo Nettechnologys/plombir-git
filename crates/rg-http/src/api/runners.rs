@@ -948,7 +948,8 @@ pub async fn job_status(
 }
 
 /// POST /api/v1/runners/:id/jobs/:job_id/log
-/// Upload job log (streaming or batch).
+/// Upload job log. A runner posting its complete final log may request
+/// replacement, making retries idempotent; legacy chunk uploads still append.
 #[utoipa::path(
     post,
     path = "/runners/{id}/jobs/{job_id}/log",
@@ -970,6 +971,7 @@ pub async fn job_status(
 pub async fn upload_log(
     State(state): State<AppState>,
     Path((runner_id, job_id)): Path<(i64, i64)>,
+    headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
     let job = match assigned_job(&state, runner_id, job_id).await {
@@ -978,19 +980,36 @@ pub async fn upload_log(
     };
 
     let body = match secrets_for_job(&state, job.stage_id).await {
-        Ok(secrets) => rg_core::auth::encryption::mask_values(&body, &secrets),
+        Ok(secrets) => {
+            let body =
+                rg_core::auth::ci_token::mask_job_tokens_in_log(&body, &state.jwt_secret, job_id);
+            rg_core::auth::encryption::mask_values(&body, &secrets)
+        }
         Err(error) => {
             tracing::error!(job_id, error = %format!("{error:#}"), "failed to load secrets while masking runner log");
             return AppError::internal("failed to sanitize job log").into_response();
         }
     };
 
+    if headers
+        .get("x-job-log-mode")
+        .is_some_and(|value| value == "replace")
+    {
+        // A full-log retry must be safe even when the previous response was
+        // lost after commit. Wait for the write here, so 200 means durable.
+        if let Err(error) =
+            rg_db::ops::pipeline_ops::update_job_log(&state.db_write, job_id, &body).await
+        {
+            tracing::error!(job_id, error = %format!("{error:#}"), "failed to persist runner log");
+            return AppError::from(error).into_response();
+        }
+    } else {
+        // Legacy clients may send chunks. Keep their append contract intact.
+        state.log_write_queue.write(job_id, &body).await;
+    }
+
     // Broadcast only the server-sanitized log via WebSocket to frontend.
     crate::ws::push_job_log(&state.notification_hub, job_id, &body).await;
-
-    // Write log through the queue to serialise concurrent writes and
-    // avoid SQLITE_BUSY under high concurrency.
-    state.log_write_queue.write(job_id, &body).await;
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
