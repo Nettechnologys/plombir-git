@@ -89,7 +89,7 @@ RUN for manifest in crates/*/Cargo.toml; do \
     done
 
 # 2c. Cache all crate dependencies (the stubs are valid Rust and compile)
-RUN cargo build --release
+RUN cargo build --release -j 6
 
 # 2d. Drop the stubs, copy the real sources, and compile for real.
 #
@@ -113,7 +113,7 @@ ARG PLOMBIR_GIT_SOURCE_COMMIT=
 RUN find crates -name '*.rs' -delete
 COPY crates/ crates/
 RUN find crates -name '*.rs' -exec touch {} + \
-    && cargo build --release --workspace --bins
+    && cargo build --release --workspace --bins -j 6
 
 # Derive the runtime payload from Cargo's target graph. Keeping this as a
 # separate directory prevents `*.d`, `deps/` and other release-build outputs
@@ -145,6 +145,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # `rg_git::cli_gateway::MIN_GIT_VERSION`. Changing the base image means
     # re-checking this.
     git \
+    gnupg \
     curl \
     libsqlite3-0 \
     openssh-client \

@@ -84,6 +84,7 @@ repos.templates = namespace();
 export const reviews = namespace();
 export const runners = namespace();
 export const search = namespace();
+export const signingKeys = namespace();
 export const sshKeys = namespace();
 export const tagProtections = namespace();
 export const timeTracking = namespace();

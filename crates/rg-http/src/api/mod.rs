@@ -18,6 +18,7 @@ pub mod ci_retention;
 pub mod ci_secrets;
 pub mod clearable;
 pub mod collaborators;
+pub mod commit_signing_keys;
 pub mod deploy_keys;
 pub mod imports;
 pub mod instance;

@@ -143,6 +143,7 @@
               <a href="/settings/security" onclick={close} role="menuitem">{t('nav.security', 'Security')}</a>
               <a href="/settings/notifications" onclick={close} role="menuitem">{t('nav.notification_settings')}</a>
               <a href="/settings/ssh-keys" onclick={close} role="menuitem">{t('nav.ssh_keys', 'SSH keys')}</a>
+              <a href="/settings/signing-keys" onclick={close} role="menuitem">{t('nav.signing_keys')}</a>
               <a href="/settings/tokens" onclick={close} role="menuitem">{t('nav.access_tokens', 'Access tokens')}</a>
               <a href="/settings/agents" onclick={close} role="menuitem">{t('nav.agents', 'Agents')}</a>
               {#if isAdmin()}

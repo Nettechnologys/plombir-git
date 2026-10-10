@@ -80,6 +80,7 @@ probed_entities!(
     ci_environment_approver_grant,
     ci_retention_policy,
     ci_secret,
+    commit_signing_key,
     commit_status,
     deploy_key,
     email_confirmation,

@@ -197,6 +197,7 @@ fn resource(path: &str) -> Option<&str> {
 struct Seeded {
     token: i64,
     ssh_key: i64,
+    signing_key: i64,
     passkey: i64,
     import: i64,
     notification: i64,
@@ -219,6 +220,7 @@ fn coverage(resource: &str, path: &str, seeded: &Seeded) -> Coverage {
         "tokens" if path.contains("/users/bots/{bot}/") => Coverage::Probe(seeded.bot_token),
         "tokens" => Coverage::Probe(seeded.token),
         "ssh-keys" => Coverage::Probe(seeded.ssh_key),
+        "signing-keys" => Coverage::Probe(seeded.signing_key),
         "passkeys" => Coverage::Probe(seeded.passkey),
         "imports" => Coverage::Probe(seeded.import),
         "notifications" => Coverage::Probe(seeded.notification),
@@ -277,6 +279,26 @@ async fn seed(fx: &Fixture, db: &rg_db::DatabaseConnection, owner_id: i64) -> Se
             "SSH key",
         )
         .await;
+    // This sweep checks ownership of an existing row. Registration's verified
+    // email requirement is covered by the signing-key endpoint tests.
+    let signing_key = rg_db::ops::commit_signing_key_ops::create(
+        db,
+        rg_db::entities::commit_signing_key::ActiveModel {
+            user_id: Set(owner_id),
+            title: Set("Sweep commit signer".to_string()),
+            kind: Set("ssh".to_string()),
+            public_key: Set(OWNER_SSH_KEY.to_string()),
+            fingerprint: Set(
+                rg_core::auth::ssh_key::fingerprint_from_openssh(OWNER_SSH_KEY)
+                    .expect("fixture signing key is valid"),
+            ),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("seed commit signing key")
+    .id;
 
     let passkey = rg_db::ops::passkey_credential_ops::create(
         db,
@@ -350,6 +372,7 @@ async fn seed(fx: &Fixture, db: &rg_db::DatabaseConnection, owner_id: i64) -> Se
     Seeded {
         token,
         ssh_key,
+        signing_key,
         passkey,
         import,
         notification,

@@ -399,6 +399,11 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
          answered 404 by the ownership check behind the gate. The owner's cell is real",
     ),
     (
+        "outsider global DELETE /api/v1/users/signing-keys/{id}",
+        "the signing key is the owner's; the outsider's 404 is the ownership check, while the \
+         owner's cell deletes the seeded row",
+    ),
+    (
         "outsider global DELETE /api/v1/users/tokens/{id}",
         "the personal access token is the owner's, and a token id belongs to one account: the \
          outsider is answered 404 by the ownership check behind the gate. The owner's cell is real",
@@ -984,6 +989,7 @@ async fn create_org_with_teams(
 /// The owner's own rows the global routes address.
 struct OwnerRows {
     ssh_key_id: String,
+    signing_key_id: String,
     token_id: String,
     notification_id: String,
     bot: String,
@@ -1023,6 +1029,23 @@ async fn seed_owner_rows(fx: &Fixture, db: &rg_db::DatabaseConnection, owner_id:
         serde_json::json!({"title": "sweep laptop", "key": ed25519_key('A', "sweep-ssh")}),
     )
     .await;
+    let signing_public_key = ed25519_key('B', "sweep-signing");
+    let signing_fingerprint = rg_core::auth::ssh_key::fingerprint_from_openssh(&signing_public_key)
+        .expect("fixture: signing public key is valid");
+    let signing_key = rg_db::ops::commit_signing_key_ops::create(
+        db,
+        rg_db::entities::commit_signing_key::ActiveModel {
+            id: rg_db::sea_orm::NotSet,
+            user_id: rg_db::sea_orm::Set(owner_id),
+            title: rg_db::sea_orm::Set("sweep commit signer".to_string()),
+            kind: rg_db::sea_orm::Set("ssh".to_string()),
+            public_key: rg_db::sea_orm::Set(signing_public_key),
+            fingerprint: rg_db::sea_orm::Set(signing_fingerprint),
+            created_at: rg_db::sea_orm::Set(chrono::Utc::now()),
+        },
+    )
+    .await
+    .expect("fixture: seed the owner's commit signing key");
     let token_id = created(
         "personal access token",
         "/api/v1/users/tokens",
@@ -1065,6 +1088,7 @@ async fn seed_owner_rows(fx: &Fixture, db: &rg_db::DatabaseConnection, owner_id:
 
     OwnerRows {
         ssh_key_id,
+        signing_key_id: signing_key.id.to_string(),
         token_id,
         notification_id: notification.id.to_string(),
         bot: SWEEP_BOT.to_string(),
@@ -1254,6 +1278,7 @@ struct GlobalSeed {
     org_member_id: String,
     team_member_id: String,
     ssh_key_id: String,
+    signing_key_id: String,
     token_id: String,
     /// A notification addressed to the *owner*. The outsider's cell on the same
     /// routes stays a `404` and always will — see the note on
@@ -1277,6 +1302,7 @@ impl GlobalSeed {
             org_member_id: absent(),
             team_member_id: absent(),
             ssh_key_id: absent(),
+            signing_key_id: absent(),
             token_id: absent(),
             notification_id: absent(),
             bot: "nosuchbot".to_string(),
@@ -2047,6 +2073,7 @@ fn fill(fact: &RouteFact, repo: &RepoSeed, globals: &GlobalSeed, org: &str) -> S
             "id" if path.contains("/pipelines/{id}") => &repo.pipeline_id,
             "id" if path.contains("/notifications/{id}") => &globals.notification_id,
             "id" if path.contains("/users/ssh-keys/{id}") => &globals.ssh_key_id,
+            "id" if path.contains("/users/signing-keys/{id}") => &globals.signing_key_id,
             "id" if path.contains("/users/tokens/{id}") => &globals.token_id,
             "id" if path.contains("/users/bots/{bot}/tokens/{id}") => &globals.bot_token_id,
             "bot" if deletes && path.ends_with("/users/bots/{bot}") => &globals.doomed_bot,
@@ -2446,6 +2473,7 @@ async fn every_route_answers_its_declared_access_level() {
         org_member_id: org_member.id.to_string(),
         team_member_id: team_member.id.to_string(),
         ssh_key_id: owner_rows.ssh_key_id,
+        signing_key_id: owner_rows.signing_key_id,
         token_id: owner_rows.token_id,
         notification_id: owner_rows.notification_id,
         bot: owner_rows.bot,

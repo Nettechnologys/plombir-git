@@ -705,6 +705,37 @@
     },
     {
       "method": "GET",
+      "url": "/api/v1/users/signing-keys",
+      "access": "User",
+      "handler": "api::commit_signing_keys::list_signing_keys",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/users/signing-keys",
+      "access": "User",
+      "handler": "api::commit_signing_keys::create_signing_key",
+      "testedIn": [
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/users/signing-keys/{id}",
+      "access": "User",
+      "handler": "api::commit_signing_keys::delete_signing_key",
+      "testedIn": [
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
       "url": "/api/v1/repos/{owner}/{name}/keys",
       "access": "RepoAdmin",
       "handler": "api::deploy_keys::list_deploy_keys",
@@ -26807,6 +26838,140 @@
       "passive": []
     },
     {
+      "route": "/settings/signing-keys",
+      "file": "web/src/routes/settings/signing-keys/+page.svelte",
+      "admin": false,
+      "controls": [
+        {
+          "tag": "form",
+          "label": "i18n:signing_keys.name",
+          "line": 108,
+          "via": null,
+          "href": null,
+          "handler": "addKey",
+          "calls": [
+            {
+              "symbol": "signingKeys.create",
+              "method": "POST",
+              "url": "/api/v1/users/signing-keys",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/signing-keys",
+              "access": "User",
+              "handler": "api::commit_signing_keys::create_signing_key",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            },
+            {
+              "symbol": "signingKeys.list",
+              "method": "GET",
+              "url": "/api/v1/users/signing-keys",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/signing-keys",
+              "access": "User",
+              "handler": "api::commit_signing_keys::list_signing_keys",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "select",
+          "label": "i18n:signing_keys.ssh",
+          "line": 112,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "textarea",
+          "label": "",
+          "line": 117,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:signing_keys.adding",
+          "line": 119,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:signing_keys.delete",
+          "line": 138,
+          "via": null,
+          "href": null,
+          "handler": "() => deleteKey(key)",
+          "calls": [
+            {
+              "symbol": "signingKeys.delete",
+              "method": "DELETE",
+              "url": "/api/v1/users/signing-keys/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/signing-keys/{id}",
+              "access": "User",
+              "handler": "api::commit_signing_keys::delete_signing_key",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            },
+            {
+              "symbol": "signingKeys.list",
+              "method": "GET",
+              "url": "/api/v1/users/signing-keys",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/signing-keys",
+              "access": "User",
+              "handler": "api::commit_signing_keys::list_signing_keys",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
+        }
+      ],
+      "passive": []
+    },
+    {
       "route": "/settings/ssh-keys",
       "file": "web/src/routes/settings/ssh-keys/+page.svelte",
       "admin": false,
@@ -27117,7 +27282,7 @@
       "outsider"
     ],
     "scenarios": 47,
-    "inventoryEntries": 744,
+    "inventoryEntries": 748,
     "coveredEntries": 172,
     "coveredRoutes": 163,
     "maxUiRoutesWithoutFrontendTest": 26

@@ -24,6 +24,7 @@ const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 pub struct ServerSideCommitPolicy {
     target_ref: String,
     signed_commit_required_refs: Vec<String>,
+    signing_keys: Vec<rg_git::signatures::RegisteredSigningKey>,
     /// LFS locks someone other than the actor holds. receive-pack refuses a
     /// push that changes one of these paths, and a commit the server makes on
     /// the actor's behalf is held to the same lock (card_e486e8e09406).
@@ -47,6 +48,11 @@ impl ServerSideCommitPolicy {
         crate::auth::credential_context::refuse_protected_write(db, repo_id, branch).await?;
         let protections = rg_db::ops::protected_branch_ops::list_rules_by_repo(db, repo_id).await?;
         let signed_commit_required_refs = signed_commit_required_refs(&protections);
+        let signing_keys = if signed_commit_required_refs.is_empty() {
+            Vec::new()
+        } else {
+            super::push_rules::load_registered_signing_keys(db).await?
+        };
         let rejected_refs = branch_protection_rejected_refs(protections, Some(actor_id))?;
         let target_ref = format!("refs/heads/{branch}");
 
@@ -62,6 +68,7 @@ impl ServerSideCommitPolicy {
         Ok(Self {
             target_ref,
             signed_commit_required_refs,
+            signing_keys,
             foreign_locks,
         })
     }
@@ -94,12 +101,13 @@ impl ServerSideCommitPolicy {
             return Err(crate::error::conflict(lock.refusal()));
         }
         let old_sha = old_sha.unwrap_or(ZERO_SHA);
-        match rg_git::protocol::receive_pack::unsigned_commit_for_required_signature(
+        match rg_git::protocol::receive_pack::unsigned_commit_for_required_signature_with_keys(
             repo_path,
             old_sha,
             new_sha,
             &self.target_ref,
             &self.signed_commit_required_refs,
+            &self.signing_keys,
         )
         .map_err(anyhow::Error::new)
         .with_context(|| {
@@ -124,6 +132,7 @@ mod tests {
         ServerSideCommitPolicy {
             target_ref: "refs/heads/main".to_string(),
             signed_commit_required_refs: vec!["refs/heads/main".to_string()],
+            signing_keys: Vec::new(),
             foreign_locks: Vec::new(),
         }
     }
@@ -189,6 +198,7 @@ mod tests {
         ServerSideCommitPolicy {
             target_ref: "refs/heads/main".to_string(),
             signed_commit_required_refs: Vec::new(),
+            signing_keys: Vec::new(),
             foreign_locks: vec![rg_git::protocol::receive_pack::ForeignLock {
                 path: path.to_string(),
                 owner: "alice".to_string(),

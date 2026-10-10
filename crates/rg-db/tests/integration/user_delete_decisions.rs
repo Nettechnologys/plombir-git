@@ -38,6 +38,12 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "the account's own credential",
     ),
     (
+        "commit_signing_keys",
+        "user_id",
+        "CASCADE",
+        "the account's own public signing key and trust grant",
+    ),
+    (
         "ci_environment_approver_grants",
         "user_id",
         "CASCADE",

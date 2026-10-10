@@ -251,6 +251,9 @@ const DISARMED_ENV: &[(&str, &str)] = &[
     // a home directory rather than through a configuration variable.
     ("HOME", DISARMED_HOME),
     ("XDG_CONFIG_HOME", DISARMED_HOME),
+    // GPG has a separate home lookup. A Git child verifying a commit must
+    // never discover the server account's personal keyring by inheritance.
+    ("GNUPGHOME", DISARMED_HOME),
     // `/etc/gitconfig` and `~/.gitconfig`, which is where the settings above are
     // actually written.
     ("GIT_CONFIG_NOSYSTEM", "1"),

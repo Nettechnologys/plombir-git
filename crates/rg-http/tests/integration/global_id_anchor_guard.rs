@@ -591,8 +591,10 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// whose scope is the whole instance — every account is its to reset. 138
 /// since card_a0377b61860e: `api::runners::job_status` takes the runner id —
 /// anchored by the route layer like every runner route — and a job id, which
-/// it reads only through `assigned_job`.
-const CENSUS_TOTAL: usize = 138;
+/// it reads only through `assigned_job`. 139 since card_b96fdb28ed1b:
+/// `api::commit_signing_keys::delete_signing_key` compares the fetched key's
+/// owner to the authenticated user and deletes with both id and user id.
+const CENSUS_TOTAL: usize = 139;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

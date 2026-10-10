@@ -17,6 +17,7 @@
 use anyhow::{Context, Result};
 use rg_db::ops::{protected_branch_ops, protected_tag_ops};
 use rg_git::protocol::receive_pack::{validate_tag_protection_pattern, PushPolicy};
+use rg_git::signatures::{RegisteredSigningKey, SigningKeyKind};
 use sea_orm::DatabaseConnection;
 
 /// Everything `receive-pack` must hold one push to in `repo_id`, for the
@@ -60,6 +61,11 @@ pub async fn load_receive_pack_policy(
         }));
     }
     let require_signed_refs = signed_commit_required_refs(&protection_rules);
+    let signing_keys = if require_signed_refs.is_empty() {
+        Vec::new()
+    } else {
+        load_registered_signing_keys(db).await?
+    };
     let fast_forward_only_refs = branch_protection_fast_forward_refs(&protection_rules);
     let undeletable_refs = branch_protection_undeletable_refs(&protection_rules);
     rejected_refs.extend(branch_protection_rejected_refs(protection_rules, actor_id)?);
@@ -79,10 +85,36 @@ pub async fn load_receive_pack_policy(
     Ok(PushPolicy {
         rejected_refs,
         require_signed_refs,
+        signing_keys,
         fast_forward_only_refs,
         foreign_locks,
         undeletable_refs,
     })
+}
+
+/// Only active accounts with a proved email contribute trust material.
+/// A broken stored key type fails the policy load instead of silently
+/// shrinking the trusted set for one transport.
+pub async fn load_registered_signing_keys(
+    db: &DatabaseConnection,
+) -> Result<Vec<RegisteredSigningKey>> {
+    rg_db::ops::commit_signing_key_ops::list_active_verified(db)
+        .await?
+        .into_iter()
+        .map(|(key, email)| {
+            let kind = match key.kind.as_str() {
+                "gpg" => SigningKeyKind::Gpg,
+                "ssh" => SigningKeyKind::Ssh,
+                kind => anyhow::bail!("stored commit signing key has unknown type {kind:?}"),
+            };
+            Ok(RegisteredSigningKey {
+                kind,
+                public_key: key.public_key,
+                fingerprint: key.fingerprint,
+                email,
+            })
+        })
+        .collect()
 }
 
 /// Refs that must be rejected because a protected-branch rule forbids this push.

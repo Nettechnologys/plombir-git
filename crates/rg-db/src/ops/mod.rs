@@ -6,6 +6,7 @@ pub mod board_ops;
 pub mod ci_environment_ops;
 pub mod ci_retention_ops;
 pub mod ci_secret_ops;
+pub mod commit_signing_key_ops;
 pub mod commit_status_ops;
 pub mod deploy_key_ops;
 pub mod email_confirmation_ops;

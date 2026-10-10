@@ -116,6 +116,7 @@ export {
 export { tokens, splitList, type TokenNarrowing, type TokenNarrowingFields } from './tokens';
 export { bots, type Bot, type BotToken } from './bots';
 export { sshKeys, type SshKey } from './sshKeys';
+export { signingKeys, type SigningKey, type SigningKeyKind } from './signingKeys';
 export { deployKeys, type DeployKey } from './deployKeys';
 export { lfsLocks, type LfsLock } from './lfsLocks';
 export { lfsStorage, type LfsObject, type LfsPruneOutcome, type LfsUsage } from './lfsStorage';

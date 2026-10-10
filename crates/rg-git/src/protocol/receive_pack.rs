@@ -64,6 +64,8 @@ pub struct PushPolicy {
     pub rejected_refs: Vec<(String, String)>,
     /// Ref patterns every new commit of which must carry a valid signature.
     pub require_signed_refs: Vec<String>,
+    /// A snapshot of the instance's registered keys, not the host keyring.
+    pub signing_keys: Vec<crate::signatures::RegisteredSigningKey>,
     /// `(pattern, message)` pairs for refs whose history may only grow: an
     /// update of an existing matching ref is refused with that message unless
     /// its old value is an ancestor of the new one (card_a5c343996db3). A ref
@@ -870,6 +872,7 @@ async fn check_and_write_refs(
         let repo = repo_path.to_path_buf();
         let fast_forward_only = policy.fast_forward_only_refs.clone();
         let signed = policy.require_signed_refs.clone();
+        let signing_keys = policy.signing_keys.clone();
         let view =
             incoming.map(|incoming| (incoming.objects.clone(), incoming.live_objects.clone()));
         updates = tokio::task::spawn_blocking(move || {
@@ -882,7 +885,13 @@ async fn check_and_write_refs(
             let env = env.as_ref().map(|env| env.as_slice()).unwrap_or(&[]);
             enforce_connectivity(&repo, &mut updates, env);
             enforce_fast_forward_only(&repo, &mut updates, &fast_forward_only, env);
-            enforce_signed_commit_policies_with_env(&repo, &mut updates, &signed, env);
+            enforce_signed_commit_policies_with_env(
+                &repo,
+                &mut updates,
+                &signed,
+                &signing_keys,
+                env,
+            );
             updates
         })
         .await
@@ -1209,12 +1218,13 @@ impl std::error::Error for RequiredSignatureError {}
 /// broken verifier is not evidence that the pusher supplied an unsigned
 /// commit.  Receive-pack and Plombir Git's server-side commit adapter share this
 /// function so both paths keep the same matcher and `%G?` semantics.
-pub fn unsigned_commit_for_required_signature(
+pub fn unsigned_commit_for_required_signature_with_keys(
     repo_path: &Path,
     old_sha: &str,
     new_sha: &str,
     refname: &str,
     patterns: &[String],
+    keys: &[crate::signatures::RegisteredSigningKey],
 ) -> std::result::Result<Option<String>, RequiredSignatureError> {
     unsigned_commit_for_required_signature_with_env(
         repo_path,
@@ -1222,6 +1232,7 @@ pub fn unsigned_commit_for_required_signature(
         new_sha,
         refname,
         patterns,
+        keys,
         &[],
     )
 }
@@ -1232,6 +1243,7 @@ fn unsigned_commit_for_required_signature_with_env(
     new_sha: &str,
     refname: &str,
     patterns: &[String],
+    keys: &[crate::signatures::RegisteredSigningKey],
     env: &[(&str, &str)],
 ) -> std::result::Result<Option<String>, RequiredSignatureError> {
     if !patterns
@@ -1240,6 +1252,9 @@ fn unsigned_commit_for_required_signature_with_env(
     {
         return Ok(None);
     }
+
+    let verifier = crate::signatures::SignatureVerifier::new(keys)
+        .map_err(|error| RequiredSignatureError::Unavailable(format!("{error:#}")))?;
 
     let gateway = crate::cli_gateway::global_gateway()
         .as_ref()
@@ -1261,9 +1276,9 @@ fn unsigned_commit_for_required_signature_with_env(
     }
 
     for commit in commits.stdout_str().lines() {
-        let verification = gateway
-            .run_with_env(&["log", "--format=%G?", "-1", commit], Some(repo_path), env)
-            .and_then(|output| signature_is_cryptographically_valid(&output))
+        let verification = verifier
+            .check_commit(repo_path, commit, env)
+            .and_then(|check| signature_is_cryptographically_valid(&check.status))
             .map_err(|source| RequiredSignatureError::Verification {
                 commit: commit.to_string(),
                 source,
@@ -1282,13 +1297,14 @@ fn enforce_signed_commit_policies(
     updates: &mut [RefUpdate],
     patterns: &[String],
 ) {
-    enforce_signed_commit_policies_with_env(repo_path, updates, patterns, &[]);
+    enforce_signed_commit_policies_with_env(repo_path, updates, patterns, &[], &[]);
 }
 
 fn enforce_signed_commit_policies_with_env(
     repo_path: &Path,
     updates: &mut [RefUpdate],
     patterns: &[String],
+    keys: &[crate::signatures::RegisteredSigningKey],
     env: &[(&str, &str)],
 ) {
     for update in updates.iter_mut().filter(|update| writes_an_object(update)) {
@@ -1298,6 +1314,7 @@ fn enforce_signed_commit_policies_with_env(
             &update.new_sha,
             &update.refname,
             patterns,
+            keys,
             env,
         ) {
             Ok(Some(commit)) => {
@@ -1771,20 +1788,13 @@ async fn first_locked_path_changed_with_env(
 
 /// Interpret `git log --format=%G?` without turning an unavailable verifier
 /// into a claim that the client supplied a bad signature.
-fn signature_is_cryptographically_valid(
-    verify_output: &crate::cli_gateway::GitOutput,
-) -> Result<bool> {
-    verify_output
-        .ensure_success()
-        .context("git could not verify commit signature")?;
-
-    match verify_output.stdout_str().trim() {
+fn signature_is_cryptographically_valid(status: &str) -> Result<bool> {
+    match status {
         "G" => Ok(true),
         // Validity is stricter than merely having a signature: an expired,
         // revoked, untrusted, bad, or absent signature cannot satisfy this
         // branch-protection policy.
-        "B" | "N" | "U" | "X" | "Y" | "R" => Ok(false),
-        "E" => bail!("git could not check the commit signature (status E)"),
+        "B" | "N" | "U" | "X" | "Y" | "R" | "E" => Ok(false),
         status => bail!("git returned an unexpected commit signature status {status:?}"),
     }
 }
@@ -2719,30 +2729,27 @@ mod rejection_pattern_tests {
 
     #[test]
     fn signature_verification_distinguishes_invalid_and_unavailable() {
-        let gateway = crate::cli_gateway::global_gateway().as_ref().unwrap();
-        let success_status = gateway.run(&["--version"], None).unwrap().status;
-        let output = |status: &str| crate::cli_gateway::GitOutput {
-            stdout: format!("{status}\n").into_bytes(),
-            stderr: Vec::new(),
-            status: success_status,
-            command: "git log --format=%G? -1 fixture".into(),
-        };
-
-        assert!(signature_is_cryptographically_valid(&output("G")).unwrap());
-        assert!(!signature_is_cryptographically_valid(&output("B")).unwrap());
-        assert!(!signature_is_cryptographically_valid(&output("N")).unwrap());
-        assert!(signature_is_cryptographically_valid(&output("E")).is_err());
+        assert!(signature_is_cryptographically_valid("G").unwrap());
+        assert!(!signature_is_cryptographically_valid("B").unwrap());
+        assert!(!signature_is_cryptographically_valid("N").unwrap());
+        // With a controlled keyring, E means no registered public key could
+        // check this commit, not that the host GPG installation is unknown.
+        assert!(!signature_is_cryptographically_valid("E").unwrap());
     }
 
     #[test]
     fn nonzero_signature_command_output_is_an_operational_error() {
+        let repo = tempfile::tempdir().unwrap();
         let gateway = crate::cli_gateway::global_gateway().as_ref().unwrap();
-        let output = gateway
-            .run(&["rev-parse", "--verify", "not-a-real-commit"], None)
+        gateway
+            .run(&["init"], Some(repo.path()))
+            .unwrap()
+            .ensure_success()
             .unwrap();
-        assert!(!output.success());
-
-        let error = signature_is_cryptographically_valid(&output).unwrap_err();
+        let verifier = crate::signatures::SignatureVerifier::new(&[]).unwrap();
+        let error = verifier
+            .check_commit(repo.path(), "not-a-real-commit", &[])
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("git could not verify commit signature"),
             "non-zero git exit must be an operational verification error: {error:#}"

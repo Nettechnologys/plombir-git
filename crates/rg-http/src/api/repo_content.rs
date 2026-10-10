@@ -241,7 +241,7 @@ pub struct CommitEntry {
 /// imported is the answer for *every* signed commit. That is not a claim about
 /// the commit, and a boolean has no room to say so (card_61b29791d099). The
 /// push path already keeps the two apart in
-/// [`rg_git::protocol::receive_pack::unsigned_commit_for_required_signature`];
+/// [`rg_git::protocol::receive_pack::unsigned_commit_for_required_signature_with_keys`];
 /// this is the same distinction on the read path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1698,7 +1698,7 @@ fn list_tag_names(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// GET /api/v1/repos/:owner/:name/commits/:sha/signature
-/// Get GPG signature verification status for a commit.
+/// Get GPG or SSH signature verification status for a commit.
 #[utoipa::path(
     get,
     path = "/repos/{owner}/{name}/commits/{sha}/signature",
@@ -1738,14 +1738,20 @@ pub async fn get_commit_signature(
         return AppError::bad_request("invalid commit SHA format").into_response();
     }
 
-    // `verify_commit_signature` opens a gix repository, decodes the commit
-    // object, and — when a `gpgsig` header is present — shells out to
-    // `git log --format=%G?…` through `GitCommandGateway::run`, whose
-    // `recv_timeout` blocks the calling thread for up to `git_cmd_secs`. GPG
-    // itself may then reach a keyserver, so "slow" here is not hypothetical.
-    // Off the tokio runtime worker, matching the shape `list_issue_templates`
-    // uses for the same class of shell-out.
-    match tokio::task::spawn_blocking(move || verify_commit_signature(&repo_path, &sha)).await {
+    let signing_keys =
+        match rg_core::branch_protection::push_rules::load_registered_signing_keys(&state.db).await
+        {
+            Ok(keys) => keys,
+            Err(error) => return AppError::from(error).into_response(),
+        };
+
+    // Signature verification opens objects and runs Git/GPG subprocesses.
+    // Keep this blocking work off the Tokio runtime worker.
+    match tokio::task::spawn_blocking(move || {
+        verify_commit_signature(&repo_path, &sha, &signing_keys)
+    })
+    .await
+    {
         Ok(Ok(sig)) => (StatusCode::OK, Json(sig)).into_response(),
         // See `get_blob`: an unopenable repository is not a missing commit.
         Ok(Err(e)) => AppError::from(e).into_response(),
@@ -1753,8 +1759,12 @@ pub async fn get_commit_signature(
     }
 }
 
-/// Verify a commit's GPG signature using `git log --show-signature`.
-fn verify_commit_signature(repo_path: &std::path::Path, sha: &str) -> anyhow::Result<GpgSignature> {
+/// Verify a commit with the instance's registered keys.
+fn verify_commit_signature(
+    repo_path: &std::path::Path,
+    sha: &str,
+    keys: &[rg_git::signatures::RegisteredSigningKey],
+) -> anyhow::Result<GpgSignature> {
     let repo = rg_git::repository::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
@@ -1781,17 +1791,14 @@ fn verify_commit_signature(repo_path: &std::path::Path, sha: &str) -> anyhow::Re
         });
     }
 
-    // TODO(gix): Verify the signature using git CLI — gix doesn't support cryptographic verification (Phase 3)
-    // When gix ships built-in GPG verification (or sequoia-openpgp is introduced), replace this block.
-    let git_gateway = rg_git::cli_gateway::global_gateway()
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    let verify_output = git_gateway.run(
-        &["log", "--format=%G?%n%GK%n%GN%n%GE", "-1", &full_sha],
-        Some(repo_path),
-    )?;
-    gpg_signature_from_output(&verify_output)
+    let verifier = rg_git::signatures::SignatureVerifier::new(keys)?;
+    let check = verifier.check_commit(repo_path, &full_sha, &[])?;
+    gpg_signature_from_fields(
+        &check.status,
+        nonempty(&check.fingerprint),
+        nonempty(&check.signer_name),
+        nonempty(&check.signer_email),
+    )
 }
 
 /// Resolve an object-id prefix without asking `rev_parse_single` to encode both
@@ -1819,6 +1826,7 @@ fn resolve_signature_commit_id(
 
 /// Interpret a *successful* `git log` signature report. A Git process failure
 /// is operational, not a legitimate verdict about the commit.
+#[cfg(test)]
 fn gpg_signature_from_output(
     verify_output: &rg_git::cli_gateway::GitOutput,
 ) -> anyhow::Result<GpgSignature> {
@@ -1843,6 +1851,19 @@ fn gpg_signature_from_output(
         .map(|l: &&str| l.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    gpg_signature_from_fields(status_code, signer_key, signer_name, signer_email)
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn gpg_signature_from_fields(
+    status_code: &str,
+    signer_key: Option<String>,
+    signer_name: Option<String>,
+    signer_email: Option<String>,
+) -> anyhow::Result<GpgSignature> {
     // Codes per `git log --format=%G?`. The split that matters is not
     // good-versus-bad but checked-versus-unchecked: `E` and `U` are answers
     // about this instance's keyring, not about the commit.
@@ -2690,14 +2711,16 @@ mod tests {
             .ensure_success()
             .unwrap();
 
-        let error = rg_git::protocol::receive_pack::unsigned_commit_for_required_signature(
-            repo.path(),
-            "0000000000000000000000000000000000000000",
-            "not-a-commit",
-            "refs/heads/main",
-            &["refs/heads/main".to_string()],
-        )
-        .expect_err("an unreadable created commit must be operational failure");
+        let error =
+            rg_git::protocol::receive_pack::unsigned_commit_for_required_signature_with_keys(
+                repo.path(),
+                "0000000000000000000000000000000000000000",
+                "not-a-commit",
+                "refs/heads/main",
+                &["refs/heads/main".to_string()],
+                &[],
+            )
+            .expect_err("an unreadable created commit must be operational failure");
         let response = AppError::from(anyhow::Error::new(error)).into_response();
         assert!(
             response.status().is_server_error(),

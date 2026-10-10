@@ -237,7 +237,7 @@ Three finds from the history:
 | Registries | Package registry and OCI container registry |
 | Search | Full-text search (FTS) and per-repository code indexing |
 | Import | Pull repositories, issues, PRs, labels, milestones, releases and wiki from GitHub / GitLab |
-| Operations | TLS/HTTPS, TOML config, rate limiting, log rotation, unified pagination, GPG signature verification, audit log, health checks |
+| Operations | TLS/HTTPS, TOML config, rate limiting, log rotation, unified pagination, registered GPG/SSH commit-signature verification, audit log, health checks |
 | AI agents | Model Context Protocol built into the server (`POST /api/v1/mcp`) and as a stdio binary (`plombir-git-mcp`); bot accounts, narrowed tokens, per-bot rate limits and audit ([details](#mcp-over-http-and-agent-accounts)) |
 | Releases | Release assets with optional in-toto / DSSE attestations signed by the instance key |
 | Web UI | SvelteKit (Svelte 5) SPA (login, repos, issues, PRs, wiki, CI, review, orgs, notifications), English + Chinese i18n |
@@ -245,6 +245,17 @@ Three finds from the history:
 Databases: SQLite, PostgreSQL, and MySQL are all supported and selected at
 runtime from the scheme of `--db-url` / `[database].url` — no feature rebuild
 required.
+
+Commit signatures are checked against public keys registered at **Settings →
+Commit Signing Keys** (or `GET/POST/DELETE /api/v1/users/signing-keys`). GPG
+and SSH signing keys are separate from SSH login keys. Registering one requires
+a login session and a verified account email; the commit's committer email must
+match that account email. Unknown keys receive an undeterminable signature
+status and cannot satisfy a branch's **Require signed commits** rule. The Docker
+image includes GnuPG and checks signatures with a temporary, instance-owned
+keyring and SSH allowed-signers file; the host account's keyring is never a
+source of trust. Configure email confirmation before enabling the rule on a
+fresh instance, then register at least one signing key.
 
 ---
 

@@ -1221,6 +1221,22 @@ pub(crate) fn build_all_routes(
         .get(User, "/users/ssh-keys", api::ssh_keys::list_ssh_keys)
         .post(User, "/users/ssh-keys", api::ssh_keys::create_ssh_key)
         .delete(User, "/users/ssh-keys/{id}", api::ssh_keys::delete_ssh_key)
+        // Commit signing keys (separate from SSH login credentials).
+        .get(
+            User,
+            "/users/signing-keys",
+            api::commit_signing_keys::list_signing_keys,
+        )
+        .post(
+            User,
+            "/users/signing-keys",
+            api::commit_signing_keys::create_signing_key,
+        )
+        .delete(
+            User,
+            "/users/signing-keys/{id}",
+            api::commit_signing_keys::delete_signing_key,
+        )
         // Deploy keys
         .get(
             RepoAdmin,

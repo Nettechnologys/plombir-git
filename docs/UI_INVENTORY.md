@@ -23,13 +23,13 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 409 |
-| Из них достижимы из браузера | 284 (69%) |
+| Роутов в роутере (с объявленным `Access`) | 412 |
+| Из них достижимы из браузера | 287 (70%) |
 | Layout-модулей | 2 |
-| Страниц | 69 |
-| Интерактивных элементов | 997 |
-| — из них дёргают API | 349 |
-| — приходят из общих компонентов | 396 |
+| Страниц | 70 |
+| Интерактивных элементов | 1004 |
+| — из них дёргают API | 351 |
+| — приходят из общих компонентов | 398 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 47 / 172 / 163 |
 | **UI-роутов без единого web/smoke/browser-теста** | **26** |
 | UI-роутов без corpus-hit и browser-сценария | 0 |
@@ -40,7 +40,7 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 106 | 68 | 4 | 0 |
 | `RepoWrite` | 85 | 66 | 13 | 2 |
-| `User` | 52 | 41 | 6 | 0 |
+| `User` | 55 | 44 | 6 | 0 |
 | `RepoAdmin` | 39 | 39 | 0 | 0 |
 | `Public` | 25 | 10 | 2 | 0 |
 | `InstanceAdmin` | 25 | 21 | 0 | 0 |
@@ -114,6 +114,7 @@
 | `/[owner]/[repo]/settings/lfs-storage` | 7 | 4 | 2 |
 | `/[owner]/[repo]/settings/mirror` | 7 | 3 | 2 |
 | `/[owner]/[repo]/settings/tags` | 7 | 2 | 2 |
+| `/settings/signing-keys` | 7 | 2 | 2 |
 | `/settings/ssh-keys` | 6 | 2 | 2 |
 | `/settings/tokens` | 6 | 2 | 2 |
 | `/[owner]/[repo]/settings/ci-secrets` | 5 | 2 | 2 |
@@ -1187,6 +1188,15 @@
 | i18n:account_security.setup.code | :598 | `GET /api/v1/users/passkeys` | `User` | rust+web |
 | i18n:account_security.setup.code | :598 | `GET /api/v1/users/me/sso` | `User` | rust+web |
 | i18n:account_security.setup.code | :598 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
+
+### `/settings/signing-keys`
+
+| Элемент | Откуда | Вызов | `Access` | тест |
+|---|---|---|---|---|
+| i18n:signing_keys.name | :108 | `POST /api/v1/users/signing-keys` | `User` | web |
+| i18n:signing_keys.name | :108 | `GET /api/v1/users/signing-keys` | `User` | rust+web |
+| i18n:signing_keys.delete | :138 | `DELETE /api/v1/users/signing-keys/{id}` | `User` | web |
+| i18n:signing_keys.delete | :138 | `GET /api/v1/users/signing-keys` | `User` | rust+web |
 
 ### `/settings/ssh-keys`
 
