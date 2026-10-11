@@ -514,6 +514,21 @@ async fn lock_pipeline_for_transition(
     pipeline_id: i64,
     transition: &'static str,
 ) -> Result<pipeline::Model> {
+    // SQLite ignores SELECT FOR UPDATE. Make this the transaction's first
+    // statement so it takes the writer slot before a read snapshot can become
+    // stale; competing transitions then wait under busy_timeout and re-read
+    // the graph after the previous writer commits.
+    if tx.get_database_backend() == DbBackend::Sqlite {
+        pipeline::Entity::update_many()
+            .filter(pipeline::Column::Id.eq(pipeline_id))
+            .col_expr(
+                pipeline::Column::Status,
+                Expr::col(pipeline::Column::Status).into(),
+            )
+            .exec(tx)
+            .await
+            .with_context(|| format!("db: lock SQLite pipeline for {transition}"))?;
+    }
     pipeline::Entity::find_by_id(pipeline_id)
         .lock_exclusive()
         .one(tx)

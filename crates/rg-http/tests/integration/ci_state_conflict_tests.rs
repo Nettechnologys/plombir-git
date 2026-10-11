@@ -129,25 +129,30 @@ async fn a_manual_job_released_twice_answers_conflict_not_bad_request() {
     let (fixture, _db) = seed("play-race", true).await;
 
     const RACERS: usize = 6;
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(RACERS));
     let mut tasks = Vec::with_capacity(RACERS);
     for _ in 0..RACERS {
         let url = fixture.play_url();
         let token = fixture.token.clone();
+        let start = start.clone();
         tasks.push(tokio::spawn(async move {
-            reqwest::Client::new()
+            start.wait().await;
+            let response = reqwest::Client::new()
                 .post(url)
                 .bearer_auth(token)
                 .send()
                 .await
-                .expect("play request")
-                .status()
-                .as_u16()
+                .expect("play request");
+            let status = response.status().as_u16();
+            let body = response.text().await.expect("play response body");
+            (status, body)
         }));
     }
-    let mut statuses = Vec::with_capacity(RACERS);
+    let mut responses = Vec::with_capacity(RACERS);
     for task in tasks {
-        statuses.push(task.await.expect("play task panicked"));
+        responses.push(task.await.expect("play task panicked"));
     }
+    let statuses: Vec<_> = responses.iter().map(|(status, _)| *status).collect();
 
     assert_eq!(
         statuses.iter().filter(|status| **status == 200).count(),
@@ -157,7 +162,7 @@ async fn a_manual_job_released_twice_answers_conflict_not_bad_request() {
     assert_eq!(
         statuses.iter().filter(|status| **status == 409).count(),
         RACERS - 1,
-        "every request that found the job already released must answer 409, got {statuses:?}"
+        "every request that found the job already released must answer 409, got {responses:?}"
     );
     assert!(
         !statuses.contains(&400),
