@@ -37,7 +37,7 @@ RUN npm run build
 # local push gates use. Keep this tag on the same version and the toolchain is
 # already in the image; let it fall behind and the install below downloads the
 # right one instead of building with the wrong one.
-FROM rust:1.96.1-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3 AS builder
+FROM rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS builder
 WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
