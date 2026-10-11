@@ -159,7 +159,7 @@ pub async fn create_issue(
         "state": issue.state,
         "author_id": issue.author_id,
     });
-    if let Err(e) = crate::webhook::service::trigger_issue_opened(db, repo_id, &payload).await {
+    if let Err(e) = crate::webhook::service::trigger_issue_opened(&pools, repo_id, &payload).await {
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger issue.opened webhook");
     }
 
@@ -639,7 +639,7 @@ pub async fn update_issue(
                 "state": s,
             });
             if let Err(e) =
-                crate::webhook::service::trigger_issue_closed(db, issue_repo_id, &close_payload)
+                crate::webhook::service::trigger_issue_closed(&pools, issue_repo_id, &close_payload)
                     .await
             {
                 tracing::warn!(error = %format!("{e:#}"), "failed to trigger issue.closed webhook");
@@ -710,7 +710,7 @@ pub async fn add_comment(
         "author_id": comment.author_id,
     });
     if let Err(e) = crate::webhook::service::trigger_issue_comment(
-        db,
+        &pools,
         issue.repo_id,
         &issue_payload,
         &comment_payload,
@@ -768,7 +768,9 @@ async fn notify_milestone_closed(
         "id": milestone_id,
         "repo_id": repo_id,
     });
-    if let Err(e) = crate::webhook::service::trigger_milestone_closed(db, repo_id, &payload).await {
+    if let Err(e) =
+        crate::webhook::service::trigger_milestone_closed(&pools, repo_id, &payload).await
+    {
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger milestone.closed webhook");
     }
 

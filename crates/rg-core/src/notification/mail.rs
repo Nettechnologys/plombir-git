@@ -20,8 +20,8 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::db::DbPools;
 use anyhow::Result;
-use sea_orm::DatabaseConnection;
 
 use rg_db::entities::notification::Model as Notification;
 use rg_db::ops::{notification_ops, notification_setting_ops};
@@ -118,10 +118,11 @@ pub fn compose(rows: &[Notification], base_url: Option<&str>) -> Digest {
 /// One pass: send every recipient the mail their pending rows add up to.
 /// Returns how many mails went out.
 pub async fn deliver_pending(
-    db: &DatabaseConnection,
+    pools: &impl DbPools,
     outbox: &dyn Outbox,
     base_url: Option<&str>,
 ) -> Result<usize> {
+    let db = pools.read();
     let rows = notification_ops::list_email_pending(db, PASS_LIMIT).await?;
     let mut sent = 0;
     let mut start = 0;
@@ -163,7 +164,7 @@ pub async fn deliver_pending(
                 ),
             }
         }
-        notification_ops::clear_email_pending(db, &ids).await?;
+        notification_ops::clear_email_pending(pools.write(), &ids).await?;
     }
     Ok(sent)
 }
@@ -171,7 +172,7 @@ pub async fn deliver_pending(
 /// Run the dispatcher until `shutdown` fires: a pass [`BATCH_WINDOW`] after a
 /// wake-up, and one every [`IDLE_PASS`] regardless.
 pub fn spawn_dispatcher(
-    db: DatabaseConnection,
+    db: crate::db::Db,
     smtp: crate::email::SmtpConfig,
     base_url: Option<String>,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,

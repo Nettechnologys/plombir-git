@@ -405,7 +405,12 @@ pub async fn redeliver(
         return e.into_response();
     }
 
-    match rg_core::webhook::service::redeliver(&state.db, delivery_id).await {
+    match rg_core::webhook::service::redeliver(
+        &rg_core::db::Db::new(state.db.clone(), state.db_write.clone()),
+        delivery_id,
+    )
+    .await
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"message": "redelivery triggered"})),

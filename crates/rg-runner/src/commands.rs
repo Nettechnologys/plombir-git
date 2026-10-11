@@ -45,6 +45,82 @@ fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+#[cfg(test)]
+mod shared_docker_daemon_tests {
+    use super::remove_job_container;
+    use crate::executor::{job_container_name, run_job_docker};
+    use std::time::Duration;
+
+    async fn is_running(name: &str) -> bool {
+        let output = tokio::process::Command::new("docker")
+            .args(["inspect", "--format", "{{.State.Running}}", name])
+            .output()
+            .await
+            .expect("inspect Docker container");
+        output.status.success() && output.stdout == b"true\n"
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a shared Docker daemon with the ubuntu:24.04 image"]
+    async fn stopping_one_same_id_job_leaves_the_other_runner_container_alive() {
+        let workspace = tempfile::tempdir().expect("runner workspace");
+        let first_name = job_container_name(42);
+        let second_name = job_container_name(42);
+        assert_ne!(first_name, second_name);
+
+        let first_path = workspace.path().to_path_buf();
+        let first_container = first_name.clone();
+        let first = tokio::spawn(async move {
+            run_job_docker(
+                "ubuntu:24.04",
+                "sleep 20",
+                &[],
+                &first_path,
+                &first_container,
+            )
+            .await
+        });
+        let second_path = workspace.path().to_path_buf();
+        let second_container = second_name.clone();
+        let second = tokio::spawn(async move {
+            run_job_docker(
+                "ubuntu:24.04",
+                "sleep 20",
+                &[],
+                &second_path,
+                &second_container,
+            )
+            .await
+        });
+
+        let both_started = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if is_running(&first_name).await && is_running(&second_name).await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let second_survived = if both_started {
+            remove_job_container(&first_name).await;
+            is_running(&second_name).await
+        } else {
+            false
+        };
+        remove_job_container(&first_name).await;
+        remove_job_container(&second_name).await;
+        let first_result = first.await.expect("first runner joins");
+        let second_result = second.await.expect("second runner joins");
+        assert!(both_started, "both same-id jobs must start on the shared daemon: {first_result:?}, {second_result:?}");
+        assert!(
+            second_survived,
+            "stopping the first runner removed the second container"
+        );
+    }
+}
+
 /// Bounds of the job deadline the server may hand out, mirroring
 /// `rg_core::ci::JOB_TIMEOUT_{MIN,MAX}_SECS`. Duplicated rather than imported:
 /// the agent is a standalone binary that talks to the server over HTTP only and
@@ -584,33 +660,33 @@ const CONTAINER_REMOVAL_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// be removed by name. Never fails the caller — there is nothing left to abort —
 /// but the failure is named, because what it leaves behind is a container that
 /// keeps holding CPU, memory and the job's workspace mount.
-async fn remove_job_container(job_id: i64) {
+async fn remove_job_container(container_name: &str) {
     let removal = tokio::process::Command::new("docker")
-        .args(["rm", "-f", &job_container_name(job_id)])
+        .args(["rm", "-f", container_name])
         .output();
     match tokio::time::timeout(CONTAINER_REMOVAL_TIMEOUT, removal).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
-            tracing::warn!(job_id, %error, "failed to remove the job's docker container")
+            tracing::warn!(container_name, %error, "failed to remove the job's docker container")
         }
         Err(_) => tracing::warn!(
-            job_id,
+            container_name,
             "`docker rm` did not answer within {CONTAINER_REMOVAL_TIMEOUT:?}; the job's container \
              may still be running"
         ),
     }
 }
 
-/// The job id whose container is running right now, or `None`.
-type LiveContainer = std::sync::Mutex<Option<i64>>;
+/// The exact name of the running job container, or `None`.
+type LiveContainer = std::sync::Mutex<Option<String>>;
 
-fn remember_live_container(slot: &LiveContainer, job_id: i64) {
+fn remember_live_container(slot: &LiveContainer, container_name: String) {
     *slot
         .lock()
-        .expect("the live-container slot is not poisoned") = Some(job_id);
+        .expect("the live-container slot is not poisoned") = Some(container_name);
 }
 
-fn forget_live_container(slot: &LiveContainer) -> Option<i64> {
+fn forget_live_container(slot: &LiveContainer) -> Option<String> {
     slot.lock()
         .expect("the live-container slot is not poisoned")
         .take()
@@ -862,13 +938,22 @@ pub async fn run_jobs_until_shutdown_checking_every(
                     // is not `-d`, but dropping this process's docker client does not
                     // stop what it started, so an interrupted container has to be
                     // removed by name.
-                    if job.image.is_some() {
-                        remember_live_container(live_container, job.job_id);
+                    let container_name = job.image.as_ref().map(|_| job_container_name(job.job_id));
+                    if let Some(name) = &container_name {
+                        remember_live_container(live_container, name.clone());
                     }
                     let execution = async {
                         if let Some(img) = &job.image {
-                            run_job_docker(img, &script_str, &variables, &workspace, job.job_id)
-                                .await
+                            run_job_docker(
+                                img,
+                                &script_str,
+                                &variables,
+                                &workspace,
+                                container_name
+                                    .as_deref()
+                                    .expect("docker job has a container name"),
+                            )
+                            .await
                         } else {
                             run_job_local(&script_str, &variables, &workspace).await
                         }
@@ -883,8 +968,8 @@ pub async fn run_jobs_until_shutdown_checking_every(
                         {
                             Ok(result) => result,
                             Err(_) => {
-                                if job.image.is_some() {
-                                    remove_job_container(job.job_id).await;
+                                if let Some(name) = &container_name {
+                                    remove_job_container(name).await;
                                 }
                                 (-1, format!("Job timed out after {timeout_seconds} seconds"))
                             }
@@ -917,8 +1002,8 @@ pub async fn run_jobs_until_shutdown_checking_every(
                     let Some((exit_code, log)) = owned else {
                         // Dropping the execution killed a local job's process
                         // tree; a container is daemon-owned and goes by name.
-                        if job.image.is_some() {
-                            remove_job_container(job.job_id).await;
+                        if let Some(name) = &container_name {
+                            remove_job_container(name).await;
                         }
                         // The server already settled the job, so this report
                         // is answered `409` — and the same transaction puts
@@ -1030,8 +1115,8 @@ pub async fn run_jobs_until_shutdown_checking_every(
     }
 
     heartbeat.abort();
-    if let Some(job_id) = forget_live_container(live_container) {
-        remove_job_container(job_id).await;
+    if let Some(container_name) = forget_live_container(live_container) {
+        remove_job_container(&container_name).await;
     }
     println!("Runner {runner_id} stopping — handing its work back to the server");
     deregister_runner(&client, server, runner_id, token).await;

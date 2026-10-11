@@ -442,7 +442,7 @@ pub async fn delete_webhook(db: &DatabaseConnection, id: i64) -> Result<bool> {
 
 /// Trigger a webhook event: find matching webhooks and deliver payloads.
 pub async fn trigger_event(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     event: &str,
     payload: &Value,
@@ -458,13 +458,13 @@ pub async fn trigger_event(
 }
 
 pub(crate) async fn trigger_event_with_tracker(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     event: &str,
     payload: &Value,
     delivery_tracker: &crate::task_tracker::TaskTracker,
 ) -> Result<()> {
-    let hooks = webhook_ops::list_active_by_repo_and_event(db, repo_id, event).await?;
+    let hooks = webhook_ops::list_active_by_repo_and_event(db.read(), repo_id, event).await?;
     let payload = serde_json::to_string(payload).context("serialize webhook payload")?;
 
     // The query narrowed by substring; membership is decided here.
@@ -491,7 +491,7 @@ pub(crate) async fn trigger_event_with_tracker(
 /// replay back through [`trigger_event`] would send it to every current
 /// subscriber and would skip the original hook when it is inactive.
 fn spawn_delivery(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     hook: webhook::Model,
     event: String,
     payload: String,
@@ -501,7 +501,7 @@ fn spawn_delivery(
     // the shared delivery tracker (not a bare `tokio::spawn`) so graceful
     // shutdown can await the outbound POST + `webhook_delivery` row write
     // instead of severing it mid-flight on SIGTERM.
-    let db = db.clone();
+    let db = db.write().clone();
     let hook_id = hook.id;
     let url = hook.url;
     let content_type = hook.content_type;
@@ -625,20 +625,20 @@ pub async fn get_delivery(
 }
 
 /// Redeliver a webhook (re-post the original payload).
-pub async fn redeliver(db: &DatabaseConnection, delivery_id: i64) -> Result<()> {
+pub async fn redeliver(db: &impl crate::db::DbPools, delivery_id: i64) -> Result<()> {
     redeliver_with_tracker(db, delivery_id, crate::task_tracker::delivery_tracker()).await
 }
 
 async fn redeliver_with_tracker(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     delivery_id: i64,
     delivery_tracker: &crate::task_tracker::TaskTracker,
 ) -> Result<()> {
-    let delivery = webhook_ops::find_delivery_by_id(db, delivery_id)
+    let delivery = webhook_ops::find_delivery_by_id(db.read(), delivery_id)
         .await?
         .ok_or_else(|| crate::error::not_found("webhook delivery"))?;
 
-    let hook = webhook_ops::find_by_id(db, delivery.webhook_id)
+    let hook = webhook_ops::find_by_id(db.read(), delivery.webhook_id)
         .await?
         .ok_or_else(|| crate::error::not_found("webhook"))?;
 
@@ -670,7 +670,7 @@ async fn redeliver_with_tracker(
 
 /// Trigger a release.created webhook event.
 pub async fn trigger_release_created(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     release: &Value,
 ) -> Result<()> {
@@ -683,7 +683,7 @@ pub async fn trigger_release_created(
 
 /// Trigger a release.deleted webhook event.
 pub async fn trigger_release_deleted(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     release: &Value,
 ) -> Result<()> {
@@ -696,7 +696,7 @@ pub async fn trigger_release_deleted(
 
 /// Trigger an issue.opened webhook event.
 pub async fn trigger_issue_opened(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     issue: &Value,
 ) -> Result<()> {
@@ -709,7 +709,7 @@ pub async fn trigger_issue_opened(
 
 /// Trigger an issue.closed webhook event.
 pub async fn trigger_issue_closed(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     issue: &Value,
 ) -> Result<()> {
@@ -722,7 +722,7 @@ pub async fn trigger_issue_closed(
 
 /// Trigger an issue.comment webhook event.
 pub async fn trigger_issue_comment(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     issue: &Value,
     comment: &Value,
@@ -736,7 +736,11 @@ pub async fn trigger_issue_comment(
 }
 
 /// Trigger a pull_request.opened webhook event.
-pub async fn trigger_pr_opened(db: &DatabaseConnection, repo_id: i64, pr: &Value) -> Result<()> {
+pub async fn trigger_pr_opened(
+    db: &impl crate::db::DbPools,
+    repo_id: i64,
+    pr: &Value,
+) -> Result<()> {
     let payload = serde_json::json!({
         "event": "pull_request.opened",
         "pull_request": pr,
@@ -745,7 +749,11 @@ pub async fn trigger_pr_opened(db: &DatabaseConnection, repo_id: i64, pr: &Value
 }
 
 /// Trigger a pull_request.closed webhook event.
-pub async fn trigger_pr_closed(db: &DatabaseConnection, repo_id: i64, pr: &Value) -> Result<()> {
+pub async fn trigger_pr_closed(
+    db: &impl crate::db::DbPools,
+    repo_id: i64,
+    pr: &Value,
+) -> Result<()> {
     let payload = serde_json::json!({
         "event": "pull_request.closed",
         "pull_request": pr,
@@ -754,7 +762,11 @@ pub async fn trigger_pr_closed(db: &DatabaseConnection, repo_id: i64, pr: &Value
 }
 
 /// Trigger a pull_request.merged webhook event.
-pub async fn trigger_pr_merged(db: &DatabaseConnection, repo_id: i64, pr: &Value) -> Result<()> {
+pub async fn trigger_pr_merged(
+    db: &impl crate::db::DbPools,
+    repo_id: i64,
+    pr: &Value,
+) -> Result<()> {
     let payload = serde_json::json!({
         "event": "pull_request.merged",
         "pull_request": pr,
@@ -764,7 +776,7 @@ pub async fn trigger_pr_merged(db: &DatabaseConnection, repo_id: i64, pr: &Value
 
 /// Trigger a milestone.closed webhook event.
 pub async fn trigger_milestone_closed(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     milestone: &Value,
 ) -> Result<()> {

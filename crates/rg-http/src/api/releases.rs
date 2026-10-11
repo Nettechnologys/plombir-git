@@ -275,7 +275,7 @@ pub async fn create_release(
         .filter(|target| !target.is_empty())
         .unwrap_or_else(|| repo.default_branch.clone());
     match rg_core::release::service::publish_release(
-        &state.db,
+        &rg_core::db::Db::new(state.db.clone(), state.db_write.clone()),
         &repo_path,
         repo.id,
         user_id,
@@ -425,7 +425,7 @@ pub async fn delete_release(
     };
 
     match rg_core::release::service::delete_release(
-        &state.db,
+        &rg_core::db::Db::new(state.db.clone(), state.db_write.clone()),
         release.id,
         state.blob_storage.as_ref(),
         &state.repo_root,

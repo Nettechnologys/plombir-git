@@ -756,45 +756,50 @@ async fn adopt_unborn_head(
     let path = target.path.clone();
     let default_branch = target.default_branch.clone();
     let updates = ref_updates.to_vec();
-    let branch = match crate::blocking::run_blocking_git("adopt first pushed branch", move || {
-        let advertisement = rg_git::ref_advertisement::collect(&path)
-            .with_context(|| format!("could not read HEAD at {}", path.display()))?;
+    let db = params.db.clone();
+    let repo_id = target.repo_id;
+    let branch = match crate::repo::service::adopt_unborn_default_branch_with(
+        path,
+        move |path| {
+            let advertisement = rg_git::ref_advertisement::collect(path)
+                .with_context(|| format!("could not read HEAD at {}", path.display()))?;
 
-        // A readable HEAD with a commit must never be repointed by a feature push.
-        if advertisement.head_oid.is_some() {
-            return Ok(None);
-        }
+            // A readable HEAD with a commit must never be repointed by a feature push.
+            if advertisement.head_oid.is_some() {
+                return Ok(None);
+            }
 
-        // Ignore a branch created and deleted in the same push.
-        let created: Vec<&str> = updates
-            .iter()
-            .filter(|update| update.status == "ok")
-            .filter(|update| !update.new_sha.chars().all(|c| c == '0'))
-            .filter_map(|update| update.refname.strip_prefix("refs/heads/"))
-            .filter(|branch| {
-                advertisement
-                    .refs
-                    .iter()
-                    .any(|(_, refname)| refname == &format!("refs/heads/{branch}"))
-            })
-            .collect();
+            // Ignore a branch created and deleted in the same push.
+            let created: Vec<&str> = updates
+                .iter()
+                .filter(|update| update.status == "ok")
+                .filter(|update| !update.new_sha.chars().all(|c| c == '0'))
+                .filter_map(|update| update.refname.strip_prefix("refs/heads/"))
+                .filter(|branch| {
+                    advertisement
+                        .refs
+                        .iter()
+                        .any(|(_, refname)| refname == &format!("refs/heads/{branch}"))
+                })
+                .collect();
 
-        let branch = created
-            .iter()
-            .find(|branch| **branch == default_branch)
-            .or_else(|| created.iter().find(|branch| **branch == "main"))
-            .or_else(|| created.iter().find(|branch| **branch == "master"))
-            .or_else(|| created.first())
-            .copied();
-        let Some(branch) = branch else {
-            return Ok(None);
-        };
+            let branch = created
+                .iter()
+                .find(|branch| **branch == default_branch)
+                .or_else(|| created.iter().find(|branch| **branch == "main"))
+                .or_else(|| created.iter().find(|branch| **branch == "master"))
+                .or_else(|| created.first())
+                .copied();
+            let Some(branch) = branch else {
+                return Ok(None);
+            };
 
-        let repo = rg_git::repository::open(&path)
-            .with_context(|| format!("could not open repository at {}", path.display()))?;
-        crate::repo::service::set_bare_repo_head_to_branch(&repo, branch)?;
-        Ok(Some(branch.to_string()))
-    })
+            Ok(Some(branch.to_string()))
+        },
+        move |branch| async move {
+            rg_db::ops::repo_ops::set_default_branch(&db, repo_id, &branch).await
+        },
+    )
     .await
     {
         Ok(branch) => branch?,
@@ -809,31 +814,6 @@ async fn adopt_unborn_head(
             return None;
         }
     };
-
-    // The row is written only after Git accepted the move, so the two can
-    // disagree in one direction only: a stale row next to a correct HEAD, which
-    // the next push retries. The reverse — a row naming a branch HEAD does not
-    // resolve — is the state `set_default_branch` was written for
-    // (card_0e4d6e7fcdb2).
-    if branch != target.default_branch {
-        match rg_db::ops::repo_ops::set_default_branch(params.db, target.repo_id, &branch).await {
-            Ok(true) => {}
-            // The repository was deleted while the push ran; there is no row to
-            // correct and the hooks below will find the same.
-            Ok(false) => return None,
-            Err(error) => {
-                tracing::warn!(
-                    repo_id = target.repo_id,
-                    from = %target.default_branch,
-                    to = branch,
-                    error = %format!("{error:#}"),
-                    "Post-push: HEAD now names the pushed branch but the repository row still \
-                     names the branch it was created with"
-                );
-                return None;
-            }
-        }
-    }
 
     tracing::info!(
         repo_id = target.repo_id,
@@ -1420,6 +1400,10 @@ async fn trigger_push_webhooks(
     update: &RefUpdate,
 ) {
     let repo_id = target.repo_id;
+    let webhook_db = crate::db::Db::new(
+        params.db.clone(),
+        params.write_pool.unwrap_or(params.db).clone(),
+    );
     // 2. Trigger push webhook
     let payload = serde_json::json!({
         "ref": update.refname,
@@ -1432,7 +1416,7 @@ async fn trigger_push_webhooks(
     });
 
     if let Err(e) = crate::webhook::service::trigger_event_with_tracker(
-        params.db,
+        &webhook_db,
         repo_id,
         "push",
         &payload,
@@ -1454,7 +1438,7 @@ async fn trigger_push_webhooks(
                 "ref_type": "branch",
             });
             if let Err(e) = crate::webhook::service::trigger_event_with_tracker(
-                params.db,
+                &webhook_db,
                 repo_id,
                 "branch.created",
                 &payload,
@@ -1478,7 +1462,7 @@ async fn trigger_push_webhooks(
                 "ref_type": "branch",
             });
             if let Err(e) = crate::webhook::service::trigger_event_with_tracker(
-                params.db,
+                &webhook_db,
                 repo_id,
                 "branch.deleted",
                 &payload,
@@ -1502,7 +1486,7 @@ async fn trigger_push_webhooks(
                 "ref_type": "tag",
             });
             if let Err(e) = crate::webhook::service::trigger_event_with_tracker(
-                params.db,
+                &webhook_db,
                 repo_id,
                 "tag.created",
                 &payload,
@@ -1527,7 +1511,7 @@ async fn trigger_push_webhooks(
                 "ref_type": "tag",
             });
             if let Err(e) = crate::webhook::service::trigger_event_with_tracker(
-                params.db,
+                &webhook_db,
                 repo_id,
                 "tag.deleted",
                 &payload,

@@ -67,6 +67,7 @@ const CLASSIFIED_MOVERS = new Map(
     ['crates/rg-core/src/repo/service.rs', 'auto_init_repo', 'git:push', 'repository_initialization'],
     ['crates/rg-core/src/repo/service.rs', 'push_branch_with_lease', 'git:push', 'leased_server_side_publish'],
     ['crates/rg-core/src/repo/service.rs', 'set_bare_repo_head_to_branch', 'gix:edit_reference', 'head_metadata'],
+    ['crates/rg-core/src/repo/service.rs', 'adopt_unborn_default_branch_with', 'git:symbolic-ref', 'locked_head_adoption'],
     ['crates/rg-core/src/repo/service.rs', 'fork_repo', 'git:clone', 'repository_creation'],
     ['crates/rg-core/src/repo/service.rs', 'create_or_update_file', 'git:clone', 'scratch_clone'],
     ['crates/rg-core/src/repo/service.rs', 'update_files_in_commit', 'git:clone', 'scratch_clone'],
@@ -84,7 +85,6 @@ const CLASSIFIED_MOVERS = new Map(
     ['crates/rg-core/src/pull_request/merge_queue.rs', 'publish', 'git:update-ref', 'internal_merge_queue_ref'],
     ['crates/rg-core/src/pull_request/merge_queue.rs', 'drop', 'git:update-ref', 'internal_merge_queue_ref'],
     ['crates/rg-core/src/mirror/service.rs', 'publish_mirrored_refs', 'git:fetch', 'pull_mirror_publication'],
-    ['crates/rg-core/src/mirror/service.rs', 'adoptable_head', 'git:symbolic-ref', 'head_metadata'],
     ['crates/rg-core/src/mirror/service.rs', 'run_git_clone_mirror', 'git:clone', 'mirror_private_clone'],
     ['crates/rg-core/src/mirror/service.rs', 'run_git_remote_update', 'git:remote', 'mirror_private_clone'],
     ['crates/rg-core/src/import/service.rs', 'clone_repo', 'git:clone', 'repository_creation'],
@@ -285,6 +285,16 @@ for (const mover of movers) {
     }
     if (!mover.body.includes('validate_edit_branch')) {
       failures.push(`${mover.file}:${mover.symbol} publishes a branch without validating its name.`);
+    }
+  }
+
+  if (classification.policy === 'locked_head_adoption') {
+    if (!mover.body.includes('lock_default_branch(&repo_path)')) {
+      failures.push(`${where} moves HEAD without the shared default-branch lock.`);
+    }
+    if (!mover.body.includes('write_row(branch.clone())') ||
+        !mover.body.includes('restore unborn repository HEAD')) {
+      failures.push(`${where} does not keep row publication and HEAD compensation inside the lock.`);
     }
   }
 }

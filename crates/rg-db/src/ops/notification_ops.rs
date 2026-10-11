@@ -402,7 +402,8 @@ pub async fn delete_for_subject(
 /// [`crate::ops::webhook_ops::delete_deliveries_before`]. The caller bounds
 /// `limit`.
 pub async fn delete_stale(
-    db: &DatabaseConnection,
+    db_read: &DatabaseConnection,
+    db_write: &DatabaseConnection,
     read_before: chrono::DateTime<chrono::Utc>,
     unread_before: chrono::DateTime<chrono::Utc>,
     limit: u64,
@@ -438,7 +439,7 @@ pub async fn delete_stale(
         .order_by_asc(Column::Id)
         .limit(limit)
         .into_tuple()
-        .all(db)
+        .all(db_read)
         .await
         .context("db: list stale notifications")?;
     if ids.is_empty() {
@@ -449,7 +450,7 @@ pub async fn delete_stale(
         // Re-checked at delete time: a row read for this batch may have been
         // folded into by a new event, or picked up a pending mail, since.
         .filter(stale())
-        .exec(db)
+        .exec(db_write)
         .await
         .context("db: delete stale notifications")?;
     Ok(result.rows_affected)

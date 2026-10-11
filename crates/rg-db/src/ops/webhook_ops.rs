@@ -167,7 +167,8 @@ pub async fn find_delivery_by_id(
 /// the whole backlog (and MySQL refuses `LIMIT` inside an `IN` subquery). The
 /// caller bounds `limit`.
 pub async fn delete_deliveries_before(
-    db: &DatabaseConnection,
+    db_read: &DatabaseConnection,
+    db_write: &DatabaseConnection,
     cutoff: chrono::DateTime<chrono::Utc>,
     limit: u64,
 ) -> Result<u64> {
@@ -180,7 +181,7 @@ pub async fn delete_deliveries_before(
         .order_by_asc(Column::Id)
         .limit(limit)
         .into_tuple()
-        .all(db)
+        .all(db_read)
         .await
         .context("db: list expired webhook deliveries")?;
     if ids.is_empty() {
@@ -188,7 +189,7 @@ pub async fn delete_deliveries_before(
     }
     let result = DeliveryEntity::delete_many()
         .filter(Column::Id.is_in(ids))
-        .exec(db)
+        .exec(db_write)
         .await
         .context("db: delete expired webhook deliveries")?;
     Ok(result.rows_affected)

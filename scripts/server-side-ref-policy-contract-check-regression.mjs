@@ -61,6 +61,15 @@ try {
 
   const repoService = path.join(fixture, 'crates/rg-core/src/repo/service.rs');
   const cleanRepoService = readFileSync(repoService, 'utf8');
+  writeFileSync(
+    repoService,
+    cleanRepoService.replace(
+      'let _lock = lock_default_branch(&repo_path).await?;',
+      'let _lock = ();',
+    ),
+  );
+  expectRed('unlocked HEAD adoption mutation', 'without the shared default-branch lock');
+  writeFileSync(repoService, cleanRepoService);
   appendFileSync(
     repoService,
     '\nfn unclassified_ref_writer(git: &rg_git::cli_gateway::GitCommandGateway) {\n' +

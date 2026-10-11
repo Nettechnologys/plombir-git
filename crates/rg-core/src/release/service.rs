@@ -13,12 +13,13 @@ use rg_db::{
 };
 
 use crate::blob_storage::{BlobKey, BlobStorage};
+use crate::db::DbPools;
 use crate::deletion_recovery;
 
 /// Create a new release.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_release(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_id: i64,
     author_id: i64,
     tag_name: &str,
@@ -29,6 +30,8 @@ pub async fn create_release(
     is_prerelease: bool,
     _repo_path: &std::path::Path,
 ) -> Result<Release> {
+    let pools = db.owned();
+    let db = pools.read();
     // Validate inputs
     if tag_name.is_empty() {
         return Err(crate::error::invalid_request("tag_name cannot be empty"));
@@ -93,7 +96,9 @@ pub async fn create_release(
         "is_prerelease": release.is_prerelease,
         "author_id": release.author_id,
     });
-    if let Err(e) = crate::webhook::service::trigger_release_created(db, repo_id, &payload).await {
+    if let Err(e) =
+        crate::webhook::service::trigger_release_created(&pools, repo_id, &payload).await
+    {
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger release.created webhook");
     }
 
@@ -158,7 +163,7 @@ pub async fn ensure_release_tag(
 /// back for the caller's post-push hooks (`tag.created`, CI on tags).
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_release(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     repo_path: &Path,
     repo_id: i64,
     author_id: i64,
@@ -169,6 +174,8 @@ pub async fn publish_release(
     is_draft: bool,
     is_prerelease: bool,
 ) -> Result<(Release, Option<rg_git::protocol::receive_pack::RefUpdate>)> {
+    let pools = db.owned();
+    let db = pools.read();
     if tag_name.is_empty() {
         return Err(crate::error::invalid_request("tag_name cannot be empty"));
     }
@@ -218,7 +225,7 @@ pub async fn publish_release(
     };
 
     match create_release(
-        db,
+        &pools,
         repo_id,
         author_id,
         tag_name,
@@ -616,13 +623,15 @@ fn legacy_asset_staging(
 /// Delete a release and every asset representation it owns.
 #[allow(clippy::too_many_arguments)]
 pub async fn delete_release(
-    db: &DatabaseConnection,
+    db: &impl crate::db::DbPools,
     id: i64,
     storage: &dyn BlobStorage,
     repo_root: &Path,
     owner: &str,
     repo_name: &str,
 ) -> Result<()> {
+    let pools = db.owned();
+    let db = pools.read();
     // Get release info for webhook before deleting
     let release = rg_db::ops::release_ops::find_by_id(db, id)
         .await?
@@ -669,7 +678,9 @@ pub async fn delete_release(
         "tag_name": release.tag_name,
         "title": release.title,
     });
-    if let Err(e) = crate::webhook::service::trigger_release_deleted(db, repo_id, &payload).await {
+    if let Err(e) =
+        crate::webhook::service::trigger_release_deleted(&pools, repo_id, &payload).await
+    {
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger release.deleted webhook");
     }
 

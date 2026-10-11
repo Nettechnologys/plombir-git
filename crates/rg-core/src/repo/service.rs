@@ -3297,20 +3297,9 @@ pub struct RepoSettingsChange {
 /// own the only code that can put HEAD back after a failed write. The OS lock
 /// serializes this cross-store operation across server processes, including
 /// the fresh row read and a failed writer's compensation.
-async fn change_default_branch_with<R, RFut, W, WFut>(
-    repo_path: std::path::PathBuf,
-    branch: String,
-    read_row: R,
-    write_row: W,
-) -> Result<()>
-where
-    R: FnOnce() -> RFut,
-    RFut: std::future::Future<Output = Result<String>>,
-    W: FnOnce(String) -> WFut,
-    WFut: std::future::Future<Output = Result<bool>>,
-{
+async fn lock_default_branch(repo_path: &std::path::Path) -> Result<std::fs::File> {
     let lock_path = repo_path.join("forgekeep-default-branch.lock");
-    let _lock = crate::blocking::run_blocking_git("lock repository default branch", move || {
+    crate::blocking::run_blocking_git("lock repository default branch", move || {
         use std::fs::OpenOptions;
 
         let file = OpenOptions::new()
@@ -3324,7 +3313,85 @@ where
             .with_context(|| format!("lock repository default branch: {lock_path:?}"))?;
         Ok(file)
     })
-    .await?;
+    .await
+}
+
+/// Adopt an unborn HEAD under the same process-wide lock as settings changes.
+/// The task owns the lock, Git move, row write and compensation even if the
+/// request that noticed the first branch disappears while the row is waiting.
+pub(crate) async fn adopt_unborn_default_branch_with<C, W, WFut>(
+    repo_path: std::path::PathBuf,
+    choose: C,
+    write_row: W,
+) -> Result<Option<String>>
+where
+    C: FnOnce(&std::path::Path) -> Result<Option<String>> + Send + 'static,
+    W: FnOnce(String) -> WFut + Send + 'static,
+    WFut: std::future::Future<Output = Result<bool>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _lock = lock_default_branch(&repo_path).await?;
+        let path = repo_path.clone();
+        let adoption = crate::blocking::run_blocking_git("adopt unborn repository HEAD", move || {
+            let Some(branch) = choose(&path)? else {
+                return Ok(None);
+            };
+            let previous = rg_git::ref_advertisement::collect(&path)?
+                .head_target
+                .context("unborn repository HEAD has no symbolic target")?;
+            let git = rg_git::repository::open(&path)
+                .with_context(|| format!("could not open repository at {}", path.display()))?;
+            set_bare_repo_head_to_branch(&git, &branch)?;
+            Ok(Some((branch, previous)))
+        })
+        .await?;
+        let Some((branch, previous)) = adoption else {
+            return Ok(None);
+        };
+        match write_row(branch.clone()).await {
+            Ok(true) => Ok(Some(branch)),
+            outcome => {
+                let path = repo_path.clone();
+                if let Err(error) = crate::blocking::run_blocking_git(
+                    "restore unborn repository HEAD",
+                    move || {
+                        let git = rg_git::cli_gateway::global_gateway()
+                            .as_ref()
+                            .map_err(|error| anyhow::anyhow!("{error}"))?;
+                        git.run(&["symbolic-ref", "HEAD", &previous], Some(&path))?
+                            .ensure_success()?;
+                        Ok(())
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(error = %format!("{error:#}"), "could not restore unborn HEAD after row write failed");
+                }
+                match outcome {
+                    Ok(false) => Err(crate::error::not_found("repository")),
+                    Err(error) => Err(error),
+                    Ok(true) => unreachable!(),
+                }
+            }
+        }
+    })
+    .await
+    .context("unborn HEAD adoption task failed")?
+}
+
+async fn change_default_branch_with<R, RFut, W, WFut>(
+    repo_path: std::path::PathBuf,
+    branch: String,
+    read_row: R,
+    write_row: W,
+) -> Result<()>
+where
+    R: FnOnce() -> RFut,
+    RFut: std::future::Future<Output = Result<String>>,
+    W: FnOnce(String) -> WFut,
+    WFut: std::future::Future<Output = Result<bool>>,
+{
+    let _lock = lock_default_branch(&repo_path).await?;
 
     // The request's repository model predates the lock. A second settings
     // change may have completed while this task waited to acquire it.
@@ -3373,7 +3440,7 @@ where
 
 #[cfg(test)]
 mod default_branch_change_tests {
-    use super::change_default_branch_with;
+    use super::{adopt_unborn_default_branch_with, change_default_branch_with};
     use std::path::Path;
 
     fn git(args: &[&str], cwd: Option<&Path>) {
@@ -3548,6 +3615,210 @@ mod default_branch_change_tests {
             assert_eq!(head(&bare), "ref: refs/heads/release");
             assert_eq!(*row.lock().await, "release");
         }
+    }
+
+    #[tokio::test]
+    async fn first_push_adoption_and_settings_change_share_the_git_row_lock() {
+        use std::sync::Arc;
+
+        let (_temp, bare) = branches();
+        git(&["symbolic-ref", "HEAD", "refs/heads/unborn"], Some(&bare));
+        let row = Arc::new(tokio::sync::Mutex::new("unborn".to_string()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_row = row.clone();
+        let first = tokio::spawn(adopt_unborn_default_branch_with(
+            bare.clone(),
+            |_| Ok(Some("dev".to_string())),
+            move |branch| async move {
+                entered_tx.send(()).expect("adoption reached the row write");
+                release_rx.await.expect("release adoption");
+                *first_row.lock().await = branch;
+                Ok(true)
+            },
+        ));
+        entered_rx.await.expect("adoption moved HEAD");
+        assert_eq!(head(&bare), "ref: refs/heads/dev");
+        assert_eq!(*row.lock().await, "unborn");
+
+        let second_read = row.clone();
+        let second_write = row.clone();
+        let mut second = tokio::spawn(change_default_branch_with(
+            bare.clone(),
+            "release".into(),
+            move || async move { Ok(second_read.lock().await.clone()) },
+            move |branch| async move {
+                *second_write.lock().await = branch;
+                Ok(true)
+            },
+        ));
+        crate::test_support::assert_task_stays_blocked(
+            &mut second,
+            "settings changed HEAD before the first-push row write",
+        )
+        .await;
+        release_tx.send(()).expect("release adoption row write");
+        assert_eq!(
+            first
+                .await
+                .expect("adoption joins")
+                .expect("adoption succeeds"),
+            Some("dev".into())
+        );
+        second
+            .await
+            .expect("settings joins")
+            .expect("settings succeeds");
+        assert_eq!(head(&bare), "ref: refs/heads/release");
+        assert_eq!(*row.lock().await, "release");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_first_push_row_write_restores_the_unborn_head() {
+        let (_temp, bare) = branches();
+        git(&["symbolic-ref", "HEAD", "refs/heads/unborn"], Some(&bare));
+        let error = adopt_unborn_default_branch_with(
+            bare.clone(),
+            |_| Ok(Some("dev".to_string())),
+            |_| async { anyhow::bail!("row write failed") },
+        )
+        .await
+        .expect_err("row failure must propagate");
+        assert!(format!("{error:#}").contains("row write failed"));
+        assert_eq!(head(&bare), "ref: refs/heads/unborn");
+    }
+
+    async fn adoption_and_settings_with_database(db: sea_orm::DatabaseConnection) {
+        use sea_orm::{ConnectionTrait, TransactionTrait};
+        use std::time::Duration;
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            &format!("adopt{suffix}"),
+            &format!("adopt{suffix}@example.invalid"),
+            "unused",
+            "Owner",
+        )
+        .await
+        .expect("create owner");
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: sea_orm::Set(owner.id),
+                name: sea_orm::Set("adoption-race".into()),
+                is_private: sea_orm::Set(false),
+                default_branch: sea_orm::Set("unborn".into()),
+                stars_count: sea_orm::Set(0),
+                forks_count: sea_orm::Set(0),
+                created_at: sea_orm::Set(chrono::Utc::now()),
+                updated_at: sea_orm::Set(chrono::Utc::now()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create repository row");
+        let (_temp, bare) = branches();
+        git(&["symbolic-ref", "HEAD", "refs/heads/unborn"], Some(&bare));
+
+        let held = db.begin().await.expect("hold row writer");
+        held.execute(sea_orm::Statement::from_sql_and_values(
+            db.get_database_backend(),
+            rg_db::prepare_sql(
+                db.get_database_backend(),
+                "UPDATE repositories SET updated_at = updated_at WHERE id = ?",
+            ),
+            [repo.id.into()],
+        ))
+        .await
+        .expect("lock repository row");
+
+        let first_db = db.clone();
+        let repo_id = repo.id;
+        let first = tokio::spawn(adopt_unborn_default_branch_with(
+            bare.clone(),
+            |_| Ok(Some("dev".to_string())),
+            move |branch| async move {
+                rg_db::ops::repo_ops::set_default_branch(&first_db, repo_id, &branch).await
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while head(&bare) != "ref: refs/heads/dev" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("adoption reaches the blocked row write");
+
+        let second_db = db.clone();
+        let second_path = bare.clone();
+        let second_repo = repo.clone();
+        let mut second = tokio::spawn(async move {
+            super::update_repo_settings(
+                &second_db,
+                &second_path,
+                &second_repo,
+                super::RepoSettingsChange {
+                    default_branch: Some("release".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        crate::test_support::assert_task_stays_blocked(
+            &mut second,
+            "settings changed HEAD before the first-push row write",
+        )
+        .await;
+        held.rollback().await.expect("release row lock");
+        assert_eq!(
+            first
+                .await
+                .expect("adoption joins")
+                .expect("adoption succeeds"),
+            Some("dev".into())
+        );
+        second
+            .await
+            .expect("settings joins")
+            .expect("settings succeeds");
+        assert_eq!(head(&bare), "ref: refs/heads/release");
+        assert_eq!(
+            rg_db::ops::repo_ops::find_by_id(&db, repo.id)
+                .await
+                .expect("read row")
+                .expect("row exists")
+                .default_branch,
+            "release"
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_and_settings_serialize_on_sqlite() {
+        let temp = tempfile::tempdir().expect("temporary database directory");
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("test.db").display()
+        );
+        let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 3)
+            .await
+            .expect("connect SQLite");
+        rg_db::run_migrations(&db).await.expect("migrate SQLite");
+        adoption_and_settings_with_database(db).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+    async fn adoption_and_settings_serialize_on_server_database() {
+        let url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+            .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+        let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 3)
+            .await
+            .expect("connect server database");
+        rg_db::run_migrations(&db)
+            .await
+            .expect("migrate server database");
+        adoption_and_settings_with_database(db).await;
     }
 }
 

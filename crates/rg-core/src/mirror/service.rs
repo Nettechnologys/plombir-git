@@ -895,7 +895,8 @@ async fn publish_mirrored_refs(
     let (owner, name) = crate::repo::service::repository_identity(db, repo_id).await?;
     let served = repo_root.join(&owner).join(format!("{name}.git"));
     let clone = clone.to_path_buf();
-    let (adopt, updates) = crate::blocking::run_blocking_git("mirror ref publication", move || {
+    let adoption_clone = clone.clone();
+    let updates = crate::blocking::run_blocking_git("mirror ref publication", move || {
         let git = global_gateway()
             .as_ref()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -914,21 +915,22 @@ async fn publish_mirrored_refs(
         .ensure_success()
         .with_context(|| format!("git fetch from the mirror clone into {}", served.display()))?;
         let after = published_refs(git, &served)?;
-        Ok((
-            adoptable_head(&served, &clone)?,
-            moved_refs(&before, &after),
-        ))
+        Ok(moved_refs(&before, &after))
     })
     .await?;
 
-    if let Some(branch) = adopt {
-        if rg_db::ops::repo_ops::set_default_branch(db, repo_id, &branch).await? {
-            tracing::info!(
-                repo_id,
-                branch = %branch,
-                "a mirror pass pointed the repository's default branch at the upstream's"
-            );
-        }
+    let served = repo_root.join(&owner).join(format!("{name}.git"));
+    let write_db = db.clone();
+    if let Some(branch) = crate::repo::service::adopt_unborn_default_branch_with(
+        served,
+        move |path| adoptable_head(path, &adoption_clone),
+        move |branch| async move {
+            rg_db::ops::repo_ops::set_default_branch(&write_db, repo_id, &branch).await
+        },
+    )
+    .await?
+    {
+        tracing::info!(repo_id, branch = %branch, "a mirror pass adopted the upstream default branch");
     }
     Ok(PublishedRefs {
         owner,
@@ -990,8 +992,8 @@ fn moved_refs(
 /// The upstream's default branch, when the repository's own `HEAD` names a
 /// branch that does not exist and the upstream's does — the state of every
 /// repository right after its first pass, which was created with a default
-/// branch of its own choosing. `HEAD` is moved here; the column is the
-/// caller's.
+/// branch of its own choosing. The caller moves `HEAD` and the row under the
+/// shared default-branch lock.
 ///
 /// A `HEAD` that resolves is left alone: someone chose that branch, and it is
 /// one the upstream has.
@@ -1012,12 +1014,6 @@ fn adoptable_head(served: &Path, clone: &Path) -> Result<Option<String>> {
     if !served_refs.refs.iter().any(|(_, name)| *name == target) {
         return Ok(None);
     }
-    let git = global_gateway()
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    git.run(&["symbolic-ref", "HEAD", &target], Some(served))?
-        .ensure_success()
-        .context("git symbolic-ref HEAD")?;
     Ok(target.strip_prefix("refs/heads/").map(str::to_string))
 }
 

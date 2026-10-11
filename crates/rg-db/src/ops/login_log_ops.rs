@@ -82,7 +82,8 @@ pub async fn list_paginated(
 /// [`crate::ops::webhook_ops::delete_deliveries_before`]. The caller bounds
 /// `limit`.
 pub async fn delete_before(
-    db: &DatabaseConnection,
+    db_read: &DatabaseConnection,
+    db_write: &DatabaseConnection,
     cutoff: chrono::DateTime<chrono::Utc>,
     limit: u64,
 ) -> Result<u64, DbErr> {
@@ -94,14 +95,14 @@ pub async fn delete_before(
         .order_by_asc(login_log::Column::Id)
         .limit(limit)
         .into_tuple()
-        .all(db)
+        .all(db_read)
         .await?;
     if ids.is_empty() {
         return Ok(0);
     }
     let result = Entity::delete_many()
         .filter(login_log::Column::Id.is_in(ids))
-        .exec(db)
+        .exec(db_write)
         .await?;
     Ok(result.rows_affected)
 }

@@ -118,7 +118,7 @@ impl ForeignLock {
 ///
 /// So the transport creates the sink *outside* the timeout, hands it to the
 /// handler, and reads it on every path that came back without an outcome.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AppliedRefUpdates(std::sync::Arc<std::sync::Mutex<Vec<RefUpdate>>>);
 
 impl AppliedRefUpdates {
@@ -816,9 +816,12 @@ where
         if pack_follows {
             drain_pack(reader).await?;
         }
-        updates = check_and_write_refs(repo_path, updates, policy, None).await?;
+        updates = check_and_write_refs(repo_path, updates, policy, None, Some(applied)).await?;
     } else {
-        let incoming = IncomingObjects::new(repo_path)?;
+        let quarantine_repo = repo_path.to_path_buf();
+        let incoming = tokio::task::spawn_blocking(move || IncomingObjects::new(&quarantine_repo))
+            .await
+            .context("receive-pack quarantine setup did not complete")??;
         // Receive the incoming pack and index it into the repository.
         //
         // Two implementations exist behind a flag (default: the git CLI):
@@ -836,7 +839,8 @@ where
         } else {
             index_pack_via_git(repo_path, reader, &incoming).await?;
         }
-        updates = check_and_write_refs(repo_path, updates, policy, Some(&incoming)).await?;
+        updates =
+            check_and_write_refs(repo_path, updates, policy, Some(incoming), Some(applied)).await?;
     }
 
     // Point of no return crossed: the refs above are written and the caller's
@@ -844,11 +848,8 @@ where
     // write, the duplex drain — runs inside the transport's wall-clock budget,
     // and an elapsed budget drops this future instead of letting it return, so
     // the updates go into a sink that outlives the drop (card_ca431156e7df).
-    // No `.await` sits between the last `update_ref` and this call.
-    applied.record(&updates);
-    if updates.iter().any(|update| update.status == "ok") {
-        crate::maintenance::after_push(repo_path);
-    }
+    // The owned blocking publication records the applied updates before it
+    // completes, even if this request is cancelled while it is running.
 
     Ok(ReceivedPush {
         updates,
@@ -870,15 +871,17 @@ async fn check_and_write_refs(
     repo_path: &Path,
     mut updates: Vec<RefUpdate>,
     policy: &PushPolicy,
-    incoming: Option<&IncomingObjects>,
+    incoming: Option<IncomingObjects>,
+    applied: Option<&AppliedRefUpdates>,
 ) -> Result<Vec<RefUpdate>> {
     if updates.iter().any(writes_an_object) {
         let repo = repo_path.to_path_buf();
         let fast_forward_only = policy.fast_forward_only_refs.clone();
         let signed = policy.require_signed_refs.clone();
         let signing_keys = policy.signing_keys.clone();
-        let view =
-            incoming.map(|incoming| (incoming.objects.clone(), incoming.live_objects.clone()));
+        let view = incoming
+            .as_ref()
+            .map(|incoming| (incoming.objects.clone(), incoming.live_objects.clone()));
         updates = tokio::task::spawn_blocking(move || {
             let env = view.as_ref().map(|(objects, live)| {
                 [
@@ -904,32 +907,85 @@ async fn check_and_write_refs(
             repo_path,
             &mut updates,
             &policy.foreign_locks,
-            &incoming.map(IncomingObjects::git_env).unwrap_or_default(),
+            &incoming
+                .as_ref()
+                .map(IncomingObjects::git_env)
+                .unwrap_or_default(),
         )
         .await;
     }
 
-    if updates.iter().any(writes_an_object) {
-        if let Some(incoming) = incoming {
-            incoming.promote()?;
+    if applied.is_none() {
+        // Server-origin ref moves return their updates to a caller that owns
+        // the post-move hooks. Until that caller has a cancellation sink of its
+        // own, keep the final writes on this future: an await here could let
+        // cancellation publish a ref without delivering its hooks.
+        if updates.iter().any(writes_an_object) {
+            if let Some(incoming) = &incoming {
+                incoming.promote()?;
+            }
         }
+        write_ref_updates(repo_path, &mut updates);
+        return Ok(updates);
     }
 
-    for update in &mut updates {
+    publish_ref_updates_with(
+        repo_path.to_path_buf(),
+        updates,
+        incoming,
+        applied.cloned(),
+        || {},
+    )
+    .await
+}
+
+fn write_ref_updates(repo: &Path, updates: &mut [RefUpdate]) {
+    for update in updates {
         if update.status != "ok" {
             continue;
         }
-        match update_ref(repo_path, &update.refname, &update.old_sha, &update.new_sha) {
-            Ok(()) => {
-                update.message = "ok".to_string();
-            }
-            Err(e) => {
+        match update_ref(repo, &update.refname, &update.old_sha, &update.new_sha) {
+            Ok(()) => update.message = "ok".to_string(),
+            Err(error) => {
                 update.status = "error".to_string();
-                update.message = format!("{}", e);
+                update.message = error.to_string();
             }
         }
     }
-    Ok(updates)
+}
+
+/// The final publication owns both the writes and their cancellation sink.
+/// `before` is a no-op in production; tests hold this exact phase to prove a
+/// current-thread runtime stays live and cancellation cannot lose the refs.
+async fn publish_ref_updates_with<F>(
+    repo: std::path::PathBuf,
+    mut updates: Vec<RefUpdate>,
+    incoming: Option<IncomingObjects>,
+    applied: Option<AppliedRefUpdates>,
+    before: F,
+) -> Result<Vec<RefUpdate>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        before();
+        if updates.iter().any(writes_an_object) {
+            if let Some(incoming) = &incoming {
+                incoming.promote()?;
+            }
+        }
+
+        write_ref_updates(&repo, &mut updates);
+        if let Some(applied) = applied {
+            applied.record(&updates);
+            if updates.iter().any(|update| update.status == "ok") {
+                crate::maintenance::after_push(&repo);
+            }
+        }
+        Ok(updates)
+    })
+    .await
+    .context("receive-pack ref publication did not complete")?
 }
 
 /// Move refs on the server's own behalf — the branches API, a merge's
@@ -952,7 +1008,7 @@ pub async fn apply_server_ref_updates(
         .map(|(old_sha, new_sha, refname)| checked_command(old_sha, new_sha, refname))
         .collect();
     enforce_ref_rules(repo_path, &mut updates, policy);
-    check_and_write_refs(repo_path, updates, policy, None).await
+    check_and_write_refs(repo_path, updates, policy, None, None).await
 }
 
 fn checked_receive_negotiation_bytes(
@@ -2400,6 +2456,64 @@ mod landed_push_tests {
         assert!(
             applied.take_landed().is_none(),
             "the sink hands its updates over once — a second read would run every hook twice"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_ref_publication_keeps_the_worker_live_and_survives_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("delayed-push.git");
+        init_with_pushed_commit(&repo_path);
+        let applied = AppliedRefUpdates::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let publication = tokio::spawn(super::publish_ref_updates_with(
+            repo_path.clone(),
+            vec![super::RefUpdate {
+                old_sha: NULL_SHA1.to_string(),
+                new_sha: pushed_sha(),
+                refname: "refs/heads/main".into(),
+                status: "ok".into(),
+                message: String::new(),
+            }],
+            None,
+            Some(applied.clone()),
+            move || {
+                entered_tx.send(()).expect("signal blocking publication");
+                release_rx.recv().expect("release blocking publication");
+            },
+        ));
+        entered_rx.await.expect("blocking publication started");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::time::sleep(std::time::Duration::from_millis(30)),
+        )
+        .await
+        .expect("the current-thread runtime must progress while publication is blocked");
+        publication.abort();
+        release_tx
+            .send(())
+            .expect("allow detached publication to finish");
+        let landed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(landed) = applied.take_landed() {
+                    break landed;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the owned publication records refs after the waiter is cancelled");
+        assert_eq!(landed.len(), 1);
+        assert_eq!(landed[0].status, "ok");
+        assert_eq!(
+            gix::open(&repo_path)
+                .unwrap()
+                .find_reference("refs/heads/main")
+                .unwrap()
+                .id()
+                .to_string(),
+            pushed_sha()
         );
     }
 

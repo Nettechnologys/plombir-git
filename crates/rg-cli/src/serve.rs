@@ -1410,6 +1410,18 @@ pub(crate) async fn run_serve(
         None
     };
 
+    // Steady background writers queue on a dedicated SQLite write pool.
+    // Open it before starting retention; mail and webhook delivery use this
+    // same pool later in the startup sequence.
+    let db_write = rg_db::open_write_pool(
+        &resolved_db_url,
+        resolved_db_connect_timeout,
+        resolved_db_idle_timeout,
+        &db,
+    )
+    .await
+    .map_err(|e| dbconn::annotate_db_open_error(e, &resolved_db_url))?;
+
     // ── Retention of append-only tables ───────────────────────────
     // Webhook deliveries, notifications and login attempts are written on
     // every event and nothing else ever deletes them. The windows are
@@ -1448,7 +1460,7 @@ pub(crate) async fn run_serve(
             "Retention sweep enabled"
         );
         Some(rg_core::retention::spawn_retention_with_shutdown(
-            db.clone(),
+            rg_core::db::Db::new(db.clone(), db_write.clone()),
             config,
             Some(shutdown_rx.clone()),
         )?)
@@ -1493,18 +1505,6 @@ pub(crate) async fn run_serve(
         max_bytes = resolved_package_upload_max_bytes,
         "Package upload artifact ceiling configured"
     );
-
-    // Steady background writers queue on their own pool (card_bb685235de6f):
-    // the CI log queue, the runner heartbeat, the embedded runner and the
-    // credential usage stamps (card_a84b25c9efbe).
-    let db_write = rg_db::open_write_pool(
-        &resolved_db_url,
-        resolved_db_connect_timeout,
-        resolved_db_idle_timeout,
-        &db,
-    )
-    .await
-    .map_err(|e| dbconn::annotate_db_open_error(e, &resolved_db_url))?;
 
     // One CI engine and one WebSocket hub for the whole process: the SSH
     // transport's post-push hooks trigger pipelines and push `ci_triggered` /
@@ -1606,7 +1606,7 @@ pub(crate) async fn run_serve(
     // waits to mail them.
     let _notification_mail_handle = smtp_config.clone().map(|smtp| {
         rg_core::notification::mail::spawn_dispatcher(
-            db.clone(),
+            rg_core::db::Db::new(db.clone(), db_write.clone()),
             smtp,
             resolved_external_url.clone(),
             Some(shutdown_rx.clone()),

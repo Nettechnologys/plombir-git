@@ -176,7 +176,10 @@ const DOCKER_CPU_LIMIT: &str = "2";
 /// that outran its deadline; and the stop path, which removes the container of a
 /// job interrupted mid-flight. The last two spelt the name out inline.
 pub(crate) fn job_container_name(job_id: i64) -> String {
-    format!("plombir-git-runner-job-{job_id}")
+    format!(
+        "plombir-git-runner-job-{job_id}-{}",
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 /// Execute a job script inside a Docker container.
@@ -185,7 +188,7 @@ pub(crate) async fn run_job_docker(
     script: &str,
     variables: &[(String, String)],
     workspace: &std::path::Path,
-    job_id: i64,
+    container_name: &str,
 ) -> (i32, String) {
     // Check if Docker daemon is running
     let docker_ok = tokio::process::Command::new("docker")
@@ -201,8 +204,7 @@ pub(crate) async fn run_job_docker(
         return (-1, msg);
     }
 
-    let container_name = job_container_name(job_id);
-    let args = docker_run_args(image, script, variables, workspace, &container_name);
+    let args = docker_run_args(image, script, variables, workspace, container_name);
 
     let mut command = tokio::process::Command::new("docker");
     command.args(&args);
@@ -330,6 +332,20 @@ pub(crate) fn job_variables(value: Option<&serde_json::Value>) -> Vec<(String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_job_id_gets_distinct_container_names_for_independent_runs() {
+        let first = job_container_name(7);
+        let second = job_container_name(7);
+        assert_ne!(first, second);
+        assert!(first.starts_with("plombir-git-runner-job-7-"));
+        assert!(second.starts_with("plombir-git-runner-job-7-"));
+
+        for name in [&first, &second] {
+            let args = docker_run_args("alpine:3.20", "true", &[], std::path::Path::new("."), name);
+            assert!(args.windows(2).any(|pair| pair == ["--name", name]));
+        }
+    }
 
     #[test]
     fn docker_unavailable_message_is_fail_closed() {

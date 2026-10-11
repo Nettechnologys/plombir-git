@@ -14,9 +14,9 @@
 //! upgrade — which may find years of rows — interleaves with live writers
 //! instead of stalling them.
 
+use crate::db::DbPools;
 use crate::task_tracker::wait_optional_shutdown;
 use chrono::{DateTime, Duration, Utc};
-use sea_orm::DatabaseConnection;
 use tokio::sync::watch;
 use tokio::time;
 
@@ -136,7 +136,7 @@ where
 /// deleted stays deleted, and the next pass picks up where this one stopped:
 /// every batch is idempotent.
 pub async fn run_once(
-    db: &DatabaseConnection,
+    db: &impl DbPools,
     config: &RetentionConfig,
     now: DateTime<Utc>,
 ) -> anyhow::Result<RetentionReport> {
@@ -147,15 +147,29 @@ pub async fn run_once(
     let login_cutoff = now - Duration::days(config.login_log_days);
 
     let webhook_deliveries = drain(batch, || {
-        rg_db::ops::webhook_ops::delete_deliveries_before(db, webhook_cutoff, batch)
+        rg_db::ops::webhook_ops::delete_deliveries_before(
+            db.read(),
+            db.write(),
+            webhook_cutoff,
+            batch,
+        )
     })
     .await?;
     let notifications = drain(batch, || {
-        rg_db::ops::notification_ops::delete_stale(db, read_cutoff, unread_cutoff, batch)
+        rg_db::ops::notification_ops::delete_stale(
+            db.read(),
+            db.write(),
+            read_cutoff,
+            unread_cutoff,
+            batch,
+        )
     })
     .await?;
     let login_logs = drain(batch, || async move {
-        Ok(rg_db::ops::login_log_ops::delete_before(db, login_cutoff, batch).await?)
+        Ok(
+            rg_db::ops::login_log_ops::delete_before(db.read(), db.write(), login_cutoff, batch)
+                .await?,
+        )
     })
     .await?;
 
@@ -169,7 +183,7 @@ pub async fn run_once(
 /// Start the periodic sweep. Validates the configuration first, so a value the
 /// sweep cannot honour fails the server start.
 pub fn spawn_retention_with_shutdown(
-    db: DatabaseConnection,
+    db: crate::db::Db,
     config: RetentionConfig,
     shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
@@ -211,7 +225,7 @@ mod tests {
     use super::*;
     use crate::test_support::migrated_memory_database;
     use rg_db::entities::{login_log, notification, webhook_delivery};
-    use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
+    use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, PaginatorTrait, Set};
 
     fn config(batch_size: u64) -> RetentionConfig {
         RetentionConfig {

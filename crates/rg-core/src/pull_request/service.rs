@@ -171,7 +171,7 @@ pub async fn create_pr(
         "head_repo_id": pr.head_repo_id,
         "author_id": pr.author_id,
     });
-    if let Err(e) = crate::webhook::service::trigger_pr_opened(db, repo_id, &payload).await {
+    if let Err(e) = crate::webhook::service::trigger_pr_opened(&pools, repo_id, &payload).await {
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger PR opened webhook");
     }
 
@@ -599,9 +599,12 @@ pub async fn update_pr(
                         "title": pr.title,
                         "state": s,
                     });
-                    if let Err(e) =
-                        crate::webhook::service::trigger_pr_closed(db, pr.repo_id, &close_payload)
-                            .await
+                    if let Err(e) = crate::webhook::service::trigger_pr_closed(
+                        &pools,
+                        pr.repo_id,
+                        &close_payload,
+                    )
+                    .await
                     {
                         tracing::warn!(error = %format!("{e:#}"), "failed to trigger PR closed webhook");
                     }
@@ -4563,7 +4566,7 @@ async fn update_pr_merged(
         "strategy": format!("{:?}", strategy).to_lowercase(),
     });
     if let Err(e) =
-        crate::webhook::service::trigger_pr_merged(db, merged_pr.repo_id, &merge_payload).await
+        crate::webhook::service::trigger_pr_merged(&pools, merged_pr.repo_id, &merge_payload).await
     {
         tracing::warn!(error = %format!("{e:#}"), "failed to trigger PR merged webhook");
     }

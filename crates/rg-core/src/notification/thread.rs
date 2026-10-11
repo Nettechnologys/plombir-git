@@ -879,7 +879,9 @@ mod write_pool_tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use sea_orm::{ActiveValue::Set, ConnectionTrait, DatabaseConnection, TransactionTrait};
+    use sea_orm::{
+        ActiveModelTrait, ActiveValue::Set, ConnectionTrait, DatabaseConnection, TransactionTrait,
+    };
 
     use crate::db::Db;
 
@@ -953,6 +955,54 @@ mod write_pool_tests {
             .await
             .unwrap();
 
+        let old = now - chrono::Duration::days(400);
+        rg_db::entities::notification::ActiveModel {
+            user_id: Set(recipient.id),
+            event_type: Set("issue".into()),
+            title: Set("Old mail".into()),
+            is_read: Set(true),
+            created_at: Set(old),
+            reason: Set(Some("assigned".into())),
+            email_pending: Set(true),
+            ..Default::default()
+        }
+        .insert(&read)
+        .await
+        .unwrap();
+        let hook = rg_db::entities::webhook::ActiveModel {
+            repo_id: Set(repo.id),
+            url: Set("not-a-url".into()),
+            content_type: Set("json".into()),
+            active: Set(true),
+            events: Set("push".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&read)
+        .await
+        .unwrap();
+        rg_db::entities::webhook_delivery::ActiveModel {
+            webhook_id: Set(hook.id),
+            event: Set("push".into()),
+            delivery_id: Set(uuid::Uuid::new_v4().to_string()),
+            created_at: Set(old),
+            ..Default::default()
+        }
+        .insert(&read)
+        .await
+        .unwrap();
+        rg_db::entities::login_log::ActiveModel {
+            username: Set("pool-owner".into()),
+            auth_provider: Set("password".into()),
+            success: Set(false),
+            created_at: Set(old),
+            ..Default::default()
+        }
+        .insert(&read)
+        .await
+        .unwrap();
+
         let mut write = rg_db::open_write_pool(&url, 2, 60, &read).await.unwrap();
         let on_read = record_writes(&mut read);
         let on_write = record_writes(&mut write);
@@ -1000,12 +1050,46 @@ mod write_pool_tests {
         .await
         .unwrap();
 
+        struct NoopOutbox;
+        impl crate::notification::mail::Outbox for NoopOutbox {
+            fn send<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a crate::notification::mail::Digest,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        crate::notification::mail::deliver_pending(&pools, &NoopOutbox, None)
+            .await
+            .unwrap();
+        let tracker = crate::task_tracker::TaskTracker::new();
+        crate::webhook::service::trigger_event_with_tracker(
+            &pools,
+            repo.id,
+            "push",
+            &serde_json::json!({"ref":"refs/heads/main"}),
+            &tracker,
+        )
+        .await
+        .unwrap();
+        tracker.close();
+        tokio::time::timeout(Duration::from_secs(5), tracker.wait())
+            .await
+            .expect("webhook delivery drained");
+        crate::retention::run_once(&pools, &crate::retention::RetentionConfig::default(), now)
+            .await
+            .unwrap();
+
         let written = on_write.lock().unwrap().clone();
         for table in [
             "notifications",
             "thread_subscriptions",
             "boards",
             "board_columns",
+            "webhook_deliveries",
+            "login_logs",
         ] {
             assert!(
                 written.iter().any(|sql| sql.contains(table)),
@@ -1014,6 +1098,15 @@ mod write_pool_tests {
         }
         let leaked = on_read.lock().unwrap().clone();
         assert!(leaked.is_empty(), "writes on the shared pool: {leaked:?}");
+        assert!(written.iter().any(|sql| sql.contains("email_pending")));
+        for table in ["notifications", "webhook_deliveries", "login_logs"] {
+            assert!(
+                written
+                    .iter()
+                    .any(|sql| sql.starts_with("delete") && sql.contains(table)),
+                "retention never deleted {table} on the write pool: {written:?}"
+            );
+        }
     }
 
     async fn read_latency_during_fanout(
