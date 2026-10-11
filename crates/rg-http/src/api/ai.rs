@@ -426,7 +426,16 @@ pub async fn ai_index_repository(
     // An unborn HEAD *over existing branches* is the opposite situation: there
     // is a history to index and no branch name to reach it by. Reporting zero
     // indexed files there would quietly leave the repository unsearchable.
-    match crate::api::repo_content::classify_repo_emptiness(&repo_path) {
+    let emptiness = match classify_index_repo_emptiness_with(
+        &repo_path,
+        crate::api::repo_content::classify_repo_emptiness,
+    )
+    .await
+    {
+        Ok(emptiness) => emptiness,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    match emptiness {
         crate::api::repo_content::RepoEmptiness::Empty => {
             return (StatusCode::OK, Json(IndexResponse { indexed_files: 0 })).into_response();
         }
@@ -457,10 +466,68 @@ pub async fn ai_index_repository(
     }
 }
 
+async fn classify_index_repo_emptiness_with<F>(
+    repo_path: &std::path::Path,
+    classify: F,
+) -> anyhow::Result<crate::api::repo_content::RepoEmptiness>
+where
+    F: FnOnce(&std::path::Path) -> crate::api::repo_content::RepoEmptiness + Send + 'static,
+{
+    let repo_path = repo_path.to_path_buf();
+    rg_core::blocking::run_blocking_git("classify repository before AI indexing", move || {
+        Ok(classify(&repo_path))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ai_limit;
+    use super::{ai_limit, classify_index_repo_emptiness_with};
     use axum::http::StatusCode;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_ai_head_check_does_not_block_the_async_worker() {
+        use std::time::{Duration, Instant};
+
+        let repo = tempfile::tempdir().expect("temporary repository");
+        gix::create::into(
+            repo.path(),
+            gix::create::Kind::Bare,
+            gix::create::Options::default(),
+        )
+        .expect("create bare repository");
+        let path = repo.path().to_path_buf();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            release_tx.send(()).expect("release delayed HEAD check");
+        });
+
+        let started = Instant::now();
+        let check = tokio::spawn(async move {
+            classify_index_repo_emptiness_with(&path, move |path| {
+                entered_tx.send(()).expect("signal HEAD check start");
+                release_rx.recv().expect("wait for HEAD check release");
+                crate::api::repo_content::classify_repo_emptiness(path)
+            })
+            .await
+        });
+        entered_rx.await.expect("HEAD check must start");
+        tokio::time::timeout(Duration::from_millis(500), tokio::spawn(async {}))
+            .await
+            .expect("a cheap async task was blocked by the HEAD check")
+            .expect("cheap task joins");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(
+            check
+                .await
+                .expect("check task joins")
+                .expect("check succeeds"),
+            crate::api::repo_content::RepoEmptiness::Empty
+        ));
+        release.join().expect("release thread joins");
+    }
 
     #[test]
     fn ai_limit_rejects_non_positive_values_and_caps_positive_values() {

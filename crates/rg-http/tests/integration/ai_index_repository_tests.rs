@@ -11,7 +11,7 @@
 //! back what the index made findable. A `200` on the write half proves nothing
 //! on its own if the read half cannot see the result.
 
-use crate::common::{create_repo, register_user, spawn_test_app};
+use crate::common::{create_repo, register_user, spawn_test_app, spawn_test_app_with_repo_root};
 
 const PW: &str = "Qz7$wRtm";
 const OWNER: &str = "ai-index-owner";
@@ -136,6 +136,73 @@ async fn indexing_a_repository_without_commits_reports_nothing_indexed() {
     assert_eq!(
         body["indexed_files"], 0,
         "an empty repository has nothing to index: {body}"
+    );
+}
+
+#[tokio::test]
+async fn indexing_a_repository_whose_head_lost_its_branch_reports_the_conflict() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let token = register_user(&base, OWNER, "ai-index-desync@example.test", PW).await;
+    create_repo(&base, &token, REPO).await;
+    let client = reqwest::Client::new();
+    commit_file(
+        &client,
+        &base,
+        &token,
+        "src/needle.rs",
+        "pub fn needle() {}\n",
+    )
+    .await;
+
+    let bare = repo_root.join(format!("{OWNER}/{REPO}.git"));
+    let head = std::fs::read_to_string(bare.join("HEAD")).expect("read symbolic HEAD");
+    let branch = head
+        .trim()
+        .strip_prefix("ref: ")
+        .expect("fixture HEAD is symbolic");
+    std::fs::rename(
+        bare.join(branch),
+        bare.join("refs/heads/history-lives-here"),
+    )
+    .expect("move committed branch away from HEAD");
+
+    let response = client
+        .post(format!("{base}/api/v1/ai/repos/{OWNER}/{REPO}/index"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("index request");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("index response");
+    assert_eq!(status, 409, "HEAD desync must not look empty: {body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(branch), "missing HEAD branch: {body}");
+    assert!(
+        message.contains("history-lives-here"),
+        "missing existing branch: {body}"
+    );
+}
+
+#[tokio::test]
+async fn indexing_a_repository_with_broken_storage_is_a_server_error() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let token = register_user(&base, OWNER, "ai-index-broken@example.test", PW).await;
+    create_repo(&base, &token, REPO).await;
+    let bare = repo_root.join(format!("{OWNER}/{REPO}.git"));
+    std::fs::remove_dir_all(bare.join("objects")).expect("break repository object store");
+    assert!(gix::open(&bare).is_err(), "fixture must be unopenable");
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/ai/repos/{OWNER}/{REPO}/index"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("index request");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("index response");
+    assert!(
+        status.is_server_error(),
+        "broken storage looked empty: {body}"
     );
 }
 

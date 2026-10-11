@@ -125,7 +125,11 @@ pub async fn ensure_release_tag(
             "'{tag_name}' is not a valid tag name"
         )));
     }
-    if crate::repo::refs::ref_value(repo_path, &refname)?.is_some() {
+    let existing = crate::repo::refs::run_ref_read(repo_path, "check release tag", move |path| {
+        crate::repo::refs::ref_value(path, &refname)
+    })
+    .await?;
+    if existing.is_some() {
         return Ok(None);
     }
     crate::repo::refs::create_tag(
@@ -188,9 +192,18 @@ pub async fn publish_release(
                 "'{tag_name}' is not a valid tag name"
             )));
         }
-        if crate::repo::refs::ref_value(repo_path, &refname)?.is_none() {
-            crate::repo::refs::resolve_commit(repo_path, target_commitish)?;
-        }
+        let target_commitish = target_commitish.to_owned();
+        crate::repo::refs::run_ref_read(
+            repo_path,
+            "check draft release tag and target",
+            move |path| {
+                if crate::repo::refs::ref_value(path, &refname)?.is_none() {
+                    crate::repo::refs::resolve_commit(path, &target_commitish)?;
+                }
+                Ok(())
+            },
+        )
+        .await?;
         None
     } else {
         ensure_release_tag(

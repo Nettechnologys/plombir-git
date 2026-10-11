@@ -58,6 +58,17 @@ pub fn resolve_commit(repo_path: &Path, revision: &str) -> Result<String> {
     Ok(commit)
 }
 
+/// Keep a complete ref read on the blocking pool, including repository open
+/// and object lookup. The closure owns any names it needs across the await.
+pub(crate) async fn run_ref_read<T, F>(repo_path: &Path, what: &'static str, read: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Path) -> Result<T> + Send + 'static,
+{
+    let repo_path = repo_path.to_path_buf();
+    crate::blocking::run_blocking_git(what, move || read(&repo_path)).await
+}
+
 /// Apply one ref change under the caller's push policy.
 ///
 /// `actor_id` is the account the change is made for — the one whose
@@ -115,12 +126,20 @@ pub async fn create_branch(
 ) -> Result<RefUpdate> {
     crate::auth::credential_context::refuse_protected_write(db, repo_id, branch).await?;
     let refname = format!("refs/heads/{branch}");
-    if ref_value(repo_path, &refname)?.is_some() {
-        return Err(crate::error::conflict(format!(
-            "branch '{branch}' already exists"
-        )));
-    }
-    let target = resolve_commit(repo_path, from)?;
+    let target = run_ref_read(repo_path, "resolve branch creation", {
+        let refname = refname.clone();
+        let branch = branch.to_owned();
+        let from = from.to_owned();
+        move |path| {
+            if ref_value(path, &refname)?.is_some() {
+                return Err(crate::error::conflict(format!(
+                    "branch '{branch}' already exists"
+                )));
+            }
+            resolve_commit(path, &from)
+        }
+    })
+    .await?;
     change_ref(
         db, repo_path, repo_id, actor_id, &refname, NULL_SHA, &target,
     )
@@ -137,12 +156,20 @@ pub async fn create_tag(
     target: &str,
 ) -> Result<RefUpdate> {
     let refname = format!("refs/tags/{tag}");
-    if ref_value(repo_path, &refname)?.is_some() {
-        return Err(crate::error::conflict(format!(
-            "tag '{tag}' already exists"
-        )));
-    }
-    let commit = resolve_commit(repo_path, target)?;
+    let commit = run_ref_read(repo_path, "resolve tag creation", {
+        let refname = refname.clone();
+        let tag = tag.to_owned();
+        let target = target.to_owned();
+        move |path| {
+            if ref_value(path, &refname)?.is_some() {
+                return Err(crate::error::conflict(format!(
+                    "tag '{tag}' already exists"
+                )));
+            }
+            resolve_commit(path, &target)
+        }
+    })
+    .await?;
     change_ref(
         db, repo_path, repo_id, actor_id, &refname, NULL_SHA, &commit,
     )
@@ -201,9 +228,11 @@ async fn delete_named_ref(
             "'{refname}' is not a valid {kind} name"
         )));
     }
-    let Some(current) = ref_value(repo_path, refname)? else {
-        return Err(crate::error::not_found(kind));
-    };
+    let current = run_ref_read(repo_path, "resolve ref deletion", {
+        let refname = refname.to_owned();
+        move |path| ref_value(path, &refname)?.ok_or_else(|| crate::error::not_found(kind))
+    })
+    .await?;
     change_ref(
         db, repo_path, repo_id, actor_id, refname, &current, NULL_SHA,
     )
@@ -268,4 +297,50 @@ pub async fn delete_merged_head_branch(
     )
     .await?;
     Ok((owner, head_repo.name, path, update))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ref_value, run_ref_read};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_ref_read_does_not_block_the_async_worker() {
+        use std::time::{Duration, Instant};
+
+        let repo = tempfile::tempdir().expect("temporary repository");
+        gix::create::into(
+            repo.path(),
+            gix::create::Kind::Bare,
+            gix::create::Options::default(),
+        )
+        .expect("create bare repository");
+        let path = repo.path().to_path_buf();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            release_tx.send(()).expect("release delayed ref read");
+        });
+
+        let started = Instant::now();
+        let read = tokio::spawn(async move {
+            run_ref_read(&path, "test delayed ref read", move |path| {
+                entered_tx.send(()).expect("signal ref read start");
+                release_rx.recv().expect("wait for ref read release");
+                ref_value(path, "refs/heads/missing")
+            })
+            .await
+        });
+        entered_rx.await.expect("ref read must start");
+        tokio::time::timeout(Duration::from_millis(500), tokio::spawn(async {}))
+            .await
+            .expect("a cheap async task was blocked by the Git read")
+            .expect("cheap task joins");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            read.await.expect("read task joins").expect("read succeeds"),
+            None
+        );
+        release.join().expect("release thread joins");
+    }
 }
