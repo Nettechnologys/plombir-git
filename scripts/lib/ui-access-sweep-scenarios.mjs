@@ -112,13 +112,13 @@ const adminUsersCreate = privileged(
 const adminUsersResetPassword = privileged(
   async (context) => {
     await context.navigate('/admin/users');
-    await context.setConfirm(true);
     await context.clickWithin(
       '.users-table tbody tr',
       context.fixture.targetUsername,
       'button',
       'Reset password',
     );
+    await context.click('.confirm-modal-accept');
   },
   (context) => requestSequence(context, [
     [`/api/v1/admin/users/${context.fixture.targetUserId}/password-reset`, { method: 'POST' }],
@@ -303,8 +303,8 @@ const adminSsoTest = privileged(
 const adminSsoDelete = privileged(
   async (context) => {
     await context.navigate('/admin/settings');
-    await context.setConfirm(true);
     await context.clickWithin('.provider-row', context.fixture.ssoName, 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
   },
   (context) => requestSequence(context, [
     [`/api/v1/admin/sso/providers/${context.fixture.ssoProviderId}`, { method: 'DELETE' }],
@@ -699,8 +699,8 @@ const repoMilestones = privileged(
     await context.click('.editor button[type="submit"]');
     await context.waitForText('.milestone-list', 'Seeded surface milestone updated');
 
-    await context.setConfirm(true);
     await context.clickWithin('.milestone', 'Browser-created milestone', 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
     await context.waitForTextAbsent('.milestone-list', 'Browser-created milestone');
   },
   (context) => requestSequence(context, [
@@ -770,8 +770,8 @@ const repoBoards = privileged(
     await context.waitForTextAbsent('.kanban-board', 'In Progress');
     await context.waitForEnabled('.card button[title="Delete"]');
 
-    await context.setConfirm(true);
     await context.clickWithin('.tab', 'Seeded Surface Board', 'button', '×');
+    await context.click('.confirm-modal-accept');
   },
   (context) => requestSequence(context, [
     [`${surfaceApi(context)}/boards`],
@@ -797,8 +797,8 @@ const repoTimeTracking = privileged(
     await context.fill('#tt-desc', 'Browser-created time entry');
     await context.clickByText('.form-action button', 'Add');
     await context.waitForText('tbody', 'Browser-created time entry');
-    await context.setConfirm(true);
     await context.clickWithin('tbody tr', 'Browser-created time entry', 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
   },
   (context) => requestSequence(context, [
     [`${surfaceApi(context)}/issues/${context.fixture.surfaceIssueNumber}/time`],
@@ -828,8 +828,8 @@ const repoWiki = privileged(
     await context.waitForText('.revision-content', 'Browser surface page');
 
     await context.navigate(surfacePage(context, `/wiki/${context.fixture.surfaceWikiTitle}`));
-    await context.setConfirm(true);
     await context.clickByText('.header-actions button', 'Delete');
+    await context.click('.confirm-modal-accept');
     await context.waitForPath(surfacePage(context, '/wiki'));
   },
   (context) => requestSequence(context, [
@@ -915,6 +915,7 @@ const repoReadSurface = privileged(
     [`${surfaceApi(context)}/pipelines`, { method: 'POST', json: { ref: 'main', inputs: {} } }],
     [`${surfaceApi(context)}/pipelines/${context.fixture.surfacePipelineId}`],
     [`${surfaceApi(context)}/pipelines/${context.fixture.surfacePipelineId}/jobs/${context.fixture.surfacePipelineJobId}`],
+    [`${surfaceApi(context)}/pipelines/${context.fixture.surfacePipelineId}/jobs/${context.fixture.surfacePipelineJobId}/log`],
     [`${surfaceApi(context)}/pipelines/${context.fixture.surfacePipelineId}/artifacts`],
     [`${surfaceApi(context)}/pipelines/workflow-dispatch`],
     ['/api/v1/instance'],
@@ -948,7 +949,7 @@ const repoPullCreate = privileged(
     });
     const doomed = await context.fetchJson(`${surfaceApi(context)}/pulls`, {
       method: 'POST',
-      json: { title: 'Disposable browser pull request', head_branch: 'browser-doomed', base_branch: 'main' },
+      json: { title: 'Disposable browser pull request', head: 'browser-doomed', base: 'main' },
     });
     if (!doomed?.number) throw new Error('disposable pull request was not created');
     context.fixture.disposablePullNumber = doomed.number;
@@ -958,7 +959,7 @@ const repoPullCreate = privileged(
     [`${surfaceApi(context)}/pull_request_template`],
     [`${surfaceApi(context)}/pulls`, {
       method: 'POST',
-      json: { title: 'Denied pull', head_branch: 'browser-feature', base_branch: 'main' },
+      json: { title: 'Denied pull', head: 'browser-feature', base: 'main' },
     }],
   ]),
 );
@@ -1088,8 +1089,8 @@ const repoBranchProtections = privileged(
     await context.fill('#required-approvals', '2');
     await context.click('.rule-form button[type="submit"]');
     await context.waitForTextAbsent('.rule-form', 'Cancel');
-    await context.setConfirm(true);
     await context.clickWithin('tbody tr', context.fixture.branchName, 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
   },
   (context) => requestSequence(context, [
     [settingsApi(context, '/branches/protection'), {
@@ -1111,8 +1112,8 @@ const repoCiSecrets = privileged(
     await context.fill('#secret-value', 'browser-created-secret');
     await context.click('form button.btn-primary');
     await context.waitForText('article', 'SWEEP_CREATED');
-    await context.setConfirm(true);
     await context.clickWithin('article', context.fixture.secretName, 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
   },
   (context) => requestSequence(context, [
     [settingsApi(context, '/actions/secrets')],
@@ -1129,8 +1130,8 @@ const repoCollaborators = privileged(
     await context.navigate(settingsPage(context, 'collaborators'));
     await context.select('tbody select', 'write');
     await context.clickWithin('tbody tr', context.fixture.resourceUsername, 'button', 'Save');
-    await context.setConfirm(true);
     await context.clickWithin('tbody tr', context.fixture.resourceUsername, 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
     await context.waitForTextAbsent('tbody tr', context.fixture.resourceUsername);
     await context.fill('#collaborator-user', context.fixture.resourceUsername);
     await context.select('#collaborator-permission', 'admin');
@@ -1157,8 +1158,8 @@ const repoDeployKeys = privileged(
     await context.fill('#deploy-public-key', context.fixture.browserDeployKey);
     await context.click('form button[type="submit"]');
     await context.waitForText('article', 'Browser-created key');
-    await context.setConfirm(true);
     await context.clickWithin('article', context.fixture.deployKeyTitle, 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
   },
   (context) => requestSequence(context, [
     [settingsApi(context, '/keys')],
@@ -1180,8 +1181,8 @@ const repoLfsStorage = privileged(
     await context.waitForText('tbody tr', context.fixture.lfsObjectOid.slice(0, 12));
     await context.clickWithin('section', 'Find unreferenced objects', 'button', 'Find unreferenced objects');
     await context.waitForText('.empty-state', 'Every object is still referenced');
-    await context.setConfirm(true);
     await context.clickWithin('tbody tr', context.fixture.lfsObjectOid.slice(0, 12), 'button', 'Remove');
+    await context.click('.confirm-modal-accept');
     await context.waitForText('.outcome', 'too recently');
   },
   (context) => requestSequence(context, [
@@ -1209,8 +1210,8 @@ const repoEnvironments = privileged(
     await context.fill('#required-approvals', '2');
     await context.clickByText('form button', 'Save changes');
     await context.waitForText('form button', 'Create environment');
-    await context.setConfirm(true);
     await context.clickWithin('article', context.fixture.environmentName, 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
   },
   (context) => requestSequence(context, [
     [settingsApi(context, '/actions/environments'), {
@@ -1253,8 +1254,8 @@ const repoTagProtections = privileged(
     await context.fill('#tag-allowed-users', context.ownerUsername);
     await context.clickByText('form button', 'Save changes');
     await context.waitForText('form button', 'Add protection');
-    await context.setConfirm(true);
     await context.clickWithin('article', context.fixture.tagPattern, 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
   },
   (context) => requestSequence(context, [
     [settingsApi(context, '/tags/protection'), {
@@ -1286,8 +1287,8 @@ const repoWebhooks = privileged(
     await context.waitForSelector('.delivery-item');
     await context.clickByText('.delivery-item button', 'Redeliver');
     await context.waitForEnabled('.delivery-item button');
-    await context.setConfirm(true);
     await context.clickWithin('.hook-item', context.fixture.webhookUrl, 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
   },
   (context) => requestSequence(context, [
     [settingsApi(context, '/hooks')],
@@ -1357,15 +1358,17 @@ const organizationAdmin = privileged(
     await context.fill('.edit-organization input[type="text"]', 'Managed Browser Sweep Updated');
     await context.click('.edit-organization button[type="submit"]');
     await context.clickWithin('.managed-item', context.fixture.teamName, 'button', 'View members');
-    await context.setConfirm(true);
     await context.clickWithin('.team-members .compact-item', context.fixture.resourceUsername, 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
     await context.clickWithin('.managed-item', context.fixture.teamName, 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
     await context.clickWithin(
       '.grid .section:last-child .item',
       context.fixture.resourceUsername,
       'button',
       'Delete',
     );
+    await context.click('.confirm-modal-accept');
     await context.fill('.grid .section:last-child .member-form input', context.fixture.resourceUsername);
     await context.click('.grid .section:last-child .member-form button[type="submit"]');
     await context.fill('.grid .section:first-child .create-form input', 'browser-team');
@@ -1374,6 +1377,7 @@ const organizationAdmin = privileged(
     await context.fill('.team-members .member-form input', context.fixture.resourceUsername);
     await context.click('.team-members .member-form button[type="submit"]');
     await context.clickByText('.header-actions button', 'Delete organization');
+    await context.click('.confirm-modal-accept');
     await context.waitForPath('/orgs');
   },
   (context) => requestSequence(context, [

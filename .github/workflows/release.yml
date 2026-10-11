@@ -1,0 +1,210 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions: {}
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY_IMAGE: ghcr.io/nettechnologys/plombir-git
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Check tag, package versions, and release notes
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          version="${tag#v}"
+          commit="$(git rev-parse "refs/tags/${tag}^{commit}")"
+          test "$commit" = "$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$commit" refs/remotes/origin/main
+          test -f "docs/releases/${tag}.md"
+          python3 - "$version" <<'PY'
+          import pathlib, sys, tomllib
+          version = sys.argv[1]
+          root = pathlib.Path('Cargo.toml')
+          assert tomllib.loads(root.read_text())['workspace']['package']['version'] == version
+          for manifest in pathlib.Path('crates').glob('*/Cargo.toml'):
+              package = tomllib.loads(manifest.read_text())['package']
+              assert package['version']['workspace'] is True, manifest
+          PY
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build, attest, and push architecture image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ env.REGISTRY_IMAGE }}:${{ github.ref_name }}-${{ matrix.arch }}
+          build-args: |
+            PLOMBIR_GIT_SOURCE_COMMIT=${{ needs.validate.outputs.commit }}
+            PLOMBIR_GIT_VERSION=${{ github.ref_name }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
+      - name: Extract and verify release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY_IMAGE}:${GITHUB_REF_NAME}-${{ matrix.arch }}"
+          docker pull "$image"
+          container="$(docker create "$image")"
+          trap 'docker rm "$container" >/dev/null' EXIT
+          mkdir -p "dist/plombir-git-linux-${{ matrix.arch }}"
+          for binary in plombir-git plombir-git-runner plombir-git-mcp; do
+            docker cp "$container:/usr/local/bin/$binary" "dist/plombir-git-linux-${{ matrix.arch }}/$binary"
+            test -s "dist/plombir-git-linux-${{ matrix.arch }}/$binary"
+          done
+          mkdir -p "dist/plombir-git-linux-${{ matrix.arch }}/web"
+          docker cp "$container:/app/web/build" "dist/plombir-git-linux-${{ matrix.arch }}/web/build"
+          test -s "dist/plombir-git-linux-${{ matrix.arch }}/web/build/index.html"
+          cp LICENSE NOTICE "dist/plombir-git-linux-${{ matrix.arch }}/"
+          test "$(docker run --rm --entrypoint plombir-git "$image" --version)" = "plombir-git ${GITHUB_REF_NAME}"
+          test "$(docker run --rm --entrypoint plombir-git-runner "$image" --version)" = "plombir-git-runner ${GITHUB_REF_NAME}"
+          test "$(docker run --rm --entrypoint plombir-git-mcp "$image" --version)" = "plombir-git-mcp ${GITHUB_REF_NAME}"
+          tar -C dist -czf "dist/plombir-git-linux-${{ matrix.arch }}.tar.gz" "plombir-git-linux-${{ matrix.arch }}"
+          rm -r "dist/plombir-git-linux-${{ matrix.arch }}"
+      - name: Export SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ env.REGISTRY_IMAGE }}:${{ github.ref_name }}-${{ matrix.arch }}
+          format: spdx-json
+          syft-version: v1.54.1
+          output-file: dist/plombir-git-linux-${{ matrix.arch }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest binary archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/plombir-git-linux-${{ matrix.arch }}.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.spdx.json
+          if-no-files-found: error
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: mkdir -p dist
+      - name: Export source dependency SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: spdx-json
+          syft-version: v1.54.1
+          output-file: dist/plombir-git-source.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-architecture image
+        id: digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "${REGISTRY_IMAGE}:${GITHUB_REF_NAME}" \
+            --tag "${REGISTRY_IMAGE}:latest" \
+            "${REGISTRY_IMAGE}:${GITHUB_REF_NAME}-amd64" \
+            "${REGISTRY_IMAGE}:${GITHUB_REF_NAME}-arm64"
+          docker buildx imagetools inspect "${REGISTRY_IMAGE}:${GITHUB_REF_NAME}" --raw \
+            | jq -e '[.manifests[].platform.architecture] | index("amd64") and index("arm64")'
+          digest="$(docker buildx imagetools inspect "${REGISTRY_IMAGE}:${GITHUB_REF_NAME}" | awk '$1 == "Digest:" {print $2; exit}')"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest image index
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.REGISTRY_IMAGE }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+      - name: Verify anonymous image access
+        shell: bash
+        run: |
+          docker logout ghcr.io
+          if ! docker buildx imagetools inspect "${REGISTRY_IMAGE}:${GITHUB_REF_NAME}" >/dev/null; then
+            echo '::error::GHCR image is not public. A package admin must change its visibility to public, then rerun this job; see docs/releases/README.md.'
+            exit 1
+          fi
+      - name: Publish release assets and notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum -- ./*.tar.gz ./*.spdx.json > SHA256SUMS)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "Plombir Git $GITHUB_REF_NAME" \
+              --notes-file "docs/releases/$GITHUB_REF_NAME.md" \
+              --verify-tag
+          fi

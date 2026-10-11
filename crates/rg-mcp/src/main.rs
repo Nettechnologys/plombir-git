@@ -71,6 +71,14 @@ fn write_json<W: Write>(w: &mut W, resp: &JsonRpcResponse) -> io::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // A stdio MCP client must never see a version banner on stdout during a
+    // normal session. Handle this one argument before starting the runtime.
+    if std::env::args_os().len() == 2
+        && std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version"))
+    {
+        println!("plombir-git-mcp {}", env!("PLOMBIR_GIT_VERSION"));
+        return Ok(());
+    }
     rg_process::refuse_retired_environment()?;
 
     // Tools/resources are dispatched synchronously but perform async reqwest

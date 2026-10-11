@@ -1,6 +1,6 @@
 [package]
 name = "rg-cli"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Plombir Git — self-hosted Git platform server (main binary)"
 repository = "https://github.com/Nettechnologys/plombir-git"

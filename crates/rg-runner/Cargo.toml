@@ -1,6 +1,6 @@
 [package]
 name = "rg-runner"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Plombir Git CI runner agent"
 repository = "https://github.com/Nettechnologys/plombir-git"

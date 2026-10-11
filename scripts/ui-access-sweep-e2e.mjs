@@ -736,7 +736,6 @@ function browserContext({ tab, frontendUrl, persona, fixture }) {
       })()`;
       await waitFor(tab, `click ${targetText} inside ${containingText}`, expression);
     },
-    setConfirm: (answer) => evaluate(tab, `window.confirm = () => ${answer ? 'true' : 'false'}`),
     request,
     fetchJson: async (path, options = {}) => {
       const response = await request(path, options);

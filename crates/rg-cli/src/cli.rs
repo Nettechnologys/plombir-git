@@ -78,7 +78,7 @@ pub(crate) enum PackageCmd {
 }
 
 #[derive(Parser)]
-#[command(name = "plombir-git", about = "A Git hosting platform written in Rust")]
+#[command(name = "plombir-git", about = "A Git hosting platform written in Rust", version = env!("PLOMBIR_GIT_VERSION"))]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Commands,

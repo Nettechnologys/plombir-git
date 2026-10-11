@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # ^ Must stay the first line: once any other comment or instruction has been
 # read, a parser directive is just a comment. It selects the external BuildKit
 # Dockerfile frontend, which stage 2a needs for `COPY --parents` — the flag is
@@ -18,7 +18,7 @@
 #     plombir-git:latest
 
 # ── Stage 1: Frontend (SvelteKit SPA) ────────────────────────
-FROM node:22-alpine AS frontend-builder
+FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS frontend-builder
 WORKDIR /build/web
 
 # Cache npm deps
@@ -37,7 +37,7 @@ RUN npm run build
 # local push gates use. Keep this tag on the same version and the toolchain is
 # already in the image; let it fall behind and the install below downloads the
 # right one instead of building with the wrong one.
-FROM rust:1.96.1-slim-bookworm AS builder
+FROM rust:1.96.1-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3 AS builder
 WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -110,8 +110,10 @@ RUN cargo build --release -j 6
 #     `--build-arg PLOMBIR_GIT_SOURCE_COMMIT=$(git rev-parse HEAD)`; left empty,
 #     the server links the repository instead and warns about it at startup.
 ARG PLOMBIR_GIT_SOURCE_COMMIT=
+ARG PLOMBIR_GIT_VERSION=
 RUN find crates -name '*.rs' -delete
 COPY crates/ crates/
+COPY scripts/build-version.rs scripts/build-version.rs
 RUN find crates -name '*.rs' -exec touch {} + \
     && cargo build --release --workspace --bins -j 6
 
@@ -135,7 +137,8 @@ RUN set -eu; \
     test -n "$(find /out -maxdepth 1 -type f -print -quit)"
 
 # ── Stage 3: Runtime ────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+LABEL org.opencontainers.image.source="https://github.com/Nettechnologys/plombir-git"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -169,6 +172,7 @@ COPY --from=builder /out/ /usr/local/bin/
 
 # Copy frontend static assets (served at web/build relative to WORKDIR)
 COPY --from=frontend-builder /build/web/build /app/web/build
+COPY LICENSE NOTICE /app/
 
 # Create data directories.
 #

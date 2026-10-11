@@ -49,6 +49,9 @@ docs/
 plan.md
 deploy/
 scripts/
+!scripts/
+scripts/*
+!scripts/build-version.rs
 
 # Keep Cargo.lock and Cargo.toml
 !Cargo.lock

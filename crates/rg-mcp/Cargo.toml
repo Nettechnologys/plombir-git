@@ -1,6 +1,6 @@
 [package]
 name = "rg-mcp"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Plombir Git MCP server (stdio) exposing repository tools to AI agents"
 repository = "https://github.com/Nettechnologys/plombir-git"

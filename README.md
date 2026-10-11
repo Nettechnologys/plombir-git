@@ -261,6 +261,18 @@ fresh instance, then register at least one signing key.
 
 ## Quick start
 
+Tagged builds are available under [GitHub Releases](https://github.com/Nettechnologys/plombir-git/releases).
+Each release includes Linux x86_64 and aarch64 archives, SHA-256 checksums,
+SPDX SBOMs and a multi-architecture image at
+`ghcr.io/nettechnologys/plombir-git:v0.1.0` (substitute the desired tag).
+Run an unpacked binary from its archive directory so its bundled `web/build`
+is found by the default configuration.
+`plombir-git --version`, `plombir-git-runner --version` and
+`plombir-git-mcp --version` identify the build. Pin a deployment to the image
+digest shown by `docker image inspect`, and follow the [migration and rollback
+procedure](deploy/README.md#rolling-back-across-a-migration) before replacing a
+running server.
+
 ### Requirements
 
 - Rust 1.95+ (stable)

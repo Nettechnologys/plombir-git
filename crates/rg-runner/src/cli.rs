@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "plombir-git-runner", about = "Plombir Git CI Runner Agent")]
+#[command(name = "plombir-git-runner", about = "Plombir Git CI Runner Agent", version = env!("PLOMBIR_GIT_VERSION"))]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Commands,
