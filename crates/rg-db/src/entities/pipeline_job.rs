@@ -15,6 +15,10 @@ pub struct Model {
     pub script: String,        // shell commands (newline separated)
     /// JSON object of non-secret variables captured when the pipeline is created.
     pub variables: Option<String>,
+    /// Encrypted snapshot of the secret values sent to an external runner.
+    /// Retained until the runner finishes so log retries use the same mask.
+    #[serde(skip_serializing)]
+    pub mask_secrets_encrypted: Option<String>,
     pub cache_key: Option<String>,
     /// JSON array of workspace-relative cache paths.
     pub cache_paths: Option<String>,

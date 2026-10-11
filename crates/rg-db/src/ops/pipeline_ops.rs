@@ -362,6 +362,10 @@ pub async fn play_manual_job(db: &impl ConnectionTrait, id: i64) -> Result<bool>
             pipeline_job::Column::RunnerId,
             Expr::value(sea_orm::Value::BigInt(None)),
         )
+        .col_expr(
+            pipeline_job::Column::MaskSecretsEncrypted,
+            Expr::value(Option::<String>::None),
+        )
         .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now))
         .exec(db)
         .await
@@ -1769,6 +1773,10 @@ pub async fn reset_stuck_job(db: &DatabaseConnection, job_id: i64) -> Result<()>
             pipeline_job::Column::RunnerId,
             Expr::value(sea_orm::Value::BigInt(None)),
         )
+        .col_expr(
+            pipeline_job::Column::MaskSecretsEncrypted,
+            Expr::value(Option::<String>::None),
+        )
         .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now))
         .exec(db)
         .await
@@ -1797,6 +1805,10 @@ pub async fn hand_back_active_job(db: &impl ConnectionTrait, job_id: i64) -> Res
         .col_expr(
             pipeline_job::Column::RunnerId,
             Expr::value(sea_orm::Value::BigInt(None)),
+        )
+        .col_expr(
+            pipeline_job::Column::MaskSecretsEncrypted,
+            Expr::value(Option::<String>::None),
         )
         .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now))
         .exec(db)
@@ -1838,6 +1850,10 @@ pub async fn reset_runner_jobs(db: &impl ConnectionTrait, runner_id: i64) -> Res
             pipeline_job::Column::RunnerId,
             Expr::value(sea_orm::Value::BigInt(None)),
         )
+        .col_expr(
+            pipeline_job::Column::MaskSecretsEncrypted,
+            Expr::value(Option::<String>::None),
+        )
         .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now))
         .exec(db)
         .await
@@ -1871,6 +1887,27 @@ pub async fn reset_runner_jobs(db: &impl ConnectionTrait, runner_id: i64) -> Res
 /// A refused claim is not an error: the row simply belongs to someone else now,
 /// or the pipeline was canceled. `poll_job` looks for the next candidate.
 pub async fn assign_job(db: &DatabaseConnection, job_id: i64, runner_id: i64) -> Result<bool> {
+    assign_job_with_snapshot(db, job_id, runner_id, None).await
+}
+
+/// Claim a job and persist its sealed log mask in the same conditional write.
+/// The runner must never receive secret values without the matching durable
+/// snapshot; a refused claim stores neither ownership nor the snapshot.
+pub async fn assign_job_with_mask_snapshot(
+    db: &DatabaseConnection,
+    job_id: i64,
+    runner_id: i64,
+    encrypted_snapshot: &str,
+) -> Result<bool> {
+    assign_job_with_snapshot(db, job_id, runner_id, Some(encrypted_snapshot)).await
+}
+
+async fn assign_job_with_snapshot(
+    db: &DatabaseConnection,
+    job_id: i64,
+    runner_id: i64,
+    encrypted_snapshot: Option<&str>,
+) -> Result<bool> {
     let now = chrono::Utc::now().naive_utc();
     let result = pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::Id.eq(job_id))
@@ -1878,6 +1915,10 @@ pub async fn assign_job(db: &DatabaseConnection, job_id: i64, runner_id: i64) ->
         .filter(pipeline_job::Column::RunnerId.is_null())
         .col_expr(pipeline_job::Column::Status, Expr::value("assigned"))
         .col_expr(pipeline_job::Column::RunnerId, Expr::value(runner_id))
+        .col_expr(
+            pipeline_job::Column::MaskSecretsEncrypted,
+            Expr::value(encrypted_snapshot.map(str::to_owned)),
+        )
         .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now))
         .exec(db)
         .await
@@ -2336,6 +2377,16 @@ pub async fn finish_runner_job(
                     pipeline_completed_now: false,
                 });
             }
+
+            pipeline_job::Entity::update_many()
+                .filter(pipeline_job::Column::Id.eq(job_id))
+                .col_expr(
+                    pipeline_job::Column::MaskSecretsEncrypted,
+                    Expr::value(Option::<String>::None),
+                )
+                .exec(&tx)
+                .await
+                .context("db: clear finished runner job log mask")?;
 
             let (completed_pipeline, pipeline_completed_now) =
                 if try_update_stage(&tx, stage_id).await?.is_some() {

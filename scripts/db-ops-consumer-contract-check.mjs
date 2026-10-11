@@ -237,6 +237,12 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
       'arc is live, it is the argument-less spelling that no producer needs, because every ' +
       'producer resolves a `concurrency:` group first (which is `None` for most workflows anyway)',
   ],
+  [
+    'crates/rg-db/src/ops/pipeline_ops.rs::assign_job',
+    'the plain claim is used by test fixtures for assignment races and runner ownership. ' +
+      'Production must use `assign_job_with_mask_snapshot`, which atomically stores the sealed ' +
+      'log mask for the secrets delivered with the claimed job',
+  ],
 ]);
 
 function declarationKey({ name, file }) {

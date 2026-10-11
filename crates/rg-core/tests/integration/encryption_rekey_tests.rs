@@ -17,7 +17,7 @@ use rg_core::auth::encrypted_columns::LABELS;
 use rg_core::auth::encryption;
 use rg_core::auth::key_check::verify_encryption_key;
 use rg_core::auth::rekey::{rekey, RekeyReport};
-use sea_orm::{ActiveValue::NotSet, DatabaseConnection, Set};
+use sea_orm::{ActiveValue::NotSet, ColumnTrait, DatabaseConnection, QueryFilter, Set};
 
 const OLD_SECRET: &str = "the-secret-this-database-was-built-with";
 const NEW_SECRET: &str = "a-freshly-generated-secret-after-a-leak";
@@ -53,7 +53,7 @@ async fn store_live_totp_secret(db: &sea_orm::DatabaseConnection, user_id: i64, 
 /// secret and a signed webhook on a repository, and the instance signing key
 /// established — the things an operator would lose if a key rotation quietly
 /// skipped a column.
-async fn live_instance(db: &DatabaseConnection, secret: &str) {
+async fn live_instance(db: &DatabaseConnection, secret: &str) -> i64 {
     let user = rg_db::ops::user_ops::create_user(db, "alice", "alice@example.invalid", "", "Alice")
         .await
         .expect("create user");
@@ -113,6 +113,7 @@ async fn live_instance(db: &DatabaseConnection, secret: &str) {
     rg_core::auth::instance_key::load_or_adopt(db, "a-signing-secret", secret)
         .await
         .expect("establish the instance signing key");
+    repo.id
 }
 
 async fn stored_totp(db: &DatabaseConnection) -> String {
@@ -198,6 +199,77 @@ async fn a_live_database_moves_onto_the_new_key() {
     verify_encryption_key(&db, OLD_SECRET)
         .await
         .expect_err("the old key must now be refused");
+}
+
+/// An in-flight runner still needs its original mask after the at-rest key is
+/// rotated. A stored mask must travel with the encrypted registry regardless
+/// of the job's other state.
+#[tokio::test]
+async fn a_stored_job_mask_survives_key_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(dir.path()).await;
+    let repo_id = live_instance(&db, OLD_SECRET).await;
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo_id,
+        "0123456789abcdef",
+        "main",
+        "push",
+        None,
+    )
+    .await
+    .expect("create pipeline");
+    let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+        .await
+        .expect("create stage");
+    let job = rg_db::ops::pipeline_ops::create_job(
+        &db,
+        stage.id,
+        "test",
+        "echo test",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create job");
+    let old_mask = r#"["secret-delivered-to-runner"]"#;
+    let sealed = encryption::encrypt(old_mask, &encryption::derive_key(OLD_SECRET)).unwrap();
+    use sea_orm::EntityTrait;
+    rg_db::entities::pipeline_job::Entity::update_many()
+        .col_expr(
+            rg_db::entities::pipeline_job::Column::MaskSecretsEncrypted,
+            sea_orm::sea_query::Expr::value(sealed),
+        )
+        .filter(rg_db::entities::pipeline_job::Column::Id.eq(job.id))
+        .exec(&db)
+        .await
+        .expect("store the assigned mask");
+
+    let report = rekey(&db, OLD_SECRET, NEW_SECRET, false)
+        .await
+        .expect("rotate the encryption key");
+    assert_eq!(
+        column(&report, "pipeline_jobs.mask_secrets_encrypted").rewritten,
+        1
+    );
+    let job = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+        .await
+        .expect("read job")
+        .expect("job remains");
+    let rotated = job.mask_secrets_encrypted.expect("mask remains");
+    assert!(!opens(&rotated, OLD_SECRET));
+    assert_eq!(
+        encryption::decrypt(&rotated, &encryption::derive_key(NEW_SECRET)).unwrap(),
+        old_mask
+    );
 }
 
 /// The instance's provenance identity has to survive the rotation *unchanged*:

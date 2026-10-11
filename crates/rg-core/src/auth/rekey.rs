@@ -37,7 +37,9 @@ use sea_orm::{
     QueryOrder, Set, TransactionTrait,
 };
 
-use rg_db::entities::{ci_secret, instance_signing_key, mirror, sso_provider, user, webhook};
+use rg_db::entities::{
+    ci_secret, instance_signing_key, mirror, pipeline_job, sso_provider, user, webhook,
+};
 
 use crate::auth::encrypted_columns::with_encrypted_columns;
 use crate::auth::encryption;

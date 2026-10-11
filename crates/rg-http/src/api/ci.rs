@@ -281,7 +281,7 @@ pub async fn get_workflow_dispatch_schema(
     }
 
     let ref_name = canonical_pipeline_ref(params.ref_name.as_deref(), &repo.default_branch);
-    let commit_sha = match resolve_commit_sha(&repo_path, &ref_name) {
+    let commit_sha = match resolve_commit_sha(&repo_path, &ref_name).await {
         Ok(Some(sha)) => sha,
         Ok(None) => {
             return AppError::bad_request(format!("cannot resolve commit SHA for ref {ref_name}"))
@@ -675,7 +675,7 @@ pub async fn trigger_pipeline(
     // the branch it should have used was sitting in the row the gate had
     // already read.
     let ref_name = canonical_pipeline_ref(body.ref_name.as_deref(), &repo.default_branch);
-    let commit_sha = match resolve_commit_sha(&repo_path, &ref_name) {
+    let commit_sha = match resolve_commit_sha(&repo_path, &ref_name).await {
         Ok(Some(sha)) => sha,
         Ok(None) => {
             // Naming the ref is the whole point: the caller has to be able to
@@ -792,7 +792,7 @@ pub async fn retry_pipeline(
         return AppError::from(e).into_response();
     }
 
-    match resolve_commit_sha(&repo_path, &pipeline.ref_name) {
+    match resolve_commit_sha(&repo_path, &pipeline.ref_name).await {
         // Retry deliberately keeps the original commit even when a live branch
         // has advanced. Existence is the lifecycle question here; equality
         // would silently change reruns into builds of the branch's new head.
@@ -1024,7 +1024,7 @@ async fn reconcile_published_pipeline_ref(
     ref_name: &str,
     pipeline_id: i64,
 ) -> Result<(), AppError> {
-    match resolve_commit_sha(repo_path, ref_name) {
+    match resolve_commit_sha(repo_path, ref_name).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => {
             rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, pipeline_id)
@@ -1039,7 +1039,30 @@ async fn reconcile_published_pipeline_ref(
     }
 }
 
-fn resolve_commit_sha(
+async fn resolve_commit_sha(
+    repo_path: &std::path::Path,
+    ref_name: &str,
+) -> anyhow::Result<Option<String>> {
+    resolve_commit_sha_with(repo_path, ref_name, resolve_commit_sha_sync).await
+}
+
+async fn resolve_commit_sha_with<F>(
+    repo_path: &std::path::Path,
+    ref_name: &str,
+    lookup: F,
+) -> anyhow::Result<Option<String>>
+where
+    F: FnOnce(&std::path::Path, &str) -> anyhow::Result<Option<String>> + Send + 'static,
+{
+    let repo_path = repo_path.to_path_buf();
+    let ref_name = ref_name.to_owned();
+    rg_core::blocking::run_blocking_git("resolve CI commit ref", move || {
+        lookup(&repo_path, &ref_name)
+    })
+    .await
+}
+
+fn resolve_commit_sha_sync(
     repo_path: &std::path::Path,
     ref_name: &str,
 ) -> anyhow::Result<Option<String>> {
@@ -1148,7 +1171,7 @@ mod tests {
     fn an_absent_ref_stays_a_client_negative_answer() {
         let (temp, _, _) = commit_repo();
         assert_eq!(
-            resolve_commit_sha(temp.path(), "refs/heads/missing").unwrap(),
+            resolve_commit_sha_sync(temp.path(), "refs/heads/missing").unwrap(),
             None
         );
     }
@@ -1167,12 +1190,43 @@ mod tests {
         );
         std::fs::remove_file(object_path).expect("remove commit object");
 
-        let error = resolve_commit_sha(temp.path(), &branch)
+        let error = resolve_commit_sha_sync(temp.path(), &branch)
             .expect_err("a dangling ref must not become an absent client ref");
         assert!(
             format!("{error:#}").contains("failed to peel ref"),
             "error must retain the object-store failure: {error:#}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_ci_ref_lookup_does_not_block_the_async_worker() {
+        let (temp, _, branch) = commit_repo();
+        let path = temp.path().to_path_buf();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            release_tx.send(()).expect("release delayed Git lookup");
+        });
+        let started = std::time::Instant::now();
+        let lookup = tokio::spawn(async move {
+            resolve_commit_sha_with(&path, &branch, move |path, branch| {
+                entered_tx.send(()).expect("signal lookup start");
+                release_rx.recv().expect("wait for lookup release");
+                resolve_commit_sha_sync(path, branch)
+            })
+            .await
+        });
+        entered_rx.await.expect("blocking lookup must start");
+        tokio::spawn(async {})
+            .await
+            .expect("cheap async task must run");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the Git lookup held the only async worker"
+        );
+        assert!(lookup.await.expect("lookup task").unwrap().is_some());
+        release.join().expect("release thread");
     }
 
     #[tokio::test]

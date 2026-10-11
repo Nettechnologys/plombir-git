@@ -148,6 +148,7 @@ pub mod m20261009_000910_user_email_verified_at;
 pub mod m20261009_000920_repository_redirects;
 pub mod m20261010_000001_create_commit_signing_keys;
 pub mod m20261010_000002_job_log_chunks;
+pub mod m20261011_000001_runner_job_mask_snapshot;
 
 use sea_orm_migration::prelude::*;
 
@@ -386,6 +387,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261009_000920_repository_redirects::Migration),
             Box::new(m20261010_000001_create_commit_signing_keys::Migration),
             Box::new(m20261010_000002_job_log_chunks::Migration),
+            Box::new(m20261011_000001_runner_job_mask_snapshot::Migration),
         ]
     }
 }

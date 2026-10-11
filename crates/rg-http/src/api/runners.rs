@@ -676,9 +676,11 @@ pub async fn poll_job(
                     for reserved in rg_core::ci::BUILTIN_CI_VARIABLES {
                         variables.remove(reserved);
                     }
+                    let mut mask_secrets = Vec::new();
                     match decrypted_repo_secrets(&state, pipeline.repo_id).await {
                         Ok(secrets) => {
                             for (name, value) in secrets {
+                                mask_secrets.push(value.clone());
                                 variables.insert(name, serde_json::json!(value));
                             }
                         }
@@ -766,6 +768,15 @@ pub async fn poll_job(
                         );
                     }
 
+                    let encrypted_mask = match encrypt_job_mask(&state, &mask_secrets) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            tracing::error!(job_id = job.id, error = %format!("{error:#}"), "failed to seal runner log mask");
+                            return Err(AppError::internal("failed to prepare job log mask")
+                                .into_response());
+                        }
+                    };
+
                     let resp = PollJobResponse {
                         job_id: job.id,
                         pipeline_id,
@@ -793,8 +804,13 @@ pub async fn poll_job(
                     // database choose between a concurrent cancellation or
                     // poller. A refused claim needs no backoff: the candidate
                     // query can no longer return that row in the same state.
-                    match rg_db::ops::pipeline_ops::assign_job(&state.db, resp.job_id, runner_id)
-                        .await
+                    match rg_db::ops::pipeline_ops::assign_job_with_mask_snapshot(
+                        &state.db,
+                        resp.job_id,
+                        runner_id,
+                        &encrypted_mask,
+                    )
+                    .await
                     {
                         Ok(true) => {}
                         Ok(false) => {
@@ -980,14 +996,21 @@ pub async fn upload_log(
         Err(error) => return error.into_response(),
     };
 
-    let body = match secrets_for_job(&state, job.stage_id).await {
-        Ok(secrets) => {
+    let body = match decrypt_job_mask(&state, &job) {
+        Ok(mut secrets) => {
+            match secrets_for_job(&state, job.stage_id).await {
+                Ok(current) => secrets.extend(current),
+                Err(error) => {
+                    tracing::error!(job_id, error = %format!("{error:#}"), "failed to load current secrets while masking runner log");
+                    return AppError::internal("failed to sanitize job log").into_response();
+                }
+            }
             let body =
                 rg_core::auth::ci_token::mask_job_tokens_in_log(&body, &state.jwt_secret, job_id);
             rg_core::auth::encryption::mask_values(&body, &secrets)
         }
         Err(error) => {
-            tracing::error!(job_id, error = %format!("{error:#}"), "failed to load secrets while masking runner log");
+            tracing::error!(job_id, error = %format!("{error:#}"), "failed to load issued secret snapshot while masking runner log");
             return AppError::internal("failed to sanitize job log").into_response();
         }
     };
@@ -1686,6 +1709,25 @@ async fn decrypted_repo_secrets(
     Ok(values)
 }
 
+fn encrypt_job_mask(state: &AppState, secrets: &[String]) -> anyhow::Result<String> {
+    let values = serde_json::to_string(secrets)?;
+    let key = rg_core::auth::encryption::derive_key(&state.encryption_key);
+    rg_core::auth::encryption::encrypt(&values, &key)
+}
+
+fn decrypt_job_mask(
+    state: &AppState,
+    job: &rg_db::entities::pipeline_job::Model,
+) -> anyhow::Result<Vec<String>> {
+    let snapshot = job
+        .mask_secrets_encrypted
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("job has no issued secret snapshot"))?;
+    let key = rg_core::auth::encryption::derive_key(&state.encryption_key);
+    let values = rg_core::auth::encryption::decrypt(snapshot, &key)?;
+    Ok(serde_json::from_str(&values)?)
+}
+
 async fn secrets_for_job(state: &AppState, stage_id: i64) -> anyhow::Result<Vec<String>> {
     let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, stage_id)
         .await?
@@ -2117,11 +2159,14 @@ mod poll_job_delivery_tests {
     }
 
     fn claim_is_the_last_await_before_delivery(source: &str) -> Result<(), String> {
-        let claims =
-            rust_source::production_function_call_sites(source, "poll_job", &["assign_job"]);
+        let claims = rust_source::production_function_call_sites(
+            source,
+            "poll_job",
+            &["assign_job_with_mask_snapshot"],
+        );
         let [claim] = claims.as_slice() else {
             return Err(format!(
-                "expected one production `assign_job` in `poll_job`, found {}",
+                "expected one production `assign_job_with_mask_snapshot` in `poll_job`, found {}",
                 claims.len()
             ));
         };
@@ -2163,7 +2208,7 @@ mod poll_job_delivery_tests {
     }
 
     /// A long-poll future is canceled when its timeout expires and when the
-    /// client disconnects. Once `assign_job` commits, no fallible async work may
+    /// client disconnects. Once `assign_job_with_mask_snapshot` commits, no fallible async work may
     /// remain between that point of no return and handing the prepared body to
     /// Axum, or the row can be stranded without any runner learning its id.
     #[test]
@@ -2179,7 +2224,7 @@ mod poll_job_delivery_tests {
     fn guard_rejects_the_pre_fix_claim_order() {
         const PRE_FIX_ORDER: &str = r#"
             pub async fn poll_job() {
-                match assign_job().await {}
+                match assign_job_with_mask_snapshot().await {}
                 let stage = get_stage_by_id().await;
                 let resp = PollJobResponse {};
                 return Ok((StatusCode::OK, Json(resp)));
@@ -2188,7 +2233,7 @@ mod poll_job_delivery_tests {
 
         assert!(
             claim_is_the_last_await_before_delivery(PRE_FIX_ORDER).is_err(),
-            "moving `assign_job` back above response preparation must fail the guard"
+            "moving `assign_job_with_mask_snapshot` back above response preparation must fail the guard"
         );
     }
 }

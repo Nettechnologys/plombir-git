@@ -80,6 +80,12 @@ const CIPHERTEXT_PRODUCERS = [
     why: 'a CI secret is sealed on the way in and only ever opened by a job',
   },
   {
+    file: 'crates/rg-http/src/api/runners.rs',
+    sites: 1,
+    writes: ['pipeline_jobs.mask_secrets_encrypted'],
+    why: 'runner poll seals the exact secret values it sends, retaining the mask until the job finishes even if those secrets rotate',
+  },
+  {
     file: 'crates/rg-http/src/api/admin.rs',
     sites: 4,
     writes: ['sso_providers.client_secret_enc', 'sso_providers.ldap_bind_password_enc'],

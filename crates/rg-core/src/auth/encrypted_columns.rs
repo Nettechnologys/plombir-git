@@ -39,6 +39,10 @@ macro_rules! with_encrypted_columns {
                 "users.pending_totp_secret", optional;
             ci_secret, EncryptedValue, encrypted_value,
                 "ci_secrets.encrypted_value", required;
+            // The values delivered to a runner remain sealed until its final
+            // log upload, even if the original CI secrets rotate meanwhile.
+            pipeline_job, MaskSecretsEncrypted, mask_secrets_encrypted,
+                "pipeline_jobs.mask_secrets_encrypted", optional;
             sso_provider, ClientSecretEnc, client_secret_enc,
                 "sso_providers.client_secret_enc", optional;
             sso_provider, LdapBindPasswordEnc, ldap_bind_password_enc,
