@@ -23,6 +23,7 @@ struct TriggerGate {
 
 #[derive(Default)]
 struct RecordingCiEngine {
+    config_verdict: Mutex<Option<Result<bool, String>>>,
     triggered: Mutex<Vec<String>>,
     refs: Mutex<Vec<String>>,
     dispatch_inputs: Mutex<Vec<std::collections::HashMap<String, String>>>,
@@ -69,6 +70,14 @@ impl RecordingCiEngine {
 impl rg_core::ci::CiTrigger for RecordingCiEngine {
     fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
         true
+    }
+
+    fn has_ci_config_checked(&self, _repo_path: &Path, _commit_sha: &str) -> anyhow::Result<bool> {
+        match &*self.config_verdict.lock().unwrap() {
+            Some(Ok(present)) => Ok(*present),
+            Some(Err(message)) => anyhow::bail!("{message}"),
+            None => Ok(true),
+        }
     }
 
     fn has_workflow_for_event(&self, _query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
@@ -550,6 +559,35 @@ async fn a_manual_run_without_a_ref_builds_the_repositorys_default_branch() {
         h.engine.refs.lock().unwrap().as_slice(),
         ["refs/heads/develop".to_string()],
         "the fallback built a branch the repository does not use"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_ci_config_gate_keeps_absent_and_unreadable_responses() {
+    let h = harness("config-gate").await;
+    write_default_branch(&h, "README.md").await;
+    h.settle().await;
+    let client = reqwest::Client::new();
+
+    for verdict in [Ok(false), Err("unreadable Git store".to_string())] {
+        *h.engine.config_verdict.lock().unwrap() = Some(verdict);
+        let response = client
+            .post(format!(
+                "{}/api/v1/repos/{}/trg-repo/pipelines",
+                h.base, h.owner
+            ))
+            .bearer_auth(&h.token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("trigger pipeline");
+        assert_eq!(response.status(), 400);
+        let body = response.text().await.expect("read response");
+        assert!(body.contains(rg_core::ci::NO_CI_CONFIG_MESSAGE), "{body}");
+    }
+    assert!(
+        h.engine.pipeline_ids.lock().unwrap().is_empty(),
+        "a rejected config gate must not create a pipeline"
     );
 }
 

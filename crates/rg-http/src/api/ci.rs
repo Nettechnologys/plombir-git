@@ -690,7 +690,21 @@ pub async fn trigger_pipeline(
     // Check if CI config exists. The wording lives in `rg_core::ci` next to the
     // gate itself: this used to say `no .plombir-git-ci.yml found`, which lied to
     // every repository driving CI from `.gitea/workflows/`.
-    if !state.ci_engine.has_ci_config(&repo_path, &commit_sha) {
+    let has_ci_config = match state
+        .ci_engine
+        .has_ci_config_checked_async(&repo_path, &commit_sha)
+        .await
+    {
+        Ok(present) => present,
+        Err(error) => {
+            tracing::warn!(
+                repo = %repo_path.display(),
+                "CI gate: cannot open repository, treating the commit as having no CI config: {error:#}"
+            );
+            false
+        }
+    };
+    if !has_ci_config {
         return AppError::bad_request(rg_core::ci::NO_CI_CONFIG_MESSAGE).into_response();
     }
 

@@ -56,6 +56,7 @@ http = "1"
 # Package uploads are spooled to a request-private temporary file rather than
 # collected in heap; `PackageArtifact` owns that `TempPath`.
 tempfile = "3"
+fs2 = { workspace = true }
 
 # Effective uid/gid of the running process, for the bind-mount ownership
 # diagnostic in `platform::fs::ownership_hint` (std exposes no uid API).

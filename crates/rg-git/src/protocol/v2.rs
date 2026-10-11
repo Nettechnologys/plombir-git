@@ -1106,7 +1106,7 @@ async fn handle_object_info<W: AsyncWrite + Unpin>(
     _server_options: &[String],
 ) -> Result<()> {
     // Get object size
-    let size = get_object_size(repo_path, oid)?;
+    let size = object_size_with(repo_path, oid, get_object_size).await?;
 
     write_pkt_line(writer, &PktLine::text("size")).await?;
     let mut line = String::with_capacity(oid.len() + 22);
@@ -1120,6 +1120,17 @@ async fn handle_object_info<W: AsyncWrite + Unpin>(
 }
 
 // ─── Git Operations ───────────────────────────────────────────────────────────
+
+/// Keep the complete object lookup off the async worker. The injected reader
+/// lets the liveness test hold a real lookup without relying on a slow disk.
+async fn object_size_with<F>(repo_path: &Path, oid: &str, read: F) -> Result<u64>
+where
+    F: FnOnce(&Path, &str) -> Result<u64> + Send + 'static,
+{
+    let repo_path = repo_path.to_path_buf();
+    let oid = oid.to_string();
+    crate::ref_advertisement::run_blocking_ref_read(move || read(&repo_path, &oid)).await
+}
 
 /// Get the peel (dereferenced) SHA of a tag using gix API.
 fn get_tag_peel(repo_path: &Path, sha: &str) -> Result<String> {
@@ -1576,6 +1587,66 @@ mod tests {
             !rendered.contains("not found"),
             "a storage failure must not be reported as a missing object: {rendered}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_object_lookup_leaves_the_async_worker_free() {
+        use std::time::{Duration, Instant};
+
+        let (_dir, repo_path, oid) = repository_with_commit();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            release_tx.send(()).expect("release object lookup");
+        });
+        let lookup = tokio::spawn(async move {
+            object_size_with(&repo_path, &oid, move |path, oid| {
+                entered_tx.send(()).expect("signal object lookup start");
+                release_rx.recv().expect("wait for object lookup release");
+                get_object_size(path, oid)
+            })
+            .await
+        });
+        entered_rx.await.expect("object lookup starts");
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_millis(500), tokio::spawn(async {}))
+            .await
+            .expect("object lookup blocked the only async worker")
+            .expect("cheap task joins");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(lookup.await.unwrap().unwrap() > 0);
+        release.join().expect("release thread joins");
+    }
+
+    #[tokio::test]
+    async fn object_info_keeps_the_size_response_and_object_errors() {
+        let (_dir, repo_path, oid) = repository_with_commit();
+        let expected_size = get_object_size(&repo_path, &oid).expect("read fixture commit");
+        let mut response = Vec::new();
+        handle_object_info(&repo_path, &mut response, &oid, &[])
+            .await
+            .expect("object-info succeeds");
+        let response = String::from_utf8(response).expect("packet lines are UTF-8");
+        assert!(response.contains(&format!("{oid} {expected_size}")));
+        assert!(response.ends_with("0000"));
+
+        let missing = handle_object_info(&repo_path, &mut Vec::new(), &"b".repeat(40), &[])
+            .await
+            .expect_err("absent object remains an error");
+        assert!(format!("{missing:#}").contains("not found"));
+
+        let loose = repo_path
+            .join(".git/objects")
+            .join(&oid[..2])
+            .join(&oid[2..]);
+        std::fs::remove_file(&loose).unwrap();
+        std::fs::write(&loose, b"not a zlib stream").unwrap();
+        let unreadable = handle_object_info(&repo_path, &mut Vec::new(), &oid, &[])
+            .await
+            .expect_err("corrupt object remains an error");
+        let rendered = format!("{unreadable:#}");
+        assert!(rendered.contains("failed to read object"), "{rendered}");
     }
 
     #[tokio::test]

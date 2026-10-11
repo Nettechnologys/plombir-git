@@ -1731,22 +1731,10 @@ async fn clone_repo(
     crate::import::trust::ImportTransportPolicy::require_confidential_transport(remote.url())?;
 
     let target_dir = repo_root.join(format!("{}/{}.git", owner, name));
-    if target_holds_history(&target_dir) {
-        tracing::info!(
-            path = %target_dir.display(),
-            "Import target already holds a repository, skipping clone"
-        );
-        return Ok(CloneOutcome::Skipped);
-    }
-
     let parent = target_dir
         .parent()
-        .context("import target path has no parent directory")?;
-    // The whole path is derived from `repo_root` inside this function, so a bare
-    // `?` here hands the operator an `os error 13` that names neither the
-    // directory the import tried to create nor the setting that moves it.
-    std::fs::create_dir_all(parent)
-        .map_err(|error| path_error("import target directory", parent, &error, REPO_ROOT_HINT))?;
+        .context("import target path has no parent directory")?
+        .to_path_buf();
 
     // A per-pass token, so neither working path can collide with the target,
     // with a repository sitting next to it, or with another pass importing the
@@ -1763,26 +1751,61 @@ async fn clone_repo(
     let staging = parent.join(crate::staging::import_clone_staging_name(name, pass));
     let retired = parent.join(format!(".{name}.git.replaced-{token}"));
 
-    let staged_clone = StagedImportClone::new(staging.clone());
-    let mut staged_clone =
-        crate::blocking::run_blocking_git("import repository clone", move || {
-            // Repeat the policy at the actual sink. The check above preserves the
-            // existing fail-before-filesystem contract; this one keeps the owned
-            // guarded remote coupled to the subprocess that consumes it.
-            crate::import::trust::ImportTransportPolicy::require_confidential_transport(
-                remote.url(),
-            )?;
-            let git = global_gateway()
-                .as_ref()
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let invocation = remote.bind_invocation(credential_invocation(credentials.as_ref()))?;
-            let destination = staged_clone.path.to_string_lossy();
-            invocation
-                .run(git, &["clone", "--bare", remote.url(), &destination], None)
-                .and_then(|output| output.ensure_success().context("git clone --bare"))?;
-            Ok(staged_clone)
-        })
-        .await?;
+    let target_for_clone = target_dir.clone();
+    let parent_for_clone = parent.clone();
+    let staging_for_clone = staging.clone();
+    let prepared = crate::blocking::run_blocking_git("import repository clone", move || {
+        // Lock the stable owner directory before reading the target and keep
+        // the lock through installation. Two imports of the same target must
+        // not both see the empty skeleton and install over one another.
+        std::fs::create_dir_all(&parent_for_clone).map_err(|error| {
+            path_error(
+                "import target directory",
+                &parent_for_clone,
+                &error,
+                REPO_ROOT_HINT,
+            )
+        })?;
+        let import_lock = std::fs::File::open(&parent_for_clone).map_err(|error| {
+            path_error(
+                "import target directory",
+                &parent_for_clone,
+                &error,
+                REPO_ROOT_HINT,
+            )
+        })?;
+        fs2::FileExt::lock_exclusive(&import_lock)
+            .context("failed to lock import target directory")?;
+        if target_holds_history(&target_for_clone) {
+            return Ok(None);
+        }
+
+        let staged_clone = StagedImportClone::new(staging_for_clone);
+        // Repeat the policy at the actual sink. The check above preserves the
+        // existing fail-before-filesystem contract; this one keeps the owned
+        // guarded remote coupled to the subprocess that consumes it.
+        crate::import::trust::ImportTransportPolicy::require_confidential_transport(remote.url())?;
+        let git = global_gateway()
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let invocation = remote.bind_invocation(credential_invocation(credentials.as_ref()))?;
+        let destination = staged_clone.path.to_string_lossy();
+        invocation
+            .run(git, &["clone", "--bare", remote.url(), &destination], None)
+            .and_then(|output| output.ensure_success().context("git clone --bare"))?;
+        Ok(Some((import_lock, staged_clone)))
+    })
+    .await?;
+    let (_import_lock, mut staged_clone) = match prepared {
+        Some(prepared) => prepared,
+        None => {
+            tracing::info!(
+                path = %target_dir.display(),
+                "Import target already holds a repository, skipping clone"
+            );
+            return Ok(CloneOutcome::Skipped);
+        }
+    };
 
     // The skeleton is about to leave its live name by rename, and a rename is
     // only reversible by the process that made it. Declared one statement
@@ -5621,6 +5644,131 @@ mod clone_effect_tests {
             vec![(existing, "refs/heads/main".to_string())],
             "the import overwrote a repository that already had a history"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_target_ref_read_leaves_the_async_worker_free() {
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repo_root = directory.path().join("repos");
+        let parent = repo_root.join("importer");
+        std::fs::create_dir_all(&parent).expect("owner directory");
+        let target = parent.join("occupied.git");
+        upstream_with_a_commit(&target);
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let parent_for_lock = parent.clone();
+        let lock_holder = std::thread::spawn(move || {
+            let guard = std::fs::File::open(parent_for_lock).expect("open owner directory");
+            fs2::FileExt::lock_exclusive(&guard).expect("lock owner directory");
+            entered_tx.send(()).expect("signal held lock");
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        entered_rx.await.expect("target lock is held");
+
+        let clone = tokio::spawn(async move {
+            clone_repo(
+                crate::net::GuardedGitRemote::unbound_for_test(
+                    "https://example.invalid/unused.git",
+                ),
+                &repo_root,
+                "importer",
+                "occupied",
+                None,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_millis(500), tokio::spawn(async {}))
+            .await
+            .expect("target ref read blocked the only async worker")
+            .expect("cheap task joins");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(clone.await.unwrap().unwrap(), CloneOutcome::Skipped);
+        lock_holder.join().expect("lock holder joins");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_imports_install_only_one_clone() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        let expected = upstream_with_a_commit(&upstream);
+        let source_url = upstream.to_string_lossy().to_string();
+        let repo_root = directory.path().join("repos");
+        let parent = repo_root.join("importer");
+        std::fs::create_dir_all(&parent).expect("owner directory");
+        let target = parent.join("shared.git");
+        git(
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                &target.to_string_lossy(),
+            ],
+            None,
+        );
+
+        let (first, second) = tokio::join!(
+            clone_repo(
+                crate::net::GuardedGitRemote::unbound_for_test(&source_url),
+                &repo_root,
+                "importer",
+                "shared",
+                None,
+            ),
+            clone_repo(
+                crate::net::GuardedGitRemote::unbound_for_test(&source_url),
+                &repo_root,
+                "importer",
+                "shared",
+                None,
+            )
+        );
+        assert!(
+            matches!(
+                (first.unwrap(), second.unwrap()),
+                (CloneOutcome::Cloned, CloneOutcome::Skipped)
+                    | (CloneOutcome::Skipped, CloneOutcome::Cloned)
+            ),
+            "only the first importer may replace the empty skeleton"
+        );
+        let refs = rg_git::ref_advertisement::collect(&target).expect("read installed clone");
+        assert_eq!(refs.head_oid.as_deref(), Some(expected.as_str()));
+        let leftovers: Vec<_> = std::fs::read_dir(&parent)
+            .expect("read owner directory")
+            .map(|entry| entry.expect("read entry").file_name())
+            .filter(|name| name != "shared.git")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging or skeleton leaked: {leftovers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_target_is_not_cloned_over() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repo_root = directory.path().join("repos");
+        let parent = repo_root.join("importer");
+        std::fs::create_dir_all(&parent).expect("owner directory");
+        let target = parent.join("broken.git");
+        std::fs::write(&target, b"not a Git repository").expect("unreadable target");
+
+        let outcome = clone_repo(
+            crate::net::GuardedGitRemote::unbound_for_test("https://example.invalid/unused.git"),
+            &repo_root,
+            "importer",
+            "broken",
+            None,
+        )
+        .await
+        .expect("an unreadable target is preserved");
+        assert_eq!(outcome, CloneOutcome::Skipped);
+        assert_eq!(std::fs::read(&target).unwrap(), b"not a Git repository");
     }
 
     /// card_0e4d6e7fcdb2: the clone replaces `HEAD` along with everything else,
