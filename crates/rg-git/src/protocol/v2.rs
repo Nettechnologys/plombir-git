@@ -325,7 +325,7 @@ pub enum CommandRequest {
     Unknown(String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ShallowRequest {
     shallows: Vec<String>,
     deepen: Option<u32>,
@@ -750,7 +750,27 @@ async fn fetch_response<W: AsyncWrite + Unpin>(
     if let Some(want) = checked {
         return Err(ClientRefusal::new(format!("upload-pack: not our ref {want}")).into());
     }
-    let shallow_update = build_shallow_update(repo_path, wants, shallow)?;
+    // Both rev-list and object database reads can take arbitrarily long on a
+    // client-selected history. Keep the whole synchronous negotiation phase on
+    // a blocking worker and return only owned response data to the async task.
+    let (shallow_update, common) = {
+        let (path, wants, haves, shallow) = (
+            repo_path.to_path_buf(),
+            wants.to_vec(),
+            haves.to_vec(),
+            shallow.clone(),
+        );
+        run_fetch_negotiation_with(move || {
+            let update = build_shallow_update(&path, &wants, &shallow)?;
+            let common = if wants.is_empty() {
+                Vec::new()
+            } else {
+                acknowledged_haves(&path, &haves)
+            };
+            Ok((update, common))
+        })
+        .await?
+    };
 
     // Check if client supports sideband (Protocol V2 fetch always uses sideband)
     let use_sideband = true; // V2 fetch always uses sideband per spec
@@ -771,8 +791,6 @@ async fn fetch_response<W: AsyncWrite + Unpin>(
     // on `^<oid>` of an object it cannot find, so a client with commits of its
     // own — the ordinary case — failed its fetch the moment a common one
     // arrived in the same round and the server answered `ready`.
-    // Checked synchronously, before any .await: gix::Repository is !Send.
-    let common = acknowledged_haves(repo_path, haves);
     if needs_acknowledgments(haves, done) && !write_acknowledgments(writer, &common).await? {
         return Ok(());
     }
@@ -828,6 +846,15 @@ async fn fetch_response<W: AsyncWrite + Unpin>(
         "Sent V2 fetch packfile"
     );
     Ok(())
+}
+
+async fn run_fetch_negotiation_with<F>(operation: F) -> Result<(Option<ShallowUpdate>, Vec<String>)>
+where
+    F: FnOnce() -> Result<(Option<ShallowUpdate>, Vec<String>)> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .context("V2 fetch negotiation task did not complete")?
 }
 
 /// Return the client's `have` objects that are present in the repository.
@@ -1560,6 +1587,125 @@ mod tests {
             rendered.contains("cannot read object while negotiating"),
             "{rendered}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_fetch_negotiation_leaves_the_async_worker_free() {
+        use std::time::{Duration, Instant};
+
+        // The same boundary owns rev-list and the complete have lookup. Hold
+        // each operation where the synchronous work runs, then schedule a cheap
+        // task on the sole async worker while the blocking worker is occupied.
+        for phase in ["shallow graph", "have lookup"] {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                release_tx.send(()).expect("release fetch negotiation");
+            });
+            let negotiation = tokio::spawn(run_fetch_negotiation_with(move || {
+                entered_tx.send(()).expect("signal negotiation start");
+                release_rx.recv().expect("wait for negotiation release");
+                Ok((None, Vec::new()))
+            }));
+            entered_rx.await.expect("blocking operation starts");
+            let started = Instant::now();
+            tokio::time::timeout(Duration::from_millis(500), tokio::spawn(async {}))
+                .await
+                .unwrap_or_else(|_| panic!("{phase} blocked the only async worker"))
+                .expect("cheap task joins");
+            assert!(started.elapsed() < Duration::from_millis(500));
+            negotiation.await.unwrap().unwrap();
+            release.join().expect("release thread joins");
+        }
+    }
+
+    #[tokio::test]
+    async fn shallow_modes_keep_their_boundaries_across_the_blocking_boundary() {
+        let (_dir, repo_path, oldest) = repository_with_commit();
+        let git = crate::cli_gateway::GitCommandGateway::new().unwrap();
+        let mut commits = vec![oldest];
+        for timestamp in [2_000_000_000_i64, 2_000_000_100] {
+            let date = format!("@{timestamp} +0000");
+            git.run_with_env(
+                &["commit", "--allow-empty", "-qm", "next"],
+                Some(&repo_path),
+                &[("GIT_AUTHOR_DATE", &date), ("GIT_COMMITTER_DATE", &date)],
+            )
+            .unwrap()
+            .ensure_success()
+            .unwrap();
+            commits.push(
+                git.run(&["rev-parse", "HEAD"], Some(&repo_path))
+                    .unwrap()
+                    .stdout_str()
+                    .trim()
+                    .to_string(),
+            );
+        }
+        let tip = commits[2].clone();
+        let requests = [
+            (
+                ShallowRequest {
+                    deepen: Some(1),
+                    ..Default::default()
+                },
+                vec![tip.clone()],
+                vec![format!("shallow {tip}")],
+            ),
+            (
+                ShallowRequest {
+                    shallows: vec![commits[1].clone()],
+                    deepen: Some(1),
+                    deepen_relative: true,
+                    ..Default::default()
+                },
+                vec![],
+                vec![format!("unshallow {}", commits[1])],
+            ),
+            (
+                ShallowRequest {
+                    deepen_since: Some(2_000_000_050),
+                    ..Default::default()
+                },
+                vec![tip.clone()],
+                vec![format!("shallow {tip}")],
+            ),
+            (
+                ShallowRequest {
+                    deepen_not: vec![commits[0].clone()],
+                    ..Default::default()
+                },
+                vec![commits[1].clone()],
+                vec![format!("shallow {}", commits[1])],
+            ),
+        ];
+        for (request, boundaries, response_lines) in requests {
+            let path = repo_path.clone();
+            let want = tip.clone();
+            let (actual, _) = run_fetch_negotiation_with(move || {
+                let update = build_shallow_update(&path, &[want], &request)?;
+                Ok((update, Vec::new()))
+            })
+            .await
+            .expect("blocking calculation succeeds");
+            let actual = actual.expect("request changes depth");
+            assert_eq!(actual.boundaries, boundaries);
+            assert_eq!(actual.response_lines, response_lines);
+        }
+
+        let invalid = ShallowRequest {
+            deepen: Some(1),
+            deepen_relative: true,
+            ..Default::default()
+        };
+        let error = run_fetch_negotiation_with(move || {
+            let update = build_shallow_update(&repo_path, &[tip], &invalid)?;
+            Ok((update, Vec::new()))
+        })
+        .await
+        .expect_err("missing relative boundary stays a client refusal");
+        assert!(super::super::client_refusal(&error).is_some());
     }
 
     /// `object-info` returns an error either way, but the operator reads the

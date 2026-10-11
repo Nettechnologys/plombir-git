@@ -3294,17 +3294,44 @@ pub struct RepoSettingsChange {
 
 /// Keep the Git move, row write and any compensation in one owned task. The
 /// request may disappear while the database is waiting; its waiter must not
-/// own the only code that can put HEAD back after a failed write.
-async fn change_default_branch_with<W, Fut>(
+/// own the only code that can put HEAD back after a failed write. The OS lock
+/// serializes this cross-store operation across server processes, including
+/// the fresh row read and a failed writer's compensation.
+async fn change_default_branch_with<R, RFut, W, WFut>(
     repo_path: std::path::PathBuf,
-    previous: String,
     branch: String,
+    read_row: R,
     write_row: W,
 ) -> Result<()>
 where
-    W: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = Result<bool>>,
+    R: FnOnce() -> RFut,
+    RFut: std::future::Future<Output = Result<String>>,
+    W: FnOnce(String) -> WFut,
+    WFut: std::future::Future<Output = Result<bool>>,
 {
+    let lock_path = repo_path.join("forgekeep-default-branch.lock");
+    let _lock = crate::blocking::run_blocking_git("lock repository default branch", move || {
+        use std::fs::OpenOptions;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open default branch lock: {lock_path:?}"))?;
+        fs2::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("lock repository default branch: {lock_path:?}"))?;
+        Ok(file)
+    })
+    .await?;
+
+    // The request's repository model predates the lock. A second settings
+    // change may have completed while this task waited to acquire it.
+    let previous = read_row().await?;
+    if previous == branch {
+        return Ok(());
+    }
     let path = repo_path.clone();
     let new_branch = branch.clone();
     crate::blocking::run_blocking_git("set repository default HEAD", move || {
@@ -3378,6 +3405,7 @@ mod default_branch_change_tests {
         );
         git(&["commit", "--allow-empty", "-m", "seed"], Some(&source));
         git(&["branch", "dev"], Some(&source));
+        git(&["branch", "release"], Some(&source));
         git(
             &[
                 "clone",
@@ -3400,12 +3428,14 @@ mod default_branch_change_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_row_write_restores_head() {
         let (_temp, bare) = branches();
-        let error =
-            change_default_branch_with(bare.clone(), "main".into(), "dev".into(), |_| async {
-                anyhow::bail!("database write failed")
-            })
-            .await
-            .expect_err("row write must fail");
+        let error = change_default_branch_with(
+            bare.clone(),
+            "dev".into(),
+            || async { Ok("main".into()) },
+            |_| async { anyhow::bail!("database write failed") },
+        )
+        .await
+        .expect_err("row write must fail");
         assert!(format!("{error:#}").contains("database write failed"));
         assert_eq!(head(&bare), "ref: refs/heads/main");
     }
@@ -3419,8 +3449,8 @@ mod default_branch_change_tests {
         let request = tokio::spawn(async move {
             tokio::spawn(change_default_branch_with(
                 path,
-                "main".into(),
                 "dev".into(),
+                || async { Ok("main".into()) },
                 move |_| async move {
                     entered_tx.send(()).expect("signal database write");
                     release_rx.await.expect("release database write");
@@ -3447,6 +3477,78 @@ mod default_branch_change_tests {
         .await
         .expect("HEAD is restored after the request disappears");
     }
+
+    #[tokio::test]
+    async fn parallel_default_branch_changes_serialize_git_row_and_compensation() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        for first_fails in [false, true] {
+            let (_temp, bare) = branches();
+            let row = Arc::new(tokio::sync::Mutex::new("main".to_string()));
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let first_path = bare.clone();
+            let first_read = row.clone();
+            let first_write = row.clone();
+            let first = tokio::spawn(async move {
+                change_default_branch_with(
+                    first_path,
+                    "dev".into(),
+                    move || async move { Ok(first_read.lock().await.clone()) },
+                    move |branch| async move {
+                        entered_tx.send(()).expect("first writer entered");
+                        release_rx.await.expect("release first writer");
+                        if first_fails {
+                            anyhow::bail!("first row write failed");
+                        }
+                        *first_write.lock().await = branch;
+                        Ok(true)
+                    },
+                )
+                .await
+            });
+            entered_rx.await.expect("first HEAD moved before row write");
+            assert_eq!(head(&bare), "ref: refs/heads/dev");
+
+            let second_path = bare.clone();
+            let second_read = row.clone();
+            let second_write = row.clone();
+            let mut second = tokio::spawn(async move {
+                change_default_branch_with(
+                    second_path,
+                    "release".into(),
+                    move || async move { Ok(second_read.lock().await.clone()) },
+                    move |branch| async move {
+                        *second_write.lock().await = branch;
+                        Ok(true)
+                    },
+                )
+                .await
+            });
+            match tokio::time::timeout(Duration::from_millis(200), &mut second).await {
+                Err(_still_parked) => {}
+                Ok(Ok(result)) => {
+                    panic!("second writer finished before the lock was released: {result:?}")
+                }
+                Ok(Err(join_error)) => {
+                    panic!("second writer panicked before the lock was released: {join_error}")
+                }
+            }
+            assert_eq!(head(&bare), "ref: refs/heads/dev");
+            assert_eq!(*row.lock().await, "main");
+
+            release_tx.send(()).expect("release first writer");
+            let first_result = first.await.expect("first task joins");
+            assert_eq!(first_result.is_err(), first_fails);
+            second
+                .await
+                .expect("second task joins")
+                .expect("second wins");
+            assert_eq!(head(&bare), "ref: refs/heads/release");
+            assert_eq!(*row.lock().await, "release");
+        }
+    }
 }
 
 /// Apply [`RepoSettingsChange`] to `repo` (card_3625a7b89abb).
@@ -3472,11 +3574,7 @@ pub async fn update_repo_settings(
         }
     }
 
-    if let Some(branch) = change
-        .default_branch
-        .as_deref()
-        .filter(|branch| *branch != repo.default_branch)
-    {
+    if let Some(branch) = change.default_branch.as_deref() {
         if rg_git::refname::validate_refname(&format!("refs/heads/{branch}")).is_err() {
             return Err(crate::error::invalid_request(format!(
                 "branch '{branch}' does not exist in this repository"
@@ -3485,12 +3583,22 @@ pub async fn update_repo_settings(
         let db = db.clone();
         let repo_id = repo.id;
         let repo_path = repo_path.to_path_buf();
-        let previous = repo.default_branch.clone();
         let branch = branch.to_string();
         tokio::spawn(async move {
-            change_default_branch_with(repo_path, previous, branch, move |branch| async move {
-                repo_ops::set_default_branch(&db, repo_id, &branch).await
-            })
+            let read_db = db.clone();
+            change_default_branch_with(
+                repo_path,
+                branch,
+                move || async move {
+                    repo_ops::find_by_id(&read_db, repo_id)
+                        .await?
+                        .map(|repo| repo.default_branch)
+                        .ok_or_else(|| crate::error::not_found("repository"))
+                },
+                move |branch| async move {
+                    repo_ops::set_default_branch(&db, repo_id, &branch).await
+                },
+            )
             .await
         })
         .await

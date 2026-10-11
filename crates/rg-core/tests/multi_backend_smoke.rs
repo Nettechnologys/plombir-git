@@ -2847,6 +2847,161 @@ async fn release_asset_mutations_are_portable() {
     exercise_release_asset_mutation_contract(&db, repo.id, owner.id, suffix).await;
 }
 
+/// A held row write parks the first settings request after its Git HEAD move.
+/// A second request must then wait for the cross-process Git/DB boundary.
+async fn prove_default_branch_changes_serialize(db: DatabaseConnection) {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let user = rg_db::ops::user_ops::create_user(
+        &db,
+        &format!("branch{suffix}"),
+        &format!("branch{suffix}@example.invalid"),
+        "unused",
+        "Branch Race",
+    )
+    .await
+    .expect("create owner");
+    let repo = rg_db::ops::repo_ops::create(&db, namespace_repo(user.id, None, "branches"))
+        .await
+        .expect("create repository row");
+
+    let temp = tempfile::tempdir().expect("temporary repository");
+    let source = temp.path().join("source");
+    let bare = temp.path().join("bare.git");
+    let git = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .expect("git gateway");
+    git.run_or_bail(
+        &["init", "--initial-branch=main", source.to_str().unwrap()],
+        None,
+    )
+    .expect("initialize source");
+    git.run_with_env(
+        &["commit", "--allow-empty", "-m", "seed"],
+        Some(&source),
+        &[
+            ("GIT_AUTHOR_NAME", "test"),
+            ("GIT_AUTHOR_EMAIL", "test@example.com"),
+            ("GIT_COMMITTER_NAME", "test"),
+            ("GIT_COMMITTER_EMAIL", "test@example.com"),
+        ],
+    )
+    .expect("commit fixture")
+    .ensure_success()
+    .expect("commit succeeds");
+    for branch in ["dev", "release"] {
+        git.run_or_bail(&["branch", branch], Some(&source))
+            .expect("create branch");
+    }
+    git.run_or_bail(
+        &[
+            "clone",
+            "--bare",
+            source.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+        None,
+    )
+    .expect("create bare repository");
+
+    let held = db.begin().await.expect("begin competing row transaction");
+    held.execute(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        rg_db::prepare_sql(
+            db.get_database_backend(),
+            "UPDATE repositories SET updated_at = updated_at WHERE id = ?",
+        ),
+        [repo.id.into()],
+    ))
+    .await
+    .expect("hold repository row write lock");
+
+    let first_db = db.clone();
+    let first_path = bare.clone();
+    let first_repo = repo.clone();
+    let first = tokio::spawn(async move {
+        rg_core::repo::service::update_repo_settings(
+            &first_db,
+            &first_path,
+            &first_repo,
+            rg_core::repo::service::RepoSettingsChange {
+                default_branch: Some("dev".into()),
+                ..Default::default()
+            },
+        )
+        .await
+    });
+    let head = || std::fs::read_to_string(bare.join("HEAD")).expect("read bare HEAD");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while head().trim() != "ref: refs/heads/dev" {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first request moved HEAD before its blocked row write");
+
+    let second_db = db.clone();
+    let second_path = bare.clone();
+    let second_repo = repo.clone();
+    let mut second = tokio::spawn(async move {
+        rg_core::repo::service::update_repo_settings(
+            &second_db,
+            &second_path,
+            &second_repo,
+            rg_core::repo::service::RepoSettingsChange {
+                default_branch: Some("release".into()),
+                ..Default::default()
+            },
+        )
+        .await
+    });
+    assert_probe_stays_blocked(&mut second, "second default branch change crossed the lock").await;
+    assert_eq!(head().trim(), "ref: refs/heads/dev");
+    held.rollback().await.expect("release row write lock");
+    first
+        .await
+        .expect("first task joins")
+        .expect("first change succeeds");
+    second
+        .await
+        .expect("second task joins")
+        .expect("second change succeeds");
+    assert_eq!(head().trim(), "ref: refs/heads/release");
+    assert_eq!(
+        rg_db::ops::repo_ops::find_by_id(&db, repo.id)
+            .await
+            .expect("read repository row")
+            .expect("repository remains live")
+            .default_branch,
+        "release"
+    );
+}
+
+#[tokio::test]
+async fn default_branch_changes_serialize_on_sqlite() {
+    let temp = tempfile::tempdir().expect("temporary SQLite directory");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        temp.path().join("test.db").display()
+    );
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 3)
+        .await
+        .expect("connect to SQLite database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+    prove_default_branch_changes_serialize(db).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn default_branch_changes_serialize_on_server_database() {
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 3)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+    prove_default_branch_changes_serialize(db).await;
+}
+
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn migrations_crud_counters_and_fts_work_on_server_database() {
