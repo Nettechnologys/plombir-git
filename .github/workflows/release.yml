@@ -176,7 +176,7 @@ jobs:
             "${REGISTRY_IMAGE}:${GITHUB_REF_NAME}-arm64"
           docker buildx imagetools inspect "${REGISTRY_IMAGE}:${GITHUB_REF_NAME}" --raw \
             | jq -e '[.manifests[].platform.architecture] | index("amd64") and index("arm64")'
-          digest="$(docker buildx imagetools inspect "${REGISTRY_IMAGE}:${GITHUB_REF_NAME}" | awk '$1 == "Digest:" {print $2; exit}')"
+          digest="$(docker buildx imagetools inspect "${REGISTRY_IMAGE}:${GITHUB_REF_NAME}" | awk '$1 == "Digest:" && !found {print $2; found=1}')"
           [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Attest image index

@@ -18,7 +18,7 @@ resolver = "2"
 # the license lives in one place instead of being repeated (or, worse,
 # drifting) per crate.
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 license = "AGPL-3.0-or-later"
 # Minimum Supported Rust Version. Floored by the toughest dependencies in the
 # tree — russh 0.60 and rand 0.10 both declare `rust-version = "1.85"`. Bump only
