@@ -77,7 +77,7 @@ pub async fn create_pr(
     // A missing branch is a caller error, but an unreadable repository or ref store
     // is ours: `try_get_branch_sha` preserves that distinction instead of turning both
     // into a nullable `head_sha` on a newly-created PR.
-    let head_sha = if let Some(head_repo_id) = head_repo_id {
+    let head_path = if let Some(head_repo_id) = head_repo_id {
         // For fork PRs, resolve from the fork repo's git data
         let head_repo = repo_entity::Entity::find_by_id(head_repo_id)
             .one(db)
@@ -85,14 +85,18 @@ pub async fn create_pr(
             .context("head repository not found")?;
         let head_namespace = repository_namespace(db, &head_repo).await?;
         let head_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
-        crate::repo::service::try_get_branch_sha(&head_path, &head_branch)?.ok_or_else(|| {
-            crate::error::invalid_request(format!("head branch '{head_branch}' not found"))
-        })?
+        head_path
     } else {
-        crate::repo::service::try_get_branch_sha(&target_path, &head_branch)?.ok_or_else(|| {
-            crate::error::invalid_request(format!("head branch '{head_branch}' not found"))
-        })?
+        target_path
     };
+    let branch_for_read = head_branch.clone();
+    let head_sha = crate::blocking::run_blocking_git("read pull request head ref", move || {
+        crate::repo::service::try_get_branch_sha(&head_path, &branch_for_read)
+    })
+    .await?
+    .ok_or_else(|| {
+        crate::error::invalid_request(format!("head branch '{head_branch}' not found"))
+    })?;
 
     let model = pull_request::ActiveModel {
         id: sea_orm::NotSet,

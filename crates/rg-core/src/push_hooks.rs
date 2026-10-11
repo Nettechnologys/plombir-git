@@ -753,80 +753,62 @@ async fn adopt_unborn_head(
     target: &HookTarget,
     ref_updates: &[RefUpdate],
 ) -> Option<String> {
-    let advertisement = match rg_git::ref_advertisement::collect(&target.path) {
-        Ok(advertisement) => advertisement,
-        // Fail-closed, exactly as the advertisement itself does: a repository
-        // whose refs cannot be read is in an unknown state, not an unborn one,
-        // and moving HEAD on a guess is the one action that cannot be undone
-        // from the outside.
+    let path = target.path.clone();
+    let default_branch = target.default_branch.clone();
+    let updates = ref_updates.to_vec();
+    let branch = match crate::blocking::run_blocking_git("adopt first pushed branch", move || {
+        let advertisement = rg_git::ref_advertisement::collect(&path)
+            .with_context(|| format!("could not read HEAD at {}", path.display()))?;
+
+        // A readable HEAD with a commit must never be repointed by a feature push.
+        if advertisement.head_oid.is_some() {
+            return Ok(None);
+        }
+
+        // Ignore a branch created and deleted in the same push.
+        let created: Vec<&str> = updates
+            .iter()
+            .filter(|update| update.status == "ok")
+            .filter(|update| !update.new_sha.chars().all(|c| c == '0'))
+            .filter_map(|update| update.refname.strip_prefix("refs/heads/"))
+            .filter(|branch| {
+                advertisement
+                    .refs
+                    .iter()
+                    .any(|(_, refname)| refname == &format!("refs/heads/{branch}"))
+            })
+            .collect();
+
+        let branch = created
+            .iter()
+            .find(|branch| **branch == default_branch)
+            .or_else(|| created.iter().find(|branch| **branch == "main"))
+            .or_else(|| created.iter().find(|branch| **branch == "master"))
+            .or_else(|| created.first())
+            .copied();
+        let Some(branch) = branch else {
+            return Ok(None);
+        };
+
+        let repo = rg_git::repository::open(&path)
+            .with_context(|| format!("could not open repository at {}", path.display()))?;
+        crate::repo::service::set_bare_repo_head_to_branch(&repo, branch)?;
+        Ok(Some(branch.to_string()))
+    })
+    .await
+    {
+        Ok(branch) => branch?,
+        // Fail closed: an unreadable ref store cannot establish an unborn HEAD.
         Err(error) => {
             tracing::warn!(
                 repo_id = target.repo_id,
                 path = %target.path.display(),
                 error = %format!("{error:#}"),
-                "Post-push: could not read HEAD, leaving the default branch as recorded"
+                "Post-push: could not adopt the first pushed branch as HEAD"
             );
             return None;
         }
     };
-
-    // HEAD resolves — the repository has a default branch with commits on it.
-    if advertisement.head_oid.is_some() {
-        return None;
-    }
-
-    // Every branch this push created that still exists now. A branch created
-    // and deleted inside the same push is in `ref_updates` but not in the
-    // advertisement, and pointing HEAD at it would recreate the same defect
-    // this function exists to fix.
-    let created: Vec<&str> = ref_updates
-        .iter()
-        .filter(|update| update.status == "ok")
-        .filter(|update| !update.new_sha.chars().all(|c| c == '0'))
-        .filter_map(|update| update.refname.strip_prefix("refs/heads/"))
-        .filter(|branch| {
-            advertisement
-                .refs
-                .iter()
-                .any(|(_, refname)| refname == &format!("refs/heads/{branch}"))
-        })
-        .collect();
-
-    // A push carrying several new branches has no single obvious default, so
-    // the choice is pinned rather than left to arrival order: the branch the
-    // row already names wins (the operator said so), then the two conventional
-    // names, then the first branch of the push as a last resort.
-    let branch = created
-        .iter()
-        .find(|branch| **branch == target.default_branch)
-        .or_else(|| created.iter().find(|branch| **branch == "main"))
-        .or_else(|| created.iter().find(|branch| **branch == "master"))
-        .or_else(|| created.first())
-        .copied()?;
-
-    let repo = match rg_git::repository::open(&target.path) {
-        Ok(repo) => repo,
-        Err(error) => {
-            tracing::warn!(
-                repo_id = target.repo_id,
-                path = %target.path.display(),
-                error = %format!("{error:#}"),
-                "Post-push: could not open the repository to adopt its first branch as HEAD"
-            );
-            return None;
-        }
-    };
-    if let Err(error) = crate::repo::service::set_bare_repo_head_to_branch(&repo, branch) {
-        tracing::warn!(
-            repo_id = target.repo_id,
-            branch,
-            error = %format!("{error:#}"),
-            "Post-push: could not point HEAD at the pushed branch — the repository will keep \
-             answering `HEAD points at a branch that does not exist` until its default branch \
-             is set"
-        );
-        return None;
-    }
 
     // The row is written only after Git accepted the move, so the two can
     // disagree in one direction only: a stale row next to a correct HEAD, which
@@ -834,7 +816,7 @@ async fn adopt_unborn_head(
     // resolve — is the state `set_default_branch` was written for
     // (card_0e4d6e7fcdb2).
     if branch != target.default_branch {
-        match rg_db::ops::repo_ops::set_default_branch(params.db, target.repo_id, branch).await {
+        match rg_db::ops::repo_ops::set_default_branch(params.db, target.repo_id, &branch).await {
             Ok(true) => {}
             // The repository was deleted while the push ran; there is no row to
             // correct and the hooks below will find the same.
@@ -859,7 +841,7 @@ async fn adopt_unborn_head(
         to = branch,
         "Post-push: adopted the first pushed branch as the repository default"
     );
-    Some(branch.to_string())
+    Some(branch)
 }
 
 /// Section 5 of the post-push hook: refresh the repository's `code_fts`
@@ -974,7 +956,13 @@ async fn synchronize_open_pr_heads(
     branch_name: &str,
 ) -> anyhow::Result<OpenPrHeadSync> {
     for attempt in 1..=OPEN_PR_HEAD_REFRESH_ATTEMPTS {
-        let head_before = crate::repo::service::try_get_branch_sha(&target.path, branch_name)?;
+        let path = target.path.clone();
+        let branch = branch_name.to_string();
+        let head_before =
+            crate::blocking::run_blocking_git("read PR head before refresh", move || {
+                crate::repo::service::try_get_branch_sha(&path, &branch)
+            })
+            .await?;
         let refreshed = rg_db::ops::pull_request_ops::update_open_head_sha(
             params.db,
             target.repo_id,
@@ -982,7 +970,13 @@ async fn synchronize_open_pr_heads(
             head_before.as_deref(),
         )
         .await?;
-        let head_after = crate::repo::service::try_get_branch_sha(&target.path, branch_name)?;
+        let path = target.path.clone();
+        let branch = branch_name.to_string();
+        let head_after =
+            crate::blocking::run_blocking_git("read PR head after refresh", move || {
+                crate::repo::service::try_get_branch_sha(&path, &branch)
+            })
+            .await?;
         let mismatched_rows = refreshed
             .open_prs
             .iter()
@@ -1336,7 +1330,13 @@ async fn compensate_pipeline_created_after_ref_deletion(
     let Some(ref_kind) = ref_kind(&update.refname) else {
         return false;
     };
-    match git_ref_exists(&target.path, &update.refname) {
+    let path = target.path.clone();
+    let ref_name = update.refname.clone();
+    match crate::blocking::run_blocking_git("verify CI pipeline ref", move || {
+        git_ref_exists(&path, &ref_name)
+    })
+    .await
+    {
         Ok(true) => false,
         Ok(false) => {
             cancel_deleted_ref_pipeline(

@@ -3292,6 +3292,163 @@ pub struct RepoSettingsChange {
     pub default_branch: Option<String>,
 }
 
+/// Keep the Git move, row write and any compensation in one owned task. The
+/// request may disappear while the database is waiting; its waiter must not
+/// own the only code that can put HEAD back after a failed write.
+async fn change_default_branch_with<W, Fut>(
+    repo_path: std::path::PathBuf,
+    previous: String,
+    branch: String,
+    write_row: W,
+) -> Result<()>
+where
+    W: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let path = repo_path.clone();
+    let new_branch = branch.clone();
+    crate::blocking::run_blocking_git("set repository default HEAD", move || {
+        if try_get_branch_sha(&path, &new_branch)?.is_none() {
+            return Err(crate::error::invalid_request(format!(
+                "branch '{new_branch}' does not exist in this repository"
+            )));
+        }
+        let git = rg_git::repository::open(&path)
+            .with_context(|| format!("failed to open repository: {path:?}"))?;
+        set_bare_repo_head_to_branch(&git, &new_branch)
+    })
+    .await?;
+
+    match write_row(branch).await {
+        Ok(true) => Ok(()),
+        outcome => {
+            if let Err(error) =
+                crate::blocking::run_blocking_git("restore repository default HEAD", move || {
+                    let git = rg_git::repository::open(&repo_path)
+                        .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+                    set_bare_repo_head_to_branch(&git, &previous)
+                })
+                .await
+            {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "the default branch change failed and HEAD could not be put back"
+                );
+            }
+            match outcome {
+                Ok(false) => Err(crate::error::not_found("repository")),
+                Err(error) => Err(error),
+                Ok(true) => unreachable!(),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod default_branch_change_tests {
+    use super::change_default_branch_with;
+    use std::path::Path;
+
+    fn git(args: &[&str], cwd: Option<&Path>) {
+        rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run_with_env(
+                args,
+                cwd,
+                &[
+                    ("GIT_AUTHOR_NAME", "test"),
+                    ("GIT_AUTHOR_EMAIL", "test@example.com"),
+                    ("GIT_COMMITTER_NAME", "test"),
+                    ("GIT_COMMITTER_EMAIL", "test@example.com"),
+                ],
+            )
+            .expect("run git")
+            .ensure_success()
+            .expect("git succeeds");
+    }
+
+    fn branches() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let source = temp.path().join("source");
+        let bare = temp.path().join("bare.git");
+        git(
+            &["init", "--initial-branch=main", source.to_str().unwrap()],
+            None,
+        );
+        git(&["commit", "--allow-empty", "-m", "seed"], Some(&source));
+        git(&["branch", "dev"], Some(&source));
+        git(
+            &[
+                "clone",
+                "--bare",
+                source.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            None,
+        );
+        (temp, bare)
+    }
+
+    fn head(path: &Path) -> String {
+        std::fs::read_to_string(path.join("HEAD"))
+            .expect("read bare HEAD")
+            .trim()
+            .to_string()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_row_write_restores_head() {
+        let (_temp, bare) = branches();
+        let error =
+            change_default_branch_with(bare.clone(), "main".into(), "dev".into(), |_| async {
+                anyhow::bail!("database write failed")
+            })
+            .await
+            .expect_err("row write must fail");
+        assert!(format!("{error:#}").contains("database write failed"));
+        assert_eq!(head(&bare), "ref: refs/heads/main");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_the_request_does_not_cancel_head_compensation() {
+        let (_temp, bare) = branches();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let path = bare.clone();
+        let request = tokio::spawn(async move {
+            tokio::spawn(change_default_branch_with(
+                path,
+                "main".into(),
+                "dev".into(),
+                move |_| async move {
+                    entered_tx.send(()).expect("signal database write");
+                    release_rx.await.expect("release database write");
+                    anyhow::bail!("database write failed")
+                },
+            ))
+            .await
+        });
+        entered_rx
+            .await
+            .expect("database write starts after HEAD moves");
+        assert_eq!(head(&bare), "ref: refs/heads/dev");
+        request.abort();
+        assert!(request
+            .await
+            .expect_err("request was aborted")
+            .is_cancelled());
+        release_tx.send(()).expect("release detached change");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while head(&bare) != "ref: refs/heads/main" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HEAD is restored after the request disappears");
+    }
+}
+
 /// Apply [`RepoSettingsChange`] to `repo` (card_3625a7b89abb).
 ///
 /// * The default branch has to exist, and it is moved where clients read it —
@@ -3320,32 +3477,24 @@ pub async fn update_repo_settings(
         .as_deref()
         .filter(|branch| *branch != repo.default_branch)
     {
-        if rg_git::refname::validate_refname(&format!("refs/heads/{branch}")).is_err()
-            || try_get_branch_sha(repo_path, branch)?.is_none()
-        {
+        if rg_git::refname::validate_refname(&format!("refs/heads/{branch}")).is_err() {
             return Err(crate::error::invalid_request(format!(
                 "branch '{branch}' does not exist in this repository"
             )));
         }
-        let git = rg_git::repository::open(repo_path)
-            .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
-        set_bare_repo_head_to_branch(&git, branch)?;
-        match repo_ops::set_default_branch(db, repo.id, branch).await {
-            Ok(true) => {}
-            outcome => {
-                if let Err(error) = set_bare_repo_head_to_branch(&git, &repo.default_branch) {
-                    tracing::warn!(
-                        repo_id = repo.id,
-                        error = %format!("{error:#}"),
-                        "the default branch change failed and HEAD could not be put back"
-                    );
-                }
-                return match outcome {
-                    Ok(_) => Err(crate::error::not_found("repository")),
-                    Err(error) => Err(error),
-                };
-            }
-        }
+        let db = db.clone();
+        let repo_id = repo.id;
+        let repo_path = repo_path.to_path_buf();
+        let previous = repo.default_branch.clone();
+        let branch = branch.to_string();
+        tokio::spawn(async move {
+            change_default_branch_with(repo_path, previous, branch, move |branch| async move {
+                repo_ops::set_default_branch(&db, repo_id, &branch).await
+            })
+            .await
+        })
+        .await
+        .context("default branch change task failed")??;
     }
 
     if change.description.is_some() || change.is_private.is_some() {
