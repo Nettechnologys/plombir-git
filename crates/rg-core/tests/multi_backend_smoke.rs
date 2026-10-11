@@ -1274,6 +1274,34 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     .expect("a MySQL zero-change result is not a missing row");
     assert_eq!(unchanged.id, updated.id);
 
+    let key = rg_core::auth::encryption::derive_key("portable-ci-secret-test-key");
+    let maximum = "x".repeat(65_536);
+    let encrypted = rg_core::auth::encryption::encrypt(&maximum, &key).unwrap();
+    assert!(
+        encrypted.len() > 65_535,
+        "ciphertext must exceed MySQL TEXT"
+    );
+    let stored = rg_db::ops::ci_secret_ops::upsert(
+        db,
+        repo_id,
+        "PORTABLE_DEPLOY_TOKEN",
+        &encrypted,
+        actor_id,
+    )
+    .await
+    .expect("store the maximum CI secret ciphertext")
+    .expect("the CI secret still exists");
+    let reread =
+        rg_db::ops::ci_secret_ops::find_by_repo_and_name(db, repo_id, "PORTABLE_DEPLOY_TOKEN")
+            .await
+            .expect("read the maximum CI secret")
+            .expect("the maximum CI secret exists");
+    assert_eq!(reread.id, stored.id);
+    assert_eq!(
+        rg_core::auth::encryption::decrypt(&reread.encrypted_value, &key).unwrap(),
+        maximum
+    );
+
     assert!(rg_db::ops::ci_secret_ops::delete_by_repo_and_name(
         db,
         repo_id,

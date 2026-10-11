@@ -1,4 +1,6 @@
-use crate::common::{register_full, spawn_test_app_with_db, TEST_ENCRYPTION_KEY};
+use crate::common::{
+    register_full, spawn_test_app_over_db, spawn_test_app_with_db, TEST_ENCRYPTION_KEY,
+};
 use sea_orm::{ConnectionTrait, Statement};
 
 async fn create_repo(base: &str, token: &str, name: &str) {
@@ -79,6 +81,81 @@ async fn ci_secrets_are_admin_only_encrypted_and_never_return_values() {
     let payload = listed.text().await.unwrap();
     assert!(payload.contains("DEPLOY_TOKEN"));
     assert!(!payload.contains("plain-secret-value"));
+}
+
+#[tokio::test]
+async fn maximum_ci_secret_is_accepted_and_reads_back_after_encryption() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "max-secret-owner", "max-secret@example.com").await;
+    create_repo(&base, &token, "vault").await;
+    let value = "x".repeat(65_536);
+    let response = reqwest::Client::new()
+        .put(format!(
+            "{base}/api/v1/repos/max-secret-owner/vault/actions/secrets/MAX_SECRET"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "value": value }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&db, "max-secret-owner", "vault")
+        .await
+        .unwrap()
+        .unwrap();
+    let stored = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, "MAX_SECRET")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.encrypted_value.len() > 65_535);
+    let key = rg_core::auth::encryption::derive_key(TEST_ENCRYPTION_KEY);
+    assert_eq!(
+        rg_core::auth::encryption::decrypt(&stored.encrypted_value, &key).unwrap(),
+        value
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable PostgreSQL or MySQL database"]
+async fn maximum_ci_secret_roundtrips_through_http_on_server_database() {
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to server database");
+    rg_db::run_migrations(&db)
+        .await
+        .expect("migrate server database");
+    let base = spawn_test_app_over_db(db.clone()).await;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("maxsecret{}", &suffix[..10]);
+    let (token, _) = register_full(&base, &owner, &format!("{owner}@example.invalid")).await;
+    create_repo(&base, &token, "vault").await;
+    let value = "x".repeat(65_536);
+    let response = reqwest::Client::new()
+        .put(format!(
+            "{base}/api/v1/repos/{owner}/vault/actions/secrets/MAX_SECRET"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "value": value }))
+        .send()
+        .await
+        .expect("PUT maximum CI secret");
+    assert_eq!(response.status(), 201);
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&db, &owner, "vault")
+        .await
+        .unwrap()
+        .unwrap();
+    let stored = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, "MAX_SECRET")
+        .await
+        .unwrap()
+        .unwrap();
+    let key = rg_core::auth::encryption::derive_key(TEST_ENCRYPTION_KEY);
+    assert_eq!(
+        rg_core::auth::encryption::decrypt(&stored.encrypted_value, &key).unwrap(),
+        value
+    );
 }
 
 #[tokio::test]

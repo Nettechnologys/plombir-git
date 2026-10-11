@@ -14,6 +14,19 @@ impl MigrationTrait for Migration {
         if manager.has_table("ci_secrets").await? {
             return Ok(());
         }
+        // The API accepts 65,536 plaintext bytes. AES-GCM framing and base64
+        // expand that to 87,419 bytes, beyond MySQL's 65,535-byte TEXT limit.
+        let encrypted_value = if manager.get_database_backend() == sea_orm::DatabaseBackend::MySql {
+            ColumnDef::new(CiSecrets::EncryptedValue)
+                .custom(Alias::new("LONGTEXT"))
+                .not_null()
+                .to_owned()
+        } else {
+            ColumnDef::new(CiSecrets::EncryptedValue)
+                .text()
+                .not_null()
+                .to_owned()
+        };
         manager
             .create_table(
                 Table::create()
@@ -28,7 +41,7 @@ impl MigrationTrait for Migration {
                     )
                     .col(ColumnDef::new(CiSecrets::RepoId).big_integer().not_null())
                     .col(ColumnDef::new(CiSecrets::Name).string().not_null())
-                    .col(ColumnDef::new(CiSecrets::EncryptedValue).text().not_null())
+                    .col(encrypted_value)
                     .col(
                         ColumnDef::new(CiSecrets::CreatedById)
                             .big_integer()
