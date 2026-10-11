@@ -553,6 +553,7 @@ pub(crate) fn stamp_security(
         // Repository Content
         crate::api::repo_content::list_tree,
         crate::api::repo_content::get_blob,
+        crate::api::repo_content::get_blame,
         crate::api::repo_content::get_raw,
         crate::api::repo_content::get_log,
         crate::api::repo_content::list_branches,

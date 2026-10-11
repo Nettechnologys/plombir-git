@@ -9,6 +9,8 @@ export interface SearchResult {
   repo_name: string | null;
   state?: string | null;
   number?: number | null;
+  file_path?: string | null;
+  line?: number | null;
 }
 
 export interface SearchResponse {

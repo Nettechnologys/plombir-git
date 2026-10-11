@@ -8,7 +8,7 @@
 >
 > Легенда статуса: ✅ есть · 🟡 частично · ❌ нет · 🔒 security-релевантно
 
-_Последняя сверка с кодом: 2026-07-23._
+_Частичная сверка с кодом: 2026-10-11 (таблица agent-native и README features). Остальные разделы требуют новой проверки._
 
 ---
 
@@ -93,7 +93,7 @@ _Последняя сверка с кодом: 2026-07-23._
 | Write-tools (write_file, create/update/comment/labels issues, PR create/merge, review + inline-comment/ответ в треде + apply-suggestion, request-reviewers) | ✅ | `rg-mcp/src/tools/mod.rs` | тонкие обёртки над REST, тело строится из whitelist ключей; `write_file` коммитит в ветку и создаёт её от ветки по умолчанию |
 | CI-tools (list/get pipeline, retry/cancel, get job, commit status) | ✅ | `rg-mcp/src/tools/mod.rs` | `list_pipelines`/`get_pipeline`/`retry_pipeline`/`cancel_pipeline`/`get_ci_job`/`get_commit_status` (статусы внешнего CI) |
 | `search` через MCP | ✅ | `rg-mcp/src/tools/mod.rs` | обёртка `/search` (q/type/page/per_page) |
-| Обёртки `/ai/*` (summary / issues / prs / tree / search_code) | ✅ | `rg-mcp/src/tools/mod.rs` | оборачивает готовый AI-namespace `rg-http/src/api/ai.rs` |
+| Обёртки `/ai/*` (summary / issues / prs / tree / search_code) | 🟡 | `rg-mcp/src/tools/mod.rs`, `rg-http/src/api/ai.rs` | MCP-обёртка для tree существует, но HTTP `repo_tree` возвращает 501; поиск по коду требует явно построенного индекса |
 | MCP по HTTP (`POST /api/v1/mcp`) | ✅ 🔒 | `rg-http/src/api/mcp.rs` | те же инструменты, вызовы API идут in-process через роутер с учёткой вызывающего; локальный бинарник агенту не нужен |
 | Учётки-боты (агент как отдельный участник) | ✅ 🔒 | `rg-core/src/user/bots.rs`, `rg-http/src/api/bots.rs` | `users.bot_owner_id`; без пароля, токены выпускает владелец, только скоуп `repo`; бот перестаёт работать вместе с владельцем; в UI автор-бот показан с владельцем |
 | Сужение токена: репозитории / MCP-инструменты / защищённые ветки | ✅ 🔒 | `rg-http/src/agent_scope.rs`, `rg-core/src/auth/credential_context.rs` | per-route слой по `Access` и `{owner}/{name}`, git и OCI отдельно; запрет merge/push/server-side commit в защищённые ветки |

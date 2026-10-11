@@ -1,8 +1,7 @@
 //! Wiki service — CRUD operations for repository wiki pages.
 //!
 //! Each repository can have an associated wiki. Wiki pages are stored in the
-//! database for fast querying and optionally mirrored to a `.wiki.git` bare
-//! repository on disk for version control.
+//! database, including revision history. There is no `.wiki.git` mirror.
 
 use anyhow::{Context, Result};
 use chrono::Utc;

@@ -5,6 +5,7 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { repos } from '$lib/api/client.svelte';
+  import type { BlameLine } from '$lib/api/repos';
   import {
     LatestRepositoryResourceRequestFence,
     type RepositoryResourceRequestClaim,
@@ -56,6 +57,11 @@
   let error = $state('');
   let viewMode = $state<'rendered' | 'source'>('rendered');
   let copyStatus = $state('');
+  let blameVisible = $state(false);
+  let blameLoading = $state(false);
+  let blameError = $state('');
+  let blameLines = $state<BlameLine[]>([]);
+  let blameRequest = 0;
   let deleteOpen = $state(false);
   let deleteMessage = $state('');
   let deleteError = $state('');
@@ -195,8 +201,41 @@
     deleteError = '';
     deleting = false;
     copyStatus = '';
+    blameRequest += 1;
+    blameVisible = false;
+    blameLoading = false;
+    blameError = '';
+    blameLines = [];
     void loadBlob(expectedOwner, expectedRepo, expectedPath, expectedRef, expectedRoute);
   });
+
+  async function toggleBlame() {
+    blameVisible = !blameVisible;
+    const request = ++blameRequest;
+    if (!blameVisible || blameLines.length > 0) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedPath = filePath;
+    const expectedRef = queryRef;
+    const expectedRoute = routeGeneration;
+    blameLoading = true;
+    blameError = '';
+    viewMode = 'source';
+    try {
+      const lines = await repos.blame(expectedOwner, expectedRepo, expectedPath, expectedRef || undefined);
+      if (request === blameRequest && isCurrentRoute(expectedOwner, expectedRepo, expectedPath, expectedRef, expectedRoute)) {
+        blameLines = lines;
+      }
+    } catch (error) {
+      if (request === blameRequest && isCurrentRoute(expectedOwner, expectedRepo, expectedPath, expectedRef, expectedRoute)) {
+        blameError = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      if (request === blameRequest && isCurrentRoute(expectedOwner, expectedRepo, expectedPath, expectedRef, expectedRoute)) {
+        blameLoading = false;
+      }
+    }
+  }
 
   function blobResource(path: string, activeRef: string) {
     return `${path}\u0000${activeRef}`;
@@ -492,6 +531,11 @@
         <span class="file-size">({formatFileSize(lfs ? lfs.size : blobData.size)})</span>
       </div>
       <div class="file-actions">
+        {#if isText && !lfs && blobData.size <= 256 * 1024}
+          <button type="button" class="btn-outline btn-sm" onclick={toggleBlame}>
+            {blameVisible ? t('repo.blob.hide_blame', 'Hide blame') : t('repo.blob.blame', 'Blame')}
+          </button>
+        {/if}
         {#if isMarkdown && isText}
           <button
             type="button"
@@ -535,6 +579,8 @@
     {#if downloadError}
       <div class="delete-error download-error">{downloadError}</div>
     {/if}
+    {#if blameLoading}<div class="warning-banner">{t('common.loading')}</div>{/if}
+    {#if blameError}<div class="delete-error download-error">{blameError}</div>{/if}
 
     {#if lfs}
       <div class="lfs-banner">{t('repo.blob.lfs_stored')}</div>
@@ -611,6 +657,16 @@
       <tbody>
         {#each contentLines as line, index (line.num)}
           <tr class:selected={lineSelected(line.num)}>
+            {#if blameVisible}
+              <td class="blame-cell">
+                {#if blameLines[index]?.line === line.num}
+                  <span title={blameLines[index].summary}>{blameLines[index].author}</span>
+                  <a href={`/${owner}/${repo}/commits/${blameLines[index].commit}`} title={blameLines[index].summary}>
+                    {blameLines[index].commit.slice(0, 7)}
+                  </a>
+                {/if}
+              </td>
+            {/if}
             <td class="line-number">
               <a id={`L${line.num}`} href={`#L${line.num}`} onclick={(event) => clickLine(event, line.num)}>{line.num}</a>
             </td>
@@ -630,6 +686,15 @@
 {/snippet}
 
 <style>
+  .blame-cell {
+    white-space: nowrap;
+    color: var(--text-secondary);
+    border-right: 1px solid var(--border);
+    padding: 0 8px;
+    font-size: 11px;
+  }
+
+  .blame-cell a { margin-left: 8px; }
   .blob-breadcrumb {
     display: flex;
     align-items: center;

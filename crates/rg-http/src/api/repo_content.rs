@@ -576,6 +576,189 @@ pub async fn get_blob(
     }
 }
 
+/// Attribution for one line of a committed text file.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BlameLine {
+    pub line: u64,
+    pub commit: String,
+    pub author: String,
+    pub author_time: i64,
+    pub summary: String,
+}
+
+const MAX_BLAME_FILE_BYTES: u64 = 256 * 1024;
+const MAX_BLAME_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// GET /api/v1/repos/{owner}/{name}/blame/{path}
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/blame/{*path}",
+    tag = "Repository Content",
+    params(
+        ("owner" = String, Path),
+        ("name" = String, Path),
+        BlobQuery,
+    ),
+    responses(
+        (status = 200, description = "Line attribution", body = Vec<BlameLine>),
+        (status = 400, description = "Invalid ref, path or binary file"),
+        (status = 404, description = "Repository, ref or file not found"),
+        (status = 413, description = "File exceeds the blame limit"),
+    ),
+)]
+pub async fn get_blame(
+    State(state): State<AppState>,
+    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
+    Path((owner, name, path)): Path<(String, String, String)>,
+    Query(params): Query<BlobQuery>,
+) -> impl IntoResponse {
+    if let Err(error) = rg_core::platform::validate_repo_path(&owner) {
+        return AppError::bad_request(error.to_string()).into_response();
+    }
+    if let Err(error) = rg_core::platform::validate_repo_path(&name) {
+        return AppError::bad_request(error.to_string()).into_response();
+    }
+    let repo_path = state.repo_root.join(format!("{owner}/{name}.git"));
+    if let Err(error) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(error).into_response();
+    }
+    let git_ref = params.r#ref.unwrap_or_else(|| "HEAD".to_string());
+    match rg_core::blocking::run_blocking_git("read repository blame", move || {
+        blame_content(&repo_path, &git_ref, &path)
+    })
+    .await
+    {
+        Ok(Some(lines)) => (StatusCode::OK, Json(lines)).into_response(),
+        Ok(None) => {
+            AppError::payload_too_large("file exceeds the 256 KiB blame limit").into_response()
+        }
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+fn blame_content(
+    repo_path: &std::path::Path,
+    git_ref: &str,
+    path: &str,
+) -> anyhow::Result<Option<Vec<BlameLine>>> {
+    let repo = rg_git::repository::open(repo_path)
+        .map_err(|error| crate::error::repository_storage_open_error(repo_path, error))?;
+    let (blob_id, size) = resolve_blob(&repo, repo_path, git_ref, path)?;
+    if size > MAX_BLAME_FILE_BYTES {
+        return Ok(None);
+    }
+    let blob = repo.find_object(blob_id)?.try_into_blob()?;
+    if blob.data.contains(&0) {
+        return Err(rg_core::error::invalid_request(
+            "blame is available only for text files",
+        ));
+    }
+    let commit = repo
+        .find_object(resolve_content_ref(&repo, git_ref, repo_path)?.detach())?
+        .peel_to_commit()
+        .context("blame ref is not a commit")?;
+    let commit_sha = commit.id.to_string();
+    let git =
+        rg_git::cli_gateway::GitCommandGateway::with_timeout(std::time::Duration::from_secs(20))?;
+    let output = git.run_bounded(
+        &[
+            "blame",
+            "--line-porcelain",
+            "--no-textconv",
+            "--no-ext-diff",
+            &commit_sha,
+            "--",
+            path,
+        ],
+        Some(repo_path),
+        MAX_BLAME_OUTPUT_BYTES,
+    )?;
+    output.ensure_success()?;
+    Ok(Some(parse_blame(&output.stdout)?))
+}
+
+fn parse_blame(bytes: &[u8]) -> anyhow::Result<Vec<BlameLine>> {
+    let output = String::from_utf8_lossy(bytes);
+    let mut result = Vec::new();
+    let mut current: Option<BlameLine> = None;
+    for line in output.lines() {
+        if let Some((marked_sha, rest)) = line.split_once(' ') {
+            let sha = marked_sha.strip_prefix('^').unwrap_or(marked_sha);
+            if (sha.len() == 40 || sha.len() == 64)
+                && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                let mut fields = rest.split_whitespace();
+                let _original_line = fields.next();
+                let final_line = fields
+                    .next()
+                    .context("blame line number is missing")?
+                    .parse()
+                    .context("blame line number is invalid")?;
+                current = Some(BlameLine {
+                    line: final_line,
+                    commit: sha.to_string(),
+                    author: String::new(),
+                    author_time: 0,
+                    summary: String::new(),
+                });
+                continue;
+            }
+        }
+        let Some(entry) = current.as_mut() else {
+            continue;
+        };
+        if let Some(author) = line.strip_prefix("author ") {
+            entry.author = author.to_string();
+        } else if let Some(time) = line.strip_prefix("author-time ") {
+            entry.author_time = time.parse().context("blame author time is invalid")?;
+        } else if let Some(summary) = line.strip_prefix("summary ") {
+            entry.summary = summary.to_string();
+        } else if line.starts_with('\t') {
+            let complete = current.take().context("blame metadata is missing")?;
+            anyhow::ensure!(!complete.author.is_empty(), "blame author is missing");
+            result.push(complete);
+        }
+    }
+    anyhow::ensure!(current.is_none(), "blame output ended mid-line");
+    anyhow::ensure!(
+        bytes.is_empty() || !result.is_empty(),
+        "blame output has no lines"
+    );
+    Ok(result)
+}
+
+#[cfg(test)]
+mod blame_tests {
+    use super::parse_blame;
+
+    #[test]
+    fn malformed_nonempty_output_is_an_error() {
+        assert!(parse_blame(b"not a blame record\n").is_err());
+        assert!(parse_blame(b"").expect("empty file").is_empty());
+    }
+
+    #[test]
+    fn line_porcelain_keeps_final_line_and_boundary_commit() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let output = format!(
+            "^{sha} 1 1 1\nauthor Alice\nauthor-time 1700000000\nsummary Initial\nfilename a.rs\n\tfirst\n\
+             {sha} 2 2 1\nauthor Bob\nauthor-time 1700000001\nsummary Follow-up\nfilename a.rs\n\tsecond\n"
+        );
+        let rows = parse_blame(output.as_bytes()).expect("valid line porcelain");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].commit, sha);
+        assert_eq!(rows[0].line, 1);
+        assert_eq!(rows[1].author, "Bob");
+        assert_eq!(rows[1].line, 2);
+    }
+
+    #[test]
+    fn incomplete_porcelain_is_an_error() {
+        let output = b"0123456789abcdef0123456789abcdef01234567 1 1 1\nauthor Alice\n";
+        assert!(parse_blame(output).is_err());
+    }
+}
+
 /// Get a file's bytes — for an LFS pointer, the object it names.
 /// GET /api/v1/repos/:owner/:name/raw/:path
 ///
@@ -3180,6 +3363,18 @@ mod tests {
         git.run_or_bail(&["merge", "-q", "--no-edit", "side"], Some(&work))
             .unwrap();
         (dir, work)
+    }
+
+    #[test]
+    fn blame_reads_a_real_committed_file_through_the_gateway() {
+        let (_dir, work) = repository_with_history();
+        let lines = super::blame_content(&work, "HEAD", "src/x.rs")
+            .expect("git blame succeeds")
+            .expect("the file is under the size ceiling");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line, 1);
+        assert_eq!(lines[0].author, "Repository content test");
+        assert_eq!(lines[0].commit.len(), 40);
     }
 
     fn messages(entries: &[CommitEntry]) -> Vec<&str> {

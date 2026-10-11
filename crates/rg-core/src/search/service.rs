@@ -20,7 +20,9 @@ use sea_orm::{
 };
 use serde::Serialize;
 
-use crate::search::dialect::{fts_match, ISSUES_FTS_COLS, REPOS_FTS_COLS, WIKI_FTS_COLS};
+use crate::search::dialect::{
+    code_fts_snippet_expr, fts_match, CODE_FTS_COLS, ISSUES_FTS_COLS, REPOS_FTS_COLS, WIKI_FTS_COLS,
+};
 
 /// A unified search result.
 #[derive(Debug, Serialize)]
@@ -37,6 +39,11 @@ pub struct SearchResult {
     /// For issues: the issue number within its repo
     #[serde(skip_serializing_if = "Option::is_none")]
     pub number: Option<i64>,
+    /// Code results link to the file, and to a line when the query occurs in its content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
 }
 
 /// Parsed search qualifiers extracted from the query string.
@@ -163,7 +170,7 @@ impl SearchFilters {
     }
 }
 
-/// Search across repositories, issues, and/or wiki pages.
+/// Search across repositories, issues, wiki pages, pull requests, users and indexed code.
 /// Supports qualifier-based filtering via `q` parameter.
 ///
 /// `viewer_id` (`None` = anonymous) decides which repositories are in scope.
@@ -200,13 +207,25 @@ pub async fn search(
             fetch_wiki(db, raw_text, &filters, viewer_id, offset, limit).await?,
             count_wiki(db, raw_text, &filters, viewer_id).await?,
         )),
+        "pulls" => Ok((
+            fetch_pulls(db, raw_text, &filters, viewer_id, offset, limit).await?,
+            count_pulls(db, raw_text, &filters, viewer_id).await?,
+        )),
+        "users" => Ok((
+            fetch_users(db, raw_text, &filters, offset, limit).await?,
+            count_users(db, raw_text, &filters).await?,
+        )),
+        "code" => Ok((
+            fetch_code(db, raw_text, &filters, viewer_id, offset, limit).await?,
+            count_code(db, raw_text, &filters, viewer_id).await?,
+        )),
         "all" => search_all(db, raw_text, &filters, viewer_id, offset, limit).await,
         _ => Ok((Vec::new(), 0)),
     }
 }
 
 /// The kinds a `type=all` page interleaves, in the order they take their turn.
-const KINDS: usize = 3;
+const KINDS: usize = 6;
 
 /// `type=all` pages **one** sequence, not three independent ones.
 ///
@@ -239,6 +258,9 @@ async fn search_all(
         count_repos(db, raw_text, filters, viewer_id).await?,
         count_issues(db, raw_text, filters, viewer_id).await?,
         count_wiki(db, raw_text, filters, viewer_id).await?,
+        count_pulls(db, raw_text, filters, viewer_id).await?,
+        count_users(db, raw_text, filters).await?,
+        count_code(db, raw_text, filters, viewer_id).await?,
     ];
     let total: i64 = counts.iter().sum();
     let lengths = counts.map(|count| count.max(0) as u64);
@@ -252,7 +274,10 @@ async fn search_all(
         let rows = match kind {
             0 => fetch_repos(db, raw_text, filters, viewer_id, slice_offset, slice_limit).await?,
             1 => fetch_issues(db, raw_text, filters, viewer_id, slice_offset, slice_limit).await?,
-            _ => fetch_wiki(db, raw_text, filters, viewer_id, slice_offset, slice_limit).await?,
+            2 => fetch_wiki(db, raw_text, filters, viewer_id, slice_offset, slice_limit).await?,
+            3 => fetch_pulls(db, raw_text, filters, viewer_id, slice_offset, slice_limit).await?,
+            4 => fetch_users(db, raw_text, filters, slice_offset, slice_limit).await?,
+            _ => fetch_code(db, raw_text, filters, viewer_id, slice_offset, slice_limit).await?,
         };
         for (index, row) in rows.into_iter().enumerate() {
             page.push((
@@ -327,14 +352,19 @@ fn build_filter_clauses(
     if let Some(ref repo) = filters.repo {
         if let Some((owner, name)) = repo.split_once('/') {
             if table_alias == "r" {
-                clauses.push("u.username = ? AND r.name = ?".to_string());
+                clauses.push("COALESCE(o.name, u.username) = ? AND r.name = ?".to_string());
             } else {
                 joins.push(format!(
                     "JOIN repositories r_filt ON r_filt.id = {}.repo_id",
                     table_alias
                 ));
                 joins.push("LEFT JOIN users u_filt ON u_filt.id = r_filt.owner_id".to_string());
-                clauses.push("u_filt.username = ? AND r_filt.name = ?".to_string());
+                joins.push(
+                    "LEFT JOIN organizations o_filt ON o_filt.id = r_filt.org_id".to_string(),
+                );
+                clauses.push(
+                    "COALESCE(o_filt.name, u_filt.username) = ? AND r_filt.name = ?".to_string(),
+                );
             }
             params.push(Value::from(owner.to_string()));
             params.push(Value::from(name.to_string()));
@@ -589,10 +619,11 @@ async fn fetch_repos(
 
     let sql = format!(
         r#"
-        SELECT r.id, r.name as title, r.description as excerpt, u.username as owner_name
+        SELECT r.id, r.name as title, r.description as excerpt, COALESCE(o.name, u.username) as owner_name
         FROM repos_fts
         JOIN repositories r ON r.id = repos_fts.rowid
         LEFT JOIN users u ON u.id = r.owner_id
+        LEFT JOIN organizations o ON o.id = r.org_id
         {}
         WHERE {}
         {}
@@ -623,6 +654,8 @@ async fn fetch_repos(
             repo_name: Some(title),
             state: None,
             number: None,
+            file_path: None,
+            line: None,
         });
     }
 
@@ -645,6 +678,7 @@ async fn count_repos(
         FROM repos_fts
         JOIN repositories r ON r.id = repos_fts.rowid
         LEFT JOIN users u ON u.id = r.owner_id
+        LEFT JOIN organizations o ON o.id = r.org_id
         {}
         WHERE {}
         "#,
@@ -712,11 +746,12 @@ async fn fetch_issues(
 
     let sql = format!(
         r#"
-        SELECT i.id, i.title, i.body as excerpt, i.repo_id, r.name as repo_name, u.username as owner_name, i.state, i.number
+        SELECT i.id, i.title, i.body as excerpt, i.repo_id, r.name as repo_name, COALESCE(o.name, u.username) as owner_name, i.state, i.number
         FROM issues_fts
         JOIN issues i ON i.id = issues_fts.rowid
         JOIN repositories r ON r.id = i.repo_id
         LEFT JOIN users u ON u.id = r.owner_id
+        LEFT JOIN organizations o ON o.id = r.org_id
         {}
         WHERE {}
         {}
@@ -754,6 +789,8 @@ async fn fetch_issues(
             repo_name,
             state,
             number,
+            file_path: None,
+            line: None,
         });
     }
 
@@ -776,6 +813,8 @@ async fn count_issues(
         FROM issues_fts
         JOIN issues i ON i.id = issues_fts.rowid
         JOIN repositories r ON r.id = i.repo_id
+        LEFT JOIN users u ON u.id = r.owner_id
+        LEFT JOIN organizations o ON o.id = r.org_id
         {}
         WHERE {}
         "#,
@@ -842,11 +881,12 @@ async fn fetch_wiki(
 
     let sql = format!(
         r#"
-        SELECT w.id, w.title, SUBSTR(w.content, 1, 200) as excerpt, w.repo_id, r.name as repo_name, u.username as owner_name
+        SELECT w.id, w.title, SUBSTR(w.content, 1, 200) as excerpt, w.repo_id, r.name as repo_name, COALESCE(o.name, u.username) as owner_name
         FROM wiki_pages_fts
         JOIN wiki_pages w ON w.id = wiki_pages_fts.rowid
         JOIN repositories r ON r.id = w.repo_id
         LEFT JOIN users u ON u.id = r.owner_id
+        LEFT JOIN organizations o ON o.id = r.org_id
         {}
         WHERE {}
         {}
@@ -881,6 +921,8 @@ async fn fetch_wiki(
             repo_name,
             state: None,
             number: None,
+            file_path: None,
+            line: None,
         });
     }
 
@@ -904,6 +946,7 @@ async fn count_wiki(
         JOIN wiki_pages w ON w.id = wiki_pages_fts.rowid
         JOIN repositories r ON r.id = w.repo_id
         LEFT JOIN users u ON u.id = r.owner_id
+        LEFT JOIN organizations o ON o.id = r.org_id
         {}
         WHERE {}
         "#,
@@ -919,6 +962,336 @@ async fn count_wiki(
         .await
         .context("fts: count wiki")?;
     decode_total(&count_rows, "count wiki")
+}
+
+/// A literal substring predicate. SQL parameters carry the query, so `%` and
+/// `_` remain ordinary search characters instead of turning into LIKE globs.
+fn contains_text(backend: DatabaseBackend, column: &str) -> String {
+    match backend {
+        DatabaseBackend::Sqlite => format!("INSTR(LOWER({column}), LOWER(?)) > 0"),
+        DatabaseBackend::Postgres => format!("POSITION(LOWER(?) IN LOWER({column})) > 0"),
+        DatabaseBackend::MySql => format!("LOCATE(LOWER(?), LOWER({column})) > 0"),
+    }
+}
+
+fn pull_query(
+    backend: DatabaseBackend,
+    text: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+) -> (String, String, Vec<Value>) {
+    let (mut clauses, joins, mut params) = build_filter_clauses(filters, "p");
+    let (visibility, visibility_params) = build_visibility_clause("r", viewer_id);
+    clauses.push(visibility);
+    params.extend(visibility_params);
+    if let Some(state) = filters.state.as_deref().filter(|state| *state != "all") {
+        clauses.push("p.state = ?".to_string());
+        params.push(Value::from(state.to_string()));
+    }
+    // PR labels are stored as JSON, unlike issue_labels. Do not pretend that
+    // an issue-label qualifier filtered PRs when no such predicate exists.
+    if filters.label.is_some() {
+        clauses.push("1 = 0".to_string());
+    }
+    if !text.is_empty() {
+        clauses.push(format!(
+            "({} OR {})",
+            contains_text(backend, "p.title"),
+            contains_text(backend, "p.body")
+        ));
+        params.extend([Value::from(text.to_string()), Value::from(text.to_string())]);
+    }
+    (clauses.join(" AND "), joins.join("\n"), params)
+}
+
+async fn fetch_pulls(
+    db: &DatabaseConnection,
+    text: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+    offset: u64,
+    limit: u64,
+) -> Result<Vec<SearchResult>> {
+    let backend = db.get_database_backend();
+    let (predicate, joins, params) = pull_query(backend, text, filters, viewer_id);
+    let sql = format!(
+        "SELECT p.id, p.title, SUBSTR(p.body, 1, 200), r.name, COALESCE(o.name, u.username), p.state, p.number \
+         FROM pull_requests p JOIN repositories r ON r.id = p.repo_id \
+         LEFT JOIN users u ON u.id = r.owner_id \
+         LEFT JOIN organizations o ON o.id = r.org_id \
+         {joins} WHERE {predicate} ORDER BY p.id DESC LIMIT {limit} OFFSET {offset}"
+    );
+    let sql = rg_db::prepare_sql(backend, &sql);
+    let rows = db
+        .query_all(Statement::from_sql_and_values(backend, &sql, params))
+        .await
+        .context("search pull requests")?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(SearchResult {
+                result_type: "pull".to_string(),
+                id: decode_required(&row, 0, "search pulls", "id")?,
+                title: decode_required(&row, 1, "search pulls", "title")?,
+                excerpt: decode_optional(&row, 2, "search pulls", "body")?,
+                repo_name: decode_optional(&row, 3, "search pulls", "repo_name")?,
+                repo_owner: decode_optional(&row, 4, "search pulls", "owner_name")?,
+                state: decode_optional(&row, 5, "search pulls", "state")?,
+                number: decode_optional(&row, 6, "search pulls", "number")?,
+                file_path: None,
+                line: None,
+            })
+        })
+        .collect()
+}
+
+async fn count_pulls(
+    db: &DatabaseConnection,
+    text: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+) -> Result<i64> {
+    let backend = db.get_database_backend();
+    let (predicate, joins, params) = pull_query(backend, text, filters, viewer_id);
+    let sql = format!(
+        "SELECT COUNT(*) FROM pull_requests p JOIN repositories r ON r.id = p.repo_id \
+         LEFT JOIN users u ON u.id = r.owner_id \
+         LEFT JOIN organizations o ON o.id = r.org_id \
+         {joins} WHERE {predicate}"
+    );
+    let sql = rg_db::prepare_sql(backend, &sql);
+    let rows = db
+        .query_all(Statement::from_sql_and_values(backend, &sql, params))
+        .await
+        .context("count pull requests")?;
+    decode_total(&rows, "count pulls")
+}
+
+fn users_query(
+    backend: DatabaseBackend,
+    text: &str,
+    filters: &SearchFilters,
+) -> (String, Vec<Value>) {
+    let mut clauses = vec![
+        "u.deleted_at IS NULL".to_string(),
+        "u.is_active = ?".to_string(),
+    ];
+    let mut params = vec![Value::from(true)];
+    if filters.repo.is_some() || filters.state.is_some() || filters.label.is_some() {
+        clauses.push("1 = 0".to_string());
+    }
+    if let Some(author) = &filters.author {
+        clauses.push("u.username = ?".to_string());
+        params.push(Value::from(author.clone()));
+    }
+    if !text.is_empty() {
+        clauses.push(format!(
+            "({} OR {})",
+            contains_text(backend, "u.username"),
+            contains_text(backend, "u.display_name")
+        ));
+        params.extend([Value::from(text.to_string()), Value::from(text.to_string())]);
+    }
+    (clauses.join(" AND "), params)
+}
+
+async fn fetch_users(
+    db: &DatabaseConnection,
+    text: &str,
+    filters: &SearchFilters,
+    offset: u64,
+    limit: u64,
+) -> Result<Vec<SearchResult>> {
+    let backend = db.get_database_backend();
+    let (predicate, params) = users_query(backend, text, filters);
+    let sql = format!("SELECT u.id, u.username, u.display_name FROM users u WHERE {predicate} ORDER BY u.id DESC LIMIT {limit} OFFSET {offset}");
+    let sql = rg_db::prepare_sql(backend, &sql);
+    let rows = db
+        .query_all(Statement::from_sql_and_values(backend, &sql, params))
+        .await
+        .context("search users")?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(SearchResult {
+                result_type: "user".to_string(),
+                id: decode_required(&row, 0, "search users", "id")?,
+                title: decode_required(&row, 1, "search users", "username")?,
+                excerpt: decode_optional(&row, 2, "search users", "display_name")?,
+                repo_owner: None,
+                repo_name: None,
+                state: None,
+                number: None,
+                file_path: None,
+                line: None,
+            })
+        })
+        .collect()
+}
+
+async fn count_users(db: &DatabaseConnection, text: &str, filters: &SearchFilters) -> Result<i64> {
+    let backend = db.get_database_backend();
+    let (predicate, params) = users_query(backend, text, filters);
+    let sql = rg_db::prepare_sql(
+        backend,
+        &format!("SELECT COUNT(*) FROM users u WHERE {predicate}"),
+    );
+    let rows = db
+        .query_all(Statement::from_sql_and_values(backend, &sql, params))
+        .await
+        .context("count users")?;
+    decode_total(&rows, "count users")
+}
+
+/// A result's line is published only when the literal text occurs in the
+/// indexed file content. A match on path, language or name links to the file.
+fn content_match_line(content: &str, text: &str) -> Option<u64> {
+    let needle = text.trim_matches('"');
+    if needle.is_empty() {
+        return None;
+    }
+    let byte = content.find(needle).or_else(|| {
+        content
+            .to_ascii_lowercase()
+            .find(&needle.to_ascii_lowercase())
+    })?;
+    Some(
+        1 + content[..byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u64,
+    )
+}
+
+fn code_query(
+    backend: DatabaseBackend,
+    text: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+) -> (String, String, Vec<Value>, Vec<Value>) {
+    let (match_pred, order, fts_values) = if text.is_empty() {
+        (String::new(), String::new(), Vec::new())
+    } else {
+        fts_match(backend, "code_fts", CODE_FTS_COLS, text)
+    };
+    let (visibility, visibility_values) = build_visibility_clause("r", viewer_id);
+    let mut clauses = vec![
+        visibility,
+        "(s.repo_id IS NOT NULL OR (code_fts.repo_id > 0 AND NOT EXISTS \
+          (SELECT 1 FROM code_index_snapshots newer WHERE newer.repo_id = r.id)))"
+            .to_string(),
+    ];
+    if !match_pred.is_empty() {
+        clauses.insert(0, match_pred);
+    }
+    let mut values = fts_values
+        .first()
+        .cloned()
+        .map(Value::from)
+        .into_iter()
+        .collect::<Vec<_>>();
+    values.extend(visibility_values);
+    if let Some(repo) = &filters.repo {
+        if let Some((owner, name)) = repo.split_once('/') {
+            clauses.push("COALESCE(o.name, u.username) = ? AND r.name = ?".to_string());
+            values.extend([
+                Value::from(owner.to_string()),
+                Value::from(name.to_string()),
+            ]);
+        } else {
+            clauses.push("r.name = ?".to_string());
+            values.push(Value::from(repo.clone()));
+        }
+    }
+    if filters.state.is_some() || filters.author.is_some() || filters.label.is_some() {
+        clauses.push("1 = 0".to_string());
+    }
+    let mut page_values = values.clone();
+    if let Some(rank_value) = fts_values.get(1) {
+        page_values.push(Value::from(rank_value.clone()));
+    }
+    (clauses.join(" AND "), order, values, page_values)
+}
+
+fn code_from() -> &'static str {
+    "FROM code_fts LEFT JOIN code_index_snapshots s ON s.published_key = code_fts.repo_id \
+     JOIN repositories r ON r.id = COALESCE(s.repo_id, code_fts.repo_id) \
+     LEFT JOIN users u ON u.id = r.owner_id LEFT JOIN organizations o ON o.id = r.org_id"
+}
+
+async fn fetch_code(
+    db: &DatabaseConnection,
+    text: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+    offset: u64,
+    limit: u64,
+) -> Result<Vec<SearchResult>> {
+    let backend = db.get_database_backend();
+    let (predicate, rank_order, _, params) = code_query(backend, text, filters, viewer_id);
+    let id_column = if backend == DatabaseBackend::Sqlite {
+        "code_fts.rowid"
+    } else {
+        "code_fts.id"
+    };
+    let order = ordered_by(&rank_order, id_column);
+    let snippet = if text.is_empty() {
+        "SUBSTR(code_fts.content, 1, 200)".to_string()
+    } else {
+        code_fts_snippet_expr(backend, "code_fts", true)
+    };
+    let content = if text.is_empty() {
+        "NULL"
+    } else {
+        "code_fts.content"
+    };
+    let sql = format!(
+        "SELECT {id_column}, code_fts.file_path, {snippet}, {content}, r.name, \
+         COALESCE(o.name, u.username) {} WHERE {predicate} {order} LIMIT {limit} OFFSET {offset}",
+        code_from()
+    );
+    let sql = rg_db::prepare_sql(backend, &sql);
+    let rows = db
+        .query_all(Statement::from_sql_and_values(backend, &sql, params))
+        .await
+        .context("search indexed code")?;
+    rows.into_iter()
+        .map(|row| {
+            let path: String = decode_required(&row, 1, "search code", "file_path")?;
+            let content: Option<String> = decode_optional(&row, 3, "search code", "content")?;
+            Ok(SearchResult {
+                result_type: "code".to_string(),
+                id: decode_required(&row, 0, "search code", "id")?,
+                title: path.clone(),
+                excerpt: decode_optional(&row, 2, "search code", "snippet")?,
+                repo_name: decode_optional(&row, 4, "search code", "repo_name")?,
+                repo_owner: decode_optional(&row, 5, "search code", "owner_name")?,
+                state: None,
+                number: None,
+                file_path: Some(path),
+                line: content
+                    .as_deref()
+                    .and_then(|body| content_match_line(body, text)),
+            })
+        })
+        .collect()
+}
+
+async fn count_code(
+    db: &DatabaseConnection,
+    text: &str,
+    filters: &SearchFilters,
+    viewer_id: Option<i64>,
+) -> Result<i64> {
+    let backend = db.get_database_backend();
+    let (predicate, _, params, _) = code_query(backend, text, filters, viewer_id);
+    let sql = rg_db::prepare_sql(
+        backend,
+        &format!("SELECT COUNT(*) {} WHERE {predicate}", code_from()),
+    );
+    let rows = db
+        .query_all(Statement::from_sql_and_values(backend, &sql, params))
+        .await
+        .context("count indexed code")?;
+    decode_total(&rows, "count code")
 }
 
 #[cfg(test)]
@@ -1031,7 +1404,7 @@ mod tests {
         for repos in 0..=5u64 {
             for issues in 0..=5u64 {
                 for wiki in 0..=5u64 {
-                    let lengths = [repos, issues, wiki];
+                    let lengths = [repos, issues, wiki, 0, 0, 0];
                     let total = repos + issues + wiki;
                     for per_page in 1..=4u64 {
                         let mut seen = Vec::new();
@@ -1074,7 +1447,7 @@ mod tests {
     /// matching issues, page one used to be repositories only.
     #[test]
     fn the_first_page_mixes_the_kinds_that_have_matches() {
-        let page = merged_page(&[40, 40, 0], 0, 20);
+        let page = merged_page(&[40, 40, 0, 0, 0, 0], 0, 20);
         let kinds: Vec<usize> = page.iter().map(|(kind, _)| *kind).collect();
         assert!(
             kinds.contains(&0) && kinds.contains(&1),
@@ -1095,7 +1468,7 @@ mod tests {
     #[test]
     fn an_exhausted_kind_yields_its_turn() {
         // Repos run out after 2, wiki after 1; issues carry the tail.
-        let lengths = [2, 5, 1];
+        let lengths = [2, 5, 1, 0, 0, 0];
         assert_eq!(
             merged_page(&lengths, 0, 4),
             vec![(0, 0), (1, 0), (2, 0), (0, 1)]
@@ -1111,11 +1484,105 @@ mod tests {
     /// slice is what `search_all` skips the round-trip on.
     #[test]
     fn a_page_past_the_corpus_plans_no_query() {
-        let lengths = [3, 3, 3];
+        let lengths = [3, 3, 3, 0, 0, 0];
         for kind in 0..KINDS {
             assert_eq!(merge_slice(&lengths, kind, 9, 20).1, 0);
             assert_eq!(merge_slice(&lengths, kind, u64::MAX, 20).1, 0);
         }
+    }
+
+    #[test]
+    fn the_first_page_can_include_every_search_kind() {
+        assert_eq!(
+            merged_page(&[1, 1, 1, 1, 1, 1], 0, 6),
+            (0..6).map(|kind| (kind, 0)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn code_line_tracks_case_insensitive_content_matches() {
+        assert_eq!(content_match_line("first\nNeedle here", "needle"), Some(2));
+        assert_eq!(content_match_line("first\nNeedle here", "absent"), None);
+    }
+
+    #[tokio::test]
+    async fn code_and_pull_search_enforce_visibility_and_use_org_namespace() {
+        let db = memory_db().await;
+        let backend = db.get_database_backend();
+        for sql in [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, display_name TEXT, is_active BOOLEAN, deleted_at TEXT)",
+            "CREATE TABLE organizations (id INTEGER PRIMARY KEY, name TEXT)",
+            "CREATE TABLE repositories (id INTEGER PRIMARY KEY, owner_id INTEGER, org_id INTEGER, name TEXT, is_private BOOLEAN, deleted_at TEXT)",
+            "CREATE TABLE repo_collaborators (repo_id INTEGER, user_id INTEGER)",
+            "CREATE TABLE organization_members (org_id INTEGER, user_id INTEGER)",
+            "CREATE TABLE pull_requests (id INTEGER PRIMARY KEY, repo_id INTEGER, number INTEGER, title TEXT, body TEXT, state TEXT, author_id INTEGER)",
+            "CREATE TABLE code_index_snapshots (repo_id INTEGER PRIMARY KEY, published_key INTEGER UNIQUE)",
+            "CREATE VIRTUAL TABLE code_fts USING fts5(repo_id, file_path, file_name, content, language)",
+            "CREATE TABLE wiki_pages (id INTEGER PRIMARY KEY, repo_id INTEGER, title TEXT, content TEXT)",
+            "CREATE VIRTUAL TABLE wiki_pages_fts USING fts5(title, content)",
+            "INSERT INTO users VALUES (1, 'alice', 'Alice', 1, NULL), (2, 'outsider', 'Outsider', 1, NULL)",
+            "INSERT INTO organizations VALUES (1, 'acme')",
+            "INSERT INTO repositories VALUES (1, 1, 1, 'app', 0, NULL), (2, 1, NULL, 'secret', 1, NULL)",
+            "INSERT INTO pull_requests VALUES (1, 1, 1, 'needle in public PR', NULL, 'open', 1), (2, 2, 1, 'needle in secret PR', NULL, 'open', 1)",
+            "INSERT INTO code_index_snapshots VALUES (1, -1048577)",
+            "INSERT INTO code_fts(repo_id, file_path, file_name, content, language) VALUES (-1048577, 'src/app.rs', 'app.rs', 'first line\nneedle here', 'Rust'), (2, 'private.rs', 'private.rs', 'needle hidden', 'Rust')",
+            "INSERT INTO wiki_pages VALUES (1, 1, 'Guide', 'needle wiki')",
+            "INSERT INTO wiki_pages_fts(rowid, title, content) VALUES (1, 'Guide', 'needle wiki')",
+        ] {
+            db.execute(Statement::from_string(backend, sql.to_string())).await.expect(sql);
+        }
+
+        let (public_code, count) = search(&db, "needle", "code", None, 1, 20)
+            .await
+            .expect("anonymous code search");
+        assert_eq!(count, 1);
+        assert_eq!(public_code[0].repo_owner.as_deref(), Some("acme"));
+        assert_eq!(public_code[0].line, Some(2));
+        let (qualified_code, count) = search(&db, "repo:acme/app", "code", None, 1, 20)
+            .await
+            .expect("qualifier-only code search");
+        assert_eq!(count, 1);
+        assert_eq!(qualified_code[0].line, None);
+        assert!(
+            qualified_code[0]
+                .excerpt
+                .as_deref()
+                .unwrap_or_default()
+                .len()
+                <= 200
+        );
+        let (owner_code, count) = search(&db, "needle", "code", Some(1), 1, 20)
+            .await
+            .expect("owner code search");
+        assert_eq!(count, 2);
+        assert_eq!(owner_code.len(), 2);
+
+        let (public_pr, count) = search(&db, "needle", "pulls", None, 1, 20)
+            .await
+            .expect("anonymous PR search");
+        assert_eq!(count, 1);
+        assert_eq!(public_pr[0].repo_owner.as_deref(), Some("acme"));
+        let (org_qualified, count) = search(&db, "needle repo:acme/app", "pulls", None, 1, 20)
+            .await
+            .expect("org qualifier");
+        assert_eq!(count, 1);
+        assert_eq!(org_qualified.len(), 1);
+        let (_, count) = search(&db, "needle repo:alice/app", "pulls", None, 1, 20)
+            .await
+            .expect("wrong namespace");
+        assert_eq!(count, 0);
+
+        let (users, count) = search(&db, "alice", "users", None, 1, 20)
+            .await
+            .expect("user search");
+        assert_eq!(count, 1);
+        assert_eq!(users[0].title, "alice");
+
+        let (wiki, count) = search(&db, "needle", "wiki", None, 1, 20)
+            .await
+            .expect("wiki search and count");
+        assert_eq!(count, 1);
+        assert_eq!(wiki[0].repo_owner.as_deref(), Some("acme"));
     }
 
     /// The decoders are the whole fix, and no caller can reach the branch they

@@ -222,25 +222,25 @@ Three finds from the history:
 
 ## Features
 
-| Area | Capability |
-|------|------------|
-| Git transport | Smart Protocol V1 & V2 over HTTPS and SSH (`russh`); pkt-line, sideband-64k, packfile encode/decode |
-| Repositories | Create / delete / transfer, fork, private & public, collaborators (read/write/admin), file & tree browsing, commit log, branches, tags |
-| Auth | User registration & login (argon2 + JWT), SSH public-key auth, Personal Access Tokens, MFA, SSO |
-| Issues | CRUD, labels, milestones, comments, Gitea-compatible issue templates and chooser ([template reference](docs/issue-templates.md)) |
-| Pull requests | Diff, three merge strategies (merge / squash / rebase), cross-repo (fork) PRs, code review (approve / request changes / inline comments), branch protection, repository pull-request template ([reference](docs/issue-templates.md#pull-request-templates)), CODEOWNERS auto-review ([reference](docs/codeowners.md)) |
-| Wiki | Page CRUD backed by Git |
-| Git LFS | Batch API, object upload/download, zstd compression; works from both the HTTPS and the SSH clone URL ([details](#git-lfs)) |
-| CI/CD | Native `.plombir-git-ci.yml` pipelines ([schema reference](docs/ci.md)) and Gitea Actions (`.gitea/workflows/*.yml`, [supported subset](docs/gitea-actions.md)); embedded or external runners, optional Docker execution, artifacts, live job logs over WebSocket |
-| Webhooks | Registration, delivery, HMAC-SHA256 signatures, delivery history |
-| Notifications | In-app, email (SMTP), and real-time WebSocket delivery |
-| Registries | Package registry and OCI container registry |
-| Search | Full-text search (FTS) and per-repository code indexing |
-| Import | Pull repositories, issues, PRs, labels, milestones, releases and wiki from GitHub / GitLab |
-| Operations | TLS/HTTPS, TOML config, rate limiting, log rotation, unified pagination, registered GPG/SSH commit-signature verification, audit log, health checks |
-| AI agents | Model Context Protocol built into the server (`POST /api/v1/mcp`) and as a stdio binary (`plombir-git-mcp`); bot accounts, narrowed tokens, per-bot rate limits and audit ([details](#mcp-over-http-and-agent-accounts)) |
-| Releases | Release assets with optional in-toto / DSSE attestations signed by the instance key |
-| Web UI | SvelteKit (Svelte 5) SPA (login, repos, issues, PRs, wiki, CI, review, orgs, notifications), English + Chinese i18n |
+| Area | Capability | Implementation |
+|------|------------|----------------|
+| Git transport | Smart Protocol V1 & V2 over HTTPS and SSH (`russh`); pkt-line, sideband-64k, packfile encode/decode | [V2 transport](crates/rg-git/src/protocol/v2.rs) |
+| Repositories | Create / delete / transfer, fork, private & public, collaborators (read/write/admin), file & tree browsing, commit log, branches, tags | [Repository API](crates/rg-http/src/api/repos.rs) |
+| Auth | User registration & login (argon2 + JWT), SSH public-key auth, Personal Access Tokens, MFA, SSO | [Auth API](crates/rg-http/src/api/auth.rs) |
+| Issues | Create, view, edit and delete issues and comments; close/reopen, labels, milestones, Gitea-compatible issue templates and chooser ([template reference](docs/issue-templates.md)) | [Issue API](crates/rg-http/src/api/issues.rs) |
+| Pull requests | Diff, three merge strategies (merge / squash / rebase), cross-repo (fork) PRs, code review (approve / request changes / inline comments), branch protection, repository pull-request template ([reference](docs/issue-templates.md#pull-request-templates)), CODEOWNERS auto-review ([reference](docs/codeowners.md)) | [PR API](crates/rg-http/src/api/pulls.rs) |
+| Wiki | Markdown page CRUD with revision history stored in the database (no `.wiki.git` repository) | [Wiki API](crates/rg-http/src/api/wiki.rs) |
+| Git LFS | Batch API, object upload/download, zstd compression; works from both the HTTPS and the SSH clone URL ([details](#git-lfs)) | [LFS API](crates/rg-http/src/api/lfs.rs) |
+| CI/CD | Native `.plombir-git-ci.yml` pipelines ([schema reference](docs/ci.md)) and Gitea Actions (`.gitea/workflows/*.yml`, [supported subset](docs/gitea-actions.md)); embedded or external runners, optional Docker execution, artifacts, live job logs over WebSocket | [CI API](crates/rg-http/src/api/ci.rs) |
+| Webhooks | Registration, delivery, HMAC-SHA256 signatures, delivery history | [Webhook API](crates/rg-http/src/api/webhooks.rs) |
+| Notifications | In-app, email (SMTP), and real-time WebSocket delivery | [Notification delivery](crates/rg-core/src/notification/thread.rs) |
+| Registries | Package registry and OCI container registry | [Package API](crates/rg-http/src/api/packages.rs) |
+| Search | Global search of repositories, issues, wiki, PRs, users and indexed code; repository code search in the browser and AI API (build a code index explicitly before the first search) | [Search API](crates/rg-http/src/api/search.rs) |
+| Import | Pull repositories, issues, PRs, labels, milestones, release records and wiki from GitHub / GitLab; release assets are not imported and imported release authorship belongs to the importing account | [Import service](crates/rg-core/src/import/service.rs) |
+| Operations | TLS/HTTPS, TOML config, rate limiting, log rotation, unified pagination, registered GPG/SSH commit-signature verification, audit log, health checks | [Server startup](crates/rg-cli/src/serve.rs) |
+| AI agents | Model Context Protocol built into the server (`POST /api/v1/mcp`) and as a stdio binary (`plombir-git-mcp`); bot accounts, narrowed tokens, per-bot rate limits and audit ([details](#mcp-over-http-and-agent-accounts)) | [MCP API](crates/rg-http/src/api/mcp.rs) |
+| Releases | Release assets with optional in-toto / DSSE attestations signed by the instance key | [Release API](crates/rg-http/src/api/releases.rs) |
+| Web UI | SvelteKit (Svelte 5) SPA (login, repos, issues, PRs, wiki, CI, review, orgs, notifications, search and file blame), English + Chinese i18n | [App layout](web/src/routes/+layout.svelte) |
 
 Databases: SQLite, PostgreSQL, and MySQL are all supported and selected at
 runtime from the scheme of `--db-url` / `[database].url` — no feature rebuild

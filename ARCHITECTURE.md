@@ -336,7 +336,9 @@ which is what lets the server enforce what the CLI cannot:
 
 - **AuthN/AuthZ** — argon2 password hashing, JWT sessions, Personal Access
   Tokens, MFA and SSO; permission checks map org/team membership to
-  `can_read` / `can_write` on Git transport and the REST API.
+  `can_read` / `can_write` on Git transport and the REST API. A team's
+  `read` / `write` / `admin` permission applies to every repository in its
+  organization; teams cannot be assigned to individual repositories.
 - **Transport** — optional TLS/HTTPS (rustls); configurable CORS and CSP.
 - **Abuse controls** — token-bucket rate limiting with a trusted-proxy list for
   `X-Forwarded-For` / `X-Real-IP`. Argon2 never runs on an async worker:

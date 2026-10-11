@@ -23,12 +23,12 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 413 |
-| Из них достижимы из браузера | 287 (69%) |
+| Роутов в роутере (с объявленным `Access`) | 414 |
+| Из них достижимы из браузера | 288 (70%) |
 | Layout-модулей | 2 |
 | Страниц | 70 |
-| Интерактивных элементов | 1004 |
-| — из них дёргают API | 351 |
+| Интерактивных элементов | 1010 |
+| — из них дёргают API | 352 |
 | — приходят из общих компонентов | 398 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 47 / 172 / 163 |
 | **UI-роутов без единого web/smoke/browser-теста** | **26** |
@@ -38,7 +38,7 @@
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 107 | 68 | 4 | 0 |
+| `RepoRead` | 108 | 69 | 4 | 0 |
 | `RepoWrite` | 85 | 66 | 13 | 2 |
 | `User` | 55 | 44 | 6 | 0 |
 | `RepoAdmin` | 39 | 39 | 0 | 0 |
@@ -68,11 +68,11 @@
 | `/[owner]/[repo]/releases` | 27 | 12 | 11 |
 | `/[owner]/[repo]/issues` | 26 | 9 | 12 |
 | `/orgs/[name]` | 26 | 10 | 2 |
+| `/[owner]/[repo]` | 25 | 5 | 12 |
+| `/[owner]/[repo]/blob/[...path]` | 25 | 8 | 11 |
 | `/[owner]/[repo]/pipelines` | 25 | 11 | 14 |
-| `/[owner]/[repo]` | 24 | 5 | 12 |
 | `/[owner]/[repo]/wiki/[title]` | 24 | 9 | 13 |
 | `/admin/users` 🔒 | 24 | 7 | 4 |
-| `/[owner]/[repo]/blob/[...path]` | 23 | 7 | 11 |
 | `/[owner]/[repo]/branches` | 22 | 6 | 12 |
 | `/[owner]/[repo]/milestones` | 22 | 8 | 13 |
 | `/[owner]/[repo]/releases/new` | 21 | 5 | 11 |
@@ -100,6 +100,7 @@
 | `/settings/agents` | 13 | 5 | 2 |
 | `/login` | 12 | 1 | 0 |
 | `/admin/runners` 🔒 | 11 | 4 | 1 |
+| `/search` | 11 | 0 | 0 |
 | `/[owner]/[repo]/settings/labels` | 10 | 2 | 2 |
 | `/admin/audit` 🔒 | 9 | 6 | 1 |
 | `/[owner]/[repo]/edit/[...path]` | 8 | 0 | 8 |
@@ -108,7 +109,6 @@
 | `/[owner]/[repo]/settings/environments` | 8 | 2 | 2 |
 | `/admin/orgs` 🔒 | 8 | 3 | 1 |
 | `/orgs` | 8 | 1 | 0 |
-| `/search` | 8 | 0 | 0 |
 | `/` | 7 | 1 | 0 |
 | `/[owner]/[repo]/settings/deploy-keys` | 7 | 2 | 2 |
 | `/[owner]/[repo]/settings/lfs-storage` | 7 | 4 | 2 |
@@ -162,7 +162,7 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.retry | :426 | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web |
+| i18n:common.retry | :441 | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke+browser |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web+browser |
@@ -179,9 +179,10 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:repo.blob.download | :511 | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
-| i18n:repo.blob.deleting | :566 | `DELETE /api/v1/repos/{owner}/{name}/contents/{*path}` | `RepoWrite` | rust+web+browser |
-| i18n:repo.blob.download | :587 | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
+| i18n:repo.blob.hide_blame | :535 | `GET /api/v1/repos/{owner}/{name}/blame/{*path}` | `RepoRead` | web |
+| i18n:repo.blob.download | :555 | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
+| i18n:repo.blob.deleting | :612 | `DELETE /api/v1/repos/{owner}/{name}/contents/{*path}` | `RepoWrite` | rust+web+browser |
+| i18n:repo.blob.download | :633 | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |

@@ -49,8 +49,7 @@
 //!
 //! # Caveats
 //!
-//! - **Protocol V2** is complete in HTTP mode but has gaps in SSH mode
-//!   (`handle_v2_stream_impl` is a stub).
+//! - **Protocol V2** is handled in both HTTP and SSH modes.
 //! - Pack generation and thin-pack indexing use `git` CLI — not pure Rust.
 //!   These are the remaining migration items tracked in Project Memory.
 

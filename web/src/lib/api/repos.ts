@@ -31,6 +31,14 @@ export interface BlobResponse {
   lfs?: BlobLfs;
 }
 
+export interface BlameLine {
+  line: number;
+  commit: string;
+  author: string;
+  author_time: number;
+  summary: string;
+}
+
 interface FileOperationResponse {
   success: boolean;
   file_path: string;
@@ -191,6 +199,8 @@ export const repos = {
   blob: (owner: string, repo: string, path: string, ref?: string) => {
     return request<BlobResponse>(`${repoPath(owner, repo)}/blob/${encodeRepoPath(path)}${qs({ ref })}`);
   },
+  blame: (owner: string, repo: string, path: string, ref?: string) =>
+    request<BlameLine[]>(`${repoPath(owner, repo)}/blame/${encodeRepoPath(path)}${qs({ ref })}`),
   /** The file's bytes — for an LFS pointer, the object — as an `<img src>`. */
   rawUrl: (owner: string, repo: string, path: string, ref?: string) =>
     withApiBase(`${repoPath(owner, repo)}/raw/${encodeRepoPath(path)}${qs({ ref })}`),

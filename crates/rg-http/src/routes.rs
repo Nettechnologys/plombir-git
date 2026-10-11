@@ -2030,6 +2030,11 @@ pub(crate) fn build_all_routes(
         )
         .get(
             RepoRead,
+            "/repos/{owner}/{name}/blame/{*path}",
+            api::repo_content::get_blame,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/raw/{*path}",
             api::repo_content::get_raw,
         )

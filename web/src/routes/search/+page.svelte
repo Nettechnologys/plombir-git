@@ -29,7 +29,9 @@
   function normalizeSearchType(type: string | null): string {
     if (type === 'repo') return 'repos';
     if (type === 'issue') return 'issues';
-    if (type === 'repos' || type === 'issues' || type === 'wiki' || type === 'all') return type;
+    if (type === 'pull' || type === 'pr' || type === 'prs') return 'pulls';
+    if (type === 'user') return 'users';
+    if (type === 'repos' || type === 'issues' || type === 'wiki' || type === 'pulls' || type === 'users' || type === 'code' || type === 'all') return type;
     return 'all';
   }
 
@@ -172,6 +174,15 @@
     return `/${result.repo_owner || ''}/${resultRepoName(result)}`;
   }
 
+  function codeHref(result: SearchResult): string {
+    const file = (result.file_path || result.title).split('/').map(encodeURIComponent).join('/');
+    return `/${encodeURIComponent(result.repo_owner || '')}/${encodeURIComponent(result.repo_name || '')}/blob/${file}${result.line ? `#L${result.line}` : ''}`;
+  }
+
+  function plainCodeSnippet(snippet: string): string {
+    return snippet.replace(/<\/?b>/g, '');
+  }
+
   function stateLabel(state: string | null | undefined): string {
     return state ? t(`issues.state.${state}`, undefined, formatTranslationFallback(state)) : '';
   }
@@ -235,7 +246,10 @@
         { key: 'all', label: t('search.all') },
         { key: 'repos', label: t('search.repos') },
         { key: 'issues', label: t('search.issues') },
-        { key: 'wiki', label: t('search.wiki') }
+        { key: 'wiki', label: t('search.wiki') },
+        { key: 'pulls', label: t('search.pulls', 'Pull requests') },
+        { key: 'users', label: t('search.users', 'Users') },
+        { key: 'code', label: t('search.code', 'Code') }
       ] as tab}
         <button
           class="type-tab"
@@ -268,6 +282,9 @@
     {:else if results.length === 0}
       <div class="empty-state">
         <p>{t('search.no_results')}</p>
+        {#if activeType === 'code'}
+          <p>{t('search.code_index_hint', 'Code search uses repositories with a built index. Build one through the API or index-repo command first.')}</p>
+        {/if}
       </div>
     {:else}
       <div class="results-info">
@@ -323,6 +340,38 @@
                 {#if result.excerpt}
                   <div class="result-excerpt">{@html highlightText(result.excerpt || '', query)}</div>
                 {/if}
+              </div>
+            </a>
+          {:else if result.result_type === 'pull'}
+            <a href={`/${result.repo_owner}/${result.repo_name}/pulls/${result.number}`} class="result-card issue-card gh-list-item">
+              <div class="result-body">
+                <div class="issue-header">
+                  {#if result.state}
+                    <span class="issue-state-badge {getStateBadgeClass(result.state)}">{stateLabel(result.state)}</span>
+                  {/if}
+                  <span class="issue-badge">#{result.number}</span>
+                  <span class="result-title">{@html highlightText(result.title, query)}</span>
+                </div>
+                <div class="result-meta"><span class="repo-path">{result.repo_owner}/{result.repo_name}</span></div>
+                {#if result.excerpt}<div class="result-excerpt">{@html highlightText(result.excerpt, query)}</div>{/if}
+              </div>
+            </a>
+          {:else if result.result_type === 'user'}
+            <a href={`/${encodeURIComponent(result.title)}`} class="result-card gh-list-item">
+              <div class="result-body">
+                <span class="result-title">{@html highlightText(result.title, query)}</span>
+                <span class="result-kind">{t('search.users', 'Users')}</span>
+                {#if result.excerpt}<div class="result-excerpt">{@html highlightText(result.excerpt, query)}</div>{/if}
+              </div>
+            </a>
+          {:else if result.result_type === 'code'}
+            <a href={codeHref(result)} class="result-card gh-list-item">
+              <div class="result-body">
+                <div class="repo-name-row">
+                  <span class="result-title">{result.repo_owner}/{result.repo_name}/{result.file_path}</span>
+                  <span class="result-kind">{t('search.code', 'Code')}</span>
+                </div>
+                {#if result.excerpt}<div class="result-excerpt">{@html highlightText(plainCodeSnippet(result.excerpt), query)}</div>{/if}
               </div>
             </a>
           {/if}
@@ -547,9 +596,11 @@
     display: flex;
     gap: 0;
     border-bottom: 1px solid var(--border);
+    overflow-x: auto;
   }
 
   .type-tab {
+    flex: 0 0 auto;
     padding: 8px 16px;
     background: none;
     border: none;

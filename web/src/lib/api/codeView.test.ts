@@ -129,6 +129,27 @@ describe('the blob page', () => {
 		expect(selected).toEqual(['2', '3']);
 	});
 
+	it('opens blame for the current file and ref beside the numbered lines', async () => {
+		repos.blame.mockResolvedValue([1, 2, 3, 4].map((line) => ({
+			line,
+			commit: 'a'.repeat(40),
+			author: 'Alice',
+			author_time: 1700000000,
+			summary: 'Initial commit',
+		})));
+		const container = await open();
+		const button = Array.from(container.querySelectorAll<HTMLButtonElement>('.file-actions button'))
+			.find((candidate) => candidate.textContent?.trim() === 'Blame');
+		expect(button).toBeDefined();
+		button!.click();
+		await settle();
+		expect(repos.blame).toHaveBeenCalledWith('alice', 'demo', 'src/main.rs', 'main');
+		expect(container.querySelectorAll('.blame-cell')).toHaveLength(4);
+		expect(container.querySelector('.blame-cell')?.textContent).toContain('Alice');
+		expect(container.querySelector<HTMLAnchorElement>('.blame-cell a')?.getAttribute('href'))
+			.toBe('/alice/demo/commits/' + 'a'.repeat(40));
+	});
+
 	it('selects a line on click and a range on shift-click, in the URL', async () => {
 		const container = await open();
 		container.querySelector<HTMLAnchorElement>('a#L1')!.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));

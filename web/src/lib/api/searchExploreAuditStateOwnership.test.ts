@@ -88,6 +88,26 @@ afterEach(async () => {
 });
 
 describe('search, explore and audit async state ownership', () => {
+	it('links code matches to the matched line and exposes PR and user results', async () => {
+		search.search.mockResolvedValue({
+			results: [
+				{ result_type: 'code', id: 7, title: 'src/main.rs', excerpt: 'needle', repo_owner: 'acme', repo_name: 'app', file_path: 'src/main.rs', line: 12 },
+				{ result_type: 'pull', id: 8, title: 'needle fix', excerpt: null, repo_owner: 'acme', repo_name: 'app', number: 3, state: 'open' },
+				{ result_type: 'user', id: 9, title: 'needle-user', excerpt: null, repo_owner: null, repo_name: null },
+			],
+			total: 3,
+			page: 1,
+			per_page: 20,
+		});
+		setTestPage('/search?q=needle&type=all', {});
+		rendered = await renderComponent(SearchPage);
+		await settle();
+		expect(rendered.container.querySelector('a[href="/acme/app/blob/src/main.rs#L12"]')).not.toBeNull();
+		expect(rendered.container.querySelector('a[href="/acme/app/pulls/3"]')).not.toBeNull();
+		expect(rendered.container.querySelector('a[href="/needle-user"]')).not.toBeNull();
+		expect(Array.from(rendered.container.querySelectorAll('.type-tab')).map((tab) => tab.textContent)).toContain('Code');
+	});
+
 	it('keeps the newest URL search data, error and loading state', async () => {
 		const oldest = deferred<ReturnType<typeof searchResponse>>();
 		const staleFailure = deferred<ReturnType<typeof searchResponse>>();

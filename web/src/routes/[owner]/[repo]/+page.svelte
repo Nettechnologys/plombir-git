@@ -27,6 +27,7 @@
   let readmeContent = $state<string | null>(null);
   let readmeLoading = $state(false);
   let readmeError = $state('');
+  let codeQuery = $state('');
   let loading = $state(true);
   let error = $state('');
   const dataRequests = new LatestRepositoryResourceRequestFence<string>();
@@ -80,6 +81,11 @@
 
   function buildBlobHref(filePath: string) {
     return `/${owner}/${repo}/blob/${encodeRepoPath(filePath)}${buildRepoQuery(ref, '')}`;
+  }
+
+  function searchCode() {
+    const terms = [codeQuery.trim(), `repo:${owner}/${repo}`].filter(Boolean).join(' ');
+    goto(`/search?q=${encodeURIComponent(terms)}&type=code`);
   }
 
   function repositoryViewIdentity(expectedRef: string, expectedPath: string): string {
@@ -344,6 +350,15 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
       </div>
 
       <div class="toolbar-actions">
+        <input
+          type="search"
+          class="repo-code-query"
+          bind:value={codeQuery}
+          onkeydown={(event) => { if (event.key === 'Enter') searchCode(); }}
+          placeholder={t('search.code_in_repo', 'Search code in this repository')}
+          aria-label={t('search.code_in_repo', 'Search code in this repository')}
+        />
+        <button type="button" class="btn-outline btn-sm" onclick={searchCode}>{t('search.code', 'Code')}</button>
         <a href={`/${owner}/${repo}/branches`} class="btn-outline btn-sm branches-link">
           {t('repo.branches.title')}
         </a>

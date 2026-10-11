@@ -35,11 +35,14 @@ fn normalize_search_type(raw: &str) -> Option<&'static str> {
         "repo" | "repos" => Some("repos"),
         "issue" | "issues" => Some("issues"),
         "wiki" => Some("wiki"),
+        "pull" | "pulls" | "pr" | "prs" => Some("pulls"),
+        "user" | "users" => Some("users"),
+        "code" => Some("code"),
         _ => None,
     }
 }
 
-/// GET /api/v1/search?q=keyword&type=all|repos|issues|wiki&page=1&per_page=20
+/// GET /api/v1/search?q=keyword&type=all|repos|issues|wiki|pulls|users|code&page=1&per_page=20
 #[utoipa::path(
     get,
     path = "/search",
@@ -63,7 +66,7 @@ pub async fn search(
 
     let Some(search_type) = normalize_search_type(&params.r#type) else {
         return AppError::bad_request(
-            "invalid type, must be one of: all, repo/repos, issue/issues, wiki",
+            "invalid type, must be one of: all, repos, issues, wiki, pulls, users, code",
         )
         .into_response();
     };
@@ -110,6 +113,9 @@ mod tests {
         assert_eq!(normalize_search_type("issue"), Some("issues"));
         assert_eq!(normalize_search_type("issues"), Some("issues"));
         assert_eq!(normalize_search_type("wiki"), Some("wiki"));
+        assert_eq!(normalize_search_type("pr"), Some("pulls"));
+        assert_eq!(normalize_search_type("users"), Some("users"));
+        assert_eq!(normalize_search_type("code"), Some("code"));
         assert_eq!(normalize_search_type("unknown"), None);
     }
 }
