@@ -224,25 +224,102 @@ impl std::error::Error for ProcessOutputError {
 /// than waiting for a process the job no longer owns.
 const ORPHANED_PIPE_GRACE: Duration = Duration::from_secs(5);
 
-/// Run `command` while owning its whole descendant tree.
-///
-/// Dropping this future (for example when `tokio::time::timeout` elapses) kills
-/// the direct child and every process it started. The tree is also torn down
-/// after normal completion, so a background process cannot outlive the job that
-/// launched it.
-///
-/// Completion is the direct child's exit, not EOF on the pipes. A script such
-/// as `./server & cargo test` leaves `server` holding the inherited stdout; a
-/// run that waited for EOF before tearing the tree down waited for `server`,
-/// which never exits on its own, and the job sat "running" until its timeout.
-/// Here the child is reaped first, the group is killed, and the pipes are then
-/// drained for at most [`ORPHANED_PIPE_GRACE`]. A process that called `setsid`
-/// is outside the group and is not killed; its later output is not captured.
-pub async fn output_in_process_tree(
+/// The total captured stdout and stderr of one CI job. Both streams get half
+/// the budget. Even if every captured byte becomes a three-byte UTF-8
+/// replacement character, the resulting log fits the runner upload's 8 MiB
+/// request limit with room for notices.
+pub const MAX_JOB_LOG_BYTES: usize = 2 * 1024 * 1024;
+
+/// The beginning of a retained tail can bisect a secret. Drop enough bytes
+/// to cover the largest accepted CI secret (64 KiB), including its base64
+/// representation and line wrapping, before either runner masks the log.
+const TRUNCATED_LOG_BOUNDARY_BYTES: usize = 128 * 1024;
+
+/// Captured tail of each stream. The pipes are drained after their limits
+/// are reached, so a chatty job still finishes with its real exit status.
+pub struct CappedJobOutput {
+    pub output: Output,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+impl CappedJobOutput {
+    pub fn log(&self) -> String {
+        let visible = |bytes: &[u8], truncated: bool| {
+            let skip = if truncated {
+                TRUNCATED_LOG_BOUNDARY_BYTES.min(bytes.len())
+            } else {
+                0
+            };
+            String::from_utf8_lossy(&bytes[skip..]).into_owned()
+        };
+        let mut log = visible(&self.output.stdout, self.stdout_truncated);
+        if !self.output.stderr.is_empty() {
+            if !log.is_empty() {
+                log.push('\n');
+            }
+            log.push_str(&visible(&self.output.stderr, self.stderr_truncated));
+        }
+        if self.stdout_truncated {
+            log.push_str(&format!(
+                "\n[forgekeep-runner] stdout truncated to a {}-byte window; earlier output discarded",
+                MAX_JOB_LOG_BYTES / 2
+            ));
+        }
+        if self.stderr_truncated {
+            log.push_str(&format!(
+                "\n[forgekeep-runner] stderr truncated to a {}-byte window; earlier output discarded",
+                MAX_JOB_LOG_BYTES / 2
+            ));
+        }
+        log
+    }
+}
+
+/// Read CI process output incrementally with a fixed memory ceiling. This is
+/// used for local shells and Docker clients by both runner binaries.
+/// Dropping this future kills the direct child and its process tree.
+/// Completion is the direct child's exit, not pipe EOF: background processes
+/// in its group are killed, then pipes are drained for at most
+/// [`ORPHANED_PIPE_GRACE`]. Output from a process that escaped the group may
+/// therefore be omitted after that grace period.
+pub async fn output_ci_job_in_process_tree(
     command: &mut tokio::process::Command,
-) -> std::io::Result<Output> {
+) -> std::io::Result<CappedJobOutput> {
+    output_in_process_tree_with_capture_limit(command, MAX_JOB_LOG_BYTES / 2).await
+}
+
+async fn read_to_capture_limit<R: tokio::io::AsyncRead + Unpin>(
+    pipe: &mut R,
+    captured: &mut std::collections::VecDeque<u8>,
+    truncated: &mut bool,
+    limit: usize,
+) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt as _;
 
+    // An inline 8 KiB array in each async reader becomes part of every caller's
+    // future. The embedded runner has deep async call chains and small worker
+    // stacks; keep these read windows on the heap.
+    let mut chunk = Box::new([0u8; 8192]);
+    loop {
+        let read = pipe.read(&mut chunk[..]).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        let overflow = captured.len().saturating_add(read).saturating_sub(limit);
+        if overflow > 0 {
+            *truncated = true;
+            captured.drain(..overflow.min(captured.len()));
+        }
+        let start = read.saturating_sub(limit);
+        captured.extend(&chunk[start..read]);
+    }
+}
+
+async fn output_in_process_tree_with_capture_limit(
+    command: &mut tokio::process::Command,
+    limit: usize,
+) -> std::io::Result<CappedJobOutput> {
     // Match `Command::output`: no inherited stdin, captured stdout/stderr. The
     // direct-child guard remains defense in depth if platform setup fails after
     // spawn but before the tree owner is returned.
@@ -262,15 +339,17 @@ pub async fn output_in_process_tree(
         .take()
         .ok_or_else(|| std::io::Error::other("stderr was not piped"))?;
 
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
+    let mut stdout = std::collections::VecDeque::new();
+    let mut stderr = std::collections::VecDeque::new();
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
     let status = {
         // The pipes are read while the child runs: a child that fills a pipe
         // buffer nobody drains blocks forever on its next write.
         let drain = async {
             tokio::try_join!(
-                stdout_pipe.read_to_end(&mut stdout),
-                stderr_pipe.read_to_end(&mut stderr),
+                read_to_capture_limit(&mut stdout_pipe, &mut stdout, &mut stdout_truncated, limit),
+                read_to_capture_limit(&mut stderr_pipe, &mut stderr, &mut stderr_truncated, limit),
             )
             .map(drop)
         };
@@ -306,10 +385,14 @@ pub async fn output_in_process_tree(
         status
     };
 
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
+    Ok(CappedJobOutput {
+        output: Output {
+            status,
+            stdout: stdout.into_iter().collect(),
+            stderr: stderr.into_iter().collect(),
+        },
+        stdout_truncated,
+        stderr_truncated,
     })
 }
 
@@ -752,6 +835,91 @@ mod bounded_tests {
 }
 
 #[cfg(all(test, unix))]
+mod ci_job_output_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn both_streams_are_capped_and_the_reason_is_at_the_end() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "head -c 1048584 /dev/zero; head -c 1048584 /dev/zero >&2; exit 7",
+        ]);
+        let output = output_ci_job_in_process_tree(&mut command)
+            .await
+            .expect("job completed");
+        assert_eq!(output.output.status.code(), Some(7));
+        assert_eq!(output.output.stdout.len(), MAX_JOB_LOG_BYTES / 2);
+        assert_eq!(output.output.stderr.len(), MAX_JOB_LOG_BYTES / 2);
+        assert!(output.stdout_truncated);
+        assert!(output.stderr_truncated);
+        let log = output.log();
+        assert!(log.contains("stdout truncated to a 1048576-byte window"));
+        assert!(
+            log.ends_with("stderr truncated to a 1048576-byte window; earlier output discarded")
+        );
+        assert!(log.len() < 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn truncated_tail_keeps_final_error_without_exposing_a_split_secret() {
+        let mut output = std::process::Command::new("true")
+            .output()
+            .expect("create test status");
+        output.stdout = vec![b'x'; MAX_JOB_LOG_BYTES / 2];
+        output.stdout[..65_536].fill(b'S');
+        output.stdout.extend_from_slice(b"FINAL_ERROR");
+        let captured = CappedJobOutput {
+            output,
+            stdout_truncated: true,
+            stderr_truncated: false,
+        };
+        let log = captured.log();
+        assert!(log.contains("FINAL_ERROR"));
+        assert!(!log.contains("SSSS"), "secret fragment crossed the cut");
+        assert!(log.ends_with("earlier output discarded"));
+    }
+
+    /// Removing the capture ceiling makes this process's VmHWM grow with the
+    /// full 500 MiB stream; the 64 MiB allowance covers allocator overhead.
+    #[cfg_attr(not(target_os = "linux"), ignore = "requires /proc/self/status")]
+    #[tokio::test]
+    async fn five_hundred_mib_of_job_output_does_not_become_runner_rss() {
+        fn peak_resident_bytes() -> u64 {
+            let status = std::fs::read_to_string("/proc/self/status").expect("proc status");
+            let line = status
+                .lines()
+                .find(|line| line.starts_with("VmHWM:"))
+                .expect("VmHWM line");
+            line.split_whitespace()
+                .nth(1)
+                .expect("VmHWM value")
+                .parse::<u64>()
+                .expect("VmHWM number")
+                * 1024
+        }
+
+        let before = peak_resident_bytes();
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "head -c 524288000 /dev/zero; printf FINAL_ERROR"]);
+        let output = output_ci_job_in_process_tree(&mut command)
+            .await
+            .expect("job completed");
+        let growth = peak_resident_bytes().saturating_sub(before);
+        assert!(
+            growth < 64 * 1024 * 1024,
+            "500 MiB job output raised runner VmHWM by {} MiB",
+            growth / (1024 * 1024)
+        );
+        assert!(output.output.status.success());
+        assert!(output.stdout_truncated);
+        let log = output.log();
+        assert!(log.contains("FINAL_ERROR"));
+        assert!(log.contains("stdout truncated"));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod background_job_tests {
     use super::*;
 
@@ -772,14 +940,14 @@ mod background_job_tests {
         // after the grace, instead of killing their holder, is the defect.
         let output = tokio::time::timeout(
             ORPHANED_PIPE_GRACE - Duration::from_secs(1),
-            output_in_process_tree(&mut command),
+            output_ci_job_in_process_tree(&mut command),
         )
         .await
         .expect("the script finished but the run waited for its background job")
         .expect("run failed");
 
-        assert!(output.status.success(), "script exited non-zero");
-        assert_eq!(output.stdout, b"done\n");
+        assert!(output.output.status.success(), "script exited non-zero");
+        assert_eq!(output.output.stdout, b"done\n");
 
         // The background job is part of the tree the run owned, and it must
         // not outlive it either.
@@ -823,11 +991,11 @@ mod background_job_tests {
             "head -c 200000 /dev/zero | tr '\\0' 'a'; echo err 1>&2; exit 3",
         ]);
 
-        let output = output_in_process_tree(&mut command).await.unwrap();
+        let output = output_ci_job_in_process_tree(&mut command).await.unwrap();
 
-        assert_eq!(output.status.code(), Some(3));
-        assert_eq!(output.stdout.len(), 200_000);
-        assert_eq!(output.stderr, b"err\n");
+        assert_eq!(output.output.status.code(), Some(3));
+        assert_eq!(output.output.stdout.len(), 200_000);
+        assert_eq!(output.output.stderr, b"err\n");
     }
 }
 
@@ -1102,7 +1270,7 @@ mod windows_tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            output_in_process_tree(&mut command),
+            output_ci_job_in_process_tree(&mut command),
         )
         .await;
         assert!(

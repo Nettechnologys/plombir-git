@@ -140,7 +140,7 @@ pub(crate) async fn run_job_local(
         for (key, value) in variables {
             command.env(key, value);
         }
-        rg_process::output_in_process_tree(&mut command).await
+        rg_process::output_ci_job_in_process_tree(&mut command).await
     };
 
     #[cfg(windows)]
@@ -153,22 +153,11 @@ pub(crate) async fn run_job_local(
         for (key, value) in variables {
             command.env(key, value);
         }
-        rg_process::output_in_process_tree(&mut command).await
+        rg_process::output_ci_job_in_process_tree(&mut command).await
     };
 
     match output {
-        Ok(o) => {
-            let code = o.status.code().unwrap_or(-1);
-            let mut log = String::from_utf8_lossy(&o.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-            if !stderr.is_empty() {
-                if !log.is_empty() {
-                    log.push('\n');
-                }
-                log.push_str(&stderr);
-            }
-            (code, log)
-        }
+        Ok(o) => (o.output.status.code().unwrap_or(-1), o.log()),
         Err(e) => (-1, format!("Failed to spawn job: {}", e)),
     }
 }
@@ -228,17 +217,10 @@ pub(crate) async fn run_job_docker(
         }
     }
     command.kill_on_drop(true);
-    match command.output().await {
+    match rg_process::output_ci_job_in_process_tree(&mut command).await {
         Ok(o) => {
-            let code = o.status.code().unwrap_or(-1);
-            let mut log = String::from_utf8_lossy(&o.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-            if !stderr.is_empty() {
-                if !log.is_empty() {
-                    log.push('\n');
-                }
-                log.push_str(&stderr);
-            }
+            let code = o.output.status.code().unwrap_or(-1);
+            let mut log = o.log();
             if code != 0 && log.is_empty() {
                 log = format!("Docker exited with code {}", code);
             }

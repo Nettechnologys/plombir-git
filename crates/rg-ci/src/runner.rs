@@ -1274,23 +1274,11 @@ impl PipelineRunner {
             c
         };
 
-        let output = rg_process::output_in_process_tree(&mut cmd)
+        let output = rg_process::output_ci_job_in_process_tree(&mut cmd)
             .await
             .context("failed to spawn job process")?;
 
-        let exit_code = output.status.code().unwrap_or(-1);
-        let mut log = String::new();
-        if !output.stdout.is_empty() {
-            log.push_str(&String::from_utf8_lossy(&output.stdout));
-        }
-        if !output.stderr.is_empty() {
-            if !log.is_empty() {
-                log.push('\n');
-            }
-            log.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
-
-        Ok((exit_code, log))
+        Ok((output.output.status.code().unwrap_or(-1), output.log()))
     }
 
     /// Execute script inside a Docker container.
@@ -1394,22 +1382,12 @@ impl PipelineRunner {
                 command.env(key, value);
             }
         }
-        let output = command
-            .output()
+        let output = rg_process::output_ci_job_in_process_tree(&mut command)
             .await
             .context("failed to spawn docker run")?;
 
-        let exit_code = output.status.code().unwrap_or(-1);
-        let mut log = String::new();
-        if !output.stdout.is_empty() {
-            log.push_str(&String::from_utf8_lossy(&output.stdout));
-        }
-        if !output.stderr.is_empty() {
-            if !log.is_empty() {
-                log.push('\n');
-            }
-            log.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
+        let exit_code = output.output.status.code().unwrap_or(-1);
+        let mut log = output.log();
 
         // If docker run itself failed (e.g. image not found), provide a clear message
         if exit_code != 0 && log.is_empty() {
