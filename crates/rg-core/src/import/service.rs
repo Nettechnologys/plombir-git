@@ -806,7 +806,13 @@ async fn adopt_cloned_default_branch(
     repo_path: &Path,
     recorded_branch: &str,
 ) {
-    let advertisement = match rg_git::ref_advertisement::collect(repo_path) {
+    let repo_path_for_read = repo_path.to_path_buf();
+    let advertisement = match crate::blocking::run_blocking_git(
+        "reading the cloned repository's HEAD and refs",
+        move || rg_git::ref_advertisement::collect(&repo_path_for_read),
+    )
+    .await
+    {
         Ok(advertisement) => advertisement,
         Err(error) => {
             tracing::warn!(
@@ -5676,6 +5682,79 @@ mod clone_effect_tests {
             "master",
             "the row still names the branch the target was created with — the repository page \
              will resolve a ref that does not exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detached_cloned_head_keeps_the_recorded_default_branch() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        let sha = upstream_with_a_commit_on(&upstream, "master");
+        std::fs::write(upstream.join("HEAD"), format!("{sha}\n")).expect("detach HEAD");
+        let db = importing_user().await;
+        let repo_id = resolve_or_create_target_repo(
+            &db,
+            None,
+            "importer",
+            "detached",
+            &directory.path().join("repo_root"),
+        )
+        .await
+        .unwrap();
+
+        let (logs, guard) = CapturedLogs::capture();
+        adopt_cloned_default_branch(&db, repo_id, &upstream, "main").await;
+        drop(guard);
+
+        assert_eq!(
+            rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .default_branch,
+            "main"
+        );
+        assert!(
+            logs.rendered().contains("HEAD names no branch"),
+            "{}",
+            logs.rendered()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_cloned_head_keeps_the_recorded_branch_and_warning() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        upstream_with_a_commit_on(&upstream, "master");
+        std::fs::write(upstream.join("HEAD"), "not a ref at all\n").expect("corrupt HEAD");
+        let db = importing_user().await;
+        let repo_id = resolve_or_create_target_repo(
+            &db,
+            None,
+            "importer",
+            "unreadable",
+            &directory.path().join("repo_root"),
+        )
+        .await
+        .unwrap();
+
+        let (logs, guard) = CapturedLogs::capture();
+        adopt_cloned_default_branch(&db, repo_id, &upstream, "main").await;
+        drop(guard);
+
+        assert_eq!(
+            rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .default_branch,
+            "main"
+        );
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("could not read HEAD of the imported repository")
+                && rendered.contains("failed to read HEAD"),
+            "{rendered}"
         );
     }
 

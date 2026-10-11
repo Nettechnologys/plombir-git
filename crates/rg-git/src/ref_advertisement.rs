@@ -11,6 +11,23 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+/// Run a complete ref read away from Tokio's async workers. The closure owns
+/// its path and returns only Send data; no gix repository crosses an await.
+pub(crate) async fn run_blocking_ref_read<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .context("ref advertisement blocking task failed")?
+}
+
+pub async fn collect_for_clients_async(repo_path: &Path) -> Result<RefAdvertisement> {
+    let repo_path = repo_path.to_path_buf();
+    run_blocking_ref_read(move || collect_for_clients(&repo_path)).await
+}
+
 /// The repository state needed by v0/v1 advertisements and protocol v2
 /// `ls-refs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,7 +287,45 @@ pub fn collect(repo_path: &Path) -> Result<RefAdvertisement> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect, collect_for_clients};
+    use super::{collect, collect_for_clients, collect_for_clients_async, run_blocking_ref_read};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_ref_collection_leaves_the_async_worker_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = crate::test_support::repository_with_server_private_refs(dir.path());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            release_tx.send(()).expect("release ref read");
+        });
+        let read = tokio::spawn(async move {
+            run_blocking_ref_read(move || {
+                entered_tx.send(()).expect("signal ref read");
+                release_rx.recv().expect("wait for delayed ref read");
+                collect_for_clients(&repo_path)
+            })
+            .await
+        });
+        entered_rx.await.expect("blocking ref read starts");
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            tokio::spawn(async {}).await.expect("cheap task joins");
+        })
+        .await
+        .expect("delayed ref collection held the only async worker");
+        assert_eq!(read.await.unwrap().unwrap().refs.len(), 2);
+        release.join().expect("release thread joins");
+    }
+
+    #[tokio::test]
+    async fn async_client_advertisement_keeps_the_sync_visibility_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = crate::test_support::repository_with_server_private_refs(dir.path());
+        assert_eq!(
+            collect_for_clients_async(&repo_path).await.unwrap(),
+            collect_for_clients(&repo_path).unwrap()
+        );
+    }
 
     #[test]
     fn clients_are_not_shown_the_server_private_namespaces() {

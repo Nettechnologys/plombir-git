@@ -251,7 +251,11 @@ async fn do_receive_pack_stream_with_rejections<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let ref_list = build_ref_list(repo_path)?;
+    let repo_path_for_refs = repo_path.to_path_buf();
+    let ref_list = crate::ref_advertisement::run_blocking_ref_read(move || {
+        build_ref_list(&repo_path_for_refs)
+    })
+    .await?;
     let ad = build_ref_advertisement(&ref_list, "git-receive-pack");
     for pkt in &ad {
         write_pkt_line(stream, pkt).await?;

@@ -640,6 +640,17 @@ pub trait CiTrigger: Send + Sync {
         Ok(self.has_ci_config(repo_path, commit_sha))
     }
 
+    /// Async callers use this form so the production Git read can run on a
+    /// blocking thread. Cheap test doubles inherit the checked verdict.
+    fn has_ci_config_checked_async<'a>(
+        &'a self,
+        repo_path: &'a Path,
+        commit_sha: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        let answer = self.has_ci_config_checked(repo_path, commit_sha);
+        Box::pin(async move { answer })
+    }
+
     /// Whether a workflow at `commit_sha` is actually triggered by `event`.
     ///
     /// The gate for events the *native* `.plombir-git-ci.yml` format has no notion

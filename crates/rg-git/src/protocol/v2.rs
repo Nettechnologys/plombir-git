@@ -608,18 +608,15 @@ async fn handle_ls_refs<W: AsyncWrite + Unpin>(
     unborn: bool,
     _server_options: &[String],
 ) -> Result<()> {
-    // CRITICAL: gix::Repository is NOT Send (contains RefCell), so all gix operations
-    // MUST complete before any `.await` point. We collect all ref data synchronously first,
-    // then do async I/O with the collected data.
-
-    // --- Synchronous gix section (no .await allowed here) ---
     struct RefData {
-        entries: Vec<(String, String, Option<String>)>, // (sha, refname, symref_target)
+        lines: Vec<String>,
         unborn_line: Option<String>,
     }
 
-    let ref_data: RefData = {
-        let advertisement = crate::ref_advertisement::collect_for_clients(repo_path)
+    let repo_path = repo_path.to_path_buf();
+    let ref_patterns = ref_patterns.to_vec();
+    let ref_data = crate::ref_advertisement::run_blocking_ref_read(move || {
+        let advertisement = crate::ref_advertisement::collect_for_clients(&repo_path)
             .context("failed to collect references for ls-refs")?;
 
         let mut ref_entries: Vec<(String, String, Option<String>)> = Vec::new();
@@ -644,63 +641,58 @@ async fn handle_ls_refs<W: AsyncWrite + Unpin>(
             ref_entries.push((oid, refname, None));
         }
 
-        // repo is dropped here — no longer held across .await
-        RefData {
-            entries: ref_entries,
-            unborn_line,
-        }
-    };
-    // --- End synchronous gix section ---
+        let filtered: Vec<_> = if ref_patterns.is_empty() {
+            ref_entries
+        } else {
+            ref_entries
+                .into_iter()
+                .filter(|(_, refname, _)| {
+                    ref_patterns
+                        .iter()
+                        .any(|prefix| refname.starts_with(prefix.as_str()))
+                })
+                .collect()
+        };
 
-    // Send unborn HEAD if applicable (now safe to .await)
+        let mut lines = Vec::with_capacity(filtered.len());
+        for (sha, refname, symref_target) in &filtered {
+            let mut line = format!("{} {}", sha, refname);
+
+            // Append symref-target if client requested and we have one
+            if symrefs {
+                if let Some(target) = symref_target {
+                    line.push_str(&format!(" symref-target:{}", target));
+                }
+            }
+
+            // Append peeled SHA for annotated tags if client requested
+            if peel && refname.starts_with("refs/tags/") {
+                let peeled = get_tag_peel(&repo_path, sha)
+                    .with_context(|| format!("failed to peel advertised tag `{refname}`"))?;
+                // Only append if the peeled SHA differs from the tag object SHA
+                // (i.e., it's actually an annotated tag pointing to a commit)
+                if peeled != sha.as_str() {
+                    line.push_str(&format!(" peeled:{}", peeled));
+                }
+            }
+
+            lines.push(line);
+        }
+        Ok(RefData { lines, unborn_line })
+    })
+    .await?;
+
     if let Some(line) = &ref_data.unborn_line {
         write_pkt_line(writer, &PktLine::text(line)).await?;
     }
-
-    // Apply ref-prefix filtering
-    let filtered: Vec<_> = if ref_patterns.is_empty() {
-        ref_data.entries
-    } else {
-        ref_data
-            .entries
-            .into_iter()
-            .filter(|(_, refname, _)| {
-                ref_patterns
-                    .iter()
-                    .any(|prefix| refname.starts_with(prefix.as_str()))
-            })
-            .collect()
-    };
-
-    // Send each ref (all async I/O happens here, after gix objects are dropped)
-    for (sha, refname, symref_target) in &filtered {
-        let mut line = format!("{} {}", sha, refname);
-
-        // Append symref-target if client requested and we have one
-        if symrefs {
-            if let Some(target) = symref_target {
-                line.push_str(&format!(" symref-target:{}", target));
-            }
-        }
-
-        // Append peeled SHA for annotated tags if client requested
-        if peel && refname.starts_with("refs/tags/") {
-            let peeled = get_tag_peel(repo_path, sha)
-                .with_context(|| format!("failed to peel advertised tag `{refname}`"))?;
-            // Only append if the peeled SHA differs from the tag object SHA
-            // (i.e., it's actually an annotated tag pointing to a commit)
-            if peeled != sha.as_str() {
-                line.push_str(&format!(" peeled:{}", peeled));
-            }
-        }
-
-        write_pkt_line(writer, &PktLine::text(&line)).await?;
+    for line in &ref_data.lines {
+        write_pkt_line(writer, &PktLine::text(line)).await?;
     }
 
     // End of refs
     write_flush(writer).await?;
 
-    tracing::debug!(refs = filtered.len(), "Sent ls-refs response (V2)");
+    tracing::debug!(refs = ref_data.lines.len(), "Sent ls-refs response (V2)");
     Ok(())
 }
 
@@ -1335,6 +1327,69 @@ mod tests {
             "no partial ls-refs response may be written"
         );
         assert!(format!("{error:#}").contains("failed to read HEAD"));
+    }
+
+    #[tokio::test]
+    async fn ls_refs_peels_an_annotated_tag_before_writing_the_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("tagged");
+        let git = crate::cli_gateway::GitCommandGateway::new().unwrap();
+        git.run_or_bail(&["init", "-q", repo_path.to_str().unwrap()], None)
+            .unwrap();
+        git.run_or_bail(
+            &[
+                "-c",
+                "user.name=Ref Test",
+                "-c",
+                "user.email=refs@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+            Some(&repo_path),
+        )
+        .unwrap();
+        git.run_or_bail(
+            &[
+                "-c",
+                "user.name=Ref Test",
+                "-c",
+                "user.email=refs@example.invalid",
+                "tag",
+                "-a",
+                "v1",
+                "-m",
+                "annotated",
+            ],
+            Some(&repo_path),
+        )
+        .unwrap();
+        let commit = git
+            .run(&["rev-parse", "HEAD"], Some(&repo_path))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_string();
+
+        let mut output = Vec::new();
+        handle_ls_refs(
+            &repo_path,
+            &mut output,
+            &["refs/tags/".to_string()],
+            true,
+            false,
+            false,
+            &[],
+        )
+        .await
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains(&format!("refs/tags/v1 peeled:{commit}")),
+            "{output}"
+        );
+        assert!(!output.contains("refs/heads/"), "{output}");
     }
 
     #[test]

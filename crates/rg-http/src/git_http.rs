@@ -1141,7 +1141,13 @@ pub(crate) async fn handle_info_refs(
                 "application/x-git-receive-pack-advertisement"
             };
 
-            match build_info_refs(&repo_path, service) {
+            let service_for_refs = service.to_string();
+            let info_refs = rg_core::blocking::run_blocking_git(
+                "building HTTP Git ref advertisement",
+                move || build_info_refs(&repo_path, &service_for_refs),
+            )
+            .await;
+            match info_refs {
                 Ok(data) => (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], data),
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,

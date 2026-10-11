@@ -774,10 +774,15 @@ pub async fn compute_diff(
     let pr = get_pr(db, owner, repo_name, number).await?;
     let base_repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
 
-    if !base_repo_path.exists() {
-        bail!("repository path does not exist: {:?}", base_repo_path);
-    }
-    require_pull_request_branch(&base_repo_path, "base", &pr.base_branch)?;
+    let path_for_base = base_repo_path.clone();
+    let branch_for_base = pr.base_branch.clone();
+    crate::blocking::run_blocking_git("checking pull request base branch", move || {
+        if !path_for_base.exists() {
+            bail!("repository path does not exist: {:?}", path_for_base);
+        }
+        require_pull_request_branch(&path_for_base, "base", &branch_for_base)
+    })
+    .await?;
 
     // For fork PRs, fetch the head branch into the target repo first
     if let Some(head_repo_id) = pr.head_repo_id {
@@ -833,12 +838,14 @@ pub async fn compute_diff(
         .await;
     }
 
-    require_pull_request_branch(&base_repo_path, "head", &pr.head_branch)?;
-
-    // Same-repo diff — offload to spawn_blocking
-    let base_path = base_repo_path.clone();
+    // The head ref check and the diff are one synchronous Git phase.
+    let base_path = base_repo_path;
     let pr_clone = pr.clone();
-    tokio::task::spawn_blocking(move || compute_same_repo_diff(&base_path, &pr_clone)).await?
+    crate::blocking::run_blocking_git("diffing a same-repo pull request", move || {
+        require_pull_request_branch(&base_path, "head", &pr_clone.head_branch)?;
+        compute_same_repo_diff(&base_path, &pr_clone)
+    })
+    .await
 }
 
 /// The head revision a pull request's diff is about.

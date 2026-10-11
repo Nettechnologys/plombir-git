@@ -114,17 +114,18 @@ mod tests {
         let mirror = include_str!("mirror/service.rs");
         let pulls = include_str!("pull_request/service.rs");
 
-        for (source, function, blocking_calls) in [
-            (import, "clone_repo", &["run"] as &[&str]),
+        for (source, function, boundary_count, blocking_calls) in [
+            (import, "clone_repo", 1, &["run"] as &[&str]),
             (
                 mirror,
                 "run_sync_pass",
+                1,
                 &["run_git_clone_mirror", "run_git_remote_update"],
             ),
             // The fork fetch is one helper both share, so `--no-tags` cannot
             // drift between them.
-            (pulls, "compute_diff", &["run_fork_fetch"]),
-            (pulls, "merge_claimed_pr", &["run_fork_fetch"]),
+            (pulls, "compute_diff", 3, &["run_fork_fetch"]),
+            (pulls, "merge_claimed_pr", 1, &["run_fork_fetch"]),
         ] {
             let boundary = rust_source::production_function_call_sites(
                 source,
@@ -133,8 +134,8 @@ mod tests {
             );
             assert_eq!(
                 boundary.len(),
-                1,
-                "{function} must have one network Git blocking boundary, found {boundary:?}"
+                boundary_count,
+                "{function} must have {boundary_count} Git blocking boundaries, found {boundary:?}"
             );
 
             for blocking_call in blocking_calls {
@@ -149,11 +150,31 @@ mod tests {
                     "{function} must make one `{blocking_call}` call, found {calls:?}"
                 );
                 assert!(
-                    rust_source::call_site_contains(source, boundary[0], calls[0]),
+                    boundary
+                        .iter()
+                        .any(|site| rust_source::call_site_contains(source, *site, calls[0])),
                     "{function}'s `{blocking_call}` call is outside its blocking boundary"
                 );
             }
         }
+
+        let diff_boundaries = rust_source::production_function_call_sites(
+            pulls,
+            "compute_diff",
+            &["run_blocking_git"],
+        );
+        let branch_checks = rust_source::production_function_call_sites(
+            pulls,
+            "compute_diff",
+            &["require_pull_request_branch"],
+        );
+        assert_eq!(branch_checks.len(), 3, "{branch_checks:?}");
+        assert!(
+            branch_checks.iter().all(|call| diff_boundaries
+                .iter()
+                .any(|boundary| rust_source::call_site_contains(pulls, *boundary, *call))),
+            "base and both head ref checks must stay inside their blocking phases"
+        );
 
         let wiki_boundaries = rust_source::production_function_call_sites(
             import,

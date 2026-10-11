@@ -1115,10 +1115,21 @@ async fn post_push_branch_maintenance(
 /// `.plombir-git-ci.yml` is present at the pushed commit, then fan out the
 /// real-time owner notification and the optional SMTP email.
 async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, update: &RefUpdate) {
-    if !params
+    let has_ci_config = match params
         .ci_engine
-        .has_ci_config(&target.path, &update.new_sha)
+        .has_ci_config_checked_async(&target.path, &update.new_sha)
+        .await
     {
+        Ok(present) => present,
+        Err(error) => {
+            tracing::warn!(
+                repo = %target.path.display(),
+                "CI gate: cannot open repository, treating the commit as having no CI config: {error:#}"
+            );
+            return;
+        }
+    };
+    if !has_ci_config {
         return;
     }
     let pipeline_id = match params

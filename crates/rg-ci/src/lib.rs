@@ -193,6 +193,15 @@ impl CiEngine {
     }
 }
 
+async fn run_ci_config_gate<F>(check: F) -> Result<bool>
+where
+    F: FnOnce() -> Result<bool> + Send + 'static,
+{
+    tokio::task::spawn_blocking(check)
+        .await
+        .context("CI config gate blocking task failed")?
+}
+
 impl rg_core::ci::CiTrigger for CiEngine {
     fn has_ci_config(&self, repo_path: &std::path::Path, commit_sha: &str) -> bool {
         rg_core::ci::has_ci_config(repo_path, commit_sha)
@@ -200,6 +209,18 @@ impl rg_core::ci::CiTrigger for CiEngine {
 
     fn has_ci_config_checked(&self, repo_path: &std::path::Path, commit_sha: &str) -> Result<bool> {
         rg_core::ci::has_ci_config_checked(repo_path, commit_sha)
+    }
+
+    fn has_ci_config_checked_async<'a>(
+        &'a self,
+        repo_path: &'a std::path::Path,
+        commit_sha: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + 'a>> {
+        let repo_path = repo_path.to_path_buf();
+        let commit_sha = commit_sha.to_string();
+        Box::pin(run_ci_config_gate(move || {
+            rg_core::ci::has_ci_config_checked(&repo_path, &commit_sha)
+        }))
     }
 
     fn has_workflow_for_event(&self, query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
@@ -276,6 +297,40 @@ impl rg_core::ci::CiTrigger for CiEngine {
 mod engine_ci_config_gate_tests {
     use super::CiEngine;
     use rg_core::ci::CiTrigger;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_config_read_leaves_the_async_worker_free() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            release_tx.send(()).expect("release CI config read");
+        });
+        let read = tokio::spawn(super::run_ci_config_gate(move || {
+            entered_tx.send(()).expect("signal CI config read");
+            release_rx.recv().expect("wait for delayed CI config read");
+            Ok(true)
+        }));
+        entered_rx.await.expect("blocking CI config read starts");
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            tokio::spawn(async {}).await.expect("cheap task joins");
+        })
+        .await
+        .expect("delayed CI config read held the only async worker");
+        assert!(read.await.unwrap().unwrap());
+        release.join().expect("release thread joins");
+    }
+
+    #[tokio::test]
+    async fn async_config_gate_keeps_the_checked_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("not-a-repository.git");
+        let error = CiEngine::new()
+            .has_ci_config_checked_async(&missing, "deadbeef")
+            .await
+            .expect_err("unreadable Git remains unknown, not no config");
+        assert!(format!("{error:#}").contains("failed to open repository"));
+    }
 
     #[test]
     fn the_engine_reports_an_unopenable_repository_instead_of_inheriting_the_fail_open_default() {

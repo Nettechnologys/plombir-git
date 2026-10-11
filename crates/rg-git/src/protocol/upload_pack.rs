@@ -42,7 +42,7 @@ async fn upload_pack_stream_impl<S>(repo_path: &Path, stream: &mut S) -> Result<
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let advertisement = crate::ref_advertisement::collect_for_clients(repo_path)?;
+    let advertisement = crate::ref_advertisement::collect_for_clients_async(repo_path).await?;
     let ref_list = build_ref_advertisement_vec(advertisement.refs, advertisement.head_oid);
 
     // Send ref advertisement

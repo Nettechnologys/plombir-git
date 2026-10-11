@@ -1616,7 +1616,8 @@ async fn ensure_merge_group_ci(
     // a branch-protection rule that could not be read.
     let has_ci_config = ci
         .trigger
-        .has_ci_config_checked(&repo_path, &group_sha)
+        .has_ci_config_checked_async(&repo_path, &group_sha)
+        .await
         .with_context(|| {
             format!("merge queue: cannot tell whether merge group {group_sha} carries a CI config")
         })?;
