@@ -156,7 +156,7 @@ pub async fn submit_review(
         &pr,
         repo_id,
         reviewer_id,
-        action,
+        action.clone(),
         body,
         commit_id,
     )
@@ -177,6 +177,21 @@ pub async fn submit_review(
         event = event.mentions_in(body);
     }
     crate::notification::thread::spawn(&pools, event);
+    let payload = serde_json::json!({
+        "event": "pull_request.review_submitted",
+        "pull_request": { "id": pr.id, "number": pr.number },
+        "review": { "id": review.id, "reviewer_id": reviewer_id, "action": format!("{action:?}") },
+    });
+    if let Err(error) = crate::webhook::service::trigger_event(
+        &pools,
+        repo_id,
+        "pull_request.review_submitted",
+        &payload,
+    )
+    .await
+    {
+        tracing::warn!(repo_id, pr_number, error = %format!("{error:#}"), "failed to trigger review webhook");
+    }
     Ok(review)
 }
 
@@ -220,6 +235,20 @@ pub fn notify_review_requested(
                 error = %format!("{error:#}"),
                 "review request notification was not delivered"
             );
+        }
+        let payload = serde_json::json!({
+            "event": "pull_request.review_requested",
+            "pull_request": { "id": pr.id, "number": pr.number },
+            "reviewer_id": reviewer_id,
+            "requested_by_id": requested_by_id,
+        });
+        if let Err(error) = crate::webhook::service::trigger_event(
+            &db,
+            pr.repo_id,
+            "pull_request.review_requested",
+            &payload,
+        ).await {
+            tracing::warn!(pr_id, reviewer_id, error = %format!("{error:#}"), "failed to trigger review request webhook");
         }
     });
 }

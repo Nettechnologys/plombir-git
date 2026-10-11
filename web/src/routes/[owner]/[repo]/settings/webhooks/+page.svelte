@@ -20,9 +20,15 @@
     'issue.opened',
     'issue.closed',
     'issue.comment',
+    'issue.edited',
+    'issue.labeled',
+    'issue.assigned',
     'pull_request.opened',
     'pull_request.closed',
     'pull_request.merged',
+    'pull_request.synchronize',
+    'pull_request.review_submitted',
+    'pull_request.review_requested',
     'release.created',
     'release.deleted',
     'branch.created',
@@ -30,6 +36,10 @@
     'tag.created',
     'tag.deleted',
     'milestone.closed',
+    'ci.status',
+    'wiki.created',
+    'wiki.updated',
+    'wiki.deleted',
   ];
 
   let hooks = $state<RepositoryWebhook[]>([]);
@@ -44,7 +54,7 @@
   let success = $state('');
   let url = $state('');
   let secret = $state('');
-  let contentType = $state<'json' | 'form'>('json');
+  let contentType = $state<'json' | 'form' | 'slack' | 'discord' | 'matrix'>('json');
   let active = $state(true);
   let selectedEvents = $state<string[]>(['push']);
   let busyRows = $state<Set<string>>(new Set());
@@ -396,6 +406,9 @@
           <select id="webhook-content-type" bind:value={contentType} disabled={saving}>
             <option value="json">application/json</option>
             <option value="form">application/x-www-form-urlencoded</option>
+            <option value="slack">{t('settings.webhooks.format_slack')}</option>
+            <option value="discord">{t('settings.webhooks.format_discord')}</option>
+            <option value="matrix">{t('settings.webhooks.format_matrix')}</option>
           </select>
         </div>
 

@@ -20,6 +20,7 @@
   import { getUser } from '$lib/stores/auth.svelte';
   import ConfirmModal from '$lib/components/ConfirmModal.svelte';
   import { createConfirmer } from '$lib/confirm.svelte';
+  import { pathSegment } from '$lib/api/repoPath';
 
   const t = createT();
   const confirmer = createConfirmer();
@@ -546,6 +547,7 @@
           <button type="button" class="btn-danger" onclick={deleteOrganization} disabled={busyAction !== null}>
             {busyAction === 'delete-org' ? t('common.loading') : t('orgs.delete_organization')}
           </button>
+          <a class="btn-secondary" href={`/orgs/${pathSegment(org.name)}/hooks`}>{t('settings.webhooks.title')}</a>
         </div>
       {/if}
     </div>

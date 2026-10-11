@@ -104,7 +104,7 @@ use crate::common::source_scan::{
     functions, handler_type_name, param_base_types, relative, rust_files, signature_params,
     src_root,
 };
-use crate::common::{register_full, spawn_test_app_with_db, spawn_test_app_with_routes};
+use crate::common::{register_full, spawn_test_app_with_db, spawn_test_app_with_routes_and_db};
 
 const VICTIM: &str = "orgscopevictim";
 const ATTACKER: &str = "orgscopeattacker";
@@ -149,6 +149,15 @@ enum Role {
 /// path-string table is what rotted in the id-scope sweep's first selector.
 const ID_ROLE: &[(&str, &str, Role)] = &[
     ("teams", "team_id", Role::Target),
+    ("hooks", "id", Role::Target),
+    (
+        "deliveries",
+        "delivery_id",
+        Role::Argument(
+            "the delivery is resolved inside the hook after webhook_in_scope anchors the hook \
+             to the organization; delivery_in_webhook then anchors this id to that hook",
+        ),
+    ),
     (
         "members",
         "user_id",
@@ -245,7 +254,13 @@ fn target(path: &str) -> Option<(&str, &str)> {
 /// `None` when the path carries a placeholder this sweep cannot fill, which the
 /// caller reports rather than guesses at — a placeholder filled by guesswork is
 /// a probe that proves nothing.
-fn fill(path: &str, org: &str, target_id: i64, argument_id: i64) -> Option<String> {
+fn fill(
+    path: &str,
+    org: &str,
+    target_id: i64,
+    argument_id: i64,
+    delivery_id: i64,
+) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     let mut previous = "";
     for segment in path.split('/') {
@@ -254,6 +269,7 @@ fn fill(path: &str, org: &str, target_id: i64, argument_id: i64) -> Option<Strin
             Some(name) if name == ORG_PLACEHOLDER => org.to_string(),
             Some(name) if is_global_id(name) => match role(previous, name)? {
                 Role::Target => target_id.to_string(),
+                Role::Argument(_) if name == "delivery_id" => delivery_id.to_string(),
                 Role::Argument(_) => argument_id.to_string(),
             },
             Some(_) => return None,
@@ -275,6 +291,10 @@ fn body(fact: &RouteFact, account: i64) -> Option<serde_json::Value> {
     match (fact.method, fact.path.as_str()) {
         ("POST", "/api/v1/orgs/{name}/teams/{team_id}/members") => {
             Some(serde_json::json!({ "user_id": account, "role": "member" }))
+        }
+        ("PATCH", "/api/v1/orgs/{name}/hooks/{id}")
+        | ("POST", "/api/v1/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver") => {
+            Some(serde_json::json!({ "active": true }))
         }
         _ => None,
     }
@@ -401,6 +421,27 @@ impl Fixture {
             .unwrap_or_else(|| panic!("team response carried no id: {body}"))
     }
 
+    async fn create_hook(&self, token: &str, org: &str) -> i64 {
+        let response = self
+            .client
+            .post(format!("{}/api/v1/orgs/{org}/hooks", self.base))
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "url": "https://hooks.example.com/org-scope",
+                "events": ["push"]
+            }))
+            .send()
+            .await
+            .expect("create organization hook");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response
+            .json::<serde_json::Value>()
+            .await
+            .expect("organization hook response")["id"]
+            .as_i64()
+            .expect("organization hook id")
+    }
+
     async fn drive(
         &self,
         fact: &RouteFact,
@@ -449,7 +490,7 @@ struct Probe<'a> {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn no_org_scoped_route_reaches_another_organizations_row() {
-    let (base, facts) = spawn_test_app_with_routes().await;
+    let (base, facts, db) = spawn_test_app_with_routes_and_db().await;
     let (victim_token, victim_id) =
         register_full(&base, VICTIM, &format!("{VICTIM}@example.com")).await;
     let (attacker_token, attacker_id) =
@@ -470,6 +511,28 @@ async fn no_org_scoped_route_reaches_another_organizations_row() {
     let attacker_team = fx
         .create_team(&fx.attacker_token, ATTACKER_ORG, "attacker-devs")
         .await;
+    let victim_hook = fx.create_hook(&fx.victim_token, VICTIM_ORG).await;
+    let attacker_hook = fx.create_hook(&fx.attacker_token, ATTACKER_ORG).await;
+    let seed_delivery = |hook_id: i64, name: &str| rg_db::entities::webhook_delivery::ActiveModel {
+        webhook_id: rg_db::sea_orm::Set(hook_id),
+        event: rg_db::sea_orm::Set("push".to_string()),
+        delivery_id: rg_db::sea_orm::Set(name.to_string()),
+        request_payload: rg_db::sea_orm::Set(Some("{}".to_string())),
+        created_at: rg_db::sea_orm::Set(chrono::Utc::now()),
+        ..Default::default()
+    };
+    let victim_delivery = rg_db::ops::webhook_ops::create_delivery(
+        &db,
+        seed_delivery(victim_hook, "org-scope-victim"),
+    )
+    .await
+    .expect("seed victim delivery");
+    let attacker_delivery = rg_db::ops::webhook_ops::create_delivery(
+        &db,
+        seed_delivery(attacker_hook, "org-scope-attacker"),
+    )
+    .await
+    .expect("seed attacker delivery");
 
     assert!(
         !facts.is_empty(),
@@ -518,7 +581,7 @@ async fn no_org_scoped_route_reaches_another_organizations_row() {
         let Some((resource, placeholder)) = target(&fact.path) else {
             continue;
         };
-        if resource != "teams" {
+        if !matches!(resource, "teams" | "hooks") {
             if !signed_off(&fact.label()) {
                 unclassified.push(format!(
                     "  {} — addresses a `{resource}` row by its instance-wide id and this sweep \
@@ -538,11 +601,40 @@ async fn no_org_scoped_route_reaches_another_organizations_row() {
             ));
             continue;
         }
+        let (victim_target, attacker_target) = if resource == "hooks" {
+            (victim_hook, attacker_hook)
+        } else {
+            (victim_team, attacker_team)
+        };
         let urls = (
-            fill(&fact.path, ATTACKER_ORG, victim_team, fx.attacker_id),
-            fill(&fact.path, ATTACKER_ORG, ABSENT_ID, fx.attacker_id),
-            fill(&fact.path, ATTACKER_ORG, attacker_team, fx.attacker_id),
-            fill(&fact.path, VICTIM_ORG, victim_team, fx.victim_id),
+            fill(
+                &fact.path,
+                ATTACKER_ORG,
+                victim_target,
+                fx.attacker_id,
+                attacker_delivery.id,
+            ),
+            fill(
+                &fact.path,
+                ATTACKER_ORG,
+                ABSENT_ID,
+                fx.attacker_id,
+                attacker_delivery.id,
+            ),
+            fill(
+                &fact.path,
+                ATTACKER_ORG,
+                attacker_target,
+                fx.attacker_id,
+                attacker_delivery.id,
+            ),
+            fill(
+                &fact.path,
+                VICTIM_ORG,
+                victim_target,
+                fx.victim_id,
+                victim_delivery.id,
+            ),
         );
         let (Some(foreign), Some(absent), Some(reach), Some(owned)) = urls else {
             if !signed_off(&fact.label()) {

@@ -13,7 +13,7 @@
 //! so the gate is `require_admin` — on the reads as well: the target URL of a
 //! delivery is configuration, not repository content.
 
-use crate::common::{create_repo, register_full, spawn_test_app};
+use crate::common::{create_repo, register_full, spawn_test_app, spawn_test_app_with_db};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -438,4 +438,144 @@ async fn unknown_webhook_is_not_found() {
     assert_eq!(resp.status(), 404);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["message"], "webhook not found");
+}
+
+#[tokio::test]
+async fn organization_and_instance_hooks_are_scoped_and_reach_their_repositories() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner, _) = register_full(&base, "whscope_owner", "whscope_o@e.com").await;
+    let (outsider, _) = register_full(&base, "whscope_out", "whscope_x@e.com").await;
+    let (admin, admin_id) = register_full(&base, "whscope_admin", "whscope_a@e.com").await;
+    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
+        .await
+        .unwrap()
+        .expect("admin exists");
+    let client = reqwest::Client::new();
+
+    let org: serde_json::Value = client
+        .post(format!("{base}/api/v1/orgs"))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({"name": "whscope-org"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let org_id = org["id"].as_i64().unwrap();
+    let repo: serde_json::Value = client
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({"name": "project", "org": "whscope-org"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let repo_id = repo["id"].as_i64().unwrap();
+    let org_hooks = format!("{base}/api/v1/orgs/whscope-org/hooks");
+    let system_hooks = format!("{base}/api/v1/admin/hooks");
+    let body = serde_json::json!({
+        "url": HOOK_URL,
+        "secret": HOOK_SECRET,
+        "events": ["push"],
+        "content_type": "slack"
+    });
+
+    for (url, token, expected) in [
+        (&org_hooks, &outsider, 403),
+        (&system_hooks, &outsider, 403),
+    ] {
+        assert_eq!(
+            client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            expected
+        );
+        assert_eq!(
+            client
+                .post(url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            expected
+        );
+    }
+    let org_hook = client
+        .post(&org_hooks)
+        .bearer_auth(&owner)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(org_hook.status(), 201);
+    let org_hook: serde_json::Value = org_hook.json().await.unwrap();
+    let org_hook_id = org_hook["id"].as_i64().unwrap();
+    assert_eq!(org_hook["scope_kind"], "org");
+    assert_eq!(org_hook["scope_id"], org_id);
+    assert_eq!(org_hook["content_type"], "slack");
+    assert_eq!(org_hook["has_secret"], true);
+    assert!(org_hook.get("secret").is_none());
+
+    let system_hook = client
+        .post(&system_hooks)
+        .bearer_auth(&admin)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(system_hook.status(), 201);
+    let system_hook: serde_json::Value = system_hook.json().await.unwrap();
+    let system_hook_id = system_hook["id"].as_i64().unwrap();
+    assert_eq!(system_hook["scope_kind"], "system");
+
+    // A repository admin may not address a hook from a wider scope through
+    // the repository's global-id routes.
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/api/v1/repos/whscope-org/project/hooks/{org_hook_id}"
+            ))
+            .bearer_auth(&owner)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let repo_hooks: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/v1/repos/whscope-org/project/hooks"))
+        .bearer_auth(&owner)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(repo_hooks.is_empty());
+
+    let matching =
+        rg_db::ops::webhook_ops::list_active_for_event(&db, repo_id, Some(org_id), "push")
+            .await
+            .unwrap();
+    let ids: Vec<i64> = matching.iter().map(|hook| hook.id).collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&org_hook_id));
+    assert!(ids.contains(&system_hook_id));
+    assert_eq!(
+        rg_db::ops::webhook_ops::list_active_for_event(&db, repo_id, None, "push")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "an organization hook must not reach a repository outside that organization"
+    );
 }

@@ -503,6 +503,8 @@ async fn the_startup_pass_strips_a_legacy_webhook_url() {
         rg_db::entities::webhook::ActiveModel {
             id: NotSet,
             repo_id: Set(repo_id),
+            scope_kind: Set("repo".to_string()),
+            scope_id: Set(repo_id),
             url: Set(format!("https://receiver:{TOKEN}@hooks.example.invalid/fk")),
             content_type: Set("json".to_string()),
             secret_encrypted: Set(None),

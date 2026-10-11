@@ -482,6 +482,16 @@ impl PipelineRunner {
             match pipeline_ops::fail_pipeline_chain(&self.db_write, self.pipeline_id, &log).await {
                 Ok(true) => {
                     rg_core::metrics_hook::record_ci_pipeline_finished("failed");
+                    if let Err(hook_error) = rg_core::webhook::service::trigger_ci_status(
+                        &rg_core::db::Db::new(self.db.clone(), self.db_write.clone()),
+                        self.repo_id,
+                        self.pipeline_id,
+                        "failed",
+                    )
+                    .await
+                    {
+                        tracing::warn!(pipeline_id = self.pipeline_id, error = %hook_error, "failed to trigger CI webhook");
+                    }
                     rg_core::notification::thread::notify_ci_failed(
                         &rg_core::db::Db::new(self.db.clone(), self.db_write.clone()),
                         self.pipeline_id,
@@ -600,6 +610,16 @@ impl PipelineRunner {
         // else settled (a cancel that raced the last stage) is their outcome,
         // not a second one.
         rg_core::metrics_hook::record_ci_pipeline_finished(pipeline_status);
+        if let Err(hook_error) = rg_core::webhook::service::trigger_ci_status(
+            &rg_core::db::Db::new(self.db.clone(), self.db_write.clone()),
+            self.repo_id,
+            self.pipeline_id,
+            pipeline_status,
+        )
+        .await
+        {
+            tracing::warn!(pipeline_id = self.pipeline_id, error = %hook_error, "failed to trigger CI webhook");
+        }
         if pipeline_failed {
             rg_core::notification::thread::notify_ci_failed(
                 &rg_core::db::Db::new(self.db.clone(), self.db_write.clone()),

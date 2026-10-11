@@ -1264,6 +1264,8 @@ impl RepoSeed {
 /// repository, and because a `Scope::Global` route has no repository to read
 /// them out of.
 struct GlobalSeed {
+    org_hook_id: String,
+    org_delivery_id: String,
     /// The team every `/orgs/{name}/teams/{team_id}/...` route is pointed at.
     team_id: String,
     /// The team `DELETE /orgs/{name}/teams/{team_id}` is pointed at, for the
@@ -1297,6 +1299,8 @@ impl GlobalSeed {
     fn placeholders() -> Self {
         let absent = || "1".to_string();
         Self {
+            org_hook_id: absent(),
+            org_delivery_id: absent(),
             team_id: absent(),
             doomed_team_id: absent(),
             org_member_id: absent(),
@@ -2060,7 +2064,9 @@ fn fill(fact: &RouteFact, repo: &RepoSeed, globals: &GlobalSeed, org: &str) -> S
                 &repo.doomed_board_id
             }
             "id" if path.contains("/boards/{id}") => &repo.board_id,
+            "id" if path.contains("/orgs/{name}/hooks/{id}") => &globals.org_hook_id,
             "id" if path.contains("/hooks/{id}") => &repo.hook_id,
+            "delivery_id" if path.contains("/orgs/{name}/hooks/") => &globals.org_delivery_id,
             "id" if path.contains("/branches/protection/{id}") => &repo.branch_protection_id,
             "id" if path.contains("/tags/protection/{id}") => &repo.tag_protection_id,
             "id" if path.contains("/actions/environments/{id}") => &repo.environment_id,
@@ -2442,6 +2448,37 @@ async fn every_route_answers_its_declared_access_level() {
     let private_repo_id = create_repo(&fx, PRIVATE_REPO, true).await;
     let public_repo_id = create_repo(&fx, PUBLIC_REPO, false).await;
     let (team_id, doomed_team_id) = create_org_with_teams(&fx, &org_member, &team_member).await;
+    let org_hook_response = fx
+        .client
+        .post(format!("{}/api/v1/orgs/{ORG}/hooks", fx.base))
+        .bearer_auth(&fx.owner_token)
+        .json(&serde_json::json!({
+            "url": "https://hooks.example.com/sweep",
+            "events": ["push"]
+        }))
+        .send()
+        .await
+        .expect("fixture: create organization hook");
+    assert_eq!(org_hook_response.status(), StatusCode::CREATED);
+    let org_hook_id = org_hook_response
+        .json::<serde_json::Value>()
+        .await
+        .expect("fixture: organization hook response")["id"]
+        .as_i64()
+        .expect("fixture: organization hook id");
+    let delivery = rg_db::ops::webhook_ops::create_delivery(
+        &db,
+        rg_db::entities::webhook_delivery::ActiveModel {
+            webhook_id: rg_db::sea_orm::Set(org_hook_id),
+            event: rg_db::sea_orm::Set("push".to_string()),
+            delivery_id: rg_db::sea_orm::Set("sweep-org-delivery".to_string()),
+            request_payload: rg_db::sea_orm::Set(Some("{}".to_string())),
+            created_at: rg_db::sea_orm::Set(chrono::Utc::now()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("fixture: seed organization hook delivery");
     let owner_rows = seed_owner_rows(&fx, &db, owner_id).await;
     // Every account wears a picture, so `GET /avatars/{username}` has one to
     // serve whichever account a row names, and `Allowed` is proved by a `200`
@@ -2468,6 +2505,8 @@ async fn every_route_answers_its_declared_access_level() {
         }
     }
     let globals = GlobalSeed {
+        org_hook_id: org_hook_id.to_string(),
+        org_delivery_id: delivery.id.to_string(),
         team_id,
         doomed_team_id,
         org_member_id: org_member.id.to_string(),

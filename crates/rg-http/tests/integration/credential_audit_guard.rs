@@ -257,13 +257,28 @@ const AWAITING_A_CARD: [(&str, &str); 0] = [];
 /// a session, or a second-factor challenge — that write the same row. Inlining
 /// the record twice to satisfy a source rule would be the rule choosing the
 /// shape of the code, which is how a guard starts costing more than it catches.
-const JOURNAL_CALLS: [&str; 5] = [
+const JOURNAL_CALLS: [&str; 6] = [
     "record_credential",
     "record_grant",
     "record_instance_credential",
     "journal_password_reset",
+    "record_scope_change",
     "record",
 ];
+
+#[test]
+fn scoped_webhook_recorder_reaches_the_audit_log() {
+    let source = fs::read_to_string(workspace_crates().join("rg-http/src/api/webhooks.rs"))
+        .expect("read webhook API");
+    let recorder = functions(&source)
+        .into_iter()
+        .find(|function| function.name == "record_scope_change")
+        .expect("scoped webhook recorder exists");
+    assert!(
+        calls(&recorder.body, "rg_core::audit::record"),
+        "the scoped webhook recorder no longer writes to the audit log"
+    );
+}
 
 impl Credential {
     /// Whether `body` mints or revokes this credential.

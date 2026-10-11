@@ -4213,6 +4213,8 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         rg_db::entities::webhook::ActiveModel {
             id: NotSet,
             repo_id: Set(repo.id),
+            scope_kind: Set("repo".to_string()),
+            scope_id: Set(repo.id),
             url: Set("https://example.com/original-hook".to_string()),
             content_type: Set("json".to_string()),
             secret_encrypted: Set(None),

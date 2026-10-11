@@ -45,7 +45,7 @@ pub struct CreateWebhookRequest {
     /// not carry a credential (`https://user:token@host/hook`) — see
     /// [`reject_url_credentials`].
     pub url: String,
-    pub content_type: Option<String>, // "json" (default) or "form"
+    pub content_type: Option<String>, // json (default), form, slack, discord, matrix
     pub secret: Option<String>,
     pub active: Option<bool>,
     /// Subscription list; every entry must be one of [`WEBHOOK_EVENTS`]
@@ -249,7 +249,7 @@ pub async fn strip_legacy_url_credentials(db: &DatabaseConnection) -> Result<usi
 /// `every_event_this_server_raises_is_in_the_canon`, which reads the source
 /// rather than trusting this comment, and with the checkbox list in
 /// `web/src/routes/[owner]/[repo]/settings/webhooks/+page.svelte`.
-pub const WEBHOOK_EVENTS: [&str; 14] = [
+pub const WEBHOOK_EVENTS: [&str; 24] = [
     "push",
     "branch.created",
     "branch.deleted",
@@ -260,10 +260,20 @@ pub const WEBHOOK_EVENTS: [&str; 14] = [
     "issue.opened",
     "issue.closed",
     "issue.comment",
+    "issue.edited",
+    "issue.labeled",
+    "issue.assigned",
     "milestone.closed",
+    "ci.status",
     "pull_request.opened",
     "pull_request.closed",
     "pull_request.merged",
+    "pull_request.synchronize",
+    "pull_request.review_submitted",
+    "pull_request.review_requested",
+    "wiki.created",
+    "wiki.updated",
+    "wiki.deleted",
 ];
 
 /// Whether `event` is a name this server can ever deliver.
@@ -287,6 +297,48 @@ fn encode_subscriptions(events: &[String]) -> Result<String> {
         }
     }
     Ok(events.join(","))
+}
+
+fn delivery_format(value: &str) -> Result<&str> {
+    match value {
+        "json" | "form" | "slack" | "discord" | "matrix" => Ok(value),
+        _ => Err(crate::error::invalid_request(format!(
+            "unknown webhook content type {value:?}; expected json, form, slack, discord or matrix"
+        ))),
+    }
+}
+
+/// Build the actual request body before signing or recording it. Redelivery
+/// bypasses this conversion and reuses the recorded bytes verbatim.
+fn render_delivery_payload(format: &str, event: &str, payload: &str) -> Result<String> {
+    match delivery_format(format)? {
+        "json" => Ok(payload.to_string()),
+        "form" => Ok(format!("payload={}", urlencoding::encode(payload))),
+        "slack" | "discord" | "matrix" => {
+            let value: Value = serde_json::from_str(payload).context("parse webhook event")?;
+            let status = value.get("status").and_then(Value::as_str);
+            let repository = value.get("repository").and_then(Value::as_str).or_else(|| {
+                value
+                    .pointer("/repository/full_name")
+                    .and_then(Value::as_str)
+            });
+            let mut message = format!("ForgeKeep {event}");
+            if let Some(repository) = repository {
+                message.push_str(&format!(" in {repository}"));
+            }
+            if let Some(status) = status {
+                message.push_str(&format!(": {status}"));
+            }
+            let body = match format {
+                "slack" => serde_json::json!({ "text": message }),
+                "discord" => serde_json::json!({ "content": message }),
+                "matrix" => serde_json::json!({ "msgtype": "m.text", "body": message }),
+                _ => unreachable!(),
+            };
+            serde_json::to_string(&body).context("serialize webhook chat message")
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// Whether a stored subscription list covers `event`.
@@ -336,6 +388,22 @@ pub async fn create_webhook(
     encryption_key: &str,
     transport_policy: crate::webhook::transport::WebhookTransportPolicy,
 ) -> Result<webhook::Model> {
+    create_scoped_webhook(db, "repo", repo_id, req, encryption_key, transport_policy).await
+}
+
+/// Register an organization or instance hook. The HTTP layer must have
+/// authorized the corresponding scope before passing its identifier here.
+pub async fn create_scoped_webhook(
+    db: &DatabaseConnection,
+    scope_kind: &str,
+    scope_id: i64,
+    req: &CreateWebhookRequest,
+    encryption_key: &str,
+    transport_policy: crate::webhook::transport::WebhookTransportPolicy,
+) -> Result<webhook::Model> {
+    if !matches!(scope_kind, "repo" | "org" | "system") || scope_id < 0 {
+        return Err(crate::error::invalid_request("invalid webhook scope"));
+    }
     // Reject obviously-internal targets (bad scheme / private IP literal) at
     // registration for immediate feedback, and require an operator exception
     // before plaintext HTTP can carry payloads/signatures. Delivery re-checks
@@ -344,15 +412,14 @@ pub async fn create_webhook(
     reject_url_credentials(&req.url)?;
     let now = Utc::now();
     let events_str = encode_subscriptions(&req.events)?;
+    let content_type = delivery_format(req.content_type.as_deref().unwrap_or("json"))?;
     let model = webhook::ActiveModel {
         id: sea_orm::NotSet,
-        repo_id: sea_orm::Set(repo_id),
+        repo_id: sea_orm::Set(if scope_kind == "repo" { scope_id } else { 0 }),
+        scope_kind: sea_orm::Set(scope_kind.to_string()),
+        scope_id: sea_orm::Set(scope_id),
         url: sea_orm::Set(req.url.clone()),
-        content_type: sea_orm::Set(
-            req.content_type
-                .clone()
-                .unwrap_or_else(|| "json".to_string()),
-        ),
+        content_type: sea_orm::Set(content_type.to_string()),
         secret_encrypted: sea_orm::Set(seal_secret(req.secret.as_deref(), encryption_key)?),
         active: sea_orm::Set(req.active.unwrap_or(true)),
         events: sea_orm::Set(events_str),
@@ -365,6 +432,14 @@ pub async fn create_webhook(
 /// List all webhooks for a repository.
 pub async fn list_webhooks(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<webhook::Model>> {
     webhook_ops::list_by_repo(db, repo_id).await
+}
+
+pub async fn list_scoped_webhooks(
+    db: &DatabaseConnection,
+    scope_kind: &str,
+    scope_id: i64,
+) -> Result<Vec<webhook::Model>> {
+    webhook_ops::list_by_scope(db, scope_kind, scope_id).await
 }
 
 /// Get a webhook by id.
@@ -415,14 +490,17 @@ where
         Some(events) => encode_subscriptions(events)?,
         None => existing.events.clone(),
     };
+    let content_type = delivery_format(
+        req.content_type
+            .as_deref()
+            .unwrap_or(&existing.content_type),
+    )?;
     after_read().await?;
     webhook_ops::update_webhook(
         db,
         existing.id,
         req.url.clone().unwrap_or_else(|| existing.url.clone()),
-        req.content_type
-            .clone()
-            .unwrap_or_else(|| existing.content_type.clone()),
+        content_type.to_string(),
         secret_encrypted,
         req.active.unwrap_or(existing.active),
         events,
@@ -457,6 +535,24 @@ pub async fn trigger_event(
     .await
 }
 
+/// A terminal CI result. Both the embedded and external runner call this only
+/// after their conditional status write wins, so a retry cannot emit twice.
+pub async fn trigger_ci_status(
+    db: &impl crate::db::DbPools,
+    repo_id: i64,
+    pipeline_id: i64,
+    status: &str,
+) -> Result<()> {
+    let payload = serde_json::json!({
+        "event": "ci.status",
+        "repository": format!("repo#{repo_id}"),
+        "repository_id": repo_id,
+        "pipeline_id": pipeline_id,
+        "status": status,
+    });
+    trigger_event(db, repo_id, "ci.status", &payload).await
+}
+
 pub(crate) async fn trigger_event_with_tracker(
     db: &impl crate::db::DbPools,
     repo_id: i64,
@@ -464,7 +560,10 @@ pub(crate) async fn trigger_event_with_tracker(
     payload: &Value,
     delivery_tracker: &crate::task_tracker::TaskTracker,
 ) -> Result<()> {
-    let hooks = webhook_ops::list_active_by_repo_and_event(db.read(), repo_id, event).await?;
+    let Some(repo) = rg_db::ops::repo_ops::find_by_id(db.read(), repo_id).await? else {
+        return Ok(());
+    };
+    let hooks = webhook_ops::list_active_for_event(db.read(), repo_id, repo.org_id, event).await?;
     let payload = serde_json::to_string(payload).context("serialize webhook payload")?;
 
     // The query narrowed by substring; membership is decided here.
@@ -478,6 +577,7 @@ pub(crate) async fn trigger_event_with_tracker(
             event.to_string(),
             payload.clone(),
             delivery_tracker,
+            true,
         );
     }
 
@@ -496,6 +596,7 @@ fn spawn_delivery(
     event: String,
     payload: String,
     delivery_tracker: &crate::task_tracker::TaskTracker,
+    render: bool,
 ) {
     // Spawn delivery in background — don't block the caller. Routed through
     // the shared delivery tracker (not a bare `tokio::spawn`) so graceful
@@ -514,14 +615,18 @@ fn spawn_delivery(
         let delivery_id = uuid::Uuid::new_v4().to_string();
         let start = std::time::Instant::now();
 
-        let (status, response_body) = match deliver(
-            &url,
-            &content_type,
-            secret_encrypted.as_deref(),
-            &payload,
-        )
-        .await
-        {
+        let rendered = if render {
+            render_delivery_payload(&content_type, &event, &payload)
+        } else {
+            Ok(payload.clone())
+        };
+        let payload = rendered.as_ref().unwrap_or(&payload).clone();
+
+        let outcome = match rendered {
+            Ok(_) => deliver(&url, &content_type, secret_encrypted.as_deref(), &payload).await,
+            Err(error) => Err(error),
+        };
+        let (status, response_body) = match outcome {
             Ok(resp_status) => (Some(resp_status), None::<String>),
             Err(e) => {
                 // The reason is persisted on the delivery and shown in the
@@ -654,15 +759,34 @@ async fn redeliver_with_tracker(
             "webhook delivery {delivery_id} has no recorded request payload to resend"
         ))
     })?;
-    serde_json::from_str::<Value>(&payload).with_context(|| {
-        format!("stored request_payload of webhook delivery {delivery_id} is not valid JSON")
-    })?;
+    if hook.content_type == "form" {
+        // Older releases labeled raw JSON as form data. Replay those bytes as
+        // recorded instead of silently changing a historical request.
+        let json = if let Some(encoded) = payload.strip_prefix("payload=") {
+            urlencoding::decode(encoded)
+                .with_context(|| {
+                    format!("stored request_payload of webhook delivery {delivery_id} is not valid form encoding")
+                })?
+                .into_owned()
+        } else {
+            payload.clone()
+        };
+        serde_json::from_str::<Value>(&json).with_context(|| {
+            format!(
+                "stored request_payload of webhook delivery {delivery_id} has invalid form JSON"
+            )
+        })?;
+    } else {
+        serde_json::from_str::<Value>(&payload).with_context(|| {
+            format!("stored request_payload of webhook delivery {delivery_id} is not valid JSON")
+        })?;
+    }
 
     // Replay the exact recorded request body to the exact recorded hook. This
     // is an explicit operator action, so it does not inherit the automatic
     // fan-out's `active` filter; making a hook inactive must not turn a 200
     // redelivery response into a silent no-op.
-    spawn_delivery(db, hook, delivery.event, payload, delivery_tracker);
+    spawn_delivery(db, hook, delivery.event, payload, delivery_tracker, false);
     Ok(())
 }
 
@@ -794,6 +918,35 @@ mod tests {
 
     const KEY: &str = "the-instance-at-rest-key";
     const SECRET: &str = "s3cr3t-the-receiver-also-knows";
+
+    #[test]
+    fn each_webhook_format_has_a_real_wire_body() {
+        let event = "ci.status";
+        let payload = r#"{"repository":"team/app","status":"failed"}"#;
+        assert_eq!(
+            render_delivery_payload("json", event, payload).unwrap(),
+            payload
+        );
+        let form = render_delivery_payload("form", event, payload).unwrap();
+        assert_eq!(
+            urlencoding::decode(form.strip_prefix("payload=").unwrap()).unwrap(),
+            payload
+        );
+        let slack: Value =
+            serde_json::from_str(&render_delivery_payload("slack", event, payload).unwrap())
+                .unwrap();
+        assert_eq!(slack["text"], "ForgeKeep ci.status in team/app: failed");
+        let discord: Value =
+            serde_json::from_str(&render_delivery_payload("discord", event, payload).unwrap())
+                .unwrap();
+        assert_eq!(discord["content"], slack["text"]);
+        let matrix: Value =
+            serde_json::from_str(&render_delivery_payload("matrix", event, payload).unwrap())
+                .unwrap();
+        assert_eq!(matrix["msgtype"], "m.text");
+        assert_eq!(matrix["body"], slack["text"]);
+        assert!(delivery_format("arbitrary").is_err());
+    }
 
     async fn update_fixture() -> (DatabaseConnection, webhook::Model) {
         let mut options = ConnectOptions::new("sqlite::memory:");
@@ -1180,9 +1333,13 @@ mod event_vocabulary_tests {
     /// for it — which is the same dead subscription seen from the other end.
     #[test]
     fn every_event_this_server_raises_is_in_the_canon() {
-        let crate_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut raised: Vec<(String, String)> = Vec::new();
-        let mut files = vec![crate_src];
+        let mut files = vec![
+            workspace.join("crates/rg-core/src"),
+            workspace.join("crates/rg-http/src"),
+            workspace.join("crates/rg-ci/src"),
+        ];
         while let Some(path) = files.pop() {
             if path.is_dir() {
                 files.extend(

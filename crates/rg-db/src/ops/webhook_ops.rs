@@ -52,6 +52,52 @@ pub async fn list_active_by_repo_and_event(
         .context("db: list active webhooks by repo and event")
 }
 
+/// Repository events fan out to the repository, its organization (if any),
+/// and the instance. The scope predicate is part of the SQL query so a hook
+/// registered in another organization cannot leak a private repo event.
+pub async fn list_active_for_event(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    org_id: Option<i64>,
+    event: &str,
+) -> Result<Vec<Webhook>> {
+    let mut scopes = Condition::any()
+        .add(
+            Condition::all()
+                .add(webhook::Column::ScopeKind.eq("repo"))
+                .add(webhook::Column::RepoId.eq(repo_id)),
+        )
+        .add(webhook::Column::ScopeKind.eq("system"));
+    if let Some(org_id) = org_id {
+        scopes = scopes.add(
+            Condition::all()
+                .add(webhook::Column::ScopeKind.eq("org"))
+                .add(webhook::Column::ScopeId.eq(org_id)),
+        );
+    }
+    WebhookEntity::find()
+        .filter(scopes)
+        .filter(webhook::Column::Active.eq(true))
+        .filter(webhook::Column::Events.contains(event))
+        .all(db)
+        .await
+        .context("db: list scoped active webhooks for event")
+}
+
+pub async fn list_by_scope(
+    db: &DatabaseConnection,
+    scope_kind: &str,
+    scope_id: i64,
+) -> Result<Vec<Webhook>> {
+    WebhookEntity::find()
+        .filter(webhook::Column::ScopeKind.eq(scope_kind))
+        .filter(webhook::Column::ScopeId.eq(scope_id))
+        .order_by_desc(webhook::Column::CreatedAt)
+        .all(db)
+        .await
+        .context("db: list webhooks by scope")
+}
+
 /// Create a new webhook.
 pub async fn create_webhook(db: &DatabaseConnection, model: WebhookActiveModel) -> Result<Webhook> {
     model.insert(db).await.context("db: create webhook")

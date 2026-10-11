@@ -99,7 +99,7 @@ export {
   repoSettingsFormState,
   type RepoSettingsFormState,
 } from './repoSettingsForm';
-export { webhooks, type RepositoryWebhook, type WebhookDelivery, type WebhookPayload } from './webhooks';
+export { webhooks, organizationWebhooks, systemWebhooks, type RepositoryWebhook, type WebhookDelivery, type WebhookPayload } from './webhooks';
 export { imports, type ImportTask, type StartImportPayload } from './imports';
 export {
   milestones,

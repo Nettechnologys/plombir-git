@@ -1836,6 +1836,56 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver",
             api::webhooks::redeliver,
         )
+        .get(OrgAdmin, "/orgs/{name}/hooks", api::webhooks::org_list)
+        .post(OrgAdmin, "/orgs/{name}/hooks", api::webhooks::org_create)
+        .get(OrgAdmin, "/orgs/{name}/hooks/{id}", api::webhooks::org_get)
+        .patch(
+            OrgAdmin,
+            "/orgs/{name}/hooks/{id}",
+            api::webhooks::org_update,
+        )
+        .delete(
+            OrgAdmin,
+            "/orgs/{name}/hooks/{id}",
+            api::webhooks::org_delete,
+        )
+        .get(
+            OrgAdmin,
+            "/orgs/{name}/hooks/{id}/deliveries",
+            api::webhooks::org_deliveries,
+        )
+        .post(
+            OrgAdmin,
+            "/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver",
+            api::webhooks::org_redeliver,
+        )
+        .get(InstanceAdmin, "/admin/hooks", api::webhooks::system_list)
+        .post(InstanceAdmin, "/admin/hooks", api::webhooks::system_create)
+        .get(
+            InstanceAdmin,
+            "/admin/hooks/{id}",
+            api::webhooks::system_get,
+        )
+        .patch(
+            InstanceAdmin,
+            "/admin/hooks/{id}",
+            api::webhooks::system_update,
+        )
+        .delete(
+            InstanceAdmin,
+            "/admin/hooks/{id}",
+            api::webhooks::system_delete,
+        )
+        .get(
+            InstanceAdmin,
+            "/admin/hooks/{id}/deliveries",
+            api::webhooks::system_deliveries,
+        )
+        .post(
+            InstanceAdmin,
+            "/admin/hooks/{id}/deliveries/{delivery_id}/redeliver",
+            api::webhooks::system_redeliver,
+        )
         // ── CI/CD pipelines ────────────────────────────────────────────────
         .get(
             RepoRead,

@@ -46,6 +46,15 @@
       <div class="card-arrow">→</div>
     </a>
 
+    <a href="/admin/hooks" class="card">
+      <div class="card-icon">🔔</div>
+      <div class="card-body">
+        <h2>{t('settings.webhooks.system_title')}</h2>
+        <p>{t('settings.webhooks.system_desc')}</p>
+      </div>
+      <div class="card-arrow">→</div>
+    </a>
+
     <a href="/admin/audit" class="card">
       <div class="card-icon">📋</div>
       <div class="card-body">

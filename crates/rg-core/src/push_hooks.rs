@@ -1030,6 +1030,30 @@ async fn post_push_branch_maintenance(
             }
 
             if let Some(head_sha) = synchronized.head_sha.as_deref() {
+                if update.old_sha != update.new_sha && protocol_head == Some(head_sha) {
+                    let pools = crate::db::Db::new(
+                        params.db.clone(),
+                        params.write_pool.unwrap_or(params.db).clone(),
+                    );
+                    for pr in &synchronized.open_prs {
+                        let payload = serde_json::json!({
+                            "event": "pull_request.synchronize",
+                            "pull_request": { "id": pr.id, "number": pr.number },
+                            "head_sha": head_sha,
+                            "branch": branch_name,
+                        });
+                        if let Err(error) = crate::webhook::service::trigger_event(
+                            &pools,
+                            target.repo_id,
+                            "pull_request.synchronize",
+                            &payload,
+                        )
+                        .await
+                        {
+                            tracing::warn!(repo_id = target.repo_id, pr_number = pr.number, error = %format!("{error:#}"), "failed to trigger PR synchronize webhook");
+                        }
+                    }
+                }
                 // The `pull_request` half of the event pair a forge emits for a
                 // branch that has an open PR on it: the push gets its own `push`
                 // pipeline below, and every PR this branch heads has been

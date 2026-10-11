@@ -10,6 +10,10 @@ pub struct Model {
     pub id: i64,
     /// Repository this webhook belongs to
     pub repo_id: i64,
+    /// `repo`, `org`, or `system`; org/system rows use repo_id=0.
+    pub scope_kind: String,
+    /// Repository, organization or system identifier (0 for system).
+    pub scope_id: i64,
     /// Webhook URL (target to POST to)
     pub url: String,
     /// Content type: json / form

@@ -1,6 +1,6 @@
 //! Webhook REST API endpoints.
 //!
-//! Every endpoint here is repository *administration*: a webhook carries the
+//! Every repository endpoint here is repository *administration*: a webhook carries the
 //! delivery target and the HMAC key Plombir Git signs deliveries with, exactly
 //! like a deploy key or a CI secret. So all seven verbs — reads included — sit
 //! behind the [`RepoAdmin`] extractor, the same door `api::deploy_keys` and
@@ -12,7 +12,7 @@
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use sea_orm::DatabaseConnection;
@@ -20,6 +20,8 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_grant};
+use crate::api::admin::InstanceAdmin;
+use crate::api::orgs::OrgAdmin;
 use crate::api::repo_access::RepoAdmin;
 use crate::error::AppError;
 use crate::AppState;
@@ -53,6 +55,8 @@ fn secret_change(supplied: Option<&String>) -> &'static str {
 pub struct WebhookResponse {
     pub id: i64,
     pub repo_id: i64,
+    pub scope_kind: String,
+    pub scope_id: i64,
     pub url: String,
     pub content_type: String,
     /// Whether an HMAC secret is configured. The value itself never leaves the
@@ -69,6 +73,8 @@ impl From<rg_db::entities::webhook::Model> for WebhookResponse {
         Self {
             id: hook.id,
             repo_id: hook.repo_id,
+            scope_kind: hook.scope_kind,
+            scope_id: hook.scope_id,
             url: hook.url,
             content_type: hook.content_type,
             has_secret: hook.secret_encrypted.is_some_and(|s| !s.is_empty()),
@@ -420,6 +426,353 @@ pub async fn redeliver(
     }
 }
 
+// ── Organization and instance hooks ──────────────────────────────────────
+
+async fn list_scope(state: &AppState, kind: &str, id: i64) -> Response {
+    match rg_core::webhook::service::list_scoped_webhooks(&state.db, kind, id).await {
+        Ok(hooks) => (
+            StatusCode::OK,
+            Json(
+                hooks
+                    .into_iter()
+                    .map(WebhookResponse::from)
+                    .collect::<Vec<_>>(),
+            ),
+        )
+            .into_response(),
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+async fn record_scope_change(
+    state: &AppState,
+    actor: &rg_core::audit::AuditActor,
+    kind: &str,
+    id: i64,
+    name: &str,
+    action: &str,
+    headers: &HeaderMap,
+    hook: &rg_db::entities::webhook::Model,
+) {
+    rg_core::audit::record(
+        &state.db,
+        actor,
+        action,
+        Some(kind),
+        Some(id),
+        Some(name),
+        Some(headers),
+        Some(serde_json::json!({
+            "webhook_id": hook.id,
+            "webhook_url": hook.url,
+            "events": hook.events,
+            "has_secret": hook.secret_encrypted.is_some(),
+        })),
+    )
+    .await;
+}
+
+async fn create_scope(
+    state: &AppState,
+    kind: &str,
+    id: i64,
+    name: &str,
+    actor_id: i64,
+    headers: &HeaderMap,
+    body: &rg_core::webhook::service::CreateWebhookRequest,
+) -> Response {
+    let actor = match grant_actor(state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    match rg_core::webhook::service::create_scoped_webhook(
+        &state.db,
+        kind,
+        id,
+        body,
+        &state.encryption_key,
+        state.webhook_transport_policy,
+    )
+    .await
+    {
+        Ok(hook) => {
+            record_scope_change(
+                state,
+                &actor,
+                kind,
+                id,
+                name,
+                "webhook.create",
+                headers,
+                &hook,
+            )
+            .await;
+            (StatusCode::CREATED, Json(WebhookResponse::from(hook))).into_response()
+        }
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+async fn update_scope(
+    state: &AppState,
+    kind: &str,
+    scope_id: i64,
+    name: &str,
+    actor_id: i64,
+    hook_id: i64,
+    headers: &HeaderMap,
+    body: &rg_core::webhook::service::UpdateWebhookRequest,
+) -> Response {
+    let actor = match grant_actor(state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    let existing = match webhook_in_scope(&state.db, kind, scope_id, hook_id).await {
+        Ok(hook) => hook,
+        Err(error) => return error.into_response(),
+    };
+    match rg_core::webhook::service::update_webhook(
+        &state.db,
+        &existing,
+        body,
+        &state.encryption_key,
+        state.webhook_transport_policy,
+    )
+    .await
+    {
+        Ok(hook) => {
+            record_scope_change(
+                state,
+                &actor,
+                kind,
+                scope_id,
+                name,
+                "webhook.update",
+                headers,
+                &hook,
+            )
+            .await;
+            (StatusCode::OK, Json(WebhookResponse::from(hook))).into_response()
+        }
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+async fn delete_scope(
+    state: &AppState,
+    kind: &str,
+    scope_id: i64,
+    name: &str,
+    actor_id: i64,
+    hook_id: i64,
+    headers: &HeaderMap,
+) -> Response {
+    let actor = match grant_actor(state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    let hook = match webhook_in_scope(&state.db, kind, scope_id, hook_id).await {
+        Ok(hook) => hook,
+        Err(error) => return error.into_response(),
+    };
+    match rg_core::webhook::service::delete_webhook(&state.db, hook_id).await {
+        Ok(true) => {
+            record_scope_change(
+                state,
+                &actor,
+                kind,
+                scope_id,
+                name,
+                "webhook.delete",
+                headers,
+                &hook,
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"message": "webhook deleted"})),
+            )
+                .into_response()
+        }
+        Ok(false) => AppError::not_found("webhook not found").into_response(),
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+async fn deliveries_scope(state: &AppState, kind: &str, scope_id: i64, hook_id: i64) -> Response {
+    if let Err(error) = webhook_in_scope(&state.db, kind, scope_id, hook_id).await {
+        return error.into_response();
+    }
+    match rg_core::webhook::service::list_deliveries(&state.db, hook_id).await {
+        Ok(deliveries) => (StatusCode::OK, Json(deliveries)).into_response(),
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+async fn redeliver_scope(
+    state: &AppState,
+    kind: &str,
+    scope_id: i64,
+    hook_id: i64,
+    delivery_id: i64,
+) -> Response {
+    if let Err(error) = webhook_in_scope(&state.db, kind, scope_id, hook_id).await {
+        return error.into_response();
+    }
+    if let Err(error) = delivery_in_webhook(&state.db, hook_id, delivery_id).await {
+        return error.into_response();
+    }
+    match rg_core::webhook::service::redeliver(&state.db_pools(), delivery_id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"message": "redelivery triggered"})),
+        )
+            .into_response(),
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+#[utoipa::path(get, path = "/orgs/{name}/hooks", tag = "Webhooks", responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn org_list(State(state): State<AppState>, OrgAdmin { org, .. }: OrgAdmin) -> Response {
+    list_scope(&state, "org", org.id).await
+}
+
+#[utoipa::path(post, path = "/orgs/{name}/hooks", tag = "Webhooks", request_body(content = serde_json::Value), responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn org_create(
+    State(state): State<AppState>,
+    OrgAdmin { org, actor_id }: OrgAdmin,
+    headers: HeaderMap,
+    Json(body): Json<rg_core::webhook::service::CreateWebhookRequest>,
+) -> Response {
+    create_scope(&state, "org", org.id, &org.name, actor_id, &headers, &body).await
+}
+
+#[utoipa::path(get, path = "/orgs/{name}/hooks/{id}", tag = "Webhooks", responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn org_get(
+    State(state): State<AppState>,
+    OrgAdmin { org, .. }: OrgAdmin,
+    Path((_, hook_id)): Path<(String, i64)>,
+) -> Response {
+    match webhook_in_scope(&state.db, "org", org.id, hook_id).await {
+        Ok(hook) => (StatusCode::OK, Json(WebhookResponse::from(hook))).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(patch, path = "/orgs/{name}/hooks/{id}", tag = "Webhooks", request_body(content = serde_json::Value), responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn org_update(
+    State(state): State<AppState>,
+    OrgAdmin { org, actor_id }: OrgAdmin,
+    Path((_, hook_id)): Path<(String, i64)>,
+    headers: HeaderMap,
+    Json(body): Json<rg_core::webhook::service::UpdateWebhookRequest>,
+) -> Response {
+    update_scope(
+        &state, "org", org.id, &org.name, actor_id, hook_id, &headers, &body,
+    )
+    .await
+}
+
+#[utoipa::path(delete, path = "/orgs/{name}/hooks/{id}", tag = "Webhooks", responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn org_delete(
+    State(state): State<AppState>,
+    OrgAdmin { org, actor_id }: OrgAdmin,
+    Path((_, hook_id)): Path<(String, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    delete_scope(
+        &state, "org", org.id, &org.name, actor_id, hook_id, &headers,
+    )
+    .await
+}
+
+#[utoipa::path(get, path = "/orgs/{name}/hooks/{id}/deliveries", tag = "Webhooks", responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn org_deliveries(
+    State(state): State<AppState>,
+    OrgAdmin { org, .. }: OrgAdmin,
+    Path((_, hook_id)): Path<(String, i64)>,
+) -> Response {
+    deliveries_scope(&state, "org", org.id, hook_id).await
+}
+
+#[utoipa::path(post, path = "/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver", tag = "Webhooks", responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn org_redeliver(
+    State(state): State<AppState>,
+    OrgAdmin { org, .. }: OrgAdmin,
+    Path((_, hook_id, delivery_id)): Path<(String, i64, i64)>,
+) -> Response {
+    redeliver_scope(&state, "org", org.id, hook_id, delivery_id).await
+}
+
+#[utoipa::path(get, path = "/admin/hooks", tag = "Webhooks", responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn system_list(State(state): State<AppState>, _: InstanceAdmin) -> Response {
+    list_scope(&state, "system", 0).await
+}
+
+#[utoipa::path(post, path = "/admin/hooks", tag = "Webhooks", request_body(content = serde_json::Value), responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn system_create(
+    State(state): State<AppState>,
+    InstanceAdmin(actor_id): InstanceAdmin,
+    headers: HeaderMap,
+    Json(body): Json<rg_core::webhook::service::CreateWebhookRequest>,
+) -> Response {
+    create_scope(&state, "system", 0, "instance", actor_id, &headers, &body).await
+}
+
+#[utoipa::path(get, path = "/admin/hooks/{id}", tag = "Webhooks", responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn system_get(
+    State(state): State<AppState>,
+    _: InstanceAdmin,
+    Path(hook_id): Path<i64>,
+) -> Response {
+    match webhook_in_scope(&state.db, "system", 0, hook_id).await {
+        Ok(hook) => (StatusCode::OK, Json(WebhookResponse::from(hook))).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(patch, path = "/admin/hooks/{id}", tag = "Webhooks", request_body(content = serde_json::Value), responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn system_update(
+    State(state): State<AppState>,
+    InstanceAdmin(actor_id): InstanceAdmin,
+    Path(hook_id): Path<i64>,
+    headers: HeaderMap,
+    Json(body): Json<rg_core::webhook::service::UpdateWebhookRequest>,
+) -> Response {
+    update_scope(
+        &state, "system", 0, "instance", actor_id, hook_id, &headers, &body,
+    )
+    .await
+}
+
+#[utoipa::path(delete, path = "/admin/hooks/{id}", tag = "Webhooks", responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn system_delete(
+    State(state): State<AppState>,
+    InstanceAdmin(actor_id): InstanceAdmin,
+    Path(hook_id): Path<i64>,
+    headers: HeaderMap,
+) -> Response {
+    delete_scope(&state, "system", 0, "instance", actor_id, hook_id, &headers).await
+}
+
+#[utoipa::path(get, path = "/admin/hooks/{id}/deliveries", tag = "Webhooks", responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn system_deliveries(
+    State(state): State<AppState>,
+    _: InstanceAdmin,
+    Path(hook_id): Path<i64>,
+) -> Response {
+    deliveries_scope(&state, "system", 0, hook_id).await
+}
+
+#[utoipa::path(post, path = "/admin/hooks/{id}/deliveries/{delivery_id}/redeliver", tag = "Webhooks", responses((status = 200, description = "Success"), (status = 401, description = "Authentication required"), (status = 403, description = "Scope administrator required"), (status = 404, description = "Not found")))]
+pub async fn system_redeliver(
+    State(state): State<AppState>,
+    _: InstanceAdmin,
+    Path((hook_id, delivery_id)): Path<(i64, i64)>,
+) -> Response {
+    redeliver_scope(&state, "system", 0, hook_id, delivery_id).await
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 /// Fetch a webhook and re-anchor it to the repository the caller was authorized
@@ -435,9 +788,22 @@ async fn webhook_in_repo(
     webhook_id: i64,
 ) -> Result<rg_db::entities::webhook::Model, AppError> {
     match rg_core::webhook::service::get_webhook(db, webhook_id).await {
-        Ok(Some(hook)) if hook.repo_id == repo_id => Ok(hook),
+        Ok(Some(hook)) if hook.repo_id == repo_id && hook.scope_kind == "repo" => Ok(hook),
         Ok(Some(_)) | Ok(None) => Err(AppError::not_found("webhook not found")),
         Err(e) => Err(AppError::from(e)),
+    }
+}
+
+async fn webhook_in_scope(
+    db: &DatabaseConnection,
+    scope_kind: &str,
+    scope_id: i64,
+    webhook_id: i64,
+) -> Result<rg_db::entities::webhook::Model, AppError> {
+    match rg_core::webhook::service::get_webhook(db, webhook_id).await {
+        Ok(Some(hook)) if hook.scope_kind == scope_kind && hook.scope_id == scope_id => Ok(hook),
+        Ok(Some(_)) | Ok(None) => Err(AppError::not_found("webhook not found")),
+        Err(error) => Err(AppError::from(error)),
     }
 }
 

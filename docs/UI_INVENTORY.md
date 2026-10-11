@@ -23,16 +23,16 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 414 |
-| Из них достижимы из браузера | 288 (70%) |
+| Роутов в роутере (с объявленным `Access`) | 428 |
+| Из них достижимы из браузера | 300 (70%) |
 | Layout-модулей | 2 |
-| Страниц | 70 |
-| Интерактивных элементов | 1010 |
-| — из них дёргают API | 352 |
-| — приходят из общих компонентов | 398 |
+| Страниц | 72 |
+| Интерактивных элементов | 1036 |
+| — из них дёргают API | 364 |
+| — приходят из общих компонентов | 422 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 47 / 172 / 163 |
-| **UI-роутов без единого web/smoke/browser-теста** | **26** |
-| UI-роутов без corpus-hit и browser-сценария | 0 |
+| **UI-роутов без единого web/smoke/browser-теста** | **38** |
+| UI-роутов без corpus-hit и browser-сценария | 9 |
 
 ## По уровню доступа
 
@@ -42,12 +42,12 @@
 | `RepoWrite` | 85 | 66 | 13 | 2 |
 | `User` | 55 | 44 | 6 | 0 |
 | `RepoAdmin` | 39 | 39 | 0 | 0 |
+| `InstanceAdmin` | 32 | 27 | 6 | 6 |
 | `Public` | 25 | 10 | 2 | 0 |
-| `InstanceAdmin` | 25 | 21 | 0 | 0 |
 | `RepoAuthRead` | 18 | 18 | 1 | 0 |
+| `OrgAdmin` | 15 | 14 | 6 | 4 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 12 | 0 | 0 | 0 |
-| `OrgAdmin` | 8 | 8 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
 | `OrgRead` | 5 | 4 | 0 | 0 |
 | `Foreign:api/lfs_locks.rs` | 4 | 2 | 0 | 1 |
@@ -66,8 +66,8 @@
 | `/[owner]/[repo]/issues/[number]` | 40 | 17 | 23 |
 | `/[owner]/[repo]/pulls` | 28 | 12 | 12 |
 | `/[owner]/[repo]/releases` | 27 | 12 | 11 |
+| `/orgs/[name]` | 27 | 10 | 2 |
 | `/[owner]/[repo]/issues` | 26 | 9 | 12 |
-| `/orgs/[name]` | 26 | 10 | 2 |
 | `/[owner]/[repo]` | 25 | 5 | 12 |
 | `/[owner]/[repo]/blob/[...path]` | 25 | 8 | 11 |
 | `/[owner]/[repo]/pipelines` | 25 | 11 | 14 |
@@ -98,7 +98,9 @@
 | `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/settings/webhooks` | 13 | 6 | 2 |
 | `/settings/agents` | 13 | 5 | 2 |
+| `/admin/hooks` 🔒 | 12 | 6 | 12 |
 | `/login` | 12 | 1 | 0 |
+| `/orgs/[name]/hooks` | 12 | 6 | 12 |
 | `/admin/runners` 🔒 | 11 | 4 | 1 |
 | `/search` | 11 | 0 | 0 |
 | `/[owner]/[repo]/settings/labels` | 10 | 2 | 2 |
@@ -115,10 +117,10 @@
 | `/[owner]/[repo]/settings/mirror` | 7 | 3 | 2 |
 | `/[owner]/[repo]/settings/tags` | 7 | 2 | 2 |
 | `/settings/signing-keys` | 7 | 2 | 2 |
+| `/admin` 🔒 | 6 | 0 | 0 |
 | `/settings/ssh-keys` | 6 | 2 | 2 |
 | `/settings/tokens` | 6 | 2 | 2 |
 | `/[owner]/[repo]/settings/ci-secrets` | 5 | 2 | 2 |
-| `/admin` 🔒 | 5 | 0 | 0 |
 | `/help` | 5 | 0 | 0 |
 | `/reset-password` | 5 | 1 | 0 |
 | `/[owner]` | 4 | 0 | 0 |
@@ -861,17 +863,17 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| application/json application/x-www-form-urlencoded toggleEve | :387 | `POST /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust+web+browser |
-| application/json application/x-www-form-urlencoded toggleEve | :387 | `GET /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust+web+browser |
-| (e) => setActive(hook, e.currentTarget.c | :455 | `PATCH /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+web+browser |
-| (e) => setActive(hook, e.currentTarget.c | :455 | `GET /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust+web |
-| i18n:settings.webhooks.hide_deliveries | :464 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+web+browser |
-| i18n:settings.webhooks.hide_deliveries | :464 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust+web+browser |
-| i18n:common.loading | :475 | `DELETE /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+web+browser |
-| i18n:common.loading | :475 | `GET /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust+web |
-| i18n:common.loading | :493 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust+web |
-| i18n:settings.webhooks.redelivering | :528 | `POST /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver` | `RepoAdmin` | rust+web+browser |
-| i18n:settings.webhooks.redelivering | :528 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust+web |
+| application/json application/x-www-form-urlencoded toggleEve | :397 | `POST /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust+web+browser |
+| application/json application/x-www-form-urlencoded toggleEve | :397 | `GET /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust+web+browser |
+| (e) => setActive(hook, e.currentTarget.c | :468 | `PATCH /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+web+browser |
+| (e) => setActive(hook, e.currentTarget.c | :468 | `GET /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust+web |
+| i18n:settings.webhooks.hide_deliveries | :477 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+web+browser |
+| i18n:settings.webhooks.hide_deliveries | :477 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust+web+browser |
+| i18n:common.loading | :488 | `DELETE /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+web+browser |
+| i18n:common.loading | :488 | `GET /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust+web |
+| i18n:common.loading | :506 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust+web |
+| i18n:settings.webhooks.redelivering | :541 | `POST /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver` | `RepoAdmin` | rust+web+browser |
+| i18n:settings.webhooks.redelivering | :541 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust+web |
 
 ### `/[owner]/[repo]/tags`
 
@@ -976,6 +978,33 @@
 | i18n:admin.audit.fields.details | :241 | `GET /api/v1/admin/audit/logs/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
 | i18n:common.prev_arrow | :254 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke |
 | i18n:common.next_arrow | :256 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke |
+
+### `/admin/hooks` 🔒
+
+| Элемент | Откуда | Вызов | `Access` | тест |
+|---|---|---|---|---|
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `POST /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `POST /api/v1/admin/hooks` | `InstanceAdmin` | **—** |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `PATCH /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `PATCH /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `PATCH /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `PATCH /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| i18n:settings.webhooks.view_deliveries | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks/{id}/deliveries` | `OrgAdmin` | **—** |
+| i18n:settings.webhooks.view_deliveries | `ScopedWebhooks` | `GET /api/v1/admin/hooks/{id}/deliveries` | `InstanceAdmin` | **—** |
+| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `POST /api/v1/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver` | `OrgAdmin` | **—** |
+| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `POST /api/v1/admin/hooks/{id}/deliveries/{delivery_id}/redeliver` | `InstanceAdmin` | **—** |
+| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks/{id}/deliveries` | `OrgAdmin` | **—** |
+| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `GET /api/v1/admin/hooks/{id}/deliveries` | `InstanceAdmin` | **—** |
+| i18n:common.delete | `ScopedWebhooks` | `DELETE /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
+| i18n:common.delete | `ScopedWebhooks` | `DELETE /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
+| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
+| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
 
 ### `/admin/orgs` 🔒
 
@@ -1097,24 +1126,51 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.loading | :546 | `DELETE /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
-| editingOrg = false} disabled= > | :554 | `PATCH /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :603 | `POST /api/v1/repos` | `User` | rust+web+smoke |
-| i18n:common.loading | :603 | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web |
-| i18n:orgs.new_team | :639 | `POST /api/v1/orgs/{name}/teams` | `OrgAdmin` | rust+browser |
-| i18n:orgs.new_team | :639 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
-| i18n:orgs.hide_team_members | :664 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
-| ` ? t('common.loading') : t('common.delete')} | :668 | `DELETE /api/v1/orgs/{name}/teams/{team_id}` | `OrgAdmin` | rust+web+smoke+browser |
-| ` ? t('common.loading') : t('common.delete')} | :668 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
-| ` ? t('common.loading') : t('common.add')} | :679 | `POST /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgAdmin` | rust+web+browser |
-| ` ? t('common.loading') : t('common.add')} | :679 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
-| -$ ` ? t('common.loading') : t('common.delete')} | :707 | `DELETE /api/v1/orgs/{name}/teams/{team_id}/members/{user_id}` | `OrgAdmin` | rust+web+browser |
-| -$ ` ? t('common.loading') : t('common.delete')} | :707 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
-| i18n:orgs.member_placeholder | :732 | `POST /api/v1/orgs/{name}/members` | `OrgAdmin` | rust+web+smoke+browser |
-| i18n:orgs.member_placeholder | :732 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
-| ` ? t('common.loading') : t('common.delete')} | :758 | `DELETE /api/v1/orgs/{name}/members/{user_id}` | `OrgAdmin` | rust+web+smoke+browser |
-| ` ? t('common.loading') : t('common.delete')} | :758 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
+| i18n:common.loading | :547 | `DELETE /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
+| editingOrg = false} disabled= > | :556 | `PATCH /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
+| i18n:common.loading | :605 | `POST /api/v1/repos` | `User` | rust+web+smoke |
+| i18n:common.loading | :605 | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web |
+| i18n:orgs.new_team | :641 | `POST /api/v1/orgs/{name}/teams` | `OrgAdmin` | rust+browser |
+| i18n:orgs.new_team | :641 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
+| i18n:orgs.hide_team_members | :666 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
+| ` ? t('common.loading') : t('common.delete')} | :670 | `DELETE /api/v1/orgs/{name}/teams/{team_id}` | `OrgAdmin` | rust+web+smoke+browser |
+| ` ? t('common.loading') : t('common.delete')} | :670 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
+| ` ? t('common.loading') : t('common.add')} | :681 | `POST /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgAdmin` | rust+web+browser |
+| ` ? t('common.loading') : t('common.add')} | :681 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
+| -$ ` ? t('common.loading') : t('common.delete')} | :709 | `DELETE /api/v1/orgs/{name}/teams/{team_id}/members/{user_id}` | `OrgAdmin` | rust+web+browser |
+| -$ ` ? t('common.loading') : t('common.delete')} | :709 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
+| i18n:orgs.member_placeholder | :734 | `POST /api/v1/orgs/{name}/members` | `OrgAdmin` | rust+web+smoke+browser |
+| i18n:orgs.member_placeholder | :734 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
+| ` ? t('common.loading') : t('common.delete')} | :760 | `DELETE /api/v1/orgs/{name}/members/{user_id}` | `OrgAdmin` | rust+web+smoke+browser |
+| ` ? t('common.loading') : t('common.delete')} | :760 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
 | _(загрузка страницы)_ | — | `GET /api/v1/orgs/{name}` | `OrgRead` | rust+web+smoke |
+
+### `/orgs/[name]/hooks`
+
+| Элемент | Откуда | Вызов | `Access` | тест |
+|---|---|---|---|---|
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `POST /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `POST /api/v1/admin/hooks` | `InstanceAdmin` | **—** |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `PATCH /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `PATCH /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `PATCH /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `PATCH /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| i18n:settings.webhooks.view_deliveries | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks/{id}/deliveries` | `OrgAdmin` | **—** |
+| i18n:settings.webhooks.view_deliveries | `ScopedWebhooks` | `GET /api/v1/admin/hooks/{id}/deliveries` | `InstanceAdmin` | **—** |
+| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `POST /api/v1/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver` | `OrgAdmin` | **—** |
+| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `POST /api/v1/admin/hooks/{id}/deliveries/{delivery_id}/redeliver` | `InstanceAdmin` | **—** |
+| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks/{id}/deliveries` | `OrgAdmin` | **—** |
+| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `GET /api/v1/admin/hooks/{id}/deliveries` | `InstanceAdmin` | **—** |
+| i18n:common.delete | `ScopedWebhooks` | `DELETE /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
+| i18n:common.delete | `ScopedWebhooks` | `DELETE /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
+| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
+| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
 
 ### `/reset-password`
 
@@ -1287,6 +1343,8 @@
 | PUT | `/api/v1/repos/{owner}/{name}/lfs/objects/{oid}` | `Foreign:api/lfs.rs` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/lfs/locks` | `Foreign:api/lfs_locks.rs` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/lfs/locks/verify` | `Foreign:api/lfs_locks.rs` | **—** |
+| GET | `/api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | rust |
+| GET | `/api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
 | GET | `/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}` | `RepoRead` | rust |
 | GET | `/api/v1/ci/oidc/.well-known/openid-configuration` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/jwks` | `Public` | rust |

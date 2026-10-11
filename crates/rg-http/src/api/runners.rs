@@ -1836,6 +1836,16 @@ pub async fn finish_job(
         }
         if transition.pipeline_completed_now {
             crate::metrics::recorder::ci_pipeline_finished(&pipeline.status);
+            if let Err(hook_error) = rg_core::webhook::service::trigger_ci_status(
+                &state.db_pools(),
+                pipeline.repo_id,
+                pipeline.id,
+                &pipeline.status,
+            )
+            .await
+            {
+                tracing::warn!(pipeline_id = pipeline.id, error = %hook_error, "failed to trigger CI webhook");
+            }
             if pipeline.status == "failed" {
                 rg_core::notification::thread::notify_ci_failed(&state.db_pools(), pipeline.id);
             }

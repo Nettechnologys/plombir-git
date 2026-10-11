@@ -2322,6 +2322,126 @@
     },
     {
       "method": "GET",
+      "url": "/api/v1/orgs/{name}/hooks",
+      "access": "OrgAdmin",
+      "handler": "api::webhooks::org_list",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/orgs/{name}/hooks",
+      "access": "OrgAdmin",
+      "handler": "api::webhooks::org_create",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/orgs/{name}/hooks/{id}",
+      "access": "OrgAdmin",
+      "handler": "api::webhooks::org_get",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "PATCH",
+      "url": "/api/v1/orgs/{name}/hooks/{id}",
+      "access": "OrgAdmin",
+      "handler": "api::webhooks::org_update",
+      "testedIn": [],
+      "reachedFromUi": true
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/orgs/{name}/hooks/{id}",
+      "access": "OrgAdmin",
+      "handler": "api::webhooks::org_delete",
+      "testedIn": [],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/orgs/{name}/hooks/{id}/deliveries",
+      "access": "OrgAdmin",
+      "handler": "api::webhooks::org_deliveries",
+      "testedIn": [],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver",
+      "access": "OrgAdmin",
+      "handler": "api::webhooks::org_redeliver",
+      "testedIn": [],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/admin/hooks",
+      "access": "InstanceAdmin",
+      "handler": "api::webhooks::system_list",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/admin/hooks",
+      "access": "InstanceAdmin",
+      "handler": "api::webhooks::system_create",
+      "testedIn": [],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/admin/hooks/{id}",
+      "access": "InstanceAdmin",
+      "handler": "api::webhooks::system_get",
+      "testedIn": [],
+      "reachedFromUi": false
+    },
+    {
+      "method": "PATCH",
+      "url": "/api/v1/admin/hooks/{id}",
+      "access": "InstanceAdmin",
+      "handler": "api::webhooks::system_update",
+      "testedIn": [],
+      "reachedFromUi": true
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/admin/hooks/{id}",
+      "access": "InstanceAdmin",
+      "handler": "api::webhooks::system_delete",
+      "testedIn": [],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/admin/hooks/{id}/deliveries",
+      "access": "InstanceAdmin",
+      "handler": "api::webhooks::system_deliveries",
+      "testedIn": [],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/admin/hooks/{id}/deliveries/{delivery_id}/redeliver",
+      "access": "InstanceAdmin",
+      "handler": "api::webhooks::system_redeliver",
+      "testedIn": [],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
       "url": "/api/v1/repos/{owner}/{name}/pipelines",
       "access": "RepoRead",
       "handler": "api::ci::list_pipelines",
@@ -20013,7 +20133,7 @@
         {
           "tag": "form",
           "label": "application/json application/x-www-form-urlencoded toggleEve",
-          "line": 387,
+          "line": 397,
           "via": null,
           "href": null,
           "handler": "createWebhook",
@@ -20060,7 +20180,7 @@
         {
           "tag": "select",
           "label": "application/json application/x-www-form-urlencoded",
-          "line": 396,
+          "line": 406,
           "via": null,
           "href": null,
           "handler": null,
@@ -20070,7 +20190,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 412,
+          "line": 425,
           "via": null,
           "href": null,
           "handler": "(e) => toggleEvent(event, e.currentTarget.checked)",
@@ -20080,7 +20200,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 424,
+          "line": 437,
           "via": null,
           "href": null,
           "handler": null,
@@ -20090,7 +20210,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 429,
+          "line": 442,
           "via": null,
           "href": null,
           "handler": null,
@@ -20100,7 +20220,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 455,
+          "line": 468,
           "via": null,
           "href": null,
           "handler": "(e) => setActive(hook, e.currentTarget.checked)",
@@ -20143,7 +20263,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.webhooks.hide_deliveries",
-          "line": 464,
+          "line": 477,
           "via": null,
           "href": null,
           "handler": "() => selectedHook?.id === hook.id ? closeDeliveries() : openDeliveries(hook)",
@@ -20190,7 +20310,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 475,
+          "line": 488,
           "via": null,
           "href": null,
           "handler": "() => removeWebhook(hook)",
@@ -20233,7 +20353,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 493,
+          "line": 506,
           "via": null,
           "href": null,
           "handler": "refreshDeliveries",
@@ -20258,7 +20378,7 @@
         {
           "tag": "button",
           "label": "i18n:common.close",
-          "line": 501,
+          "line": 514,
           "via": null,
           "href": null,
           "handler": "closeDeliveries",
@@ -20268,7 +20388,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.webhooks.redelivering",
-          "line": 528,
+          "line": 541,
           "via": null,
           "href": null,
           "handler": "() => redeliverDelivery(delivery)",
@@ -22383,8 +22503,18 @@
         },
         {
           "tag": "a",
-          "label": "📋 →",
+          "label": "🔔 →",
           "line": 49,
+          "via": null,
+          "href": "/admin/hooks",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "📋 →",
+          "line": 58,
           "via": null,
           "href": "/admin/audit",
           "handler": null,
@@ -22394,7 +22524,7 @@
         {
           "tag": "a",
           "label": "▶ →",
-          "line": 58,
+          "line": 67,
           "via": null,
           "href": "/admin/runners",
           "handler": null,
@@ -22404,7 +22534,7 @@
         {
           "tag": "a",
           "label": "⚙️ →",
-          "line": 67,
+          "line": 76,
           "via": null,
           "href": "/admin/settings",
           "handler": null,
@@ -22610,6 +22740,400 @@
           "via": "Modal",
           "href": null,
           "handler": "onclose",
+          "calls": [],
+          "unresolved": true
+        }
+      ],
+      "passive": []
+    },
+    {
+      "route": "/admin/hooks",
+      "file": "web/src/routes/admin/hooks/+page.svelte",
+      "admin": true,
+      "controls": [
+        {
+          "tag": "form",
+          "label": "selectedEvents = toggle(selectedEvents, event, input.current",
+          "line": 185,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "create",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.create",
+              "method": "POST",
+              "url": "/api/v1/orgs/{name}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_create",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            },
+            {
+              "symbol": "systemWebhooks.create",
+              "method": "POST",
+              "url": "/api/v1/admin/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_create",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "organizationWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            },
+            {
+              "symbol": "systemWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "select",
+          "label": "i18n:settings.webhooks.format_json",
+          "line": 189,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 198,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "(input) => selectedEvents = toggle(selectedEvents, event, input.currentTarget.ch",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.webhooks.create",
+          "line": 202,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 211,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "(input) => void update(hook, { active: input.currentTarget.checked })",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.update",
+              "method": "PATCH",
+              "url": "/api/v1/orgs/{name}/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_update",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.update",
+              "method": "PATCH",
+              "url": "/api/v1/admin/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_update",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "organizationWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            },
+            {
+              "symbol": "systemWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 215,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "(input) => drafts = { ...drafts, [hook.id]: toggle(drafts[hook.id] ?? [], event,",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.webhooks.save_events",
+          "line": 219,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => void update(hook, { events: drafts[hook.id] ?? [] })",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.update",
+              "method": "PATCH",
+              "url": "/api/v1/orgs/{name}/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_update",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.update",
+              "method": "PATCH",
+              "url": "/api/v1/admin/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_update",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "organizationWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            },
+            {
+              "symbol": "systemWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.webhooks.view_deliveries",
+          "line": 220,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => void showDeliveries(hook.id)",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.deliveries",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks/{id}/deliveries",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}/deliveries",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_deliveries",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.deliveries",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks/{id}/deliveries",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}/deliveries",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_deliveries",
+              "matched": true,
+              "testedIn": []
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.delete",
+          "line": 221,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => deleteTarget = hook",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.webhooks.redeliver",
+          "line": 226,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => void redeliver(hook.id, delivery.id)",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.redeliver",
+              "method": "POST",
+              "url": "/api/v1/orgs/{name}/hooks/{id}/deliveries/{deliveryId}/redeliver",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_redeliver",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.redeliver",
+              "method": "POST",
+              "url": "/api/v1/admin/hooks/{id}/deliveries/{deliveryId}/redeliver",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}/deliveries/{delivery_id}/redeliver",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_redeliver",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "organizationWebhooks.deliveries",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks/{id}/deliveries",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}/deliveries",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_deliveries",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.deliveries",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks/{id}/deliveries",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}/deliveries",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_deliveries",
+              "matched": true,
+              "testedIn": []
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.delete",
+          "line": 239,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => deleteTarget && void remove(deleteTarget)",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.remove",
+              "method": "DELETE",
+              "url": "/api/v1/orgs/{name}/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_delete",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.remove",
+              "method": "DELETE",
+              "url": "/api/v1/admin/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_delete",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "organizationWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            },
+            {
+              "symbol": "systemWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 240,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => deleteTarget = null",
           "calls": [],
           "unresolved": true
         }
@@ -25020,7 +25544,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 543,
+          "line": 544,
           "via": null,
           "href": null,
           "handler": "startEditingOrganization",
@@ -25030,7 +25554,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 546,
+          "line": 547,
           "via": null,
           "href": null,
           "handler": "deleteOrganization",
@@ -25058,9 +25582,19 @@
           "unresolved": false
         },
         {
+          "tag": "a",
+          "label": "i18n:settings.webhooks.title",
+          "line": 550,
+          "via": null,
+          "href": "`/orgs/${pathSegment(org.name)}/hooks`",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
           "tag": "form",
           "label": "editingOrg = false} disabled= >",
-          "line": 554,
+          "line": 556,
           "via": null,
           "href": null,
           "handler": "saveOrganization",
@@ -25090,7 +25624,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.visibility_public",
-          "line": 563,
+          "line": 565,
           "via": null,
           "href": null,
           "handler": null,
@@ -25100,7 +25634,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 570,
+          "line": 572,
           "via": null,
           "href": null,
           "handler": null,
@@ -25110,7 +25644,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 574,
+          "line": 576,
           "via": null,
           "href": null,
           "handler": null,
@@ -25120,7 +25654,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 577,
+          "line": 579,
           "via": null,
           "href": null,
           "handler": "() => editingOrg = false",
@@ -25130,7 +25664,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 600,
+          "line": 602,
           "via": null,
           "href": null,
           "handler": null,
@@ -25140,7 +25674,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 603,
+          "line": 605,
           "via": null,
           "href": null,
           "handler": "createOrgRepo",
@@ -25180,7 +25714,7 @@
         {
           "tag": "a",
           "label": "i18n:orgs.create_repo_advanced",
-          "line": 616,
+          "line": 618,
           "via": null,
           "href": "`/dashboard?owner=${encodeURIComponent(org.name)}`",
           "handler": null,
@@ -25190,7 +25724,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 624,
+          "line": 626,
           "via": null,
           "href": "`/${org.name}/${repo.name}`",
           "handler": null,
@@ -25200,7 +25734,7 @@
         {
           "tag": "form",
           "label": "i18n:orgs.new_team",
-          "line": 639,
+          "line": 641,
           "via": null,
           "href": null,
           "handler": "createTeam",
@@ -25242,7 +25776,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.permission.read",
-          "line": 641,
+          "line": 643,
           "via": null,
           "href": null,
           "handler": null,
@@ -25252,7 +25786,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 646,
+          "line": 648,
           "via": null,
           "href": null,
           "handler": null,
@@ -25262,7 +25796,7 @@
         {
           "tag": "button",
           "label": "i18n:orgs.hide_team_members",
-          "line": 664,
+          "line": 666,
           "via": null,
           "href": null,
           "handler": "() => toggleTeamMembers(team.id)",
@@ -25287,7 +25821,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.delete')}",
-          "line": 668,
+          "line": 670,
           "via": null,
           "href": null,
           "handler": "() => deleteTeam(team)",
@@ -25331,7 +25865,7 @@
         {
           "tag": "form",
           "label": "` ? t('common.loading') : t('common.add')}",
-          "line": 679,
+          "line": 681,
           "via": null,
           "href": null,
           "handler": "(event) => addTeamMember(event, team.id)",
@@ -25374,7 +25908,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 686,
+          "line": 688,
           "via": null,
           "href": null,
           "handler": null,
@@ -25384,7 +25918,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.add')}",
-          "line": 690,
+          "line": 692,
           "via": null,
           "href": null,
           "handler": null,
@@ -25394,7 +25928,7 @@
         {
           "tag": "button",
           "label": "-$ ` ? t('common.loading') : t('common.delete')}",
-          "line": 707,
+          "line": 709,
           "via": null,
           "href": null,
           "handler": "() => removeTeamMember(team.id, teamMember)",
@@ -25437,7 +25971,7 @@
         {
           "tag": "form",
           "label": "i18n:orgs.member_placeholder",
-          "line": 732,
+          "line": 734,
           "via": null,
           "href": null,
           "handler": "addOrganizationMember",
@@ -25481,7 +26015,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 739,
+          "line": 741,
           "via": null,
           "href": null,
           "handler": null,
@@ -25491,7 +26025,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 744,
+          "line": 746,
           "via": null,
           "href": null,
           "handler": null,
@@ -25501,7 +26035,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.delete')}",
-          "line": 758,
+          "line": 760,
           "via": null,
           "href": null,
           "handler": "() => removeOrganizationMember(member)",
@@ -25580,6 +26114,400 @@
           ]
         }
       ]
+    },
+    {
+      "route": "/orgs/[name]/hooks",
+      "file": "web/src/routes/orgs/[name]/hooks/+page.svelte",
+      "admin": false,
+      "controls": [
+        {
+          "tag": "form",
+          "label": "selectedEvents = toggle(selectedEvents, event, input.current",
+          "line": 185,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "create",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.create",
+              "method": "POST",
+              "url": "/api/v1/orgs/{name}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_create",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            },
+            {
+              "symbol": "systemWebhooks.create",
+              "method": "POST",
+              "url": "/api/v1/admin/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_create",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "organizationWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            },
+            {
+              "symbol": "systemWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "select",
+          "label": "i18n:settings.webhooks.format_json",
+          "line": 189,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 198,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "(input) => selectedEvents = toggle(selectedEvents, event, input.currentTarget.ch",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.webhooks.create",
+          "line": 202,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 211,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "(input) => void update(hook, { active: input.currentTarget.checked })",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.update",
+              "method": "PATCH",
+              "url": "/api/v1/orgs/{name}/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_update",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.update",
+              "method": "PATCH",
+              "url": "/api/v1/admin/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_update",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "organizationWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            },
+            {
+              "symbol": "systemWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 215,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "(input) => drafts = { ...drafts, [hook.id]: toggle(drafts[hook.id] ?? [], event,",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.webhooks.save_events",
+          "line": 219,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => void update(hook, { events: drafts[hook.id] ?? [] })",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.update",
+              "method": "PATCH",
+              "url": "/api/v1/orgs/{name}/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_update",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.update",
+              "method": "PATCH",
+              "url": "/api/v1/admin/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_update",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "organizationWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            },
+            {
+              "symbol": "systemWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.webhooks.view_deliveries",
+          "line": 220,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => void showDeliveries(hook.id)",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.deliveries",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks/{id}/deliveries",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}/deliveries",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_deliveries",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.deliveries",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks/{id}/deliveries",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}/deliveries",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_deliveries",
+              "matched": true,
+              "testedIn": []
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.delete",
+          "line": 221,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => deleteTarget = hook",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.webhooks.redeliver",
+          "line": 226,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => void redeliver(hook.id, delivery.id)",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.redeliver",
+              "method": "POST",
+              "url": "/api/v1/orgs/{name}/hooks/{id}/deliveries/{deliveryId}/redeliver",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_redeliver",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.redeliver",
+              "method": "POST",
+              "url": "/api/v1/admin/hooks/{id}/deliveries/{deliveryId}/redeliver",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}/deliveries/{delivery_id}/redeliver",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_redeliver",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "organizationWebhooks.deliveries",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks/{id}/deliveries",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}/deliveries",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_deliveries",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.deliveries",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks/{id}/deliveries",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}/deliveries",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_deliveries",
+              "matched": true,
+              "testedIn": []
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.delete",
+          "line": 239,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => deleteTarget && void remove(deleteTarget)",
+          "calls": [
+            {
+              "symbol": "organizationWebhooks.remove",
+              "method": "DELETE",
+              "url": "/api/v1/orgs/{name}/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks/{id}",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_delete",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "systemWebhooks.remove",
+              "method": "DELETE",
+              "url": "/api/v1/admin/hooks/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks/{id}",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_delete",
+              "matched": true,
+              "testedIn": []
+            },
+            {
+              "symbol": "organizationWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/orgs/{name}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs/{name}/hooks",
+              "access": "OrgAdmin",
+              "handler": "api::webhooks::org_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            },
+            {
+              "symbol": "systemWebhooks.list",
+              "method": "GET",
+              "url": "/api/v1/admin/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/hooks",
+              "access": "InstanceAdmin",
+              "handler": "api::webhooks::system_list",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 240,
+          "via": "ScopedWebhooks",
+          "href": null,
+          "handler": "() => deleteTarget = null",
+          "calls": [],
+          "unresolved": true
+        }
+      ],
+      "passive": []
     },
     {
       "route": "/register",
@@ -27379,7 +28307,7 @@
       "outsider"
     ],
     "scenarios": 47,
-    "inventoryEntries": 749,
+    "inventoryEntries": 793,
     "coveredEntries": 172,
     "coveredRoutes": 163,
     "maxUiRoutesWithoutFrontendTest": 26

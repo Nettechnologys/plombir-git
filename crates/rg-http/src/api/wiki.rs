@@ -164,11 +164,24 @@ pub async fn create_page(
     )
     .await
     {
-        Ok(page) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!(page_to_response(&page))),
-        )
-            .into_response(),
+        Ok(page) => {
+            let payload = serde_json::json!({ "event": "wiki.created", "page": { "id": page.id, "title": page.title } });
+            if let Err(error) = rg_core::webhook::service::trigger_event(
+                &state.db_pools(),
+                repo.id,
+                "wiki.created",
+                &payload,
+            )
+            .await
+            {
+                tracing::warn!(repo_id = repo.id, error = %format!("{error:#}"), "failed to trigger wiki.created webhook");
+            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!(page_to_response(&page))),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -208,11 +221,24 @@ pub async fn update_page(
     )
     .await
     {
-        Ok(page) => (
-            StatusCode::OK,
-            Json(serde_json::json!(page_to_response(&page))),
-        )
-            .into_response(),
+        Ok(page) => {
+            let payload = serde_json::json!({ "event": "wiki.updated", "page": { "id": page.id, "title": page.title } });
+            if let Err(error) = rg_core::webhook::service::trigger_event(
+                &state.db_pools(),
+                repo.id,
+                "wiki.updated",
+                &payload,
+            )
+            .await
+            {
+                tracing::warn!(repo_id = repo.id, error = %format!("{error:#}"), "failed to trigger wiki.updated webhook");
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!(page_to_response(&page))),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -239,11 +265,25 @@ pub async fn delete_page(
     RepoWrite { repo, .. }: RepoWrite,
 ) -> impl IntoResponse {
     match rg_core::wiki::service::delete_page(&state.db, repo.id, &title).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"message": "page deleted"})),
-        )
-            .into_response(),
+        Ok(()) => {
+            let payload =
+                serde_json::json!({ "event": "wiki.deleted", "page": { "title": title } });
+            if let Err(error) = rg_core::webhook::service::trigger_event(
+                &state.db_pools(),
+                repo.id,
+                "wiki.deleted",
+                &payload,
+            )
+            .await
+            {
+                tracing::warn!(repo_id = repo.id, error = %format!("{error:#}"), "failed to trigger wiki.deleted webhook");
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"message": "page deleted"})),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

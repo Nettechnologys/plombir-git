@@ -666,6 +666,8 @@ async fn seed_vault(
         rg_db::entities::webhook::ActiveModel {
             id: sea_orm::NotSet,
             repo_id: Set(repo),
+            scope_kind: Set("repo".to_string()),
+            scope_id: Set(repo),
             url: Set("https://hooks.example.com/scope-sweep".to_string()),
             content_type: Set("json".to_string()),
             secret_encrypted: Set(None),

@@ -170,7 +170,7 @@ const ANCHORED: &[AnchoredFile] = &[
             ("id", &["webhook_in_repo"]),
             // Chained anchor: `webhook_in_repo` ties the hook to the repository,
             // then the delivery is tied to that hook.
-            ("delivery_id", &["delivery_in_webhook"]),
+            ("delivery_id", &["delivery_in_webhook", "redeliver_scope"]),
         ],
     ),
     (
@@ -596,7 +596,7 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// owner to the authenticated user and deletes with both id and user id.
 /// 141 since the bounded CI job-log route takes a pipeline id and a job id;
 /// `pipeline_in_repo` and `job_belongs_to_pipeline` anchor both before reply.
-const CENSUS_TOTAL: usize = 141;
+const CENSUS_TOTAL: usize = 153;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.
@@ -1188,6 +1188,18 @@ fn handlers_holding_a_global_id_anchor_it_to_the_authorized_repository() {
          id points into it. A mismatch answers 404, never 403.\n{}",
         offenders.join("\n")
     );
+}
+
+#[test]
+fn scoped_webhook_redelivery_anchors_both_global_ids() {
+    let source =
+        fs::read_to_string(src_root().join("api/webhooks.rs")).expect("read webhook handlers");
+    let helper = functions(&source)
+        .into_iter()
+        .find(|function| function.name == "redeliver_scope")
+        .expect("scoped redelivery helper exists");
+    assert!(calls(&helper.body, "webhook_in_scope"));
+    assert!(calls(&helper.body, "delivery_in_webhook"));
 }
 
 /// Every line of `text` that reaches one of `names` through `module`'s

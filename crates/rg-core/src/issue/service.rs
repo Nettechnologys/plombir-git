@@ -532,6 +532,10 @@ pub async fn update_issue(
     let issue_repo_id = existing.repo_id;
     let issue_milestone_id = existing.milestone_id;
     let was_open = existing.state == "open";
+    let edited = title.as_ref().is_some_and(|value| value != &existing.title)
+        || body
+            .as_ref()
+            .is_some_and(|value| Some(value.as_str()) != existing.body.as_deref());
 
     // Convert to ActiveModel — all non-PK fields become Unchanged; we Set() only changed fields.
     let mut active: issue::ActiveModel = existing.into();
@@ -565,6 +569,16 @@ pub async fn update_issue(
     if let Some(l) = labels {
         label_ids = Some(crate::label::service::resolve_label_ids(db, issue_repo_id, &l).await?);
     }
+    let added_label_ids = if let Some(ref next_ids) = label_ids {
+        let previous = issue_label_ops::get_label_ids(db, issue_id).await?;
+        next_ids
+            .iter()
+            .copied()
+            .filter(|id| !previous.contains(id))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if let Some(a) = assignee_id {
         active.assignee_id = Set(a);
     }
@@ -615,10 +629,48 @@ pub async fn update_issue(
     // FTS sync is handled by database triggers created in the migration chain.
 
     // Post-update side effects (non-fatal)
+    let issue_payload = serde_json::json!({
+        "id": updated.id,
+        "number": updated.number,
+        "title": updated.title,
+    });
+    if edited {
+        let payload = serde_json::json!({ "event": "issue.edited", "issue": issue_payload });
+        if let Err(error) =
+            crate::webhook::service::trigger_event(&pools, issue_repo_id, "issue.edited", &payload)
+                .await
+        {
+            tracing::warn!(issue_id, error = %format!("{error:#}"), "failed to trigger issue.edited webhook");
+        }
+    }
+    if !added_label_ids.is_empty() {
+        let payload = serde_json::json!({
+            "event": "issue.labeled", "issue": issue_payload, "label_ids": added_label_ids,
+        });
+        if let Err(error) =
+            crate::webhook::service::trigger_event(&pools, issue_repo_id, "issue.labeled", &payload)
+                .await
+        {
+            tracing::warn!(issue_id, error = %format!("{error:#}"), "failed to trigger issue.labeled webhook");
+        }
+    }
     if let Some(assignee) = updated
         .assignee_id
         .filter(|id| Some(*id) != previous_assignee)
     {
+        let payload = serde_json::json!({
+            "event": "issue.assigned", "issue": issue_payload, "assignee_id": assignee,
+        });
+        if let Err(error) = crate::webhook::service::trigger_event(
+            &pools,
+            issue_repo_id,
+            "issue.assigned",
+            &payload,
+        )
+        .await
+        {
+            tracing::warn!(issue_id, error = %format!("{error:#}"), "failed to trigger issue.assigned webhook");
+        }
         crate::notification::thread::spawn(
             &pools,
             crate::notification::thread::ThreadEvent::new(
