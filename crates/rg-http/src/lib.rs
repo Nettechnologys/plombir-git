@@ -216,6 +216,93 @@ pub struct AppState {
     pub metrics_access: metrics::MetricsAccess,
 }
 
+async fn run_tracked_ref_operation<T, F>(
+    tracker: &rg_core::task_tracker::TaskTracker,
+    operation: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+{
+    let credential = rg_core::auth::credential_context::current();
+    tracker
+        .spawn(async move {
+            match credential {
+                Some(context) => rg_core::auth::credential_context::scope(context, operation).await,
+                None => operation.await,
+            }
+        })
+        .await
+        .context("tracked ref operation task failed")?
+}
+
+#[cfg(test)]
+mod tracked_ref_operation_tests {
+    #[tokio::test]
+    async fn tracked_ref_operation_preserves_the_request_credential_for_policy_checks() {
+        let tracker = rg_core::task_tracker::TaskTracker::new();
+        let context = rg_core::auth::credential_context::CredentialContext {
+            user_id: 7,
+            token_id: Some(11),
+            mcp_tool: Some("create_branch".into()),
+            deny_protected_writes: true,
+        };
+        let observed = rg_core::auth::credential_context::scope(context.clone(), async {
+            super::run_tracked_ref_operation(&tracker, async {
+                Ok(rg_core::auth::credential_context::current())
+            })
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(observed, Some(context));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_waiter_still_hands_a_landed_ref_to_tracked_hooks() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let tracker = rg_core::task_tracker::TaskTracker::new();
+        let waiter_tracker = tracker.clone();
+        let hook_tracker = tracker.clone();
+        let delivered = Arc::new(AtomicBool::new(false));
+        let delivered_by_hook = delivered.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(async move {
+            super::run_tracked_ref_operation(&waiter_tracker, async move {
+                tokio::task::spawn_blocking(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await?;
+                hook_tracker.spawn(async move {
+                    delivered_by_hook.store(true, Ordering::SeqCst);
+                });
+                Ok(())
+            })
+            .await
+        });
+        entered_rx.await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::time::sleep(std::time::Duration::from_millis(30)),
+        )
+        .await
+        .expect("blocking ref publication occupied the current-thread runtime");
+        waiter.abort();
+        tracker.close();
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), tracker.wait())
+            .await
+            .expect("tracked ref publication and hooks did not drain");
+        assert!(delivered.load(Ordering::SeqCst));
+    }
+}
+
 impl AppState {
     /// Carry both pools into services that enqueue writes after the request.
     pub fn db_pools(&self) -> rg_core::db::Db {
@@ -259,6 +346,45 @@ impl AppState {
                 .run(&db, &repo_path, &owner, &repo_name, pusher_id, &ref_updates)
                 .await;
         });
+    }
+
+    /// Keep an API ref publication and its hook hand-off alive when the HTTP
+    /// future is cancelled. The operation owns its inputs and is tracked by
+    /// the same graceful-shutdown drain as the hooks it schedules.
+    pub(crate) async fn tracked_ref_operation<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        run_tracked_ref_operation(&self.delivery_tracker, operation).await
+    }
+
+    pub(crate) async fn run_ref_change<F>(
+        &self,
+        repo_path: PathBuf,
+        owner: String,
+        repo_name: String,
+        pusher_id: i64,
+        operation: F,
+    ) -> Result<rg_git::protocol::receive_pack::RefUpdate>
+    where
+        F: std::future::Future<Output = Result<rg_git::protocol::receive_pack::RefUpdate>>
+            + Send
+            + 'static,
+    {
+        let state = self.clone();
+        self.tracked_ref_operation(async move {
+            let update = operation.await?;
+            state.spawn_post_push_hooks(
+                repo_path,
+                owner,
+                repo_name,
+                Some(pusher_id),
+                vec![update.clone()],
+            );
+            Ok(update)
+        })
+        .await
     }
 
     /// This process's post-push wiring, in the owned form the hook runs take.

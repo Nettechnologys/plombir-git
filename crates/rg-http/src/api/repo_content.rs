@@ -2393,22 +2393,29 @@ pub async fn create_branch(
     let from = req
         .from
         .unwrap_or_else(|| repo_model.default_branch.clone());
-    match rg_core::repo::refs::create_branch(
-        &state.db,
-        &repo_path,
-        repo_model.id,
-        Some(actor_id),
-        &req.name,
-        &from,
-    )
-    .await
+    let db = state.db.clone();
+    let path_for_task = repo_path.clone();
+    let repo_id = repo_model.id;
+    let branch = req.name;
+    match state
+        .run_ref_change(repo_path, owner, repo, actor_id, async move {
+            rg_core::repo::refs::create_branch(
+                &db,
+                &path_for_task,
+                repo_id,
+                Some(actor_id),
+                &branch,
+                &from,
+            )
+            .await
+        })
+        .await
     {
         Ok(update) => {
             let response = RefChangeResponse {
                 r#ref: update.refname.clone(),
                 sha: update.new_sha.clone(),
             };
-            state.spawn_post_push_hooks(repo_path, owner, repo, Some(actor_id), vec![update]);
             (StatusCode::CREATED, Json(response)).into_response()
         }
         Err(e) => AppError::from(e).into_response(),
@@ -2451,15 +2458,22 @@ pub async fn delete_branch(
         Ok(path) => path,
         Err(e) => return e.into_response(),
     };
-    let deleted = rg_core::repo::refs::delete_branch(
-        &state.db,
-        &repo_path,
-        repo_model.id,
-        Some(actor_id),
-        &branch,
-    )
-    .await;
-    finish_ref_deletion(&state, repo_path, owner, repo, actor_id, deleted)
+    let db = state.db.clone();
+    let path_for_task = repo_path.clone();
+    let repo_id = repo_model.id;
+    let deleted = state
+        .run_ref_change(repo_path, owner, repo, actor_id, async move {
+            rg_core::repo::refs::delete_branch(
+                &db,
+                &path_for_task,
+                repo_id,
+                Some(actor_id),
+                &branch,
+            )
+            .await
+        })
+        .await;
+    finish_ref_deletion(deleted)
 }
 
 /// Delete a tag.
@@ -2495,10 +2509,16 @@ pub async fn delete_tag(
         Ok(path) => path,
         Err(e) => return e.into_response(),
     };
-    let deleted =
-        rg_core::repo::refs::delete_tag(&state.db, &repo_path, repo_model.id, Some(actor_id), &tag)
-            .await;
-    finish_ref_deletion(&state, repo_path, owner, repo, actor_id, deleted)
+    let db = state.db.clone();
+    let path_for_task = repo_path.clone();
+    let repo_id = repo_model.id;
+    let deleted = state
+        .run_ref_change(repo_path, owner, repo, actor_id, async move {
+            rg_core::repo::refs::delete_tag(&db, &path_for_task, repo_id, Some(actor_id), &tag)
+                .await
+        })
+        .await;
+    finish_ref_deletion(deleted)
 }
 
 /// The one ref name the router cannot hand to `{branch}` / `{tag}`: the
@@ -2551,11 +2571,6 @@ fn ref_change_repo_path(
 }
 
 fn finish_ref_deletion(
-    state: &AppState,
-    repo_path: std::path::PathBuf,
-    owner: String,
-    repo: String,
-    actor_id: i64,
     deleted: anyhow::Result<rg_git::protocol::receive_pack::RefUpdate>,
 ) -> axum::response::Response {
     match deleted {
@@ -2564,9 +2579,6 @@ fn finish_ref_deletion(
                 r#ref: update.refname.clone(),
                 sha: update.old_sha.clone(),
             };
-            // `branch.deleted` / `tag.deleted`, and the cancellation of CI work
-            // whose ref is gone — what a `git push :<ref>` triggers.
-            state.spawn_post_push_hooks(repo_path, owner, repo, Some(actor_id), vec![update]);
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => AppError::from(e).into_response(),

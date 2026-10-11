@@ -806,6 +806,34 @@ async fn adopt_cloned_default_branch(
     repo_path: &Path,
     recorded_branch: &str,
 ) {
+    let db = db.clone();
+    let repo_path = repo_path.to_path_buf();
+    let recorded_branch = recorded_branch.to_string();
+    // Keep the lock and row publication alive if the import request disappears.
+    // Settings changes and first-push adoption use this same cross-process lock.
+    if let Err(error) = tokio::spawn(async move {
+        let _lock = match crate::repo::service::lock_default_branch(&repo_path).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(repo_id, error = %format!("{error:#}"),
+                    "could not lock imported repository default branch");
+                return;
+            }
+        };
+        adopt_cloned_default_branch_locked(&db, repo_id, &repo_path, &recorded_branch).await;
+    })
+    .await
+    {
+        tracing::warn!(repo_id, %error, "imported default branch adoption task failed");
+    }
+}
+
+async fn adopt_cloned_default_branch_locked(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    repo_path: &Path,
+    recorded_branch: &str,
+) {
     let repo_path_for_read = repo_path.to_path_buf();
     let advertisement = match crate::blocking::run_blocking_git(
         "reading the cloned repository's HEAD and refs",
@@ -5578,7 +5606,8 @@ mod clone_effect_tests {
         let leftovers: Vec<_> = std::fs::read_dir(repo_root.join("importer"))
             .expect("read the namespace directory")
             .map(|entry| entry.expect("read a directory entry").file_name())
-            .filter(|name| name != "fresh.git")
+            // The sibling lock must survive a clone replacing `fresh.git`.
+            .filter(|name| name != "fresh.git" && name != ".fresh.git.default-branch.lock")
             .collect();
         assert!(
             leftovers.is_empty(),
@@ -5831,6 +5860,99 @@ mod clone_effect_tests {
             "the row still names the branch the target was created with — the repository page \
              will resolve a ref that does not exist"
         );
+    }
+
+    async fn prove_import_adoption_waits_for_settings(db: DatabaseConnection, owner: String) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        let sha = upstream_with_a_commit_on(&upstream, "master");
+        git(&["update-ref", "refs/heads/dev", &sha], Some(&upstream));
+        let repo_id = resolve_or_create_target_repo(
+            &db,
+            None,
+            &owner,
+            "settings-race",
+            &directory.path().join("repo_root"),
+        )
+        .await
+        .unwrap();
+
+        let lock = crate::repo::service::lock_default_branch(&upstream)
+            .await
+            .unwrap();
+        let task_db = db.clone();
+        let task_path = upstream.clone();
+        let mut adoption = tokio::spawn(async move {
+            adopt_cloned_default_branch(&task_db, repo_id, &task_path, "main").await;
+        });
+        crate::test_support::assert_task_stays_blocked(
+            &mut adoption,
+            "import adoption read HEAD before taking the settings lock",
+        )
+        .await;
+        let settings_db = db.clone();
+        let settings_path = upstream.clone();
+        let settings_repo = rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let settings = tokio::spawn(async move {
+            crate::repo::service::update_repo_settings(
+                &settings_db,
+                &settings_path,
+                &settings_repo,
+                crate::repo::service::RepoSettingsChange {
+                    default_branch: Some("dev".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        drop(lock);
+        adoption.await.unwrap();
+        settings.await.unwrap().unwrap();
+        assert_eq!(
+            rg_git::ref_advertisement::collect(&upstream)
+                .unwrap()
+                .head_target
+                .as_deref(),
+            Some("refs/heads/dev")
+        );
+        assert_eq!(
+            rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .default_branch,
+            "dev"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_adoption_waits_for_settings_and_reads_head_inside_the_shared_lock() {
+        prove_import_adoption_waits_for_settings(importing_user().await, "importer".into()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+    async fn import_adoption_and_settings_serialize_on_server_database() {
+        let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+            .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+        let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 3)
+            .await
+            .expect("connect to test database");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+        let owner = format!("importer{}", uuid::Uuid::new_v4().simple());
+        rg_db::ops::user_ops::create_user(
+            &db,
+            &owner,
+            &format!("{owner}@example.invalid"),
+            "unused",
+            "Import Race",
+        )
+        .await
+        .expect("create import target owner");
+        prove_import_adoption_waits_for_settings(db, owner).await;
     }
 
     #[tokio::test]

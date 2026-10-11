@@ -752,6 +752,21 @@ fn enforce_ref_rules(repo_path: &Path, updates: &mut [RefUpdate], policy: &PushP
     }
 }
 
+async fn enforce_ref_rules_off_worker(
+    repo_path: &Path,
+    mut updates: Vec<RefUpdate>,
+    policy: &PushPolicy,
+) -> Result<Vec<RefUpdate>> {
+    let repo_path = repo_path.to_path_buf();
+    let policy = policy.clone();
+    tokio::task::spawn_blocking(move || {
+        enforce_ref_rules(&repo_path, &mut updates, &policy);
+        updates
+    })
+    .await
+    .context("receive-pack ref rules did not complete")
+}
+
 /// Process the push: read update commands, packfile, and update refs.
 ///
 /// An empty [`PushPolicy`] means "no policy applies to this push", which is a
@@ -805,7 +820,7 @@ where
         });
     }
 
-    enforce_ref_rules(repo_path, &mut updates, policy);
+    updates = enforce_ref_rules_off_worker(repo_path, updates, policy).await?;
 
     let writes_objects = updates
         .iter()
@@ -915,20 +930,6 @@ async fn check_and_write_refs(
         .await;
     }
 
-    if applied.is_none() {
-        // Server-origin ref moves return their updates to a caller that owns
-        // the post-move hooks. Until that caller has a cancellation sink of its
-        // own, keep the final writes on this future: an await here could let
-        // cancellation publish a ref without delivering its hooks.
-        if updates.iter().any(writes_an_object) {
-            if let Some(incoming) = &incoming {
-                incoming.promote()?;
-            }
-        }
-        write_ref_updates(repo_path, &mut updates);
-        return Ok(updates);
-    }
-
     publish_ref_updates_with(
         repo_path.to_path_buf(),
         updates,
@@ -1007,7 +1008,7 @@ pub async fn apply_server_ref_updates(
         .into_iter()
         .map(|(old_sha, new_sha, refname)| checked_command(old_sha, new_sha, refname))
         .collect();
-    enforce_ref_rules(repo_path, &mut updates, policy);
+    updates = enforce_ref_rules_off_worker(repo_path, updates, policy).await?;
     check_and_write_refs(repo_path, updates, policy, None, None).await
 }
 

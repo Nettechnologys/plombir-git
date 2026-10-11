@@ -274,26 +274,31 @@ pub async fn create_release(
         .clone()
         .filter(|target| !target.is_empty())
         .unwrap_or_else(|| repo.default_branch.clone());
-    match rg_core::release::service::publish_release(
-        &rg_core::db::Db::new(state.db.clone(), state.db_write.clone()),
-        &repo_path,
-        repo.id,
-        user_id,
-        &body.tag_name,
-        &body.title,
-        body.body.as_deref(),
-        &target,
-        body.is_draft.unwrap_or(false),
-        body.is_prerelease.unwrap_or(false),
-    )
-    .await
-    {
-        Ok((release, created_tag)) => {
+    let owned_state = state.clone();
+    let repo_id = repo.id;
+    match state
+        .tracked_ref_operation(async move {
+            let (release, created_tag) = rg_core::release::service::publish_release(
+                &rg_core::db::Db::new(owned_state.db.clone(), owned_state.db_write.clone()),
+                &repo_path,
+                repo_id,
+                user_id,
+                &body.tag_name,
+                &body.title,
+                body.body.as_deref(),
+                &target,
+                body.is_draft.unwrap_or(false),
+                body.is_prerelease.unwrap_or(false),
+            )
+            .await?;
             if let Some(tag) = created_tag {
-                state.spawn_post_push_hooks(repo_path, owner, name, Some(user_id), vec![tag]);
+                owned_state.spawn_post_push_hooks(repo_path, owner, name, Some(user_id), vec![tag]);
             }
-            (StatusCode::CREATED, Json(serde_json::json!(release))).into_response()
-        }
+            Ok(release)
+        })
+        .await
+    {
+        Ok(release) => (StatusCode::CREATED, Json(serde_json::json!(release))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -364,34 +369,43 @@ pub async fn update_release(
                 return AppError::bad_request(e.to_string()).into_response();
             }
         }
-        let repo_path = state.repo_root.join(format!("{owner}/{name}.git"));
-        match rg_core::release::service::ensure_release_tag(
-            &state.db,
-            &repo_path,
-            repo.id,
-            actor_id,
-            &release.tag_name,
-            &release.target_commitish,
-        )
-        .await
-        {
-            Ok(Some(tag)) => {
-                state.spawn_post_push_hooks(repo_path, owner, name, Some(actor_id), vec![tag])
-            }
-            Ok(None) => {}
-            Err(e) => return AppError::from(e).into_response(),
-        }
     }
 
-    match rg_core::release::service::update_release(
-        &state.db,
-        release.id,
-        body.title.as_deref(),
-        body.body.as_deref(),
-        body.is_draft,
-        body.is_prerelease,
-    )
-    .await
+    let owned_state = state.clone();
+    match state
+        .tracked_ref_operation(async move {
+            if release.is_draft && body.is_draft == Some(false) {
+                let repo_path = owned_state.repo_root.join(format!("{owner}/{name}.git"));
+                if let Some(tag) = rg_core::release::service::ensure_release_tag(
+                    &owned_state.db,
+                    &repo_path,
+                    repo.id,
+                    actor_id,
+                    &release.tag_name,
+                    &release.target_commitish,
+                )
+                .await?
+                {
+                    owned_state.spawn_post_push_hooks(
+                        repo_path,
+                        owner,
+                        name,
+                        Some(actor_id),
+                        vec![tag],
+                    );
+                }
+            }
+            rg_core::release::service::update_release(
+                &owned_state.db,
+                release.id,
+                body.title.as_deref(),
+                body.body.as_deref(),
+                body.is_draft,
+                body.is_prerelease,
+            )
+            .await
+        })
+        .await
     {
         Ok(release) => (StatusCode::OK, Json(serde_json::json!(release))).into_response(),
         Err(e) => AppError::from(e).into_response(),

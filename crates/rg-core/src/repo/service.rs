@@ -3297,8 +3297,17 @@ pub struct RepoSettingsChange {
 /// own the only code that can put HEAD back after a failed write. The OS lock
 /// serializes this cross-store operation across server processes, including
 /// the fresh row read and a failed writer's compensation.
-async fn lock_default_branch(repo_path: &std::path::Path) -> Result<std::fs::File> {
-    let lock_path = repo_path.join("forgekeep-default-branch.lock");
+pub(crate) async fn lock_default_branch(repo_path: &std::path::Path) -> Result<std::fs::File> {
+    // Imports replace the entire bare repository directory by rename. A lock
+    // file inside it would then protect the retired inode while the importer
+    // and a settings request lock a different file at the same path.
+    let name = repo_path
+        .file_name()
+        .context("repository path has no name")?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".default-branch.lock");
+    let lock_path = repo_path.with_file_name(lock_name);
     crate::blocking::run_blocking_git("lock repository default branch", move || {
         use std::fs::OpenOptions;
 
@@ -3442,6 +3451,23 @@ where
 mod default_branch_change_tests {
     use super::{adopt_unborn_default_branch_with, change_default_branch_with};
     use std::path::Path;
+
+    #[tokio::test]
+    async fn default_branch_lock_survives_import_replacing_the_repo_directory() {
+        let (_temp, bare) = branches();
+        let first = super::lock_default_branch(&bare).await.unwrap();
+        std::fs::rename(&bare, bare.with_extension("retired")).unwrap();
+        std::fs::create_dir(&bare).unwrap();
+        let mut second =
+            tokio::spawn(async move { super::lock_default_branch(&bare).await.unwrap() });
+        crate::test_support::assert_task_stays_blocked(
+            &mut second,
+            "a replacement repo directory bypassed the default-branch lock",
+        )
+        .await;
+        drop(first);
+        second.await.unwrap();
+    }
 
     fn git(args: &[&str], cwd: Option<&Path>) {
         rg_git::cli_gateway::global_gateway()

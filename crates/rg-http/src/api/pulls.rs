@@ -725,24 +725,30 @@ pub async fn merge_pr(
             if req.delete_head_branch {
                 // The merge has landed whatever happens here: a branch that
                 // must stay is reported beside the merge, never as its failure.
-                let (deleted, kept) = match rg_core::repo::refs::delete_merged_head_branch(
-                    &state.db,
-                    &state.repo_root,
-                    &pr,
-                    actor_id,
-                )
-                .await
-                {
-                    Ok((head_owner, head_repo, head_path, update)) => {
-                        state.spawn_post_push_hooks(
+                let owned_state = state.clone();
+                let pr_for_task = pr.clone();
+                let (deleted, kept) = match state
+                    .tracked_ref_operation(async move {
+                        let (head_owner, head_repo, head_path, update) =
+                            rg_core::repo::refs::delete_merged_head_branch(
+                                &owned_state.db,
+                                &owned_state.repo_root,
+                                &pr_for_task,
+                                actor_id,
+                            )
+                            .await?;
+                        owned_state.spawn_post_push_hooks(
                             head_path,
                             head_owner,
                             head_repo,
                             Some(actor_id),
                             vec![update],
                         );
-                        (true, None)
-                    }
+                        Ok(())
+                    })
+                    .await
+                {
+                    Ok(()) => (true, None),
                     Err(e) => match rg_core::error::client_facing_message(&e) {
                         Some(reason) => (false, Some(reason)),
                         None => {

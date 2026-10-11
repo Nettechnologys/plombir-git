@@ -1207,6 +1207,16 @@ pub(crate) async fn run_serve(
     rg_db::run_migrations(&db).await?;
     tracing::info!("Database ready");
 
+    // Open the dedicated writer before starting any background database work.
+    let db_write = rg_db::open_write_pool(
+        &resolved_db_url,
+        resolved_db_connect_timeout,
+        resolved_db_idle_timeout,
+        &db,
+    )
+    .await
+    .map_err(|e| dbconn::annotate_db_open_error(e, &resolved_db_url))?;
+
     // ── Interrupted storage mutations ─────────────────────────────
     // The spool sweep above retires drafts; this pass finishes journalled
     // deletions, moves, repository creations and attachment publications.
@@ -1355,6 +1365,7 @@ pub(crate) async fn run_serve(
         };
         Some(rg_core::audit::archiver::spawn_archiver_with_shutdown(
             db.clone(),
+            db_write.clone(),
             archive_config,
             Some(shutdown_rx.clone()),
         )?)
@@ -1409,18 +1420,6 @@ pub(crate) async fn run_serve(
         );
         None
     };
-
-    // Steady background writers queue on a dedicated SQLite write pool.
-    // Open it before starting retention; mail and webhook delivery use this
-    // same pool later in the startup sequence.
-    let db_write = rg_db::open_write_pool(
-        &resolved_db_url,
-        resolved_db_connect_timeout,
-        resolved_db_idle_timeout,
-        &db,
-    )
-    .await
-    .map_err(|e| dbconn::annotate_db_open_error(e, &resolved_db_url))?;
 
     // ── Retention of append-only tables ───────────────────────────
     // Webhook deliveries, notifications and login attempts are written on

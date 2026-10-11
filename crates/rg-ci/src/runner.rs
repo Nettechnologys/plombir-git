@@ -111,13 +111,15 @@ const CONTAINER_REMOVAL_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// One function rather than a `format!` at each site: the stop path removes the
 /// container by name, so a name that drifts from the one `docker run --name`
 /// was given leaves a live container behind with nothing pointing at it.
-pub(crate) fn job_container_name(job_id: i64) -> String {
-    format!("plombir-git-job-{job_id}")
+fn job_container_name(job_id: i64, runner_id: uuid::Uuid) -> String {
+    format!("plombir-git-job-{job_id}-{}", runner_id.simple())
 }
 
 /// Pipeline runner that executes stages/jobs sequentially.
 pub struct PipelineRunner {
     db: DatabaseConnection,
+    /// Distinguishes this embedded runner from other instances sharing Docker.
+    runner_id: uuid::Uuid,
     /// Where the runner's own writes go — the job heartbeat, `running`, the
     /// result and the graph roll-up it makes due. A runner with a job in hand
     /// writes steadily, and on the shared pool every one of those writes waits
@@ -196,6 +198,7 @@ impl PipelineRunner {
         Self {
             db_write: db.clone(),
             db,
+            runner_id: uuid::Uuid::new_v4(),
             repo_path: repo_path.to_path_buf(),
             pipeline_id,
             repo_id: 0,
@@ -236,6 +239,7 @@ impl PipelineRunner {
         Self {
             db_write: db.clone(),
             db,
+            runner_id: uuid::Uuid::new_v4(),
             repo_path: repo_path.to_path_buf(),
             pipeline_id,
             repo_id: 0,
@@ -347,6 +351,10 @@ impl PipelineRunner {
         command
     }
 
+    fn job_container_name(&self, job_id: i64) -> String {
+        job_container_name(job_id, self.runner_id)
+    }
+
     /// Force-remove the container a job ran in.
     ///
     /// `docker run` here is not `-d`, but the container is still not this
@@ -355,7 +363,7 @@ impl PipelineRunner {
     /// is nothing left to abort — but the failure is named, because what it
     /// leaves behind holds CPU, memory and the job's workspace mount.
     async fn remove_job_container(&self, job_id: i64) {
-        let container_name = job_container_name(job_id);
+        let container_name = self.job_container_name(job_id);
         let mut command = self.docker_command();
         command.args(["rm", "-f", &container_name]);
         let removal = command.output();
@@ -1318,7 +1326,7 @@ impl PipelineRunner {
         }
 
         // Generate a unique container name
-        let container_name = job_container_name(job_id);
+        let container_name = self.job_container_name(job_id);
 
         // Run: docker run --rm --name <name> <hardening flags> -v <repo_path>:/workspace -w /workspace <image> sh -c <script>
         //
@@ -3198,10 +3206,52 @@ esac
         while process_is_alive(pid) {
             assert!(
                 std::time::Instant::now() < deadline,
-                "{description} process {pid} survived the job timeout"
+                "{description} process {pid} survived job cleanup"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// Two in-process runners can receive the same local job ID while sharing
+    /// one daemon. Removing either one's container must leave the other alive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn embedded_runners_with_the_same_job_id_remove_only_their_own_container() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (mut first, db, job) = runner_with_one_job(
+            temp.path(),
+            "shared-daemon",
+            "echo ready",
+            Some("fixture:success"),
+            60,
+        )
+        .await;
+        let mut second = PipelineRunner::new(db, &first.repo_path, first.pipeline_id);
+        let first_name = first.job_container_name(job.id);
+        let second_name = second.job_container_name(job.id);
+        assert_ne!(first_name, second_name);
+
+        let program = temp.path().join("docker-remove-fixture");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nstate=$(dirname \"$0\")\n[ \"$1\" = rm ] && [ \"$2\" = -f ] || exit 64\nrm -f \"$state/$3\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        first.set_docker_program(&program);
+        second.set_docker_program(&program);
+        let first_marker = temp.path().join(&first_name);
+        let second_marker = temp.path().join(&second_name);
+        std::fs::write(&first_marker, b"").unwrap();
+        std::fs::write(&second_marker, b"").unwrap();
+
+        first.remove_job_container(job.id).await;
+        assert!(!first_marker.exists());
+        assert!(second_marker.exists());
+        second.remove_job_container(job.id).await;
+        assert!(!second_marker.exists());
     }
 
     /// A timed-out `docker run` has two owners to stop: the Docker CLI child and
@@ -3223,6 +3273,7 @@ esac
         )
         .await;
         runner.set_docker_program(&fixture.program);
+        let container_name = runner.job_container_name(job.id);
 
         tokio::time::timeout(std::time::Duration::from_secs(15), runner.run())
             .await
@@ -3249,8 +3300,57 @@ esac
             std::fs::read_to_string(fixture.root.join("rm.args"))
                 .unwrap()
                 .trim(),
-            format!("rm -f {}", job_container_name(job.id))
+            format!("rm -f {container_name}")
         );
+        assert!(!fixture.root.join("container.live").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_an_embedded_docker_job_removes_its_named_container() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = DockerFixture::new(&temp.path().join("fake-docker"));
+        let (mut runner, db, job) = runner_with_one_job(
+            temp.path(),
+            "docker-shutdown",
+            "sleep forever",
+            Some("fixture:hang"),
+            60,
+        )
+        .await;
+        let container_name = runner.job_container_name(job.id);
+        runner.set_docker_program(&fixture.program);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        runner.set_shutdown(Some(shutdown_rx));
+        let execution = tokio::spawn(async move { runner.run().await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !fixture.root.join("container.pid").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the Docker job never started");
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), execution)
+            .await
+            .expect("the runner did not stop")
+            .expect("runner task panicked")
+            .expect("a stopped runner is not a job failure");
+
+        let handed_back = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handed_back.status, "pending");
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("rm.args"))
+                .unwrap()
+                .trim(),
+            format!("rm -f {container_name}")
+        );
+        assert_process_stops(fixture.pid("client.pid"), "docker client").await;
+        assert_process_stops(fixture.pid("container.pid"), "docker container").await;
         assert!(!fixture.root.join("container.live").exists());
     }
 

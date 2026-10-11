@@ -122,6 +122,7 @@ pub fn ensure_archive_dir(archive_dir: &Path) -> anyhow::Result<()> {
 /// there is nothing to flush, only a clean loop exit.
 pub fn spawn_archiver_with_shutdown(
     db: DatabaseConnection,
+    db_write: DatabaseConnection,
     config: AuditArchiveConfig,
     shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
@@ -141,7 +142,7 @@ pub fn spawn_archiver_with_shutdown(
                 }
             }
             loop {
-                match run_archive_once(&db, &config).await {
+                match run_archive_once(&db, &db_write, &config).await {
                     Ok(Some(result)) => {
                         tracing::info!(
                             count = result.count,
@@ -174,6 +175,7 @@ pub fn spawn_archiver_with_shutdown(
 /// Archive one bounded batch. Returns `None` when no eligible entries exist.
 pub async fn run_archive_once(
     db: &DatabaseConnection,
+    db_write: &DatabaseConnection,
     config: &AuditArchiveConfig,
 ) -> anyhow::Result<Option<ArchiveResult>> {
     config.validate()?;
@@ -220,7 +222,7 @@ pub async fn run_archive_once(
     }
 
     let ids = old_entries.iter().map(|entry| entry.id).collect::<Vec<_>>();
-    rg_db::ops::audit_log_ops::delete_by_ids(db, &ids).await?;
+    rg_db::ops::audit_log_ops::delete_by_ids(db_write, &ids).await?;
 
     Ok(Some(ArchiveResult {
         path,
@@ -289,7 +291,7 @@ async fn write_archive_atomically(
 mod tests {
     use super::{ensure_archive_dir, run_archive_once, AuditArchiveConfig};
     use chrono::{Duration, Utc};
-    use sea_orm::{NotSet, Set};
+    use sea_orm::{ConnectionTrait, NotSet, Set, TransactionTrait};
     use std::io::Cursor;
 
     /// Connect a throwaway database through the production path.
@@ -399,6 +401,7 @@ mod tests {
         make_read_only(&archive_dir);
 
         let error = super::spawn_archiver_with_shutdown(
+            db.clone(),
             db,
             AuditArchiveConfig::with_archive_dir(archive_dir.clone()),
             None,
@@ -433,7 +436,7 @@ mod tests {
         make_read_only(&archive_dir);
         let config = AuditArchiveConfig::with_archive_dir(archive_dir.clone());
 
-        let error = run_archive_once(&db, &config).await.unwrap_err();
+        let error = run_archive_once(&db, &db, &config).await.unwrap_err();
         let rendered = format!("{error:#}");
 
         assert!(
@@ -475,6 +478,7 @@ mod tests {
         std::fs::set_permissions(&archive_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let result = run_archive_once(
+            &db,
             &db,
             &AuditArchiveConfig::with_archive_dir(archive_dir.clone()),
         )
@@ -566,8 +570,8 @@ mod tests {
             interval_minutes: 60,
             batch_size: 1,
         };
-        let first = run_archive_once(&db, &config).await.unwrap().unwrap();
-        let second = run_archive_once(&db, &config).await.unwrap().unwrap();
+        let first = run_archive_once(&db, &db, &config).await.unwrap().unwrap();
+        let second = run_archive_once(&db, &db, &config).await.unwrap().unwrap();
         assert_eq!(first.count, 1);
         assert_eq!(second.count, 1);
         assert_ne!(first.path, second.path);
@@ -587,7 +591,107 @@ mod tests {
                 .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].action, "new.action");
-        assert!(run_archive_once(&db, &config).await.unwrap().is_none());
+        assert!(run_archive_once(&db, &db, &config).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn archive_delete_waits_on_the_write_pool_without_starving_readers() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("audit.db").display()
+        );
+        let bootstrap = connect_test_db(&url).await;
+        rg_db::run_migrations(&bootstrap).await.unwrap();
+        insert_audit_row(&bootstrap, "old.action", Utc::now() - Duration::days(91)).await;
+        drop(bootstrap);
+
+        let mut read = rg_db::connect_with_pool(
+            &url,
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        let mut write = rg_db::open_write_pool(
+            &url,
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            &read,
+        )
+        .await
+        .unwrap();
+        let holder = rg_db::connect_with_pool(
+            &url,
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        let on_read = Arc::new(Mutex::new(Vec::new()));
+        let on_write = Arc::new(Mutex::new(Vec::new()));
+        for (pool, statements) in [(&mut read, &on_read), (&mut write, &on_write)] {
+            let statements = Arc::clone(statements);
+            pool.set_metric_callback(move |info| {
+                statements
+                    .lock()
+                    .unwrap()
+                    .push(info.statement.sql.to_ascii_lowercase());
+            });
+        }
+
+        let held = holder.begin().await.unwrap();
+        held.execute_unprepared("UPDATE audit_log SET action = action")
+            .await
+            .unwrap();
+        let config = AuditArchiveConfig::with_archive_dir(dir.path().join("archive"));
+        let archive_dir = config.archive_dir.clone();
+        let read_for_task = read.clone();
+        let write_for_task = write.clone();
+        let archive = tokio::spawn(async move {
+            run_archive_once(&read_for_task, &write_for_task, &config).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if archive_dir.exists()
+                    && std::fs::read_dir(&archive_dir).unwrap().any(|entry| {
+                        entry
+                            .unwrap()
+                            .path()
+                            .extension()
+                            .is_some_and(|ext| ext == "zst")
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("archive published before the blocked delete");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            read.execute_unprepared("SELECT 1"),
+        )
+        .await
+        .expect("a reader waited behind the archive DELETE")
+        .unwrap();
+        held.rollback().await.unwrap();
+        archive.await.unwrap().unwrap().expect("one batch archived");
+
+        let reads = on_read.lock().unwrap();
+        assert!(!reads
+            .iter()
+            .any(|sql| sql.trim_start().starts_with("delete")));
+        let writes = on_write.lock().unwrap();
+        assert!(writes
+            .iter()
+            .any(|sql| sql.trim_start().starts_with("delete") && sql.contains("audit_log")));
     }
 
     /// The reverse arc for the archiver's own spool: a `SIGKILL` between
@@ -630,7 +734,7 @@ mod tests {
         }
 
         assert!(
-            run_archive_once(&db, &config).await.unwrap().is_none(),
+            run_archive_once(&db, &db, &config).await.unwrap().is_none(),
             "there is nothing to archive — the prune must not depend on there being something"
         );
 
