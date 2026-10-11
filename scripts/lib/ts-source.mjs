@@ -517,6 +517,7 @@ function unwrapParamExpression(expression) {
     'String',
     'Number',
     'encodeURIComponent',
+    'pathSegment',
     'encodeRepoPath',
     'decodeURIComponent',
     'normalize',

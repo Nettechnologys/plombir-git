@@ -1,4 +1,5 @@
 import { request, qs, type PaginatedResponse } from './_base.svelte';
+import { pathSegment } from './repoPath';
 
 export interface AdminUser {
   id: number;
@@ -181,9 +182,9 @@ export const admin = {
   listOrgs: (page?: number, perPage?: number) =>
     request<PaginatedResponse<AdminOrg>>(`/admin/orgs${qs({ page, per_page: perPage })}`),
   getOrg: (name: string) =>
-    request<AdminOrg>(`/admin/orgs/${name}`),
+    request<AdminOrg>(`/admin/orgs/${pathSegment(name)}`),
   deleteOrg: (name: string) =>
-    request<{ deleted: boolean }>(`/admin/orgs/${name}`, { method: 'DELETE' }),
+    request<{ deleted: boolean }>(`/admin/orgs/${pathSegment(name)}`, { method: 'DELETE' }),
   listAuditLogs: (query?: AuditLogQuery) =>
     request<AuditLogResponse>(`/admin/audit/logs${qs({
       page: query?.page,

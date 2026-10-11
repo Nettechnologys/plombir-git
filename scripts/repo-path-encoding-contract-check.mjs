@@ -13,9 +13,10 @@ for (const file of readdirSync(dir).filter((name) => name.endsWith('.ts') && !na
     const literal = match[0];
     const rawOwnerOrRepo = /\$\{\s*(?:owner|repo)\s*\}/.test(literal);
     const rawRepoName = literal.includes('/repos/') && /\$\{\s*name\s*\}/.test(literal);
-    if (!rawOwnerOrRepo && !rawRepoName) continue;
+    const rawOrgName = /\/(?:admin\/)?orgs\//.test(literal) && /\$\{\s*name\s*\}/.test(literal);
+    if (!rawOwnerOrRepo && !rawRepoName && !rawOrgName) continue;
     const line = source.slice(0, match.index).split('\n').length;
-    failures.push(`${file}:${line}: raw owner/repo segment in repository API path`);
+    failures.push(`${file}:${line}: raw owner/repo/organization segment in API path`);
   }
 }
 

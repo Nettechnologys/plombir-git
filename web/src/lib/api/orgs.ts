@@ -1,5 +1,6 @@
 import { request } from './_base.svelte';
 import { buildUserRef } from './userRef';
+import { pathSegment } from './repoPath';
 
 export type OrganizationVisibility = 'public' | 'private';
 export type OrganizationMemberRole = 'owner' | 'admin' | 'member';
@@ -59,52 +60,52 @@ export const orgs = {
   list: (userId?: number) =>
     request<Organization[]>(`/orgs${userId ? `?user_id=${userId}` : ''}`),
   get: (name: string) =>
-    request<Organization>(`/orgs/${name}`),
+    request<Organization>(`/orgs/${pathSegment(name)}`),
   create: (name: string, displayName?: string, description?: string, visibility?: OrganizationVisibility) =>
     request<Pick<Organization, 'id' | 'name' | 'display_name' | 'visibility'>>('/orgs', {
       method: 'POST',
       body: JSON.stringify({ name, display_name: displayName, description, visibility }),
     }),
   update: (name: string, data: OrganizationUpdatePayload) =>
-    request<Organization>(`/orgs/${name}`, {
+    request<Organization>(`/orgs/${pathSegment(name)}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
   delete: (name: string) =>
-    request<{ deleted: boolean }>(`/orgs/${name}`, { method: 'DELETE' }),
+    request<{ deleted: boolean }>(`/orgs/${pathSegment(name)}`, { method: 'DELETE' }),
   listMembers: (name: string) =>
-    request<OrganizationMember[]>(`/orgs/${name}/members`),
+    request<OrganizationMember[]>(`/orgs/${pathSegment(name)}/members`),
   // The owner types a name, not a row key: there is no endpoint on this
   // instance that would let them turn one into the other.
   addMember: (name: string, user: string | number, role?: OrganizationMemberRole) => {
     const ref = buildUserRef(user);
     if (ref === null) return Promise.reject(new Error('A user is required.'));
-    return request<OrganizationMember>(`/orgs/${name}/members`, {
+    return request<OrganizationMember>(`/orgs/${pathSegment(name)}/members`, {
       method: 'POST',
       body: JSON.stringify({ ...ref, role: role || 'member' }),
     });
   },
   removeMember: (name: string, userId: number) =>
-    request<{ removed: boolean }>(`/orgs/${name}/members/${userId}`, { method: 'DELETE' }),
+    request<{ removed: boolean }>(`/orgs/${pathSegment(name)}/members/${userId}`, { method: 'DELETE' }),
   listTeams: (name: string) =>
-    request<OrganizationTeam[]>(`/orgs/${name}/teams`),
+    request<OrganizationTeam[]>(`/orgs/${pathSegment(name)}/teams`),
   createTeam: (name: string, teamName: string, description?: string, permission?: TeamPermission) =>
-    request<OrganizationTeam>(`/orgs/${name}/teams`, {
+    request<OrganizationTeam>(`/orgs/${pathSegment(name)}/teams`, {
       method: 'POST',
       body: JSON.stringify({ name: teamName, description, permission: permission || 'read' }),
     }),
   deleteTeam: (name: string, teamId: number) =>
-    request<{ deleted: boolean }>(`/orgs/${name}/teams/${teamId}`, { method: 'DELETE' }),
+    request<{ deleted: boolean }>(`/orgs/${pathSegment(name)}/teams/${teamId}`, { method: 'DELETE' }),
   listTeamMembers: (name: string, teamId: number) =>
-    request<TeamMember[]>(`/orgs/${name}/teams/${teamId}/members`),
+    request<TeamMember[]>(`/orgs/${pathSegment(name)}/teams/${teamId}/members`),
   addTeamMember: (name: string, teamId: number, user: string | number, role?: TeamMemberRole) => {
     const ref = buildUserRef(user);
     if (ref === null) return Promise.reject(new Error('A user is required.'));
-    return request<TeamMember>(`/orgs/${name}/teams/${teamId}/members`, {
+    return request<TeamMember>(`/orgs/${pathSegment(name)}/teams/${teamId}/members`, {
       method: 'POST',
       body: JSON.stringify({ ...ref, role: role || 'member' }),
     });
   },
   removeTeamMember: (name: string, teamId: number, userId: number) =>
-    request<{ removed: boolean }>(`/orgs/${name}/teams/${teamId}/members/${userId}`, { method: 'DELETE' }),
+    request<{ removed: boolean }>(`/orgs/${pathSegment(name)}/teams/${teamId}/members/${userId}`, { method: 'DELETE' }),
 };

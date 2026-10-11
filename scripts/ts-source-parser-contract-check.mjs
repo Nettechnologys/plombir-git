@@ -10,7 +10,7 @@
 // bytes, and that is indistinguishable from a correct run by the check's own
 // output (card_a54b6a2db9f2).
 
-import { productionTsCode, productionTsSource, isSvelteComponent, tsFunctionBody, tsInterfaceBody } from './lib/ts-source.mjs';
+import { extractRequestCalls, productionTsCode, productionTsSource, isSvelteComponent, tsFunctionBody, tsInterfaceBody } from './lib/ts-source.mjs';
 
 const failures = [];
 
@@ -248,6 +248,21 @@ const MARKUP_ONLY = `<h1>Help</h1>\n<!-- <a href="/ghost">gone</a> -->\n<a href=
 expect(isSvelteComponent(MARKUP_ONLY), 'a script-less component must still be read as markup');
 expect(!/ghost/.test(productionTsSource(MARKUP_ONLY)), 'a script-less component must have its HTML comments blanked');
 expect(/\/real/.test(productionTsSource(MARKUP_ONLY)), 'a script-less component must keep its live markup');
+
+const encodedOrg = 'request(`/orgs/${pathSegment(name)}/members`, { method: "POST" });';
+expect(
+  extractRequestCalls(encodedOrg, 'orgs.ts').some(
+    (call) => call.method === 'post' && call.path === '/orgs/{name}/members',
+  ),
+  'a known pathSegment wrapper must preserve the URL route shape for consumer checks',
+);
+const opaqueOrg = 'request(`/orgs/${unknownHelper(name)}/members`, { method: "POST" });';
+expect(
+  extractRequestCalls(opaqueOrg, 'orgs.ts').every(
+    (call) => call.path !== '/orgs/{name}/members',
+  ),
+  'an unknown helper must not be guessed into a route match',
+);
 
 if (failures.length > 0) {
   console.error('❌ TypeScript production view contract failed:');

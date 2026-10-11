@@ -983,7 +983,7 @@
 |---|---|---|---|---|
 | i18n:common.prev_arrow | :157 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust+web |
 | i18n:common.next_arrow | :159 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust+web |
-| i18n:common.loading | :177 | `DELETE /api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :177 | `DELETE /api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust+web+smoke+browser |
 | i18n:common.loading | :177 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust+web+browser |
 
 ### `/admin/runners` 🔒
@@ -1346,7 +1346,7 @@
 | GET | `/api/v1/artifacts/{id}` | `RepoRead` | rust |
 | GET | `/api/v1/admin/runners/{id}` | `InstanceAdmin` | rust |
 | GET | `/api/v1/admin/users/{id}` | `InstanceAdmin` | rust |
-| GET | `/api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust |
+| GET | `/api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust+web |
 | GET | `/api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/webhooks/external/ci` | `RepoWrite` | rust |
 | GET | `/api/v1/ai/repos/{owner}/{name}/summary` | `RepoRead` | rust |

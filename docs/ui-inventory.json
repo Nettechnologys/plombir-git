@@ -4749,7 +4749,8 @@
       "access": "InstanceAdmin",
       "handler": "api::admin::get_org",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": false
     },
@@ -4760,6 +4761,7 @@
       "handler": "api::admin::delete_org",
       "testedIn": [
         "rust",
+        "web",
         "smoke",
         "browser"
       ],
@@ -22718,6 +22720,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke",
                 "browser"
               ],
