@@ -1012,6 +1012,23 @@ async fn creating_pr_requests_matching_codeowner_user() {
         applied["comments"][0]["suggestion_commit_sha"],
         applied["commit_sha"]
     );
+    // Applying a suggestion moves Git first, then schedules post-push branch
+    // maintenance. Approval must target the new PR head; on a busy workspace
+    // the maintenance can finish after the review, invalidating that approval.
+    let applied_sha = applied["commit_sha"].as_str().unwrap().to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let current = rg_core::pull_request::get_pr(&db, "owners-owner", "owned-code", 2)
+                .await
+                .expect("read PR after suggestion push");
+            if current.head_sha.as_deref() == Some(applied_sha.as_str()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("post-push maintenance did not publish the suggestion commit as PR head");
     let applied_content = git
         .run(
             &["show", "refs/heads/queue-feature:src/queued.rs"],
@@ -1103,7 +1120,17 @@ async fn creating_pr_requests_matching_codeowner_user() {
         .json::<serde_json::Value>()
         .await
         .unwrap();
-    assert_eq!(queued_pr["state"], "merged");
+    let queue_pr = rg_core::pull_request::get_pr(&db, "owners-owner", "owned-code", 2)
+        .await
+        .unwrap();
+    let queue_entry = rg_db::ops::merge_queue_ops::find_by_pr(&db, queue_pr.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        queued_pr["state"], "merged",
+        "queue entry: {queue_entry:?}; PR head: {:?}; approved head: {applied_sha}",
+        queue_pr.head_sha
+    );
     assert!(rg_db::ops::merge_queue_ops::list_by_repo(&db, repo_id)
         .await
         .unwrap()

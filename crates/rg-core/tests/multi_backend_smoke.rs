@@ -4226,12 +4226,17 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     )
     .await
     .expect("create smoke-test webhook");
+    let maximum_secret = "w".repeat(rg_core::webhook::service::MAX_WEBHOOK_SECRET_BYTES);
+    let secret_key = rg_core::auth::encryption::derive_key("backend-smoke-webhook-key");
+    let sealed_secret = rg_core::auth::encryption::encrypt(&maximum_secret, &secret_key)
+        .expect("seal maximum webhook signing secret");
+    assert!(sealed_secret.len() > 255);
     let webhook = rg_db::ops::webhook_ops::update_webhook(
         &db,
         webhook.id,
         "https://example.com/updated-hook".to_string(),
         "form".to_string(),
-        Some("sealed-placeholder".to_string()),
+        Some(sealed_secret.clone()),
         false,
         "release.created".to_string(),
         chrono::Utc::now(),
@@ -4243,7 +4248,15 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     assert_eq!(webhook.content_type, "form");
     assert_eq!(
         webhook.secret_encrypted.as_deref(),
-        Some("sealed-placeholder")
+        Some(sealed_secret.as_str())
+    );
+    assert_eq!(
+        rg_core::auth::encryption::decrypt(
+            webhook.secret_encrypted.as_deref().unwrap(),
+            &secret_key
+        )
+        .expect("open maximum webhook signing secret"),
+        maximum_secret
     );
     assert!(!webhook.active);
     assert_eq!(webhook.events, "release.created");

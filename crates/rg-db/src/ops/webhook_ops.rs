@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
+use crate::entities::organization;
 use crate::entities::webhook::{
     self, ActiveModel as WebhookActiveModel, Entity as WebhookEntity, Model as Webhook,
 };
@@ -79,7 +80,38 @@ pub async fn list_by_scope(
 
 /// Create a new webhook.
 pub async fn create_webhook(db: &DatabaseConnection, model: WebhookActiveModel) -> Result<Webhook> {
-    model.insert(db).await.context("db: create webhook")
+    if !matches!(&model.scope_kind, ActiveValue::Set(kind) if kind == "org") {
+        return model.insert(db).await.context("db: create webhook");
+    }
+    // Serialize an org hook insert with retirement of its owner. The HTTP
+    // scope check may have completed before retirement took the org row.
+    let org_id = match &model.scope_id {
+        ActiveValue::Set(id) | ActiveValue::Unchanged(id) => *id,
+        ActiveValue::NotSet => anyhow::bail!("org webhook scope id was not set"),
+    };
+    let transaction = db.begin().await.context("db: begin org webhook create")?;
+    let mut query =
+        organization::Entity::find_by_id(org_id).filter(organization::Column::DeletedAt.is_null());
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        query = query.lock_exclusive();
+    }
+    if query
+        .one(&transaction)
+        .await
+        .context("db: check org webhook owner")?
+        .is_none()
+    {
+        anyhow::bail!("organization is no longer active");
+    }
+    let hook = model
+        .insert(&transaction)
+        .await
+        .context("db: create org webhook")?;
+    transaction
+        .commit()
+        .await
+        .context("db: commit org webhook create")?;
+    Ok(hook)
 }
 
 /// Update a webhook in one conditional statement.
@@ -138,10 +170,35 @@ pub async fn create_delivery(
     db: &DatabaseConnection,
     model: DeliveryActiveModel,
 ) -> Result<WebhookDelivery> {
-    model
-        .insert(db)
+    let webhook_id = match &model.webhook_id {
+        ActiveValue::Set(id) | ActiveValue::Unchanged(id) => *id,
+        ActiveValue::NotSet => anyhow::bail!("webhook delivery has no webhook id"),
+    };
+    let transaction = db.begin().await.context("db: begin webhook delivery")?;
+    // A delivery may finish its network request after its hook is retired.
+    // Lock the hook until the journal insert commits so deletion can neither
+    // miss this row nor leave a new orphan after its cleanup statement.
+    let mut query = WebhookEntity::find_by_id(webhook_id);
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        query = query.lock_exclusive();
+    }
+    if query
+        .one(&transaction)
         .await
-        .context("db: create webhook delivery")
+        .context("db: check webhook delivery owner")?
+        .is_none()
+    {
+        anyhow::bail!("webhook was removed before its delivery was recorded");
+    }
+    let delivery = model
+        .insert(&transaction)
+        .await
+        .context("db: create webhook delivery")?;
+    transaction
+        .commit()
+        .await
+        .context("db: commit webhook delivery")?;
+    Ok(delivery)
 }
 
 /// List deliveries for a webhook.

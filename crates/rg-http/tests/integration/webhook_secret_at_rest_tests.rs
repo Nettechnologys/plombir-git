@@ -98,3 +98,70 @@ async fn a_secret_replaced_through_patch_is_stored_as_ciphertext() {
     assert_ne!(stored, rotated, "PATCH stored the secret in the clear");
     assert_eq!(open(&stored), rotated);
 }
+
+#[tokio::test]
+async fn webhook_secret_limit_is_checked_before_storage_on_create_and_update() {
+    let (base, db) = spawn_test_app_with_db().await;
+    exercise_secret_limit(&base, &db, "long_hook_secret").await;
+}
+
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
+async fn server_database_webhook_secret_limit_is_checked_through_http() {
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    assert!(database_url.starts_with("postgres://") || database_url.starts_with("mysql://"));
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        .await
+        .expect("connect to disposable server database");
+    rg_db::run_migrations(&db)
+        .await
+        .expect("migrate disposable server database");
+    let base = crate::common::spawn_test_app_over_db(db.clone()).await;
+    exercise_secret_limit(&base, &db, "server_long_hook_secret").await;
+}
+
+async fn exercise_secret_limit(base: &str, db: &rg_db::DatabaseConnection, owner: &str) {
+    let (token, _) = register_full(base, owner, &format!("{owner}@example.com")).await;
+    create_repo(base, &token, "hooked").await;
+    let max = rg_core::webhook::service::MAX_WEBHOOK_SECRET_BYTES;
+    let accepted = "s".repeat(max);
+    let id = post_hook(base, &token, owner, "hooked", &accepted).await;
+    assert_eq!(open(&stored_secret(db, id).await.unwrap()), accepted);
+
+    let client = reqwest::Client::new();
+    let oversized = "s".repeat(max + 1);
+    let rejected_create = client
+        .post(format!("{base}/api/v1/repos/{owner}/hooked/hooks"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "url": "https://hooks.example.invalid/too-long",
+            "secret": oversized,
+            "events": ["push"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected_create.status(), 400);
+
+    let replacement = "r".repeat(max);
+    let updated = client
+        .patch(format!("{base}/api/v1/repos/{owner}/hooked/hooks/{id}"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"secret": replacement}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), 200);
+    assert_eq!(open(&stored_secret(db, id).await.unwrap()), replacement);
+
+    let rejected_update = client
+        .patch(format!("{base}/api/v1/repos/{owner}/hooked/hooks/{id}"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"secret": "r".repeat(max + 1)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected_update.status(), 400);
+    assert_eq!(open(&stored_secret(db, id).await.unwrap()), replacement);
+}

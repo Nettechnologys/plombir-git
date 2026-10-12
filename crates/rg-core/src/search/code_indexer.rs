@@ -602,15 +602,26 @@ enum RoundOutcome {
     /// Nothing to do: the published generation describes the branch.
     Current { files: i64 },
     /// This round changed what readers see.
-    Changed { files: i64 },
+    Changed,
     /// Someone else changed the published generation first; look again.
     Raced,
-    /// A newer rebuild owns the repository and will publish.
-    Superseded { files: i64 },
+    /// A newer rebuild owns the repository; its publication is not guaranteed.
+    Superseded,
 }
 
 fn file_count(files: i64) -> usize {
     usize::try_from(files).unwrap_or(0)
+}
+
+fn settle_round(outcome: RoundOutcome) -> Result<Option<usize>> {
+    match outcome {
+        RoundOutcome::Current { files } => Ok(Some(file_count(files))),
+        RoundOutcome::Changed => Ok(None),
+        RoundOutcome::Raced => Ok(None),
+        RoundOutcome::Superseded => Err(crate::error::conflict(
+            "code index rebuild was superseded before publication; retry indexing",
+        )),
+    }
 }
 
 impl CodeIndexer {
@@ -702,17 +713,12 @@ impl CodeIndexer {
         limits: IndexLimits,
     ) -> Result<usize> {
         let mut mode = mode;
-        let mut files = 0;
         for _ in 0..MAX_CONVERGENCE_ROUNDS {
-            match self
-                .refresh_round(repo_id, repo_path, ref_name, mode, limits)
-                .await?
-            {
-                RoundOutcome::Current { files } | RoundOutcome::Superseded { files } => {
-                    return Ok(file_count(files))
-                }
-                RoundOutcome::Changed { files: published } => files = published,
-                RoundOutcome::Raced => {}
+            if let Some(count) = settle_round(
+                self.refresh_round(repo_id, repo_path, ref_name, mode, limits)
+                    .await?,
+            )? {
+                return Ok(count);
             }
             // Whatever this round did, the next one only has to catch up.
             mode = RefreshMode::Incremental;
@@ -723,7 +729,13 @@ impl CodeIndexer {
             repo_id,
             "code index refresh stopped following a branch that kept moving"
         );
-        Ok(file_count(files))
+        let published = read_state(&self.db, repo_id, false).await?;
+        if published.indexed_tree.is_none() {
+            return Err(crate::error::conflict(
+                "code index rebuild did not publish a snapshot; retry indexing",
+            ));
+        }
+        Ok(file_count(published.indexed_files))
     }
 
     /// One look at the branch and the published snapshot, and the write that
@@ -762,13 +774,12 @@ impl CodeIndexer {
                     .await
             }
             TreePlan::Snapshot { tree, entries } => {
-                let files = i64::try_from(entries.len()).unwrap_or(i64::MAX);
                 match self
                     .build_snapshot(repo_id, &tree, &entries, |_| std::future::ready(Ok(())))
                     .await?
                 {
-                    BuildOutcome::Published => Ok(RoundOutcome::Changed { files }),
-                    BuildOutcome::Superseded => Ok(RoundOutcome::Superseded { files }),
+                    BuildOutcome::Published => Ok(RoundOutcome::Changed),
+                    BuildOutcome::Superseded => Ok(RoundOutcome::Superseded),
                 }
             }
         }
@@ -1036,7 +1047,7 @@ impl CodeIndexer {
                 .finish_write(transaction, outcome, &mut budget, attempt, "apply")
                 .await?
             {
-                Some(true) => return Ok(RoundOutcome::Changed { files }),
+                Some(true) => return Ok(RoundOutcome::Changed),
                 Some(false) => return Ok(RoundOutcome::Raced),
                 None => continue,
             }
@@ -2248,6 +2259,53 @@ mod tests {
             BuildOutcome::Published
         ));
         assert_eq!(indexer.indexed_file_count(TEST_REPO_ID).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn superseded_first_build_does_not_claim_an_unpublished_success() {
+        let indexer = test_indexer().await;
+        let (first_reached_tx, first_reached_rx) = oneshot::channel();
+        let first_release = Arc::new(Notify::new());
+        let first = tokio::spawn(build_paused_after_first_chunk(
+            indexer.db.clone(),
+            TEST_REPO_ID,
+            generation_entries("first", 1),
+            first_reached_tx,
+            first_release.clone(),
+        ));
+        first_reached_rx
+            .await
+            .expect("first build reached its unpublished chunk");
+
+        let (second_reached_tx, second_reached_rx) = oneshot::channel();
+        let second_release = Arc::new(Notify::new());
+        let second = tokio::spawn(build_paused_after_first_chunk(
+            indexer.db.clone(),
+            TEST_REPO_ID,
+            generation_entries("second", 1),
+            second_reached_tx,
+            second_release,
+        ));
+        second_reached_rx
+            .await
+            .expect("replacement reached its unpublished chunk");
+        first_release.notify_one();
+        let outcome = first
+            .await
+            .expect("first build task")
+            .expect("first build outcome");
+        assert!(matches!(outcome, BuildOutcome::Superseded));
+        let error = settle_round(RoundOutcome::Superseded)
+            .expect_err("a superseded plan cannot certify a published snapshot");
+        assert!(format!("{error:#}").contains("superseded"));
+        assert_eq!(indexer.indexed_file_count(TEST_REPO_ID).await.unwrap(), 0);
+        assert!(state(&indexer, TEST_REPO_ID).await.indexed_tree.is_none());
+
+        // The replacement can fail or remain stuck. Neither changes the
+        // earlier operation into a success with its planned file count.
+        second.abort();
+        assert!(matches!(second.await, Err(error) if error.is_cancelled()));
+        assert_eq!(indexer.indexed_file_count(TEST_REPO_ID).await.unwrap(), 0);
     }
 
     /// The card's property, on whichever backend `db` is: a rebuild publishes

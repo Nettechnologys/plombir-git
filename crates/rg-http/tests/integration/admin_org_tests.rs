@@ -1,4 +1,5 @@
 use crate::common::{register_full, spawn_test_app_with_db};
+use sea_orm::{ActiveValue::Set, EntityTrait};
 
 #[tokio::test]
 async fn admin_orgs_list_requires_auth() {
@@ -182,6 +183,34 @@ async fn admin_orgs_delete() {
         .unwrap();
     assert_eq!(create_resp.status(), 201);
 
+    let hook = client
+        .post(format!("{base}/api/v1/orgs/victim-org/hooks"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "url": "https://hooks.example.invalid/admin-org-delete",
+            "secret": "an-org-secret",
+            "events": ["push"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hook.status(), 201);
+    let hook_id = hook.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let delivery = rg_db::ops::webhook_ops::create_delivery(
+        &db,
+        rg_db::entities::webhook_delivery::ActiveModel {
+            webhook_id: Set(hook_id),
+            event: Set("push".to_string()),
+            delivery_id: Set(format!("admin-org-delete-{hook_id}")),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
         .unwrap()
@@ -204,6 +233,18 @@ async fn admin_orgs_delete() {
         .await
         .unwrap();
     assert_eq!(get_after.status(), 404);
+    assert!(rg_db::entities::webhook::Entity::find_by_id(hook_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        rg_db::entities::webhook_delivery::Entity::find_by_id(delivery.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// The delete above passes on a fixture where the owner's user id and the

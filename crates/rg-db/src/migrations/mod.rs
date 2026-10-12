@@ -152,6 +152,7 @@ pub mod m20261011_000001_runner_job_mask_snapshot;
 pub mod m20261011_000002_ci_secrets_mysql_longtext;
 pub mod m20261011_000003_webhook_scopes;
 pub mod m20261012_000001_webhook_delivery_mysql_longtext;
+pub mod m20261012_000002_webhook_secret_mysql_longtext;
 
 use sea_orm_migration::prelude::*;
 
@@ -394,6 +395,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261011_000002_ci_secrets_mysql_longtext::Migration),
             Box::new(m20261011_000003_webhook_scopes::Migration),
             Box::new(m20261012_000001_webhook_delivery_mysql_longtext::Migration),
+            Box::new(m20261012_000002_webhook_secret_mysql_longtext::Migration),
         ]
     }
 }

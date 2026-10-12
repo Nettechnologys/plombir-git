@@ -65,6 +65,10 @@ pub struct UpdateWebhookRequest {
 
 // ── The secret at rest ────────────────────────────────────────────────────
 
+/// Match the CI secret limit. The sealed, base64-encoded value is larger than
+/// the plaintext, so the database column must hold more than this many bytes.
+pub const MAX_WEBHOOK_SECRET_BYTES: usize = 65_536;
+
 /// Seal an operator-supplied signing secret for storage.
 ///
 /// An absent or empty secret is stored as `NULL` rather than as the ciphertext
@@ -75,6 +79,11 @@ fn seal_secret(secret: Option<&str>, encryption_key: &str) -> Result<Option<Stri
     let Some(secret) = secret.filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
+    if secret.len() > MAX_WEBHOOK_SECRET_BYTES {
+        return Err(crate::error::invalid_request(format!(
+            "webhook signing secret must contain at most {MAX_WEBHOOK_SECRET_BYTES} bytes"
+        )));
+    }
     let key = encryption::derive_key(encryption_key);
     encryption::encrypt(secret, &key)
         .map(Some)

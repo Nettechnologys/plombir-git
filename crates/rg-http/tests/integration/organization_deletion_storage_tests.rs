@@ -12,6 +12,7 @@
 //!   both the organization and that repository retryable.
 
 use rg_core::blob_storage::BlobKey;
+use sea_orm::{ActiveValue::Set, EntityTrait};
 use sha2::Digest;
 
 use crate::common::{
@@ -62,6 +63,98 @@ async fn create_org_repo(base: &str, token: &str, org: &str, name: &str) -> i64 
         .expect("repository response has an id")
 }
 
+async fn seed_org_hook(
+    base: &str,
+    db: &rg_db::DatabaseConnection,
+    token: &str,
+    org: &str,
+) -> (i64, i64) {
+    let hook = reqwest::Client::new()
+        .post(format!("{base}/api/v1/orgs/{org}/hooks"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "url": "https://hooks.example.invalid/org-delete",
+            "secret": "a-signing-secret",
+            "events": ["push"]
+        }))
+        .send()
+        .await
+        .expect("create organization hook");
+    assert_eq!(hook.status(), 201);
+    let hook_id = hook.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let delivery = rg_db::ops::webhook_ops::create_delivery(
+        db,
+        rg_db::entities::webhook_delivery::ActiveModel {
+            webhook_id: Set(hook_id),
+            event: Set("push".to_string()),
+            delivery_id: Set(format!("org-delete-{hook_id}")),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("seed organization hook delivery");
+    (hook_id, delivery.id)
+}
+
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
+async fn server_database_org_delete_removes_hook_and_delivery_together() {
+    crate::common::install_test_tracing();
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    assert!(database_url.starts_with("postgres://") || database_url.starts_with("mysql://"));
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        .await
+        .expect("connect to disposable server database");
+    rg_db::run_migrations(&db)
+        .await
+        .expect("migrate disposable server database");
+    let base = crate::common::spawn_test_app_over_db(db.clone()).await;
+    let (token, _) = register_full(
+        &base,
+        "server_org_hook_owner",
+        "server_org_hook@example.com",
+    )
+    .await;
+    create_org(&base, &token, "server-hook-org").await;
+    let (hook_id, delivery_id) = seed_org_hook(&base, &db, &token, "server-hook-org").await;
+
+    let response = reqwest::Client::new()
+        .delete(format!("{base}/api/v1/orgs/server-hook-org"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete server database organization");
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    assert!(rg_db::entities::webhook::Entity::find_by_id(hook_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        rg_db::entities::webhook_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(rg_db::ops::webhook_ops::create_delivery(
+        &db,
+        rg_db::entities::webhook_delivery::ActiveModel {
+            webhook_id: Set(hook_id),
+            event: Set("push".to_string()),
+            delivery_id: Set(format!("late-server-org-delete-{hook_id}")),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+    )
+    .await
+    .is_err());
+}
+
 fn representative_blob_keys(org: &str, repo: &str) -> Vec<BlobKey> {
     vec![
         BlobKey::from_segments([
@@ -103,6 +196,7 @@ async fn deleting_an_organization_retires_its_repositories_before_reusing_the_na
     let (token, _) = register_full(&base, "org-delete-owner", "org-delete@example.com").await;
     let old_org_id = create_org(&base, &token, "recycled-org").await;
     let old_repo_id = create_org_repo(&base, &token, "recycled-org", "payloads").await;
+    let (hook_id, delivery_id) = seed_org_hook(&base, &db, &token, "recycled-org").await;
 
     let keys = representative_blob_keys("recycled-org", "payloads");
     for (index, key) in keys.iter().enumerate() {
@@ -155,6 +249,33 @@ async fn deleting_an_organization_retires_its_repositories_before_reusing_the_na
             .expect("read deleted organization")
             .is_none(),
         "organization row survived a successful deletion"
+    );
+    assert!(rg_db::entities::webhook::Entity::find_by_id(hook_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        rg_db::entities::webhook_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let late_delivery = rg_db::ops::webhook_ops::create_delivery(
+        &db,
+        rg_db::entities::webhook_delivery::ActiveModel {
+            webhook_id: Set(hook_id),
+            event: Set("push".to_string()),
+            delivery_id: Set(format!("late-org-delete-{hook_id}")),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        late_delivery.is_err(),
+        "a delivery finishing after org deletion must not recreate an orphan"
     );
     assert!(
         rg_db::ops::repo_ops::find_by_id(&db, old_repo_id)
@@ -228,6 +349,7 @@ async fn repository_storage_failure_does_not_delete_the_organization() {
     .await;
     let org_id = create_org(&app.base, &token, "fault-org").await;
     let repo_id = create_org_repo(&app.base, &token, "fault-org", "survivor").await;
+    let (hook_id, delivery_id) = seed_org_hook(&app.base, &app.db, &token, "fault-org").await;
     let package = representative_blob_keys("fault-org", "survivor")
         .into_iter()
         .next()
@@ -275,5 +397,17 @@ async fn repository_storage_failure_does_not_delete_the_organization() {
             .expect("read organization after failed deletion")
             .is_some(),
         "failed repository deletion removed the organization row"
+    );
+    assert!(rg_db::entities::webhook::Entity::find_by_id(hook_id)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(
+        rg_db::entities::webhook_delivery::Entity::find_by_id(delivery_id)
+            .one(&app.db)
+            .await
+            .unwrap()
+            .is_some()
     );
 }
