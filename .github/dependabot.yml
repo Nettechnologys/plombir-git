@@ -4,6 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # The observability stack pins its images by digest; this is what proposes
+  # the next digest as a reviewable pull request.
+  - package-ecosystem: docker-compose
+    directory: /deploy
+    schedule:
+      interval: weekly
   - package-ecosystem: github-actions
     directory: /
     schedule:

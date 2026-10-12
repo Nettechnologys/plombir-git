@@ -131,6 +131,40 @@ if (!isObject(services) || Object.keys(services).length === 0) {
   process.exit(1);
 }
 
+// `repository[:tag][@sha256:<digest>]`. The digest goes first: its own colon
+// would otherwise be read as the tag separator.
+function splitReference(reference) {
+  const at = reference.indexOf('@');
+  const named = at === -1 ? reference : reference.slice(0, at);
+  const digest = at === -1 ? '' : reference.slice(at + 1);
+  const separator = named.lastIndexOf(':');
+  return {
+    name: separator === -1 ? named : named.slice(0, separator),
+    tag: separator === -1 ? '' : named.slice(separator + 1),
+    digest,
+  };
+}
+
+const DIGEST = /^sha256:[0-9a-f]{64}$/;
+
+// ── Every service runs the bytes this commit reviewed ──
+//
+// A tag is a name the registry may point somewhere else tomorrow, so a redeploy
+// of one commit could pull a different Prometheus, Grafana or node-exporter —
+// dashboards and alerting changing with no diff to review. Every service, not
+// only the two this job runs, carries a content digest.
+for (const [service, definition] of Object.entries(services)) {
+  if (!isObject(definition) || typeof definition.image !== 'string') continue;
+  const reference = definition.image.trim();
+  const { digest } = splitReference(reference);
+  if (!DIGEST.test(digest)) {
+    problems.push(
+      `${display(composePath)}: services.${service}.image is \`${reference}\` — `
+        + 'pin a digest (`tag@sha256:<64 hex>`), a tag alone is whatever the registry serves today.',
+    );
+  }
+}
+
 // ── The image pins the job has to run ──
 const tags = [];
 
@@ -151,9 +185,7 @@ for (const { service, repository } of IMAGE_SERVICES) {
   }
 
   const reference = image.trim();
-  const separator = reference.lastIndexOf(':');
-  const name = separator === -1 ? reference : reference.slice(0, separator);
-  const tag = separator === -1 ? '' : reference.slice(separator + 1);
+  const { name, tag } = splitReference(reference);
 
   if (name !== repository) {
     problems.push(

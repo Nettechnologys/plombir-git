@@ -184,6 +184,35 @@ fixture(
   red('deploy/alertmanager/gone.yml does not exist'),
 );
 
+// The digest is what makes a redeploy of one commit pull the same bytes, and
+// it is checked on every service — Grafana and node-exporter run nothing in
+// this job, but they are just as mutable under their tags.
+fixture(
+  'a tag without a digest is red',
+  (source) => source.replace(/(image: prom\/node-exporter:v[^@\n]+)@sha256:[0-9a-f]{64}/, '$1'),
+  red('services.node-exporter.image'),
+);
+
+fixture(
+  'a truncated digest is red',
+  (source) => source.replace(/(image: grafana\/grafana:[^@\n]+@sha256:)([0-9a-f]{64})/, (_, head, hex) => `${head}${hex.slice(0, 12)}`),
+  red('pin a digest'),
+);
+
+// The digest carries its own colon; it must not be read as the tag separator,
+// or the repository check reads `prom/prometheus:v2.55.0@sha256` as the name.
+fixture(
+  'the image this gate runs keeps its digest on stdout',
+  (source) => source.replace('  # ── Prometheus (Metrics Storage) ──\n', '  # ── Prometheus ──\n'),
+  (result) => {
+    const reason = green('prometheus=prom/prometheus:v2.55.0@sha256:', null)(result);
+    if (reason) return reason;
+    return /^alertmanager=prom\/alertmanager:v[^@\s]+@sha256:[0-9a-f]{64}$/m.test(result.stdout)
+      ? null
+      : 'stdout does not carry the alertmanager digest';
+  },
+);
+
 // The floors: a read that finds nothing must be the read breaking, not the
 // stack passing.
 fixture(

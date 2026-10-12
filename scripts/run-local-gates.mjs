@@ -79,6 +79,13 @@ export const CARGO_JOBS = new Map([
   ['clippy', { verifier: 'cargo clippy' }],
   ['docs', { verifier: 'cargo doc' }],
   [
+    'msrv',
+    {
+      ciOnly: 'installs a second Rust toolchain and builds the whole workspace with it; '
+        + 'a pre-push run would double the build for a fact a push rarely changes.',
+    },
+  ],
+  [
     'rust',
     {
       ciOnly: 'the workspace test suite, doc-tests and the fresh-DB migration smoke; '

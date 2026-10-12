@@ -21,10 +21,14 @@ resolver = "2"
 version = "0.1.1"
 license = "AGPL-3.0-or-later"
 # Minimum Supported Rust Version. Floored by the toughest dependencies in the
-# tree — russh 0.60 and rand 0.10 both declare `rust-version = "1.85"`. Bump only
-# deliberately (a bump is a breaking change for downstream builders). Every crate
-# inherits this via `rust-version.workspace = true`.
-rust-version = "1.85"
+# lockfile — webauthn-rs 0.5.5, jsonwebtoken 10.4, time 0.3.47, image 0.25.10
+# and home 0.5.12 all declare 1.88, and `cargo +1.87.0 check --workspace
+# --locked` refuses them. The `msrv` CI job checks the workspace with exactly
+# this toolchain, and `scripts/msrv-declaration-contract-check.mjs` keeps the
+# README and CONTRIBUTING on the same number. Bump only deliberately (a bump is
+# a breaking change for downstream builders). Every crate inherits this via
+# `rust-version.workspace = true`.
+rust-version = "1.88"
 
 # Regression guard for CWE-833: holding a non-async lock guard across an `.await`
 # blocks the tokio worker and risks deadlock/DoS. clippy already warns on this by

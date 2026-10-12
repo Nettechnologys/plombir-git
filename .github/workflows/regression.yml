@@ -115,6 +115,43 @@ jobs:
       - name: Build the workspace documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps -j 6
 
+  # `rust-version` in Cargo.toml is a promise to downstream builders, and an
+  # unchecked one drifted: it said 1.85 while the lockfile needed 1.88
+  # (card_b5633973b38f). This job builds the workspace with exactly the declared
+  # toolchain against the committed lockfile, reading the number from the one
+  # place it is declared.
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev git
+
+      - name: Read the declared MSRV
+        id: msrv
+        run: node scripts/msrv-declaration-contract-check.mjs --print >>"${GITHUB_OUTPUT}"
+
+      - name: Install the MSRV toolchain
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: rustup toolchain install "${MSRV}" --profile minimal --no-self-update
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Check the workspace with the MSRV toolchain
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo "+${MSRV}" check --workspace --locked -j 6
+
   rust:
     name: Rust tests and migration smoke
     runs-on: ubuntu-latest
@@ -295,7 +332,12 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:17
+        # PostgreSQL 17.11. Pinned by the multi-platform index digest so a rerun
+        # of the same commit migrates against the same server build. No
+        # Dependabot entry watches workflow service images, so a bump is a
+        # reviewed edit of this line; `docker buildx imagetools inspect
+        # postgres:17` names the current digest.
+        image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
         env:
           POSTGRES_USER: plombir_git
           POSTGRES_PASSWORD: plombir_git
@@ -374,7 +416,8 @@ jobs:
     timeout-minutes: 20
     services:
       mysql:
-        image: mysql:8.4
+        # MySQL 8.4.11, pinned by digest for the reason given on postgres-smoke.
+        image: mysql:8.4@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242
         env:
           MYSQL_ROOT_PASSWORD: root
           MYSQL_DATABASE: plombir_git

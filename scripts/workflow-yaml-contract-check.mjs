@@ -86,6 +86,14 @@ const PINNED_STEPS = [
     run: 'node scripts/observability-compose-contract-check.mjs >>"${GITHUB_OUTPUT}"',
   },
   {
+    // The MSRV is only checked if this job still builds with the toolchain the
+    // declaration names. Dropping `--locked` would let it resolve a different
+    // dependency graph from the one downstream builders get.
+    workflow: 'regression.yml',
+    job: 'msrv',
+    run: 'cargo "+${MSRV}" check --workspace --locked -j 6',
+  },
+  {
     // The step that executes EVERY `scripts/*-contract-check.mjs` in this
     // repository, and therefore the single line on which the whole contract
     // gate rests. Commenting it out with one `#` left this check, the local
@@ -167,6 +175,26 @@ for (const [workflow, parsedWorkflow] of parsed) {
   }
 
   for (const [job, definition] of Object.entries(jobs)) {
+    // A service or job container named by tag alone is whatever the registry
+    // serves under that tag on the day of the run, so two runs of one commit
+    // could migrate against different PostgreSQL or MySQL builds and disagree
+    // with no diff to review. Every one carries its content digest.
+    const containers = [];
+    if (definition?.container !== undefined) containers.push(['container', definition.container]);
+    if (definition?.services && typeof definition.services === 'object') {
+      for (const [service, spec] of Object.entries(definition.services)) {
+        containers.push([`services.${service}`, spec]);
+      }
+    }
+    for (const [where, spec] of containers) {
+      const image = typeof spec === 'string' ? spec : spec?.image;
+      if (typeof image !== 'string' || !/@sha256:[0-9a-f]{64}$/.test(image.trim())) {
+        problems.push(
+          `${workflow}: job \`${job}\`, ${where} runs \`${image}\` — pin it as \`tag@sha256:<64 hex>\`.`,
+        );
+      }
+    }
+
     const inspected = workflowJobRuns(definition);
     if (inspected.invalidSteps) {
       problems.push(`${workflow}: job \`${job}\` has a \`steps\` that is not a list — it declares no runnable step.`);

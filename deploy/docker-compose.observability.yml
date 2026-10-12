@@ -1,10 +1,18 @@
 # Plombir Git Observability Stack (Phase 22-C)
 # Prometheus + Alertmanager + Grafana
+#
+# Every image is pinned as `tag@sha256:<digest>`. The tag is for the reader;
+# the digest is what Docker pulls, so a redeploy of the same commit runs the same
+# bytes instead of whatever the registry serves under that tag today. Each digest
+# is the multi-platform index (manifest list), so amd64 and arm64 hosts both
+# resolve. Dependabot (`.github/dependabot.yml`, `docker-compose`) proposes new
+# digests as pull requests, and `scripts/observability-compose-contract-check.mjs`
+# refuses a service without one.
 
 services:
   # ── Prometheus (Metrics Storage) ──
   prometheus:
-    image: prom/prometheus:v2.55.0
+    image: prom/prometheus:v2.55.0@sha256:378f4e03703557d1c6419e6caccf922f96e6d88a530f7431d66a4c4f4b1000fe
     container_name: plombir-git-prometheus
     restart: unless-stopped
     # Every port of this stack is loopback-only: Prometheus and Alertmanager
@@ -38,7 +46,7 @@ services:
 
   # ── Alertmanager (Alert Routing) ──
   alertmanager:
-    image: prom/alertmanager:v0.27.0
+    image: prom/alertmanager:v0.27.0@sha256:e13b6ed5cb929eeaee733479dce55e10eb3bc2e9c4586c705a4e8da41e5eacf5
     container_name: plombir-git-alertmanager
     restart: unless-stopped
     ports:
@@ -53,7 +61,7 @@ services:
 
   # ── Grafana (Visualization) ──
   grafana:
-    image: grafana/grafana:11.3.0
+    image: grafana/grafana:11.3.0@sha256:a0f881232a6fb71a0554a47d0fe2203b6888fe77f4cefb7ea62bed7eb54e13c3
     container_name: plombir-git-grafana
     restart: unless-stopped
     ports:
@@ -76,7 +84,7 @@ services:
 
   # ── Node Exporter (Host Metrics) ──
   node-exporter:
-    image: prom/node-exporter:v1.8.2
+    image: prom/node-exporter:v1.8.2@sha256:4032c6d5bfd752342c3e631c2f1de93ba6b86c41db6b167b9a35372c139e7706
     container_name: plombir-git-node-exporter
     restart: unless-stopped
     ports:

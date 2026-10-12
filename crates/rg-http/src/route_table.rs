@@ -354,7 +354,7 @@ impl fmt::Display for DeclaredBodyLimit {
             (1024, "KiB"),
         ];
         for (scale, unit) in UNITS {
-            if self.0 >= scale && self.0 % scale == 0 {
+            if self.0 >= scale && self.0.is_multiple_of(scale) {
                 return write!(f, "{} {unit}", self.0 / scale);
             }
         }
