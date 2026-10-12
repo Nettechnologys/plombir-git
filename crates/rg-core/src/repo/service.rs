@@ -5132,13 +5132,22 @@ pub async fn delete_file(
 /// or a `..` component — so `..%2f..%2fetc%2fcron.d%2fx` reached
 /// `std::fs::write` (H-02). The path is the caller's own input, so this is a
 /// typed [`crate::error::InvalidRequest`]: a real `400`, not a 5xx.
+///
+/// A `.git` component is refused at any depth, whatever its case. The edit is
+/// made in an ordinary clone, where `.git` is that clone's own repository
+/// directory: git never tracks a path inside it, yet the write would still land
+/// there, in the configuration and state the `git add` and `git commit` that
+/// follow read.
 fn validate_repo_file_path(file_path: &str) -> Result<()> {
     let path = std::path::Path::new(file_path);
     if path.as_os_str().is_empty()
         || path.is_absolute()
-        || path
-            .components()
-            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        || path.components().any(|part| match part {
+            std::path::Component::Normal(name) => {
+                name.to_string_lossy().eq_ignore_ascii_case(".git")
+            }
+            _ => true,
+        })
     {
         // Fixed text on purpose: the message reaches the client verbatim, and
         // echoing the rejected path back would put a caller-chosen absolute
@@ -5194,6 +5203,54 @@ fn checked_worktree_file_path(
 fn validate_edit_branch(branch: &str) -> Result<()> {
     rg_git::refname::validate_branch_name(branch)
         .map_err(|_| crate::error::invalid_request("invalid branch name"))
+}
+
+#[cfg(test)]
+mod file_path_validation_tests {
+    use super::validate_repo_file_path;
+
+    fn refused(path: &str) -> bool {
+        validate_repo_file_path(path)
+            .expect_err(path)
+            .downcast_ref::<crate::error::InvalidRequest>()
+            .is_some()
+    }
+
+    #[test]
+    fn a_path_inside_the_clones_git_directory_is_refused() {
+        for path in [
+            ".git/config",
+            ".git/hooks/post-commit",
+            ".GIT/config",
+            ".Git",
+            "sub/.git",
+            "a/.git/b",
+        ] {
+            assert!(refused(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn names_that_only_resemble_the_git_directory_stay_editable() {
+        for path in [
+            ".gitignore",
+            ".gitattributes",
+            ".github/workflows/ci.yml",
+            "docs/.gitkeep",
+            "git/config",
+            "x.git/config",
+            "src/.git-hooks/pre-commit",
+        ] {
+            validate_repo_file_path(path).expect(path);
+        }
+    }
+
+    #[test]
+    fn empty_absolute_and_parent_paths_stay_refused() {
+        for path in ["", "/etc/passwd", "../outside", "a/../../outside", "./a"] {
+            assert!(refused(path), "{path:?}");
+        }
+    }
 }
 
 #[cfg(test)]
