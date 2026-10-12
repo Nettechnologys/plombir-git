@@ -5,7 +5,9 @@ use chrono::Utc;
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, Set, TransactionTrait,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use crate::db::DbPools;
 use crate::error::NotFound;
@@ -728,7 +730,7 @@ pub async fn update_pr(
 // ── Diff ────────────────────────────────────────────────────────────────
 
 /// Diff result for a PR.
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct PrDiff {
     pub base_branch: String,
     pub head_branch: String,
@@ -736,7 +738,7 @@ pub struct PrDiff {
     pub stats: DiffStats,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct FileDiff {
     pub path: String,
     pub status: String, // added / modified / deleted / renamed
@@ -746,7 +748,7 @@ pub struct FileDiff {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub struct DiffLine {
     /// meta / context / addition / deletion
     pub kind: String,
@@ -755,11 +757,75 @@ pub struct DiffLine {
     pub new_line: Option<i64>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct DiffStats {
     pub total_additions: i64,
     pub total_deletions: i64,
     pub files_changed: i64,
+}
+
+// A diff can contain megabytes of patches. Bound both count and total wire
+// size, and do not retain an oversized response at all. The cache is shared
+// by requests in one server process; a restart simply starts cold.
+const PR_DIFF_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const PR_DIFF_CACHE_ENTRIES: usize = 128;
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct DiffCacheKey {
+    base_repo: PathBuf,
+    head_repo: PathBuf,
+    base_branch: String,
+    head_branch: String,
+    base_sha: String,
+    head_sha: String,
+    reviewed_head_sha: Option<String>,
+}
+
+#[derive(Default)]
+struct DiffCache {
+    entries: HashMap<DiffCacheKey, (PrDiff, usize)>,
+    lru: VecDeque<DiffCacheKey>,
+    bytes: usize,
+}
+
+impl DiffCache {
+    fn get(&mut self, key: &DiffCacheKey) -> Option<PrDiff> {
+        let diff = self.entries.get(key)?.0.clone();
+        self.lru.retain(|old| old != key);
+        self.lru.push_back(key.clone());
+        Some(diff)
+    }
+
+    fn insert(&mut self, key: DiffCacheKey, diff: PrDiff) {
+        let Ok(bytes) = serde_json::to_vec(&diff).map(|body| body.len()) else {
+            return;
+        };
+        if bytes > PR_DIFF_CACHE_BYTES {
+            return;
+        }
+        if let Some((_, old_bytes)) = self.entries.remove(&key) {
+            self.bytes -= old_bytes;
+            self.lru.retain(|old| old != &key);
+        }
+        while self.entries.len() >= PR_DIFF_CACHE_ENTRIES
+            || self.bytes + bytes > PR_DIFF_CACHE_BYTES
+        {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some((_, old_bytes)) = self.entries.remove(&oldest) {
+                self.bytes -= old_bytes;
+            }
+        }
+        self.bytes += bytes;
+        self.lru.push_back(key.clone());
+        self.entries.insert(key, (diff, bytes));
+    }
+}
+
+fn pr_diff_cache() -> &'static Mutex<DiffCache> {
+    static CACHE: OnceLock<Mutex<DiffCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(DiffCache::default()))
 }
 
 /// Compute the diff between base and head branches using `git diff`.
@@ -776,19 +842,7 @@ pub async fn compute_diff(
 ) -> Result<PrDiff> {
     let pr = get_pr(db, owner, repo_name, number).await?;
     let base_repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
-
-    let path_for_base = base_repo_path.clone();
-    let branch_for_base = pr.base_branch.clone();
-    crate::blocking::run_blocking_git("checking pull request base branch", move || {
-        if !path_for_base.exists() {
-            bail!("repository path does not exist: {:?}", path_for_base);
-        }
-        require_pull_request_branch(&path_for_base, "base", &branch_for_base)
-    })
-    .await?;
-
-    // For fork PRs, fetch the head branch into the target repo first
-    if let Some(head_repo_id) = pr.head_repo_id {
+    let (head_repo_path, head_namespace) = if let Some(head_repo_id) = pr.head_repo_id {
         let head_repo = repo_entity::Entity::find_by_id(head_repo_id)
             .one(db)
             .await?
@@ -803,50 +857,74 @@ pub async fn compute_diff(
         // succeeded.
         let head_namespace = repository_namespace(db, &head_repo).await?;
         let head_repo_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
+        (head_repo_path, Some(head_namespace))
+    } else {
+        (base_repo_path.clone(), None)
+    };
 
-        let fetch_ref = format!("refs/heads/{}", pr.head_branch);
-        let local_ref = scratch_fork_ref();
-        let legacy_ref = legacy_fork_ref(&head_namespace, &pr.head_branch);
-        let base_path = base_repo_path;
-        let pr_clone = pr.clone();
-        return crate::blocking::run_blocking_git(
-            "fetching and diffing a fork pull request",
-            move || {
-                // A deleted head branch is stale PR state (409), whereas an
-                // unreadable fork repository or failed fetch is retryable (5xx).
-                require_pull_request_branch(&head_repo_path, "head", &pr_clone.head_branch)?;
-                let diffed = (|| {
-                    let git = rg_git::cli_gateway::global_gateway()
-                        .as_ref()
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    let fetch_output =
-                        run_fork_fetch(git, &head_repo_path, &fetch_ref, &local_ref, &base_path)?;
-                    fetch_output
-                        .ensure_success()
-                        .context("failed to fetch pull request head branch")?;
-                    compute_cross_repo_diff(
-                        &base_path,
-                        &pr_clone.base_branch,
-                        &local_ref,
-                        &pr_clone,
-                    )
-                })();
-                // In the same phase as the fetch, however the diff went: the
-                // ref exists only so the diff can name the fork's head.
-                discard_fork_ref(&base_path, &local_ref);
-                discard_legacy_fork_ref(&base_path, &legacy_ref);
-                diffed
-            },
-        )
-        .await;
-    }
+    crate::blocking::run_blocking_git("diffing a pull request", move || {
+        if !base_repo_path.exists() {
+            bail!("repository path does not exist: {:?}", base_repo_path);
+        }
+        require_pull_request_branch(&base_repo_path, "base", &pr.base_branch)?;
+        require_pull_request_branch(&head_repo_path, "head", &pr.head_branch)?;
+        // Resolve the current refs even when the review is pinned to an older
+        // head SHA. A deleted or rewritten branch must never reuse old output.
+        let key = DiffCacheKey {
+            base_repo: base_repo_path.clone(),
+            head_repo: head_repo_path.clone(),
+            base_branch: pr.base_branch.clone(),
+            head_branch: pr.head_branch.clone(),
+            base_sha: get_ref_sha(&base_repo_path, &pr.base_branch)?,
+            head_sha: get_ref_sha(&head_repo_path, &pr.head_branch)?,
+            reviewed_head_sha: pr.head_sha.clone(),
+        };
+        if let Some(diff) = pr_diff_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(diff);
+        }
 
-    // The head ref check and the diff are one synchronous Git phase.
-    let base_path = base_repo_path;
-    let pr_clone = pr.clone();
-    crate::blocking::run_blocking_git("diffing a same-repo pull request", move || {
-        require_pull_request_branch(&base_path, "head", &pr_clone.head_branch)?;
-        compute_same_repo_diff(&base_path, &pr_clone)
+        let diff = if let Some(head_namespace) = head_namespace {
+            let fetch_ref = format!("refs/heads/{}", pr.head_branch);
+            let local_ref = scratch_fork_ref();
+            let legacy_ref = legacy_fork_ref(&head_namespace, &pr.head_branch);
+            let diffed = (|| {
+                let git = rg_git::cli_gateway::global_gateway()
+                    .as_ref()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                run_fork_fetch(
+                    git,
+                    &head_repo_path,
+                    &fetch_ref,
+                    &local_ref,
+                    &base_repo_path,
+                )?
+                .ensure_success()
+                .context("failed to fetch pull request head branch")?;
+                compute_cross_repo_diff(&base_repo_path, &pr.base_branch, &local_ref, &pr)
+            })();
+            discard_fork_ref(&base_repo_path, &local_ref);
+            discard_legacy_fork_ref(&base_repo_path, &legacy_ref);
+            diffed?
+        } else {
+            compute_same_repo_diff(&base_repo_path, &pr)?
+        };
+
+        // A push during the cold computation must not publish a diff under a
+        // key for the earlier tips. It can still serve this one response, as
+        // the uncached implementation always could.
+        if get_ref_sha(&base_repo_path, &pr.base_branch).ok().as_ref() == Some(&key.base_sha)
+            && get_ref_sha(&head_repo_path, &pr.head_branch).ok().as_ref() == Some(&key.head_sha)
+        {
+            pr_diff_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, diff.clone());
+        }
+        Ok(diff)
     })
     .await
 }

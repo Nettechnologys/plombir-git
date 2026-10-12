@@ -5,6 +5,7 @@ use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
+use crate::entities::repository;
 use crate::entities::runner::{ActiveModel, Column, Entity as RunnerEntity, Model as Runner};
 
 /// Register a new runner.
@@ -28,6 +29,18 @@ pub async fn register_runner(
     let now = Utc::now();
     let token = generate_token();
 
+    // The HTTP route resolves a live repository before it calls us, but that
+    // read can race its soft-delete. Serialize issuance with retirement on the
+    // repository row, so a credential cannot appear after the delete commits.
+    let txn = db.begin().await.context("db: begin runner registration")?;
+    let live_repo = repository::Entity::find_by_id(repo_id)
+        .filter(repository::Column::DeletedAt.is_null())
+        .lock_exclusive()
+        .one(&txn)
+        .await
+        .context("db: verify runner repository is live")?;
+    anyhow::ensure!(live_repo.is_some(), "runner repository is not live");
+
     let active_model = ActiveModel {
         id: NotSet,
         repo_id: Set(Some(repo_id)),
@@ -44,9 +57,13 @@ pub async fn register_runner(
     };
 
     let runner = active_model
-        .insert(db)
+        .insert(&txn)
         .await
         .context("db: register runner")?;
+
+    txn.commit()
+        .await
+        .context("db: commit runner registration")?;
 
     Ok((runner, token))
 }

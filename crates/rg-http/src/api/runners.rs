@@ -2002,11 +2002,21 @@ pub async fn authenticate_runner(
 
     match rg_db::ops::runner_ops::find_by_token(&state.db, token).await {
         Ok(Some(runner)) if runner.id == runner_id => {
-            if runner.repo_id.is_none() {
+            let Some(repo_id) = runner.repo_id else {
                 return AppError::forbidden(
                     "runner is not repository-scoped; re-register it for owner/repo",
                 )
                 .into_response();
+            };
+            // Older installations may already hold runners orphaned by a
+            // soft-delete. Refuse those credentials even before a future
+            // retirement can clean up their rows.
+            match rg_db::ops::repo_ops::find_by_id(&state.db, repo_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return AppError::unauthorized("runner repository is deleted").into_response()
+                }
+                Err(error) => return AppError::from(error).into_response(),
             }
             // Valid token — also update heartbeat, unless a recent one already
             // stands (see `OPPORTUNISTIC_REFRESH_WINDOW`). The outcome travels

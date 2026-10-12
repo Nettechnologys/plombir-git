@@ -13,6 +13,7 @@
 
 use axum::http::StatusCode;
 use futures::StreamExt;
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait, DbBackend, Statement};
 
 use crate::common::ws::handshake_request;
 use crate::common::{create_repo, register_full, spawn_test_app_with_db};
@@ -104,6 +105,202 @@ async fn poll(base: &str, runner_id: i64, runner_token: &str, timeout: u8) -> re
         .send()
         .await
         .expect("poll runner job")
+}
+
+#[tokio::test]
+async fn deleting_personal_and_organization_repositories_revokes_runner_tokens() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, owner_id) =
+        register_full(&base, "runner-retire", "runner-retire@example.com").await;
+    rg_db::ops::user_ops::update_by_id(&db, owner_id, None, None, Some(true), None)
+        .await
+        .unwrap()
+        .unwrap();
+    let personal_id = create_repo(&base, &owner_token, "personal").await;
+
+    let client = reqwest::Client::new();
+    let org = client
+        .post(format!("{base}/api/v1/orgs"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"name": "runner-retire-org"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(org.status(), StatusCode::CREATED);
+    let org_repo = client
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"org": "runner-retire-org", "name": "project"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(org_repo.status(), StatusCode::CREATED);
+    let org_repo_id = org_repo.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    for (repository, repo_id) in [
+        ("runner-retire/personal", personal_id),
+        ("runner-retire-org/project", org_repo_id),
+    ] {
+        let (runner_id, runner_token) =
+            register_runner(&base, &owner_token, repository, "retired-runner").await;
+        assert_eq!(
+            client
+                .post(format!("{base}/api/v1/runners/{runner_id}/heartbeat"))
+                .bearer_auth(&runner_token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let deleted = client
+            .delete(format!("{base}/api/v1/repos/{repository}"))
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK, "{repository}");
+        assert!(rg_db::ops::runner_ops::find_by_id(&db, runner_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            client
+                .post(format!("{base}/api/v1/runners/{runner_id}/heartbeat"))
+                .bearer_auth(&runner_token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            poll(&base, runner_id, &runner_token, 0).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(rg_db::ops::runner_ops::register_runner(
+            &db,
+            repo_id,
+            "late-runner",
+            "[]",
+            None,
+            None,
+            None,
+        )
+        .await
+        .is_err());
+    }
+
+    // A database upgraded after an older soft-delete may already contain an
+    // orphaned runner. Authentication must refuse that historical credential.
+    let now = chrono::Utc::now();
+    let old_token = "historical-orphan-token";
+    let orphan = rg_db::entities::runner::ActiveModel {
+        repo_id: Set(Some(personal_id)),
+        name: Set("historical-orphan".to_string()),
+        token_hash: Set(rg_db::ops::runner_ops::hash_token(old_token)),
+        status: Set("online".to_string()),
+        labels: Set("[]".to_string()),
+        last_seen_at: Set(now),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        client
+            .post(format!("{base}/api/v1/runners/{}/heartbeat", orphan.id))
+            .bearer_auth(old_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn failed_runner_retirement_rolls_back_repository_and_job() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, owner_id) =
+        register_full(&base, "runner-rollback", "runner-rollback@example.com").await;
+    rg_db::ops::user_ops::update_by_id(&db, owner_id, None, None, Some(true), None)
+        .await
+        .unwrap()
+        .unwrap();
+    let repo_id = create_repo(&base, &owner_token, "project").await;
+    let (runner_id, runner_token) = register_runner(
+        &base,
+        &owner_token,
+        "runner-rollback/project",
+        "rollback-runner",
+    )
+    .await;
+    let job_id = pending_job(&db, repo_id, "rollback").await;
+    assert!(rg_db::ops::pipeline_ops::assign_job(&db, job_id, runner_id)
+        .await
+        .unwrap());
+
+    // Fail after the repo UPDATE and job reset, just before the runner DELETE.
+    db.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        format!(
+            "CREATE TRIGGER refuse_retirement BEFORE DELETE ON runners \
+             WHEN OLD.id = {runner_id} BEGIN SELECT RAISE(ABORT, 'runner delete refused'); END"
+        ),
+    ))
+    .await
+    .unwrap();
+    assert!(rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
+        &db,
+        repo_id,
+        chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+    )
+    .await
+    .is_err());
+    assert!(rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(rg_db::ops::runner_ops::find_by_token(&db, &runner_token)
+        .await
+        .unwrap()
+        .is_some());
+    let job = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, "assigned");
+    assert_eq!(job.runner_id, Some(runner_id));
+
+    db.execute_unprepared("DROP TRIGGER refuse_retirement")
+        .await
+        .unwrap();
+    assert_eq!(
+        rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
+            &db,
+            repo_id,
+            chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+        )
+        .await
+        .unwrap(),
+        rg_db::ops::repo_ops::RepositoryRetirement::Deleted
+    );
+    let released = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.status, "pending");
+    assert_eq!(released.runner_id, None);
+    assert!(rg_db::ops::runner_ops::find_by_id(&db, runner_id)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

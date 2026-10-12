@@ -791,6 +791,7 @@ async fn a_fork_pull_request_diffs_and_merges_after_its_branch_is_rewritten() {
     ] {
         git_stdout(&["update-ref", &scratch, &main_sha], Some(&base_path));
     }
+    let cold_started = std::time::Instant::now();
     let diff = client
         .get(format!("{pulls_url}/{number}/diff"))
         .bearer_auth(&owner_token)
@@ -799,6 +800,7 @@ async fn a_fork_pull_request_diffs_and_merges_after_its_branch_is_rewritten() {
         .expect("diff request");
     let diff_status = diff.status();
     let diff_body = diff.text().await.unwrap_or_default();
+    let cold_elapsed = cold_started.elapsed();
     assert_eq!(
         diff_status, 200,
         "the diff of a rewritten fork branch failed: {diff_body}"
@@ -806,6 +808,20 @@ async fn a_fork_pull_request_diffs_and_merges_after_its_branch_is_rewritten() {
     assert!(
         diff_body.contains("first rewrite"),
         "the diff must show the rewritten branch, not the cached one: {diff_body}"
+    );
+    let warm_started = std::time::Instant::now();
+    let repeated = client
+        .get(format!("{pulls_url}/{number}/diff"))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .expect("repeat fork diff request");
+    assert_eq!(repeated.status(), 200);
+    assert_eq!(repeated.text().await.unwrap(), diff_body);
+    eprintln!(
+        "fork PR diff: cold={:?}, warm={:?}",
+        cold_elapsed,
+        warm_started.elapsed()
     );
 
     assert_eq!(
@@ -835,6 +851,16 @@ async fn a_fork_pull_request_diffs_and_merges_after_its_branch_is_rewritten() {
 
     let second = rewrite_fork_branch(&fork_path, fork_branch, "second rewrite\n");
     record_pr_head(&db, pr_id, &second).await;
+    let changed = client
+        .get(format!("{pulls_url}/{number}/diff"))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .expect("diff after another fork rewrite");
+    assert_eq!(changed.status(), 200);
+    let changed_body = changed.text().await.unwrap();
+    assert!(changed_body.contains("second rewrite"), "{changed_body}");
+    assert!(!changed_body.contains("first rewrite"), "{changed_body}");
     let merge = client
         .post(format!("{pulls_url}/{number}/merge"))
         .bearer_auth(&owner_token)

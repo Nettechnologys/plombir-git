@@ -16,7 +16,8 @@ use crate::entities::repository::{
 };
 use crate::entities::{
     ci_secret, deploy_key, mirror, mirror_sync_lease, oci_blob, oci_repository, organization,
-    package, package_file, package_registry, package_version, repository_transfer_lease, user,
+    package, package_file, package_registry, package_version, repository_transfer_lease, runner,
+    user,
 };
 
 /// Count non-deleted repositories — backs the `plombir_git_repositories` gauge.
@@ -548,6 +549,24 @@ pub async fn soft_delete_unless_mirror_syncing(
         .exec(&transaction)
         .await
         .context("db: retire repository mirror lease")?;
+
+    // A soft delete cannot cascade to runners. Return any jobs still owned by
+    // one before removing its credential; both writes must roll back with the
+    // repository if either fails. The normal routed deletion refuses active
+    // pipelines, but this also covers direct callers and stale assignments.
+    let runners = runner::Entity::find()
+        .filter(runner::Column::RepoId.eq(id))
+        .all(&transaction)
+        .await
+        .context("db: find repository runners to retire")?;
+    for runner in runners {
+        crate::ops::pipeline_ops::reset_runner_jobs(&transaction, runner.id).await?;
+    }
+    runner::Entity::delete_many()
+        .filter(runner::Column::RepoId.eq(id))
+        .exec(&transaction)
+        .await
+        .context("db: retire repository runners")?;
 
     transaction
         .commit()

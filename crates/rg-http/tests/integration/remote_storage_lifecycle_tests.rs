@@ -1,7 +1,9 @@
 //! Accepted remote values round-trip through HTTP and repository retirement
 //! removes the credentials and grants owned by the deleted repository.
 
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Set,
+};
 use sea_orm_migration::{MigrationTrait, SchemaManager};
 
 use crate::common::{
@@ -271,9 +273,30 @@ async fn exercise_retirement(base: &str, db: &rg_db::DatabaseConnection) {
     let (token, _) = register_full(base, &owner, &format!("{owner}@example.invalid")).await;
     let repo_id = create_repo(base, &token, "retired").await;
     let fingerprint = seed_owned_rows(db, repo_id, &unique("key")).await;
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        db,
+        repo_id,
+        "retired-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(owned_counts(db, repo_id).await, (1, 1, 1));
 
     let client = reqwest::Client::new();
+    let heartbeat = |runner_id, token: &str| {
+        client
+            .post(format!("{base}/api/v1/runners/{runner_id}/heartbeat"))
+            .bearer_auth(token)
+            .send()
+    };
+    assert_eq!(
+        heartbeat(runner.id, &runner_token).await.unwrap().status(),
+        200
+    );
     let response = client
         .delete(format!("{base}/api/v1/repos/{owner}/retired"))
         .bearer_auth(&token)
@@ -282,6 +305,14 @@ async fn exercise_retirement(base: &str, db: &rg_db::DatabaseConnection) {
         .unwrap();
     assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
     assert_eq!(owned_counts(db, repo_id).await, (0, 0, 0));
+    assert!(rg_db::ops::runner_ops::find_by_id(db, runner.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        heartbeat(runner.id, &runner_token).await.unwrap().status(),
+        401
+    );
     assert!(
         rg_db::ops::deploy_key_ops::find_by_fingerprint(db, &fingerprint)
             .await
@@ -310,6 +341,24 @@ async fn exercise_retirement(base: &str, db: &rg_db::DatabaseConnection) {
         .as_i64()
         .unwrap();
     seed_owned_rows(db, org_repo_id, &unique("orgkey")).await;
+    let (org_runner, org_runner_token) = rg_db::ops::runner_ops::register_runner(
+        db,
+        org_repo_id,
+        "org-retired-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        heartbeat(org_runner.id, &org_runner_token)
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let response = client
         .delete(format!("{base}/api/v1/orgs/{org}"))
         .bearer_auth(&token)
@@ -318,6 +367,17 @@ async fn exercise_retirement(base: &str, db: &rg_db::DatabaseConnection) {
         .unwrap();
     assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
     assert_eq!(owned_counts(db, org_repo_id).await, (0, 0, 0));
+    assert!(rg_db::ops::runner_ops::find_by_id(db, org_runner.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        heartbeat(org_runner.id, &org_runner_token)
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
 }
 
 #[tokio::test]
@@ -332,6 +392,120 @@ async fn server_database_repository_and_organization_delete_retire_owned_credent
     let db = server_database().await;
     let base = spawn_test_app_over_db(db.clone()).await;
     exercise_retirement(&base, &db).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
+async fn server_database_runner_delete_failure_preserves_repo_and_token() {
+    use sea_orm::DatabaseBackend;
+
+    let db = server_database().await;
+    let base = spawn_test_app_over_db(db.clone()).await;
+    let owner = unique("runnerrollback");
+    let (token, _) = register_full(&base, &owner, &format!("{owner}@example.invalid")).await;
+    let repo_id = create_repo(&base, &token, "project").await;
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo_id,
+        "rollback-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let trigger = unique("refuse_runner_");
+    let function = format!("{trigger}_fn");
+    match db.get_database_backend() {
+        DatabaseBackend::Postgres => {
+            db.execute_unprepared(&format!(
+                "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$ BEGIN RAISE EXCEPTION 'runner retirement refused'; END $$"
+            ))
+            .await
+            .unwrap();
+            db.execute_unprepared(&format!(
+                "CREATE TRIGGER {trigger} BEFORE DELETE ON runners \
+                 FOR EACH ROW EXECUTE FUNCTION {function}()"
+            ))
+            .await
+            .unwrap();
+        }
+        DatabaseBackend::MySql => {
+            db.execute_unprepared(&format!(
+                "CREATE TRIGGER {trigger} BEFORE DELETE ON runners FOR EACH ROW \
+                 SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'runner retirement refused'"
+            ))
+            .await
+            .unwrap();
+        }
+        other => panic!("expected server database, got {other:?}"),
+    }
+
+    let client = reqwest::Client::new();
+    let delete_url = format!("{base}/api/v1/repos/{owner}/project");
+    let refused = client
+        .delete(&delete_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(refused.status().is_server_error());
+    assert!(rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(rg_db::ops::runner_ops::find_by_id(&db, runner.id)
+        .await
+        .unwrap()
+        .is_some());
+    let heartbeat_url = format!("{base}/api/v1/runners/{}/heartbeat", runner.id);
+    assert_eq!(
+        client
+            .post(&heartbeat_url)
+            .bearer_auth(&runner_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    match db.get_database_backend() {
+        DatabaseBackend::Postgres => {
+            db.execute_unprepared(&format!("DROP TRIGGER {trigger} ON runners"))
+                .await
+                .unwrap();
+            db.execute_unprepared(&format!("DROP FUNCTION {function}()"))
+                .await
+                .unwrap();
+        }
+        DatabaseBackend::MySql => {
+            db.execute_unprepared(&format!("DROP TRIGGER {trigger}"))
+                .await
+                .unwrap();
+        }
+        _ => unreachable!(),
+    }
+    let deleted = client
+        .delete(&delete_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 200);
+    assert_eq!(
+        client
+            .post(&heartbeat_url)
+            .bearer_auth(&runner_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
 }
 
 #[tokio::test]

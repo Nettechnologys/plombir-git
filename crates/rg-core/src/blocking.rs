@@ -124,7 +124,7 @@ mod tests {
             ),
             // The fork fetch is one helper both share, so `--no-tags` cannot
             // drift between them.
-            (pulls, "compute_diff", 3, &["run_fork_fetch"]),
+            (pulls, "compute_diff", 1, &["run_fork_fetch"]),
             (pulls, "merge_claimed_pr", 1, &["run_fork_fetch"]),
         ] {
             let boundary = rust_source::production_function_call_sites(
@@ -168,12 +168,12 @@ mod tests {
             "compute_diff",
             &["require_pull_request_branch"],
         );
-        assert_eq!(branch_checks.len(), 3, "{branch_checks:?}");
+        assert_eq!(branch_checks.len(), 2, "{branch_checks:?}");
         assert!(
             branch_checks.iter().all(|call| diff_boundaries
                 .iter()
                 .any(|boundary| rust_source::call_site_contains(pulls, *boundary, *call))),
-            "base and both head ref checks must stay inside their blocking phases"
+            "base and head ref checks must stay inside the blocking phase"
         );
 
         let wiki_boundaries = rust_source::production_function_call_sites(
