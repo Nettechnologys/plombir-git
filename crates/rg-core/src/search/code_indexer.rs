@@ -675,7 +675,11 @@ impl CodeIndexer {
         ref_name: &str,
     ) -> Result<Option<usize>> {
         let state = read_state(&self.db, repo_id, false).await?;
-        if !state.recorded && self.indexed_file_count(repo_id).await? == 0 {
+        // A manual first build records its generation before publishing rows.
+        // A post-push refresh racing that build must still treat the repository
+        // as unindexed; otherwise it can steal the generation and make the
+        // manual index endpoint report files before search can see any.
+        if state.indexed_tree.is_none() && self.indexed_file_count(repo_id).await? == 0 {
             return Ok(None);
         }
         self.index_repository_with_limits(
@@ -2207,6 +2211,43 @@ mod tests {
                 }
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn push_refresh_does_not_steal_an_unpublished_first_index() {
+        let indexer = test_indexer().await;
+        let (_dir, worktree) = committed_repository(&[("needle.rs", b"fn needle() {}\n")]);
+        let entries = generation_entries("needle", 1);
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let first = tokio::spawn(build_paused_after_first_chunk(
+            indexer.db.clone(),
+            TEST_REPO_ID,
+            entries,
+            reached_tx,
+            release.clone(),
+        ));
+        reached_rx
+            .await
+            .expect("first index reached its unpublished chunk");
+        assert!(state(&indexer, TEST_REPO_ID).await.building_key.is_some());
+        assert_eq!(indexer.indexed_file_count(TEST_REPO_ID).await.unwrap(), 0);
+
+        assert_eq!(
+            indexer
+                .refresh_repository(TEST_REPO_ID, &worktree, "main")
+                .await
+                .expect("push refresh during the first manual build"),
+            None,
+            "a push must not claim the generation before the first index publishes"
+        );
+        assert!(state(&indexer, TEST_REPO_ID).await.building_key.is_some());
+        release.notify_one();
+        assert!(matches!(
+            first.await.expect("first index task").expect("first index"),
+            BuildOutcome::Published
+        ));
+        assert_eq!(indexer.indexed_file_count(TEST_REPO_ID).await.unwrap(), 1);
     }
 
     /// The card's property, on whichever backend `db` is: a rebuild publishes

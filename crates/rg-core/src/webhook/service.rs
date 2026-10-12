@@ -647,11 +647,12 @@ fn spawn_delivery(
         let succeeded = matches!(status, Some(s) if (200..300).contains(&s));
         crate::metrics_hook::record_webhook_delivery(succeeded);
 
+        let payload_bytes = payload.len();
         let delivery_model = webhook_delivery::ActiveModel {
             id: sea_orm::NotSet,
             webhook_id: sea_orm::Set(hook_id),
-            event: sea_orm::Set(event),
-            delivery_id: sea_orm::Set(delivery_id),
+            event: sea_orm::Set(event.clone()),
+            delivery_id: sea_orm::Set(delivery_id.clone()),
             response_status: sea_orm::Set(status),
             request_payload: sea_orm::Set(Some(payload)),
             response_body: sea_orm::Set(response_body),
@@ -660,7 +661,15 @@ fn spawn_delivery(
         };
 
         if let Err(e) = webhook_ops::create_delivery(&db, delivery_model).await {
-            tracing::error!(error = %format!("{e:#}"), "failed to record webhook delivery");
+            tracing::error!(
+                webhook_id = hook_id,
+                %delivery_id,
+                %event,
+                payload_bytes,
+                response_status = status,
+                error = %format!("{e:#}"),
+                "failed to record webhook delivery"
+            );
         }
     });
 }
@@ -1223,6 +1232,137 @@ mod tests {
                 .is_some_and(|body| body.starts_with("delivery error:")),
             "the deterministic SSRF refusal remains diagnostic"
         );
+    }
+
+    /// The request body is larger than MySQL's former `VARCHAR(255)`. A failed
+    /// outbound attempt still has to leave an exact body for explicit replay.
+    async fn prove_large_delivery_is_journaled_and_replayable(db: DatabaseConnection) {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let username = format!("delivery{suffix}");
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            &username,
+            &format!("{username}@example.invalid"),
+            "unused",
+            "Delivery owner",
+        )
+        .await
+        .expect("create delivery owner");
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(owner.id),
+                name: Set("payload".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                deleted_at: Set(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create delivery repository");
+        let hook = webhook_ops::create_webhook(
+            &db,
+            webhook::ActiveModel {
+                repo_id: Set(repo.id),
+                scope_kind: Set("repo".to_string()),
+                scope_id: Set(repo.id),
+                url: Set("http://127.0.0.1:1/deterministically-rejected".to_string()),
+                content_type: Set("json".to_string()),
+                secret_encrypted: Set(None),
+                active: Set(true),
+                events: Set("push".to_string()),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create delivery hook");
+
+        let event = serde_json::json!({"ref": "refs/heads/main", "message": "x".repeat(512)});
+        let expected = serde_json::to_string(&event).unwrap();
+        assert!(expected.len() > 255);
+        let tracker = crate::task_tracker::TaskTracker::new();
+        trigger_event_with_tracker(&db, repo.id, "push", &event, &tracker)
+            .await
+            .expect("trigger the webhook event");
+        tracker.close();
+        tracker.wait().await;
+
+        let deliveries = webhook_ops::list_deliveries_by_webhook(&db, hook.id)
+            .await
+            .expect("read delivery journal");
+        assert_eq!(deliveries.len(), 1, "outbound attempt needs an audit row");
+        assert_eq!(
+            deliveries[0].request_payload.as_deref(),
+            Some(expected.as_str())
+        );
+
+        let replay = crate::task_tracker::TaskTracker::new();
+        redeliver_with_tracker(&db, deliveries[0].id, &replay)
+            .await
+            .expect("request exact redelivery");
+        replay.close();
+        replay.wait().await;
+        let deliveries = webhook_ops::list_deliveries_by_webhook(&db, hook.id)
+            .await
+            .expect("read replay journal");
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries
+            .iter()
+            .all(|delivery| delivery.request_payload.as_deref() == Some(expected.as_str())));
+
+        // An unusually long transport error must not erase the whole row
+        // either; response_body shared the same MySQL VARCHAR(255) mistake.
+        let diagnostic = format!("delivery error: {}", "r".repeat(512));
+        let recorded = webhook_ops::create_delivery(
+            &db,
+            webhook_delivery::ActiveModel {
+                webhook_id: Set(hook.id),
+                event: Set("push".to_string()),
+                delivery_id: Set(uuid::Uuid::new_v4().to_string()),
+                response_status: Set(None),
+                request_payload: Set(Some(expected)),
+                response_body: Set(Some(diagnostic.clone())),
+                duration_ms: Set(Some(1)),
+                created_at: Set(Utc::now()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("record long delivery diagnostic");
+        assert_eq!(recorded.response_body.as_deref(), Some(diagnostic.as_str()));
+    }
+
+    #[tokio::test]
+    async fn large_delivery_is_journaled_and_replayable_on_sqlite() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect SQLite");
+        rg_db::run_migrations(&db).await.expect("migrate SQLite");
+        prove_large_delivery_is_journaled_and_replayable(db).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+    async fn large_delivery_is_journaled_and_replayable_on_server_database() {
+        let url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+            .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+        let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+            .await
+            .expect("connect server database");
+        rg_db::run_migrations(&db)
+            .await
+            .expect("migrate server database");
+        prove_large_delivery_is_journaled_and_replayable(db).await;
     }
 }
 

@@ -16,6 +16,10 @@
 //!
 //! Every `docker` invocation gets `--config <tempdir>`, so a login here never
 //! touches the credentials of whoever is running the suite.
+//! A rootless daemon may have a different loopback namespace from the test
+//! process. Running the compiled test in a temporary container with
+//! `--network host` and the daemon socket mounted puts both ends in the
+//! daemon's namespace without changing its registry configuration.
 
 use std::path::Path;
 use std::process::Command;
@@ -147,6 +151,20 @@ async fn docker_image_inventory_delete_and_gc() {
     let body: serde_json::Value = listed.json().await.unwrap();
     let images = body["images"].as_array().expect("OCI images array");
     assert_eq!(images.len(), 1, "{body}");
+    assert_eq!(images[0]["namespace"], "ocilivegc/images", "{body}");
+    assert_eq!(images[0]["tag"], "v1", "{body}");
+    assert!(
+        images[0]["size_bytes"]
+            .as_u64()
+            .is_some_and(|size| size > 0),
+        "{body}"
+    );
+    assert!(
+        images[0]["pushed_at"]
+            .as_str()
+            .is_some_and(|date| chrono::DateTime::parse_from_rfc3339(date).is_ok()),
+        "{body}"
+    );
     let digest = images[0]["digest"].as_str().expect("digest");
     let removed = client
         .delete(format!(
@@ -185,6 +203,14 @@ async fn docker_image_inventory_delete_and_gc() {
         !blobs.is_empty(),
         "docker push must have stored layer bytes"
     );
+    let digests: Vec<_> = blobs.iter().map(|blob| blob.digest.clone()).collect();
+    for digest in &digests {
+        assert!(state
+            .oci_storage
+            .blob_exists("ocilivegc", "images", digest)
+            .await
+            .unwrap());
+    }
     for blob in blobs {
         let mut aged: rg_db::entities::oci_blob::ActiveModel = blob.into();
         aged.created_at = sea_orm::Set(chrono::Utc::now() - chrono::Duration::hours(25));
@@ -195,6 +221,13 @@ async fn docker_image_inventory_delete_and_gc() {
         .unwrap();
     assert!(sweep.oci_blobs_deleted > 0, "{sweep:?}");
     assert_eq!(sweep.failures, 0, "{sweep:?}");
+    for digest in &digests {
+        assert!(!state
+            .oci_storage
+            .blob_exists("ocilivegc", "images", digest)
+            .await
+            .unwrap());
+    }
 }
 
 /// Best-effort teardown: a test that leaves images behind poisons the next run

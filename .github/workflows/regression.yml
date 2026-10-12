@@ -358,6 +358,9 @@ jobs:
       - name: Run PostgreSQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
 
+      - name: Prove large webhook deliveries remain replayable on PostgreSQL
+        run: cargo test -p rg-core -j 6 large_delivery_is_journaled_and_replayable_on_server_database -- --ignored --nocapture
+
       # Last because the focused migration test replaces only package_files in
       # this disposable database to exercise the pre-migration schema directly.
       - name: Prove package filename uniqueness on PostgreSQL
@@ -438,6 +441,9 @@ jobs:
 
       - name: Run MySQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
+
+      - name: Prove large webhook deliveries remain replayable on MySQL
+        run: cargo test -p rg-core -j 6 large_delivery_is_journaled_and_replayable_on_server_database -- --ignored --nocapture
 
       # Last for the same reason as PostgreSQL: this is an isolated schema
       # migration proof, not another consumer of the runtime-smoke fixtures.
