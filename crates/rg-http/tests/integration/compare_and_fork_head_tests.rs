@@ -119,7 +119,7 @@ async fn push_branch(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compare_previews_a_branch_and_a_fork_branch() {
-    let (base, _db, _repo_root) = spawn_test_app_with_db_and_repo_root().await;
+    let (base, _db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
     let (alice, _) = register_full(&base, "cmp_alice", "cmp_alice@example.com").await;
     let (bob, _) = register_full(&base, "cmp_bob", "cmp_bob@example.com").await;
     let alice_pat = pat_for(&base, &alice).await;
@@ -164,23 +164,59 @@ async fn compare_previews_a_branch_and_a_fork_branch() {
         root.path().to_path_buf(),
         base.clone(),
         "cmp_bob",
-        bob_pat,
+        bob_pat.clone(),
         "cmp_bob",
         "proj",
         "fork-feature",
         &["c.txt"],
     )
     .await;
-    let (status, body) = api(
-        reqwest::Method::GET,
-        compare("cmp_bob:fork-feature"),
-        &alice,
-        None,
-    )
-    .await;
+    let fork_compare = compare("cmp_bob:fork-feature");
+    let cold_start = std::time::Instant::now();
+    let (status, body) = api(reqwest::Method::GET, fork_compare.clone(), &alice, None).await;
+    let cold_elapsed = cold_start.elapsed();
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["total_commits"], 1, "{body}");
     assert_eq!(body["files_changed"][0]["path"], "c.txt", "{body}");
+
+    // Fetch writes FETCH_HEAD. Replacing it with a marker after the cold
+    // request makes a repeated fetch observable without timing assumptions.
+    let fetch_head = repo_root.join("cmp_alice/proj.git/FETCH_HEAD");
+    assert!(fetch_head.exists(), "the cold fork comparison must fetch");
+    std::fs::write(&fetch_head, "warm-cache-marker\n").unwrap();
+    let warm_start = std::time::Instant::now();
+    let (status, warm_body) = api(reqwest::Method::GET, fork_compare.clone(), &alice, None).await;
+    let warm_elapsed = warm_start.elapsed();
+    assert_eq!(status, 200, "{warm_body}");
+    assert_eq!(warm_body, body);
+    assert_eq!(
+        std::fs::read_to_string(&fetch_head).unwrap(),
+        "warm-cache-marker\n"
+    );
+    eprintln!("fork compare cold={cold_elapsed:?} warm={warm_elapsed:?}; fetches=1/0");
+
+    // A fast-forward push changes the head SHA, so the next GET must fetch
+    // again and return the new commit. Deletion must keep the existing 400.
+    let work = root.path().join("cmp_bob-cmp_bob-proj-fork-feature");
+    std::fs::write(work.join("d.txt"), "d.txt\n").unwrap();
+    git_ok(&work, "cmp_bob", &["add", "d.txt"]);
+    git_ok(&work, "cmp_bob", &["commit", "-q", "-m", "d.txt"]);
+    git_ok(&work, "cmp_bob", &["push", "-q", "origin", "fork-feature"]);
+    let (status, updated) = api(reqwest::Method::GET, fork_compare.clone(), &alice, None).await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(updated["total_commits"], 2, "{updated}");
+    assert_ne!(updated, body);
+    assert_ne!(
+        std::fs::read_to_string(&fetch_head).unwrap(),
+        "warm-cache-marker\n"
+    );
+    git_ok(
+        &work,
+        "cmp_bob",
+        &["push", "-q", "origin", "--delete", "fork-feature"],
+    );
+    let (status, missing) = api(reqwest::Method::GET, fork_compare, &alice, None).await;
+    assert_eq!(status, 400, "{missing}");
 
     for head in ["no-such-branch", "cmp_bob:no-such-branch", "nobody:feature"] {
         let (status, body) = api(reqwest::Method::GET, compare(head), &alice, None).await;
@@ -272,6 +308,16 @@ async fn a_private_fork_stays_private_to_readers_of_its_parent() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
+    // The owner's successful comparison now warms the cache. It must not
+    // let a reader of the parent see a private fork through that cache.
+    let (status, body) = api(
+        reqwest::Method::GET,
+        format!("{base}/api/v1/repos/pf_carol/secret/compare?base=main&head=pf_erin:hidden"),
+        &dave,
+        None,
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
 }
 
 /// card_2060696224ff: the merge form's "delete head branch" removes the merged

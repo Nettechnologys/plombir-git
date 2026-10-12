@@ -781,23 +781,32 @@ struct DiffCacheKey {
     reviewed_head_sha: Option<String>,
 }
 
-#[derive(Default)]
-struct DiffCache {
-    entries: HashMap<DiffCacheKey, (PrDiff, usize)>,
+struct BoundedGitReadCache<T> {
+    entries: HashMap<DiffCacheKey, (T, usize)>,
     lru: VecDeque<DiffCacheKey>,
     bytes: usize,
 }
 
-impl DiffCache {
-    fn get(&mut self, key: &DiffCacheKey) -> Option<PrDiff> {
+impl<T> Default for BoundedGitReadCache<T> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<T: Clone + serde::Serialize> BoundedGitReadCache<T> {
+    fn get(&mut self, key: &DiffCacheKey) -> Option<T> {
         let diff = self.entries.get(key)?.0.clone();
         self.lru.retain(|old| old != key);
         self.lru.push_back(key.clone());
         Some(diff)
     }
 
-    fn insert(&mut self, key: DiffCacheKey, diff: PrDiff) {
-        let Ok(bytes) = serde_json::to_vec(&diff).map(|body| body.len()) else {
+    fn insert(&mut self, key: DiffCacheKey, value: T) {
+        let Ok(bytes) = serde_json::to_vec(&value).map(|body| body.len()) else {
             return;
         };
         if bytes > PR_DIFF_CACHE_BYTES {
@@ -819,13 +828,13 @@ impl DiffCache {
         }
         self.bytes += bytes;
         self.lru.push_back(key.clone());
-        self.entries.insert(key, (diff, bytes));
+        self.entries.insert(key, (value, bytes));
     }
 }
 
-fn pr_diff_cache() -> &'static Mutex<DiffCache> {
-    static CACHE: OnceLock<Mutex<DiffCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(DiffCache::default()))
+fn pr_diff_cache() -> &'static Mutex<BoundedGitReadCache<PrDiff>> {
+    static CACHE: OnceLock<Mutex<BoundedGitReadCache<PrDiff>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BoundedGitReadCache::default()))
 }
 
 /// Compute the diff between base and head branches using `git diff`.
@@ -1180,7 +1189,7 @@ fn compute_cross_repo_diff(
 }
 
 /// One commit of a comparison, in the shape the commit log answers with.
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ComparedCommit {
     pub sha: String,
     pub message: String,
@@ -1192,7 +1201,7 @@ pub struct ComparedCommit {
 /// What a pull request from a head branch into `base` would bring, before it
 /// exists: the commits the head adds since the merge base, and the diff the
 /// pull request would show (card_87f9b1c97489).
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Comparison {
     #[serde(flatten)]
     pub diff: PrDiff,
@@ -1205,6 +1214,13 @@ pub struct Comparison {
 
 /// How many commits a comparison lists. The count is reported in full.
 pub const MAX_COMPARED_COMMITS: usize = 250;
+
+// A comparison includes patches and commits, so share the PR diff cache's
+// bounded eviction policy. The two answer types keep separate budgets.
+fn comparison_cache() -> &'static Mutex<BoundedGitReadCache<Comparison>> {
+    static CACHE: OnceLock<Mutex<BoundedGitReadCache<Comparison>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BoundedGitReadCache::default()))
+}
 
 /// Compare `base` of `base_repo` with `head_branch` of `head_repo` — the base
 /// repository itself when `None`, or a fork of it, as [`resolve_head_ref`]
@@ -1232,50 +1248,77 @@ pub async fn compare_branches(
             return Err(missing_branch(side, branch));
         }
     }
-    if crate::repo::service::try_get_branch_sha(&base_path, base)?.is_none() {
-        return Err(missing_branch("base", base));
-    }
-
-    let Some(head_repo) = head_repo.filter(|head_repo| head_repo.id != base_repo.id) else {
-        if crate::repo::service::try_get_branch_sha(&base_path, &head_branch)?.is_none() {
-            return Err(missing_branch("head", &head_branch));
-        }
-        let base = base.to_string();
-        return tokio::task::spawn_blocking(move || {
-            let head_rev = format!("refs/heads/{head_branch}");
-            compare_in(&base_path, &base, &head_branch, &head_rev)
-        })
-        .await?;
-    };
-
-    let head_namespace = repository_namespace(db, head_repo).await?;
-    let fork_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
+    let head_path =
+        if let Some(head_repo) = head_repo.filter(|head_repo| head_repo.id != base_repo.id) {
+            let head_namespace = repository_namespace(db, head_repo).await?;
+            repo_root.join(format!("{head_namespace}/{}.git", head_repo.name))
+        } else {
+            base_path.clone()
+        };
     let base = base.to_string();
-    crate::blocking::run_blocking_git("fetching and comparing a fork branch", move || {
-        if crate::repo::service::try_get_branch_sha(&fork_path, &head_branch)?.is_none() {
-            return Err(crate::error::invalid_request(format!(
-                "head branch '{head_branch}' does not exist"
-            )));
+    crate::blocking::run_blocking_git("comparing branches", move || {
+        let base_sha = crate::repo::service::try_get_branch_sha(&base_path, &base)?
+            .ok_or_else(|| missing_branch("base", &base))?;
+        let head_sha = crate::repo::service::try_get_branch_sha(&head_path, &head_branch)?
+            .ok_or_else(|| missing_branch("head", &head_branch))?;
+        let key = DiffCacheKey {
+            base_repo: base_path.clone(),
+            head_repo: head_path.clone(),
+            base_branch: base.clone(),
+            head_branch: head_branch.clone(),
+            base_sha,
+            head_sha,
+            reviewed_head_sha: None,
+        };
+        if let Some(comparison) = comparison_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(comparison);
         }
-        let local_ref = scratch_fork_ref();
-        let compared = (|| {
-            let git = rg_git::cli_gateway::global_gateway()
+
+        let comparison = if head_path == base_path {
+            let head_rev = format!("refs/heads/{head_branch}");
+            compare_in(&base_path, &base, &head_branch, &head_rev)?
+        } else {
+            let local_ref = scratch_fork_ref();
+            let compared = (|| {
+                let git = rg_git::cli_gateway::global_gateway()
+                    .as_ref()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                run_fork_fetch(
+                    git,
+                    &head_path,
+                    &format!("refs/heads/{head_branch}"),
+                    &local_ref,
+                    &base_path,
+                )?
+                .ensure_success()
+                .context("failed to fetch the head branch to compare")?;
+                compare_in(&base_path, &base, &head_branch, &local_ref)
+            })();
+            // In the same phase as the fetch, however the comparison went.
+            discard_fork_ref(&base_path, &local_ref);
+            compared?
+        };
+        if crate::repo::service::try_get_branch_sha(&base_path, &base)
+            .ok()
+            .flatten()
+            .as_ref()
+            == Some(&key.base_sha)
+            && crate::repo::service::try_get_branch_sha(&head_path, &head_branch)
+                .ok()
+                .flatten()
                 .as_ref()
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            run_fork_fetch(
-                git,
-                &fork_path,
-                &format!("refs/heads/{head_branch}"),
-                &local_ref,
-                &base_path,
-            )?
-            .ensure_success()
-            .context("failed to fetch the head branch to compare")?;
-            compare_in(&base_path, &base, &head_branch, &local_ref)
-        })();
-        // In the same phase as the fetch, however the comparison went.
-        discard_fork_ref(&base_path, &local_ref);
-        compared
+                == Some(&key.head_sha)
+        {
+            comparison_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, comparison.clone());
+        }
+        Ok(comparison)
     })
     .await
 }
