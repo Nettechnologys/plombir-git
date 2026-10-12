@@ -50,6 +50,7 @@ STAND_REBUILD_FRONTEND=1 \
 STAND_CONFIG_PATH="${FIXTURE_DIR}/plombir-git.toml" \
 UI_ACCESS_SWEEP_LDAP_PORT="${LDAP_PORT}" \
 "${ROOT_DIR}/scripts/ephemeral-stand.sh" \
+  --build \
   --frontend \
   --no-founder \
   -- \

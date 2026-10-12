@@ -2336,9 +2336,14 @@
       "access": "OrgAdmin",
       "handler": "api::webhooks::org_list",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "org-webhooks"
+      ]
     },
     {
       "method": "POST",
@@ -2346,9 +2351,13 @@
       "access": "OrgAdmin",
       "handler": "api::webhooks::org_create",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "org-webhooks"
+      ]
     },
     {
       "method": "GET",
@@ -2365,32 +2374,52 @@
       "url": "/api/v1/orgs/{name}/hooks/{id}",
       "access": "OrgAdmin",
       "handler": "api::webhooks::org_update",
-      "testedIn": [],
-      "reachedFromUi": true
+      "testedIn": [
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "org-webhooks"
+      ]
     },
     {
       "method": "DELETE",
       "url": "/api/v1/orgs/{name}/hooks/{id}",
       "access": "OrgAdmin",
       "handler": "api::webhooks::org_delete",
-      "testedIn": [],
-      "reachedFromUi": true
+      "testedIn": [
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "org-webhooks"
+      ]
     },
     {
       "method": "GET",
       "url": "/api/v1/orgs/{name}/hooks/{id}/deliveries",
       "access": "OrgAdmin",
       "handler": "api::webhooks::org_deliveries",
-      "testedIn": [],
-      "reachedFromUi": true
+      "testedIn": [
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "org-webhooks"
+      ]
     },
     {
       "method": "POST",
       "url": "/api/v1/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver",
       "access": "OrgAdmin",
       "handler": "api::webhooks::org_redeliver",
-      "testedIn": [],
-      "reachedFromUi": true
+      "testedIn": [
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "org-webhooks"
+      ]
     },
     {
       "method": "GET",
@@ -2398,17 +2427,27 @@
       "access": "InstanceAdmin",
       "handler": "api::webhooks::system_list",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "system-webhooks"
+      ]
     },
     {
       "method": "POST",
       "url": "/api/v1/admin/hooks",
       "access": "InstanceAdmin",
       "handler": "api::webhooks::system_create",
-      "testedIn": [],
-      "reachedFromUi": true
+      "testedIn": [
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "system-webhooks"
+      ]
     },
     {
       "method": "GET",
@@ -2423,32 +2462,52 @@
       "url": "/api/v1/admin/hooks/{id}",
       "access": "InstanceAdmin",
       "handler": "api::webhooks::system_update",
-      "testedIn": [],
-      "reachedFromUi": true
+      "testedIn": [
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "system-webhooks"
+      ]
     },
     {
       "method": "DELETE",
       "url": "/api/v1/admin/hooks/{id}",
       "access": "InstanceAdmin",
       "handler": "api::webhooks::system_delete",
-      "testedIn": [],
-      "reachedFromUi": true
+      "testedIn": [
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "system-webhooks"
+      ]
     },
     {
       "method": "GET",
       "url": "/api/v1/admin/hooks/{id}/deliveries",
       "access": "InstanceAdmin",
       "handler": "api::webhooks::system_deliveries",
-      "testedIn": [],
-      "reachedFromUi": true
+      "testedIn": [
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "system-webhooks"
+      ]
     },
     {
       "method": "POST",
       "url": "/api/v1/admin/hooks/{id}/deliveries/{delivery_id}/redeliver",
       "access": "InstanceAdmin",
       "handler": "api::webhooks::system_redeliver",
-      "testedIn": [],
-      "reachedFromUi": true
+      "testedIn": [
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "system-webhooks"
+      ]
     },
     {
       "method": "GET",
@@ -4150,7 +4209,8 @@
       "access": "RepoRead",
       "handler": "api::packages::list_oci_images",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -4160,7 +4220,8 @@
       "access": "RepoWrite",
       "handler": "api::packages::delete_oci_image",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -11306,7 +11367,8 @@
               "handler": "api::packages::list_oci_images",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -11340,7 +11402,8 @@
               "handler": "api::packages::delete_oci_image",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -11353,7 +11416,8 @@
               "handler": "api::packages::list_oci_images",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -22902,7 +22966,12 @@
               "access": "InstanceAdmin",
               "handler": "api::webhooks::system_create",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "browser"
+              ],
+              "browserScenarios": [
+                "system-webhooks"
+              ]
             },
             {
               "symbol": "organizationWebhooks.list",
@@ -22914,7 +22983,8 @@
               "handler": "api::webhooks::org_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             },
             {
@@ -22927,7 +22997,12 @@
               "handler": "api::webhooks::system_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "system-webhooks"
               ]
             }
           ],
@@ -22991,7 +23066,12 @@
               "access": "InstanceAdmin",
               "handler": "api::webhooks::system_update",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "browser"
+              ],
+              "browserScenarios": [
+                "system-webhooks"
+              ]
             },
             {
               "symbol": "organizationWebhooks.list",
@@ -23003,7 +23083,8 @@
               "handler": "api::webhooks::org_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             },
             {
@@ -23016,7 +23097,8 @@
               "handler": "api::webhooks::system_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -23072,7 +23154,8 @@
               "handler": "api::webhooks::org_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             },
             {
@@ -23085,7 +23168,8 @@
               "handler": "api::webhooks::system_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -23119,7 +23203,12 @@
               "access": "InstanceAdmin",
               "handler": "api::webhooks::system_deliveries",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "browser"
+              ],
+              "browserScenarios": [
+                "system-webhooks"
+              ]
             }
           ],
           "unresolved": false
@@ -23162,7 +23251,12 @@
               "access": "InstanceAdmin",
               "handler": "api::webhooks::system_redeliver",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "browser"
+              ],
+              "browserScenarios": [
+                "system-webhooks"
+              ]
             },
             {
               "symbol": "organizationWebhooks.deliveries",
@@ -23217,7 +23311,12 @@
               "access": "InstanceAdmin",
               "handler": "api::webhooks::system_delete",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "browser"
+              ],
+              "browserScenarios": [
+                "system-webhooks"
+              ]
             },
             {
               "symbol": "organizationWebhooks.list",
@@ -23229,7 +23328,8 @@
               "handler": "api::webhooks::org_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             },
             {
@@ -23242,7 +23342,8 @@
               "handler": "api::webhooks::system_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -26259,7 +26360,11 @@
               "handler": "api::webhooks::org_create",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "org-webhooks"
               ]
             },
             {
@@ -26283,7 +26388,12 @@
               "handler": "api::webhooks::org_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "org-webhooks"
               ]
             },
             {
@@ -26296,7 +26406,8 @@
               "handler": "api::webhooks::system_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -26349,7 +26460,12 @@
               "access": "OrgAdmin",
               "handler": "api::webhooks::org_update",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "browser"
+              ],
+              "browserScenarios": [
+                "org-webhooks"
+              ]
             },
             {
               "symbol": "systemWebhooks.update",
@@ -26372,7 +26488,8 @@
               "handler": "api::webhooks::org_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             },
             {
@@ -26385,7 +26502,8 @@
               "handler": "api::webhooks::system_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -26441,7 +26559,8 @@
               "handler": "api::webhooks::org_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             },
             {
@@ -26454,7 +26573,8 @@
               "handler": "api::webhooks::system_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -26477,7 +26597,12 @@
               "access": "OrgAdmin",
               "handler": "api::webhooks::org_deliveries",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "browser"
+              ],
+              "browserScenarios": [
+                "org-webhooks"
+              ]
             },
             {
               "symbol": "systemWebhooks.deliveries",
@@ -26520,7 +26645,12 @@
               "access": "OrgAdmin",
               "handler": "api::webhooks::org_redeliver",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "browser"
+              ],
+              "browserScenarios": [
+                "org-webhooks"
+              ]
             },
             {
               "symbol": "systemWebhooks.redeliver",
@@ -26575,7 +26705,12 @@
               "access": "OrgAdmin",
               "handler": "api::webhooks::org_delete",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "browser"
+              ],
+              "browserScenarios": [
+                "org-webhooks"
+              ]
             },
             {
               "symbol": "systemWebhooks.remove",
@@ -26598,7 +26733,8 @@
               "handler": "api::webhooks::org_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             },
             {
@@ -26611,7 +26747,8 @@
               "handler": "api::webhooks::system_list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -28427,10 +28564,10 @@
       "owner",
       "outsider"
     ],
-    "scenarios": 47,
+    "scenarios": 49,
     "inventoryEntries": 796,
-    "coveredEntries": 172,
-    "coveredRoutes": 163,
+    "coveredEntries": 184,
+    "coveredRoutes": 175,
     "maxUiRoutesWithoutFrontendTest": 26
   }
 }

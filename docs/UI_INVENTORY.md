@@ -30,22 +30,22 @@
 | Интерактивных элементов | 1041 |
 | — из них дёргают API | 366 |
 | — приходят из общих компонентов | 423 |
-| Browser sweep: сценариев / записей инвентаря / роутов | 47 / 172 / 163 |
-| **UI-роутов без единого web/smoke/browser-теста** | **40** |
-| UI-роутов без corpus-hit и browser-сценария | 9 |
+| Browser sweep: сценариев / записей инвентаря / роутов | 49 / 184 / 175 |
+| **UI-роутов без единого web/smoke/browser-теста** | **26** |
+| UI-роутов без corpus-hit и browser-сценария | 0 |
 
 ## По уровню доступа
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 109 | 70 | 5 | 0 |
-| `RepoWrite` | 86 | 67 | 14 | 2 |
+| `RepoRead` | 109 | 70 | 4 | 0 |
+| `RepoWrite` | 86 | 67 | 13 | 2 |
 | `User` | 55 | 44 | 6 | 0 |
 | `RepoAdmin` | 39 | 39 | 0 | 0 |
-| `InstanceAdmin` | 32 | 27 | 6 | 6 |
+| `InstanceAdmin` | 32 | 27 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
 | `RepoAuthRead` | 18 | 18 | 1 | 0 |
-| `OrgAdmin` | 15 | 14 | 6 | 4 |
+| `OrgAdmin` | 15 | 14 | 0 | 0 |
 | `Foreign:oci.rs` | 14 | 0 | 0 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 12 | 0 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
@@ -416,9 +416,9 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.next | :248 | `GET /api/v1/repos/{owner}/{name}/packages/oci/images` | `RepoRead` | rust |
-| i18n:common.delete | :262 | `DELETE /api/v1/repos/{owner}/{name}/packages/oci/images/{digest}` | `RepoWrite` | rust |
-| i18n:common.delete | :262 | `GET /api/v1/repos/{owner}/{name}/packages/oci/images` | `RepoRead` | rust |
+| i18n:common.next | :248 | `GET /api/v1/repos/{owner}/{name}/packages/oci/images` | `RepoRead` | rust+web |
+| i18n:common.delete | :262 | `DELETE /api/v1/repos/{owner}/{name}/packages/oci/images/{digest}` | `RepoWrite` | rust+web |
+| i18n:common.delete | :262 | `GET /api/v1/repos/{owner}/{name}/packages/oci/images` | `RepoRead` | rust+web |
 | i18n:common.retry | :274 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
 | i18n:common.retry | :274 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
 | i18n:common.all | :283 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
@@ -987,27 +987,27 @@
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
 | selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `POST /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
-| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `POST /api/v1/admin/hooks` | `InstanceAdmin` | **—** |
-| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
-| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `POST /api/v1/admin/hooks` | `InstanceAdmin` | browser |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust+smoke |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust+smoke+browser |
 | (input) => void update(hook, { active: i | `ScopedWebhooks` | `PATCH /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
-| (input) => void update(hook, { active: i | `ScopedWebhooks` | `PATCH /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
-| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
-| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `PATCH /api/v1/admin/hooks/{id}` | `InstanceAdmin` | browser |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust+smoke |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust+smoke |
 | i18n:settings.webhooks.save_events | `ScopedWebhooks` | `PATCH /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
 | i18n:settings.webhooks.save_events | `ScopedWebhooks` | `PATCH /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
-| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
-| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust+smoke |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust+smoke |
 | i18n:settings.webhooks.view_deliveries | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks/{id}/deliveries` | `OrgAdmin` | **—** |
-| i18n:settings.webhooks.view_deliveries | `ScopedWebhooks` | `GET /api/v1/admin/hooks/{id}/deliveries` | `InstanceAdmin` | **—** |
+| i18n:settings.webhooks.view_deliveries | `ScopedWebhooks` | `GET /api/v1/admin/hooks/{id}/deliveries` | `InstanceAdmin` | browser |
 | i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `POST /api/v1/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver` | `OrgAdmin` | **—** |
-| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `POST /api/v1/admin/hooks/{id}/deliveries/{delivery_id}/redeliver` | `InstanceAdmin` | **—** |
+| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `POST /api/v1/admin/hooks/{id}/deliveries/{delivery_id}/redeliver` | `InstanceAdmin` | browser |
 | i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks/{id}/deliveries` | `OrgAdmin` | **—** |
 | i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `GET /api/v1/admin/hooks/{id}/deliveries` | `InstanceAdmin` | **—** |
 | i18n:common.delete | `ScopedWebhooks` | `DELETE /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
-| i18n:common.delete | `ScopedWebhooks` | `DELETE /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
-| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
-| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| i18n:common.delete | `ScopedWebhooks` | `DELETE /api/v1/admin/hooks/{id}` | `InstanceAdmin` | browser |
+| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust+smoke |
+| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust+smoke |
 
 ### `/admin/orgs` 🔒
 
@@ -1152,28 +1152,28 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `POST /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `POST /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust+browser |
 | selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `POST /api/v1/admin/hooks` | `InstanceAdmin` | **—** |
-| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
-| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
-| (input) => void update(hook, { active: i | `ScopedWebhooks` | `PATCH /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust+smoke+browser |
+| selectedEvents = toggle(selectedEvents, event, input.current | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust+smoke |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `PATCH /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | browser |
 | (input) => void update(hook, { active: i | `ScopedWebhooks` | `PATCH /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
-| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
-| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust+smoke |
+| (input) => void update(hook, { active: i | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust+smoke |
 | i18n:settings.webhooks.save_events | `ScopedWebhooks` | `PATCH /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
 | i18n:settings.webhooks.save_events | `ScopedWebhooks` | `PATCH /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
-| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
-| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
-| i18n:settings.webhooks.view_deliveries | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks/{id}/deliveries` | `OrgAdmin` | **—** |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust+smoke |
+| i18n:settings.webhooks.save_events | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust+smoke |
+| i18n:settings.webhooks.view_deliveries | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks/{id}/deliveries` | `OrgAdmin` | browser |
 | i18n:settings.webhooks.view_deliveries | `ScopedWebhooks` | `GET /api/v1/admin/hooks/{id}/deliveries` | `InstanceAdmin` | **—** |
-| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `POST /api/v1/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver` | `OrgAdmin` | **—** |
+| i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `POST /api/v1/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver` | `OrgAdmin` | browser |
 | i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `POST /api/v1/admin/hooks/{id}/deliveries/{delivery_id}/redeliver` | `InstanceAdmin` | **—** |
 | i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks/{id}/deliveries` | `OrgAdmin` | **—** |
 | i18n:settings.webhooks.redeliver | `ScopedWebhooks` | `GET /api/v1/admin/hooks/{id}/deliveries` | `InstanceAdmin` | **—** |
-| i18n:common.delete | `ScopedWebhooks` | `DELETE /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | **—** |
+| i18n:common.delete | `ScopedWebhooks` | `DELETE /api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | browser |
 | i18n:common.delete | `ScopedWebhooks` | `DELETE /api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
-| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust |
-| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust |
+| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/orgs/{name}/hooks` | `OrgAdmin` | rust+smoke |
+| i18n:common.delete | `ScopedWebhooks` | `GET /api/v1/admin/hooks` | `InstanceAdmin` | rust+smoke |
 
 ### `/reset-password`
 

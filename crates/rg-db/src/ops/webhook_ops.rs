@@ -31,27 +31,6 @@ pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<W
         .context("db: list webhooks by repo")
 }
 
-/// Active webhooks of `repo_id` whose subscription list *mentions* `event`.
-///
-/// A narrowing filter, not a verdict: `events` is one comma-joined string, and
-/// `LIKE '%<event>%'` cannot tell a list entry from a substring of one. Deciding
-/// membership is `rg_core::webhook::service::subscription_covers`'s job, and the
-/// one caller applies it to every row this returns — do not use these rows as a
-/// delivery list on their own (card_55c9cddfe9d6).
-pub async fn list_active_by_repo_and_event(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    event: &str,
-) -> Result<Vec<Webhook>> {
-    WebhookEntity::find()
-        .filter(webhook::Column::RepoId.eq(repo_id))
-        .filter(webhook::Column::Active.eq(true))
-        .filter(webhook::Column::Events.contains(event))
-        .all(db)
-        .await
-        .context("db: list active webhooks by repo and event")
-}
-
 /// Repository events fan out to the repository, its organization (if any),
 /// and the instance. The scope predicate is part of the SQL query so a hook
 /// registered in another organization cannot leak a private repo event.

@@ -1315,6 +1315,60 @@ const repoWebhooks = privileged(
   ]),
 );
 
+function scopedWebhooks(pagePath, apiPath, hookIdField, deliveryIdField) {
+  return privileged(
+    async (context) => {
+      await context.navigate(pagePath(context));
+      await context.waitForText('.scoped-webhooks article', context.fixture.webhookUrl);
+      await context.fill('.scoped-webhooks form input[type="url"]', context.fixture.browserWebhookUrl);
+      await context.click('.scoped-webhooks form button[type="submit"]');
+      await context.waitForText('.scoped-webhooks article', context.fixture.browserWebhookUrl);
+      await context.setCheckedWithin(
+        '.scoped-webhooks article',
+        context.fixture.webhookUrl,
+        'input[type="checkbox"]',
+        false,
+      );
+      await context.waitForText('.scoped-webhooks article', 'Disabled');
+      await context.clickWithin('.scoped-webhooks article', context.fixture.webhookUrl, 'button', 'View deliveries');
+      await context.waitForSelector('.scoped-webhooks article li button');
+      await context.clickByText('.scoped-webhooks article li button', 'Redeliver');
+      await context.waitForEnabled('.scoped-webhooks article li button');
+      await context.clickWithin('.scoped-webhooks article', context.fixture.browserWebhookUrl, 'button', 'Delete');
+      await context.clickByText('[role="dialog"] button', 'Delete');
+    },
+    (context) => {
+      const path = apiPath(context);
+      const hookId = context.fixture[hookIdField];
+      const deliveryId = context.fixture[deliveryIdField];
+      return requestSequence(context, [
+        [path],
+        [path, {
+          method: 'POST',
+          json: { url: 'https://outsider.example.invalid/hook', events: ['issue.opened'] },
+        }],
+        [`${path}/${hookId}`, { method: 'PATCH', json: { active: false } }],
+        [`${path}/${hookId}/deliveries`],
+        [`${path}/${hookId}/deliveries/${deliveryId}/redeliver`, { method: 'POST' }],
+        [`${path}/${hookId}`, { method: 'DELETE' }],
+      ]);
+    },
+  );
+}
+
+const orgWebhooks = scopedWebhooks(
+  (context) => `/orgs/${context.fixture.managedOrg}/hooks`,
+  (context) => `/api/v1/orgs/${context.fixture.managedOrg}/hooks`,
+  'orgWebhookId',
+  'orgWebhookDeliveryId',
+);
+const systemWebhooks = scopedWebhooks(
+  () => '/admin/hooks',
+  () => '/api/v1/admin/hooks',
+  'systemWebhookId',
+  'systemWebhookDeliveryId',
+);
+
 // card_3625a7b89abb: the general settings form, on the repository
 // `repo-transfer` moves away right after. Only the description changes, so the
 // repository keeps the name and visibility every later scenario relies on.
@@ -1455,6 +1509,8 @@ export const UI_ACCESS_SWEEP_SCENARIOS = new Map([
   ['repo-retention', repoRetention],
   ['repo-tag-protections', repoTagProtections],
   ['repo-webhooks', repoWebhooks],
+  ['org-webhooks', orgWebhooks],
+  ['system-webhooks', systemWebhooks],
   ['repo-settings-general', repoSettingsGeneral],
   ['repo-transfer', repoTransfer],
   ['organization-admin', organizationAdmin],

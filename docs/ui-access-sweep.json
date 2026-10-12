@@ -117,12 +117,12 @@
       ]
     },
     {
-    "id": "repo-content-delete",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-content-delete",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/blob/[...path]",
           "kind": "control",
@@ -136,12 +136,12 @@
       ]
     },
     {
-    "id": "repo-watch",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-watch",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]",
           "kind": "control",
@@ -324,12 +324,12 @@
       ]
     },
     {
-    "id": "repo-milestones",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-milestones",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/milestones",
           "kind": "control",
@@ -383,12 +383,12 @@
       ]
     },
     {
-    "id": "repo-boards",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-boards",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/boards",
           "kind": "passive",
@@ -508,12 +508,12 @@
       ]
     },
     {
-    "id": "repo-time-tracking",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-time-tracking",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/time_tracking",
           "kind": "control",
@@ -557,12 +557,12 @@
       ]
     },
     {
-    "id": "repo-wiki",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-wiki",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/wiki",
           "kind": "passive",
@@ -634,12 +634,12 @@
       ]
     },
     {
-    "id": "repo-labels",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-labels",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/settings/labels",
           "kind": "control",
@@ -915,12 +915,12 @@
       ]
     },
     {
-    "id": "repo-pull-detail",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-pull-detail",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/pulls/[number]",
           "kind": "control",
@@ -1142,12 +1142,12 @@
       ]
     },
     {
-    "id": "repo-release-asset-delete",
-    "personaOrder": [
-      "outsider",
-      "owner"
-    ],
-    "covers": [
+      "id": "repo-release-asset-delete",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
         {
           "page": "/[owner]/[repo]/releases",
           "kind": "control",
@@ -1988,6 +1988,144 @@
           "method": "POST",
           "routeUrl": "/api/v1/repos/{owner}/{name}/transfer",
           "access": "RepoOwner"
+        }
+      ]
+    },
+    {
+      "id": "org-webhooks",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/orgs/[name]/hooks",
+          "kind": "control",
+          "control": "create",
+          "line": 185,
+          "symbol": "organizationWebhooks.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/orgs/{name}/hooks",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]/hooks",
+          "kind": "control",
+          "control": "create",
+          "line": 185,
+          "symbol": "organizationWebhooks.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/orgs/{name}/hooks",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]/hooks",
+          "kind": "control",
+          "control": "(input) => void update(hook, { active: input.currentTarget.checked })",
+          "line": 211,
+          "symbol": "organizationWebhooks.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/orgs/{name}/hooks/{id}",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]/hooks",
+          "kind": "control",
+          "control": "() => void showDeliveries(hook.id)",
+          "line": 220,
+          "symbol": "organizationWebhooks.deliveries",
+          "method": "GET",
+          "routeUrl": "/api/v1/orgs/{name}/hooks/{id}/deliveries",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]/hooks",
+          "kind": "control",
+          "control": "() => void redeliver(hook.id, delivery.id)",
+          "line": 226,
+          "symbol": "organizationWebhooks.redeliver",
+          "method": "POST",
+          "routeUrl": "/api/v1/orgs/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]/hooks",
+          "kind": "control",
+          "control": "() => deleteTarget && void remove(deleteTarget)",
+          "line": 239,
+          "symbol": "organizationWebhooks.remove",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/orgs/{name}/hooks/{id}",
+          "access": "OrgAdmin"
+        }
+      ]
+    },
+    {
+      "id": "system-webhooks",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/hooks",
+          "kind": "control",
+          "control": "create",
+          "line": 185,
+          "symbol": "systemWebhooks.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/hooks",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/hooks",
+          "kind": "control",
+          "control": "create",
+          "line": 185,
+          "symbol": "systemWebhooks.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/admin/hooks",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/hooks",
+          "kind": "control",
+          "control": "(input) => void update(hook, { active: input.currentTarget.checked })",
+          "line": 211,
+          "symbol": "systemWebhooks.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/admin/hooks/{id}",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/hooks",
+          "kind": "control",
+          "control": "() => void showDeliveries(hook.id)",
+          "line": 220,
+          "symbol": "systemWebhooks.deliveries",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/hooks/{id}/deliveries",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/hooks",
+          "kind": "control",
+          "control": "() => void redeliver(hook.id, delivery.id)",
+          "line": 226,
+          "symbol": "systemWebhooks.redeliver",
+          "method": "POST",
+          "routeUrl": "/api/v1/admin/hooks/{id}/deliveries/{delivery_id}/redeliver",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/hooks",
+          "kind": "control",
+          "control": "() => deleteTarget && void remove(deleteTarget)",
+          "line": 239,
+          "symbol": "systemWebhooks.remove",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/admin/hooks/{id}",
+          "access": "InstanceAdmin"
         }
       ]
     },

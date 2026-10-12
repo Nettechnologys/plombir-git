@@ -411,6 +411,33 @@ async function seedFixtures(backendUrl, tokens) {
       events: ['issue.opened'],
     },
   });
+  const orgHookPath = `/orgs/${ADMIN_FIXTURE.managedOrg}/hooks`;
+  const orgWebhook = await ownerJson(orgHookPath, {
+    method: 'POST',
+    json: {
+      url: ADMIN_FIXTURE.webhookUrl,
+      content_type: 'json',
+      active: true,
+      events: ['issue.opened'],
+    },
+  });
+  const systemWebhook = await ownerJson('/admin/hooks', {
+    method: 'POST',
+    json: {
+      url: ADMIN_FIXTURE.webhookUrl,
+      content_type: 'json',
+      active: true,
+      events: ['issue.opened'],
+    },
+  });
+  await ownerJson('/repos', {
+    method: 'POST',
+    json: { name: 'hook-source', org: ADMIN_FIXTURE.managedOrg, is_private: true },
+  });
+  await ownerJson(`/repos/${ADMIN_FIXTURE.managedOrg}/hook-source/issues`, {
+    method: 'POST',
+    json: { title: 'Seed scoped webhook deliveries', body: 'Browser sweep fixture', labels: [] },
+  });
   await ownerJson(`${repoPath}/issues`, {
     method: 'POST',
     json: { title: 'Seed a webhook delivery', body: 'Browser sweep fixture', labels: [] },
@@ -425,6 +452,19 @@ async function seedFixtures(backendUrl, tokens) {
     description: 'webhook fixture delivery id',
     timeoutMs: UI_WAIT_MS,
   });
+  async function scopedDelivery(path, hookId, description) {
+    return waitForValue({
+      read: async () => {
+        const deliveries = await ownerJson(`${path}/${hookId}/deliveries`);
+        return deliveries[0] || null;
+      },
+      accept: (value) => Number.isInteger(value?.id),
+      description,
+      timeoutMs: UI_WAIT_MS,
+    });
+  }
+  const orgDelivery = await scopedDelivery(orgHookPath, orgWebhook.id, 'organization webhook fixture delivery id');
+  const systemDelivery = await scopedDelivery('/admin/hooks', systemWebhook.id, 'instance webhook fixture delivery id');
 
   const orgMember = await ownerJson(`/orgs/${ADMIN_FIXTURE.managedOrg}/members`, {
     method: 'POST',
@@ -458,6 +498,10 @@ async function seedFixtures(backendUrl, tokens) {
     tagRuleId: tagRule.id,
     webhookId: webhook.id,
     webhookDeliveryId: delivery.id,
+    orgWebhookId: orgWebhook.id,
+    orgWebhookDeliveryId: orgDelivery.id,
+    systemWebhookId: systemWebhook.id,
+    systemWebhookDeliveryId: systemDelivery.id,
     orgMemberId: orgMember.id,
     teamId: team.id,
     teamMemberId: teamMember.id,
