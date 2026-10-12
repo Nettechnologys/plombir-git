@@ -16,9 +16,9 @@
 # smaller test but a destructive one: the e2e scenarios this loads create
 # repositories, issues and users, and assert counts over them ("the list holds
 # exactly one issue"). Run twice against a surviving database and the second run
-# is red through no fault of the product. Run against the live instance at
-# `git.bearby.io` and the test deletes real repositories that no daily backup
-# covers. So every stand gets a fresh `mktemp -d`, and the trap removes it.
+# is red through no fault of the product. Running against any live instance
+# could delete real repositories. So every stand gets a fresh `mktemp -d`,
+# and the trap removes it.
 #
 # The server is started with its working directory INSIDE that temporary
 # directory. Every path handed to it below is absolute, but the defaults it

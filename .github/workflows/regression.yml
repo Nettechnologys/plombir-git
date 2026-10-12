@@ -7,6 +7,13 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_INCREMENTAL: "0"
 
@@ -25,7 +32,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       # Every job installs the toolchain `rust-toolchain.toml` names, with the
       # components it lists, rather than whatever `stable` is on the day of the
@@ -61,7 +70,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
         run: |
@@ -74,7 +85,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       # --all-targets so tests, examples and benches are linted too: the deny
       # lints are about code that runs, and test code holding a guard across an
@@ -99,7 +110,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
         run: |
@@ -110,14 +123,14 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Build the workspace documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps -j 6
 
   # `rust-version` in Cargo.toml is a promise to downstream builders, and an
-  # unchecked one drifted: it said 1.85 while the lockfile needed 1.88
-  # (card_b5633973b38f). This job builds the workspace with exactly the declared
+  # unchecked one drifted: it said 1.85 while the lockfile needed 1.88.
+  # This job builds the workspace with exactly the declared
   # toolchain against the committed lockfile, reading the number from the one
   # place it is declared.
   msrv:
@@ -126,7 +139,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
         run: |
@@ -143,7 +158,7 @@ jobs:
         run: rustup toolchain install "${MSRV}" --profile minimal --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           key: msrv
 
@@ -158,7 +173,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
         run: |
@@ -169,11 +186,11 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       # Prebuilt binary — no from-source compile, keeps the gate fast.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-nextest
 
@@ -210,14 +227,16 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: rustup toolchain install --no-self-update
 
       # Prebuilt binaries — no from-source compile, keeps the gate fast.
       - name: Install cargo-audit and cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: cargo-audit,cargo-deny
 
@@ -244,7 +263,7 @@ jobs:
       # continue-on-error to promote this to a blocking gate.
       - name: Install osv-scanner
         continue-on-error: true
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: osv-scanner
 
@@ -260,7 +279,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
         run: |
@@ -271,7 +292,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Build Plombir Git
         run: cargo build -p rg-cli
@@ -285,14 +306,16 @@ jobs:
   # the route: two real accounts drive every write control of the UI in a
   # headless Chrome against a throwaway server. It used to run nowhere, and
   # rotted where nobody saw it — a fixture wrote to a branch its own setup had
-  # just protected (card_8f4c23e5e5b5).
+  # just protected.
   ui-access-sweep:
     name: Browser UI access sweep
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
         run: |
@@ -303,10 +326,10 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -353,13 +376,15 @@ jobs:
       PLOMBIR_GIT_TEST_DATABASE_URL: postgres://plombir_git:plombir_git@127.0.0.1:5432/plombir_git
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       # First, deliberately: this reproduces the original failure only while the
       # database is still empty, because that is when concurrent migrators race
@@ -440,13 +465,15 @@ jobs:
       PLOMBIR_GIT_TEST_DATABASE_URL: mysql://plombir_git:plombir_git@127.0.0.1:3306/plombir_git
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Allow the migration account to create triggers with binary logging
         run: >-
@@ -517,10 +544,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
@@ -560,10 +589,12 @@ jobs:
         working-directory: web
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -598,7 +629,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       # Globs deploy/docker-compose*.yml rather than naming the files, for the
       # same reason the contract-check runner does: the two named here used to
@@ -636,7 +669,7 @@ jobs:
 
       # The reverse-proxy examples deploy/README.md tells operators to copy,
       # loaded by the proxies themselves (`nginx -t`, `caddy validate`). The
-      # same script runs in the local mirror (card_b7bfdbf0b00d).
+      # same script runs in the local push gates.
       - name: Validate the reverse-proxy examples
         run: bash scripts/check-reverse-proxy-examples.sh
 
@@ -673,7 +706,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       # Grafana has no offline provisioning linter. Use the same real YAML
       # parser as the workflow contract gate, installed explicitly so a runner
@@ -690,7 +725,7 @@ jobs:
       # pulled out of the raw bytes by shell here and again in the local mirror
       # — `grep … | head -1` handed the win to a commented-out pin above the
       # live one, and Docker creates a missing mount source as an empty
-      # directory rather than failing (card_f0fbdd88a68b). The script's header
+      # directory rather than failing. The script's header
       # carries the detail; stdout is `GITHUB_OUTPUT` syntax, the log half is on
       # stderr.
       - name: Image pins and mounted files of the observability stack
@@ -815,8 +850,9 @@ jobs:
       - name: Checkout
         # Full history: the path gate diffs against the pull request's base
         # commit, which a depth-1 checkout does not have.
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       # The decision is a step, not a job-level `if`, so the job always runs and
@@ -847,7 +883,7 @@ jobs:
 
       - name: Set up Buildx
         if: steps.scope.outputs.build == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       # cache-from/to type=gha is what keeps a source-only pull request
       # affordable: stage 2c compiles the whole dependency tree and only has to
@@ -865,7 +901,7 @@ jobs:
       # image stays inside buildx and never reaches the daemon.
       - name: Build the production image
         if: steps.scope.outputs.build == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile
@@ -932,7 +968,7 @@ jobs:
       # image detail that changes under it.
       - name: Install Node
         if: steps.scope.outputs.build == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
@@ -1012,7 +1048,7 @@ jobs:
           # outside `/api/v1` answers `200 text/html` exactly as it would in
           # production. That is the failure the smoke was blind to for its whole
           # life — it requested every path without the `/api/v1` mount prefix,
-          # got the SPA, and printed 288 green ticks (card_b23fa617838f). Inside
+          # got the SPA, and printed 288 green ticks. Inside
           # `/api/v1` an unrouted path is a JSON 404 that differs from a
           # handler's 404 only in its message, which is what the smoke compares.
           #

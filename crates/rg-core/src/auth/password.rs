@@ -16,8 +16,7 @@
 //! address. The synchronous kernels stay private, so a caller cannot reach
 //! Argon2 without going through the limiter.
 //!
-//! Also includes a [`PasswordValidator`] for password strength checks
-//! (Phase 22-D security hardening).
+//! Also includes a [`PasswordValidator`] for password strength checks.
 
 use anyhow::{Context, Result};
 use argon2::{
@@ -428,7 +427,7 @@ pub(crate) fn dummy_verification_burns() -> usize {
     DUMMY_VERIFICATION_BURNS.with(|burns| burns.get())
 }
 
-// ── Password Strength Validation (Phase 22-D) ──────────────────────────────
+// ── Password strength validation ───────────────────────────────────────────
 
 /// Password validation error.
 #[derive(Debug, Clone, PartialEq, Eq)]

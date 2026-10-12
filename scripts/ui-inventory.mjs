@@ -11,7 +11,7 @@
 // one-line diff to review rather than an assertion to rewrite.
 //
 // Why derived and not written by hand: `docs/FEATURE_INVENTORY.md` is the hand-
-// maintained twin and carries "последняя сверка с кодом: 2026-07-23" — 962
+// maintained twin and carries the date of its last source review — 962
 // commits ago, 64 of them in the router and 59 in `web/src`. A list a person
 // has to remember to update is a list that is wrong.
 
@@ -897,45 +897,41 @@ export function renderMarkdown(inv) {
 
   out.push('# Plombir Git — UI Inventory (generated)');
   out.push('');
-  out.push('> **Сгенерировано.** Не править руками — перегенерировать:');
+  out.push('> **Generated file.** Regenerate instead of editing by hand:');
   out.push('> `node scripts/ui-inventory.mjs`');
   out.push('>');
-  out.push('> Выводится из исходников: роутер (`crates/rg-http/src/routes.rs`), клиент');
-  out.push('> (`web/src/lib/api`), страницы (`web/src/routes`) и общие компоненты');
-  out.push('> (`web/src/lib/components`). Ручной близнец — `docs/FEATURE_INVENTORY.md`.');
+  out.push('> Built from the router (`crates/rg-http/src/routes.rs`), API client');
+  out.push('> (`web/src/lib/api`), pages (`web/src/routes`), and shared components');
+  out.push('> (`web/src/lib/components`). See also `docs/FEATURE_INVENTORY.md`.');
   out.push('>');
-  out.push('> **Что значит «покрыт».** `rust` / `smoke` отвечают на слабый вопрос —');
-  out.push('> *называет ли исполняемый тестовый код метод и полный URL роута*.');
-  out.push('> Комментарии и тот же URL под другим HTTP-методом coverage не создают.');
-  out.push('> `web` строже, потому что SvelteKit пишет адрес страницы ровно так же, как');
-  out.push('> адрес API за ней: засчитывается либо исполняемое обращение к client-члену,');
-  out.push('> привязанному к роуту (`repos.explore`), либо URL рядом с транспортом');
-  out.push('> (`request` / `downloadApiFile` / `fetch` / `WebSocket`). Навигация вроде');
-  out.push('> `setTestPage(\'/search?q=…\')` сама по себе HTTP-кредита не даёт. `browser` сильнее:');
-  out.push('> manifest называет ровно один живой control/passive call, а runtime проводит');
-  out.push('> его через owner + outsider и сверяет фактический статус с `Access`.');
-  out.push('> Текстовое упоминание само по себе всё ещё НЕ означает полезного теста.');
+  out.push('> **Coverage meaning.** `rust` and `smoke` only prove that executable');
+  out.push('> tests name the route method and full URL. Comments and another method');
+  out.push('> on the same URL do not count. `web` requires an executable API client');
+  out.push('> call or a URL next to its transport (`request`, `downloadApiFile`,');
+  out.push('> `fetch`, or `WebSocket`); navigation alone does not count. `browser`');
+  out.push('> names a live control or passive call and checks its actual response');
+  out.push('> against `Access` for both an owner and an outsider.');
   out.push('');
 
-  out.push('## Сводка');
+  out.push('## Summary');
   out.push('');
   out.push('| | |');
   out.push('|---|---|');
-  out.push(`| Роутов в роутере (с объявленным \`Access\`) | ${routes.length} |`);
-  out.push(`| Из них достижимы из браузера | ${uiRoutes.length} (${pct(uiRoutes.length, routes.length)}) |`);
-  out.push(`| Layout-модулей | ${layouts.length} |`);
-  out.push(`| Страниц | ${inv.pages.length} |`);
-  out.push(`| Интерактивных элементов | ${controls.length} |`);
-  out.push(`| — из них дёргают API | ${controls.filter((c) => c.calls.length).length} |`);
-  out.push(`| — приходят из общих компонентов | ${controls.filter((c) => c.via).length} |`);
-  out.push(`| Browser sweep: сценариев / записей инвентаря / роутов | ${inv.browserSweep.scenarios} / ${inv.browserSweep.coveredEntries} / ${inv.browserSweep.coveredRoutes} |`);
-  out.push(`| **UI-роутов без единого web/smoke/browser-теста** | **${uiRoutes.filter((r) => !frontendTested(r)).length}** |`);
-  out.push(`| UI-роутов без corpus-hit и browser-сценария | ${uiRoutes.filter((r) => !r.testedIn.length).length} |`);
+  out.push(`| Router routes (with declared \`Access\`) | ${routes.length} |`);
+  out.push(`| Reachable from the browser | ${uiRoutes.length} (${pct(uiRoutes.length, routes.length)}) |`);
+  out.push(`| Layout modules | ${layouts.length} |`);
+  out.push(`| Pages | ${inv.pages.length} |`);
+  out.push(`| Interactive controls | ${controls.length} |`);
+  out.push(`| Controls calling an API | ${controls.filter((c) => c.calls.length).length} |`);
+  out.push(`| Controls from shared components | ${controls.filter((c) => c.via).length} |`);
+  out.push(`| Browser sweep: scenarios / inventory entries / routes | ${inv.browserSweep.scenarios} / ${inv.browserSweep.coveredEntries} / ${inv.browserSweep.coveredRoutes} |`);
+  out.push(`| **UI routes without a web/smoke/browser test** | **${uiRoutes.filter((r) => !frontendTested(r)).length}** |`);
+  out.push(`| UI routes without corpus or browser coverage | ${uiRoutes.filter((r) => !r.testedIn.length).length} |`);
   out.push('');
 
-  out.push('## По уровню доступа');
+  out.push('## By access level');
   out.push('');
-  out.push('| `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |');
+  out.push('| `Access` | routes | reachable from UI | no frontend test | no corpus/browser coverage |');
   out.push('|---|---:|---:|---:|---:|');
   const byAccess = new Map();
   for (const route of routes) {
@@ -948,9 +944,9 @@ export function renderMarkdown(inv) {
   }
   out.push('');
 
-  out.push('## Страницы');
+  out.push('## Pages');
   out.push('');
-  out.push('| Страница | элементов | дёргают API | из компонентов |');
+  out.push('| Page | controls | call an API | from components |');
   out.push('|---|---:|---:|---:|');
   for (const page of [...inv.pages].sort((a, b) => b.controls.length - a.controls.length)) {
     const flag = page.admin ? ' 🔒' : '';
@@ -958,15 +954,15 @@ export function renderMarkdown(inv) {
   }
   out.push('');
 
-  out.push('## План тестов: элемент → роут → уровень доступа');
+  out.push('## Test plan: control → route → access level');
   out.push('');
-  out.push('Каждая строка — один сценарий e2e. `Access` говорит, какая персона обязана');
-  out.push('пройти и какая обязана получить отказ.');
+  out.push('Each row is an end-to-end scenario. `Access` defines which actor may');
+  out.push('succeed and which must be denied.');
   out.push('');
   if (layouts.some((layout) => layout.passive.length)) {
-    out.push('### Глобальные layout-загрузки');
+    out.push('### Global layout requests');
     out.push('');
-    out.push('| Scope | Источник | Вызов | `Access` | тест |');
+    out.push('| Scope | Source | Call | `Access` | test |');
     out.push('|---|---|---|---|---|');
     for (const layout of layouts) {
       for (const call of layout.passive) {
@@ -981,7 +977,7 @@ export function renderMarkdown(inv) {
     if (!acting.length && !page.passive.length) continue;
     out.push(`### \`${page.route}\`${page.admin ? ' 🔒' : ''}`);
     out.push('');
-    out.push('| Элемент | Откуда | Вызов | `Access` | тест |');
+    out.push('| Control | Source | Call | `Access` | test |');
     out.push('|---|---|---|---|---|');
     for (const control of acting) {
       for (const call of control.calls) {
@@ -992,17 +988,17 @@ export function renderMarkdown(inv) {
     }
     for (const call of page.passive) {
       const tested = call.testedIn.length ? call.testedIn.join('+') : '**—**';
-      out.push(`| _(загрузка страницы)_ | — | \`${call.method} ${esc(call.routeUrl || call.url)}\` | \`${esc(call.access || '?')}\` | ${tested} |`);
+      out.push(`| _(page load)_ | — | \`${call.method} ${esc(call.routeUrl || call.url)}\` | \`${esc(call.access || '?')}\` | ${tested} |`);
     }
     out.push('');
   }
 
-  out.push('## Роуты, недостижимые из браузера');
+  out.push('## Routes not reached from the browser');
   out.push('');
-  out.push('Не дефект: git, OCI, LFS, CI-раннер и вебхуки — легитимные не-браузерные');
-  out.push('клиенты. Это список того, что браузерный тест закрыть не может в принципе.');
+  out.push('This includes legitimate non-browser clients such as Git, OCI, LFS,');
+  out.push('CI runners, and webhooks. A browser test cannot cover these routes.');
   out.push('');
-  out.push('| Метод | URL | `Access` | тест |');
+  out.push('| Method | URL | `Access` | test |');
   out.push('|---|---|---|---|');
   for (const route of routes.filter((r) => !r.reachedFromUi)) {
     out.push(`| ${route.method} | \`${esc(route.url)}\` | \`${esc(route.access)}\` | ${route.testedIn.join('+') || '**—**'} |`);

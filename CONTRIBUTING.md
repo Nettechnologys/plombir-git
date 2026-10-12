@@ -52,21 +52,12 @@ cargo tree                  # inspect the dependency graph
 git clone https://github.com/Nettechnologys/plombir-git.git
 cd plombir-git
 
-# Use the repository-owned pre-push fallback for this clone. GitHub Actions runs
-# every job of regression.yml on each push and pull request, but only after the
-# push; these local checks are the part that runs before it. The jobs they
-# cannot mirror (the workspace tests, the security audit, the git-protocol and
-# database smokes) are reported as "run in CI only" — check the Actions run of
-# the commit you pushed.
-#
-# The normal card workflow runs the verifier once after committing. It checks
-# Rustfmt, strict workspace Clippy, and every cargo-free job of regression.yml,
-# then records a receipt bound to that commit. The hook accepts the receipt; a
-# direct push without one runs the same verifier as a fallback. Needs `node` and
-# `docker` on PATH in addition to the Rust toolchain.
+# Install the optional repository pre-push hook. It runs formatting, strict
+# workspace Clippy, and the local source/contract checks. The GitHub workflow
+# also runs tests and deployment checks; review its result on your PR.
 ./scripts/install-git-hooks.sh
 
-# After committing a card and before pushing, run all push gates once:
+# Before pushing, run the local push gates once:
 sh scripts/verify-push-gates.sh
 
 cargo build -j 6            # verify dependencies fetch and compile
@@ -283,31 +274,21 @@ Explain **why**, not just what — especially for protocol details:
 
 ## Commit conventions
 
-Follow [Conventional Commits](https://www.conventionalcommits.org/):
+Write a short imperative subject that says what changed. Add a body when the
+reason, compatibility impact, or verification is not obvious. The repository
+does not enforce a subject prefix or a particular merge strategy. For example:
 
 ```
-<type>(<scope>): <description>
-
-[body]
-
-[footer]
-```
-
-**Types:** `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `perf`.
-
-**Scope:** the crate name — `rg-git`, `rg-ssh`, `rg-http`, `rg-core`, `rg-db`,
-`rg-ci`, `rg-cli`, `rg-runner`, `rg-mcp`.
-
-**Example:**
-
-```
-feat(rg-ssh): implement SSH git push with sideband-64k report-status
+Send SSH report-status through sideband-64k
 
 Wrap report-status pkt-lines in band-1 sideband data instead of sending them
 as plain pkt-lines after a sideband flush.
-
-Closes #12
 ```
+
+Some older source comments and regression fixtures contain `card_...`
+identifiers from an internal tracker. They are historical context, not public
+links. Explain the invariant in the comment itself and link a public issue or
+PR for new work; do not add an unexplained internal identifier.
 
 ---
 
@@ -402,15 +383,6 @@ Put it in your **own** `~/.cargo/config.toml`, not in the repository's
 runner that has not installed it — the flag is target-scoped and therefore
 inert on macOS/Windows, but on Linux without `mold` it simply does not link.
 
-#### `target/` needs sweeping out now and then
-
-Cargo never garbage-collects artifacts from earlier builds, and this tree links
-a lot of large binaries — every `cargo build` of the workspace leaves another
-set of test binaries behind. One clean build is about 17 GB; left alone, this
-`target/` reached 316 GB (233 stale copies of the `plombir-git` binary). If the
-disk gets tight, `cargo clean` is the whole fix — the next build is cold
-(~7 min on a 24-core machine), and nothing else is lost.
-
 #### Test databases go through the production connect path
 
 `setup_test_db` (in `crates/rg-http/tests/integration/common/mod.rs`) connects via
@@ -502,18 +474,18 @@ environment variables (e.g. `FULL_REGRESSION_ONLY=backend`,
 
 ## Branching & PRs
 
-```
-main          ← stable; only tested PRs are merged
-dev           ← development trunk
-feat/<topic>  ← feature branches
-fix/<topic>   ← bug-fix branches
-```
+Create a topic branch from `main`, open a PR targeting `main`, and describe
+the change and its tests. Branch names such as `feat/<topic>` and
+`fix/<topic>` are suggestions, not required routing rules.
 
-Before a PR is merged into `main`:
+Before merge, formatting and strict workspace Clippy must pass without
+warnings, the relevant crate tests and source checks must pass, and the GitHub
+Regression workflow must finish green. Changes that affect the release image
+also need the image build and runtime smoke in that workflow. Explain any
+test that needs a live instance or manual acceptance in the PR.
 
-1. `cargo build --release` passes.
-2. `cargo clippy` reports no errors (and preferably no new warnings).
-3. The relevant `scripts/` regression subset passes.
+See [SECURITY.md](SECURITY.md) for private vulnerability reports and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for project participation.
 
 ---
 

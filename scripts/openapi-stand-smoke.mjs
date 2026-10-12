@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Compatibility entry point for the hourly OpenAPI smoke. The stand itself
+// Entry point for the OpenAPI smoke on an ephemeral stand. The stand itself
 // belongs to scripts/ephemeral-stand.sh: keeping the boot, readiness polling,
 // process-group teardown and temporary workspace in one loader is what makes a
 // green smoke run repeatable and an interrupted one safe.

@@ -26,10 +26,10 @@ function baseline(fixture) {
     'scripts/lib/stand.sh',
     'scripts/ephemeral-stand.sh',
     'scripts/git-protocol-e2e.sh',
-    // The hourly wrapper is a named regression target: it must keep delegating
+    // The OpenAPI wrapper is a named regression target: it must keep delegating
     // instead of quietly regrowing the third boot sequence fixed by
     // card_91a376a406db.
-    'scripts/codex-hourly-automation.mjs',
+    'scripts/openapi-stand-smoke.mjs',
     'web/vite.config.ts',
   ]) {
     cpSync(join(root, file), join(fixture, file));
@@ -93,15 +93,15 @@ const MUTATIONS = [
     expect: 'scripts/browser-e2e.sh starts its own Plombir Git',
   },
   {
-    name: 'the hourly wrapper regrows its own server boot',
+    name: 'the OpenAPI wrapper regrows its own server boot',
     apply: (fixture) => {
-      const file = join(fixture, 'scripts/codex-hourly-automation.mjs');
+      const file = join(fixture, 'scripts/openapi-stand-smoke.mjs');
       writeFileSync(
         file,
         `${readFileSync(file, 'utf8')}\nspawn('plombir-git', ['serve', '--listen-address-file', 'fixture']);\n`,
       );
     },
-    expect: 'scripts/codex-hourly-automation.mjs starts its own Plombir Git',
+    expect: 'scripts/openapi-stand-smoke.mjs starts its own Plombir Git',
   },
   {
     name: 'teardown stops removing the temporary workspace',

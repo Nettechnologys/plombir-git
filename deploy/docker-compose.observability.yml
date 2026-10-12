@@ -1,4 +1,4 @@
-# Plombir Git Observability Stack (Phase 22-C)
+# Plombir Git Observability Stack
 # Prometheus + Alertmanager + Grafana
 #
 # Every image is pinned as `tag@sha256:<digest>`. The tag is for the reader;

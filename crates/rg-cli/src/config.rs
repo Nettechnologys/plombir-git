@@ -2917,7 +2917,7 @@ mod tests {
             // work, not with a config edit.
             row(
                 "docs/FEATURE_INVENTORY.md",
-                "новый ключ отвергается ДО вставки",
+                "Bounded client-key map",
                 "rg_http::rate_limit::DEFAULT_MAX_KEYS",
                 format!("default {}", rg_http::rate_limit::DEFAULT_MAX_KEYS),
             ),
@@ -2938,13 +2938,13 @@ mod tests {
             ),
             row(
                 "docs/FEATURE_INVENTORY.md",
-                "всегда включён по умолчанию",
+                "always-on by default",
                 "DEFAULT_AUTH_RATE_LIMIT_MAX",
                 format!("({}/", super::DEFAULT_AUTH_RATE_LIMIT_MAX),
             ),
             row(
                 "docs/FEATURE_INVENTORY.md",
-                "всегда включён по умолчанию",
+                "always-on by default",
                 "DEFAULT_AUTH_RATE_LIMIT_WINDOW",
                 format!("/{}s", super::DEFAULT_AUTH_RATE_LIMIT_WINDOW),
             ),

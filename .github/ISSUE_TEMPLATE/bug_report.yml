@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a reproducible problem that is safe to discuss publicly.
+title: "Bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "For security vulnerabilities, use the private reporting link in SECURITY.md instead."
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release tag or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include expected and actual behavior. Redact secrets and personal data.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and logs
+      description: Operating system, database, and relevant redacted logs

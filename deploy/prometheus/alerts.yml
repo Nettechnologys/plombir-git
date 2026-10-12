@@ -1,5 +1,4 @@
 # Plombir Git Alert Rules
-# Phase 22-C: Observability Stack
 groups:
   # HTTP/API alerts
   - name: plombir_git_http

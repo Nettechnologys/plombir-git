@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Plombir Git Observability Quick Start
-# Phase 22-C
 
 set -e
 
@@ -122,7 +121,7 @@ fi
 read -r PLOMBIR_GIT_HOST_PORT PLOMBIR_GIT_CONTAINER_PORT <<<"${PLOMBIR_GIT_HTTP_PORTS}"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Plombir Git Observability Stack — Phase 22-C"
+echo "  Plombir Git Observability Stack"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 

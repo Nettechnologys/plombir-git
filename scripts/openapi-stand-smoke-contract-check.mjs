@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Drive the real hourly wrapper through the shared stand with cheap process
+// Drive the real OpenAPI wrapper through the shared stand with cheap process
 // fixtures. This proves the compatibility entry point still delegates the
 // release build and OpenAPI smoke, and that a signal sent to the Node wrapper
 // reaches the stand's bounded process-group teardown.
@@ -21,8 +21,8 @@ import { fileURLToPath } from 'node:url';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptsDir, '..');
-const automation = join(scriptsDir, 'codex-hourly-automation.mjs');
-const fixture = scratchDir(join(tmpdir(), 'plombir-git-codex-hourly-contract-'));
+const automation = join(scriptsDir, 'openapi-stand-smoke.mjs');
+const fixture = scratchDir(join(tmpdir(), 'plombir-git-openapi-stand-contract-'));
 const results = join(fixture, 'results');
 const bin = join(fixture, 'bin');
 const standTmp = join(fixture, 'tmp');
@@ -109,7 +109,7 @@ async function waitForRun(run, timeoutMs = 20_000) {
     return await Promise.race([
       run.done,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('hourly automation fixture timed out')), timeoutMs);
+        timer = setTimeout(() => reject(new Error('OpenAPI stand fixture timed out')), timeoutMs);
       }),
     ]);
   } finally {
@@ -243,14 +243,14 @@ try {
     throw new Error(`stubborn server teardown took ${teardownMs}ms, expected the bounded ~5s TERM -> KILL path`);
   }
   if (standWorkspaces().length !== 0) {
-    throw new Error(`SIGINT hourly run left stand workspaces: ${standWorkspaces().join(', ')}`);
+    throw new Error(`SIGINT OpenAPI smoke left stand workspaces: ${standWorkspaces().join(', ')}`);
   }
   await requireProcessGone(join(results, 'server-pid-interrupted'));
   await requireProcessGone(join(results, 'helper-pid-interrupted'));
   await requireProcessGone(join(results, 'smoke-pid-interrupted'));
 
   console.log(
-    `✅ codex hourly automation: shared stand cleans SIGINT and kills a stubborn process group in ${teardownMs}ms`,
+    `✅ OpenAPI stand smoke: shared stand cleans SIGINT and kills a stubborn process group in ${teardownMs}ms`,
   );
 } finally {
   for (const child of activeRuns) {

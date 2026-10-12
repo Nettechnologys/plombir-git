@@ -94,7 +94,7 @@ mode) is the lightweight default; PostgreSQL/MySQL suit larger deployments.
 ## 4. Workspace structure
 
 ```
-ForgeKeep/
+plombir-git/
 ├── Cargo.toml                    # workspace root
 ├── crates/
 │   ├── rg-core/                  # core business logic

@@ -1,0 +1,19 @@
+name: Feature request
+description: Suggest a product change.
+title: "Feature: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the workflow and who needs it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include alternatives or compatibility constraints if relevant.
+    validations:
+      required: true

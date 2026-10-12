@@ -589,7 +589,7 @@ proved itself.
 
 ---
 
-## 📊 Observability Stack (Phase 22-C)
+## 📊 Observability Stack
 
 ## Overview
 
@@ -688,11 +688,10 @@ The server logs a warning at startup while `/metrics` is open to anyone.
 > live. The CI/CD family is emitted by **both** executors: the external runner
 > through its `finish` handler, and the embedded in-process runner
 > (`ci.external_runners = false`, the default) through the
-> `rg_core::metrics_hook` observers. Until `card_e309fbb5a3fd` only the external
-> path produced any of it, so a default instance answered zero for every CI
-> series while its builds ran.
+> `rg_core::metrics_hook` observers. Both execution modes must report CI
+> metrics; check them when changing either runner.
 
-### Business Metrics (Phase 22-C)
+### Business Metrics
 | Metric | Type | Description |
 |--------|------|-------------|
 | `plombir_git_users_registered_total` | Counter | User accounts created — self-service registration **and** LDAP/SSO first-login auto-provision (provenance split via `plombir_git_auth_events_total{event="provision",outcome="ldap"\|"sso"}`; refusals are a separate series, `event="provision_refused",outcome=<rule>`, and never count as an account) |

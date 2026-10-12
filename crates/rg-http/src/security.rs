@@ -1,6 +1,6 @@
 //! Security headers middleware for Plombir Git.
 //!
-//! Phase 22-D: Adds defense-in-depth HTTP security headers to all responses.
+//! Adds defense-in-depth HTTP security headers to all responses.
 //! These headers protect against common web vulnerabilities (XSS, clickjacking,
 //! MIME sniffing, etc.) without affecting functionality.
 //!
@@ -33,7 +33,7 @@ pub(crate) fn inject_csp_nonce(html: &str, nonce: &str) -> String {
 
 /// Middleware that adds security headers to all responses.
 ///
-/// Headers added (Phase 22-D):
+/// Headers added:
 /// - `X-Content-Type-Options: nosniff` — prevent MIME sniffing
 /// - `X-Frame-Options: DENY` — prevent clickjacking
 /// - `X-XSS-Protection: 0` — disable legacy XSS filter (modern browsers deprecated it)

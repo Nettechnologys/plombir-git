@@ -1,128 +1,96 @@
 # Plombir Git — Feature Inventory
 
-> Живой реестр того, **что реально реализовано** в кодовой базе, с упором на
-> security-поверхность. Цель — чтобы перед «а давайте добавим X» можно было за
-> 30 секунд проверить, нет ли X уже, и в каком он состоянии. Обновлять при
-> добавлении/изменении фичи. Ссылки вида `crate/файл:строка` кликабельны из
-> индекса.
->
-> Легенда статуса: ✅ есть · 🟡 частично · ❌ нет · 🔒 security-релевантно
+This is a maintained map of implemented features and known gaps, focused on
+security boundaries. It is not a substitute for source or runtime checks.
+Last partial source review: 2026-10-11 (agent features and README claims).
 
-_Частичная сверка с кодом: 2026-10-11 (таблица agent-native и README features). Остальные разделы требуют новой проверки._
+Legend: ✅ implemented · 🟡 partial · ❌ absent · 🔒 security relevant.
+Paths below are relative to `crates/` unless stated otherwise.
 
----
+## Git transport
 
-## 1. Git transport
+| Feature | State | Implementation and limit |
+|---|---|---|
+| Smart Protocol V1 and V2 | ✅ | `rg-git/src/protocol/`: pkt-line, sideband, pack handling |
+| HTTPS and SSH | ✅ 🔒 | `rg-http/src/lib.rs`, `rg-ssh/`; SSH public-key authentication |
+| Git request body limits | ✅ 🔒 | `rg-http/src/routes.rs` |
+| Git subprocess timeout and termination | ✅ 🔒 | `rg-git/src/cli_gateway.rs`; default 120 seconds |
+| Stream wall-clock limit | ✅ 🔒 | `rg-http/src/git_http.rs`, `rg-ssh/src/lib.rs`; `[timeouts].git_stream_secs`, default 300, 0 disables |
+| Idle stream limit | ✅ 🔒 | `rg-git/src/io_timeout.rs`, HTTP and SSH call sites; `[timeouts].git_idle_secs`, default 30, 0 disables |
+| Outgoing pack memory bound | 🟡 🔒 | Upload bodies are spooled with limits; generated download packs can still be assembled in memory |
 
-| Фича | Статус | Где | Заметки |
-|------|--------|-----|---------|
-| Smart Protocol V1 + V2 | ✅ | `rg-git/src/protocol/` | pkt-line, sideband-64k, packfile encode/decode |
-| HTTPS transport | ✅ | `rg-http/src/lib.rs` | axum + `axum-server`/rustls при TLS |
-| SSH transport | ✅ | `rg-ssh/` (`russh`) | public-key auth |
-| Лимит размера тела git-запроса | ✅ 🔒 | `rg-http/src/routes.rs` | RequestBodyLimit на git-роутах |
-| git CLI gateway с timeout+kill | ✅ 🔒 | `rg-git/src/cli_gateway.rs` | синхронный `run()` — timeout + kill child (default 120s) |
-| Wall-clock bound на стриминг-пути (pack-objects/index-pack) | ✅ 🔒 | `rg-http/src/git_http.rs::with_git_timeout`, `rg-ssh/src/lib.rs::with_git_timeout` | **HTTP:** upload-pack (V1+V2) и receive-pack обёрнуты в `tokio::time::timeout([timeouts].git_stream_secs, деф. 300, 0=off)`; по таймауту future дропается → `kill_on_drop` убивает git → 504 `GIT_TIMEOUT`. **SSH:** тот же bound вокруг `handle_*_stream` в `exec_request` spawn (тот же `[timeouts].git_stream_secs`, проброшен через `SshServerConfig`/`SharedState`); по таймауту → лог + exit_code≠0 + `stream.shutdown()`, git убит `kill_on_drop`. Оба входа покрывают все 3 `spawn_async`-колсайта. |
-| Idle-таймаут на стриминг-пути (slow-drip watchdog поверх wall-clock) | ✅ 🔒 | `rg-git/src/io_timeout.rs::IdleTimeout`, `rg-ssh/src/lib.rs`, `rg-http/src/git_http.rs::stage_git_body` | Второй сторож: рвёт соединение при отсутствии **прогресса** байт дольше `[timeouts].git_idle_secs` (деф. 30, 0=off), даже пока wall-clock ещё не истёк — ловит slow-drip push/fetch. **SSH:** сетевой `ChannelStream` обёрнут в `IdleTimeout` (reset-on-progress reader+writer); idle-трип → `io::Error(TimedOut)` из хендлера → git убит `kill_on_drop` + exit≠0. **HTTP upload:** после авторизации тело по frame'ам пишется во временный файл; `timeout(git_idle_secs, body.frame())` даёт 504, а потолки 16 MiB для negotiation и 1 GiB для receive-pack — 413. Большой push больше не резервирует равный ему `Vec`. **HTTP download:** `git_response_body_with_idle` ограничивает backpressure и даёт 504 медленному читателю. **Остаток:** сам исходящий pack пока целиком собирается в памяти до отправки — `card_73f02e2a97ad`. |
+## Authentication and authorization
 
-## 2. Аутентификация и авторизация
+| Feature | State | Implementation and limit |
+|---|---|---|
+| Registration and login | ✅ 🔒 | `rg-core/src/auth/`, `rg-core/src/user/service.rs`; Argon2 and JWT |
+| Scoped personal access tokens | ✅ 🔒 | `rg-http/src/pat_auth.rs`, `pat_scope.rs`; stored as SHA-256 hashes |
+| SSH keys, MFA/TOTP, SSO/LDAP/OAuth | ✅ 🔒 | `rg-ssh/`, `rg-core/src/auth/` |
+| CI OIDC and JWKS | ✅ 🔒 | `rg-core/src/auth/ci_oidc.rs`; short-lived Ed25519 JWTs |
+| Sanitized internal errors | ✅ 🔒 | `rg-http/src/error.rs`; generic client messages |
+| Invite, approval, or CAPTCHA for registration | ❌ 🔒 | Registration is open; auth routes have an always-on per-route rate-limit (10/60s) instead |
 
-| Фича | Статус | Где | Заметки |
-|------|--------|-----|---------|
-| Регистрация/логин (argon2 + JWT HS256) | ✅ 🔒 | `rg-core/src/auth/jwt.rs`, `rg-core/src/user/service.rs` | |
-| Personal Access Tokens (SHA-256 hash, scoped) | ✅ 🔒 | `rg-http/src/pat_auth.rs`, `pat_scope.rs` | скоупы по семействам API |
-| SSH public-key auth | ✅ 🔒 | `rg-ssh/` | |
-| MFA / TOTP | ✅ 🔒 | `totp-rs`, `rg-core/src/auth/` | |
-| SSO / LDAP / OAuth (PKCE) | ✅ 🔒 | `rg-core/src/auth/`, `ldap3` | |
-| CI OIDC — Ed25519 short-lived JWT + JWKS | ✅ 🔒 | `rg-core/src/auth/ci_oidc.rs` | **Ed25519-ключ уже в системе** — переиспользуем для подписи артефактов |
-| Санитизация internal-ошибок в ответах (H-05) | ✅ 🔒 | `rg-http/src/error.rs` | internal → generic message |
-| Защита регистрации от спама (invite/approval/captcha) | ⚠️ 🔒 | `rg-http/src/routes.rs` | открытая саморегистрация; барьер — always-on per-route rate-limit на `/register`+`/login` (10/60s по умолчанию); invite/approval/captcha пока нет |
+## Abuse limits
 
-## 3. Anti-abuse / rate limiting
+| Feature | State | Implementation and limit |
+|---|---|---|
+| Global per-IP rate limit | ✅ 🔒 | `rg-http/src/rate_limit.rs`; disabled by default when `max=0` |
+| Trusted proxy address resolution | ✅ 🔒 | `rg-http/src/rate_limit.rs`; allowlisted proxy addresses |
+| Bounded client-key map | ✅ 🔒 | `[rate_limit].max_keys`, default 100000; a new key is rejected before insertion when full |
+| Auth route limits and reset-mail cooldown | ✅ 🔒 | `rg-http/src/routes.rs`; always-on by default (10/60s) for sensitive routes |
+| Agent account limit | ✅ 🔒 | `rg-http/src/pat_auth.rs`; default 600 requests per 60 seconds |
+| Dedicated Git push limit | ❌ 🔒 | Pushes use the global limit only |
+| CAPTCHA or proof of work | ❌ | No external CAPTCHA service is required |
 
-| Фича | Статус | Где | Заметки |
-|------|--------|-----|---------|
-| Rate limiter (fixed-window token bucket, per-IP) | ✅ 🔒 | `rg-http/src/rate_limit.rs` | глобальный один слой; по умолчанию `max=0` (выкл.) |
-| Trusted-proxy resolve (XFF/X-Real-IP по allowlist IP) | ✅ 🔒 | `rg-http/src/rate_limit.rs:140` | |
-| `max_keys` cap на карту клиентов | ✅ 🔒 | `rg-http/src/rate_limit.rs` | новый ключ отвергается ДО вставки при заполнении; амортизированный inline-sweep протухших ≤1×/сек; default 100000, `[rate_limit] max_keys` |
-| Per-route / per-endpoint лимиты (вход и восстановление) | ✅ 🔒 | `rg-http/src/routes.rs` | отдельный, более жёсткий лимитер per-route на `/users/register`, `/users/login`, `/users/forgot-password`, `/users/reset-password`, `/users/mfa/verify`, `/users/passkeys/login/*` (один бюджет на клиента); всегда включён по умолчанию (10/60s), `[rate_limit] auth_max`/`auth_window_secs`; плюс кулдаун 60 с на письмо сброса для одного аккаунта |
-| Лимит на бот-аккаунт (агенты) | ✅ 🔒 | `rg-http/src/pat_auth.rs` | ключ — аккаунт бота, не IP; включён по умолчанию (600/60s), `[rate_limit] agent_max`/`agent_window_secs` |
-| Per-route лимит на git-push | ❌ 🔒 | — | push бьётся только глобальным лимитом; отдельный лимитер не заведён |
-| CAPTCHA / proof-of-work | ❌ | — | сознательно НЕ портируем iCaptcha (внешний сервис); альтернатива — hashcash PoW |
+## Outbound network calls
 
-## 4. Исходящие сетевые вызовы (webhooks / mirrors)
+| Feature | State | Implementation and limit |
+|---|---|---|
+| Outbound webhooks | ✅ 🔒 | `rg-core/src/webhook/`; HTTPS by default; HTTP requires explicit opt-in |
+| Mirror transport policy | ✅ 🔒 | `rg-core/src/mirror/`; HTTPS by default, HTTP opt-in, native `git://` rejected |
+| Webhook HMAC signing and inbound verification | ✅ 🔒 | `X-Hub-Signature-256`; inbound check requires a configured external secret |
+| HTTP timeouts and redirect refusal | ✅ 🔒 | `rg-core/src/net.rs`; 30-second request and 10-second connect timeouts |
+| Webhook DNS-rebinding defense | ✅ 🔒 | Checked addresses are passed to the connector; proxy use and redirects are disabled |
+| Mirror SSRF defense | ✅ 🔒 | URL checks at configuration and execution, plus checked address selection |
 
-| Фича | Статус | Где | Заметки |
-|------|--------|-----|---------|
-| Outbound webhook доставка | ✅ 🔒 | `rg-core/src/webhook/service.rs`, `rg-core/src/webhook/transport.rs` | HTTPS по умолчанию; plaintext `http://` требует явного `[webhooks].allow_insecure_http = true`, не отключающего SSRF-проверки |
-| Mirror transport confidentiality | ✅ 🔒 | `rg-core/src/mirror/transport.rs`, `mirror/service.rs` | HTTPS по умолчанию; plaintext `http://` требует явного instance-level `[mirror].allow_insecure_http = true`, а нешифрованный native `git://` запрещён безусловно, включая legacy-строки. Create/update, sync-time guard и последний git sink проверяют policy; HTTP opt-in не отключает SSRF и не разрешает `git://` |
-| HMAC-SHA256 подпись исходящих (`X-Hub-Signature-256`) | ✅ 🔒 | `rg-core/src/webhook/service.rs:188` | GitHub-совместимо |
-| Timeout на исходящем HTTP-клиенте | ✅ 🔒 | `rg-core/src/net.rs`, `auth/sso.rs` | общий `outbound_client()` с `timeout(30s)` + `connect_timeout(10s)`; все 7 SSO/OIDC call-site'ов идут через него |
-| Запрет редиректов / SSRF-защита (private/loopback IP) | ✅ 🔒 | `rg-core/src/net.rs`, `webhook/service.rs`, `auth/sso.rs` | Webhook-клиент: `redirect(Policy::none())` + proxy-off + кастомный `reqwest::dns::Resolve`, который reject'ит private/loopback/link-local/ULA/CGNAT и отдаёт коннектору те же проверенные адреса без DNS-rebinding TOCTOU. SSO-outbound: timeout + redirect-ban применены; private-IP guard сознательно НЕ навешен (admin-config / OIDC-discovery endpoint'ы, self-hosted internal IdP — легитимен). Import API/git subprocess destination pinning вынесен в отдельные cards. |
-| Верификация HMAC на входящих вебхуках | ✅ 🔒 | `rg-http/src/api/webhooks_external.rs` | opt-in `[webhooks].external_secret` / `PLOMBIR_GIT_EXTERNAL_WEBHOOK_SECRET`; при заданном секрете `X-Hub-Signature-256` над сырым телом проверяется constant-time (`hmac::verify_slice`), формат `sha256=<hex>` симметричен исходящим; не задан → auth-only как раньше |
-| SSRF-защита mirror-sync (git-субпроцесс на user-URL) | ✅ 🔒 | `rg-core/src/net.rs`, `mirror/service.rs` | Общий git allow-list остаётся `https/http/git` для mirror/import SSRF-классификации, но mirror-owned transport policy поверх него допускает только `https` и явно opt-in `http`; `git://` fail-closed. `check_git_url_static()` на create/update + DNS `guard_git_url()` перед `git clone --mirror`/`remote update`; тот же `is_forbidden_ip` (private/loopback/link-local/ULA/CGNAT). Timeout — общий git-gateway. Оставшийся import `git://` scope вынесен в `card_7dac1a31bba3` |
+## Runtime robustness
 
-## 5. Robustness / эксплуатация
+| Feature | State | Implementation and limit |
+|---|---|---|
+| Graceful HTTP/SSH shutdown | ✅ | `rg-cli/src/serve.rs`, `rg-http/src/lib.rs`; configurable grace period |
+| Worker and detached-delivery drain | ✅ | Shutdown channel and `rg-core/src/task_tracker.rs` |
+| Database unavailable vs internal error | ✅ 🔒 | `rg-http/src/error.rs`; connection errors use 503, statement errors 500 |
+| Git timeout response | ✅ 🔒 | `GIT_TIMEOUT` returns 504 without leaking command details |
+| Numeric configuration range checks | 🟡 | Some values still accept zero or extreme input; check each setting |
+| Prometheus metrics | ✅ | `rg-http/src/metrics.rs`; served on the main app port |
+| Private metrics listener | ❌ | Restrict `/metrics` at the proxy or configure a metrics token |
 
-| Фича | Статус | Где | Заметки |
-|------|--------|-----|---------|
-| Graceful shutdown + drain in-flight запросов | ✅ | `rg-cli/src/serve.rs`, `rg-http/src/lib.rs` | SIGTERM/ctrl_c → `watch`-канал; `with_graceful_shutdown` (HTTP) + `axum_server::Handle::graceful_shutdown` (HTTPS) с конфигурируемым grace-окном (`[server].shutdown_grace_secs`, деф. 30). Живой тест: `kill -TERM` → exit 0 за ~0.2s |
-| Shutdown-канал для фоновых воркеров | ✅ | audit/ci-retention/runner-watchdog/rate-limit/ci-log | Персистентные loop-воркеры + CI-log-очередь (`spawn_with_shutdown`) сливают буфер и выходят по сигналу (unit-тест `drains_buffered_writes_on_shutdown`) |
-| Drain detached fire-and-forget доставок (webhook/WS) | ✅ | `rg-core/src/task_tracker.rs`, `webhook/service.rs:141`, `rg-http/src/ws.rs:319`, `lib.rs` (run drain) | Per-request detached-задачи (webhook-доставка + `webhook_delivery`-строка, WS-нотификация + persisted-строка) спавнятся через общий `tokio_util::task::TaskTracker` (`delivery_tracker()`), а не голый `tokio::spawn`; `run()` после server/CI-log-drain делает `close()`+`timeout(grace, wait())` → доставки не обрываются на полуслове по SIGTERM. Unit-тест `close_then_wait_drains_a_spawned_task`. Mirror-sync/merge-queue вызываются инлайн-await в хендлерах → уже покрыты HTTP-drain. Импорт (долгий) — recovery через watchdog, см. card_7bdb43ffa88c |
-| Разделение ошибок: 503 (БД недоступна) vs 500 | ✅ 🔒 | `rg-http/src/error.rs` | `AppError::ServiceUnavailable`→503 `DB_UNAVAILABLE`; `From<DbErr>` классифицирует connection-level (`Conn`/`ConnectionAcquire`) → 503, statement-level (Exec/Query) → 500. Health-probe уже отдаёт 503 при падении БД. Осталось: часть хендлеров конвертит `DbErr` явно через `AppError::internal(...)` в обход `From` → см. card |
-| Отдельный 504 для git-timeout | ✅ 🔒 | `rg-http/src/error.rs` | `AppError::Timeout`→504 `GIT_TIMEOUT`; `From<anyhow::Error>` downcast'ит `GitCliError::Timeout` (в т.ч. сквозь `.context()`). Детали (git-командная строка) не утекают клиенту |
-| Range-валидация числовых конфигов | ❌ | `rg-cli/src/serve.rs` | serde-дефолты без проверки; `0`/абсурд принимается молча → см. card |
-| Prometheus метрики (HTTP/db/git/ci/business/security) | ✅ | `rg-http/src/metrics.rs` | богаче, чем у аналогов; на основном порту |
-| `/metrics` на отдельном приватном интерфейсе | 🟡 | `rg-http/src/metrics.rs` | сейчас на публичном app-порту (опционально вынести) |
-| pack-size histogram | ❌ | — | мелкое дополнение метрик |
+## Storage and artifacts
 
-## 6. Хранилище / артефакты
+| Feature | State | Implementation and limit |
+|---|---|---|
+| Atomic local blob storage | ✅ | `rg-core/src/blob_storage.rs` |
+| OCI content-addressed packages | ✅ 🔒 | `rg-core/src/package_registry/oci/` |
+| Release asset SHA-256 | ✅ 🔒 | `rg-core/src/release/service.rs`; legacy assets without a digest are separate |
+| Release attestations | ✅ 🔒 | Optional DSSE envelope, Ed25519 signing, and verification API |
 
-| Фича | Статус | Где | Заметки |
-|------|--------|-----|---------|
-| BlobStorage trait + локальный atomic backend | ✅ | `rg-core/src/blob_storage.rs:88` | чистый trait-based дизайн |
-| OCI package registry (content-addressed digests) | ✅ | `rg-core/src/package_registry/oci/` | digest для content-addressing, не provenance |
-| SHA-256 digest для релизных ассетов | ✅ 🔒 | `rg-core/src/release/service.rs:154,214` | `upload_asset` пишет `sha256`, `download_asset` сверяет целостность (bail при mismatch), отдаётся `X-Checksum-Sha256`; legacy-ассеты (NULL) без guard'а |
-| Подпись/attestation релизных ассетов (in-toto + DSSE, SLSA/Sigstore-совместимо) | ✅ 🔒 | `rg-core/src/attestation/`, `rg-core/src/release/service.rs` | opt-in (`[releases] attestation_enabled` / `PLOMBIR_GIT_ATTESTATION_ENABLED`); detached DSSE-envelope с JCS-каноникализацией (RFC 8785), Ed25519-подпись **тем же** ключом, что и CI OIDC JWKS (`/ci/oidc/jwks`); pluggable verifier-registry по `predicateType`; API `POST/GET .../assets/:id/attestation` + `.../verify`; неверная подпись/подменённый ассет → verify FAIL |
+## Agent and MCP support
 
-## 7. Agent-native / MCP
+| Feature | State | Implementation and limit |
+|---|---|---|
+| MCP stdio and HTTP tools | ✅ 🔒 | `rg-mcp/`, `rg-http/src/api/mcp.rs`; REST authorization applies |
+| Repository read and write tools | ✅ 🔒 | `rg-mcp/src/tools/mod.rs`; writes use REST authorization |
+| CI tools and search | ✅ | `rg-mcp/src/tools/mod.rs`; code search needs an index |
+| AI tree endpoint | 🟡 | MCP wrapper exists; HTTP `repo_tree` currently returns 501 |
+| Bot accounts and scoped tokens | ✅ 🔒 | `rg-core/src/user/bots.rs`, `rg-http/src/agent_scope.rs` |
+| Agent activity audit | ✅ 🔒 | `rg-core/src/audit/audit.rs` |
+| Human approval for bot-authored PRs | ✅ 🔒 | `rg-core/src/branch_protection/service.rs` |
 
-| Фича | Статус | Где | Заметки |
-|------|--------|-----|---------|
-| MCP-сервер (JSON-RPC, stdio) | ✅ | `rg-mcp/` | |
-| Read tools (list_repos, read_file, read_dir, get_issue, get_pr, get_pr_diff, list_reviews, list_review_comments) | ✅ | `rg-mcp/src/tools/mod.rs` | 8 read-обёрток; ревью и inline-комментарии PR видны агенту |
-| Write-tools (write_file, create/update/comment/labels issues, PR create/merge, review + inline-comment/ответ в треде + apply-suggestion, request-reviewers) | ✅ | `rg-mcp/src/tools/mod.rs` | тонкие обёртки над REST, тело строится из whitelist ключей; `write_file` коммитит в ветку и создаёт её от ветки по умолчанию |
-| CI-tools (list/get pipeline, retry/cancel, get job, commit status) | ✅ | `rg-mcp/src/tools/mod.rs` | `list_pipelines`/`get_pipeline`/`retry_pipeline`/`cancel_pipeline`/`get_ci_job`/`get_commit_status` (статусы внешнего CI) |
-| `search` через MCP | ✅ | `rg-mcp/src/tools/mod.rs` | обёртка `/search` (q/type/page/per_page) |
-| Обёртки `/ai/*` (summary / issues / prs / tree / search_code) | 🟡 | `rg-mcp/src/tools/mod.rs`, `rg-http/src/api/ai.rs` | MCP-обёртка для tree существует, но HTTP `repo_tree` возвращает 501; поиск по коду требует явно построенного индекса |
-| MCP по HTTP (`POST /api/v1/mcp`) | ✅ 🔒 | `rg-http/src/api/mcp.rs` | те же инструменты, вызовы API идут in-process через роутер с учёткой вызывающего; локальный бинарник агенту не нужен |
-| Учётки-боты (агент как отдельный участник) | ✅ 🔒 | `rg-core/src/user/bots.rs`, `rg-http/src/api/bots.rs` | `users.bot_owner_id`; без пароля, токены выпускает владелец, только скоуп `repo`; бот перестаёт работать вместе с владельцем; в UI автор-бот показан с владельцем |
-| Сужение токена: репозитории / MCP-инструменты / защищённые ветки | ✅ 🔒 | `rg-http/src/agent_scope.rs`, `rg-core/src/auth/credential_context.rs` | per-route слой по `Access` и `{owner}/{name}`, git и OCI отдельно; запрет merge/push/server-side commit в защищённые ветки |
-| Отдельный rate-limit агентов | ✅ 🔒 | `rg-http/src/pat_auth.rs` | бюджет на бот-аккаунт, общий для всех его токенов; `[rate_limit] agent_max`/`agent_window_secs` (600/60s) |
-| Аудит действий агента | ✅ 🔒 | `rg-core/src/audit/audit.rs` | `agent.mcp_tool_call`, `agent.scope_denied`; каждая запись через токен несёт `credential.token_id` и `credential.mcp_tool` |
-| Одобряет человек (агент открыл PR → CODEOWNERS → человек одобрил) | ✅ 🔒 | `rg-core/src/branch_protection/service.rs` | в `required_approvals` идёт одобрение только человека с правом записи, не автора и не владельца бота-автора; e2e: `agent_accounts_tests::an_agents_pull_request_merges_only_after_a_code_owner_approves` |
+## Deliberately out of scope
 
----
+Decentralized identity, UCAN proof chains, peer-to-peer replication, and
+wallet-backed bounties are not part of this centralized forge. The project
+uses accounts, scoped tokens, and repository permissions instead.
 
-## Сознательно НЕ реализуем (и почему)
-
-Идеи из gitlawb, отвергнутые как чуждые архитектуре централизованного форджа:
-
-- **UCAN capability-tokens + proof-chains** — решают делегирование между
-  взаимно-недоверяющими пирами; у нас PAT-scopes + permission-строки в БД.
-- **`did:key` / `did:web` identity** — DID нужны при отсутствии центрального
-  реестра аккаунтов; у нас есть users/OAuth/LDAP/SSH.
-- **libp2p / p2p-репликация / gossip** — чистая федерация.
-- **iCaptcha** — требует внешний сервис, нарушает single-binary без внешних
-  зависимостей. Приемлемая альтернатива — self-contained hashcash-PoW.
-- **bounties / tasks как first-class сущности** — завязаны на wallet/UCAN,
-  отдельный экономический продукт.
-- **git-remote helper для кастомной URL-схемы** — обслуживает DID-модель.
-
----
-
-## Как пользоваться
-
-1. Перед добавлением фичи — `grep`/поиск по этой таблице.
-2. Каждый ❌/🟡 с пометкой «→ см. card» имеет карточку в roadmap-фазе
-   _«Hardening & agent-native: идеи из gitlawb»_.
-3. Закрыл gap — обнови статус в таблице в том же PR.
+When changing a feature, update its row in the same PR. Verify the behavior
+against current code and tests before promoting a partial row to implemented.

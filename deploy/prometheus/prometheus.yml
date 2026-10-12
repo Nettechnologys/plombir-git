@@ -1,5 +1,4 @@
 # Plombir Git Prometheus Configuration
-# Phase 22-C: Observability Stack
 
 global:
   scrape_interval: 15s          # Scrape targets every 15s

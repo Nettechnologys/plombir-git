@@ -257,7 +257,7 @@ pub fn init_registry() -> Result<(), prometheus::Error> {
     Ok(())
 }
 
-/// Rate limit metrics (Phase 22-D).
+/// Rate limit metrics.
 pub mod rate_limit {
     use prometheus::{IntCounter, Opts, Registry};
     use std::sync::OnceLock;
@@ -278,7 +278,7 @@ pub mod rate_limit {
     }
 }
 
-/// Security metrics (Phase 22-D).
+/// Security metrics.
 pub mod security {
     use prometheus::{IntCounterVec, Opts, Registry};
     use std::sync::OnceLock;
@@ -318,7 +318,7 @@ pub mod security {
     }
 }
 
-/// Business-level metrics (Phase 22-C).
+/// Business-level metrics.
 /// Tracks entity counts that matter for the product: users, repos, issues, PRs, etc.
 pub mod business {
     use prometheus::{IntCounter, IntCounterVec, IntGauge, Opts, Registry};

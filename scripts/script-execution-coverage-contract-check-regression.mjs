@@ -166,12 +166,12 @@ runFixture(
 runFixture(
   'a filename binding stops counting when it no longer reaches spawn',
   (fixture) => replaceRequired(
-    join(fixture, 'scripts', 'codex-hourly-automation-contract-check.mjs'),
+    join(fixture, 'scripts', 'openapi-stand-smoke-contract-check.mjs'),
     'const child = spawn(process.execPath, [automation], {',
     "const child = spawn(process.execPath, ['-e', ''], {",
   ),
   1,
-  'scripts/codex-hourly-automation.mjs is executed by nothing',
+  'scripts/openapi-stand-smoke.mjs is executed by nothing',
 );
 
 runFixture(

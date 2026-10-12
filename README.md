@@ -1004,7 +1004,7 @@ treat an agent as a participant of its own rather than as its owner:
 ## Repository layout
 
 ```
-ForgeKeep/
+plombir-git/
 ├── Cargo.toml              # workspace root
 ├── ARCHITECTURE.md         # architecture overview
 ├── CONTRIBUTING.md         # development guide
