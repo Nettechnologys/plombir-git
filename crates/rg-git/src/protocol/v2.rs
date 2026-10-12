@@ -16,6 +16,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use tokio::io::{split, AsyncRead, AsyncWrite, BufReader};
 
+use super::upload_pack::validated_oid;
 use super::{pack_stream, ClientRefusal};
 use crate::pkt_line::{read_pkt_line, write_flush, write_pkt_line, PktLine};
 use crate::sideband;
@@ -508,7 +509,7 @@ fn parse_fetch_args(args: &[String]) -> Result<CommandRequest> {
         } else if let Some(have) = arg.strip_prefix("have ") {
             haves.push(have.to_string());
         } else if let Some(shallow) = arg.strip_prefix("shallow ") {
-            shallows.push(shallow.to_string());
+            shallows.push(validated_oid(shallow)?);
         } else if let Some(d) = arg.strip_prefix("deepen ") {
             deepen = Some(
                 d.parse()
@@ -523,7 +524,7 @@ fn parse_fetch_args(args: &[String]) -> Result<CommandRequest> {
                     .map_err(|_| ClientRefusal::new("invalid Protocol V2 deepen-since value"))?,
             );
         } else if let Some(revision) = arg.strip_prefix("deepen-not ") {
-            deepen_not.push(revision.to_string());
+            deepen_not.push(validated_deepen_not(revision)?);
         } else if let Some(f) = arg.strip_prefix("filter ") {
             filter = Some(f.to_string());
         } else if *arg == "done" {
@@ -549,6 +550,33 @@ fn parse_fetch_args(args: &[String]) -> Result<CommandRequest> {
         done,
         pack,
     })
+}
+
+/// The longest `deepen-not` value accepted; a ref name is far shorter.
+const MAX_DEEPEN_NOT_LEN: usize = 255;
+
+/// What `deepen-not` may name: a full object id, or a ref name as
+/// `git clone --shallow-exclude=<ref>` sends it. The value is later placed on a
+/// `rev-list` command line, so what git would read as an option or as a
+/// revision expression (`^`, `~`, `..`, `@{`, `:` and the like) is refused
+/// here, and `load_commit_graph` ends option parsing before it as a second
+/// layer.
+fn validated_deepen_not(revision: &str) -> Result<String> {
+    let acceptable = !revision.is_empty()
+        && revision.len() <= MAX_DEEPEN_NOT_LEN
+        && !revision.starts_with('-')
+        && !revision.contains("..")
+        && !revision.contains("@{")
+        && !revision.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        });
+    if acceptable {
+        Ok(revision.to_string())
+    } else {
+        Err(ClientRefusal::new("invalid Protocol V2 deepen-not value").into())
+    }
 }
 
 /// Parse the args section of an `object-info` command.
@@ -1086,11 +1114,16 @@ fn load_commit_graph(
     if let Some(timestamp) = max_age {
         args.push(format!("--max-age={timestamp}"));
     }
+    // Nothing after this is an option, whatever it looks like. The exclusions
+    // are spelled `^<rev>` because `--not` is itself an option and would be
+    // read as a revision from here on.
+    args.push("--end-of-options".to_string());
     args.extend(starts.iter().cloned());
-    if !excluded_revisions.is_empty() {
-        args.push("--not".to_string());
-        args.extend(excluded_revisions.iter().cloned());
-    }
+    args.extend(
+        excluded_revisions
+            .iter()
+            .map(|revision| format!("^{revision}")),
+    );
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = global_gateway()
         .as_ref()
@@ -1706,6 +1739,103 @@ mod tests {
         .await
         .expect_err("missing relative boundary stays a client refusal");
         assert!(super::super::client_refusal(&error).is_some());
+    }
+
+    /// `shallow` and `deepen-not` end up on a `rev-list` command line. A value
+    /// that is not an object id (or, for `deepen-not`, a plain ref name) is
+    /// refused when the request is parsed, as `want` and `have` are over v0/v1
+    /// (`validated_oid`).
+    #[test]
+    fn shallow_and_deepen_not_values_that_are_not_ids_or_ref_names_are_refused() {
+        let oid = "a".repeat(40);
+        for line in [
+            "shallow --max-count=1".to_string(),
+            "shallow main".to_string(),
+            format!("shallow {oid}\nwant {oid}"),
+            "deepen-not --max-count=1".to_string(),
+            "deepen-not ".to_string(),
+            "deepen-not main^".to_string(),
+            "deepen-not HEAD~1".to_string(),
+            "deepen-not a..b".to_string(),
+            "deepen-not main@{1}".to_string(),
+            "deepen-not v1:path".to_string(),
+            "deepen-not two words".to_string(),
+            format!("deepen-not {}", "x".repeat(MAX_DEEPEN_NOT_LEN + 1)),
+        ] {
+            let error = parse_fetch_args(std::slice::from_ref(&line)).expect_err(&line);
+            assert!(super::super::client_refusal(&error).is_some(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn deepen_not_accepts_a_full_id_or_a_ref_name() {
+        let oid = "a".repeat(40);
+        for value in [
+            oid.as_str(),
+            "main",
+            "release/1.0",
+            "refs/tags/v1.0",
+            "feature-x_1",
+        ] {
+            let args = [format!("deepen-not {value}"), format!("shallow {oid}")];
+            match parse_fetch_args(&args).unwrap() {
+                CommandRequest::Fetch { shallow, .. } => {
+                    assert_eq!(shallow.deepen_not, vec![value.to_string()]);
+                    assert_eq!(shallow.shallows, vec![oid.clone()]);
+                }
+                other => panic!("expected Fetch, got {other:?}"),
+            }
+        }
+    }
+
+    /// `git clone --shallow-exclude=<ref>` sends a ref name, not an id, so
+    /// restricting `deepen-not` to ids would break it.
+    #[test]
+    fn deepen_not_with_a_ref_name_cuts_the_history_as_the_id_does() {
+        let (_dir, repo_path, oldest) = repository_with_commit();
+        let git = crate::cli_gateway::GitCommandGateway::new().unwrap();
+        git.run_or_bail(&["tag", "base"], Some(&repo_path)).unwrap();
+        git.run_or_bail(
+            &["commit", "--allow-empty", "-qm", "next"],
+            Some(&repo_path),
+        )
+        .unwrap();
+        let tip = git
+            .run(&["rev-parse", "HEAD"], Some(&repo_path))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_string();
+
+        for excluded in ["base".to_string(), oldest] {
+            let request = ShallowRequest {
+                deepen_not: vec![excluded],
+                ..Default::default()
+            };
+            let update = build_shallow_update(&repo_path, std::slice::from_ref(&tip), &request)
+                .unwrap()
+                .expect("deepen-not changes the depth");
+            assert_eq!(update.boundaries, vec![tip.clone()]);
+            assert_eq!(update.response_lines, vec![format!("shallow {tip}")]);
+        }
+    }
+
+    /// The second layer: whatever reaches `load_commit_graph`, `rev-list` does
+    /// not take it for one of its own options.
+    #[test]
+    fn load_commit_graph_never_reads_a_value_as_an_option() {
+        let (_dir, repo_path, tip) = repository_with_commit();
+        for (starts, excluded) in [
+            (vec!["--max-count=0".to_string()], vec![]),
+            (vec![tip.clone()], vec!["--max-count=0".to_string()]),
+        ] {
+            assert!(
+                load_commit_graph(&repo_path, &starts, None, &excluded).is_err(),
+                "{starts:?} {excluded:?}"
+            );
+        }
+        let graph = load_commit_graph(&repo_path, std::slice::from_ref(&tip), None, &[]).unwrap();
+        assert!(graph.contains_key(&tip));
     }
 
     /// `object-info` returns an error either way, but the operator reads the

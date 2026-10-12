@@ -386,7 +386,7 @@ fn checked_negotiation_bytes(current: usize, frame: usize, max_bytes: usize) -> 
 
 /// A want or have names one object by its full SHA-1. Anything else would
 /// reach `pack-objects` as a revision expression.
-fn validated_oid(sha: &str) -> Result<String> {
+pub(super) fn validated_oid(sha: &str) -> Result<String> {
     if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(
             ClientRefusal::new("upload-pack object id must be 40 hexadecimal characters").into(),
