@@ -21,4 +21,10 @@ ignore = [
     # migrated to `rustls_pki_types::pem::PemObject`; it now reaches us ONLY
     # transitively via axum-server v0.7, so the ignore stays until that updates.
     "RUSTSEC-2025-0134",
+    # unsafe-libyaml unmaintained (via serde_yaml 0.9.34+deprecated) — TEMPORARY,
+    # and NOT low-exposure: it parses untrusted YAML (CI workflows, issue
+    # templates, gemspecs, Helm charts). Ignored only while we migrate to
+    # pure-Rust `serde-saphyr`; remove together with serde_yaml, no later than
+    # 2026-12-31 (tracked in card_6c5fa094c6ed). See the twin entry in deny.toml.
+    "RUSTSEC-2024-0449",
 ]
