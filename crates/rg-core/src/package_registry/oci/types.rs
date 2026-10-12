@@ -252,6 +252,7 @@ pub mod media_types {
 
 /// OCI error codes (per distribution spec).
 pub mod error_codes {
+    pub const DENIED: &str = "DENIED";
     pub const BLOB_UNKNOWN: &str = "BLOB_UNKNOWN";
     pub const BLOB_UPLOAD_INVALID: &str = "BLOB_UPLOAD_INVALID";
     pub const BLOB_UPLOAD_UNKNOWN: &str = "BLOB_UPLOAD_UNKNOWN";

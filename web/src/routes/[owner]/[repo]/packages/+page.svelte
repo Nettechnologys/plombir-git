@@ -1,7 +1,9 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
+  import Modal from '$lib/components/Modal.svelte';
   import { packages } from '$lib/api/client.svelte';
+  import type { OciImageSummary } from '$lib/api/packages';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
   import { viewerPermission } from '$lib/viewerPermission.svelte';
@@ -22,6 +24,13 @@
   let formatFilter = $state<string>('');
   let searchQuery = $state<string>('');
   let packageList = $state<any[]>([]);
+  let ociImages = $state<OciImageSummary[]>([]);
+  let ociNext = $state<string | null>(null);
+  let ociRequestGeneration = 0;
+  let ociLoading = $state(true);
+  let ociError = $state('');
+  let deletingImage = $state<OciImageSummary | null>(null);
+  let deleting = $state(false);
   let failedRegistryTypes = $state<string[]>([]);
   let loading = $state(true);
   let error = $state('');
@@ -37,13 +46,58 @@
     formatFilter = '';
     searchQuery = '';
     packageList = [];
+    ociImages = [];
+    ociNext = null;
+    ociRequestGeneration += 1;
+    ociLoading = true;
+    ociError = '';
+    deletingImage = null;
     failedRegistryTypes = [];
     currentPage = 1;
     totalPages = 1;
     loading = true;
     error = '';
     void loadPackages(expectedOwner, expectedRepo, '', '', 1, routeGeneration);
+    void loadOciImages(expectedOwner, expectedRepo, routeGeneration);
   });
+
+  async function loadOciImages(expectedOwner: string, expectedRepo: string, expectedRoute: number, last?: string) {
+    const requestGeneration = ++ociRequestGeneration;
+    ociLoading = true;
+    ociError = '';
+    try {
+      const page = await packages.listOciImages(expectedOwner, expectedRepo, last);
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute) && requestGeneration === ociRequestGeneration) {
+        ociImages = last ? [...ociImages, ...page.images] : page.images;
+        ociNext = page.next;
+      }
+    } catch (e: any) {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute) && requestGeneration === ociRequestGeneration) ociError = e.message;
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute) && requestGeneration === ociRequestGeneration) ociLoading = false;
+    }
+  }
+
+  async function deleteSelectedImage() {
+    const selected = deletingImage;
+    if (!selected || deleting) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    deleting = true;
+    ociError = '';
+    try {
+      await packages.deleteOciImage(expectedOwner, expectedRepo, selected.digest);
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        deletingImage = null;
+        await loadOciImages(expectedOwner, expectedRepo, expectedRoute);
+      }
+    } catch (e: any) {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) ociError = e.message;
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) deleting = false;
+    }
+  }
 
   function packageListIntent(format: string, query: string, pageNumber: number): string {
     return JSON.stringify([format, query, pageNumber]);
@@ -137,6 +191,10 @@
   function packageHref(pkg: { format: string; name: string }): string {
     return `/${owner}/${repo}/packages/${encodeURIComponent(pkg.format)}/${encodePackageRouteName(pkg.name)}`;
   }
+
+  function pullCommand(image: OciImageSummary): string {
+    return `docker pull ${$page.url.host}/${image.namespace}:${image.tag}`;
+  }
 </script>
 
 <svelte:head>
@@ -155,6 +213,55 @@
 
   {#if error}
     <div class="error-banner">{error}</div>
+  {/if}
+
+  <section class="oci-images" aria-label={t('packages.oci_images', 'Container images')}>
+    <h2>{t('packages.oci_images', 'Container images')}</h2>
+    {#if ociError}<div class="error-banner">{ociError}</div>{/if}
+    {#if ociLoading}
+      <p class="loading-text">{t('common.loading')}</p>
+    {:else if ociImages.length === 0}
+      <p>{t('packages.no_oci_images', 'No container images')}</p>
+    {:else}
+      <div class="package-list">
+        {#each ociImages as image (image.namespace + ':' + image.tag)}
+          <div class="package-card">
+            <div class="package-header">
+              <strong>{image.namespace}:{image.tag}</strong>
+              <span class="format-badge">{t('packages.oci_label')}</span>
+            </div>
+            <div class="package-meta">
+              <span>{image.digest}</span>
+              <span>{t('packages.size_mib', { size: (image.size_bytes / 1024 / 1024).toFixed(2) })}</span>
+              <span>{formatDate(image.pushed_at)}</span>
+            </div>
+            <code>{pullCommand(image)}</code>
+            {#if permission.canWrite}
+              <button class="btn-outline" onclick={() => deletingImage = image}>
+                {t('common.delete')}
+              </button>
+            {/if}
+          </div>
+        {/each}
+      </div>
+      {#if ociNext}
+        <button class="btn-outline" disabled={ociLoading} onclick={() => loadOciImages(owner, repo, routeGeneration, ociNext!)}>
+          {t('common.next', 'Next')}
+        </button>
+      {/if}
+    {/if}
+  </section>
+
+  {#if deletingImage}
+    <Modal onclose={() => { if (!deleting) deletingImage = null; }} labelledby="oci-delete-title" width="500px" padding="2rem">
+      <h2 id="oci-delete-title">{t('packages.delete_oci_title', 'Delete container image?')}</h2>
+      <p>{deletingImage.namespace}:{deletingImage.tag}</p>
+      <p>{t('packages.delete_oci_detail', 'All tags for this digest will be removed. Unused layers are collected after the safety period.')}</p>
+      <div class="oci-actions">
+        <button class="btn-outline" onclick={() => deletingImage = null} disabled={deleting} data-autofocus>{t('common.cancel')}</button>
+        <button class="btn-primary" onclick={deleteSelectedImage} disabled={deleting}>{t('common.delete')}</button>
+      </div>
+    </Modal>
   {/if}
 
   {#if failedRegistryTypes.length > 0}
@@ -195,9 +302,9 @@
   {#if loading}
     <p class="loading-text">{t('common.loading')}</p>
   {:else if packageList.length === 0 && failedRegistryTypes.length === 0}
-    <div class="empty">
-      <p>{t('packages.no_packages')}</p>
-    </div>
+    {#if ociImages.length === 0 && !ociLoading}
+      <div class="empty"><p>{t('packages.no_packages')}</p></div>
+    {/if}
   {:else}
     <div class="package-list">
       {#each packageList as pkg}
@@ -248,6 +355,11 @@
 </div>
 
 <style>
+
+  .oci-images { margin: 24px 0; }
+  .oci-images h2 { font-size: 20px; margin-bottom: 12px; }
+  .oci-images code { display: block; overflow-wrap: anywhere; margin: 12px 0; }
+  .oci-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 20px; }
 
   .page-header {
     display: flex;

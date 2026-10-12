@@ -147,6 +147,7 @@ let rendered: RenderedComponent | undefined;
 beforeEach(async () => {
 	await logout();
 	resetTestClient();
+	packages.listOciImages.mockResolvedValue({ images: [], next: null });
 	navigation.goto.mockReset();
 });
 
@@ -157,6 +158,30 @@ afterEach(async () => {
 });
 
 describe('package index and dashboard state ownership', () => {
+	it('shows a pushed OCI image and deletes its digest through the repository API', async () => {
+		prepareRepoHeader();
+		repos.get.mockResolvedValue({ ...repository('demo'), viewer_permission: 'write' });
+		packages.list.mockResolvedValue(emptyPackageResponse());
+		const image = {
+			namespace: 'alice/demo', tag: 'latest', digest: `sha256:${'a'.repeat(64)}`,
+			size_bytes: 1048576, pushed_at: timestamp,
+		};
+		packages.listOciImages
+			.mockResolvedValueOnce({ images: [image], next: null })
+			.mockResolvedValueOnce({ images: [], next: null });
+		packages.deleteOciImage.mockResolvedValue(undefined);
+		setTestPage('/alice/demo/packages', { owner: 'alice', repo: 'demo' });
+		rendered = await renderComponent(PackageIndexPage);
+		await settle();
+		expect(rendered.container.textContent).toContain('alice/demo:latest');
+		expect(rendered.container.textContent).toContain('docker pull');
+		await click(element(rendered.container, '.oci-images .package-card button'));
+		await click(element(rendered.container, '.oci-actions button:last-child'));
+		expect(packages.deleteOciImage).toHaveBeenCalledWith('alice', 'demo', image.digest);
+		await settle();
+		expect(rendered.container.textContent).not.toContain('alice/demo:latest');
+	});
+
 	it('rejects a package list from the first A -> B -> A repository visit', async () => {
 		const firstVisit = deferred<ReturnType<typeof packageResponse>>();
 		prepareRepoHeader();

@@ -7,7 +7,9 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path as FsPath, PathBuf};
+use std::time::{Duration, SystemTime};
 use utoipa::ToSchema;
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -28,6 +30,8 @@ pub struct CleanupResponse {
     /// artifact, but it is the same question — storage whose retention window
     /// closed — and this is the pass that already asks it hourly.
     pub oci_uploads_deleted: u64,
+    pub oci_blobs_deleted: u64,
+    pub oci_orphan_objects_deleted: u64,
     pub failures: u64,
 }
 
@@ -330,7 +334,168 @@ pub async fn cleanup_expired_storage(
         summary.oci_uploads_deleted += 1;
     }
 
+    // Deleting a manifest retires metadata immediately, but shared layers are
+    // collected only after a grace period. Repository metadata writers use the
+    // same lease, and each object gets its publication lease before deletion.
+    for oci_repo in rg_db::ops::oci_ops::list_repositories(&state.db, repo_filter).await? {
+        let Some((owner, repo)) = oci_repo.namespace.split_once('/') else {
+            summary.failures += 1;
+            tracing::error!(namespace = %oci_repo.namespace, "OCI GC skipped malformed namespace");
+            continue;
+        };
+        let key = format!("oci/metadata/{}", oci_repo.id);
+        let lease = match rg_core::package_registry::oci::acquire_publication_lease(&state.db, &key)
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                summary.failures += 1;
+                tracing::error!(repo_id = oci_repo.repo_id, error = %format!("{error:#}"), "OCI GC could not acquire metadata lease");
+                continue;
+            }
+        };
+        let result = if lease.exclusive() {
+            cleanup_oci_repository(state, oci_repo.id, owner, repo).await
+        } else {
+            // The previous holder might still be writing after lease expiry.
+            Err(anyhow::anyhow!(
+                "OCI metadata lease was taken over; collection deferred"
+            ))
+        };
+        rg_core::package_registry::oci::release_publication_lease(&state.db, &lease).await;
+        match result {
+            Ok((blobs, orphans)) => {
+                summary.oci_blobs_deleted += blobs;
+                summary.oci_orphan_objects_deleted += orphans;
+            }
+            Err(error) => {
+                summary.failures += 1;
+                tracing::error!(repo_id = oci_repo.repo_id, error = %format!("{error:#}"), "OCI GC failed for repository");
+            }
+        }
+    }
+
     Ok(summary)
+}
+
+/// Reclaim only mature, unreferenced bytes. A manifest row is authoritative:
+/// malformed historical JSON conservatively stops collection for this repo.
+async fn cleanup_oci_repository(
+    state: &AppState,
+    oci_repo_id: i64,
+    owner: &str,
+    repo: &str,
+) -> anyhow::Result<(u64, u64)> {
+    use rg_core::package_registry::oci::{
+        acquire_publication_lease, release_publication_lease, ParsedManifest,
+    };
+    let mut referenced = HashSet::new();
+    let mut live = HashSet::new();
+    let mut cursor = 0;
+    loop {
+        let page =
+            rg_db::ops::oci_ops::list_manifest_page(&state.db, oci_repo_id, cursor, 10).await?;
+        if page.is_empty() {
+            break;
+        }
+        for manifest in page {
+            cursor = manifest.id;
+            let parsed = ParsedManifest::parse(manifest.manifest_json.as_bytes())?;
+            referenced.extend(parsed.referenced_blobs());
+            live.insert(
+                state
+                    .oci_storage
+                    .manifest_storage_key(owner, repo, &manifest.digest)?,
+            );
+        }
+    }
+    let before = chrono::Utc::now() - chrono::Duration::hours(24);
+    let mut removed_blobs = 0;
+    for candidate in rg_db::ops::oci_ops::list_mature_blobs(&state.db, oci_repo_id, before).await? {
+        if referenced.contains(&candidate.digest) {
+            continue;
+        }
+        let lease = acquire_publication_lease(&state.db, &candidate.storage_path).await?;
+        let result = async {
+            if !lease.exclusive() {
+                return Ok(false);
+            }
+            let current =
+                rg_db::ops::oci_ops::find_blob(&state.db, oci_repo_id, &candidate.digest).await?;
+            if current
+                .as_ref()
+                .is_none_or(|row| row.id != candidate.id || row.created_at >= before)
+            {
+                return Ok(false);
+            }
+            if !rg_db::ops::oci_ops::delete_blob_by_id(&state.db, candidate.id).await? {
+                return Ok(false);
+            }
+            state
+                .oci_storage
+                .discard_published_object(&candidate.storage_path)
+                .await?;
+            Ok::<_, anyhow::Error>(true)
+        }
+        .await;
+        release_publication_lease(&state.db, &lease).await;
+        if result? {
+            removed_blobs += 1;
+        }
+    }
+
+    // A crash between metadata deletion and byte deletion can leave an object
+    // with no row. Sweep only old objects and re-check under their key lease.
+    for blob in
+        rg_db::ops::oci_ops::list_mature_blobs(&state.db, oci_repo_id, chrono::Utc::now()).await?
+    {
+        live.insert(blob.storage_path);
+    }
+    let mut removed_orphans = 0;
+    for object in state
+        .oci_storage
+        .list_published_objects(owner, repo)
+        .await?
+    {
+        let key = object.key.as_str();
+        if live.contains(key)
+            || object.modified.is_none_or(|time| {
+                SystemTime::now().duration_since(time).unwrap_or_default()
+                    < Duration::from_secs(24 * 60 * 60)
+            })
+        {
+            continue;
+        }
+        let lease = acquire_publication_lease(&state.db, key).await?;
+        let result = async {
+            if !lease.exclusive() {
+                return Ok(false);
+            }
+            // A blob finalizer can publish while the repository lease is held,
+            // but its key lease forces it to finish before this recheck.
+            let current_blobs =
+                rg_db::ops::oci_ops::list_mature_blobs(&state.db, oci_repo_id, chrono::Utc::now())
+                    .await?;
+            if current_blobs.iter().any(|blob| blob.storage_path == key) {
+                return Ok(false);
+            }
+            if state
+                .oci_storage
+                .discard_published_object(key)
+                .await
+                .is_err()
+            {
+                return Err(anyhow::anyhow!("could not remove orphan OCI object {key}"));
+            }
+            Ok::<_, anyhow::Error>(true)
+        }
+        .await;
+        release_publication_lease(&state.db, &lease).await;
+        if result? {
+            removed_orphans += 1;
+        }
+    }
+    Ok((removed_blobs, removed_orphans))
 }
 
 async fn artifact_repo_id(state: &AppState, job_id: i64) -> anyhow::Result<Option<i64>> {

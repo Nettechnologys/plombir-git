@@ -78,6 +78,16 @@
       "reachedFromUi": false
     },
     {
+      "method": "DELETE",
+      "url": "/v2/{owner}/{repo}/manifests/{reference}",
+      "access": "Foreign:oci.rs",
+      "handler": "oci::delete_manifest",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
+    },
+    {
       "method": "GET",
       "url": "/v2/{owner}/{repo}/blobs/{digest}",
       "access": "Foreign:oci.rs",
@@ -4131,6 +4141,26 @@
       "testedIn": [
         "rust",
         "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/packages/oci/images",
+      "access": "RepoRead",
+      "handler": "api::packages::list_oci_images",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/repos/{owner}/{name}/packages/oci/images/{digest}",
+      "access": "RepoWrite",
+      "handler": "api::packages::delete_oci_image",
+      "testedIn": [
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -11241,7 +11271,7 @@
         {
           "tag": "a",
           "label": "i18n:packages.upload",
-          "line": 152,
+          "line": 210,
           "via": null,
           "href": "`/${owner}/${repo}/packages/upload`",
           "handler": null,
@@ -11250,8 +11280,89 @@
         },
         {
           "tag": "button",
+          "label": "i18n:common.delete",
+          "line": 240,
+          "via": null,
+          "href": null,
+          "handler": "() => deletingImage = image",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.next",
+          "line": 248,
+          "via": null,
+          "href": null,
+          "handler": "() => loadOciImages(owner, repo, routeGeneration, ociNext!)",
+          "calls": [
+            {
+              "symbol": "packages.listOciImages",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/packages/oci/images",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/packages/oci/images",
+              "access": "RepoRead",
+              "handler": "api::packages::list_oci_images",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 261,
+          "via": null,
+          "href": null,
+          "handler": "() => deletingImage = null",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.delete",
+          "line": 262,
+          "via": null,
+          "href": null,
+          "handler": "deleteSelectedImage",
+          "calls": [
+            {
+              "symbol": "packages.deleteOciImage",
+              "method": "DELETE",
+              "url": "/api/v1/repos/{owner}/{repo}/packages/oci/images/{digest}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/packages/oci/images/{digest}",
+              "access": "RepoWrite",
+              "handler": "api::packages::delete_oci_image",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            },
+            {
+              "symbol": "packages.listOciImages",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/packages/oci/images",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/packages/oci/images",
+              "access": "RepoRead",
+              "handler": "api::packages::list_oci_images",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
           "label": "i18n:common.retry",
-          "line": 167,
+          "line": 274,
           "via": null,
           "href": null,
           "handler": "retryFailedRegistries",
@@ -11290,7 +11401,7 @@
         {
           "tag": "select",
           "label": "i18n:common.all",
-          "line": 176,
+          "line": 283,
           "via": null,
           "href": null,
           "handler": "handleFormatChange",
@@ -11329,7 +11440,7 @@
         {
           "tag": "button",
           "label": "i18n:common.search",
-          "line": 191,
+          "line": 298,
           "via": null,
           "href": null,
           "handler": "handleSearch",
@@ -11368,7 +11479,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 206,
+          "line": 313,
           "via": null,
           "href": "packageHref(pkg)",
           "handler": null,
@@ -11378,7 +11489,7 @@
         {
           "tag": "button",
           "label": "i18n:common.previous",
-          "line": 230,
+          "line": 337,
           "via": null,
           "href": null,
           "handler": "() => selectPage(currentPage - 1)",
@@ -11417,7 +11528,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next",
-          "line": 238,
+          "line": 345,
           "via": null,
           "href": null,
           "handler": "() => selectPage(currentPage + 1)",
@@ -11667,6 +11778,16 @@
           "handler": null,
           "calls": [],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 116,
+          "via": "Modal",
+          "href": null,
+          "handler": "onclose",
+          "calls": [],
+          "unresolved": true
         }
       ],
       "passive": [
@@ -28307,7 +28428,7 @@
       "outsider"
     ],
     "scenarios": 47,
-    "inventoryEntries": 793,
+    "inventoryEntries": 796,
     "coveredEntries": 172,
     "coveredRoutes": 163,
     "maxUiRoutesWithoutFrontendTest": 26

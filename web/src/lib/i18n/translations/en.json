@@ -1809,6 +1809,12 @@
     "identity_mismatch": "Board response identity mismatch"
   },
   "packages": {
+    "oci_images": "Container images",
+    "oci_label": "OCI",
+    "size_mib": "{size} MiB",
+    "no_oci_images": "No container images",
+    "delete_oci_title": "Delete container image?",
+    "delete_oci_detail": "All tags for this digest will be removed. Unused layers are collected after the safety period.",
     "upload": "Upload Package",
     "format": "Format",
     "no_packages": "No packages yet",

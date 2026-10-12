@@ -138,6 +138,7 @@ const REASONS = new Map([
 // stale entry is how one turns into a blanket.
 const ALLOWED_WITHOUT_CONSUMER = new Map([
   ['PUT /v2/{owner}/{repo}/manifests/{reference}', 'protocol'],
+  ['DELETE /v2/{owner}/{repo}/manifests/{reference}', 'protocol'],
   ['POST /v2/{owner}/{repo}/blobs/uploads/', 'protocol'],
   ['POST /v2/{owner}/{repo}/blobs/uploads', 'protocol'],
   ['PATCH /v2/{owner}/{repo}/blobs/uploads/{uuid}', 'protocol'],

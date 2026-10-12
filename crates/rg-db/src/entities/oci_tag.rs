@@ -23,6 +23,19 @@ pub struct Model {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::oci_manifest::Entity",
+        from = "Column::OciManifestId",
+        to = "super::oci_manifest::Column::Id"
+    )]
+    Manifest,
+}
+
+impl Related<super::oci_manifest::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Manifest.def()
+    }
+}
 
 impl ActiveModelBehavior for ActiveModel {}

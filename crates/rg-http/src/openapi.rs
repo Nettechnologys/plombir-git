@@ -582,6 +582,8 @@ pub(crate) fn stamp_security(
         crate::api::packages::publish,
         crate::api::packages::list_registries,
         crate::api::packages::list_packages,
+        crate::api::packages::list_oci_images,
+        crate::api::packages::delete_oci_image,
         crate::api::packages::get_package,
         crate::api::packages::list_versions,
         crate::api::packages::get_version,

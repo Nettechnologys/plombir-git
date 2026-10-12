@@ -23,30 +23,30 @@
 
 | | |
 |---|---|
-| Роутов в роутере (с объявленным `Access`) | 428 |
-| Из них достижимы из браузера | 300 (70%) |
+| Роутов в роутере (с объявленным `Access`) | 431 |
+| Из них достижимы из браузера | 302 (70%) |
 | Layout-модулей | 2 |
 | Страниц | 72 |
-| Интерактивных элементов | 1036 |
-| — из них дёргают API | 364 |
-| — приходят из общих компонентов | 422 |
+| Интерактивных элементов | 1041 |
+| — из них дёргают API | 366 |
+| — приходят из общих компонентов | 423 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 47 / 172 / 163 |
-| **UI-роутов без единого web/smoke/browser-теста** | **38** |
+| **UI-роутов без единого web/smoke/browser-теста** | **40** |
 | UI-роутов без corpus-hit и browser-сценария | 9 |
 
 ## По уровню доступа
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 108 | 69 | 4 | 0 |
-| `RepoWrite` | 85 | 66 | 13 | 2 |
+| `RepoRead` | 109 | 70 | 5 | 0 |
+| `RepoWrite` | 86 | 67 | 14 | 2 |
 | `User` | 55 | 44 | 6 | 0 |
 | `RepoAdmin` | 39 | 39 | 0 | 0 |
 | `InstanceAdmin` | 32 | 27 | 6 | 6 |
 | `Public` | 25 | 10 | 2 | 0 |
 | `RepoAuthRead` | 18 | 18 | 1 | 0 |
 | `OrgAdmin` | 15 | 14 | 6 | 4 |
-| `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
+| `Foreign:oci.rs` | 14 | 0 | 0 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 12 | 0 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
 | `OrgRead` | 5 | 4 | 0 | 0 |
@@ -73,6 +73,7 @@
 | `/[owner]/[repo]/pipelines` | 25 | 11 | 14 |
 | `/[owner]/[repo]/wiki/[title]` | 24 | 9 | 13 |
 | `/admin/users` 🔒 | 24 | 7 | 4 |
+| `/[owner]/[repo]/packages` | 23 | 11 | 12 |
 | `/[owner]/[repo]/branches` | 22 | 6 | 12 |
 | `/[owner]/[repo]/milestones` | 22 | 8 | 13 |
 | `/[owner]/[repo]/releases/new` | 21 | 5 | 11 |
@@ -80,7 +81,6 @@
 | `/[owner]/[repo]/time_tracking` | 20 | 10 | 13 |
 | `/[owner]/[repo]/network` | 19 | 6 | 11 |
 | `/admin/settings` 🔒 | 19 | 9 | 2 |
-| `/[owner]/[repo]/packages` | 18 | 9 | 11 |
 | `/[owner]/[repo]/releases/edit/[id]` | 18 | 5 | 11 |
 | `/[owner]/[repo]/tags` | 18 | 5 | 12 |
 | `/settings/security` | 18 | 10 | 2 |
@@ -416,16 +416,19 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.retry | :167 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.retry | :167 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
-| i18n:common.all | :176 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.all | :176 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
-| i18n:common.search | :191 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.search | :191 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
-| i18n:common.previous | :230 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.previous | :230 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
-| i18n:common.next | :238 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.next | :238 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.next | :248 | `GET /api/v1/repos/{owner}/{name}/packages/oci/images` | `RepoRead` | rust |
+| i18n:common.delete | :262 | `DELETE /api/v1/repos/{owner}/{name}/packages/oci/images/{digest}` | `RepoWrite` | rust |
+| i18n:common.delete | :262 | `GET /api/v1/repos/{owner}/{name}/packages/oci/images` | `RepoRead` | rust |
+| i18n:common.retry | :274 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.retry | :274 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.all | :283 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.all | :283 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.search | :298 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.search | :298 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.previous | :337 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.previous | :337 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.next | :345 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.next | :345 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -1293,6 +1296,7 @@
 | GET | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | rust+smoke |
 | HEAD | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | rust |
 | PUT | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | rust |
+| DELETE | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | rust |
 | GET | `/v2/{owner}/{repo}/blobs/{digest}` | `Foreign:oci.rs` | rust |
 | HEAD | `/v2/{owner}/{repo}/blobs/{digest}` | `Foreign:oci.rs` | rust |
 | POST | `/v2/{owner}/{repo}/blobs/uploads/` | `Foreign:oci.rs` | rust |

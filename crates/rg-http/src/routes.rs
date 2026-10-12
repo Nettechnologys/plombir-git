@@ -693,6 +693,11 @@ fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
             oci::put_manifest,
             &manifest_limit,
         )
+        .delete(
+            OCI_TOKEN,
+            "/v2/{owner}/{repo}/manifests/{reference}",
+            oci::delete_manifest,
+        )
         // Blobs
         .get(
             OCI_TOKEN,
@@ -2508,6 +2513,16 @@ pub(crate) fn build_all_routes(
             RepoRead,
             "/repos/{owner}/{name}/packages",
             api::packages::list_registries,
+        )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/packages/oci/images",
+            api::packages::list_oci_images,
+        )
+        .delete(
+            RepoWrite,
+            "/repos/{owner}/{name}/packages/oci/images/{digest}",
+            api::packages::delete_oci_image,
         )
         .post(
             RepoWrite,

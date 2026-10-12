@@ -1238,6 +1238,90 @@ pub async fn get_manifest(
     get_manifest_impl(State(state), headers, Path((owner, repo, reference)), false).await
 }
 
+/// Remove a tag or digest-addressed manifest. A tag removal keeps the digest
+/// available to another tag; a digest removal retires every tag naming it.
+pub async fn delete_manifest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((owner, repo, reference)): Path<(String, String, String)>,
+) -> Response {
+    let user_id = match require_access(&state, &headers, &owner, &repo, "push").await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
+        Ok(Some(repo)) => repo,
+        Ok(None) => return oci_not_found(error_codes::NAME_UNKNOWN, "repository not found"),
+        Err(error) => return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
+    };
+    let reference = match Reference::parse(&reference) {
+        Ok(reference) => reference,
+        Err(error) => return oci_reference_error(&error),
+    };
+    let metadata_key = format!("oci/metadata/{}", oci_repo.id);
+    let lease = match acquire_publication_lease(&state.db, &metadata_key).await {
+        Ok(lease) => lease,
+        Err(error) => return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
+    };
+    if !lease.exclusive() {
+        release_publication_lease(&state.db, &lease).await;
+        return oci_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNKNOWN",
+            "OCI metadata lease was recovered; retry deletion",
+        );
+    }
+    let result = match &reference {
+        Reference::Tag(tag) => rg_db::ops::oci_ops::delete_tag(&state.db, oci_repo.id, tag)
+            .await
+            .map(|deleted| {
+                if deleted {
+                    rg_db::ops::oci_ops::ManifestDeleteOutcome::Deleted
+                } else {
+                    rg_db::ops::oci_ops::ManifestDeleteOutcome::Missing
+                }
+            }),
+        Reference::Digest(digest) => {
+            rg_db::ops::oci_ops::delete_manifest_by_digest(&state.db, oci_repo.id, digest).await
+        }
+    };
+    release_publication_lease(&state.db, &lease).await;
+    match result {
+        Ok(rg_db::ops::oci_ops::ManifestDeleteOutcome::Deleted) => {
+            let actor = match user_id {
+                Some(user_id) => {
+                    rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, user_id).await
+                }
+                None => rg_core::audit::AuditActor::none(),
+            };
+            rg_core::audit::record(
+                &state.db,
+                &actor,
+                "oci.manifest.delete",
+                Some("oci_manifest"),
+                None,
+                Some(&match &reference {
+                    Reference::Tag(tag) => format!("{owner}/{repo}:{tag}"),
+                    Reference::Digest(digest) => format!("{owner}/{repo}@{digest}"),
+                }),
+                Some(&headers),
+                Some(serde_json::json!({"reference": reference.as_str()})),
+            )
+            .await;
+            StatusCode::ACCEPTED.into_response()
+        }
+        Ok(rg_db::ops::oci_ops::ManifestDeleteOutcome::Missing) => {
+            oci_not_found(error_codes::MANIFEST_UNKNOWN, "manifest not found")
+        }
+        Ok(rg_db::ops::oci_ops::ManifestDeleteOutcome::ReferencedByIndex) => oci_err(
+            StatusCode::CONFLICT,
+            error_codes::DENIED,
+            "manifest is referenced by an image index",
+        ),
+        Err(error) => oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
+    }
+}
+
 async fn get_manifest_impl(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1479,9 +1563,28 @@ pub async fn put_manifest(
             );
         }
     };
-    let lease = match acquire_publication_lease(&state.db, &manifest_key).await {
+    // Serialize metadata publication with DELETE and the repository collector.
+    // The earlier storage probe is advisory; claim_referenced_blobs checks the
+    // rows again while this lease is held.
+    let metadata_key = format!("oci/metadata/{}", oci_repo.id);
+    let metadata_lease = match acquire_publication_lease(&state.db, &metadata_key).await {
         Ok(lease) => lease,
         Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
+    };
+    if !metadata_lease.exclusive() {
+        release_publication_lease(&state.db, &metadata_lease).await;
+        return oci_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNKNOWN",
+            "OCI metadata lease was recovered; retry publication",
+        );
+    }
+    let lease = match acquire_publication_lease(&state.db, &manifest_key).await {
+        Ok(lease) => lease,
+        Err(e) => {
+            release_publication_lease(&state.db, &metadata_lease).await;
+            return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}"));
+        }
     };
     let response = put_manifest_under_lease(
         &state,
@@ -1499,6 +1602,7 @@ pub async fn put_manifest(
     )
     .await;
     release_publication_lease(&state.db, &lease).await;
+    release_publication_lease(&state.db, &metadata_lease).await;
     response
 }
 

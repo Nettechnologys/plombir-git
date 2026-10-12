@@ -1126,6 +1126,7 @@ const SWEEP_DOOMED_BOT: &str = "sweepowner-doomed-agent";
 /// is pointed at the spare and the rest of the family keeps the one they share.
 struct RepoSeed {
     name: String,
+    oci_digest: String,
     /// Id of the issue comment seeded in this repository. Comment ids are
     /// handed out instance-wide, so the public repository's comment is not
     /// number 1 — and the handlers refuse a comment belonging to another
@@ -1221,6 +1222,7 @@ impl RepoSeed {
         let absent = || "1".to_string();
         Self {
             name: name.to_string(),
+            oci_digest: absent(),
             comment_id: absent(),
             milestone_id: absent(),
             label_id: absent(),
@@ -1847,6 +1849,35 @@ async fn seed_repo_rows(
          {package_status}: {package_body}"
     );
 
+    // The browser OCI delete route must reach a real digest. An empty image
+    // index has no blob dependencies, so this fixture can publish it without a
+    // Docker daemon or a staged upload.
+    rg_db::ops::oci_ops::find_or_create_repo(db, repo_id, &format!("{OWNER}/{repo}"), owner_id)
+        .await
+        .expect("fixture: OCI repository");
+    let oci_body = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+    let oci_digest = rg_core::package_registry::oci::ParsedManifest::parse(oci_body.as_bytes())
+        .expect("fixture: OCI index")
+        .digest;
+    let oci_push = fx
+        .client
+        .put(format!("{}/v2/{OWNER}/{repo}/manifests/sweep", fx.base))
+        .bearer_auth(&fx.owner_token)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/vnd.oci.image.index.v1+json",
+        )
+        .body(oci_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        oci_push.status(),
+        StatusCode::CREATED,
+        "fixture: OCI index in {repo}: {}",
+        oci_push.text().await.unwrap()
+    );
+
     // ── One pipeline per repository ────────────────────────────────────────
     //
     // Written through `rg_db` rather than through the API: a pipeline is
@@ -1873,6 +1904,7 @@ async fn seed_repo_rows(
 
     RepoSeed {
         name: repo.to_string(),
+        oci_digest,
         comment_id,
         milestone_id: id_of(milestone),
         label_id: id_of(label),
@@ -2124,6 +2156,7 @@ fn fill(fact: &RouteFact, repo: &RepoSeed, globals: &GlobalSeed, org: &str) -> S
             "artifact_id" => "sweep",
             "version" => PACKAGE_VERSION,
             "reference" => "latest",
+            "digest" if path.contains("/packages/oci/images/") => &repo.oci_digest,
             "digest" | "uuid" => {
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             }

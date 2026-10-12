@@ -1809,6 +1809,12 @@
     "identity_mismatch": "看板响应与请求的看板不一致"
   },
   "packages": {
+    "oci_images": "容器镜像",
+    "oci_label": "OCI",
+    "size_mib": "{size} MiB",
+    "no_oci_images": "暂无容器镜像",
+    "delete_oci_title": "删除容器镜像？",
+    "delete_oci_detail": "此摘要的所有标签都将删除。未使用的层会在安全等待期后清理。",
     "upload": "上传包",
     "format": "格式",
     "no_packages": "暂无包",

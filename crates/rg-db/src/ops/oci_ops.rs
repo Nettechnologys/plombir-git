@@ -25,6 +25,18 @@ pub async fn find_repo_by_id(
         .await
 }
 
+/// Repositories with OCI metadata, optionally restricted to one Git repository.
+pub async fn list_repositories(
+    db: &DatabaseConnection,
+    repo_id: Option<i64>,
+) -> Result<Vec<oci_repository::Model>, DbErr> {
+    let mut query = oci_repository::Entity::find();
+    if let Some(repo_id) = repo_id {
+        query = query.filter(oci_repository::Column::RepoId.eq(repo_id));
+    }
+    query.all(db).await
+}
+
 /// Find or create an OCI repository.
 #[allow(clippy::too_many_arguments)]
 pub async fn find_or_create_repo(
@@ -122,6 +134,43 @@ pub async fn find_manifest_by_digest(
         .await
 }
 
+/// Read a bounded page of manifest bodies. A repository can hold a large
+/// number of 4 MiB manifests, so a collector must never materialize all.
+pub async fn list_manifest_page<C: ConnectionTrait>(
+    db: &C,
+    oci_repo_id: i64,
+    after_id: i64,
+    limit: u64,
+) -> Result<Vec<oci_manifest::Model>, DbErr> {
+    oci_manifest::Entity::find()
+        .filter(oci_manifest::Column::OciRepositoryId.eq(oci_repo_id))
+        .filter(oci_manifest::Column::Id.gt(after_id))
+        .order_by_asc(oci_manifest::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+}
+
+/// Tags with their manifest rows for the package inventory.
+pub async fn list_tagged_manifests(
+    db: &DatabaseConnection,
+    oci_repo_id: i64,
+    last: Option<&str>,
+    limit: u64,
+) -> Result<Vec<(oci_tag::Model, Option<oci_manifest::Model>)>, DbErr> {
+    let mut query =
+        oci_tag::Entity::find().filter(oci_tag::Column::OciRepositoryId.eq(oci_repo_id));
+    if let Some(last) = last {
+        query = query.filter(oci_tag::Column::Tag.gt(last));
+    }
+    query
+        .find_also_related(oci_manifest::Entity)
+        .order_by_asc(oci_tag::Column::Tag)
+        .limit(limit)
+        .all(db)
+        .await
+}
+
 /// Find the tag row that names an image, inside one repository.
 async fn find_tag<C: ConnectionTrait>(
     db: &C,
@@ -180,6 +229,142 @@ pub async fn list_tags(
     }
     let tags = query.order_by_asc(oci_tag::Column::Tag).all(db).await?;
     Ok(tags.into_iter().map(|named| named.tag).collect())
+}
+
+/// Remove a tag mapping. The manifest row is retained until a separate digest
+/// deletion, since another tag or a multi-platform index may still name it.
+/// `false` means the tag was already absent.
+pub async fn delete_tag(
+    db: &DatabaseConnection,
+    oci_repo_id: i64,
+    tag: &str,
+) -> Result<bool, DbErr> {
+    Ok(oci_tag::Entity::delete_many()
+        .filter(oci_tag::Column::OciRepositoryId.eq(oci_repo_id))
+        .filter(oci_tag::Column::Tag.eq(tag))
+        .exec(db)
+        .await?
+        .rows_affected
+        > 0)
+}
+
+/// Remove a digest-addressed manifest and every tag that names it in one
+/// transaction. Blob bytes are left for GC, which must re-check references
+/// before retiring anything shared with another image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestDeleteOutcome {
+    Deleted,
+    Missing,
+    ReferencedByIndex,
+}
+
+pub async fn delete_manifest_by_digest(
+    db: &DatabaseConnection,
+    oci_repo_id: i64,
+    digest: &str,
+) -> Result<ManifestDeleteOutcome, DbErr> {
+    let transaction = db.begin().await?;
+    let Some(manifest) = oci_manifest::Entity::find()
+        .filter(oci_manifest::Column::OciRepositoryId.eq(oci_repo_id))
+        .filter(oci_manifest::Column::Digest.eq(digest))
+        .one(&transaction)
+        .await?
+    else {
+        transaction.rollback().await?;
+        return Ok(ManifestDeleteOutcome::Missing);
+    };
+    // Build the index reference graph while the caller holds the repository
+    // metadata lease. A child can have several parent indexes and its own tag.
+    let mut nodes = std::collections::HashMap::new();
+    let mut parents: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut cursor = 0;
+    loop {
+        let page = list_manifest_page(&transaction, oci_repo_id, cursor, 10).await?;
+        if page.is_empty() {
+            break;
+        }
+        for parent in page {
+            cursor = parent.id;
+            let body: serde_json::Value =
+                serde_json::from_str(&parent.manifest_json).map_err(|error| {
+                    DbErr::Custom(format!(
+                        "stored OCI manifest {} is malformed: {error}",
+                        parent.digest
+                    ))
+                })?;
+            let children: Vec<String> = body
+                .get("manifests")
+                .and_then(serde_json::Value::as_array)
+                .map(|children| {
+                    children
+                        .iter()
+                        .filter_map(|child| child.get("digest").and_then(serde_json::Value::as_str))
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for child in &children {
+                parents
+                    .entry(child.clone())
+                    .or_default()
+                    .insert(parent.digest.clone());
+            }
+            nodes.insert(parent.digest, (parent.id, children));
+        }
+    }
+    if parents
+        .get(digest)
+        .is_some_and(|parents| !parents.is_empty())
+    {
+        transaction.rollback().await?;
+        return Ok(ManifestDeleteOutcome::ReferencedByIndex);
+    }
+    let tagged: std::collections::HashSet<i64> = oci_tag::Entity::find()
+        .filter(oci_tag::Column::OciRepositoryId.eq(oci_repo_id))
+        .all(&transaction)
+        .await?
+        .into_iter()
+        .map(|tag| tag.oci_manifest_id)
+        .collect();
+    let mut retired = std::collections::HashSet::from([digest.to_owned()]);
+    let mut pending = std::collections::VecDeque::from([digest.to_owned()]);
+    while let Some(parent) = pending.pop_front() {
+        let Some((_, children)) = nodes.get(&parent) else {
+            continue;
+        };
+        for child in children {
+            let Some((child_id, _)) = nodes.get(child) else {
+                continue;
+            };
+            if !retired.contains(child)
+                && !tagged.contains(child_id)
+                && parents
+                    .get(child)
+                    .is_some_and(|parents| parents.iter().all(|parent| retired.contains(parent)))
+            {
+                retired.insert(child.clone());
+                pending.push_back(child.clone());
+            }
+        }
+    }
+    // Delete tags on the requested digest, then remove the entire now-unreachable
+    // index subtree. Blob ownership is independently collected after the grace
+    // period, and shared blobs are still retained by remaining manifests.
+    oci_tag::Entity::delete_many()
+        .filter(oci_tag::Column::OciRepositoryId.eq(oci_repo_id))
+        .filter(oci_tag::Column::OciManifestId.eq(manifest.id))
+        .exec(&transaction)
+        .await?;
+    for retired_digest in retired {
+        if let Some((id, _)) = nodes.get(&retired_digest) {
+            oci_manifest::Entity::delete_by_id(*id)
+                .exec(&transaction)
+                .await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(ManifestDeleteOutcome::Deleted)
 }
 
 /// Insert a digest-addressed manifest and claim its blob references exactly once.
@@ -428,6 +613,28 @@ pub async fn find_blob(
         .filter(oci_blob::Column::Digest.eq(digest))
         .one(db)
         .await
+}
+
+/// Mature blobs are candidates only; the caller must re-check every manifest
+/// after taking the repository metadata lease before deleting one.
+pub async fn list_mature_blobs(
+    db: &DatabaseConnection,
+    oci_repo_id: i64,
+    before: DateTimeUtc,
+) -> Result<Vec<oci_blob::Model>, DbErr> {
+    oci_blob::Entity::find()
+        .filter(oci_blob::Column::OciRepositoryId.eq(oci_repo_id))
+        .filter(oci_blob::Column::CreatedAt.lt(before))
+        .all(db)
+        .await
+}
+
+pub async fn delete_blob_by_id(db: &DatabaseConnection, id: i64) -> Result<bool, DbErr> {
+    Ok(oci_blob::Entity::delete_by_id(id)
+        .exec(db)
+        .await?
+        .rows_affected
+        > 0)
 }
 
 /// Insert a blob record unless this repository already owns the digest.

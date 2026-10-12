@@ -327,6 +327,17 @@ impl OciStorage {
         Ok(())
     }
 
+    /// Objects belonging to this OCI namespace, including orphaned manifest
+    /// and blob bytes left after a metadata or storage failure.
+    pub async fn list_published_objects(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> anyhow::Result<Vec<crate::blob_storage::BlobMetadata>> {
+        let prefix = BlobKey::from_segments(["oci", owner, repo])?;
+        Ok(self.backend.list(Some(&prefix)).await?)
+    }
+
     fn manifest_key(&self, owner: &str, repo: &str, digest: &str) -> anyhow::Result<BlobKey> {
         let (algorithm, hash) = digest_parts(digest)?;
         BlobKey::from_segments(["oci", owner, repo, "manifests", algorithm, hash])

@@ -15,6 +15,286 @@ use crate::common::{
 };
 use sha2::Digest as _;
 
+/// Deleting one image must leave a shared layer pullable; retiring the last
+/// manifest lets the scheduled collector reclaim the old layer bytes.
+#[tokio::test]
+async fn image_inventory_delete_and_gc_preserve_shared_layers() {
+    let (base, db, state) = crate::common::spawn_test_app_with_state().await;
+    let client = reqwest::Client::new();
+    let (token, _) = register_full(&base, "oci_gc", "oci_gc@example.com").await;
+    create_repo(&base, &token, "images").await;
+    let layer = b"a layer shared by two images";
+    let layer_digest = push_blob(&base, &token, "oci_gc", "images", layer).await;
+    let mut digests = Vec::new();
+    for tag in ["first", "second"] {
+        let body = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": DOCKER_MANIFEST_V2,
+            "config": {"mediaType": DOCKER_CONFIG_V1, "size": layer.len(), "digest": layer_digest},
+            "layers": [],
+            "annotations": {"org.opencontainers.image.ref.name": tag},
+        })
+        .to_string();
+        let digest = sha256(body.as_bytes());
+        let response = client
+            .put(format!("{base}/v2/oci_gc/images/manifests/{tag}"))
+            .bearer_auth(&token)
+            .header(reqwest::header::CONTENT_TYPE, DOCKER_MANIFEST_V2)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+        digests.push(digest);
+    }
+
+    let inventory = client
+        .get(format!(
+            "{base}/api/v1/repos/oci_gc/images/packages/oci/images"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inventory.status(), 200);
+    let rows: serde_json::Value = inventory.json().await.unwrap();
+    assert_eq!(rows["images"].as_array().unwrap().len(), 2, "{rows}");
+
+    let unlink = client
+        .delete(format!("{base}/v2/oci_gc/images/manifests/first"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unlink.status(), 202);
+    let still_by_digest = client
+        .get(format!("{base}/v2/oci_gc/images/manifests/{}", digests[0]))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(still_by_digest.status(), 200);
+
+    let deleted = client
+        .delete(format!("{base}/v2/oci_gc/images/manifests/{}", digests[0]))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 202);
+    let shared = client
+        .get(format!("{base}/v2/oci_gc/images/blobs/{layer_digest}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shared.status(), 200);
+
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&db, "oci_gc", "images")
+        .await
+        .unwrap()
+        .unwrap();
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let row = rg_db::ops::oci_ops::find_blob(&db, oci_repo.id, &layer_digest)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut aged: rg_db::entities::oci_blob::ActiveModel = row.into();
+    aged.created_at = sea_orm::Set(chrono::Utc::now() - chrono::Duration::hours(25));
+    sea_orm::ActiveModelTrait::update(aged, &db).await.unwrap();
+    let first_sweep = rg_http::api::ci_retention::cleanup_expired_storage(&state, Some(repo.id))
+        .await
+        .unwrap();
+    assert_eq!(first_sweep.oci_blobs_deleted, 0, "{first_sweep:?}");
+
+    let deleted = client
+        .delete(format!(
+            "{base}/api/v1/repos/oci_gc/images/packages/oci/images/{}",
+            digests[1]
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 202, "{}", deleted.text().await.unwrap());
+    let sweep = rg_http::api::ci_retention::cleanup_expired_storage(&state, Some(repo.id))
+        .await
+        .unwrap();
+    assert_eq!(sweep.oci_blobs_deleted, 1, "{sweep:?}");
+    assert!(!state
+        .oci_storage
+        .blob_exists("oci_gc", "images", &layer_digest)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn deleting_an_index_child_is_refused_until_its_parent_is_deleted() {
+    let (base, db, state) = crate::common::spawn_test_app_with_state().await;
+    let client = reqwest::Client::new();
+    let (token, _) = register_full(&base, "oci_index_gc", "oci_index_gc@example.com").await;
+    create_repo(&base, &token, "images").await;
+    let config = b"index child config";
+    let config_digest = push_blob(&base, &token, "oci_index_gc", "images", config).await;
+    let child = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {"mediaType": DOCKER_CONFIG_V1, "size": config.len(), "digest": config_digest},
+        "layers": [],
+    })
+    .to_string();
+    let child_digest = sha256(child.as_bytes());
+    let pushed = client
+        .put(format!(
+            "{base}/v2/oci_index_gc/images/manifests/{child_digest}"
+        ))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(child.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pushed.status(), 201, "{}", pushed.text().await.unwrap());
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX_V1,
+        "manifests": [{"mediaType": OCI_MANIFEST_V1, "size": child.len(), "digest": child_digest,
+            "platform": {"os": "linux", "architecture": "amd64"}}],
+    })
+    .to_string();
+    let index_digest = sha256(index.as_bytes());
+    let pushed = client
+        .put(format!("{base}/v2/oci_index_gc/images/manifests/latest"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_INDEX_V1)
+        .body(index)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pushed.status(), 201, "{}", pushed.text().await.unwrap());
+    let second_index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX_V1,
+        "manifests": [{"mediaType": OCI_MANIFEST_V1, "size": child.len(), "digest": child_digest,
+            "platform": {"os": "linux", "architecture": "amd64"}}],
+        "annotations": {"org.opencontainers.image.ref.name": "second"},
+    })
+    .to_string();
+    let second_index_digest = sha256(second_index.as_bytes());
+    let second_index_size = second_index.len();
+    let pushed = client
+        .put(format!("{base}/v2/oci_index_gc/images/manifests/second"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_INDEX_V1)
+        .body(second_index)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pushed.status(), 201, "{}", pushed.text().await.unwrap());
+    let inventory = client
+        .get(format!(
+            "{base}/api/v1/repos/oci_index_gc/images/packages/oci/images"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inventory.status(), 200);
+    let listing: serde_json::Value = inventory.json().await.unwrap();
+    let second = listing["images"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|image| image["tag"] == "second")
+        .expect("second index is listed");
+    assert_eq!(
+        second["size_bytes"],
+        (second_index_size + child.len() + config.len()) as u64
+    );
+    let refused = client
+        .delete(format!(
+            "{base}/v2/oci_index_gc/images/manifests/{child_digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 409, "{}", refused.text().await.unwrap());
+    let child_still_present = client
+        .get(format!(
+            "{base}/v2/oci_index_gc/images/manifests/{child_digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(child_still_present.status(), 200);
+    let deleted_index = client
+        .delete(format!(
+            "{base}/v2/oci_index_gc/images/manifests/{index_digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted_index.status(), 202);
+    let shared_child = client
+        .get(format!(
+            "{base}/v2/oci_index_gc/images/manifests/{child_digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shared_child.status(), 200);
+    let deleted_second_index = client
+        .delete(format!(
+            "{base}/v2/oci_index_gc/images/manifests/{second_index_digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted_second_index.status(), 202);
+    let retired_child = client
+        .get(format!(
+            "{base}/v2/oci_index_gc/images/manifests/{child_digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retired_child.status(), 404);
+
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&db, "oci_index_gc", "images")
+        .await
+        .unwrap()
+        .unwrap();
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let row = rg_db::ops::oci_ops::find_blob(&db, oci_repo.id, &config_digest)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut aged: rg_db::entities::oci_blob::ActiveModel = row.into();
+    aged.created_at = sea_orm::Set(chrono::Utc::now() - chrono::Duration::hours(25));
+    sea_orm::ActiveModelTrait::update(aged, &db).await.unwrap();
+    let sweep = rg_http::api::ci_retention::cleanup_expired_storage(&state, Some(repo.id))
+        .await
+        .unwrap();
+    assert_eq!(sweep.oci_blobs_deleted, 1, "{sweep:?}");
+    assert!(!state
+        .oci_storage
+        .blob_exists("oci_index_gc", "images", &config_digest)
+        .await
+        .unwrap());
+}
+
 const DOCKER_MANIFEST_V2: &str = "application/vnd.docker.distribution.manifest.v2+json";
 const DOCKER_CONFIG_V1: &str = "application/vnd.docker.container.image.v1+json";
 const DOCKER_LAYER_GZ: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";

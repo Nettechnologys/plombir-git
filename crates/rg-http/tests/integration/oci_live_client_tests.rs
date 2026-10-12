@@ -20,7 +20,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::common::{register_full, spawn_test_app_with_db};
+use crate::common::{register_full, spawn_test_app_with_db, spawn_test_app_with_state};
 
 /// A `docker` run and what it said, with the streams kept apart: the daemon
 /// puts progress on stderr and the useful failure text there too.
@@ -88,6 +88,7 @@ fn registry_host(base_url: &str) -> &str {
 struct Registry {
     host: String,
     reference: String,
+    token: String,
     logged_in: tempfile::TempDir,
 }
 
@@ -117,8 +118,83 @@ async fn private_repo(base_url: &str, user: &str) -> Registry {
     Registry {
         host,
         reference,
+        token,
         logged_in,
     }
+}
+
+/// Drive the complete lifecycle with the stock Docker client. The unit wire
+/// replay cannot prove Docker accepts the challenge, digest and 202 response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a working Docker daemon; run with --ignored"]
+async fn docker_image_inventory_delete_and_gc() {
+    let (base_url, db, state) = spawn_test_app_with_state().await;
+    let registry = private_repo(&base_url, "ocilivegc").await;
+    let config = registry.logged_in.path();
+    tiny_image(config, &registry.reference);
+    docker_ok(config, &["push", &registry.reference]);
+
+    let client = reqwest::Client::new();
+    let listed = client
+        .get(format!(
+            "{base_url}/api/v1/repos/ocilivegc/images/packages/oci/images"
+        ))
+        .bearer_auth(&registry.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+    let body: serde_json::Value = listed.json().await.unwrap();
+    let images = body["images"].as_array().expect("OCI images array");
+    assert_eq!(images.len(), 1, "{body}");
+    let digest = images[0]["digest"].as_str().expect("digest");
+    let removed = client
+        .delete(format!(
+            "{base_url}/api/v1/repos/ocilivegc/images/packages/oci/images/{digest}"
+        ))
+        .bearer_auth(&registry.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 202, "{}", removed.text().await.unwrap());
+
+    forget(config, &registry.reference);
+    let pull = docker(config, &["pull", &registry.reference]);
+    assert!(
+        !pull.status.success(),
+        "deleted image remained pullable: {}",
+        pull.combined()
+    );
+
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&db, "ocilivegc", "images")
+        .await
+        .unwrap()
+        .unwrap();
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let blobs = rg_db::ops::oci_ops::list_mature_blobs(
+        &db,
+        oci_repo.id,
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !blobs.is_empty(),
+        "docker push must have stored layer bytes"
+    );
+    for blob in blobs {
+        let mut aged: rg_db::entities::oci_blob::ActiveModel = blob.into();
+        aged.created_at = sea_orm::Set(chrono::Utc::now() - chrono::Duration::hours(25));
+        sea_orm::ActiveModelTrait::update(aged, &db).await.unwrap();
+    }
+    let sweep = rg_http::api::ci_retention::cleanup_expired_storage(&state, Some(repo.id))
+        .await
+        .unwrap();
+    assert!(sweep.oci_blobs_deleted > 0, "{sweep:?}");
+    assert_eq!(sweep.failures, 0, "{sweep:?}");
 }
 
 /// Best-effort teardown: a test that leaves images behind poisons the next run

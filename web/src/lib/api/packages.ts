@@ -63,6 +63,19 @@ interface PackageListResponse {
   failedRegistryTypes: string[];
 }
 
+export interface OciImageSummary {
+  namespace: string;
+  tag: string;
+  digest: string;
+  size_bytes: number;
+  pushed_at: string;
+}
+
+export interface OciImageListResponse {
+  images: OciImageSummary[];
+  next: string | null;
+}
+
 /** What `PATCH .../{version}/yank` answers: the state the version is now in. */
 interface YankResponse {
   yanked: boolean;
@@ -111,6 +124,10 @@ function filterPackagesByQuery(packages: PackageSummaryResponse[], query?: strin
 }
 
 export const packages = {
+  listOciImages: (owner: string, repo: string, last?: string) =>
+    request<OciImageListResponse>(`${repoPath(owner, repo)}/packages/oci/images${qs({ last })}`),
+  deleteOciImage: (owner: string, repo: string, digest: string) =>
+    request<void>(`${repoPath(owner, repo)}/packages/oci/images/${encodeURIComponent(digest)}`, { method: 'DELETE' }),
   list: async (owner: string, repo: string, pkg_type?: string, page?: number, perPage?: number, query?: string): Promise<PackageListResponse> => {
     if (pkg_type) {
       const res = await request<PackageListByTypeResponse>(`${repoPath(owner, repo)}/packages/${encodeURIComponent(pkg_type)}/list`);
