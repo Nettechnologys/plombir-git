@@ -3516,7 +3516,7 @@ pub async fn list_oci_images(
         } else {
             None
         };
-        return Json(OciImageListResponse { images, next }).into_response();
+        Json(OciImageListResponse { images, next }).into_response()
     }
 }
 

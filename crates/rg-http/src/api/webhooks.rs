@@ -428,6 +428,13 @@ pub async fn redeliver(
 
 // ── Organization and instance hooks ──────────────────────────────────────
 
+#[derive(Clone, Copy)]
+struct ScopeRef<'a> {
+    kind: &'a str,
+    id: i64,
+    name: &'a str,
+}
+
 async fn list_scope(state: &AppState, kind: &str, id: i64) -> Response {
     match rg_core::webhook::service::list_scoped_webhooks(&state.db, kind, id).await {
         Ok(hooks) => (
@@ -447,9 +454,7 @@ async fn list_scope(state: &AppState, kind: &str, id: i64) -> Response {
 async fn record_scope_change(
     state: &AppState,
     actor: &rg_core::audit::AuditActor,
-    kind: &str,
-    id: i64,
-    name: &str,
+    scope: ScopeRef<'_>,
     action: &str,
     headers: &HeaderMap,
     hook: &rg_db::entities::webhook::Model,
@@ -458,9 +463,9 @@ async fn record_scope_change(
         &state.db,
         actor,
         action,
-        Some(kind),
-        Some(id),
-        Some(name),
+        Some(scope.kind),
+        Some(scope.id),
+        Some(scope.name),
         Some(headers),
         Some(serde_json::json!({
             "webhook_id": hook.id,
@@ -499,9 +504,7 @@ async fn create_scope(
             record_scope_change(
                 state,
                 &actor,
-                kind,
-                id,
-                name,
+                ScopeRef { kind, id, name },
                 "webhook.create",
                 headers,
                 &hook,
@@ -515,9 +518,7 @@ async fn create_scope(
 
 async fn update_scope(
     state: &AppState,
-    kind: &str,
-    scope_id: i64,
-    name: &str,
+    scope: ScopeRef<'_>,
     actor_id: i64,
     hook_id: i64,
     headers: &HeaderMap,
@@ -527,7 +528,7 @@ async fn update_scope(
         Ok(actor) => actor,
         Err(error) => return error.into_response(),
     };
-    let existing = match webhook_in_scope(&state.db, kind, scope_id, hook_id).await {
+    let existing = match webhook_in_scope(&state.db, scope.kind, scope.id, hook_id).await {
         Ok(hook) => hook,
         Err(error) => return error.into_response(),
     };
@@ -541,17 +542,7 @@ async fn update_scope(
     .await
     {
         Ok(hook) => {
-            record_scope_change(
-                state,
-                &actor,
-                kind,
-                scope_id,
-                name,
-                "webhook.update",
-                headers,
-                &hook,
-            )
-            .await;
+            record_scope_change(state, &actor, scope, "webhook.update", headers, &hook).await;
             (StatusCode::OK, Json(WebhookResponse::from(hook))).into_response()
         }
         Err(error) => AppError::from(error).into_response(),
@@ -580,9 +571,11 @@ async fn delete_scope(
             record_scope_change(
                 state,
                 &actor,
-                kind,
-                scope_id,
-                name,
+                ScopeRef {
+                    kind,
+                    id: scope_id,
+                    name,
+                },
                 "webhook.delete",
                 headers,
                 &hook,
@@ -668,7 +661,16 @@ pub async fn org_update(
     Json(body): Json<rg_core::webhook::service::UpdateWebhookRequest>,
 ) -> Response {
     update_scope(
-        &state, "org", org.id, &org.name, actor_id, hook_id, &headers, &body,
+        &state,
+        ScopeRef {
+            kind: "org",
+            id: org.id,
+            name: &org.name,
+        },
+        actor_id,
+        hook_id,
+        &headers,
+        &body,
     )
     .await
 }
@@ -740,7 +742,16 @@ pub async fn system_update(
     Json(body): Json<rg_core::webhook::service::UpdateWebhookRequest>,
 ) -> Response {
     update_scope(
-        &state, "system", 0, "instance", actor_id, hook_id, &headers, &body,
+        &state,
+        ScopeRef {
+            kind: "system",
+            id: 0,
+            name: "instance",
+        },
+        actor_id,
+        hook_id,
+        &headers,
+        &body,
     )
     .await
 }
