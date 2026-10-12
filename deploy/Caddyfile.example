@@ -18,6 +18,14 @@
 # every push.
 
 git.example.com {
+	# `/metrics` describes the whole instance (traffic per route, the rate of
+	# failed logins) and answers anyone unless `[observability].metrics_token`
+	# is set. Prometheus scrapes it over the compose network, not through this
+	# proxy, so nothing legitimate needs it here. See "`/metrics` and the outside
+	# world" in deploy/README.md.
+	@metrics path /metrics /metrics/*
+	respond @metrics 404
+
 	reverse_proxy 127.0.0.1:8080 {
 		# Hand each chunk of a clone's pack, and each line of a live log, to
 		# the client as the server produces it rather than when a buffer fills.
