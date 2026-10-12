@@ -101,8 +101,11 @@ async fn indexing_over_http_makes_the_repository_searchable() {
         .send()
         .await
         .expect("post-index search request");
-    assert_eq!(after.status(), 200, "search after indexing must succeed");
-    let after: Vec<serde_json::Value> = after.json().await.expect("post-index search results");
+    let status = after.status();
+    let body = after.text().await.expect("post-index search body");
+    assert_eq!(status, 200, "search after indexing must succeed: {body}");
+    let after: Vec<serde_json::Value> =
+        serde_json::from_str(&body).expect("post-index search results");
     assert!(
         after.iter().any(|hit| hit["file_path"] == "src/needle.rs"),
         "the file committed above must be findable once indexed: {after:?}"
