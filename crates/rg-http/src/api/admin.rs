@@ -742,6 +742,7 @@ fn validate_sso_provider_request(
     oidc_transport_policy: &rg_core::auth::sso::OidcTransportPolicy,
     ldap_transport_policy: &rg_core::auth::ldap::LdapTransportPolicy,
 ) -> Result<(), String> {
+    validate_sso_provider_lengths(body)?;
     match provider_type {
         "ldap" => {
             validate_ldap_provider_request(body, has_stored_ldap_password, ldap_transport_policy)
@@ -753,6 +754,73 @@ fn validate_sso_provider_request(
             "unknown SSO provider type '{other}': expected one of oauth2, oidc, ldap"
         )),
     }
+}
+
+/// The longest client secret or LDAP bind password a provider may store.
+///
+/// Sealing adds a 12-byte nonce and a 16-byte tag and base64 grows the result
+/// by a third, so the ciphertext columns are `TEXT`
+/// (`m20261012_000004_sso_secret_columns_text`) and this is the contract. Real
+/// IdP secrets and bind passwords are a few dozen bytes.
+pub const MAX_SSO_SECRET_BYTES: usize = 4_096;
+
+/// The `VARCHAR(n)` width of every plain-text `sso_providers` column the form
+/// writes. PostgreSQL and MySQL both enforce it in characters, so a value
+/// past it used to pass validation and fail the insert as a 500.
+const SSO_TEXT_COLUMN_LIMITS: [(&str, usize); 11] = [
+    ("name", 50),
+    ("slug", 30),
+    ("client ID", 512),
+    ("discovery URL", 512),
+    ("scopes", 255),
+    ("LDAP host", 255),
+    ("LDAP bind DN", 512),
+    ("LDAP base DN", 512),
+    ("LDAP user filter", 512),
+    ("allowed email domains", 1024),
+    ("icon URL", 512),
+];
+
+/// Refuse a value the provider row cannot hold, before anything is sealed or
+/// written. Secrets are bounded in bytes (the plaintext the cipher sees), the
+/// plain columns in characters (what `VARCHAR(n)` counts).
+fn validate_sso_provider_lengths(body: &UpsertSsoProviderRequest) -> Result<(), String> {
+    for (value, name) in [
+        (body.client_secret.as_deref(), "client secret"),
+        (body.ldap_bind_password.as_deref(), "LDAP bind password"),
+    ] {
+        if value.is_some_and(|value| value.len() > MAX_SSO_SECRET_BYTES) {
+            return Err(format!(
+                "{name} must contain at most {MAX_SSO_SECRET_BYTES} bytes"
+            ));
+        }
+    }
+    // The stored domain list is the normalized one, which is what has to fit.
+    let allowed_email_domains = body
+        .allowed_email_domains
+        .as_deref()
+        .map(rg_core::user::provisioning::normalize_email_domains)
+        .transpose()?
+        .flatten();
+    let values = [
+        Some(body.name.as_str()),
+        Some(body.slug.as_str()),
+        body.client_id.as_deref(),
+        body.discovery_url.as_deref(),
+        body.scopes.as_deref(),
+        body.ldap_host.as_deref(),
+        body.ldap_bind_dn.as_deref(),
+        body.ldap_base_dn.as_deref(),
+        body.ldap_user_filter.as_deref(),
+        allowed_email_domains.as_deref(),
+        body.icon_url.as_deref(),
+    ];
+    for (value, (name, limit)) in values.into_iter().zip(SSO_TEXT_COLUMN_LIMITS) {
+        if value.is_some_and(|value| value.chars().count() > limit) {
+            return Err(format!("{name} must contain at most {limit} characters"));
+        }
+    }
+    Ok(())
 }
 
 /// The OAuth2/OIDC half of [`validate_sso_provider_request`].

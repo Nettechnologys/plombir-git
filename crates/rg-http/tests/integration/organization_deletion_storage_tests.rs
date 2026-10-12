@@ -113,17 +113,16 @@ async fn server_database_org_delete_removes_hook_and_delivery_together() {
         .await
         .expect("migrate disposable server database");
     let base = crate::common::spawn_test_app_over_db(db.clone()).await;
-    let (token, _) = register_full(
-        &base,
-        "server_org_hook_owner",
-        "server_org_hook@example.com",
-    )
-    .await;
-    create_org(&base, &token, "server-hook-org").await;
-    let (hook_id, delivery_id) = seed_org_hook(&base, &db, &token, "server-hook-org").await;
+    // A server database outlives one run, so every name carries a suffix.
+    let suffix = &uuid::Uuid::new_v4().simple().to_string()[..10];
+    let owner = format!("server_org_hook_{suffix}");
+    let org = format!("server-hook-org-{suffix}");
+    let (token, _) = register_full(&base, &owner, &format!("{owner}@example.com")).await;
+    create_org(&base, &token, &org).await;
+    let (hook_id, delivery_id) = seed_org_hook(&base, &db, &token, &org).await;
 
     let response = reqwest::Client::new()
-        .delete(format!("{base}/api/v1/orgs/server-hook-org"))
+        .delete(format!("{base}/api/v1/orgs/{org}"))
         .bearer_auth(&token)
         .send()
         .await

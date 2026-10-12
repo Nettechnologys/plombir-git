@@ -118,7 +118,12 @@ async fn server_database_webhook_secret_limit_is_checked_through_http() {
         .await
         .expect("migrate disposable server database");
     let base = crate::common::spawn_test_app_over_db(db.clone()).await;
-    exercise_secret_limit(&base, &db, "server_long_hook_secret").await;
+    // A server database outlives one run, so the owner carries a suffix.
+    let owner = format!(
+        "longhooksecret{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..10]
+    );
+    exercise_secret_limit(&base, &db, &owner).await;
 }
 
 async fn exercise_secret_limit(base: &str, db: &rg_db::DatabaseConnection, owner: &str) {

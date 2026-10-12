@@ -153,6 +153,8 @@ pub mod m20261011_000002_ci_secrets_mysql_longtext;
 pub mod m20261011_000003_webhook_scopes;
 pub mod m20261012_000001_webhook_delivery_mysql_longtext;
 pub mod m20261012_000002_webhook_secret_mysql_longtext;
+pub mod m20261012_000003_webhook_url_events_mysql_text;
+pub mod m20261012_000004_sso_secret_columns_text;
 
 use sea_orm_migration::prelude::*;
 
@@ -396,6 +398,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261011_000003_webhook_scopes::Migration),
             Box::new(m20261012_000001_webhook_delivery_mysql_longtext::Migration),
             Box::new(m20261012_000002_webhook_secret_mysql_longtext::Migration),
+            Box::new(m20261012_000003_webhook_url_events_mysql_text::Migration),
+            Box::new(m20261012_000004_sso_secret_columns_text::Migration),
         ]
     }
 }

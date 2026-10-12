@@ -11,6 +11,7 @@
 //! Adding a test file means adding a `mod` line here — a file dropped into this
 //! directory without one is silently not run.
 
+mod accepted_values_column_widening;
 mod aggregate_sums_decode;
 mod ci_embedded_runner_atomicity;
 mod ci_initial_graph_atomicity;

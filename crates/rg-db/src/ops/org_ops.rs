@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
-use crate::entities::{organization, organization_member, team, team_member, webhook};
+use crate::entities::{organization, organization_member, team, team_member};
 
 // ── Organization ops ──────────────────────────────────────────
 
@@ -252,42 +252,11 @@ pub async fn delete_org(db: &DatabaseConnection, id: i64) -> Result<bool> {
     }
     // Polymorphic scope_id has no foreign key to organizations. Retire the
     // hooks and their journals in the same transaction as the owner row.
-    // Keep the owner lookup in SQL: expanding all hook ids into an IN list
-    // would exceed SQLite's bind limit for a large organization.
-    let backend = transaction.get_database_backend();
-    // The journal writer locks its hook until it commits. Take those locks
-    // before deleting deliveries, otherwise a writer could commit between
-    // the delivery cleanup and the hook delete and leave an orphan behind.
-    if backend != DatabaseBackend::Sqlite {
-        webhook::Entity::find()
-            .select_only()
-            .column(webhook::Column::Id)
-            .filter(webhook::Column::ScopeKind.eq("org"))
-            .filter(webhook::Column::ScopeId.eq(id))
-            .lock_exclusive()
-            .into_tuple::<i64>()
-            .all(&transaction)
-            .await
-            .context("db: lock org webhooks for delete")?;
-    }
-    transaction
-        .execute(Statement::from_sql_and_values(
-            backend,
-            crate::prepare_sql(
-                backend,
-                "DELETE FROM webhook_deliveries WHERE webhook_id IN (\
-                 SELECT id FROM webhooks WHERE scope_kind = 'org' AND scope_id = ?)",
-            ),
-            [id.into()],
-        ))
-        .await
-        .context("db: delete org webhook deliveries")?;
-    webhook::Entity::delete_many()
-        .filter(webhook::Column::ScopeKind.eq("org"))
-        .filter(webhook::Column::ScopeId.eq(id))
-        .exec(&transaction)
-        .await
-        .context("db: delete org webhooks")?;
+    crate::ops::webhook_ops::delete_owned_hooks(
+        &transaction,
+        crate::ops::webhook_ops::WebhookOwner::Organization(id),
+    )
+    .await?;
     transaction
         .commit()
         .await

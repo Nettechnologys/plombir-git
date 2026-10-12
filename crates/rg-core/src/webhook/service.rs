@@ -69,6 +69,21 @@ pub struct UpdateWebhookRequest {
 /// the plaintext, so the database column must hold more than this many bytes.
 pub const MAX_WEBHOOK_SECRET_BYTES: usize = 65_536;
 
+/// The longest target URL a hook may name. Browsers and proxies commonly stop
+/// at 8 KiB; the column is `TEXT` on MySQL and unbounded elsewhere, so this is
+/// the contract rather than a storage accident, and an overlong URL is the
+/// caller's `400` instead of a failed insert.
+pub const MAX_WEBHOOK_URL_BYTES: usize = 8_192;
+
+fn reject_overlong_url(url: &str) -> Result<()> {
+    if url.len() > MAX_WEBHOOK_URL_BYTES {
+        return Err(crate::error::invalid_request(format!(
+            "webhook URL must contain at most {MAX_WEBHOOK_URL_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 /// Seal an operator-supplied signing secret for storage.
 ///
 /// An absent or empty secret is stored as `NULL` rather than as the ciphertext
@@ -296,7 +311,12 @@ pub fn is_known_event(event: &str) -> bool {
 /// contain a comma or be empty: the reader splits on `,`, so either would
 /// produce a subscription entry that can never be matched — the same silent
 /// dead end by a different route.
+///
+/// A repeated name is kept once. Repetition subscribes to nothing more, and
+/// without it the stored value is bounded by the canon: every declared event
+/// once, which the `TEXT` column holds on every backend.
 fn encode_subscriptions(events: &[String]) -> Result<String> {
+    let mut subscribed: Vec<&str> = Vec::with_capacity(events.len().min(WEBHOOK_EVENTS.len()));
     for event in events {
         if !is_known_event(event) {
             return Err(crate::error::invalid_request(format!(
@@ -304,8 +324,11 @@ fn encode_subscriptions(events: &[String]) -> Result<String> {
                 WEBHOOK_EVENTS.join(", ")
             )));
         }
+        if !subscribed.contains(&event.as_str()) {
+            subscribed.push(event);
+        }
     }
-    Ok(events.join(","))
+    Ok(subscribed.join(","))
 }
 
 fn delivery_format(value: &str) -> Result<&str> {
@@ -417,6 +440,7 @@ pub async fn create_scoped_webhook(
     // registration for immediate feedback, and require an operator exception
     // before plaintext HTTP can carry payloads/signatures. Delivery re-checks
     // both policy and DNS so legacy rows cannot bypass a safer new default.
+    reject_overlong_url(&req.url)?;
     transport_policy.validate_url_static(&req.url)?;
     reject_url_credentials(&req.url)?;
     let now = Utc::now();
@@ -488,6 +512,7 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     if let Some(url) = req.url.as_deref() {
+        reject_overlong_url(url)?;
         transport_policy.validate_url_static(url)?;
         reject_url_credentials(url)?;
     }

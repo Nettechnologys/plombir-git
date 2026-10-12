@@ -515,6 +515,17 @@ pub async fn soft_delete_unless_mirror_syncing(
         return Ok(RepositoryRetirement::MirrorSyncInFlight);
     }
 
+    // No route addresses a deleted repository's hooks any more, yet each one
+    // keeps its signing secret and its journal keeps every payload it sent.
+    // Retire them with the row: a failure here rolls the soft delete back and
+    // leaves both for the retry, and a recreated repository under the same
+    // name gets a new id and starts without them.
+    crate::ops::webhook_ops::delete_owned_hooks(
+        &transaction,
+        crate::ops::webhook_ops::WebhookOwner::Repository(id),
+    )
+    .await?;
+
     transaction
         .commit()
         .await

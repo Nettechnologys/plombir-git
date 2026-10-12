@@ -4,13 +4,13 @@ use anyhow::{Context, Result};
 use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
-use crate::entities::organization;
 use crate::entities::webhook::{
     self, ActiveModel as WebhookActiveModel, Entity as WebhookEntity, Model as Webhook,
 };
 use crate::entities::webhook_delivery::{
     ActiveModel as DeliveryActiveModel, Entity as DeliveryEntity, Model as WebhookDelivery,
 };
+use crate::entities::{organization, repository};
 
 // ── Webhook CRUD ──────────────────────────────────────────────────────────
 
@@ -80,38 +80,127 @@ pub async fn list_by_scope(
 
 /// Create a new webhook.
 pub async fn create_webhook(db: &DatabaseConnection, model: WebhookActiveModel) -> Result<Webhook> {
-    if !matches!(&model.scope_kind, ActiveValue::Set(kind) if kind == "org") {
-        return model.insert(db).await.context("db: create webhook");
-    }
-    // Serialize an org hook insert with retirement of its owner. The HTTP
-    // scope check may have completed before retirement took the org row.
-    let org_id = match &model.scope_id {
-        ActiveValue::Set(id) | ActiveValue::Unchanged(id) => *id,
-        ActiveValue::NotSet => anyhow::bail!("org webhook scope id was not set"),
+    let owner = match &model.scope_kind {
+        ActiveValue::Set(kind) | ActiveValue::Unchanged(kind) => match kind.as_str() {
+            "org" => Some("organization"),
+            "repo" => Some("repository"),
+            _ => None,
+        },
+        ActiveValue::NotSet => None,
     };
-    let transaction = db.begin().await.context("db: begin org webhook create")?;
-    let mut query =
-        organization::Entity::find_by_id(org_id).filter(organization::Column::DeletedAt.is_null());
-    if db.get_database_backend() != DatabaseBackend::Sqlite {
-        query = query.lock_exclusive();
-    }
-    if query
-        .one(&transaction)
+    let Some(owner) = owner else {
+        return model.insert(db).await.context("db: create webhook");
+    };
+    // Serialize a scoped hook insert with retirement of its owner. The HTTP
+    // scope check may have completed before retirement took the owner row,
+    // and the retirement deletes the owner's hooks in its own transaction.
+    let owner_id = match &model.scope_id {
+        ActiveValue::Set(id) | ActiveValue::Unchanged(id) => *id,
+        ActiveValue::NotSet => anyhow::bail!("{owner} webhook scope id was not set"),
+    };
+    let transaction = db
+        .begin()
         .await
-        .context("db: check org webhook owner")?
-        .is_none()
-    {
-        anyhow::bail!("organization is no longer active");
+        .context("db: begin scoped webhook create")?;
+    let lock = db.get_database_backend() != DatabaseBackend::Sqlite;
+    let active = if owner == "organization" {
+        let mut query = organization::Entity::find_by_id(owner_id)
+            .filter(organization::Column::DeletedAt.is_null());
+        if lock {
+            query = query.lock_exclusive();
+        }
+        query.one(&transaction).await.map(|row| row.is_some())
+    } else {
+        let mut query = repository::Entity::find_by_id(owner_id)
+            .filter(repository::Column::DeletedAt.is_null());
+        if lock {
+            query = query.lock_exclusive();
+        }
+        query.one(&transaction).await.map(|row| row.is_some())
+    }
+    .with_context(|| format!("db: check {owner} webhook owner"))?;
+    if !active {
+        anyhow::bail!("{owner} is no longer active");
     }
     let hook = model
         .insert(&transaction)
         .await
-        .context("db: create org webhook")?;
+        .context("db: create scoped webhook")?;
     transaction
         .commit()
         .await
-        .context("db: commit org webhook create")?;
+        .context("db: commit scoped webhook create")?;
     Ok(hook)
+}
+
+/// The owner whose retirement takes its webhooks and their journals along.
+#[derive(Clone, Copy, Debug)]
+pub enum WebhookOwner {
+    Organization(i64),
+    Repository(i64),
+}
+
+/// Delete every hook of `owner` and every delivery recorded for them.
+///
+/// Runs on the caller's transaction, after the owner row is written, so the
+/// hooks leave together with their owner or not at all. `scope_id` is
+/// polymorphic and carries no foreign key, and neither does
+/// `webhook_deliveries.webhook_id`, so nothing in the schema does this.
+///
+/// The owner lookup stays in SQL: expanding all hook ids into an `IN` list
+/// would exceed SQLite's bind limit for a large owner. On a server backend the
+/// hooks are locked first, because the journal writer
+/// ([`create_delivery`]) holds its hook's lock until it commits — without it a
+/// writer could commit between the delivery cleanup and the hook delete and
+/// leave an orphan behind.
+pub async fn delete_owned_hooks(
+    transaction: &DatabaseTransaction,
+    owner: WebhookOwner,
+) -> Result<()> {
+    let backend = transaction.get_database_backend();
+    let (kind, owner_column, id) = match owner {
+        WebhookOwner::Organization(id) => ("org", webhook::Column::ScopeId, id),
+        // Repository events select hooks by `repo_id`, so retire by the same
+        // column the dispatcher reads.
+        WebhookOwner::Repository(id) => ("repo", webhook::Column::RepoId, id),
+    };
+    if backend != DatabaseBackend::Sqlite {
+        WebhookEntity::find()
+            .select_only()
+            .column(webhook::Column::Id)
+            .filter(webhook::Column::ScopeKind.eq(kind))
+            .filter(owner_column.eq(id))
+            .lock_exclusive()
+            .into_tuple::<i64>()
+            .all(transaction)
+            .await
+            .with_context(|| format!("db: lock {kind} webhooks for delete"))?;
+    }
+    let sql = match owner {
+        WebhookOwner::Organization(_) => {
+            "DELETE FROM webhook_deliveries WHERE webhook_id IN (\
+             SELECT id FROM webhooks WHERE scope_kind = 'org' AND scope_id = ?)"
+        }
+        WebhookOwner::Repository(_) => {
+            "DELETE FROM webhook_deliveries WHERE webhook_id IN (\
+             SELECT id FROM webhooks WHERE scope_kind = 'repo' AND repo_id = ?)"
+        }
+    };
+    transaction
+        .execute(Statement::from_sql_and_values(
+            backend,
+            crate::prepare_sql(backend, sql),
+            [id.into()],
+        ))
+        .await
+        .with_context(|| format!("db: delete {kind} webhook deliveries"))?;
+    WebhookEntity::delete_many()
+        .filter(webhook::Column::ScopeKind.eq(kind))
+        .filter(owner_column.eq(id))
+        .exec(transaction)
+        .await
+        .with_context(|| format!("db: delete {kind} webhooks"))?;
+    Ok(())
 }
 
 /// Update a webhook in one conditional statement.
@@ -149,18 +238,51 @@ pub async fn update_webhook(
     }
 }
 
-/// Delete a webhook by id, reporting whether this call removed it.
+/// Delete a webhook by id together with its delivery journal, reporting
+/// whether this call removed it.
 ///
 /// `false` means the row was already gone when the DELETE ran — the caller's
 /// own lookup happened in a separate statement, so a concurrent delete can win
 /// in between. Only the request that actually removed the row may report a
 /// deletion.
+///
+/// The journal goes in the same transaction: each delivery keeps the full
+/// request payload and the receiver's response, and once the hook is gone no
+/// route addresses them, so they would sit unreachable until the retention
+/// sweep. On a server backend the hook is locked first so a delivery whose
+/// network request finishes now either commits before this cleanup or finds
+/// no hook ([`create_delivery`]); on SQLite the first statement is a write,
+/// which takes the single writer slot outright.
 pub async fn delete_webhook_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let transaction = db.begin().await.context("db: begin webhook delete")?;
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        WebhookEntity::find_by_id(id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await
+            .context("db: lock webhook for delete")?;
+    }
+    DeliveryEntity::delete_many()
+        .filter(crate::entities::webhook_delivery::Column::WebhookId.eq(id))
+        .exec(&transaction)
+        .await
+        .context("db: delete webhook deliveries")?;
     let result = WebhookEntity::delete_by_id(id)
-        .exec(db)
+        .exec(&transaction)
         .await
         .context("db: delete webhook")?;
-    Ok(result.rows_affected > 0)
+    if result.rows_affected == 0 {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back missing webhook delete")?;
+        return Ok(false);
+    }
+    transaction
+        .commit()
+        .await
+        .context("db: commit webhook delete")?;
+    Ok(true)
 }
 
 // ── Webhook Delivery ──────────────────────────────────────────────────────
