@@ -138,7 +138,9 @@ they do not rot. What they set beyond a stock proxy, and why, is commented in
 each file: no request-body ceiling (pushes, LFS, packages and OCI layers carry
 their own limits on the server), streaming instead of buffering in both
 directions, timeouts longer than a large clone, the WebSocket upgrade for live
-CI logs, and `X-Forwarded-For` / `X-Forwarded-Proto`.
+CI logs, `X-Forwarded-For` / `X-Forwarded-Proto`, and a `404` for `/metrics` so
+the instance's traffic figures are not published with everything else
+([why](#metrics-and-the-outside-world)).
 
 Then tell the server two things in `plombir-git.toml`:
 
