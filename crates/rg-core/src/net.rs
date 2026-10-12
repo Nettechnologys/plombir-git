@@ -689,6 +689,29 @@ pub(crate) fn guard_git_url_with_addresses(
 // the three call sites cannot drift apart on what counts as a secret:
 // **the password is one, the login name is not**.
 
+/// Maximum stored remote address and login lengths. MySQL stores these in
+/// `TEXT` columns; the limits also give callers a predictable request error.
+pub const MAX_REMOTE_URL_BYTES: usize = 8_192;
+pub const MAX_REMOTE_USERNAME_BYTES: usize = 8_192;
+
+pub fn check_remote_url_length(url: &str) -> Result<()> {
+    if url.len() > MAX_REMOTE_URL_BYTES {
+        return Err(crate::error::invalid_request(format!(
+            "remote URL must contain at most {MAX_REMOTE_URL_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+pub fn check_remote_username_length(username: Option<&str>) -> Result<()> {
+    if username.is_some_and(|value| value.len() > MAX_REMOTE_USERNAME_BYTES) {
+        return Err(crate::error::invalid_request(format!(
+            "remote username must contain at most {MAX_REMOTE_USERNAME_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 /// A user-supplied URL with the credential taken out of its userinfo section.
 ///
 /// Two rewritten forms, because the callers differ in what they can store:

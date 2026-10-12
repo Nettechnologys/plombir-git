@@ -208,6 +208,7 @@ mod release_asset_filename_tests;
 mod release_attestation_tests;
 mod release_deletion_storage_tests;
 mod release_tests;
+mod remote_storage_lifecycle_tests;
 mod repo_content_failure_status_tests;
 mod repo_cookie_session_tests;
 mod repo_name_transport_tests;

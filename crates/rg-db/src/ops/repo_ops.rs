@@ -15,8 +15,8 @@ use crate::entities::repository::{
     self, ActiveModel as RepoActiveModel, Entity as RepoEntity, Model as Repo,
 };
 use crate::entities::{
-    oci_blob, oci_repository, organization, package, package_file, package_registry,
-    package_version, repository_transfer_lease, user,
+    ci_secret, deploy_key, mirror, mirror_sync_lease, oci_blob, oci_repository, organization,
+    package, package_file, package_registry, package_version, repository_transfer_lease, user,
 };
 
 /// Count non-deleted repositories — backs the `plombir_git_repositories` gauge.
@@ -525,6 +525,29 @@ pub async fn soft_delete_unless_mirror_syncing(
         crate::ops::webhook_ops::WebhookOwner::Repository(id),
     )
     .await?;
+
+    // A soft delete does not activate FK cascades. These rows carry a sealed
+    // secret or an SSH grant and have no route once the repository is gone.
+    ci_secret::Entity::delete_many()
+        .filter(ci_secret::Column::RepoId.eq(id))
+        .exec(&transaction)
+        .await
+        .context("db: retire repository CI secrets")?;
+    deploy_key::Entity::delete_many()
+        .filter(deploy_key::Column::RepoId.eq(id))
+        .exec(&transaction)
+        .await
+        .context("db: retire repository deploy keys")?;
+    mirror::Entity::delete_many()
+        .filter(mirror::Column::RepoId.eq(id))
+        .exec(&transaction)
+        .await
+        .context("db: retire repository mirror")?;
+    mirror_sync_lease::Entity::delete_many()
+        .filter(mirror_sync_lease::Column::RepoId.eq(id))
+        .exec(&transaction)
+        .await
+        .context("db: retire repository mirror lease")?;
 
     transaction
         .commit()

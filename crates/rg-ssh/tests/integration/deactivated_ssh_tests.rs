@@ -508,6 +508,78 @@ async fn deleting_a_deploy_key_stops_execs_on_the_connection_it_opened() {
     h.server.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn soft_deleted_repository_revokes_its_deploy_key_on_new_and_existing_connections() {
+    let h = harness("ssh_repo_deploy_retired").await;
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&h.db, &h.username, REPO)
+        .await
+        .unwrap()
+        .expect("the fixture repository");
+    let deploy_private = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let openssh = deploy_private.public_key().to_openssh().unwrap();
+    let fingerprint = rg_core::auth::ssh_key::fingerprint_from_openssh(&openssh).unwrap();
+    rg_db::ops::deploy_key_ops::create(
+        &h.db,
+        rg_db::entities::deploy_key::ActiveModel {
+            id: sea_orm::NotSet,
+            repo_id: Set(repo.id),
+            created_by_id: Set(Some(h.user_id)),
+            title: Set("retired repository".to_string()),
+            public_key: Set(openssh),
+            fingerprint: Set(fingerprint.clone()),
+            read_only: Set(true),
+            created_at: Set(chrono::Utc::now()),
+            last_used_at: Set(None),
+        },
+    )
+    .await
+    .unwrap();
+
+    let deploy_private = Arc::new(deploy_private);
+    let mut existing = h.server.connect().await;
+    assert!(existing
+        .authenticate_publickey(
+            "git",
+            PrivateKeyWithHashAlg::new(deploy_private.clone(), None),
+        )
+        .await
+        .unwrap()
+        .success());
+    assert!(upload_pack_allowed(&existing, &h.username).await);
+
+    assert_eq!(
+        rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
+            &h.db,
+            repo.id,
+            chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+        )
+        .await
+        .unwrap(),
+        rg_db::ops::repo_ops::RepositoryRetirement::Deleted,
+    );
+    assert!(
+        rg_db::ops::deploy_key_ops::find_by_fingerprint(&h.db, &fingerprint)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !upload_pack_allowed(&existing, &h.username).await,
+        "an existing connection still serves git after repository retirement"
+    );
+
+    let mut new_session = h.server.connect().await;
+    assert!(
+        !new_session
+            .authenticate_publickey("git", PrivateKeyWithHashAlg::new(deploy_private, None))
+            .await
+            .unwrap()
+            .success(),
+        "a new SSH session accepted a deploy key whose repository was deleted"
+    );
+    h.server.abort();
+}
+
 /// The reason somebody resets a password is that somebody else has it.
 ///
 /// The web session was closed by `session_version` the day it was introduced,

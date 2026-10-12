@@ -13,7 +13,7 @@
 //! `PLOMBIR_GIT_TEST_DATABASE_URL`; without it the rows go to a throwaway
 //! SQLite, where the migrations are no-ops and only the round trip is proved.
 
-use rg_db::entities::{sso_provider, webhook};
+use rg_db::entities::{import_task, mirror, repository, sso_provider, webhook};
 use rg_db::sea_orm::{
     ActiveModelTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, NotSet,
     Set, Statement,
@@ -120,6 +120,87 @@ async fn widened_columns_keep_live_rows_and_hold_accepted_values() {
     );
     let events = "pull_request.review_requested,".repeat(12) + "push";
     let sealed = "s".repeat(6_000);
+    let old_remote = format!("https://example.invalid/{suffix}/old.git");
+    let remote = format!(
+        "https://example.invalid/{suffix}/{}",
+        "r".repeat(8_192 - "https://example.invalid/".len() - suffix.len() - 1)
+    );
+    let remote_username = "u".repeat(8_192);
+    let old_mirror_ciphertext = "existing-sealed-password".to_string();
+
+    let user = rg_db::ops::user_ops::create_user(
+        &db,
+        &format!("wide{suffix}"),
+        &format!("wide{suffix}@example.invalid"),
+        "unused",
+        "Widening",
+    )
+    .await
+    .expect("create widening fixture user");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        repository::ActiveModel {
+            owner_id: Set(user.id),
+            name: Set(format!("wide{suffix}")),
+            description: Set(None),
+            is_private: Set(false),
+            default_branch: Set("main".to_string()),
+            fork_id: Set(None),
+            stars_count: Set(0),
+            forks_count: Set(0),
+            org_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            origin_repo_id: Set(None),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create widening fixture repository");
+    let existing_mirror = mirror::ActiveModel {
+        repo_id: Set(repo.id),
+        url: Set(old_remote.clone()),
+        username: Set(Some("old-bot".to_string())),
+        password_encrypted: Set(Some(old_mirror_ciphertext.clone())),
+        sync_interval_seconds: Set(3600),
+        next_sync_at: Set(None),
+        last_sync_at: Set(None),
+        last_sync_error: Set(None),
+        status: Set("inactive".to_string()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("store an old mirror row");
+    let existing_import = import_task::ActiveModel {
+        user_id: Set(user.id),
+        repo_id: Set(Some(repo.id)),
+        platform: Set("git".to_string()),
+        source_url: Set(old_remote.clone()),
+        target_owner: Set(user.username.clone()),
+        target_name: Set(repo.name.clone()),
+        status: Set("completed".to_string()),
+        progress: Set(100),
+        stage: Set(None),
+        error: Set(None),
+        import_repo: Set(true),
+        import_issues: Set(false),
+        import_pull_requests: Set(false),
+        import_wiki: Set(false),
+        import_releases: Set(false),
+        import_labels: Set(false),
+        import_milestones: Set(false),
+        stats: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("store an old import row");
 
     let hook = webhook::ActiveModel {
         id: NotSet,
@@ -162,6 +243,27 @@ async fn widened_columns_keep_live_rows_and_hold_accepted_values() {
         .up(&manager)
         .await
         .expect("rerun the SSO secret column widening over a live row");
+    rg_db::migrations::m20261012_000005_remote_addresses_mysql_text::Migration
+        .up(&manager)
+        .await
+        .expect("rerun remote address widening over live rows");
+
+    let kept_mirror = mirror::Entity::find_by_id(existing_mirror.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("mirror survived the widening");
+    assert_eq!(kept_mirror.url, old_remote);
+    assert_eq!(
+        kept_mirror.password_encrypted.as_deref(),
+        Some(old_mirror_ciphertext.as_str())
+    );
+    let kept_import = import_task::Entity::find_by_id(existing_import.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("import survived the widening");
+    assert_eq!(kept_import.source_url, old_remote);
 
     let kept_hook = webhook::Entity::find_by_id(hook.id)
         .one(&db)
@@ -197,6 +299,19 @@ async fn widened_columns_keep_live_rows_and_hold_accepted_values() {
         .update(&db)
         .await
         .expect("store sealed secrets past VARCHAR(1024)");
+    let mut widened_mirror: mirror::ActiveModel = kept_mirror.into();
+    widened_mirror.url = Set(remote.clone());
+    widened_mirror.username = Set(Some(remote_username.clone()));
+    let widened_mirror = widened_mirror
+        .update(&db)
+        .await
+        .expect("store a mirror address and username past VARCHAR(255)");
+    let mut widened_import: import_task::ActiveModel = kept_import.into();
+    widened_import.source_url = Set(remote.clone());
+    let widened_import = widened_import
+        .update(&db)
+        .await
+        .expect("store an import address past VARCHAR(255)");
     let hook_id = kept_hook.id;
 
     let stored_hook = webhook::Entity::find_by_id(hook_id)
@@ -219,12 +334,38 @@ async fn widened_columns_keep_live_rows_and_hold_accepted_values() {
         stored_provider.ldap_bind_password_enc.as_deref(),
         Some(sealed.as_str())
     );
+    let stored_mirror = mirror::Entity::find_by_id(widened_mirror.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_mirror.url, remote);
+    assert_eq!(
+        stored_mirror.username.as_deref(),
+        Some(remote_username.as_str())
+    );
+    assert_eq!(
+        stored_mirror.password_encrypted.as_deref(),
+        Some(old_mirror_ciphertext.as_str())
+    );
+    assert_eq!(
+        import_task::Entity::find_by_id(widened_import.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .source_url,
+        remote
+    );
 
     for (table, column) in [
         ("webhooks", "url"),
         ("webhooks", "events"),
         ("sso_providers", "client_secret_enc"),
         ("sso_providers", "ldap_bind_password_enc"),
+        ("mirrors", "url"),
+        ("mirrors", "username"),
+        ("import_tasks", "source_url"),
     ] {
         if let Some((declared, length)) = column_type(&db, table, column).await {
             let unbounded =
@@ -241,6 +382,18 @@ async fn widened_columns_keep_live_rows_and_hold_accepted_values() {
         .await
         .unwrap();
     sso_provider::Entity::delete_by_id(provider.id)
+        .exec(&db)
+        .await
+        .unwrap();
+    import_task::Entity::delete_by_id(widened_import.id)
+        .exec(&db)
+        .await
+        .unwrap();
+    mirror::Entity::delete_by_id(widened_mirror.id)
+        .exec(&db)
+        .await
+        .unwrap();
+    repository::Entity::delete_by_id(repo.id)
         .exec(&db)
         .await
         .unwrap();

@@ -221,10 +221,8 @@ async fn delete_repository_retires_git_and_secondary_blob_namespaces() {
 
 /// card_374998ffebc1: a mirrored repository owns a second Git tree — the full
 /// clone of its upstream under `<repo_root>/<repo_id>.mirror` — and the deletion
-/// used to answer `2xx` with that copy still on disk. Worse, it came back:
-/// `mirrors` survives the repository's *soft* delete, so the scheduler kept
-/// selecting the row, found no `HEAD`, and re-cloned the whole upstream into the
-/// path the deletion had just cleared.
+/// used to answer `2xx` with that copy still on disk. The scheduler must also
+/// leave it gone after the repository and mirror row have retired.
 ///
 /// Three independent claims, one per half of the defect and one for the gap
 /// between them:
@@ -273,6 +271,10 @@ async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_
         1,
         "the fixture did not make the mirror due, so nothing below is being tested"
     );
+    let mirror_before_delete = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+        .await
+        .expect("read the due mirror")
+        .expect("the due mirror exists");
 
     // What one completed sync leaves behind: a bare clone of the upstream.
     let clone = state.repo_root.join(format!("{repo_id}.mirror"));
@@ -312,12 +314,10 @@ async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_
         "DELETE returned success while the staged mirror clone remained: {tombstones:?}"
     );
 
-    // The row outlived the soft-delete — that is the point. What must not
-    // outlive it is its place in the sweep's work list.
-    let mirror = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+    assert!(rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
         .await
         .expect("read the mirror row")
-        .expect("the mirror row survives its repository's soft-delete");
+        .is_none());
     assert!(
         rg_db::ops::mirror_ops::list_due_sync(&db, 10)
             .await
@@ -329,7 +329,7 @@ async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_
     assert_eq!(
         rg_core::mirror::service::sync_mirror(
             &db,
-            &mirror,
+            &mirror_before_delete,
             &state.repo_root,
             Default::default(),
             TEST_ENCRYPTION_KEY,
@@ -372,17 +372,11 @@ async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_
         clone.display()
     );
 
-    // The refusal happens before the credential is decrypted and before the
-    // SSRF guard, so an untouched `last_sync_at` is the evidence that nothing
-    // reached out to the remote on behalf of a repository that no longer exists.
-    let after = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+    // No row can be updated by a late pass after retirement.
+    assert!(rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
         .await
         .expect("re-read the mirror row")
-        .expect("the mirror row");
-    assert!(
-        after.last_sync_at.is_none(),
-        "a sync pass ran for a deleted repository: {after:?}"
-    );
+        .is_none());
 }
 
 /// Configure a mirror on `owner/name` and return the path its clone occupies,

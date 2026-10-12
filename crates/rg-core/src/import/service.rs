@@ -3804,6 +3804,7 @@ pub async fn start_import(
     // `git` pairs the token with (see the module note).
     let source = crate::net::split_url_credentials(&source_url).context("invalid source URL")?;
     let source_url = source.url_without_secret;
+    crate::net::check_remote_url_length(&source_url)?;
     let auth_token = auth_token
         .filter(|token| !token.is_empty())
         .or(source.password);

@@ -400,6 +400,12 @@ jobs:
       - name: Run PostgreSQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
 
+      - name: Prove remote values and repository credential retirement on PostgreSQL
+        run: "cargo test -p rg-http --test integration -j 6 remote_storage_lifecycle_tests:: -- --ignored --nocapture"
+
+      - name: Prove remote column widening keeps live PostgreSQL rows
+        run: cargo test -p rg-db --test integration -j 6 widened_columns_keep_live_rows_and_hold_accepted_values -- --nocapture
+
       - name: Prove large webhook deliveries remain replayable on PostgreSQL
         run: cargo test -p rg-core -j 6 large_delivery_is_journaled_and_replayable_on_server_database -- --ignored --nocapture
 
@@ -484,6 +490,12 @@ jobs:
 
       - name: Run MySQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
+
+      - name: Prove remote values and repository credential retirement on MySQL
+        run: "cargo test -p rg-http --test integration -j 6 remote_storage_lifecycle_tests:: -- --ignored --nocapture"
+
+      - name: Prove remote column widening keeps live MySQL rows
+        run: cargo test -p rg-db --test integration -j 6 widened_columns_keep_live_rows_and_hold_accepted_values -- --nocapture
 
       - name: Prove large webhook deliveries remain replayable on MySQL
         run: cargo test -p rg-core -j 6 large_delivery_is_journaled_and_replayable_on_server_database -- --ignored --nocapture

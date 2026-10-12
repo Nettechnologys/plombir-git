@@ -5263,6 +5263,7 @@ dependencies = [
  "rg-mcp",
  "rg-runner",
  "sea-orm",
+ "sea-orm-migration",
  "serde",
  "serde_json",
  "serde_urlencoded",

@@ -75,6 +75,9 @@ use std::path::Path;
 /// frequent mirroring that the form simply does not offer.
 pub const MIN_SYNC_INTERVAL_SECONDS: i64 = 60;
 
+/// The plaintext credential limit. Its sealed form fits MySQL `TEXT`.
+pub const MAX_MIRROR_PASSWORD_BYTES: usize = 4_096;
+
 /// Reject an interval the scheduler cannot turn into a schedule.
 ///
 /// `next_sync_at` is written as `now + sync_interval_seconds` and
@@ -168,6 +171,8 @@ pub async fn create_mirror(
     let password = password
         .filter(|value| !value.is_empty())
         .or(remote.password);
+    crate::net::check_remote_url_length(&url)?;
+    crate::net::check_remote_username_length(username.as_deref())?;
 
     // Check for existing mirror. This read is the fast path only — the row can
     // still appear between here and the insert below, which is why the insert
@@ -296,18 +301,19 @@ where
 
     let mut updated_url = None;
     let mut updated_username = None;
-    let mut updated_password = None;
+    let mut updated_password_plain = None;
     if let Some(v) = url {
         // …and the same split, for the same reason. Whatever the URL carried is
         // written to the credential fields first, so an explicit `username` /
         // `password` in this same request still overwrites it below.
         let remote = crate::net::split_url_credentials(&v).context("invalid mirror URL")?;
+        crate::net::check_remote_url_length(&remote.url)?;
         updated_url = Some(remote.url);
         if let Some(lifted) = remote.username {
             updated_username = Some(Some(lifted));
         }
         if let Some(lifted) = remote.password {
-            updated_password = Some(encrypt_password(Some(&lifted), encryption_key)?);
+            updated_password_plain = Some(lifted);
         }
     }
     if let Some(v) = username {
@@ -318,8 +324,13 @@ where
         updated_username = Some(Some(v).filter(|v| !v.is_empty()));
     }
     if let Some(v) = password {
-        updated_password = Some(encrypt_password(Some(&v), encryption_key)?);
+        updated_password_plain = Some(v);
     }
+    crate::net::check_remote_username_length(updated_username.as_ref().and_then(Option::as_deref))?;
+    let updated_password = updated_password_plain
+        .as_deref()
+        .map(|value| encrypt_password(Some(value), encryption_key))
+        .transpose()?;
     let updated_status = if let Some(v) = status {
         // The half of `status` a caller owns is the switch, and a switch has
         // two positions. `error` is the sweep's to write and `last_sync_error`
@@ -552,13 +563,13 @@ pub enum SyncOutcome {
 ///
 /// ## The lease
 ///
-/// The row outlives its repository: `delete_repo` soft-deletes, so nothing
-/// cascades to `mirrors`, and a pass that ran anyway would `git clone` the whole
-/// upstream straight back into the directory the deletion just retired — bytes
-/// nothing owns, with no sweep that walks the filesystem to find them again
-/// (card_374998ffebc1). `list_due_sync` keeps such rows out of the sweep's
-/// selection, and this function used to re-read the repository immediately
-/// before `git` for the gap after that selection.
+/// A pass selected before `delete_repo` may still hold the old mirror model
+/// after its row and repository have retired. A pass that ran anyway would
+/// `git clone` the whole upstream straight back into the directory the deletion
+/// just retired — bytes nothing owns, with no sweep that walks the filesystem
+/// to find them again (card_374998ffebc1). `list_due_sync` keeps rows for
+/// already-deleted repositories out of the sweep's selection as a defensive
+/// fallback; this function also checks the repository before `git`.
 ///
 /// Re-reading is not enough, because the pass does not end at the check. `git
 /// clone --mirror` runs for minutes, writing to the absolute path it was handed,
@@ -1115,6 +1126,11 @@ fn encrypt_password(password: Option<&str>, encryption_key: &str) -> Result<Opti
     let Some(password) = password.filter(|p| !p.is_empty()) else {
         return Ok(None);
     };
+    if password.len() > MAX_MIRROR_PASSWORD_BYTES {
+        return Err(crate::error::invalid_request(format!(
+            "mirror password must contain at most {MAX_MIRROR_PASSWORD_BYTES} bytes"
+        )));
+    }
     let key = crate::auth::encryption::derive_key(encryption_key);
     crate::auth::encryption::encrypt(password, &key)
         .context("failed to encrypt the mirror credential")
