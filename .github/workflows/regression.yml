@@ -883,7 +883,7 @@ jobs:
 
       - name: Set up Buildx
         if: steps.scope.outputs.build == 'true'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # cache-from/to type=gha is what keeps a source-only pull request
       # affordable: stage 2c compiles the whole dependency tree and only has to
