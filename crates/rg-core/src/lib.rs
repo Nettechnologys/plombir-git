@@ -61,6 +61,7 @@ pub mod retention; // Bounded windows for the tables every event appends to
 pub mod search; // Cross-platform abstractions
 pub mod staging; // The `.tmp/` spools of in-flight uploads, and the startup sweep that retires them
 pub mod task_tracker; // Drain-aware tracker for detached fire-and-forget delivery tasks
+pub mod yaml; // The one parser entry point for untrusted YAML (budgets, alias limits)
 
 pub mod blocking; // Keep synchronous Git/IO phases off Tokio's worker threads
 pub(crate) mod committed_blob; // Size a committed file before it is read whole into memory

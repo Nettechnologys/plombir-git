@@ -1,0 +1,16 @@
+# Untrusted YAML goes through `rg_core::yaml` only: that module sets the alias
+# and size budgets and the YAML 1.2 scalar rules. A direct parser call elsewhere
+# would bypass all of them, so the parser's entry points are disallowed here and
+# allowed in that one module.
+disallowed-methods = [
+    { path = "serde_saphyr::from_str", reason = "use rg_core::yaml::from_str" },
+    { path = "serde_saphyr::from_str_with_options", reason = "use rg_core::yaml::from_str" },
+    { path = "serde_saphyr::from_slice", reason = "use rg_core::yaml::from_str" },
+    { path = "serde_saphyr::from_slice_with_options", reason = "use rg_core::yaml::from_str" },
+    { path = "serde_saphyr::from_reader", reason = "use rg_core::yaml::from_str" },
+    { path = "serde_saphyr::from_reader_with_options", reason = "use rg_core::yaml::from_str" },
+    { path = "serde_saphyr::from_multiple", reason = "use rg_core::yaml::from_str" },
+    { path = "serde_saphyr::from_multiple_with_options", reason = "use rg_core::yaml::from_str" },
+    { path = "serde_saphyr::read", reason = "use rg_core::yaml::from_str" },
+    { path = "serde_saphyr::read_with_options", reason = "use rg_core::yaml::from_str" },
+]

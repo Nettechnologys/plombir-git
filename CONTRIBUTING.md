@@ -22,7 +22,7 @@ setup, crate boundaries, coding conventions, and the common workflows.
 ### Required tools
 
 ```bash
-# Rust 1.88+ is the floor the crates build with (MSRV, checked in CI). The
+# Rust 1.89+ is the floor the crates build with (MSRV, checked in CI). The
 # toolchain the gates run is pinned in rust-toolchain.toml; rustup installs it
 # on the first cargo call in this tree.
 rustup show active-toolchain

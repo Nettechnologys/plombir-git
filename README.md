@@ -3,7 +3,7 @@
 > A lightweight, self-hosted Git forge for teams where code is written by
 > people and AI agents alike.
 
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.89%2B-orange)](https://www.rust-lang.org/)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 
 **Built with [codeindexer.dev](https://codeindexer.dev):** 1,294 commits in ten
@@ -275,7 +275,7 @@ running server.
 
 ### Requirements
 
-- Rust 1.88+ — the oldest compiler the crates build with, checked in CI.
+- Rust 1.89+ — the oldest compiler the crates build with, checked in CI.
   The repository's `rust-toolchain.toml` pins the toolchain the gates run
   (1.96.1), and rustup installs it on the first `cargo` call in this tree.
 - `git` 2.38 or newer on `PATH`. A few pack / diff operations are still
