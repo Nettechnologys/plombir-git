@@ -58,7 +58,7 @@ rg-mcp = { path = "../rg-mcp" }
 # drives those very functions against the live router, which is the only place
 # both halves of that agreement exist.
 rg-runner = { path = "../rg-runner" }
-reqwest = { version = "0.12", features = ["json", "multipart"] }
+reqwest = { workspace = true, features = ["multipart"] }
 serde_urlencoded = "0.7"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tar = "0.4"

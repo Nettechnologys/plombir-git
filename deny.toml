@@ -83,6 +83,16 @@ exceptions = [
 # rather than fail so the gate stays about security, not housekeeping noise.
 multiple-versions = "warn"
 wildcards = "allow"
+# One TLS stack: rustls. OpenSSL and libcurl must not re-enter the graph through
+# a default feature (reqwest, ldap3, gix) — the check fails the moment one does.
+# `openssl-sys` is allowed only through webauthn-rs-core and webauthn-attestation-ca,
+# which depend on it unconditionally (not behind a feature), and the `openssl`
+# crate they use. Removing that path means replacing webauthn-rs, a decision of
+# its own, not a feature flag.
+deny = [
+    { name = "openssl-sys", wrappers = ["openssl", "webauthn-rs-core", "webauthn-attestation-ca"], reason = "TLS is rustls only; the one allowed path is webauthn-rs's unconditional openssl dependency" },
+    { name = "curl-sys", reason = "gix runs without its curl transport; git traffic goes through the git CLI" },
+]
 
 # ───────────────────────────────── Sources ────────────────────────────────
 [sources]

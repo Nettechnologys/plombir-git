@@ -119,8 +119,10 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 password-hash = "0.5"
 rand_core = "0.6"
 
-# HTTP client
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client. rustls only: the default `default-tls` feature pulls native-tls
+# and OpenSSL into every crate that inherits this line. `rustls-tls-native-roots`
+# keeps trusting the system certificate store, as the OpenSSL build did.
+reqwest = { version = "0.12", default-features = false, features = ["json", "charset", "http2", "rustls-tls-native-roots"] }
 
 # Email
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "builder", "hostname", "smtp-transport"] }
@@ -158,7 +160,12 @@ rand = "0.8"
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
 
 # LDAP
-ldap3 = { version = "0.11", features = ["tls"] }
+# rustls with the ring provider, the same one reqwest uses, and system roots
+# (rustls-native-certs). 0.11's `tls-rustls` pulled rustls 0.21 and
+# rustls-webpki 0.101, which `cargo deny` reports with three advisories;
+# 0.12 resolves to rustls 0.23 and rustls-webpki 0.103. The default `tls`
+# feature is native-tls and OpenSSL.
+ldap3 = { version = "0.12", default-features = false, features = ["sync", "tls-rustls-ring"] }
 
 # TLS
 tokio-rustls = "0.26"
@@ -187,8 +194,11 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 tracing-opentelemetry = "0.33"
 
 # Git library (replacing git CLI)
+# `blocking-network-client` without an HTTP transport: it is what switches on
+# gix-pack's `streaming-input`, which rg-git's native receive-pack indexer
+# (`Bundle::write_to_directory`) needs. No HTTP client, so no curl and no TLS.
 gix = { version = "0.84", features = [
-    "blocking-http-transport-curl",
+    "blocking-network-client",
     "max-performance",
     "blob-diff",
     "pack-cache-lru-dynamic",
