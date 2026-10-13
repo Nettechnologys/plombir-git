@@ -7,7 +7,8 @@ use sea_orm::{
 use sea_orm_migration::{MigrationTrait, SchemaManager};
 
 use crate::common::{
-    create_repo, register_full, spawn_test_app_over_db, spawn_test_app_with_db, TEST_ENCRYPTION_KEY,
+    create_repo, register_full, spawn_test_app_over_db, spawn_test_app_with_db, SHARED_SERVER_DB,
+    TEST_ENCRYPTION_KEY,
 };
 
 fn unique(prefix: &str) -> String {
@@ -195,6 +196,7 @@ async fn remote_values_fit_sqlite_and_oversize_values_are_requests_errors() {
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
 async fn remote_values_fit_server_database_and_oversize_values_are_request_errors() {
+    let _shared = SHARED_SERVER_DB.lock().await;
     let db = server_database().await;
     let base = spawn_test_app_over_db(db.clone()).await;
     exercise_limits(&base, &db).await;
@@ -389,6 +391,7 @@ async fn repository_and_organization_delete_retire_owned_credentials() {
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
 async fn server_database_repository_and_organization_delete_retire_owned_credentials() {
+    let _shared = SHARED_SERVER_DB.lock().await;
     let db = server_database().await;
     let base = spawn_test_app_over_db(db.clone()).await;
     exercise_retirement(&base, &db).await;
@@ -399,6 +402,8 @@ async fn server_database_repository_and_organization_delete_retire_owned_credent
 async fn server_database_runner_delete_failure_preserves_repo_and_token() {
     use sea_orm::DatabaseBackend;
 
+    // Exclusive: this test changes the schema of `runners` while it runs.
+    let _shared = SHARED_SERVER_DB.lock().await;
     let db = server_database().await;
     let base = spawn_test_app_over_db(db.clone()).await;
     let owner = unique("runnerrollback");
@@ -416,8 +421,13 @@ async fn server_database_runner_delete_failure_preserves_repo_and_token() {
     .await
     .unwrap();
 
+    // The refusal names this runner and nothing else, so even a test that ran
+    // beside this one without the shared guard would keep its own deletes. The
+    // guard (`SHARED_SERVER_DB`, held above) keeps the DDL itself from locking
+    // the table under those tests.
     let trigger = unique("refuse_runner_");
     let function = format!("{trigger}_fn");
+    let runner_id = runner.id;
     match db.get_database_backend() {
         DatabaseBackend::Postgres => {
             db.execute_unprepared(&format!(
@@ -428,7 +438,7 @@ async fn server_database_runner_delete_failure_preserves_repo_and_token() {
             .unwrap();
             db.execute_unprepared(&format!(
                 "CREATE TRIGGER {trigger} BEFORE DELETE ON runners \
-                 FOR EACH ROW EXECUTE FUNCTION {function}()"
+                 FOR EACH ROW WHEN (OLD.id = {runner_id}) EXECUTE FUNCTION {function}()"
             ))
             .await
             .unwrap();
@@ -436,7 +446,9 @@ async fn server_database_runner_delete_failure_preserves_repo_and_token() {
         DatabaseBackend::MySql => {
             db.execute_unprepared(&format!(
                 "CREATE TRIGGER {trigger} BEFORE DELETE ON runners FOR EACH ROW \
-                 SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'runner retirement refused'"
+                 BEGIN IF OLD.id = {runner_id} THEN \
+                 SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'runner retirement refused'; \
+                 END IF; END"
             ))
             .await
             .unwrap();

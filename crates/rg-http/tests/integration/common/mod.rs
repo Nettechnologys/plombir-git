@@ -360,6 +360,18 @@ pub struct StateOverrides {
 /// [`build_test_app_state_with`].
 pub const TEST_ENCRYPTION_KEY: &str = "test-encryption-key";
 
+/// Serialises the tests that share one disposable server database.
+///
+/// Every server-database test in this binary holds this lock for its whole
+/// body, so they run one at a time even under `cargo test`'s parallelism. They
+/// all write into the same tables (`runners`, `repositories`, `access_tokens`,
+/// …), and concurrent runs of them end as lock-wait and metadata-lock errors,
+/// which a request answers as 503. A test that changes a table's schema makes
+/// it worse: a `CREATE`/`DROP TRIGGER` takes a metadata lock on the whole table.
+/// The lock lives here rather than in a nextest group because CI runs these
+/// tests with `cargo test`.
+pub static SHARED_SERVER_DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The secret every test AppState derives its provenance identity from.
 ///
 /// A third distinct string, for the same reason `TEST_ENCRYPTION_KEY` is a

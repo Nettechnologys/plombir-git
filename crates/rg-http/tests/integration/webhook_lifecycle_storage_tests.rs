@@ -16,7 +16,9 @@
 
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
 
-use crate::common::{create_repo, register_full, spawn_test_app_over_db, spawn_test_app_with_db};
+use crate::common::{
+    create_repo, register_full, spawn_test_app_over_db, spawn_test_app_with_db, SHARED_SERVER_DB,
+};
 
 fn unique(prefix: &str) -> String {
     format!(
@@ -187,6 +189,7 @@ async fn deleting_a_hook_in_any_scope_removes_its_deliveries() {
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
 async fn server_database_deleting_a_hook_in_any_scope_removes_its_deliveries() {
+    let _shared = SHARED_SERVER_DB.lock().await;
     let db = server_database().await;
     let base = spawn_test_app_over_db(db.clone()).await;
     exercise_scoped_hook_delete(&base, &db).await;
@@ -297,6 +300,7 @@ async fn deleting_a_repository_removes_its_hooks_and_deliveries() {
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
 async fn server_database_deleting_a_repository_removes_its_hooks_and_deliveries() {
+    let _shared = SHARED_SERVER_DB.lock().await;
     let db = server_database().await;
     let base = spawn_test_app_over_db(db.clone()).await;
     exercise_repository_delete(&base, &db).await;
@@ -454,6 +458,7 @@ async fn the_full_event_canon_and_the_longest_url_are_stored() {
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
 async fn server_database_the_full_event_canon_and_the_longest_url_are_stored() {
+    let _shared = SHARED_SERVER_DB.lock().await;
     let db = server_database().await;
     let base = spawn_test_app_over_db(db.clone()).await;
     exercise_value_limits(&base, &db).await;
