@@ -176,6 +176,7 @@ async fn sso_secret_and_column_limits_are_checked_before_storage() {
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
 async fn server_database_sso_secret_and_column_limits_are_checked_before_storage() {
+    let _shared = crate::common::SHARED_SERVER_DB.lock().await;
     let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
         .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     assert!(database_url.starts_with("postgres://") || database_url.starts_with("mysql://"));

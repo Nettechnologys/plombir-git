@@ -119,6 +119,7 @@ async fn maximum_ci_secret_is_accepted_and_reads_back_after_encryption() {
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable PostgreSQL or MySQL database"]
 async fn maximum_ci_secret_roundtrips_through_http_on_server_database() {
+    let _shared = crate::common::SHARED_SERVER_DB.lock().await;
     let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
         .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)

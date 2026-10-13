@@ -369,7 +369,8 @@ pub const TEST_ENCRYPTION_KEY: &str = "test-encryption-key";
 /// which a request answers as 503. A test that changes a table's schema makes
 /// it worse: a `CREATE`/`DROP TRIGGER` takes a metadata lock on the whole table.
 /// The lock lives here rather than in a nextest group because CI runs these
-/// tests with `cargo test`.
+/// tests with `cargo test`. `shared_server_db_guard` fails any server-database
+/// test that does not take it.
 pub static SHARED_SERVER_DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The secret every test AppState derives its provenance identity from.

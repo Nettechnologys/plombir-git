@@ -108,6 +108,7 @@ async fn webhook_secret_limit_is_checked_before_storage_on_create_and_update() {
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
 async fn server_database_webhook_secret_limit_is_checked_through_http() {
+    let _shared = crate::common::SHARED_SERVER_DB.lock().await;
     let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
         .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
     assert!(database_url.starts_with("postgres://") || database_url.starts_with("mysql://"));

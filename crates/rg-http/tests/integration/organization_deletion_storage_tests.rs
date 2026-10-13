@@ -102,6 +102,7 @@ async fn seed_org_hook(
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable PostgreSQL or MySQL"]
 async fn server_database_org_delete_removes_hook_and_delivery_together() {
+    let _shared = crate::common::SHARED_SERVER_DB.lock().await;
     crate::common::install_test_tracing();
     let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
         .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
