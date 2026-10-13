@@ -25,6 +25,7 @@
 #![allow(clippy::disallowed_methods)] // the one module allowed to call the parser
 
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 /// Ceiling on events replayed from aliases across one document.
 ///
@@ -43,7 +44,7 @@ pub const MAX_SCALAR_BYTES: usize = 16 * 1024 * 1024;
 /// Reading a tag never constructs anything.
 pub use serde_saphyr::Tagged;
 
-/// A YAML document that could not be read, with the parser's
+/// A YAML document that could not be read or written, with the parser's
 /// message (line and column included when it has them).
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -70,6 +71,13 @@ fn options() -> serde_saphyr::Options {
 /// Parse one YAML document into `T`.
 pub fn from_str<T: DeserializeOwned>(input: &str) -> Result<T, YamlError> {
     serde_saphyr::from_str_with_options(input, options()).map_err(|e| YamlError(e.to_string()))
+}
+
+/// Serialize `value` as one YAML document. Strings a YAML 1.1 reader would
+/// take for a boolean, number or null (`yes`, `on`, `1.10`, `null`) come out
+/// quoted, so Helm and other 1.1-era readers get them back as strings.
+pub fn to_string<T: Serialize>(value: &T) -> Result<String, YamlError> {
+    serde_saphyr::to_string(value).map_err(|e| YamlError(e.to_string()))
 }
 
 #[cfg(test)]
@@ -221,6 +229,19 @@ mod tests {
         let doc = parse("defaults: &d {image: alpine, retries: 2}\na: *d\nb: *d\n");
         assert_eq!(doc["a"], doc["b"]);
         assert_eq!(doc["a"]["image"], json!("alpine"));
+    }
+
+    #[test]
+    fn round_trip_keeps_strings_that_look_like_other_types() {
+        let value = json!({"a": "yes", "b": "1.10", "c": "null", "d": "on", "e": "0755", "f": "~"});
+        let text = to_string(&value).unwrap();
+        assert_eq!(parse(&text), value, "serialized as:\n{text}");
+        for word in ["yes", "on"] {
+            assert!(
+                !text.contains(&format!(": {word}\n")),
+                "{word} left bare:\n{text}"
+            );
+        }
     }
 
     // ── Parity with `serde_yaml`, the parser this replaced ─────────────────

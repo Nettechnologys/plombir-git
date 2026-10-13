@@ -105,8 +105,8 @@ fn extract_from_chart(artifact: &PackageArtifact) -> Result<ExtractedMetadata, a
 
 /// Parse Chart.yaml content.
 fn parse_chart_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
-    let doc: serde_yaml::Value =
-        serde_yaml::from_str(yaml).map_err(|e| anyhow::anyhow!("invalid Chart.yaml: {e}"))?;
+    let doc: serde_json::Value =
+        crate::yaml::from_str(yaml).map_err(|e| anyhow::anyhow!("invalid Chart.yaml: {e}"))?;
 
     let name = doc
         .get("name")
@@ -140,7 +140,7 @@ fn parse_chart_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
     let keywords = doc
         .get("keywords")
         .and_then(|v| {
-            v.as_sequence().map(|seq| {
+            v.as_array().map(|seq| {
                 seq.iter()
                     .filter_map(|k| k.as_str())
                     .collect::<Vec<_>>()
@@ -152,7 +152,7 @@ fn parse_chart_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
     // Helm charts can have a "sources" list for repository URLs
     let repository_url = doc
         .get("sources")
-        .and_then(|v| v.as_sequence())
+        .and_then(|v| v.as_array())
         .and_then(|seq| seq.first())
         .and_then(|s| s.as_str())
         .map(String::from);
@@ -200,9 +200,9 @@ fn parse_chart_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
 ///
 /// The distinction that has to survive: a key that is simply absent (or an
 /// explicit YAML `null`) is not damage, and neither is an empty list.
-fn chart_protocol_metadata(doc: &serde_yaml::Value) -> Result<Option<String>, anyhow::Error> {
+fn chart_protocol_metadata(doc: &serde_json::Value) -> Result<Option<String>, anyhow::Error> {
     let mut out = serde_json::Map::new();
-    let unreadable = |key: &str, must_be: &str, found: &serde_yaml::Value| {
+    let unreadable = |key: &str, must_be: &str, found: &serde_json::Value| {
         anyhow::anyhow!(
             "Chart.yaml `{key}` must be {must_be}, found {}",
             yaml_type_name(found)
@@ -232,7 +232,7 @@ fn chart_protocol_metadata(doc: &serde_yaml::Value) -> Result<Option<String>, an
             continue;
         };
         let seq = declared
-            .as_sequence()
+            .as_array()
             .ok_or_else(|| unreadable(key, "a list", declared))?;
         let mut values = Vec::with_capacity(seq.len());
         for (position, entry) in seq.iter().enumerate() {
@@ -265,7 +265,7 @@ fn chart_protocol_metadata(doc: &serde_yaml::Value) -> Result<Option<String>, an
     // a faithful `ChartMetadata`, which is what a mirror re-serves verbatim.
     if let Some(declared) = declared(doc, "dependencies") {
         let seq = declared
-            .as_sequence()
+            .as_array()
             .ok_or_else(|| unreadable("dependencies", "a list", declared))?;
         let mut deps = Vec::with_capacity(seq.len());
         for (position, dep) in seq.iter().enumerate() {
@@ -288,21 +288,20 @@ fn chart_protocol_metadata(doc: &serde_yaml::Value) -> Result<Option<String>, an
 ///
 /// A key that is absent and one written with no value (`kubeVersion:`, which
 /// YAML reads as `null`) are the same claim, and neither is damage.
-fn declared<'a>(doc: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
+fn declared<'a>(doc: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
     doc.get(key).filter(|value| !value.is_null())
 }
 
 /// What a refusal calls the shape it found, so the message names a type rather
 /// than echoing the chart back at its author.
-fn yaml_type_name(value: &serde_yaml::Value) -> &'static str {
+fn yaml_type_name(value: &serde_json::Value) -> &'static str {
     match value {
-        serde_yaml::Value::Null => "null",
-        serde_yaml::Value::Bool(_) => "a boolean",
-        serde_yaml::Value::Number(_) => "a number",
-        serde_yaml::Value::String(_) => "a string",
-        serde_yaml::Value::Sequence(_) => "a list",
-        serde_yaml::Value::Mapping(_) => "a map",
-        serde_yaml::Value::Tagged(_) => "a tagged value",
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "a map",
     }
 }
 
@@ -337,74 +336,101 @@ pub struct HelmIndexEntry {
 /// Build a Helm repository index.yaml.
 ///
 /// Format: <https://helm.sh/docs/topics/chart_repository/#the-chart-repository-structure>
+///
+/// Written through `crate::yaml`, which quotes strings a YAML 1.1 reader would
+/// take for something else. Helm is such a reader: an unquoted `appVersion: yes`
+/// or keyword `on` reached it as a boolean.
 pub fn build_helm_index(entries: &[HelmIndexEntry]) -> String {
-    let mut chart_entries: serde_yaml::Mapping = serde_yaml::Mapping::new();
-
-    // Group entries by chart name
+    let mut charts: Vec<(&str, Vec<IndexVersion<'_>>)> = Vec::new();
     for entry in entries {
-        let chart_list = chart_entries
-            .entry(serde_yaml::Value::String(entry.name.clone()))
-            .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()));
-
-        if let serde_yaml::Value::Sequence(ref mut seq) = chart_list {
-            let mut ver = serde_yaml::Mapping::new();
-            ver.insert("name".into(), entry.name.clone().into());
-            ver.insert("version".into(), entry.version.clone().into());
-            if let Some(ref av) = entry.app_version {
-                ver.insert("appVersion".into(), av.clone().into());
-            }
-            if let Some(ref desc) = entry.description {
-                ver.insert("description".into(), desc.clone().into());
-            }
-            if let Some(ref api) = entry.api_version {
-                ver.insert("apiVersion".into(), api.clone().into());
-            }
-            if let Some(ref kube) = entry.kube_version {
-                ver.insert("kubeVersion".into(), kube.clone().into());
-            }
-            if let Some(ref chart_type) = entry.chart_type {
-                ver.insert("type".into(), chart_type.clone().into());
-            }
-            if entry.deprecated {
-                ver.insert("deprecated".into(), true.into());
-            }
-            if !entry.dependencies.is_empty() {
-                if let Ok(deps) = serde_yaml::to_value(&entry.dependencies) {
-                    ver.insert("dependencies".into(), deps);
-                }
-            }
-            if let Some(ref home) = entry.home {
-                ver.insert("home".into(), home.clone().into());
-            }
-            if !entry.sources.is_empty() {
-                let sources: Vec<serde_yaml::Value> =
-                    entry.sources.iter().map(|s| s.clone().into()).collect();
-                ver.insert("sources".into(), serde_yaml::Value::Sequence(sources));
-            }
-            if !entry.keywords.is_empty() {
-                let keywords: Vec<serde_yaml::Value> =
-                    entry.keywords.iter().map(|k| k.clone().into()).collect();
-                ver.insert("keywords".into(), serde_yaml::Value::Sequence(keywords));
-            }
-            ver.insert("created".into(), entry.created.clone().into());
-            if let Some(ref d) = entry.digest {
-                ver.insert("digest".into(), d.clone().into());
-            }
-            let urls: Vec<serde_yaml::Value> =
-                entry.urls.iter().map(|u| u.clone().into()).collect();
-            ver.insert("urls".into(), serde_yaml::Value::Sequence(urls));
-
-            seq.push(serde_yaml::Value::Mapping(ver));
+        let version = IndexVersion::from(entry);
+        match charts.iter_mut().find(|(name, _)| *name == entry.name) {
+            Some((_, versions)) => versions.push(version),
+            None => charts.push((&entry.name, vec![version])),
         }
     }
+    let index = IndexFile {
+        api_version: "v1",
+        generated: chrono::Utc::now().to_rfc3339(),
+        entries: ChartEntries(charts),
+    };
+    crate::yaml::to_string(&index).unwrap_or_default()
+}
 
-    let mut root = serde_yaml::Mapping::new();
-    root.insert("apiVersion".into(), "v1".into());
-    root.insert("generated".into(), chrono::Utc::now().to_rfc3339().into());
-    root.insert("entries".into(), serde_yaml::Value::Mapping(chart_entries));
+#[derive(serde::Serialize)]
+struct IndexFile<'a> {
+    #[serde(rename = "apiVersion")]
+    api_version: &'static str,
+    generated: String,
+    entries: ChartEntries<'a>,
+}
 
-    let value = serde_yaml::Value::Mapping(root);
-    serde_yaml::to_string(&value).unwrap_or_default()
+/// Chart name → its versions, in the order the charts were first seen.
+struct ChartEntries<'a>(Vec<(&'a str, Vec<IndexVersion<'a>>)>);
+
+impl serde::Serialize for ChartEntries<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, versions) in &self.0 {
+            map.serialize_entry(name, versions)?;
+        }
+        map.end()
+    }
+}
+
+/// One chart version as `index.yaml` carries it. Optional keys are left out
+/// rather than written empty: `deprecated: false` is an answer, not a silence.
+#[derive(serde::Serialize)]
+struct IndexVersion<'a> {
+    name: &'a str,
+    version: &'a str,
+    #[serde(rename = "appVersion", skip_serializing_if = "Option::is_none")]
+    app_version: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
+    api_version: Option<&'a str>,
+    #[serde(rename = "kubeVersion", skip_serializing_if = "Option::is_none")]
+    kube_version: Option<&'a str>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    chart_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    deprecated: bool,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    dependencies: &'a [serde_json::Value],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    sources: &'a [String],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    keywords: &'a [String],
+    created: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    digest: Option<&'a str>,
+    urls: &'a [String],
+}
+
+impl<'a> From<&'a HelmIndexEntry> for IndexVersion<'a> {
+    fn from(entry: &'a HelmIndexEntry) -> Self {
+        Self {
+            name: &entry.name,
+            version: &entry.version,
+            app_version: entry.app_version.as_deref(),
+            description: entry.description.as_deref(),
+            api_version: entry.api_version.as_deref(),
+            kube_version: entry.kube_version.as_deref(),
+            chart_type: entry.chart_type.as_deref(),
+            deprecated: entry.deprecated,
+            dependencies: &entry.dependencies,
+            home: entry.home.as_deref(),
+            sources: &entry.sources,
+            keywords: &entry.keywords,
+            created: &entry.created,
+            digest: entry.digest.as_deref(),
+            urls: &entry.urls,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -767,5 +793,39 @@ dependencies:
         assert!(yaml.contains("deprecated: true"), "{yaml}");
         assert!(yaml.contains("postgresql"), "{yaml}");
         assert!(yaml.contains("condition: postgresql.enabled"), "{yaml}");
+    }
+
+    /// Helm reads `index.yaml` as YAML 1.1, where a bare `yes` or `on` is a
+    /// boolean. The serde_yaml writer emitted both bare, so a chart with
+    /// `appVersion: "yes"` or a keyword `on` reached `helm repo update` as a
+    /// bool where Helm wants a string. Everything else must read back as
+    /// written, in the order it was written.
+    #[test]
+    fn the_index_quotes_strings_a_yaml_1_1_reader_would_retype() {
+        let yaml = build_helm_index(&[HelmIndexEntry {
+            name: "nginx".into(),
+            version: "1.2.3".into(),
+            app_version: Some("yes".into()),
+            description: Some("A chart: with colon".into()),
+            api_version: Some("v2".into()),
+            kube_version: None,
+            chart_type: None,
+            deprecated: false,
+            dependencies: Vec::new(),
+            home: None,
+            sources: Vec::new(),
+            keywords: vec!["on".into(), "1.10".into(), "null".into()],
+            created: "2024-01-01T00:00:00Z".into(),
+            digest: None,
+            urls: vec!["https://example.com/charts/nginx-1.2.3.tgz".into()],
+        }]);
+        assert!(yaml.contains("appVersion: \"yes\""), "{yaml}");
+        assert!(yaml.contains("- \"on\""), "{yaml}");
+
+        let index: serde_json::Value = crate::yaml::from_str(&yaml).unwrap();
+        let entry = &index["entries"]["nginx"][0];
+        assert_eq!(entry["appVersion"], "yes");
+        assert_eq!(entry["keywords"], serde_json::json!(["on", "1.10", "null"]));
+        assert_eq!(entry["description"], "A chart: with colon");
     }
 }

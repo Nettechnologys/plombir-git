@@ -13,4 +13,5 @@ disallowed-methods = [
     { path = "serde_saphyr::from_multiple_with_options", reason = "use rg_core::yaml::from_str" },
     { path = "serde_saphyr::read", reason = "use rg_core::yaml::from_str" },
     { path = "serde_saphyr::read_with_options", reason = "use rg_core::yaml::from_str" },
+    { path = "serde_saphyr::to_string", reason = "use rg_core::yaml::to_string" },
 ]
