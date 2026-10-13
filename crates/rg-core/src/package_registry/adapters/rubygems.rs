@@ -128,7 +128,7 @@ fn extract_from_gem(artifact: &PackageArtifact) -> Result<ExtractedMetadata, any
 /// The metadata.gz contains a YAML document with keys:
 /// name, version, summary, description, homepage, licenses, authors, etc.
 fn parse_gemspec_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(yaml)
+    let doc: serde_json::Value = crate::yaml::from_str(yaml)
         .map_err(|e| anyhow::anyhow!("invalid RubyGems metadata (not valid YAML): {e}"))?;
 
     let name = doc
@@ -185,7 +185,7 @@ fn parse_gemspec_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
     let license = doc
         .get("licenses")
         .and_then(|v| {
-            v.as_sequence()
+            v.as_array()
                 .map(|seq| {
                     seq.iter()
                         .filter_map(|l| l.as_str())
@@ -204,7 +204,7 @@ fn parse_gemspec_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         .get("metadata")
         .and_then(|v| v.get("tags").or_else(|| v.get("keywords")))
         .and_then(|v| {
-            v.as_sequence()
+            v.as_array()
                 .map(|seq| {
                     seq.iter()
                         .filter_map(|t| t.as_str())
@@ -241,7 +241,7 @@ fn parse_gemspec_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
 /// Fallible because a gemspec can declare a runtime dependency this shape
 /// cannot carry; see [`gemspec_dependencies`] for why that is a refusal rather
 /// than a best-effort translation.
-fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> Result<String, anyhow::Error> {
+fn gemspec_protocol_metadata(doc: &serde_json::Value) -> Result<String, anyhow::Error> {
     let mut out = serde_json::Map::new();
 
     for (key, yaml_key) in [("summary", "summary"), ("description", "description")] {
@@ -264,7 +264,7 @@ fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> Result<String, anyhow::
 
     let licenses: Vec<serde_json::Value> = doc
         .get("licenses")
-        .and_then(|v| v.as_sequence())
+        .and_then(|v| v.as_array())
         .map(|seq| {
             seq.iter()
                 .filter_map(|l| l.as_str())
@@ -289,7 +289,7 @@ fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> Result<String, anyhow::
     // on before it looks at a dependency. Unpublished, a gem needing 3.1
     // resolves cleanly onto 2.7 and fails at parse time.
     for key in ["required_ruby_version", "required_rubygems_version"] {
-        let Some(declared) = doc.get(key).map(untagged).filter(|v| !v.is_null()) else {
+        let Some(declared) = doc.get(key).filter(|v| !v.is_null()) else {
             continue;
         };
         out.insert(key.into(), gem_requirement_string(declared, key)?.into());
@@ -316,8 +316,8 @@ fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> Result<String, anyhow::
 /// A declared value this index cannot spell is refused rather than treated as
 /// absent or assembled from whichever legacy components happened to parse. A
 /// missing platform honestly means the default; an unreadable one does not.
-fn gemspec_platform(doc: &serde_yaml::Value) -> Result<Option<String>, anyhow::Error> {
-    let Some(platform) = doc.get("platform").map(untagged) else {
+fn gemspec_platform(doc: &serde_json::Value) -> Result<Option<String>, anyhow::Error> {
+    let Some(platform) = doc.get("platform") else {
         return Ok(None);
     };
 
@@ -335,7 +335,7 @@ fn gemspec_platform(doc: &serde_yaml::Value) -> Result<Option<String>, anyhow::E
         // Gems packed before RubyGems flattened the field carry a serialized
         // `Gem::Platform` instead of the `cpu-os-version` string it prints as.
         None => {
-            let mapping = platform.as_mapping().ok_or_else(|| {
+            let mapping = platform.as_object().ok_or_else(|| {
                 anyhow::anyhow!(
                     "RubyGems metadata `platform` must be `ruby`, a non-empty platform string, \
                      or a Gem::Platform, found {}",
@@ -343,13 +343,7 @@ fn gemspec_platform(doc: &serde_yaml::Value) -> Result<Option<String>, anyhow::E
                 )
             })?;
             for key in mapping.keys() {
-                let key = untagged(key).as_str().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "RubyGems metadata `platform` Gem::Platform component names must be \
-                         strings, found {}",
-                        yaml_type_name(key)
-                    )
-                })?;
+                let key = key.as_str();
                 if !matches!(key, "cpu" | "os" | "version") {
                     anyhow::bail!(
                         "RubyGems metadata `platform.{key}` is not a Gem::Platform component; \
@@ -360,7 +354,7 @@ fn gemspec_platform(doc: &serde_yaml::Value) -> Result<Option<String>, anyhow::E
 
             let mut parts = Vec::with_capacity(3);
             for key in ["cpu", "os", "version"] {
-                let Some(value) = platform.get(key).map(untagged) else {
+                let Some(value) = platform.get(key) else {
                     continue;
                 };
                 if value.is_null() {
@@ -408,14 +402,14 @@ fn gemspec_platform(doc: &serde_yaml::Value) -> Result<Option<String>, anyhow::E
 /// detect: a shorter list still resolves, cleanly, and Bundler only finds out
 /// at the missing constant far from the publish that caused it. Naming the
 /// element at publish is the last point where the answer is still cheap.
-fn gemspec_dependencies(doc: &serde_yaml::Value) -> Result<Vec<(String, String)>, anyhow::Error> {
-    let Some(declared) = doc.get("dependencies").map(untagged) else {
+fn gemspec_dependencies(doc: &serde_json::Value) -> Result<Vec<(String, String)>, anyhow::Error> {
+    let Some(declared) = doc.get("dependencies") else {
         return Ok(Vec::new());
     };
     if declared.is_null() {
         return Ok(Vec::new());
     }
-    let deps = declared.as_sequence().ok_or_else(|| {
+    let deps = declared.as_array().ok_or_else(|| {
         anyhow::anyhow!(
             "RubyGems metadata `dependencies` must be a list of Gem::Dependency, found {}",
             yaml_type_name(declared)
@@ -430,9 +424,9 @@ fn gemspec_dependencies(doc: &serde_yaml::Value) -> Result<Vec<(String, String)>
             continue;
         }
 
-        let declared_name = dep.get("name").map(untagged);
+        let declared_name = dep.get("name");
         let name = declared_name
-            .and_then(serde_yaml::Value::as_str)
+            .and_then(serde_json::Value::as_str)
             .filter(|name| !name.trim().is_empty())
             .ok_or_else(|| match declared_name {
                 Some(value) => anyhow::anyhow!(
@@ -455,7 +449,6 @@ fn gemspec_dependencies(doc: &serde_yaml::Value) -> Result<Vec<(String, String)>
                 dep.get("version_requirements")
                     .map(|value| ("version_requirements", value))
             })
-            .map(|(key, value)| (key, untagged(value)))
             .filter(|(_, value)| !value.is_null());
         let requirements = match declared_requirement {
             Some((key, value)) => {
@@ -481,8 +474,8 @@ fn gemspec_dependencies(doc: &serde_yaml::Value) -> Result<Vec<(String, String)>
 /// symbol at all cannot be read as "runtime, presumably". A malformed entry the
 /// kind check does exclude is *not* refused — a development dependency never
 /// reaches the index, so nothing about it can be published wrong.
-fn is_runtime_dependency(dep: &serde_yaml::Value, index: usize) -> Result<bool, anyhow::Error> {
-    let Some(declared) = dep.get("type").map(untagged) else {
+fn is_runtime_dependency(dep: &serde_json::Value, index: usize) -> Result<bool, anyhow::Error> {
+    let Some(declared) = dep.get("type") else {
         return Ok(true);
     };
     if declared.is_null() {
@@ -497,33 +490,16 @@ fn is_runtime_dependency(dep: &serde_yaml::Value, index: usize) -> Result<bool, 
     Ok(kind.trim().trim_start_matches(':') == "runtime")
 }
 
-/// The value under a Ruby tag.
-///
-/// Indexing a `Value` sees through tags on its own, but `as_str` does not — so
-/// a field Psych wrote as `!ruby/symbol runtime` would otherwise read as "not a
-/// string" and be refused as damaged. Everything a gemspec declares is tagged
-/// somewhere in the wild, which is exactly why the refusals below have to
-/// discriminate the shape and not the spelling.
-fn untagged(value: &serde_yaml::Value) -> &serde_yaml::Value {
-    let mut value = value;
-    while let serde_yaml::Value::Tagged(tagged) = value {
-        value = &tagged.value;
-    }
-    value
-}
-
 /// What a YAML value is, for a refusal that has to say why without echoing the
 /// gemspec back at the client.
-fn yaml_type_name(value: &serde_yaml::Value) -> &'static str {
-    match untagged(value) {
-        serde_yaml::Value::Null => "null",
-        serde_yaml::Value::Bool(_) => "a boolean",
-        serde_yaml::Value::Number(_) => "a number",
-        serde_yaml::Value::String(_) => "a string",
-        serde_yaml::Value::Sequence(_) => "a list",
-        serde_yaml::Value::Mapping(_) => "a mapping",
-        // `untagged` loops until the value is not one.
-        serde_yaml::Value::Tagged(_) => unreachable!("untagged value is never tagged"),
+fn yaml_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "a mapping",
     }
 }
 
@@ -544,13 +520,10 @@ fn yaml_type_name(value: &serde_yaml::Value) -> &'static str {
 /// the first sign is a consumer breaking on a version this gem said it could
 /// not use.
 fn gem_requirement_string(
-    requirement: &serde_yaml::Value,
+    requirement: &serde_json::Value,
     path: &str,
 ) -> Result<String, anyhow::Error> {
-    let Some(constraints) = requirement
-        .get("requirements")
-        .and_then(|v| v.as_sequence())
-    else {
+    let Some(constraints) = requirement.get("requirements").and_then(|v| v.as_array()) else {
         // Some tooling writes the requirement as a bare string.
         return requirement
             .as_str()
@@ -574,7 +547,7 @@ fn gem_requirement_string(
 
     let mut spelled = Vec::with_capacity(constraints.len());
     for (position, constraint) in constraints.iter().enumerate() {
-        let pair = untagged(constraint).as_sequence().ok_or_else(|| {
+        let pair = constraint.as_array().ok_or_else(|| {
             anyhow::anyhow!(
                 "RubyGems metadata `{path}.requirements[{position}]` must be an \
                  [operator, version] pair, found {}",
@@ -583,8 +556,7 @@ fn gem_requirement_string(
         })?;
         let operator = pair
             .first()
-            .map(untagged)
-            .and_then(serde_yaml::Value::as_str)
+            .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|operator| !operator.is_empty())
             .ok_or_else(|| {
@@ -609,7 +581,7 @@ fn gem_requirement_string(
 
 /// A `Gem::Version` is a tagged object wrapping a `version` scalar, but a plain
 /// string turns up in hand-written and older metadata.
-fn gem_version_string(value: &serde_yaml::Value) -> Option<String> {
+fn gem_version_string(value: &serde_json::Value) -> Option<String> {
     if let Some(version) = value.as_str() {
         return Some(version.to_string());
     }
@@ -1628,7 +1600,8 @@ dependencies:
             ),
             (
                 "platform:\n  cpu: x86_64\n  42: linux\n  version:\n",
-                "Gem::Platform component names must be strings, found a number",
+                // A number key reads as its spelling, so it is refused by name.
+                "`platform.42` is not a Gem::Platform component",
             ),
             (
                 "platform:\n  cpu: x86_64\n  os: [linux]\n  version:\n",
@@ -1709,4 +1682,105 @@ dependencies:
         let names = build_compact_index_names(&["a-gem".to_string(), "b-gem".to_string()]);
         assert_eq!(names, "---\na-gem\nb-gem\n");
     }
+
+    /// Metadata as RubyGems itself writes it (nokogiri 1.16.7, trimmed of its
+    /// author and file lists): every object Ruby-tagged, nested three deep in
+    /// the requirements. The expected values were taken from the serde_yaml
+    /// reader before the move to `crate::yaml`, so this pins that the move
+    /// changed nothing a client of the index can see.
+    #[test]
+    fn real_gemspec_with_nested_ruby_tags_reads_as_before() {
+        let metadata = parse_gemspec_yaml(NOKOGIRI_GEMSPEC).unwrap();
+        assert_eq!(metadata.name, "nokogiri");
+        assert_eq!(metadata.version, "1.16.7");
+        assert_eq!(metadata.license.as_deref(), Some("MIT"));
+        assert_eq!(
+            metadata.repository_url.as_deref(),
+            Some("https://github.com/sparklemotion/nokogiri")
+        );
+        assert_eq!(
+            metadata.protocol_metadata.as_deref(),
+            Some(
+                "{\"dependencies\":[{\"name\":\"mini_portile2\",\"requirements\":\"~> 2.8.2\"},\
+                 {\"name\":\"racc\",\"requirements\":\"~> 1.4\"}],\"homepage\":\"https://nokogiri.org\",\
+                 \"licenses\":[\"MIT\"],\"required_ruby_version\":\">= 3.0.0\",\
+                 \"required_rubygems_version\":\">= 0\",\"summary\":\"Nokogiri (鋸) makes it easy and \
+                 painless to work with XML and HTML from Ruby.\"}"
+            )
+        );
+    }
+
+    const NOKOGIRI_GEMSPEC: &str = r#"--- !ruby/object:Gem::Specification
+name: nokogiri
+version: !ruby/object:Gem::Version
+  version: 1.16.7
+platform: ruby
+autorequire:
+bindir: bin
+cert_chain: []
+date: 2024-07-27 00:00:00.000000000 Z
+dependencies:
+- !ruby/object:Gem::Dependency
+  name: mini_portile2
+  requirement: !ruby/object:Gem::Requirement
+    requirements:
+    - - "~>"
+      - !ruby/object:Gem::Version
+        version: 2.8.2
+  type: :runtime
+  prerelease: false
+  version_requirements: !ruby/object:Gem::Requirement
+    requirements:
+    - - "~>"
+      - !ruby/object:Gem::Version
+        version: 2.8.2
+  force_ruby_platform: false
+- !ruby/object:Gem::Dependency
+  name: racc
+  requirement: !ruby/object:Gem::Requirement
+    requirements:
+    - - "~>"
+      - !ruby/object:Gem::Version
+        version: '1.4'
+  type: :runtime
+  prerelease: false
+  version_requirements: !ruby/object:Gem::Requirement
+    requirements:
+    - - "~>"
+      - !ruby/object:Gem::Version
+        version: '1.4'
+  force_ruby_platform: false
+homepage: https://nokogiri.org
+licenses:
+- MIT
+metadata:
+  homepage_uri: https://nokogiri.org
+  bug_tracker_uri: https://github.com/sparklemotion/nokogiri/issues
+  documentation_uri: https://nokogiri.org/rdoc/index.html
+  changelog_uri: https://nokogiri.org/CHANGELOG.html
+  source_code_uri: https://github.com/sparklemotion/nokogiri
+  rubygems_mfa_required: 'true'
+post_install_message:
+rdoc_options:
+- "--main"
+- README.md
+require_paths:
+- lib
+required_ruby_version: !ruby/object:Gem::Requirement
+  requirements:
+  - - ">="
+    - !ruby/object:Gem::Version
+      version: 3.0.0
+required_rubygems_version: !ruby/object:Gem::Requirement
+  requirements:
+  - - ">="
+    - !ruby/object:Gem::Version
+      version: '0'
+requirements: []
+rubygems_version: 3.5.11
+signing_key:
+specification_version: 4
+summary: Nokogiri (鋸) makes it easy and painless to work with XML and HTML from Ruby.
+test_files: []
+"#;
 }
