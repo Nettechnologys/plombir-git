@@ -18,6 +18,8 @@
 //!   `${{ … }}`); `!include` is not compiled in.
 //! * **Merge keys are ordinary keys**, as they were under `serde_yaml`: `<<`
 //!   is read as a key named `<<`, not spliced into its mapping.
+//! * **A redundant leading zero keeps the spelling.** Plain `0755` is the
+//!   string `"0755"`, as under `serde_yaml`; see [`quote_leading_zero_decimals`].
 //!
 //! The parser is `serde-saphyr` (pure Rust). It replaced `serde_yaml`, which
 //! sits on C-translated, unmaintained libyaml (RUSTSEC-2024-0449).
@@ -26,6 +28,8 @@
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde_saphyr::granit_parser::{Event, Parser, ScalarStyle};
+use std::borrow::Cow;
 
 /// Ceiling on events replayed from aliases across one document.
 ///
@@ -70,7 +74,62 @@ fn options() -> serde_saphyr::Options {
 
 /// Parse one YAML document into `T`.
 pub fn from_str<T: DeserializeOwned>(input: &str) -> Result<T, YamlError> {
-    serde_saphyr::from_str_with_options(input, options()).map_err(|e| YamlError(e.to_string()))
+    let input = quote_leading_zero_decimals(input);
+    serde_saphyr::from_str_with_options(&input, options()).map_err(|e| YamlError(e.to_string()))
+}
+
+/// Quote every untagged plain scalar spelled as a decimal with a redundant
+/// leading zero (`0755`, `-007`), so it reads as the string it was written as.
+///
+/// `serde_yaml` read those as strings. serde-saphyr skips the integer reading
+/// for them and then takes the float one, so an untyped `0755` became `755.0`
+/// — `chmod 0755` in a workflow matrix would have run as `chmod 755.0`. No
+/// option restores the old meaning, so this pass does, before the real parse:
+/// it walks the event stream (aliases are events here, not expansions, so the
+/// pass is linear in the input) and wraps those scalars in single quotes, which
+/// is exact because they hold only a sign and digits. A document the event
+/// stream cannot read is passed through untouched, for the real parse to
+/// refuse with its own message.
+fn quote_leading_zero_decimals(input: &str) -> Cow<'_, str> {
+    let mut spans = Vec::new();
+    for event in Parser::new_from_str(input) {
+        let Ok((event, span)) = event else {
+            return Cow::Borrowed(input);
+        };
+        let Event::Scalar(value, ScalarStyle::Plain, _, None) = event else {
+            continue;
+        };
+        if !is_leading_zero_decimal(&value) {
+            continue;
+        }
+        let (Some(start), Some(end)) = (span.start.byte_offset(), span.end.byte_offset()) else {
+            return Cow::Borrowed(input);
+        };
+        if input.get(start..end) != Some(value.as_ref()) {
+            return Cow::Borrowed(input);
+        }
+        spans.push(start..end);
+    }
+    if spans.is_empty() {
+        return Cow::Borrowed(input);
+    }
+    let mut quoted = String::with_capacity(input.len() + 2 * spans.len());
+    let mut copied = 0;
+    for span in spans {
+        quoted.push_str(&input[copied..span.start]);
+        quoted.push('\'');
+        quoted.push_str(&input[span.clone()]);
+        quoted.push('\'');
+        copied = span.end;
+    }
+    quoted.push_str(&input[copied..]);
+    Cow::Owned(quoted)
+}
+
+/// `0755`, `+007`, `-00` — but not `0`, `-0`, `0x1F`, `0o17` or `0.5`.
+fn is_leading_zero_decimal(text: &str) -> bool {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    digits.len() > 1 && digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Serialize `value` as one YAML document. Strings a YAML 1.1 reader would
@@ -112,22 +171,44 @@ mod tests {
         assert_eq!(doc["exp"], json!(1000.0));
     }
 
-    /// `serde_yaml` read an untyped `0755` as the string `"0755"`; serde-saphyr
-    /// 1.3 skips the integer reading for a redundant leading zero and then
-    /// takes the float one, `755.0`. A typed `String` field keeps the spelling
-    /// either way, so only callers reading into an untyped value see this —
-    /// workflow `env` / `with` / `matrix`, Helm values, gemspec metadata. They
-    /// own the decision (card_d2db3ea7caee). If this assertion starts failing,
-    /// the parser changed its mind: re-check those callers.
     #[test]
-    fn leading_zero_decimal_is_a_known_divergence() {
+    fn a_redundant_leading_zero_keeps_the_spelling() {
+        let doc = parse(
+            "mode: 0755\nneg: -007\nplus: +010\nzero: 0\nnegzero: -0\nhex: 0x1F\nfrac: 0.5\n\
+             quoted: '0755'\ntagged: !!str 0755\nlist: [0644, 1]\n0755: key\nanchored: &m 0700\nalias: *m\n",
+        );
+        assert_eq!(doc["mode"], json!("0755"));
+        assert_eq!(doc["neg"], json!("-007"));
+        assert_eq!(doc["plus"], json!("+010"));
+        assert_eq!(doc["zero"], json!(0));
+        assert_eq!(doc["negzero"], json!(0));
+        assert_eq!(doc["hex"], json!(31));
+        assert_eq!(doc["frac"], json!(0.5));
+        assert_eq!(doc["quoted"], json!("0755"));
+        assert_eq!(doc["tagged"], json!("0755"));
+        assert_eq!(doc["list"], json!(["0644", 1]));
+        assert_eq!(doc["0755"], json!("key"));
+        assert_eq!(doc["anchored"], json!("0700"));
+        assert_eq!(doc["alias"], json!("0700"));
+    }
+
+    /// A typed number field refuses `0755`, as it did under `serde_yaml`,
+    /// instead of quietly taking 755; a typed string field keeps the spelling.
+    #[test]
+    fn typed_fields_see_a_leading_zero_as_serde_yaml_did() {
         #[derive(serde::Deserialize)]
         struct Typed {
             mode: String,
         }
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Numeric {
+            mode: i64,
+        }
         let typed: Typed = from_str("mode: 0755\n").unwrap();
         assert_eq!(typed.mode, "0755");
-        assert_eq!(parse("mode: 0755\n")["mode"], json!(755.0));
+        assert!(from_str::<Numeric>("mode: 0755\n").is_err());
+        assert!(old_parser_typed::<Numeric>("mode: 0755\n").is_err());
     }
 
     #[test]
@@ -250,7 +331,7 @@ mod tests {
 
     const EDGE_CASES: &[&str] = &[
         "on: push\nenabled: yes\n",
-        "b: 0o17\nc: 0x1F\nd: 1.10\ne: 1e3\nf: -0\n",
+        "a: 0755\nb: 0o17\nc: 0x1F\nd: 1.10\ne: 1e3\nf: -0\ng: -007\nh: [0644]\n",
         "a: ~\nb: null\nc:\nd: 'null'\n",
         "a: 2001-12-14t21:59:43.10-05:00\nb: 12:30:00\n",
         "a: |\n  line one\n  line two\nb: >\n  folded\n  text\n",
@@ -264,6 +345,10 @@ mod tests {
         "a: !!str 123\nb: !!int '42'\n",
         "steps:\n  - uses: actions/checkout@v4\n    with:\n      fetch-depth: 0\n",
     ];
+
+    fn old_parser_typed<T: DeserializeOwned>(input: &str) -> Result<T, String> {
+        serde_yaml::from_str(input).map_err(|e| e.to_string())
+    }
 
     fn old_parser(input: &str) -> Result<Value, String> {
         serde_yaml::from_str(input).map_err(|e| e.to_string())
