@@ -1,6 +1,6 @@
 // Helpers for asserting against source files from the contract checks.
 
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -833,10 +833,38 @@ export function utoipaRowFor(rows, handler) {
 }
 
 /** `crates/rg-http/src/api/packages/npm.rs` under `api/` → `api::packages::npm`. */
-function moduleForFile(relativePath, rootModule) {
+function moduleForFile(relativePath, rootModule, reexportedBy = () => new Set()) {
   const segments = relativePath.replace(/\.rs$/, '').split('/');
-  if (segments[segments.length - 1] === 'mod') segments.pop();
+  if (segments[segments.length - 1] === 'mod') {
+    segments.pop();
+  } else if (segments.length > 1) {
+    // A child that its directory's `mod.rs` glob-re-exports is reached through
+    // the directory: `api/packages/oci.rs` serves `api::packages::delete_oci_image`.
+    const parent = segments.slice(0, -1).join('/');
+    if (reexportedBy(parent).has(segments[segments.length - 1])) segments.pop();
+  }
   return [rootModule, ...segments].join('::');
+}
+
+/**
+ * The children of the module directory `dir` (relative to `apiDir`) that its
+ * `mod.rs` glob-re-exports, as `pub use child::*;` or `pub(crate) use child::*;`.
+ * Read once per directory; a directory without a `mod.rs` re-exports nothing.
+ */
+function reexportsOf(apiDir) {
+  const cache = new Map();
+  return (dir) => {
+    if (!cache.has(dir)) {
+      const modFile = join(apiDir, dir, 'mod.rs');
+      const names = existsSync(modFile)
+        ? [...productionRustSource(readFileSync(modFile, 'utf8')).matchAll(/^\s*pub(?:\([^)]*\))?\s+use\s+(\w+)::\*;/gm)].map(
+            (match) => match[1],
+          )
+        : [];
+      cache.set(dir, new Set(names));
+    }
+    return cache.get(dir);
+  };
 }
 
 /**
@@ -861,9 +889,10 @@ export function loadUtoipaPaths(apiDir, rootModule = 'api') {
 
   const byHandler = new Map();
   const unattributed = [];
+  const reexportedBy = reexportsOf(apiDir);
   for (const relative of files) {
     const source = readFileSync(join(apiDir, relative), 'utf8');
-    for (const row of parseUtoipaPaths(source, moduleForFile(relative, rootModule), relative)) {
+    for (const row of parseUtoipaPaths(source, moduleForFile(relative, rootModule, reexportedBy), relative)) {
       if (row.handler === null) {
         unattributed.push(`${row.file}:${row.line}`);
         continue;

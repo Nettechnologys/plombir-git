@@ -108,7 +108,7 @@ plombir-git/
 │   ├── rg-ci/                    # CI/CD engine (native + Gitea Actions)
 │   ├── rg-cli/                   # main binary  → plombir-git
 │   ├── rg-runner/                # CI runner agent  → plombir-git-runner
-│   ├── rg-process/               # bounded child-process lifecycle + CI workspace archives
+│   ├── rg-process/               # bounded child-process lifecycle, CI workspace archives, client transport policy
 │   └── rg-mcp/                   # MCP server  → plombir-git-mcp
 ├── web/                          # SvelteKit frontend
 ├── plombir-git.example.toml        # sample configuration
@@ -124,7 +124,7 @@ plombir-git/
 ```
 rg-ci ──> rg-core, rg-db, rg-git, rg-process
 rg-cli ──> rg-ci, rg-core, rg-db, rg-git, rg-http, rg-process, rg-runner, rg-ssh
-rg-core ──> rg-db, rg-git
+rg-core ──> rg-db, rg-git, rg-process
 rg-db ──> none
 rg-git ──> rg-process
 rg-http ──> rg-core, rg-db, rg-git, rg-mcp
@@ -140,7 +140,9 @@ are HTTP clients of APIs served by `rg-http`, but neither has a Cargo dependency
 on `rg-http`; the edge runs the other way for `rg-mcp`, whose tools `rg-http`
 embeds to serve MCP over HTTP. `rg-mcp` takes `rg-process` only for the start-up
 refusal every binary shares (`refuse_retired_environment`). `rg-git` remains protocol-only: its sole internal dependency is
-the business-agnostic `rg-process` lifecycle helper. `rg-ci` and `rg-runner` also pack and unpack every CI
+the business-agnostic `rg-process` lifecycle helper. `rg-process::client_policy` holds the loopback predicate and
+the same-origin redirect policy that every client carrying a credential shares: the CLI, the MCP server, the
+runner, and `rg-core`, which re-exports the redirect policy for its own outbound clients. `rg-ci` and `rg-runner` also pack and unpack every CI
 workspace archive through `rg_process::workspace_archive`, so the embedded and
 the external runner share one rule for symlinks: a link met while walking a
 declared directory is stored as a link, and a declared path that resolves outside

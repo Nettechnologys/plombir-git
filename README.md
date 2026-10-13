@@ -234,7 +234,7 @@ Three finds from the history:
 | CI/CD | Native `.plombir-git-ci.yml` pipelines ([schema reference](docs/ci.md)) and Gitea Actions (`.gitea/workflows/*.yml`, [supported subset](docs/gitea-actions.md)); embedded or external runners, optional Docker execution, artifacts, live job logs over WebSocket | [CI API](crates/rg-http/src/api/ci.rs) |
 | Webhooks | Registration, delivery, HMAC-SHA256 signatures, delivery history | [Webhook API](crates/rg-http/src/api/webhooks.rs) |
 | Notifications | In-app, email (SMTP), and real-time WebSocket delivery | [Notification delivery](crates/rg-core/src/notification/thread.rs) |
-| Registries | Package registry and OCI container registry | [Package API](crates/rg-http/src/api/packages/) |
+| Registries | Package registry and OCI container registry | [Package API](crates/rg-http/src/api/packages/mod.rs) |
 | Search | Global search of repositories, issues, wiki, PRs, users and indexed code; repository code search in the browser and AI API (build a code index explicitly before the first search) | [Search API](crates/rg-http/src/api/search.rs) |
 | Import | Pull repositories, issues, PRs, labels, milestones, release records and wiki from GitHub / GitLab; release assets are not imported and imported release authorship belongs to the importing account | [Import service](crates/rg-core/src/import/service.rs) |
 | Operations | TLS/HTTPS, TOML config, rate limiting, log rotation, unified pagination, registered GPG/SSH commit-signature verification, audit log, health checks | [Server startup](crates/rg-cli/src/serve.rs) |

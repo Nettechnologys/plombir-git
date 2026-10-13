@@ -190,12 +190,31 @@ const EXEMPT = [];
 const MIN_BUFFERING_ROUTES = 10;
 
 /** `api::runners::upload_log` → the file it lives in and the fn name. */
+function declares(file, fn) {
+  return new RegExp(`^\\s*(?:pub(?:\\([^)]*\\))?\\s+)?(?:async\\s+)?fn\\s+${fn}\\b`, 'm').test(
+    productionRustSource(readFileSync(file, 'utf8')),
+  );
+}
+
+/**
+ * The file a handler path names. A module that outgrew one file is a directory
+ * whose `mod.rs` glob-re-exports its children, so the function may sit in any
+ * file of that directory: the file that declares it is the one to read.
+ */
 function locate(handler) {
   const segments = handler.split('::');
   const fn = segments.pop();
   const base = path.join(HTTP_SRC, ...segments);
   for (const candidate of [`${base}.rs`, path.join(base, 'mod.rs')]) {
-    if (existsSync(candidate)) return { file: candidate, fn };
+    if (existsSync(candidate) && declares(candidate, fn)) return { file: candidate, fn };
+  }
+  if (existsSync(base) && statSync(base).isDirectory()) {
+    const sibling = readdirSync(base)
+      .filter((name) => name.endsWith('.rs'))
+      .sort()
+      .map((name) => path.join(base, name))
+      .find((file) => declares(file, fn));
+    if (sibling !== undefined) return { file: sibling, fn };
   }
   return null;
 }
