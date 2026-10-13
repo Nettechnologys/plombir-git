@@ -3626,17 +3626,15 @@ async fn every_index_publishes_the_digest_of_the_file_its_link_points_at() {
         .text()
         .await
         .unwrap();
-    let digest = index
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("digest: "))
+    // Read as the YAML document Helm reads, not line by line: the writer may
+    // quote any scalar, and a quoted URL scraped as text keeps its quotes.
+    let parsed: serde_json::Value = rg_core::yaml::from_str(&index).unwrap();
+    let entry = &parsed["entries"]["matrix-hash-chart"][0];
+    let digest = entry["digest"]
+        .as_str()
         .unwrap_or_else(|| panic!("no digest in the Helm index:\n{index}"));
-    let url = index
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("- ")
-                .filter(|u| u.contains("http"))
-        })
+    let url = entry["urls"][0]
+        .as_str()
         .unwrap_or_else(|| panic!("no chart url in the Helm index:\n{index}"));
 
     let downloaded = client.get(url).send().await.unwrap();
@@ -4031,7 +4029,7 @@ sources:
         .text()
         .await
         .unwrap();
-    let index: serde_json::Value = serde_yaml::from_str(&index).unwrap();
+    let index: serde_json::Value = rg_core::yaml::from_str(&index).unwrap();
     let chart = &index["entries"]["matrix-chart"][0];
     assert_eq!(chart["apiVersion"], "v2");
     assert_eq!(chart["appVersion"], "1.19");
@@ -5279,9 +5277,9 @@ async fn equivalent_helm_build_metadata_is_a_conflict_without_a_second_row() {
         .text()
         .await
         .unwrap();
-    let index: serde_yaml::Value = serde_yaml::from_str(&index).unwrap();
+    let index: serde_json::Value = rg_core::yaml::from_str(&index).unwrap();
     let entries = index["entries"]["matrix-build-meta"]
-        .as_sequence()
+        .as_array()
         .expect("published chart entries");
     assert_eq!(entries.len(), 1, "the Helm index exposed two equal rows");
     assert_eq!(entries[0]["version"].as_str(), Some("1.0.0+b"));

@@ -208,7 +208,6 @@ mod tests {
         let typed: Typed = from_str("mode: 0755\n").unwrap();
         assert_eq!(typed.mode, "0755");
         assert!(from_str::<Numeric>("mode: 0755\n").is_err());
-        assert!(old_parser_typed::<Numeric>("mode: 0755\n").is_err());
     }
 
     #[test]
@@ -322,84 +321,6 @@ mod tests {
                 !text.contains(&format!(": {word}\n")),
                 "{word} left bare:\n{text}"
             );
-        }
-    }
-
-    // ── Parity with `serde_yaml`, the parser this replaced ─────────────────
-    // Goes away with `serde_yaml` itself (card_5d675575968e); the pinned
-    // expectations above stay.
-
-    const EDGE_CASES: &[&str] = &[
-        "on: push\nenabled: yes\n",
-        "a: 0755\nb: 0o17\nc: 0x1F\nd: 1.10\ne: 1e3\nf: -0\ng: -007\nh: [0644]\n",
-        "a: ~\nb: null\nc:\nd: 'null'\n",
-        "a: 2001-12-14t21:59:43.10-05:00\nb: 12:30:00\n",
-        "a: |\n  line one\n  line two\nb: >\n  folded\n  text\n",
-        "a: \"quoted \\\"escapes\\\" \\u00e9\"\nb: 'single ''quote'''\n",
-        "x: &x {k: v}\ny: *x\n",
-        "- 1\n- two\n- {three: 3}\n- [4, 5]\n",
-        "1: one\n2: two\n",
-        "run: echo ${{ github.ref }}\n",
-        "",
-        "# only a comment\n",
-        "a: !!str 123\nb: !!int '42'\n",
-        "steps:\n  - uses: actions/checkout@v4\n    with:\n      fetch-depth: 0\n",
-    ];
-
-    fn old_parser_typed<T: DeserializeOwned>(input: &str) -> Result<T, String> {
-        serde_yaml::from_str(input).map_err(|e| e.to_string())
-    }
-
-    fn old_parser(input: &str) -> Result<Value, String> {
-        serde_yaml::from_str(input).map_err(|e| e.to_string())
-    }
-
-    fn assert_same_as_old(label: &str, input: &str) {
-        let new = from_str::<Value>(input).map_err(|e| e.to_string());
-        let old = old_parser(input);
-        match (&new, &old) {
-            (Ok(n), Ok(o)) => assert_eq!(n, o, "{label}"),
-            (Err(_), Err(_)) => {}
-            _ => panic!("{label}: new {new:?} vs old {old:?}"),
-        }
-    }
-
-    #[test]
-    fn edge_cases_parse_as_serde_yaml_did() {
-        for input in EDGE_CASES {
-            assert_same_as_old(&format!("{input:?}"), input);
-        }
-    }
-
-    /// Every YAML file the repository ships, read by both parsers.
-    #[test]
-    fn repository_yaml_parses_as_serde_yaml_did() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut files = Vec::new();
-        for dir in [".github", "deploy"] {
-            collect_yaml(&root.join(dir), &mut files);
-        }
-        assert!(files.len() >= 10, "found only {files:?}");
-        for path in files {
-            let input = std::fs::read_to_string(&path).unwrap();
-            assert_same_as_old(&path.display().to_string(), &input);
-        }
-    }
-
-    fn collect_yaml(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_yaml(&path, out);
-            } else if matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("yml" | "yaml")
-            ) {
-                out.push(path);
-            }
         }
     }
 }

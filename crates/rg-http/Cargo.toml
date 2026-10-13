@@ -73,9 +73,6 @@ md-5 = { workspace = true }
 # Same shape for npm and Composer: `dist.shasum` is SHA-1 by protocol, so the
 # test has to hash the downloaded file the way the client would.
 sha1 = { workspace = true }
-# Helm's `index.yaml` is asserted on as a parsed document, not as text: a
-# `contains` check passes on a key that landed under the wrong chart.
-serde_yaml = { workspace = true }
 # The archive-stream regression test asserts on the warning an operator sees
 # when `git archive` stdout fails after the 200 response has started.
 tracing-subscriber = { workspace = true }
