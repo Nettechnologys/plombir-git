@@ -11,6 +11,7 @@ compile_error!("rg-process supports Unix and Windows process trees only");
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
+pub mod client_policy;
 mod retired_environment;
 pub mod workspace_archive;
 

@@ -531,7 +531,7 @@ pub async fn create_bot_token(
         id: sea_orm::NotSet,
         user_id: sea_orm::Set(bot.id),
         name: sea_orm::Set(body.name),
-        token_hash: sea_orm::Set(super::users::hash_token(&raw_token)),
+        token_hash: sea_orm::Set(rg_db::token_digest(&raw_token)),
         scopes: sea_orm::Set(BOT_TOKEN_SCOPES.to_string()),
         expires_at: sea_orm::Set(expires_at),
         last_used_at: sea_orm::Set(None),

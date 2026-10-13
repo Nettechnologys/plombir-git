@@ -25,6 +25,8 @@ pub mod tools;
 // Re-export for convenience
 pub use error::{Error, Result};
 
+use rg_process::client_policy::{is_loopback_host, same_origin_redirect_policy};
+
 /// The Plombir Git API this server talks to when `PLOMBIR_GIT_URL` is unset.
 ///
 /// A named constant rather than a literal inside the resolve, because the same
@@ -42,25 +44,6 @@ const DEFAULT_ALLOW_INSECURE_HTTP: bool = false;
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Connect timeout (TCP + TLS handshake only).
 const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Keep the PAT on the exact origin of each initiating request. Reqwest's
-/// default sensitive-header stripping compares host and port but not scheme,
-/// so it is not sufficient for an HTTPS-to-HTTP redirect on the same socket.
-fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
-    let default = reqwest::redirect::Policy::default();
-    reqwest::redirect::Policy::custom(move |attempt| {
-        let stays_on_origin = attempt.previous().first().is_some_and(|initial| {
-            initial.scheme() == attempt.url().scheme()
-                && initial.host_str() == attempt.url().host_str()
-                && initial.port_or_known_default() == attempt.url().port_or_known_default()
-        });
-        if stays_on_origin {
-            default.redirect(attempt)
-        } else {
-            attempt.stop()
-        }
-    })
-}
 
 /// Build the `reqwest::Client` used for every Plombir Git API call: the static
 /// `Bearer` header plus the outbound request + connect timeouts.
@@ -84,33 +67,6 @@ fn build_http_client(pat: &str) -> reqwest::Client {
         .default_headers(headers)
         .build()
         .expect("reqwest::Client::build() failed: no native TLS backend available")
-}
-
-// `rg-mcp` deliberately stays independent of the server-side `rg-core` crate,
-// so it carries the small DNS-free loopback predicate locally.
-fn is_loopback_host(url: &reqwest::Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    let literal = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    literal
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| match ip {
-            std::net::IpAddr::V4(ip) => ip.is_loopback(),
-            std::net::IpAddr::V6(ip) => {
-                ip.is_loopback()
-                    || ip
-                        .to_ipv4_mapped()
-                        .is_some_and(|mapped| mapped.is_loopback())
-            }
-        })
 }
 
 fn require_confidential_bearer_server(

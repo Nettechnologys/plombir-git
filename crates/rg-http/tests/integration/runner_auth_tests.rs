@@ -122,7 +122,7 @@ async fn runner_token_gate_refusals_are_the_api_error_envelope() {
         id: sea_orm::NotSet,
         repo_id: Set(None),
         name: Set("envelope-legacy".to_string()),
-        token_hash: Set(rg_db::ops::runner_ops::hash_token(LEGACY_TOKEN)),
+        token_hash: Set(rg_db::token_digest(LEGACY_TOKEN)),
         status: Set("offline".to_string()),
         labels: Set("[]".to_string()),
         last_seen_at: Set(now),
@@ -320,7 +320,7 @@ async fn a_registered_runners_token_is_not_recoverable_from_the_database() {
         !dump.contains(&issued),
         "the issued runner token is readable from the row: {dump}"
     );
-    assert_eq!(row.token_hash, rg_db::ops::runner_ops::hash_token(&issued));
+    assert_eq!(row.token_hash, rg_db::token_digest(&issued));
 
     // ...and the credential that is no longer stored still works, which is what
     // makes the absence above a fix rather than a broken registration.

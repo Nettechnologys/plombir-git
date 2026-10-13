@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use rg_process::client_policy::is_loopback_host;
 use tracing_subscriber::EnvFilter;
 
 use crate::admin;
@@ -660,31 +661,6 @@ fn build_package_publish_client() -> anyhow::Result<reqwest::Client> {
         .redirect(rg_core::net::same_origin_redirect_policy())
         .build()
         .context("failed to build package-publish HTTP client")
-}
-
-fn is_loopback_host(url: &reqwest::Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    let literal = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    literal
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| match ip {
-            std::net::IpAddr::V4(ip) => ip.is_loopback(),
-            std::net::IpAddr::V6(ip) => {
-                ip.is_loopback()
-                    || ip
-                        .to_ipv4_mapped()
-                        .is_some_and(|mapped| mapped.is_loopback())
-            }
-        })
 }
 
 fn require_confidential_package_server(

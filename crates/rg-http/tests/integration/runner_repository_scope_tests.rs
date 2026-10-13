@@ -201,7 +201,7 @@ async fn deleting_personal_and_organization_repositories_revokes_runner_tokens()
     let orphan = rg_db::entities::runner::ActiveModel {
         repo_id: Set(Some(personal_id)),
         name: Set("historical-orphan".to_string()),
-        token_hash: Set(rg_db::ops::runner_ops::hash_token(old_token)),
+        token_hash: Set(rg_db::token_digest(old_token)),
         status: Set("online".to_string()),
         labels: Set("[]".to_string()),
         last_seen_at: Set(now),

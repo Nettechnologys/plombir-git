@@ -1418,8 +1418,7 @@ async fn forgot_password_inner(
 
     // Generate a random token
     let raw_token = uuid::Uuid::new_v4().to_string();
-    use sha2::Digest;
-    let token_hash = hex::encode(sha2::Sha256::digest(raw_token.as_bytes()));
+    let token_hash = rg_db::token_digest(&raw_token);
 
     // Token valid for 15 minutes
     let expires_at = Utc::now() + Duration::minutes(15);
@@ -1486,8 +1485,7 @@ pub async fn reset_password(
     new_password: &str,
     jwt_secret: &str,
 ) -> Result<PasswordResetOutcome> {
-    use sha2::Digest;
-    let token_hash = hex::encode(sha2::Sha256::digest(raw_token.as_bytes()));
+    let token_hash = rg_db::token_digest(raw_token);
 
     let token_record = rg_db::ops::password_reset_token_ops::find_by_hash(db, &token_hash).await?;
     // A token that is absent, spent or expired is the caller's problem and

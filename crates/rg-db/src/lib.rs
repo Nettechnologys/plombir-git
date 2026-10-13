@@ -27,7 +27,10 @@ mod serialized_user_grants;
 pub mod sqlite_process_guard;
 #[cfg(test)]
 mod test_support;
+pub mod token_digest;
 pub mod user_grants;
+
+pub use token_digest::token_digest;
 
 use std::any::Any;
 use std::collections::HashMap;

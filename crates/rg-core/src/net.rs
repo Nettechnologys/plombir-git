@@ -326,27 +326,9 @@ fn ssrf_safe_client_builder<R: reqwest::dns::Resolve + 'static>(
 }
 
 /// Follow redirects only while they stay on the initiating request's exact
-/// HTTP origin (`scheme + host + effective port`).
-///
-/// Reqwest's default policy strips sensitive headers when host or port changes,
-/// but not when only the scheme changes. Stopping before any origin change is
-/// therefore the credential boundary; delegating allowed redirects back to the
-/// default policy preserves its normal redirect-count limit.
-pub fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
-    let default = reqwest::redirect::Policy::default();
-    reqwest::redirect::Policy::custom(move |attempt| {
-        let stays_on_origin = attempt.previous().first().is_some_and(|initial| {
-            initial.scheme() == attempt.url().scheme()
-                && initial.host_str() == attempt.url().host_str()
-                && initial.port_or_known_default() == attempt.url().port_or_known_default()
-        });
-        if stays_on_origin {
-            default.redirect(attempt)
-        } else {
-            attempt.stop()
-        }
-    })
-}
+/// HTTP origin (`scheme + host + effective port`). The policy lives in
+/// `rg_process::client_policy`, shared with the CLI, MCP server and runner.
+pub use rg_process::client_policy::same_origin_redirect_policy;
 
 /// Shared outbound HTTP client for operator-controlled provider endpoints.
 ///

@@ -679,8 +679,6 @@ pub async fn me(State(state): State<AppState>, AuthUser(user_id): AuthUser) -> i
 
 // ── PAT (Personal Access Token) handlers ────────────────────────────────
 
-use sha2::{Digest, Sha256};
-
 #[derive(serde::Deserialize, ToSchema)]
 pub struct CreateTokenRequest {
     pub name: String,
@@ -718,12 +716,6 @@ pub(crate) fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     format!("ifp_{}", hex::encode(bytes))
-}
-
-pub(crate) fn hash_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 pub(crate) fn parse_token_expiration(
@@ -834,7 +826,7 @@ pub async fn create_token(
     // Generate the credential only after every client-supplied field is known
     // to be valid. A rejected request must never mint even a transient raw PAT.
     let raw_token = generate_token();
-    let token_hash = hash_token(&raw_token);
+    let token_hash = rg_db::token_digest(&raw_token);
     let now = chrono::Utc::now();
     let model = rg_db::entities::access_token::ActiveModel {
         id: sea_orm::NotSet,
@@ -1275,7 +1267,7 @@ mod finalized_login_user_tests {
 
 #[cfg(test)]
 mod token_tests {
-    use super::{generate_token, hash_token};
+    use super::generate_token;
     use std::collections::HashSet;
 
     #[test]
@@ -1320,6 +1312,9 @@ mod token_tests {
 
     #[test]
     fn distinct_tokens_hash_distinctly() {
-        assert_ne!(hash_token(&generate_token()), hash_token(&generate_token()));
+        assert_ne!(
+            rg_db::token_digest(&generate_token()),
+            rg_db::token_digest(&generate_token())
+        );
     }
 }

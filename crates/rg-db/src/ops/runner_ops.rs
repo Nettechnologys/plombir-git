@@ -7,6 +7,7 @@ use sea_orm::*;
 
 use crate::entities::repository;
 use crate::entities::runner::{ActiveModel, Column, Entity as RunnerEntity, Model as Runner};
+use crate::token_digest;
 
 /// Register a new runner.
 ///
@@ -45,7 +46,7 @@ pub async fn register_runner(
         id: NotSet,
         repo_id: Set(Some(repo_id)),
         name: Set(name.to_string()),
-        token_hash: Set(hash_token(&token)),
+        token_hash: Set(token_digest(&token)),
         status: Set("offline".to_string()),
         labels: Set(labels.to_string()),
         last_seen_at: Set(now),
@@ -150,7 +151,7 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Runne
 /// holds only its hash, so the comparison happens between hashes.
 pub async fn find_by_token(db: &DatabaseConnection, token: &str) -> Result<Option<Runner>> {
     RunnerEntity::find()
-        .filter(Column::TokenHash.eq(hash_token(token)))
+        .filter(Column::TokenHash.eq(token_digest(token)))
         .one(db)
         .await
         .context("db: find runner by token")
@@ -208,20 +209,6 @@ fn generate_token() -> String {
     uuid::Uuid::new_v4().to_string().replace('-', "")
 }
 
-/// Hash a runner token for storage and lookup.
-///
-/// Plain SHA-256 with no salt, exactly as `access_token.token_hash` and
-/// `password_reset_token.token_hash`: the lookup is *by* the hash, so there is
-/// nowhere to put a per-row salt. That is sound here because the input is not
-/// user-chosen — a v4 UUID carries 122 bits out of the CSPRNG, which no
-/// dictionary or rainbow table reaches.
-pub fn hash_token(token: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,11 +233,11 @@ mod tests {
     #[test]
     fn hashing_is_deterministic_and_hides_the_token() {
         let token = generate_token();
-        let hash = hash_token(&token);
+        let hash = token_digest(&token);
 
-        assert_eq!(hash, hash_token(&token));
+        assert_eq!(hash, token_digest(&token));
         assert_ne!(hash, token);
         assert_eq!(hash.len(), 64, "expected SHA-256 hex, got {hash}");
-        assert_ne!(hash, hash_token(&generate_token()));
+        assert_ne!(hash, token_digest(&generate_token()));
     }
 }

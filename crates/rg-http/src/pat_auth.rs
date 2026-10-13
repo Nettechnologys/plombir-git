@@ -28,10 +28,9 @@ pub(crate) async fn resolve_pat(
         rg_db::entities::user::Model,
     )>,
 > {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    let hash = format!("{:x}", hasher.finalize());
+    // Issuance hashes with the same function (`rg_db::token_digest`), so a token
+    // minted by any path resolves here and nowhere else can disagree with it.
+    let hash = rg_db::token_digest(token);
 
     let Some(tok) = rg_db::ops::token_ops::find_by_hash(db, &hash).await? else {
         return Ok(None);

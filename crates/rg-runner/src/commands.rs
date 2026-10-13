@@ -2,6 +2,7 @@
 //! if needed, then poll-and-execute loop).
 
 use anyhow::{Context, Result};
+use rg_process::client_policy::{is_loopback_host, same_origin_redirect_policy};
 
 use crate::api::{
     deregister_runner, download_workspace, finish_job, job_liveness, poll_job, publish_artifact,
@@ -25,25 +26,6 @@ use crate::workspace::{
 /// Mirrors `rg_core::net`'s outbound connect timeout so a dead/hung server can't
 /// pin registration or the heartbeat task on the connect phase forever.
 const RUNNER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Keep runner credentials on the exact origin of each initiating request.
-/// Reqwest's built-in sensitive-header stripping ignores scheme-only changes,
-/// so an explicit policy is the credential boundary for the shared client.
-fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
-    let default = reqwest::redirect::Policy::default();
-    reqwest::redirect::Policy::custom(move |attempt| {
-        let stays_on_origin = attempt.previous().first().is_some_and(|initial| {
-            initial.scheme() == attempt.url().scheme()
-                && initial.host_str() == attempt.url().host_str()
-                && initial.port_or_known_default() == attempt.url().port_or_known_default()
-        });
-        if stays_on_origin {
-            default.redirect(attempt)
-        } else {
-            attempt.stop()
-        }
-    })
-}
 
 #[cfg(test)]
 mod shared_docker_daemon_tests {
@@ -240,31 +222,6 @@ fn build_runner_client() -> reqwest::Client {
         .redirect(same_origin_redirect_policy())
         .build()
         .expect("failed to build runner HTTP client: no native TLS backend available")
-}
-
-fn is_loopback_host(url: &reqwest::Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    let literal = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    literal
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| match ip {
-            std::net::IpAddr::V4(ip) => ip.is_loopback(),
-            std::net::IpAddr::V6(ip) => {
-                ip.is_loopback()
-                    || ip
-                        .to_ipv4_mapped()
-                        .is_some_and(|mapped| mapped.is_loopback())
-            }
-        })
 }
 
 fn require_confidential_runner_server(server: &str, allow_insecure_http: bool) -> Result<()> {

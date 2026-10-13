@@ -349,17 +349,11 @@ pub struct Mailer<'a> {
 /// A fresh link token and the hash that is stored for it.
 fn new_link_token() -> (String, String) {
     use rand::RngCore;
-    use sha2::Digest;
     let mut raw = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut raw);
     let token = hex::encode(raw);
-    let hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+    let hash = rg_db::token_digest(&token);
     (token, hash)
-}
-
-fn token_hash(token: &str) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(token.trim().as_bytes()))
 }
 
 /// Send one mail off the request path, through the tracker graceful shutdown
@@ -643,7 +637,8 @@ pub async fn confirm(
         PURPOSE_EMAIL_CHANGE, PURPOSE_EMAIL_VERIFY, PURPOSE_REGISTRATION,
     };
 
-    let Some(row) = rg_db::ops::email_confirmation_ops::take_live(db, &token_hash(token)).await?
+    let Some(row) =
+        rg_db::ops::email_confirmation_ops::take_live(db, &rg_db::token_digest(token)).await?
     else {
         return Err(crate::error::invalid_request(
             "this confirmation link is invalid, already used, or expired",
