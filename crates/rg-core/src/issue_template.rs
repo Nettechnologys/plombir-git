@@ -123,9 +123,9 @@ struct FrontMatter {
     #[serde(default)]
     description: String,
     #[serde(default)]
-    labels: serde_yaml::Value,
+    labels: serde_json::Value,
     #[serde(default)]
-    assignees: serde_yaml::Value,
+    assignees: serde_json::Value,
     #[serde(default, rename = "ref")]
     git_ref: String,
 }
@@ -226,7 +226,7 @@ pub fn read_issue_config(repository_path: &Path, default_branch: &str) -> Result
         else {
             continue;
         };
-        let config: IssueConfig = serde_yaml::from_str(&content)
+        let config: IssueConfig = crate::yaml::from_str(&content)
             .context(crate::error::InvalidRequest::new(
                 "invalid issue template config",
             ))
@@ -457,7 +457,7 @@ fn parse_markdown_template(path: &str, source: &str) -> Result<IssueTemplate> {
     let fallback_about = ellipsis(body.trim(), 80);
 
     let front_matter = match metadata {
-        Some(yaml) => serde_yaml::from_str::<FrontMatter>(yaml)
+        Some(yaml) => crate::yaml::from_str::<FrontMatter>(yaml)
             .context("invalid issue template front matter")?,
         None => FrontMatter::default(),
     };
@@ -508,16 +508,16 @@ fn split_front_matter(source: &str) -> (Option<&str>, &str) {
     (None, source)
 }
 
-fn yaml_string_list(value: &serde_yaml::Value) -> Result<Vec<String>> {
+fn yaml_string_list(value: &serde_json::Value) -> Result<Vec<String>> {
     match value {
-        serde_yaml::Value::Null => Ok(Vec::new()),
-        serde_yaml::Value::String(value) => Ok(value
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::String(value) => Ok(value
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .collect()),
-        serde_yaml::Value::Sequence(values) => values
+        serde_json::Value::Array(values) => values
             .iter()
             .map(|value| {
                 value
@@ -931,12 +931,13 @@ struct IssueContactLink {
                     templates += 1;
                 }
                 "yaml" => {
-                    let config: IssueConfig = serde_yaml::from_str(&body).unwrap_or_else(|error| {
-                        panic!(
-                            "{name}:{line}: this ```yaml block is not a valid issue chooser \
+                    let config: IssueConfig =
+                        crate::yaml::from_str(&body).unwrap_or_else(|error| {
+                            panic!(
+                                "{name}:{line}: this ```yaml block is not a valid issue chooser \
                                  `config.yml`: {error}"
-                        )
-                    });
+                            )
+                        });
                     // Parsing is only half the gate: a contact link with a
                     // relative URL or a blank name is refused after parsing, by
                     // the same function that judges the reader's own file.
@@ -1234,7 +1235,7 @@ struct IssueContactLink {
         // The row promises a behaviour, so the behaviour is what is asked —
         // both ways in, since the two used to carry their own copy of the value.
         let omitted: IssueConfig =
-            serde_yaml::from_str("contact_links: []").expect("a config with no blank-issue key");
+            crate::yaml::from_str("contact_links: []").expect("a config with no blank-issue key");
         assert_eq!(
             omitted.blank_issues_enabled,
             super::DEFAULT_BLANK_ISSUES_ENABLED,
@@ -1366,7 +1367,7 @@ struct IssueContactLink {
 
     #[test]
     fn issue_config_defaults_to_blank_enabled() {
-        let config: IssueConfig = serde_yaml::from_str("contact_links: []").unwrap();
+        let config: IssueConfig = crate::yaml::from_str("contact_links: []").unwrap();
         assert!(config.blank_issues_enabled);
     }
 
@@ -1382,10 +1383,10 @@ struct IssueContactLink {
         assert!(reason.contains("blank_issue_enabled"), "{reason}");
         assert!(reason.contains("unknown field"), "{reason}");
 
-        let config: IssueConfig = serde_yaml::from_str("blank_issues_enabled: false\n").unwrap();
+        let config: IssueConfig = crate::yaml::from_str("blank_issues_enabled: false\n").unwrap();
         assert!(!config.blank_issues_enabled);
 
-        let nested_error = serde_yaml::from_str::<IssueConfig>(
+        let nested_error = crate::yaml::from_str::<IssueConfig>(
             "contact_links:\n  - name: Support\n    url: https://example.com/support\n    about: Ask here\n    icon: help\n",
         )
         .unwrap_err()
@@ -1429,6 +1430,45 @@ struct IssueContactLink {
             );
             assert!(reason.contains(key), "{reason}");
         }
+    }
+
+    /// Front matter is written by whoever can push to the repository, and
+    /// every visitor of the "new issue" page makes the server read it. An
+    /// alias bomb there must cost one bounded refusal, listed like any other
+    /// broken template, and leave the healthy ones served.
+    #[test]
+    fn an_alias_bomb_in_front_matter_is_a_bounded_discovery_error() {
+        // `labels` is the untyped field, so the bomb lives inside it: a key the
+        // struct does not know would be refused before anything expands.
+        let mut levels = vec!["&a0 [x, x, x, x, x, x, x, x, x, x]".to_string()];
+        for level in 1..=9 {
+            let items = vec![format!("*a{}", level - 1); 10].join(", ");
+            levels.push(format!("&a{level} [{items}]"));
+        }
+        let bomb = format!(
+            "---\nname: Bomb\nlabels: [{}]\n---\nBody\n",
+            levels.join(", ")
+        );
+        let (_directory, repository) = committed_repository(&[
+            (".gitea/ISSUE_TEMPLATE/bomb.md", bomb.as_str()),
+            (
+                ".gitea/ISSUE_TEMPLATE/valid.md",
+                "---\nname: Valid\nabout: Supported metadata\n---\nValid body\n",
+            ),
+        ]);
+
+        let started = std::time::Instant::now();
+        let discovery = discover_issue_templates(&repository, "main").unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        assert_eq!(discovery.templates.len(), 1);
+        assert_eq!(discovery.templates[0].name, "Valid");
+        let (_, reason) = discovery
+            .errors
+            .iter()
+            .find(|(path, _)| path.ends_with("bomb.md"))
+            .unwrap_or_else(|| panic!("missing diagnostic: {:?}", discovery.errors));
+        assert!(reason.contains("alias replay limit"), "{reason}");
     }
 
     /// Git accepts path bytes that are not UTF-8. Such a template cannot be
