@@ -234,9 +234,10 @@ const files = rustFiles(HTTP_SRC);
  * every classifier chain this tree actually has is intra-file
  * (`attachment_body_error` in `attachments.rs`, `oci_body_error` in `oci.rs`).
  * A crate-wide name index turns two unrelated `fn create` into one node, which
- * is the same over-reach `callsIn` documents from the other side. A helper
- * reached across files is spelled with a module path and so is not an edge here
- * — it reads as uncovered, which is a question rather than a false green.
+ * is the same over-reach `callsIn` documents from the other side. A bare call
+ * resolves to its own file, or to its one sibling in the same module directory
+ * (`definingFile`); a helper spelled with a module path is not an edge here, and
+ * reads as uncovered, which is a question rather than a false green.
  */
 const byFile = new Map();
 const loaded = [];
@@ -270,6 +271,31 @@ const lineOf = (code, index) => code.slice(0, index).split('\n').length;
 const classifying = new Set();
 const key = (file, name) => `${file}::${name}`;
 
+/**
+ * The file a bare `name(` call made from `file` resolves to, or `null`.
+ *
+ * A module that outgrew one file lives as a directory (`api/packages/` with
+ * `mod.rs` and one file per protocol). Every file there is `use super::*`, and
+ * `mod.rs` re-exports the children, so a sibling's item is a bare name in scope:
+ * the call is a real edge. Two siblings defining the same name make the call
+ * ambiguous, and an ambiguous name resolves to nothing, which reads as
+ * uncovered rather than as a false green.
+ */
+function definingFile(file, name) {
+  if (byFile.get(file)?.has(name)) return file;
+  const dir = path.dirname(file);
+  const siblings = [...byFile.keys()].filter(
+    (other) => other !== file && path.dirname(other) === dir && byFile.get(other).has(name),
+  );
+  return siblings.length === 1 ? siblings[0] : null;
+}
+
+/** Whether a bare call to `called`, made from `file`, reaches a classifier. */
+const classifiesCall = (file, called) => {
+  const home = definingFile(file, called);
+  return home !== null && classifying.has(key(home, called));
+};
+
 for (const [file, index] of byFile) {
   for (const [name, records] of index) {
     if (file === CLASSIFIER_FILE && name === CLASSIFIER) continue;
@@ -284,7 +310,7 @@ for (let changed = true; changed; ) {
     for (const [name, records] of index) {
       if (classifying.has(key(file, name))) continue;
       const reaches = records.some((record) =>
-        [...callsIn(record.body)].some((called) => classifying.has(key(file, called))),
+        [...callsIn(record.body)].some((called) => classifiesCall(file, called)),
       );
       if (reaches) {
         classifying.add(key(file, name));
@@ -429,20 +455,26 @@ function callDisposition(code, index) {
 /** Whether `region` names something that classifies a body error. */
 function regionClassifies(file, region) {
   if (region.includes(CLASSIFIER)) return true;
-  return [...callsIn(region)].some((called) => classifying.has(key(file, called)));
+  return [...callsIn(region)].some((called) => classifiesCall(file, called));
 }
 
-/** Every bare `name(` call inside another top-level fn of `file`. */
+/**
+ * Every bare `name(` call inside another top-level fn of any file whose `name`
+ * resolves to `file`. Each site carries the file it is in, because the caller
+ * may sit in a sibling module file.
+ */
 function callSitesOf(file, name) {
-  const index = byFile.get(file);
   const sites = [];
-  for (const [caller, records] of index) {
-    if (caller === name) continue;
-    for (const record of records) {
-      const call = new RegExp(`(^|[^.:\\w])${name}\\s*\\(`, 'g');
-      let match;
-      while ((match = call.exec(record.body)) !== null) {
-        sites.push({ caller, at: record.start + match.index + match[1].length });
+  for (const [callerFile, index] of byFile) {
+    if (definingFile(callerFile, name) !== file) continue;
+    for (const [caller, records] of index) {
+      if (caller === name) continue;
+      for (const record of records) {
+        const call = new RegExp(`(^|[^.:\\w])${name}\\s*\\(`, 'g');
+        let match;
+        while ((match = call.exec(record.body)) !== null) {
+          sites.push({ file: callerFile, caller, at: record.start + match.index + match[1].length });
+        }
       }
     }
   }
@@ -462,13 +494,13 @@ function callSitesOf(file, name) {
 function escapeHandled(file, name, seen = new Set()) {
   if (seen.has(name)) return false;
   seen.add(name);
-  const code = loaded.find((entry) => entry.file === file).code;
   const sites = callSitesOf(file, name);
   if (sites.length === 0) return false;
-  return sites.every(({ caller, at }) => {
+  return sites.every(({ file: callerFile, caller, at }) => {
+    const code = loaded.find((entry) => entry.file === callerFile).code;
     const disposition = callDisposition(code, at);
-    if (disposition.kind === 'handled') return regionClassifies(file, disposition.region);
-    if (disposition.kind === 'propagated') return escapeHandled(file, caller, seen);
+    if (disposition.kind === 'handled') return regionClassifies(callerFile, disposition.region);
+    if (disposition.kind === 'propagated') return escapeHandled(callerFile, caller, seen);
     return false;
   });
 }
