@@ -80,3 +80,54 @@ fn an_occupied_http_port_makes_serve_exit_unsuccessfully() {
         "startup must not be announced before the listener owns its address:\n{text}"
     );
 }
+
+#[test]
+fn explicit_zero_log_size_is_rejected_by_serve_wiring() {
+    let dir = tempfile::tempdir().expect("temporary instance directory");
+    // If the size branch is disconnected, the occupied port makes the process
+    // exit instead of leaving this regression test waiting on a live server.
+    let occupied = TcpListener::bind("127.0.0.1:0").expect("reserve an HTTP port");
+    let http_addr = occupied.local_addr().expect("reserved HTTP address");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("plombir-git.db").display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_plombir-git"))
+        .args([
+            "serve",
+            "--repo-root",
+            dir.path().join("repos").to_str().expect("UTF-8 repo root"),
+            "--http-addr",
+            &http_addr.to_string(),
+            "--ssh-addr",
+            "127.0.0.1:0",
+            "--host-key",
+            dir.path()
+                .join("host_ed25519")
+                .to_str()
+                .expect("UTF-8 host key"),
+            "--db-url",
+            &database_url,
+            "--log-file",
+            dir.path().join("app.log").to_str().expect("UTF-8 log path"),
+            "--log-max-size-mb",
+            "0",
+            "--jwt-secret",
+            "test-jwt-secret-long-enough-for-startup-validation",
+            "--encryption-key",
+            "test-at-rest-key-independent-from-the-jwt-secret",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("run plombir-git serve with an explicit zero log cap");
+    let text = diagnostic(&output);
+
+    assert!(
+        !output.status.success(),
+        "zero log cap was accepted:\n{text}"
+    );
+    assert!(
+        text.contains("logging.max_size_mb"),
+        "the requested cap must be rejected by the selected file appender:\n{text}"
+    );
+}

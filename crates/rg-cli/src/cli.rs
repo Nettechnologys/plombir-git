@@ -211,10 +211,10 @@ pub(crate) enum Commands {
         #[arg(long, value_enum)]
         log_format: Option<crate::config::LogFormat>,
 
-        /// Log rotation: nominal max log file size in MB. NOT ENFORCED: the
-        /// file appender rotates daily, not by size, and the server warns at
-        /// startup when this is set. Kept so older configs still start.
-        /// [config: [logging].max_size_mb] [default: 10]
+        /// Log rotation: rotate the log file once it reaches this many MB
+        /// (keeping `max_files` older ones as app.log.1, app.log.2, …). Left
+        /// unset the file appender rotates daily instead.
+        /// [config: [logging].max_size_mb] [example: 10]
         #[arg(long)]
         log_max_size_mb: Option<u64>,
 
@@ -2238,12 +2238,6 @@ const AFTER: &str = "after";
             ),
             (
                 "logging",
-                "max_size_mb",
-                "--log-max-size-mb",
-                DEFAULT_LOG_MAX_SIZE_MB
-            ),
-            (
-                "logging",
                 "max_files",
                 "--log-max-files",
                 DEFAULT_LOG_MAX_FILES
@@ -2254,7 +2248,11 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 20] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 21] = [
+        (
+            "DEFAULT_LOG_MAX_SIZE_MB",
+            "the size cap is inactive until explicitly set; presenting 10 MB as an active default would mislead operators",
+        ),
         (
             "DEFAULT_SOURCE_URL",
             "config-file-only: `[server].source_url` has no CLI flag, so no help text names it",

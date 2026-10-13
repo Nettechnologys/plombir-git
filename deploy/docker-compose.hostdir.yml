@@ -48,6 +48,25 @@ services:
         PLOMBIR_GIT_SOURCE_COMMIT: ${PLOMBIR_GIT_SOURCE_COMMIT:-}
     container_name: plombir-git
     restart: unless-stopped
+    # Hardening. No entrypoint in the image chowns or drops privileges: /data's
+    # owner is fixed at build time (the uid/gid args above) and the server runs
+    # as that non-root user on unprivileged ports, so it needs no capability —
+    # drop all of them and refuse to regain one through a setuid binary.
+    #
+    # `read_only: true` is safe because everything the server writes lives in
+    # ./data: repos/, the database, backups/, the audit archive, and — with the
+    # bundled plombir-git.docker.toml, which pins [server].host_key =
+    # /data/ssh_host_key — the SSH host key and the at-rest encryption key
+    # derived beside it (/data/encryption_key). Keep [server].host_key set: left
+    # unset it falls back to $HOME/.ssh, which is not writable here. /tmp is the
+    # only scratch path outside ./data.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
       # HTTP is bound to loopback: put a TLS-terminating reverse proxy in front
       # of it. Drop the "127.0.0.1:" prefix only if you really want it exposed

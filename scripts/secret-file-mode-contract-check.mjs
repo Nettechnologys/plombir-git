@@ -333,15 +333,16 @@ for (const [variant, mask] of [
   }
 }
 
-const serveWriter = fnBody(
-  productionRustCode(readFileSync(join(root, CLI_SERVE), 'utf8')),
-  'run_serve',
-);
+const serveCode = productionRustCode(readFileSync(join(root, CLI_SERVE), 'utf8'));
+const serveWriter = fnBody(serveCode, 'run_serve');
+const logAppender = fnBody(serveCode, 'open_file_log_appender');
 if (!serveWriter) {
   failures.push(`${CLI_SERVE}: \`run_serve\` is gone — server startup policy cannot be read.`);
 } else {
   const installed = serveWriter.indexOf('resolved_state_permissions.install');
-  const firstWrite = serveWriter.indexOf('RollingFileAppender::builder');
+  // Both daily and size rotation now create their file in this helper. Check
+  // the call in run_serve so moving it above the umask still makes the gate red.
+  const firstWrite = serveWriter.indexOf('open_file_log_appender(');
   if (installed < 0) {
     failures.push(`${CLI_SERVE}: \`run_serve\` no longer installs resolved state permissions.`);
   } else if (firstWrite < 0 || installed > firstWrite) {
@@ -350,6 +351,13 @@ if (!serveWriter) {
         + 'server startup\'s first file creation.',
     );
   }
+}
+if (!logAppender
+    || !logAppender.includes('RollingFileAppender::builder')
+    || !logAppender.includes('SizeRotatingWriter::new')) {
+  failures.push(
+    `${CLI_SERVE}: \`open_file_log_appender\` must own both file-creating rotation branches.`,
+  );
 }
 
 const runnerWriter = fnBody(
