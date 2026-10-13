@@ -454,15 +454,23 @@ export function loadProductionRust(cratesDir) {
  * `main.rs` are the crate root — reached through the crate name, which is the
  * directory under `crates/` with its hyphens turned into underscores.
  */
-export function declaringModule(file) {
+export function declaringModule(file, globsOfParent = () => NO_GLOBS) {
   const base = path.basename(file);
   if (base === 'lib.rs' || base === 'main.rs') {
     const crate = /(?:^|[\\/])crates[\\/]([^\\/]+)[\\/]src[\\/]/.exec(file);
     return crate === null ? null : crate[1].replace(/-/g, '_');
   }
   if (base === 'mod.rs') return path.basename(path.dirname(file));
-  return base.slice(0, -'.rs'.length);
+  const stem = base.slice(0, -'.rs'.length);
+  // A child its parent glob-re-exports (`pub(crate) use npm::*;` in
+  // `packages/mod.rs`, or in `packages.rs`) is reached as `packages::name`:
+  // the parent is the module a caller can spell, and `npm` names no path one
+  // can write from outside the parent.
+  const parent = path.dirname(file);
+  return globsOfParent(parent).has(stem) ? path.basename(parent) : stem;
 }
+
+const NO_GLOBS = new Set();
 
 /** Every leaf name a `use` tree brings into scope, plus the globbed modules. */
 function useFacts(source) {
@@ -477,7 +485,9 @@ function useFacts(source) {
   // module `wa`, which names this module and no other. Eleven live WebAuthn
   // entry points read as orphans until the aliases were followed.
   const moduleAliases = new Map();
-  for (const statement of source.matchAll(/\b(pub\s+)?use\s+([^;]+);/g)) {
+  // `pub(crate) use` and `pub(super) use` re-export inside the crate, which is
+  // exactly the reach a caller in another module needs, so they count as `pub`.
+  for (const statement of source.matchAll(/\b(pub(?:\([^)]*\))?\s+)?use\s+([^;]+);/g)) {
     const tree = statement[2].replace(/\s+/g, ' ');
     for (const glob of tree.matchAll(/(\w+)\s*::\s*\*/g)) {
       globbedModules.add(glob[1]);
@@ -523,6 +533,11 @@ function useFacts(source) {
  */
 export function findPublicFunctionOrphans({ root, scannedDirs, production }) {
   const scannedFiles = scannedDirs.flatMap((dir) => rustFiles(path.join(root, dir)));
+  // Facts first: a child's module name depends on what its parent re-exports.
+  const facts = new Map();
+  for (const [file, source] of production) facts.set(file, useFacts(source));
+  const globsOfParent = (dir) =>
+    (facts.get(path.join(dir, 'mod.rs')) ?? facts.get(`${dir}.rs`))?.globReexported ?? NO_GLOBS;
   const declarations = [];
   // ABI strings have already been blanked by `stripRustNonCode`, so
   // `extern "C" fn` reaches this pass as `extern     fn`.
@@ -533,19 +548,21 @@ export function findPublicFunctionOrphans({ root, scannedDirs, production }) {
       production.get(file) ??
       stripCfgTestItems(stripRustNonCode(readFileSync(file, 'utf8')));
     for (const match of source.matchAll(declaration)) {
-      declarations.push({ name: match[1], file, module: declaringModule(file) });
+      declarations.push({
+        name: match[1],
+        file,
+        module: declaringModule(file, globsOfParent),
+        stem: path.basename(file, '.rs'),
+      });
     }
   }
 
   // One pass over the workspace for the two things the per-declaration loop
   // below has to ask of every file: what it imported, and what it re-exports.
-  const facts = new Map();
   const reexportQualifiers = new Map();
   const globReexportQualifiers = new Map();
-  for (const [file, source] of production) {
-    const fileFacts = useFacts(source);
-    facts.set(file, fileFacts);
-    const module = declaringModule(file);
+  for (const [file, fileFacts] of facts) {
+    const module = declaringModule(file, globsOfParent);
     if (module === null) continue;
     for (const name of fileFacts.reexported) {
       if (!reexportQualifiers.has(name)) reexportQualifiers.set(name, new Set());
@@ -565,11 +582,12 @@ export function findPublicFunctionOrphans({ root, scannedDirs, production }) {
   };
 
   const orphans = [];
-  for (const { name, file, module } of declarations) {
+  for (const { name, file, module, stem } of declarations) {
     let consumers = 0;
     for (const [candidate, source] of production) {
       consumers += consumerCalls(source, name, {
         module,
+        stem,
         declaringFile: candidate === file,
         facts: facts.get(candidate) ?? emptyFacts,
         reexportedBy: reexportQualifiers.get(name) ?? null,
@@ -657,9 +675,12 @@ function consumerCalls(source, name, scope) {
         continue;
       }
       const resolved = scope.facts.moduleAliases.get(segment) ?? segment;
+      // `npm::name(` is still a true spelling where `npm` is the file's stem and
+      // `packages` glob-re-exports it: `packages::npm` is reachable inside it.
       if (
         resolved !== scope.module
         && segment !== scope.module
+        && segment !== scope.stem
         && !(scope.reexportedBy?.has(segment) ?? false)
         && !(scope.globReexportedBy?.has(segment) ?? false)
       ) {
