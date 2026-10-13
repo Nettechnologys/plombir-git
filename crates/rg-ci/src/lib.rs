@@ -2077,10 +2077,10 @@ fn read_ci_config_with_inputs(
     // The reason (with its line/column) goes into the message, not into a
     // `with_context` source: callers log this with `Display`, and the client
     // that just typed the broken YAML is shown this text verbatim. Dumping the
-    // whole file here used to bury the actual complaint. `serde_yaml` reports
-    // only a line/column and its own complaint — no filesystem path — so it is
-    // safe to hand over (H-05).
-    let config: CiConfig = serde_yaml::from_str(&ci_yml).map_err(|e| {
+    // whole file here used to bury the actual complaint. `rg_core::yaml`
+    // reports only a line/column and its own complaint — no filesystem path and
+    // no snippet of the file — so it is safe to hand over (H-05).
+    let config: CiConfig = rg_core::yaml::from_str(&ci_yml).map_err(|e| {
         rg_core::error::invalid_request(format!("failed to parse {ci_filename}: {e}"))
     })?;
 
@@ -7068,7 +7068,7 @@ mod matrix_tests {
     fn runs_on_expression_resolves_per_matrix_variant_before_pipeline_creation() {
         let (config, fields) = resolved_actions_expression_fields();
         assert!(
-            !serde_yaml::to_string(&config).unwrap().contains("${{"),
+            !rg_core::yaml::to_string(&config).unwrap().contains("${{"),
             "Actions syntax must be compiled, not retained in CiConfig"
         );
         assert_eq!(
@@ -7086,7 +7086,7 @@ mod matrix_tests {
     #[test]
     fn container_image_expression_resolves_per_matrix_variant_before_pipeline_creation() {
         let (config, fields) = resolved_actions_expression_fields();
-        assert!(!serde_yaml::to_string(&config).unwrap().contains("${{"));
+        assert!(!rg_core::yaml::to_string(&config).unwrap().contains("${{"));
         assert_eq!(
             fields
                 .iter()
@@ -7102,7 +7102,7 @@ mod matrix_tests {
     #[test]
     fn environment_name_expression_resolves_per_matrix_variant_before_pipeline_creation() {
         let (config, fields) = resolved_actions_expression_fields();
-        assert!(!serde_yaml::to_string(&config).unwrap().contains("${{"));
+        assert!(!rg_core::yaml::to_string(&config).unwrap().contains("${{"));
         assert_eq!(
             fields
                 .iter()
