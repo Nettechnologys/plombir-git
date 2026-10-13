@@ -120,3 +120,55 @@ async fn a_deleted_holder_releases_its_name() {
         .expect_err("now the organization holds it");
     assert!(rg_db::is_unique_violation_anyhow(&taken), "{taken:#}");
 }
+
+/// card_2095e88c98f1: one holder per name in any case, on every backend — not
+/// only under MySQL's case-insensitive collation. The holder itself may still
+/// change the case of its own name, and an update that is not a rename never
+/// touches the key.
+#[tokio::test]
+async fn a_name_has_one_holder_in_any_case() {
+    let (db, _temp, suffix) = setup().await;
+    let founder = account(&db, &format!("founder{suffix}"))
+        .await
+        .expect("the organization founder");
+    let name = format!("Twin{suffix}");
+    let user = account(&db, &name).await.expect("the first holder");
+
+    let lower = account(&db, &name.to_lowercase())
+        .await
+        .expect_err("an account in another case");
+    assert!(rg_db::is_unique_violation_anyhow(&lower), "{lower:#}");
+    let upper =
+        rg_db::ops::org_ops::create_org(&db, &name.to_uppercase(), None, None, founder, "public")
+            .await
+            .expect_err("an organization in another case");
+    assert!(rg_db::is_unique_violation_anyhow(&upper), "{upper:#}");
+    assert!(
+        rg_db::ops::owner_name_ops::is_held_in_any_case(&db, &name.to_uppercase())
+            .await
+            .expect("look the name up")
+    );
+
+    use rg_db::sea_orm::ConnectionTrait;
+    db.execute_unprepared(&format!(
+        "UPDATE users SET display_name = 'Renamed display' WHERE id = {user}"
+    ))
+    .await
+    .expect("an update that is not a rename");
+    let recased = name.to_lowercase();
+    db.execute_unprepared(&format!(
+        "UPDATE users SET username = '{recased}' WHERE id = {user}"
+    ))
+    .await
+    .expect("the holder changes only the case of its own name");
+    assert!(rg_db::ops::owner_name_ops::is_held_in_any_case(&db, &name)
+        .await
+        .expect("look the name up"));
+    assert!(
+        rg_db::ops::owner_name_ops::list_names_held_only_in_another_case(&db)
+            .await
+            .expect("list case twins")
+            .is_empty(),
+        "a fresh database has no keyless names"
+    );
+}

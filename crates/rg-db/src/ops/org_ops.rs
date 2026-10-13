@@ -59,7 +59,6 @@ pub async fn get_orgs_by_ids(
         .context("db: get orgs by id")
 }
 
-/// Get an organization by name.
 /// Organization names an account holds too, sorted.
 ///
 /// Owners share the first URL segment, and `resolve_owner` answers a name with
@@ -86,6 +85,7 @@ pub async fn list_names_held_by_an_account_too(db: &DatabaseConnection) -> Resul
     Ok(names)
 }
 
+/// Get an organization by name.
 pub async fn get_org_by_name(
     db: &DatabaseConnection,
     name: &str,

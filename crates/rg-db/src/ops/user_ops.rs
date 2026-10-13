@@ -6,7 +6,12 @@ use sea_orm::*;
 
 use crate::entities::user::{self, ActiveModel, Entity as UserEntity, Model as User};
 
-/// Find a user by username (case-insensitive on SQLite).
+/// Find a user by username, exactly as spelled.
+///
+/// The comparison is the backend's own: case-sensitive on SQLite and
+/// PostgreSQL, case-insensitive under MySQL's default collation. Whether a name
+/// is *free* is a different question and is asked in any case — see
+/// `rg_core::namespace::owner_name_is_taken`.
 pub async fn find_by_username(db: &DatabaseConnection, username: &str) -> Result<Option<User>> {
     UserEntity::find()
         .filter(user::Column::Username.eq(username))

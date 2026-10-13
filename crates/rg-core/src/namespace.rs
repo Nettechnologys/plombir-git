@@ -89,17 +89,27 @@ pub fn is_reserved_segment(name: &str) -> bool {
 /// name asks this instead: registration, organization creation, bots, and the
 /// SSO and LDAP paths that generate a name without a human seeing it.
 ///
-/// Exact match, like the two lookups it combines. This is the friendly first
-/// answer, not the guarantee: two concurrent creates of one name across the
-/// two tables can both pass it. The guarantee is `owner_names`, the database's
-/// own unique key over both tables, written by triggers in the same statement
-/// as the row — the loser of that race fails its insert with an ordinary
-/// unique violation, which every door already answers as "taken"
-/// (`m20261009_000001_owner_names_unique`, card_8f3f821705f2).
+/// In any case: `zubrenok` is taken while `Zubrenok` exists. A reader cannot
+/// tell the two apart in a link, and a stock client that lowercases what it is
+/// given cannot address the second one at all — Docker refuses an upper-case
+/// image path, so `docker pull host/zubrenok/app` reached whoever registered
+/// the lower-case twin (card_2095e88c98f1). The two exact lookups stay for the
+/// names that predate the rule and hold no folded key.
+///
+/// This is the friendly first answer, not the guarantee: two concurrent creates
+/// of one name across the two tables can both pass it. The guarantee is
+/// `owner_names`, the database's own unique key over both tables and over the
+/// folded name, written by triggers in the same statement as the row — the
+/// loser of that race fails its insert with an ordinary unique violation, which
+/// every door already answers as "taken" (`m20261009_000001_owner_names_unique`,
+/// `m20261014_000001_owner_names_fold_case`, card_8f3f821705f2).
 pub async fn owner_name_is_taken(
     db: &rg_db::DatabaseConnection,
     name: &str,
 ) -> anyhow::Result<bool> {
+    if rg_db::ops::owner_name_ops::is_held_in_any_case(db, name).await? {
+        return Ok(true);
+    }
     if rg_db::ops::user_ops::find_by_username(db, name)
         .await?
         .is_some()
@@ -109,6 +119,41 @@ pub async fn owner_name_is_taken(
     Ok(rg_db::ops::org_ops::get_org_by_name(db, name)
         .await?
         .is_some())
+}
+
+/// Name every owner whose name another holder already has in a different case.
+///
+/// A sibling of [`report_names_held_by_an_account_and_an_organization`]: the
+/// doors and the folded key refuse new pairs like `Zubrenok` / `zubrenok`, this
+/// says which pairs came through before they did. The upgrade gave the name to
+/// one holder and left the others as they were; which of them to rename is the
+/// operator's call, so a warning and a startup that continues.
+pub async fn report_owner_names_that_differ_only_in_case(db: &rg_db::DatabaseConnection) {
+    let pairs = match rg_db::ops::owner_name_ops::list_names_held_only_in_another_case(db).await {
+        Ok(pairs) => pairs,
+        // Silence here reads exactly like "none", which is the answer the
+        // operator would act on.
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "could not check whether any owner name differs from another only in case"
+            );
+            return;
+        }
+    };
+    if pairs.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        names = pairs
+            .iter()
+            .map(|(name, holder)| format!("{name} (as {holder})"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        "these owner names differ from a name somebody else holds only in case, so a link or a \
+         client that lowercases the name cannot tell the two apart; they predate the rule and \
+         renaming one of each pair is a decision for you, not for the server"
+    );
 }
 
 /// Name every organization whose name an account holds too.
@@ -395,6 +440,56 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// card_2095e88c98f1: a name is taken in every case, and the boot pass
+    /// names the pairs that came through before the folded key existed.
+    #[tokio::test]
+    async fn a_name_is_taken_in_any_case_and_older_case_twins_are_named() {
+        let db = crate::test_support::migrated_memory_database().await;
+        rg_db::ops::user_ops::create_user(&db, "Zubrenok", "z@example.invalid", "", "Z")
+            .await
+            .expect("seed the first holder");
+        // The state an upgraded instance is in: the twin got in while names
+        // were compared exactly, and the upgrade left it without a key.
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared("DROP INDEX uq_owner_names_name_key")
+            .await
+            .expect("lift the folded rule for the legacy seed");
+        rg_db::ops::user_ops::create_user(&db, "zubrenok", "twin@example.invalid", "", "Twin")
+            .await
+            .expect("seed the twin");
+        db.execute_unprepared(
+            "UPDATE owner_names SET name_key = NULL WHERE name = 'zubrenok'; \
+             CREATE UNIQUE INDEX uq_owner_names_name_key ON owner_names (name_key)",
+        )
+        .await
+        .expect("put the rule back, as the upgrade leaves it");
+
+        assert_eq!(
+            rg_db::ops::owner_name_ops::list_names_held_only_in_another_case(&db)
+                .await
+                .expect("list case twins"),
+            vec![("zubrenok".to_string(), "Zubrenok".to_string())]
+        );
+        for (name, taken) in [
+            ("Zubrenok", true),
+            ("zubrenok", true),
+            ("ZUBRENOK", true),
+            ("zubrenok2", false),
+        ] {
+            assert_eq!(
+                owner_name_is_taken(&db, name)
+                    .await
+                    .expect("look the name up"),
+                taken,
+                "{name}"
+            );
+        }
+        let refused = rg_db::ops::org_ops::create_org(&db, "ZuBrEnOk", None, None, 1, "public")
+            .await
+            .expect_err("the database refuses a third spelling");
+        assert!(rg_db::is_unique_violation_anyhow(&refused), "{refused:#}");
     }
 
     /// The list is what the guard compares against, so a duplicate or an

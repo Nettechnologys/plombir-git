@@ -31,6 +31,7 @@ pub mod npm_dist_tag_ops;
 pub mod oauth_account_ops;
 pub mod oci_ops;
 pub mod org_ops;
+pub mod owner_name_ops;
 pub mod package_file_ops;
 pub mod package_ops;
 pub mod package_registry_ops;
