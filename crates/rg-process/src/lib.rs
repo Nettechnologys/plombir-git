@@ -12,6 +12,7 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 
 pub mod client_policy;
+pub mod docker_job;
 mod retired_environment;
 pub mod workspace_archive;
 

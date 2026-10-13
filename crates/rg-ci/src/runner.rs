@@ -68,13 +68,6 @@ where
     }
 }
 
-/// Hard cap on the number of processes a job container may spawn (fork-bomb guard).
-const DOCKER_PIDS_LIMIT: &str = "512";
-/// Default memory ceiling for a job container.
-const DOCKER_MEMORY_LIMIT: &str = "2g";
-/// Default CPU quota for a job container.
-const DOCKER_CPU_LIMIT: &str = "2";
-
 /// Default CI token scopes for jobs.
 /// Grants read access to the triggering repo and packages.
 const DEFAULT_CI_TOKEN_SCOPES: &str = "repo:read packages:read";
@@ -346,9 +339,7 @@ impl PipelineRunner {
     /// it expires, dropping `output()` must kill the Docker CLI; otherwise a
     /// wedged client survives even after the job has been recorded as failed.
     fn docker_command(&self) -> tokio::process::Command {
-        let mut command = tokio::process::Command::new(&self.docker_program);
-        command.kill_on_drop(true);
-        command
+        rg_process::docker_job::client(&self.docker_program)
     }
 
     fn job_container_name(&self, job_id: i64) -> String {
@@ -1322,9 +1313,6 @@ impl PipelineRunner {
         job_environment: &[(String, String)],
     ) -> Result<(i32, String)> {
         let workspace_path = self.workspace_path();
-        let repo_path_str = workspace_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("repo path is not valid UTF-8"))?;
 
         // Check if Docker is available
         let mut docker_check_command = self.docker_command();
@@ -1348,68 +1336,19 @@ impl PipelineRunner {
         // Generate a unique container name
         let container_name = self.job_container_name(job_id);
 
-        // Run: docker run --rm --name <name> <hardening flags> -v <repo_path>:/workspace -w /workspace <image> sh -c <script>
-        //
-        // SECURITY (CWE-269 privilege escalation): the container is confined so a
-        // malicious job cannot break out onto the host:
-        // - `--cap-drop=ALL` strips every Linux capability (no raw sockets, no mount…).
-        // - `--security-opt=no-new-privileges` blocks setuid/gain-privilege via execve.
-        // - `--pids-limit` / `--memory` / `--cpus` bound resource exhaustion (fork bomb, OOM).
-        // The Docker socket is deliberately NOT mounted and `--privileged` is never
-        // passed, so the job has no path to the daemon or host devices.
-        let mut args = vec![
-            "run".to_string(),
-            "--rm".to_string(),
-            "--name".to_string(),
-            container_name,
-            "--cap-drop".to_string(),
-            "ALL".to_string(),
-            "--security-opt".to_string(),
-            "no-new-privileges".to_string(),
-            "--pids-limit".to_string(),
-            DOCKER_PIDS_LIMIT.to_string(),
-            "--memory".to_string(),
-            DOCKER_MEMORY_LIMIT.to_string(),
-            "--cpus".to_string(),
-            DOCKER_CPU_LIMIT.to_string(),
-            "-v".to_string(),
-            format!("{}:/workspace", repo_path_str),
-            "-w".to_string(),
-            "/workspace".to_string(),
-        ];
-        // The workspace is created owner-only and container root holds no
-        // capability to override that; the job runs as the workspace's owner,
-        // which also keeps everything it builds removable by the cleanup
-        // (`rg_process::container_user`).
-        if let Some(user) = rg_process::container_user() {
-            args.push("--user".to_string());
-            args.push(user);
-        }
-        for (key, _) in job_environment {
-            if key == "HOME" {
-                continue;
-            }
-            args.push("-e".to_string());
-            // Pass only the variable name on the command line. The value is
-            // inherited from the Docker CLI environment so CI_JOB_TOKEN and
-            // future secrets are not exposed in the host process arguments.
-            args.push(key.clone());
-        }
-        args.extend([
-            "-e".to_string(),
-            "HOME=/tmp".to_string(),
-            image.to_string(),
-            "sh".to_string(),
-            "-c".to_string(),
-            script.to_string(),
-        ]);
+        // `docker run` for the job. The hardening, the mount and the environment
+        // rules are shared with the external runner, see `rg_process::docker_job`.
+        let args = rg_process::docker_job::run_args(&rg_process::docker_job::JobContainer {
+            name: &container_name,
+            image,
+            script,
+            workspace: &workspace_path,
+            user: rg_process::container_user(),
+            variables: job_environment,
+        })?;
         let mut command = self.docker_command();
         command.args(&args);
-        for (key, value) in job_environment {
-            if key != "HOME" {
-                command.env(key, value);
-            }
-        }
+        rg_process::docker_job::apply_environment(&mut command, job_environment);
         let output = rg_process::output_ci_job_in_process_tree(&mut command)
             .await
             .context("failed to spawn docker run")?;

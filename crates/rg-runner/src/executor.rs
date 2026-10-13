@@ -162,13 +162,6 @@ pub(crate) async fn run_job_local(
     }
 }
 
-/// Hard cap on the number of processes a job container may spawn (fork-bomb guard).
-const DOCKER_PIDS_LIMIT: &str = "512";
-/// Default memory ceiling for a job container.
-const DOCKER_MEMORY_LIMIT: &str = "2g";
-/// Default CPU quota for a job container.
-const DOCKER_CPU_LIMIT: &str = "2";
-
 /// Name of the Docker container a job runs in.
 ///
 /// Written down once because three places have to agree on it: this executor,
@@ -191,7 +184,7 @@ pub(crate) async fn run_job_docker(
     container_name: &str,
 ) -> (i32, String) {
     // Check if Docker daemon is running
-    let docker_ok = tokio::process::Command::new("docker")
+    let docker_ok = rg_process::docker_job::client("docker")
         .arg("info")
         .output()
         .await
@@ -204,21 +197,21 @@ pub(crate) async fn run_job_docker(
         return (-1, msg);
     }
 
-    let args = docker_run_args(image, script, variables, workspace, container_name);
+    let args = match rg_process::docker_job::run_args(&rg_process::docker_job::JobContainer {
+        name: container_name,
+        image,
+        script,
+        workspace,
+        user: rg_process::container_user(),
+        variables,
+    }) {
+        Ok(args) => args,
+        Err(error) => return (-1, error.to_string()),
+    };
 
-    let mut command = tokio::process::Command::new("docker");
+    let mut command = rg_process::docker_job::client("docker");
     command.args(&args);
-    // Only the variable name is passed on the command line above; the value is
-    // inherited from the Docker CLI environment so secrets are not exposed in the
-    // host process arguments.
-    for (key, value) in variables {
-        // The job's `HOME` is not the Docker CLI's: the client reads its own
-        // config and registry credentials from there.
-        if key != "HOME" {
-            command.env(key, value);
-        }
-    }
-    command.kill_on_drop(true);
+    rg_process::docker_job::apply_environment(&mut command, variables);
     match rg_process::output_ci_job_in_process_tree(&mut command).await {
         Ok(o) => {
             let code = o.output.status.code().unwrap_or(-1);
@@ -230,68 +223,6 @@ pub(crate) async fn run_job_docker(
         }
         Err(e) => (-1, format!("Failed to run docker: {}", e)),
     }
-}
-
-/// Build the `docker run` argument vector for a job container.
-///
-/// SECURITY (CWE-269 privilege escalation): the container is confined so a
-/// malicious job cannot break out onto the runner host. Aligned with the
-/// internal rg-ci `PipelineRunner`:
-/// - `--cap-drop=ALL` strips every Linux capability (no raw sockets, no mount…).
-/// - `--security-opt=no-new-privileges` blocks setuid/gain-privilege via execve.
-/// - `--pids-limit` / `--memory` / `--cpus` bound resource exhaustion (fork bomb, OOM).
-///
-/// The Docker socket is deliberately NOT mounted and `--privileged` is never
-/// passed, so the job has no path to the daemon or host devices. Only variable
-/// *names* are placed on the command line; values are inherited from the CLI
-/// environment so secrets never appear in the host process arguments.
-fn docker_run_args(
-    image: &str,
-    script: &str,
-    variables: &[(String, String)],
-    workspace: &std::path::Path,
-    container_name: &str,
-) -> Vec<String> {
-    let mut args = vec![
-        "run".to_string(),
-        "--rm".to_string(),
-        "--name".to_string(),
-        container_name.to_string(),
-        "--cap-drop".to_string(),
-        "ALL".to_string(),
-        "--security-opt".to_string(),
-        "no-new-privileges".to_string(),
-        "--pids-limit".to_string(),
-        DOCKER_PIDS_LIMIT.to_string(),
-        "--memory".to_string(),
-        DOCKER_MEMORY_LIMIT.to_string(),
-        "--cpus".to_string(),
-        DOCKER_CPU_LIMIT.to_string(),
-        "-v".to_string(),
-        format!("{}:/workspace", workspace.to_string_lossy()),
-        "-w".to_string(),
-        "/workspace".to_string(),
-    ];
-    if let Some(user) = rg_process::container_user() {
-        args.push("--user".to_string());
-        args.push(user);
-    }
-    for (key, _) in variables {
-        // `HOME` is this host's workspace path, which does not exist inside
-        // the container; the job gets a home every uid can write instead.
-        if key == "HOME" {
-            continue;
-        }
-        args.push("-e".to_string());
-        args.push(key.clone());
-    }
-    args.push("-e".to_string());
-    args.push("HOME=/tmp".to_string());
-    args.push(image.to_string());
-    args.push("sh".to_string());
-    args.push("-c".to_string());
-    args.push(script.to_string());
-    args
 }
 
 fn docker_unavailable_message(image: &str) -> String {
@@ -333,6 +264,25 @@ pub(crate) fn job_variables(value: Option<&serde_json::Value>) -> Vec<(String, S
 mod tests {
     use super::*;
 
+    /// The argv of one job container, built the way `run_job_docker` builds it.
+    fn job_args(
+        image: &str,
+        script: &str,
+        variables: &[(String, String)],
+        workspace: &std::path::Path,
+        name: &str,
+    ) -> Vec<String> {
+        rg_process::docker_job::run_args(&rg_process::docker_job::JobContainer {
+            name,
+            image,
+            script,
+            workspace,
+            user: rg_process::container_user(),
+            variables,
+        })
+        .expect("test workspace is UTF-8")
+    }
+
     #[test]
     fn same_job_id_gets_distinct_container_names_for_independent_runs() {
         let first = job_container_name(7);
@@ -342,7 +292,7 @@ mod tests {
         assert!(second.starts_with("plombir-git-runner-job-7-"));
 
         for name in [&first, &second] {
-            let args = docker_run_args("alpine:3.20", "true", &[], std::path::Path::new("."), name);
+            let args = job_args("alpine:3.20", "true", &[], std::path::Path::new("."), name);
             assert!(args.windows(2).any(|pair| pair == ["--name", name]));
         }
     }
@@ -356,9 +306,9 @@ mod tests {
     }
 
     #[test]
-    fn docker_run_args_apply_sandbox_hardening() {
+    fn job_container_applies_sandbox_hardening() {
         let variables = vec![("CI_JOB_TOKEN".to_string(), "secret".to_string())];
-        let args = docker_run_args(
+        let args = job_args(
             "alpine:3.20",
             "echo hi",
             &variables,
@@ -378,11 +328,17 @@ mod tests {
             "missing no-new-privileges: {args:?}"
         );
         assert!(
-            window("--pids-limit", DOCKER_PIDS_LIMIT),
+            window("--pids-limit", rg_process::docker_job::PIDS_LIMIT),
             "missing --pids-limit"
         );
-        assert!(window("--memory", DOCKER_MEMORY_LIMIT), "missing --memory");
-        assert!(window("--cpus", DOCKER_CPU_LIMIT), "missing --cpus");
+        assert!(
+            window("--memory", rg_process::docker_job::MEMORY_LIMIT),
+            "missing --memory"
+        );
+        assert!(
+            window("--cpus", rg_process::docker_job::CPU_LIMIT),
+            "missing --cpus"
+        );
 
         // Never grant a path to the host daemon / devices.
         assert!(
@@ -421,7 +377,7 @@ mod tests {
             ),
             ("CI".to_string(), "true".to_string()),
         ];
-        let args = docker_run_args(
+        let args = job_args(
             "node:20",
             "npm ci",
             &variables,
