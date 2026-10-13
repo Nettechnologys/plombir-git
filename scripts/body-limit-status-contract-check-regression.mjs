@@ -110,7 +110,8 @@ function expect(name, mutate, { red, mentions = [] }) {
       bodyLimit: join(http, 'body_limit.rs'),
       lfs: join(http, 'api', 'lfs.rs'),
       oci: join(http, 'oci.rs'),
-      packages: join(http, 'api', 'packages.rs'),
+      pypi: join(http, 'api', 'packages', 'pypi.rs'),
+      packagesMod: join(http, 'api', 'packages', 'mod.rs'),
       check: join(fixture, 'scripts', checkName),
     });
     const result = spawnSync(process.execPath, [join(fixture, 'scripts', checkName)], {
@@ -266,16 +267,16 @@ expect(
 // still classifying — the read site is what has to be asked.
 expect(
   'one multipart read losing the classifier is caught',
-  ({ packages }) =>
+  ({ pypi }) =>
     edit(
-      packages,
+      pypi,
       '        .map_err(|error| package_multipart_error(error, "invalid Twine multipart body"))?',
       '        .map_err(|error| AppError::bad_request(format!("invalid Twine body: {error}")))?',
     ),
   {
     red: true,
     mentions: [
-      site('crates/rg-http/src/api/packages.rs', 'decode_twine_upload', '.next_field('),
+      site('crates/rg-http/src/api/packages/pypi.rs', 'decode_twine_upload', '.next_field('),
       "this `Multipart::next_field` call's error is not handed to",
     ],
   },
@@ -306,9 +307,9 @@ expect(
 // must read as deleted (card_d67b6f433341).
 expect(
   'a classifier that exists only in a comment reads as absent',
-  ({ packages }) =>
+  ({ packagesMod }) =>
     edit(
-      packages,
+      packagesMod,
       `                if crate::body_limit::is_length_limit_error(&*inner) {
                     return Err(AppError::payload_too_large(
                         "package upload exceeds the configured request-body limit",
@@ -323,7 +324,7 @@ expect(
   {
     red: true,
     mentions: [
-      site('crates/rg-http/src/api/packages.rs', 'stage_package_upload', '.into_data_stream('),
+      site('crates/rg-http/src/api/packages/mod.rs', 'stage_package_upload', '.into_data_stream('),
       '`stage_package_upload` streams the request body',
     ],
   },

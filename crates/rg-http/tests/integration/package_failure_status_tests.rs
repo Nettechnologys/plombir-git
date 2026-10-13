@@ -850,7 +850,19 @@ async fn a_missing_package_blob_is_a_sanitized_404() {
 /// default or `continue` fail even when its route has no publish fixture here.
 #[test]
 fn every_package_read_failure_reaches_the_shared_classifier() {
-    let source = include_str!("../../src/api/packages.rs");
+    let source = [
+        include_str!("../../src/api/packages/mod.rs"),
+        include_str!("../../src/api/packages/cargo.rs"),
+        include_str!("../../src/api/packages/composer.rs"),
+        include_str!("../../src/api/packages/helm.rs"),
+        include_str!("../../src/api/packages/maven.rs"),
+        include_str!("../../src/api/packages/npm.rs"),
+        include_str!("../../src/api/packages/nuget.rs"),
+        include_str!("../../src/api/packages/oci.rs"),
+        include_str!("../../src/api/packages/pypi.rs"),
+        include_str!("../../src/api/packages/rubygems.rs"),
+    ]
+    .concat();
     for handler in [
         "get_package",
         "list_versions",
@@ -872,7 +884,7 @@ fn every_package_read_failure_reaches_the_shared_classifier() {
     ] {
         assert_eq!(
             source_scan::reaches_any(
-                source,
+                &source,
                 handler,
                 &["package_error_response", "package_file_error_response"]
             ),

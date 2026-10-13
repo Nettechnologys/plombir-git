@@ -563,10 +563,31 @@ fn routes() {
 // ── Reading a handler's signature ──────────────────────────────────────────
 
 /// `api::issues::update_issue` → (`api/issues.rs`, `update_issue`).
+///
+/// A module that outgrew one file lives as a directory (`api/packages/` with
+/// `mod.rs` and one file per protocol). Then the function is searched for in
+/// each file of that directory, rather than assumed to sit beside `mod.rs`.
 fn handler_location(handler: &str) -> (String, String) {
     let mut segments: Vec<&str> = handler.split("::").collect();
-    let name = segments.pop().expect("a handler path names a function");
-    (format!("{}.rs", segments.join("/")), name.to_string())
+    let name = segments
+        .pop()
+        .expect("a handler path names a function")
+        .to_string();
+    let module = segments.join("/");
+    let flat = format!("{module}.rs");
+    if src_root().join(&flat).is_file() {
+        return (flat, name);
+    }
+    let mut candidates: Vec<String> = fs::read_dir(src_root().join(&module))
+        .unwrap_or_else(|e| panic!("`{handler}` is neither {flat} nor a module directory: {e}"))
+        .map(|entry| relative(&entry.expect("read module entry").path()))
+        .filter(|rel| rel.ends_with(".rs"))
+        .collect();
+    candidates.sort();
+    let found = candidates
+        .into_iter()
+        .find(|rel| signature_params(&read(rel), &name).is_some());
+    (found.unwrap_or(flat), name)
 }
 
 /// The rung each anchored alias in the tree carries.
