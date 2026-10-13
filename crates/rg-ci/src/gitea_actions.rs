@@ -116,7 +116,7 @@ pub struct WorkflowTriggerSingle {
     /// the keys is what lets `validate_supported_triggers` refuse the workflow
     /// by the name its author actually wrote (card_c8f24edaee89).
     #[serde(flatten)]
-    pub other: HashMap<String, serde_yaml::Value>,
+    pub other: HashMap<String, serde_json::Value>,
 }
 
 /// The schema-bearing body shared by `workflow_dispatch` and `workflow_call`.
@@ -131,7 +131,7 @@ pub struct GiteaTriggerDeclaration {
     #[serde(default)]
     inputs: HashMap<String, GiteaInputDefinition>,
     #[serde(flatten)]
-    other: HashMap<String, serde_yaml::Value>,
+    other: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,7 +146,7 @@ pub struct GiteaInputDefinition {
     default: Option<GiteaInputValue>,
     options: Option<Vec<String>>,
     #[serde(flatten)]
-    other: HashMap<String, serde_yaml::Value>,
+    other: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,7 +174,7 @@ impl GiteaInputType {
     fn implicit_default(&self, options: Option<&[String]>) -> GiteaInputValue {
         match self {
             Self::Boolean => GiteaInputValue::Boolean(false),
-            Self::Number => GiteaInputValue::Number(serde_yaml::Number::from(0)),
+            Self::Number => GiteaInputValue::Number(serde_json::Number::from(0)),
             Self::Choice => GiteaInputValue::String(
                 options
                     .and_then(|values| values.first())
@@ -198,7 +198,7 @@ impl GiteaInputType {
                 .parse::<f64>()
                 .ok()
                 .filter(|value| value.is_finite())
-                .and_then(|_| serde_yaml::from_str::<serde_yaml::Number>(value).ok())
+                .and_then(|_| rg_core::yaml::from_str::<serde_json::Number>(value).ok())
                 .map(GiteaInputValue::Number),
             Self::Choice | Self::Environment | Self::String => {
                 Some(GiteaInputValue::String(value.to_owned()))
@@ -232,15 +232,15 @@ impl<'de> Deserialize<'de> for GiteaInputType {
 pub enum GiteaInputValue {
     String(String),
     Boolean(bool),
-    Number(serde_yaml::Number),
+    Number(serde_json::Number),
 }
 
 impl GiteaInputValue {
-    fn from_yaml(value: serde_yaml::Value) -> std::result::Result<Self, String> {
+    fn from_yaml(value: serde_json::Value) -> std::result::Result<Self, String> {
         match value {
-            serde_yaml::Value::String(value) => Ok(Self::String(value)),
-            serde_yaml::Value::Bool(value) => Ok(Self::Boolean(value)),
-            serde_yaml::Value::Number(value) => Ok(Self::Number(value)),
+            serde_json::Value::String(value) => Ok(Self::String(value)),
+            serde_json::Value::Bool(value) => Ok(Self::Boolean(value)),
+            serde_json::Value::Number(value) => Ok(Self::Number(value)),
             _ => Err("must be a string, number, or boolean".into()),
         }
     }
@@ -259,7 +259,7 @@ impl<'de> Deserialize<'de> for GiteaInputValue {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let value = serde_json::Value::deserialize(deserializer)?;
         Self::from_yaml(value).map_err(serde::de::Error::custom)
     }
 }
@@ -283,7 +283,7 @@ pub struct EventFilter {
     /// variant". Keeping the spelling lets `validate_supported_triggers` name
     /// the exact declaration the author must fix (card_444a8741da37).
     #[serde(flatten)]
-    pub other: HashMap<String, serde_yaml::Value>,
+    pub other: HashMap<String, serde_json::Value>,
 }
 
 const SUPPORTED_EVENT_FILTERS: &[&str] = &[
@@ -560,7 +560,7 @@ pub struct GiteaJob {
 
     /// Reusable-workflow secret declaration (`inherit` is accepted implicitly
     /// because repository secrets are already scoped to every job).
-    pub secrets: Option<serde_yaml::Value>,
+    pub secrets: Option<serde_json::Value>,
     /// Runner label (e.g., `ubuntu-latest`, `self-hosted`).
     #[serde(rename = "runs-on")]
     pub runs_on: Option<GiteaRunsOn>,
@@ -610,18 +610,18 @@ pub enum GiteaRunsOn {
 }
 
 impl GiteaRunsOn {
-    fn from_yaml(value: serde_yaml::Value) -> std::result::Result<Self, String> {
+    fn from_yaml(value: serde_json::Value) -> std::result::Result<Self, String> {
         match value {
-            serde_yaml::Value::String(label) => Ok(Self::Label(label)),
-            serde_yaml::Value::Sequence(labels) if labels.is_empty() => {
+            serde_json::Value::String(label) => Ok(Self::Label(label)),
+            serde_json::Value::Array(labels) if labels.is_empty() => {
                 Err("runs-on must be a string or a non-empty list of strings".into())
             }
-            serde_yaml::Value::Sequence(labels) => {
+            serde_json::Value::Array(labels) => {
                 let labels = labels
                     .into_iter()
                     .enumerate()
                     .map(|(index, label)| match label {
-                        serde_yaml::Value::String(label) => Ok(label),
+                        serde_json::Value::String(label) => Ok(label),
                         _ => Err(format!("runs-on[{index}] must be a string")),
                     })
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -644,7 +644,7 @@ impl<'de> Deserialize<'de> for GiteaRunsOn {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let value = serde_json::Value::deserialize(deserializer)?;
         Self::from_yaml(value).map_err(serde::de::Error::custom)
     }
 }
@@ -693,15 +693,15 @@ pub struct GiteaStrategy {
 pub enum GiteaMatrixValue {
     String(String),
     Bool(bool),
-    Number(serde_yaml::Number),
+    Number(serde_json::Number),
 }
 
 impl GiteaMatrixValue {
-    fn from_yaml(value: serde_yaml::Value) -> std::result::Result<Self, String> {
+    fn from_yaml(value: serde_json::Value) -> std::result::Result<Self, String> {
         match value {
-            serde_yaml::Value::String(value) => Ok(Self::String(value)),
-            serde_yaml::Value::Bool(value) => Ok(Self::Bool(value)),
-            serde_yaml::Value::Number(value) => Ok(Self::Number(value)),
+            serde_json::Value::String(value) => Ok(Self::String(value)),
+            serde_json::Value::Bool(value) => Ok(Self::Bool(value)),
+            serde_json::Value::Number(value) => Ok(Self::Number(value)),
             _ => Err("must be a string, number, or boolean".into()),
         }
     }
@@ -720,7 +720,7 @@ impl<'de> Deserialize<'de> for GiteaMatrixValue {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let value = serde_json::Value::deserialize(deserializer)?;
         Self::from_yaml(value).map_err(serde::de::Error::custom)
     }
 }
@@ -764,9 +764,9 @@ pub struct GiteaStep {
     /// semantics fail loudly in `validate_supported_actions`.
     pub id: Option<String>,
     #[serde(rename = "continue-on-error")]
-    pub continue_on_error: Option<serde_yaml::Value>,
+    pub continue_on_error: Option<serde_json::Value>,
     #[serde(rename = "timeout-minutes")]
-    pub timeout_minutes: Option<serde_yaml::Value>,
+    pub timeout_minutes: Option<serde_json::Value>,
 
     /// Step-level environment variables.
     #[serde(default)]
@@ -1167,32 +1167,25 @@ impl WorkflowContext {
 /// Deserializing the final untagged type alone is fail-closed, but serde then
 /// reports only that no enum variant matched. That loses the job and author key
 /// which a committed workflow must name in its client-facing refusal.
-fn validate_job_environments(raw: &serde_yaml::Value) -> Result<()> {
+fn validate_job_environments(raw: &serde_json::Value) -> Result<()> {
     let Some(jobs) = raw
-        .as_mapping()
-        .and_then(|root| root.get(serde_yaml::Value::String("jobs".into())))
-        .and_then(serde_yaml::Value::as_mapping)
+        .as_object()
+        .and_then(|root| root.get("jobs"))
+        .and_then(serde_json::Value::as_object)
     else {
         return Ok(());
     };
 
     for (job_name, job) in jobs {
-        let Some(job_name) = job_name.as_str() else {
-            continue;
-        };
-        let Some(environment) = job
-            .as_mapping()
-            .and_then(|job| job.get(serde_yaml::Value::String("environment".into())))
-        else {
+        let Some(environment) = job.as_object().and_then(|job| job.get("environment")) else {
             continue;
         };
 
         match environment {
-            serde_yaml::Value::String(_) => {}
-            serde_yaml::Value::Mapping(mapping) => {
+            serde_json::Value::String(_) => {}
+            serde_json::Value::Object(mapping) => {
                 let mut unsupported = mapping
                     .keys()
-                    .filter_map(serde_yaml::Value::as_str)
                     .filter(|key| *key != "name")
                     .map(|key| format!("environment.{key}"))
                     .collect::<Vec<_>>();
@@ -1203,12 +1196,7 @@ fn validate_job_environments(raw: &serde_yaml::Value) -> Result<()> {
                         unsupported.join(", ")
                     );
                 }
-                if mapping.keys().any(|key| key.as_str().is_none()) {
-                    anyhow::bail!(
-                        "job '{job_name}' environment has a non-string key. Supported field: environment.name"
-                    );
-                }
-                let Some(name) = mapping.get(serde_yaml::Value::String("name".into())) else {
+                let Some(name) = mapping.get("name") else {
                     anyhow::bail!(
                         "job '{job_name}' is missing required environment.name. Supported field: environment.name"
                     );
@@ -1230,36 +1218,30 @@ fn validate_job_environments(raw: &serde_yaml::Value) -> Result<()> {
 
 /// Validate `jobs.<name>.strategy.matrix.<dimension>[index]` while the job and
 /// author-written path are still available for the client-facing refusal.
-fn validate_job_matrix_values(raw: &serde_yaml::Value) -> Result<()> {
+fn validate_job_matrix_values(raw: &serde_json::Value) -> Result<()> {
     let Some(jobs) = raw
-        .as_mapping()
-        .and_then(|root| root.get(serde_yaml::Value::String("jobs".into())))
-        .and_then(serde_yaml::Value::as_mapping)
+        .as_object()
+        .and_then(|root| root.get("jobs"))
+        .and_then(serde_json::Value::as_object)
     else {
         return Ok(());
     };
 
     for (job_name, job) in jobs {
-        let Some(job_name) = job_name.as_str() else {
-            continue;
-        };
         let Some(matrix) = job
-            .as_mapping()
-            .and_then(|job| job.get(serde_yaml::Value::String("strategy".into())))
-            .and_then(serde_yaml::Value::as_mapping)
-            .and_then(|strategy| strategy.get(serde_yaml::Value::String("matrix".into())))
+            .as_object()
+            .and_then(|job| job.get("strategy"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|strategy| strategy.get("matrix"))
         else {
             continue;
         };
-        let Some(matrix) = matrix.as_mapping() else {
+        let Some(matrix) = matrix.as_object() else {
             anyhow::bail!("job '{job_name}' strategy.matrix must be a mapping");
         };
 
         for (dimension, values) in matrix {
-            let Some(dimension) = dimension.as_str() else {
-                anyhow::bail!("job '{job_name}' strategy.matrix has a non-string dimension");
-            };
-            let Some(values) = values.as_sequence() else {
+            let Some(values) = values.as_array() else {
                 anyhow::bail!(
                     "job '{job_name}' strategy.matrix.{dimension} must be a list of strings, numbers, or booleans"
                 );
@@ -1279,23 +1261,17 @@ fn validate_job_matrix_values(raw: &serde_yaml::Value) -> Result<()> {
 
 /// Validate `jobs.<name>.runs-on` while both the job name and the author's key
 /// are still available for the client-facing refusal.
-fn validate_job_runs_on(raw: &serde_yaml::Value) -> Result<()> {
+fn validate_job_runs_on(raw: &serde_json::Value) -> Result<()> {
     let Some(jobs) = raw
-        .as_mapping()
-        .and_then(|root| root.get(serde_yaml::Value::String("jobs".into())))
-        .and_then(serde_yaml::Value::as_mapping)
+        .as_object()
+        .and_then(|root| root.get("jobs"))
+        .and_then(serde_json::Value::as_object)
     else {
         return Ok(());
     };
 
     for (job_name, job) in jobs {
-        let Some(job_name) = job_name.as_str() else {
-            continue;
-        };
-        let Some(runs_on) = job
-            .as_mapping()
-            .and_then(|job| job.get(serde_yaml::Value::String("runs-on".into())))
-        else {
+        let Some(runs_on) = job.as_object().and_then(|job| job.get("runs-on")) else {
             continue;
         };
 
@@ -1309,11 +1285,11 @@ fn validate_job_runs_on(raw: &serde_yaml::Value) -> Result<()> {
 impl GiteaWorkflow {
     /// Parse a Gitea Actions workflow YAML string.
     pub fn parse(yaml: &str) -> Result<Self> {
-        let raw: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+        let raw: serde_json::Value = rg_core::yaml::from_str(yaml)?;
         validate_job_runs_on(&raw)?;
         validate_job_environments(&raw)?;
         validate_job_matrix_values(&raw)?;
-        let wf: GiteaWorkflow = serde_yaml::from_str(yaml)?;
+        let wf: GiteaWorkflow = rg_core::yaml::from_str(yaml)?;
         Ok(wf)
     }
 
@@ -2764,11 +2740,11 @@ fn deserialize_present_trigger<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let value = serde_yaml::Value::deserialize(deserializer)?;
+    let value = serde_json::Value::deserialize(deserializer)?;
     if value.is_null() {
         return Ok(Some(GiteaTriggerDeclaration::default()));
     }
-    serde_yaml::from_value(value)
+    serde_json::from_value(value)
         .map(Some)
         .map_err(serde::de::Error::custom)
 }
@@ -3535,6 +3511,33 @@ fn substitute_expr(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// What a committed workflow's scalars mean must not move with the parser:
+    /// `on:` is the trigger key (not `true`), a leading-zero mode is the text
+    /// the author wrote (`chmod 0755`, not `chmod 755.0`), and a matrix keeps
+    /// the scalar type the expression engine compares by.
+    #[test]
+    fn workflow_scalars_keep_the_meaning_their_author_wrote() {
+        let wf = GiteaWorkflow::parse(
+            "on: push\nenv:\n  MODE: 0755\n  FLAG: yes\njobs:\n  build:\n    runs-on: ubuntu-latest\n    \
+             strategy:\n      matrix:\n        mode: [0755, 1, 1.10, true, on]\n    steps:\n      - run: chmod ${{ matrix.mode }} f\n",
+        )
+        .unwrap();
+        assert!(
+            matches!(&wf.on, WorkflowTriggers::Simple(event) if event == "push"),
+            "`on: push` must declare the push trigger: {:?}",
+            wf.on
+        );
+        assert_eq!(wf.env["MODE"], "0755");
+        assert_eq!(wf.env["FLAG"], "yes");
+        let matrix = &wf.jobs["build"].strategy.as_ref().unwrap().matrix["mode"];
+        let rendered: Vec<String> = matrix.iter().map(GiteaMatrixValue::as_string).collect();
+        assert_eq!(rendered, ["0755", "1", "1.1", "true", "on"]);
+        assert!(matches!(matrix[0], GiteaMatrixValue::String(_)));
+        assert!(matches!(matrix[1], GiteaMatrixValue::Number(_)));
+        assert!(matches!(matrix[3], GiteaMatrixValue::Bool(true)));
+        assert!(matches!(matrix[4], GiteaMatrixValue::String(_)));
+    }
 
     #[allow(dead_code)]
     mod rust_source {
@@ -6149,7 +6152,7 @@ mod tail_tests {
                 "name: W\non:\n  {event}:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
             );
             let workflow: GiteaWorkflow =
-                serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("parse {event}: {e}"));
+                rg_core::yaml::from_str(&yaml).unwrap_or_else(|e| panic!("parse {event}: {e}"));
             workflow
                 .validate_supported_triggers()
                 .unwrap_or_else(|e| panic!("`on: {event}:` refused by validation: {e:#}"));
