@@ -164,6 +164,9 @@ pub async fn create_column(
     name: String,
     color: Option<String>,
 ) -> Result<Column> {
+    let color = color
+        .map(|value| crate::validate_hex_color(&value))
+        .transpose()?;
     let db = db.write();
     let now = Utc::now();
     let model = ColumnAM {
@@ -204,6 +207,9 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    let color = color
+        .map(|value| crate::validate_hex_color(&value))
+        .transpose()?;
     rg_db::ops::board_ops::find_column_by_id(db.read(), id)
         .await?
         .ok_or_else(|| crate::error::not_found("board column"))?;

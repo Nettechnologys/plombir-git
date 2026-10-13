@@ -38,6 +38,18 @@ if (
   failures.push('Delete confirmation copy must display the exact owner/repo path the backend route deletes, as text.');
 }
 
+// Keep the whole settings page on Svelte's escaped text path. The assertion
+// above only guards the present spelling of the delete instruction.
+if (/\{@html\b/.test(settings)) {
+  failures.push('Repository settings must not render translated or repository text through {@html}.');
+}
+
+for (const [locale, catalog] of [['en', en], ['zh-CN', zh]]) {
+  if (catalog.settings.delete.confirm_instruction.includes('<')) {
+    failures.push(`${locale} delete confirmation must contain text, not HTML markup.`);
+  }
+}
+
 if (en.settings.delete.confirm_placeholder !== 'Type owner/repository') {
   failures.push('English delete confirmation placeholder must ask for owner/repository.');
 }

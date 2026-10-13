@@ -55,11 +55,11 @@ pub async fn create_label(
     if name.trim().is_empty() {
         return Err(crate::error::invalid_request("label name cannot be empty"));
     }
-    if !color.starts_with('#') || color.len() != 7 {
-        return Err(crate::error::invalid_request(
-            "color must be a hex string like #ff0000",
-        ));
-    }
+    // `#` plus seven characters was not the rule: `#0;x:1;` passed it and the
+    // web client writes the stored colour into a `style` attribute under a CSP
+    // that allows inline styles. The shared validator closes the declaration
+    // and normalises the case — see [`crate::validate_hex_color`].
+    let color = crate::validate_hex_color(&color)?;
 
     let now = Utc::now();
     let model = LabelActiveModel {
@@ -173,13 +173,10 @@ where
         }
         renamed_to = Some(n.clone());
     }
-    if let Some(c) = color.as_ref() {
-        if !c.starts_with('#') || c.len() != 7 {
-            return Err(crate::error::invalid_request(
-                "invalid color: must be a hex string like #ff0000",
-            ));
-        }
-    }
+    // One rule for create and update alike; see [`crate::validate_hex_color`].
+    let color = color
+        .map(|value| crate::validate_hex_color(&value))
+        .transpose()?;
 
     after_read().await?;
 

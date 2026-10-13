@@ -5,6 +5,7 @@
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
   import Modal from '$lib/components/Modal.svelte';
+  import { safeHexColor } from '$lib/utils/color';
 
   interface Label {
     id: number;
@@ -300,7 +301,7 @@
           <div class="custom-color">
             <span class="color-section-label">{t('settings.custom_color')}</span>
             <div class="custom-color-input">
-              <div class="color-preview" style="background-color: {formData.color}"></div>
+              <div class="color-preview" style="background-color: {safeHexColor(formData.color, '#888888')}"></div>
               <input 
                 id="label-color-input"
                 type="text" 
@@ -368,7 +369,7 @@
       {#each labelList as label (label.id)}
         <div class="label-card">
           <div class="label-info">
-            <div class="label-color" style="background-color: {label.color}"></div>
+            <div class="label-color" style="background-color: {safeHexColor(label.color, '#888888')}"></div>
             <div class="label-text">
               <span class="label-name">{label.name}</span>
               {#if label.description}
