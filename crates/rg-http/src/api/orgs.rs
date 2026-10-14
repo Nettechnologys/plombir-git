@@ -318,15 +318,12 @@ pub async fn update_org(
 )]
 pub async fn delete_org(
     State(state): State<AppState>,
-    // `OrgAdmin` is the level the route declares, and taking it here is what
-    // makes that declaration enforced rather than merely written down. It is a
-    // *floor*, not the whole rule: deleting an organization is owner-only, and
-    // `rg_core::org::delete_org` still enforces exactly that below — an admin
-    // who is not the owner passes this gate and is refused there, as before.
-    // The gate is not redundant for it, though. Without it the level was carried
-    // by `require_user` plus whatever the service happened to check, so lowering
-    // the service's rule to admin would have widened the route silently.
-    OrgAdmin { org, actor_id }: OrgAdmin,
+    // Deleting an organization is owner-only, and the owners are the members
+    // holding the `owner` role — decided here, by the gate, because the core
+    // service may not read membership. It used to be decided there instead,
+    // against `organizations.owner_id`: a creator removed from the
+    // organization could still delete it, and an owner-role member could not.
+    OrgOwner { org, actor_id }: OrgOwner,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // The organization is the *resource*, never the actor. This file used to
@@ -364,10 +361,9 @@ pub async fn delete_org(
             .await;
             Json(serde_json::json!({"deleted": true})).into_response()
         }
-        // Only the owner-mismatch branch is a refusal; it carries
-        // `rg_core::error::Forbidden` and still answers 403. A failed lookup
-        // or a dead pool underneath is ours, and must not be reported as "you
-        // are not allowed to delete this organization".
+        // The refusal was the gate's. A failed lookup or a dead pool
+        // underneath is ours, and must not be reported as "you are not allowed
+        // to delete this organization".
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -987,19 +983,33 @@ async fn resolve_org(
     }
 }
 
-/// Whether `user_id` may administer `org`: its owner, or a member holding the
-/// `owner` / `admin` role.
+/// The role `user_id` holds in `org`, if they are a member at all.
+///
+/// Membership is the only source of an organization right. `organizations.
+/// owner_id` names the account that created the organization (or whoever it
+/// was handed to), and it used to answer "yes" here on its own — so a creator
+/// removed from the organization kept administering it (security audit
+/// PR #11). The column stays as bookkeeping and is never read as a grant.
+async fn member_role(
+    db: &sea_orm::DatabaseConnection,
+    org: &rg_db::entities::organization::Model,
+    user_id: i64,
+) -> anyhow::Result<Option<String>> {
+    Ok(rg_core::org::find_org_member(db, org.id, user_id)
+        .await?
+        .map(|member| member.role))
+}
+
+/// Whether `user_id` may administer `org`: a member holding the `owner` or
+/// `admin` role.
 async fn is_org_admin(
     db: &sea_orm::DatabaseConnection,
     org: &rg_db::entities::organization::Model,
     user_id: i64,
 ) -> anyhow::Result<bool> {
-    if org.owner_id == user_id {
-        return Ok(true);
-    }
-    Ok(rg_core::org::find_org_member(db, org.id, user_id)
+    Ok(member_role(db, org, user_id)
         .await?
-        .is_some_and(|m| m.role == "owner" || m.role == "admin"))
+        .is_some_and(|role| role == "owner" || role == "admin"))
 }
 
 /// Authorization gate for every org mutation — membership changes and the whole
@@ -1050,9 +1060,6 @@ async fn require_org_visible(
     let Some(user_id) = user_id else {
         return Err(AppError::not_found("organization not found"));
     };
-    if org.owner_id == user_id {
-        return Ok(());
-    }
     match rg_core::org::is_org_member(db, org.id, user_id).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(AppError::not_found("organization not found")),
@@ -1154,6 +1161,35 @@ impl axum::extract::FromRequestParts<AppState> for OrgAdmin {
         require_org_visible(&state.db, &org, Some(actor_id)).await?;
         require_org_admin(&state.db, &org, actor_id).await?;
         Ok(Self { org, actor_id })
+    }
+}
+
+/// An authenticated member of the organization named by `{name}` holding the
+/// `owner` role — the level that may dispose of the organization itself.
+///
+/// [`OrgAdmin`] first, with every answer it gives, then the role: an admin is
+/// a member who already sees the organization, so refusing them with `403`
+/// leaks nothing. `admin` deliberately does not reach this level — admins run
+/// the organization, owners may destroy it — the line `RepoAdmin` /
+/// `RepoOwner` draws for a repository.
+pub struct OrgOwner {
+    pub org: rg_db::entities::organization::Model,
+    pub actor_id: i64,
+}
+
+impl axum::extract::FromRequestParts<AppState> for OrgOwner {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let OrgAdmin { org, actor_id } = OrgAdmin::from_request_parts(parts, state).await?;
+        match member_role(&state.db, &org, actor_id).await {
+            Ok(Some(role)) if role == "owner" => Ok(Self { org, actor_id }),
+            Ok(_) => Err(AppError::forbidden("only organization owners can do this")),
+            Err(error) => Err(AppError::from(error)),
+        }
     }
 }
 

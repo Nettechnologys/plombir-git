@@ -132,6 +132,11 @@ const TAKEN: &[(&str, Rank)] = &[
 /// repository is anonymously readable — and are deliberately absent, as is
 /// `OrgRead` from the `User` row for the same reason.
 ///
+/// `OrgOwner` runs `OrgAdmin` in full before it asks for the `owner` role, so
+/// it proves everything `OrgAdmin` does; `DELETE /orgs/{name}` declares the
+/// `OrgAdmin` floor and takes `OrgOwner`, the way a repository row declares a
+/// floor its handler may exceed.
+///
 /// `NamespaceCreate<_>` / `NamespaceWrite<_>` are on the `User` row because each
 /// resolves an `actor_id` before it answers: `POST /repos` and `POST /imports`
 /// declare `User` and are gated by one of them rather than by a prologue. They
@@ -150,6 +155,7 @@ const NON_REPO: &[(&str, &[&str])] = &[
             "SudoUser",
             "LoginSession",
             "OrgAdmin",
+            "OrgOwner",
             "InstanceAdmin",
             "RepoAuthRead",
             "RepoWrite",
@@ -159,8 +165,8 @@ const NON_REPO: &[(&str, &[&str])] = &[
             "NamespaceWrite",
         ],
     ),
-    ("OrgRead", &["OrgRead", "OrgAdmin"]),
-    ("OrgAdmin", &["OrgAdmin"]),
+    ("OrgRead", &["OrgRead", "OrgAdmin", "OrgOwner"]),
+    ("OrgAdmin", &["OrgAdmin", "OrgOwner"]),
     ("InstanceAdmin", &["InstanceAdmin"]),
 ];
 

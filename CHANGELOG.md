@@ -90,6 +90,19 @@ This project records user-facing changes here. The format follows
   so only after the directory accepted the password.
 - `GET /v2/auth/token`, where `docker login` presents a password, carries the
   same credential rate limiter as the web login.
+- Organization rights come from membership roles only. The account an
+  organization or its repositories name as `owner_id` (the creator) kept
+  reading, writing, deleting and transferring the organization's private
+  repositories, seeing them in listings and search, and deleting the
+  organization after it was removed from it; an `owner`-role member could
+  not delete or transfer a repository the row did not name. Deleting or
+  transferring an organization repository, and deleting the organization,
+  now take the `owner` role (`admin` administers without disposing), and
+  push and CI notifications go to a repository's owner only for a personal
+  repository. On upgrade, every organization without an `owner`-role member
+  gives that role to the account in its `owner_id` — the right that column
+  carried until now — and records it in the audit log
+  (`org.owner_role_backfill`).
 
 ## [0.1.1] - 2026-10-11
 

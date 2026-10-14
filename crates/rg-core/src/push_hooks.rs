@@ -439,7 +439,14 @@ struct RefUpdateCascade {
 /// fan-out pointed at the repository whose branch actually moved.
 struct HookTarget {
     repo_id: i64,
-    owner_id: i64,
+    /// The account that owns the repository personally, and is told about its
+    /// pushes and pipelines for that reason. `None` for an organization
+    /// repository: its `owner_id` names the organization's owner at creation,
+    /// who may have been removed from it since, and the push and CI events
+    /// carry the repository's name, ref and commit (security audit PR #11).
+    /// Members hear about an organization repository through watching it,
+    /// which asks who may read it.
+    personal_owner_id: Option<i64>,
     /// Namespace — user or organization name.
     owner: String,
     name: String,
@@ -448,6 +455,11 @@ struct HookTarget {
     /// The branch this repository's derived snapshots are taken from — the
     /// code-search index refresh below only fires for a move of this ref.
     default_branch: String,
+}
+
+/// [`HookTarget::personal_owner_id`] for `repo`.
+fn personal_owner(repo: &rg_db::entities::repository::Model) -> Option<i64> {
+    repo.org_id.is_none().then_some(repo.owner_id)
 }
 
 impl RefUpdateCascade {
@@ -513,7 +525,7 @@ async fn resolve_hook_target(
     match crate::repo::service::find_repo_by_owner_name(db, owner, name).await {
         Ok(Some(repo)) => Some(HookTarget {
             repo_id: repo.id,
-            owner_id: repo.owner_id,
+            personal_owner_id: personal_owner(&repo),
             owner: owner.to_string(),
             name: name.to_string(),
             path: repo_root.join(format!("{owner}/{name}.git")),
@@ -588,7 +600,7 @@ async fn run_ref_move_hooks(
     {
         Ok(Some(repo)) => HookTarget {
             repo_id: repo.id,
-            owner_id: repo.owner_id,
+            personal_owner_id: personal_owner(&repo),
             owner: params.owner.to_string(),
             name: params.repo_name.to_string(),
             path: params.repo_path.to_path_buf(),
@@ -710,7 +722,7 @@ async fn run_ref_move_hooks(
 
         // 4. Watch fan-out.
         //
-        // The real-time notification above goes to `repo_owner_id` alone, so
+        // The real-time notification above goes to the personal owner alone, so
         // until card_dc66742badc5 a "Watch" subscription produced nothing for a
         // push: `notify_watchers_push` existed with no caller anywhere in the
         // tree. This is that caller. Read access is re-checked per recipient
@@ -1233,9 +1245,12 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
 
     tracing::info!(pipeline_id, "CI pipeline triggered");
 
+    let Some(owner_id) = target.personal_owner_id else {
+        return;
+    };
     // Push real-time notification to repo owner
     params.notify(
-        target.owner_id,
+        owner_id,
         "ci_triggered",
         serde_json::json!({
             "pipeline_id": pipeline_id,
@@ -1249,7 +1264,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
     if let Some(smtp) = params.smtp_config {
         if let Some(owner_user) = crate::notification::best_effort_user_by_id(
             params.db,
-            target.owner_id,
+            owner_id,
             target.repo_id,
             "ci_triggered",
             "recipient",
@@ -1562,15 +1577,17 @@ async fn trigger_push_webhooks(
     }
 
     // Push real-time notification for push event
-    params.notify(
-        target.owner_id,
-        "push",
-        serde_json::json!({
-            "repo": format!("{}/{}", target.owner, target.name),
-            "ref": update.refname,
-            "commit": update.new_sha,
-        }),
-    );
+    if let Some(owner_id) = target.personal_owner_id {
+        params.notify(
+            owner_id,
+            "push",
+            serde_json::json!({
+                "repo": format!("{}/{}", target.owner, target.name),
+                "ref": update.refname,
+                "commit": update.new_sha,
+            }),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1604,7 +1621,7 @@ mod tests {
     fn target(repo_id: i64) -> Arc<HookTarget> {
         Arc::new(HookTarget {
             repo_id,
-            owner_id: 1,
+            personal_owner_id: Some(1),
             owner: "owner".to_string(),
             name: format!("repo-{repo_id}"),
             path: PathBuf::from(format!("/repos/owner/repo-{repo_id}.git")),
@@ -1794,7 +1811,7 @@ mod tests {
         let repo_path = repo_root.join(format!("{}/{repo_name}.git", owner.username));
         let target = Arc::new(HookTarget {
             repo_id: repo.id,
-            owner_id: owner.id,
+            personal_owner_id: Some(owner.id),
             owner: owner.username,
             name: repo_name,
             path: repo_path,
@@ -1894,6 +1911,94 @@ mod tests {
         (pipeline.status, stage.status, job.status)
     }
 
+    /// Security audit PR #11: the push event carries the repository's name,
+    /// ref and commit, and went to `owner_id` — on an organization repository
+    /// the organization's owner at creation, who may have been removed from
+    /// it since. Only a personal repository's owner is told now.
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_personal_repository_owner_hears_about_its_pushes() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<(i64, String)>>);
+        impl PushNotifier for Recording {
+            fn notify(&self, user_id: i64, event_type: &str, _data: serde_json::Value) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((user_id, event_type.to_string()));
+            }
+        }
+
+        let (db, _sandbox, personal) = deletion_target("notify-owner").await;
+        let repo = rg_db::ops::repo_ops::find_by_id(&db, personal.repo_id)
+            .await
+            .unwrap()
+            .expect("repository");
+        assert_eq!(personal_owner(&repo), Some(repo.owner_id));
+        let in_org = rg_db::entities::repository::Model {
+            org_id: Some(1),
+            ..repo
+        };
+        assert_eq!(
+            personal_owner(&in_org),
+            None,
+            "an organization repository has no personal owner to tell"
+        );
+
+        for (target, expected) in [
+            (
+                personal.clone(),
+                vec![(personal.personal_owner_id.unwrap(), "push".to_string())],
+            ),
+            (
+                Arc::new(HookTarget {
+                    repo_id: personal.repo_id,
+                    personal_owner_id: None,
+                    owner: personal.owner.clone(),
+                    name: personal.name.clone(),
+                    path: personal.path.clone(),
+                    default_branch: personal.default_branch.clone(),
+                }),
+                Vec::new(),
+            ),
+        ] {
+            let recording = Recording::default();
+            let ci = RecordingPrCi::new();
+            let smtp = None;
+            let tracker = crate::task_tracker::TaskTracker::new();
+            let repo_root = target.path.parent().and_then(Path::parent).unwrap();
+            let params = PostPushParams {
+                db: &db,
+                repo_path: &target.path,
+                repo_root,
+                owner: &target.owner,
+                repo_name: &target.name,
+                pusher_id: None,
+                docker_enabled: false,
+                external_runners: false,
+                allow_host_runner: false,
+                jwt_secret: None,
+                encryption_key: None,
+                notifier: Some(&recording),
+                smtp_config: &smtp,
+                ci_engine: &ci,
+                external_url: None,
+                delivery_tracker: &tracker,
+                write_pool: None,
+                storage_limits: Default::default(),
+            };
+            trigger_push_webhooks(
+                &params,
+                &target,
+                &moved(
+                    "refs/heads/main",
+                    "0123456789012345678901234567890123456789",
+                ),
+            )
+            .await;
+            assert_eq!(*recording.0.lock().unwrap(), expected);
+        }
+    }
+
     /// The push is already committed when CI reads the repository-owned file.
     /// A typed refusal therefore becomes a failed run the committer can inspect
     /// instead of being reduced to the server warning this path used to emit.
@@ -1914,7 +2019,7 @@ mod tests {
             repo_root,
             owner: &target.owner,
             repo_name: &target.name,
-            pusher_id: Some(target.owner_id),
+            pusher_id: target.personal_owner_id,
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,
@@ -2353,7 +2458,7 @@ mod tests {
         };
         let target = HookTarget {
             repo_id: repo.id,
-            owner_id: owner.id,
+            personal_owner_id: Some(owner.id),
             owner: "headsync".to_string(),
             name: "head-sync".to_string(),
             path: repo_path.clone(),

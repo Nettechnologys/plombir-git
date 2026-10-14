@@ -90,7 +90,9 @@ pub async fn update_org(
 /// different variants instead of being distinguished by which number was typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrgDeleteActor {
-    /// A regular user. Allowed only when they own the organization.
+    /// A member the route's `OrgOwner` gate admitted: one holding the `owner`
+    /// role. The gate is the authorization — this module may not read
+    /// membership, and `organizations.owner_id` is not a grant.
     Owner(i64),
     /// An instance administrator. The route-level `InstanceAdmin` gate *is* the
     /// authorization here; owning the organization is deliberately not required,
@@ -118,18 +120,15 @@ pub async fn delete_org(
         .await?
         .ok_or_else(|| crate::error::not_found("organization"))?;
 
+    // Both variants are decided by a route gate before this runs: `OrgOwner`
+    // or `InstanceAdmin`. The actor is still taken so the two stay spelled as
+    // different rules at every call site.
     match actor {
-        OrgDeleteActor::Owner(user_id) if org.owner_id != user_id => {
-            return Err(crate::error::forbidden(
-                "only the organization owner can delete it",
-            ));
-        }
         OrgDeleteActor::Owner(_) | OrgDeleteActor::InstanceAdmin => {}
     }
 
-    // Close the namespace before inventorying it. The ownership check above
-    // read the org in a statement of its own, so two concurrent deletes both
-    // pass it; this claim is the one statement only one of them can win, and
+    // Close the namespace before inventorying it. Two concurrent deletes both
+    // passed their gate; this claim is the one statement only one of them can win, and
     // the loser gets the same 404 as a request for an organization that was
     // never there rather than a second retirement of the same storage.
     //

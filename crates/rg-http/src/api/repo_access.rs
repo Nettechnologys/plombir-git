@@ -407,9 +407,14 @@ pub(crate) async fn administers(
 /// bodies — a rule stated in prose next to the route and re-derived in code
 /// inside it, which is exactly the split this module exists to close.
 ///
-/// Ownership is compared against `repo.owner_id` directly rather than through
+/// Ownership is its own predicate, `can_own_repo`, rather than
 /// `can_admin_repo`: an organization admin administers the repository, and a
-/// collaborator may write to it, but neither of them owns it.
+/// collaborator may write to it, but neither of them owns it. On a personal
+/// repository the owner is `owner_id`; on an organization repository it is a
+/// member holding the `owner` role, never `owner_id` — which names the
+/// organization's owner at creation and kept a creator removed from the
+/// organization able to delete and transfer its repositories (security audit
+/// PR #11).
 pub(crate) async fn require_owner(
     state: &AppState,
     headers: &HeaderMap,
@@ -420,10 +425,11 @@ pub(crate) async fn require_owner(
         .ok_or_else(|| AppError::unauthorized("authentication required"))?;
     let repo = resolve_repo(state, owner, name).await?;
 
-    if repo.owner_id != actor_id {
-        return Err(AppError::forbidden("repository owner access required"));
+    match rg_core::repo::service::can_own_repo(&state.db, &repo, Some(actor_id)).await {
+        Ok(true) => Ok((repo, actor_id)),
+        Ok(false) => Err(AppError::forbidden("repository owner access required")),
+        Err(error) => Err(AppError::from(error)),
     }
-    Ok((repo, actor_id))
 }
 
 // ---------------------------------------------------------------------------
