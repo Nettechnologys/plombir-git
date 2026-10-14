@@ -419,6 +419,9 @@ jobs:
       - name: Prove PostgreSQL code FTS create/retry boundary
         run: cargo test -p rg-db -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
 
+      - name: Prove PostgreSQL CI secret scoping converges and reverses
+        run: cargo test -p rg-db -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
+
       - name: Prove PostgreSQL code index refresh boundary
         run: cargo test -p rg-core -j 6 server_code_index_refresh_is_failure_atomic_and_serialized -- --ignored --nocapture
 
@@ -511,6 +514,9 @@ jobs:
 
       - name: Prove MySQL code FTS create/retry boundary
         run: cargo test -p rg-db -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
+
+      - name: Prove MySQL CI secret scoping converges and reverses
+        run: cargo test -p rg-db -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
 
       - name: Prove MySQL code index refresh boundary
         run: cargo test -p rg-core -j 6 server_code_index_refresh_is_failure_atomic_and_serialized -- --ignored --nocapture

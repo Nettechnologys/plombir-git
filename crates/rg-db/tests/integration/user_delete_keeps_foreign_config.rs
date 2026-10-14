@@ -134,7 +134,7 @@ async fn deleting_an_account_keeps_the_configuration_it_left_in_another_reposito
     let guest = seed_user(&db, "config-guest").await;
     let repo = seed_repo(&db, host, "shared").await;
 
-    rg_db::ops::ci_secret_ops::upsert(&db, repo, "DEPLOY_TOKEN", "ciphertext", guest)
+    rg_db::ops::ci_secret_ops::upsert(&db, repo, None, "DEPLOY_TOKEN", "ciphertext", guest)
         .await
         .expect("seed the CI secret the guest set on the host's repository");
 
@@ -273,7 +273,7 @@ async fn deleting_an_account_keeps_the_configuration_it_left_in_another_reposito
         "the guest row was not there to delete"
     );
 
-    let secret = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo, "DEPLOY_TOKEN")
+    let secret = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo, None, "DEPLOY_TOKEN")
         .await
         .expect("read the CI secret after its author was deleted")
         .expect(

@@ -157,6 +157,7 @@ pub mod m20261012_000003_webhook_url_events_mysql_text;
 pub mod m20261012_000004_sso_secret_columns_text;
 pub mod m20261012_000005_remote_addresses_mysql_text;
 pub mod m20261014_000001_owner_names_fold_case;
+pub mod m20261014_000002_ci_secret_environments;
 
 use sea_orm_migration::prelude::*;
 
@@ -404,6 +405,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261012_000004_sso_secret_columns_text::Migration),
             Box::new(m20261012_000005_remote_addresses_mysql_text::Migration),
             Box::new(m20261014_000001_owner_names_fold_case::Migration),
+            Box::new(m20261014_000002_ci_secret_environments::Migration),
         ]
     }
 }

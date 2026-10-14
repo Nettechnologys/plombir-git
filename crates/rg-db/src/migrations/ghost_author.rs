@@ -192,6 +192,7 @@ impl GhostAuthorRebuild {
     {
         self.sqlite_rendered_with_hook(
             manager,
+            |table| table.columns,
             |table| Ok(table.body.replace("{rule}", shape.nullability())),
             |table| Ok(table.foreign_keys.replace("{on_delete}", shape.on_delete())),
             |_| Ok(String::new()),
@@ -200,9 +201,10 @@ impl GhostAuthorRebuild {
         .await
     }
 
-    async fn sqlite_rendered_with_hook<F, Fut, B, K, W>(
+    async fn sqlite_rendered_with_hook<F, Fut, L, B, K, W>(
         &self,
         manager: &SchemaManager<'_>,
+        live_columns_for: L,
         body_for: B,
         foreign_keys_for: K,
         copy_filter_for: W,
@@ -211,6 +213,7 @@ impl GhostAuthorRebuild {
     where
         F: Fn(SqliteRebuildPoint) -> Fut,
         Fut: Future<Output = Result<(), DbErr>>,
+        L: Fn(&SqliteTable) -> &'static [&'static str],
         B: Fn(&SqliteTable) -> Result<String, DbErr>,
         K: Fn(&SqliteTable) -> Result<String, DbErr>,
         W: Fn(&SqliteTable) -> Result<String, DbErr>,
@@ -239,7 +242,8 @@ impl GhostAuthorRebuild {
 
         let mut sequences = Vec::with_capacity(self.sqlite_tables.len());
         for table in self.sqlite_tables {
-            self.assert_sqlite_columns(&mut connection, table).await?;
+            self.assert_sqlite_columns(&mut connection, table.name, live_columns_for(table))
+                .await?;
             sequences.push(self.autoincrement_seq(&mut connection, table.name).await?);
         }
 
@@ -549,9 +553,9 @@ impl GhostAuthorRebuild {
     async fn assert_sqlite_columns(
         &self,
         connection: &mut SqlitePoolConnection,
-        table: &SqliteTable,
+        name: &str,
+        live_columns: &[&str],
     ) -> Result<(), DbErr> {
-        let name = table.name;
         let rows = (&mut **connection)
             .fetch_all(format!("SELECT name FROM pragma_table_info('{name}')").as_str())
             .await
@@ -566,13 +570,13 @@ impl GhostAuthorRebuild {
             .collect::<Result<Vec<_>, _>>()?;
         live.sort();
 
-        let mut expected: Vec<String> = table.columns.iter().map(|c| (*c).to_string()).collect();
+        let mut expected: Vec<String> = live_columns.iter().map(|c| (*c).to_string()).collect();
         expected.sort();
 
         if live != expected {
             return Err(DbErr::Migration(format!(
                 "{}: refusing to rebuild `{name}` — its columns are {live:?}, but this migration \
-                 copies {expected:?}. A column was added to the table without updating the \
+                 expects {expected:?}. A column was added to the table without updating the \
                  migration's rebuild recipe; rebuilding now would drop it.",
                 self.migration
             )));
@@ -748,7 +752,7 @@ impl GhostAuthorRebuild {
     ///
     /// Looked up rather than assumed: the constraint was declared inline by
     /// SeaORM and its name is whatever the server generated.
-    async fn postgres_foreign_key(
+    pub(crate) async fn postgres_foreign_key(
         &self,
         manager: &SchemaManager<'_>,
         table: &str,
@@ -828,7 +832,7 @@ impl GhostAuthorRebuild {
     }
 
     /// Name of the foreign key on `table.column` that points at `users`.
-    async fn mysql_foreign_key(
+    pub(crate) async fn mysql_foreign_key(
         &self,
         manager: &SchemaManager<'_>,
         table: &str,
@@ -900,6 +904,7 @@ impl RequiredReferenceRebuild {
         runner
             .sqlite_rendered_with_hook(
                 manager,
+                |table| table.columns,
                 |table| Ok(table.body.to_string()),
                 |table| self.sqlite_foreign_keys(table, with_references),
                 |table| self.sqlite_copy_filter(table, with_references),
@@ -1091,6 +1096,62 @@ impl RequiredReferenceRebuild {
             .await?;
         }
         Ok(())
+    }
+}
+
+/// A SQLite table rebuilt into a different set of columns.
+///
+/// [`GhostAuthorRebuild`] and [`RequiredReferenceRebuild`] keep a table's
+/// columns and change the rules on them. Adding a column SQLite cannot `ALTER`
+/// in (a generated one), or dropping one again on the way down, changes the
+/// columns themselves: the live table must have `live_columns`, and only
+/// `table.columns` is copied into the replacement — a new column takes its
+/// default, a dropped one is left behind in the staging table.
+///
+/// Everything else is the same guarded rebuild: one pinned connection,
+/// `foreign_keys = OFF` and `legacy_alter_table = ON` proven on it, one
+/// `BEGIN IMMEDIATE`, a foreign-key check before `COMMIT`, and a rollback that
+/// restores every table, row and sequence on any error.
+pub(crate) struct SqliteReshape {
+    pub migration: &'static str,
+    pub staging_suffix: &'static str,
+    pub table: &'static SqliteTable,
+    pub live_columns: &'static [&'static str],
+    pub cascade_warning: &'static str,
+}
+
+impl SqliteReshape {
+    pub(crate) async fn sqlite(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+        self.sqlite_with_hook(manager, |_| async { Ok(()) }).await
+    }
+
+    pub(crate) async fn sqlite_with_hook<F, Fut>(
+        &self,
+        manager: &SchemaManager<'_>,
+        after_step: F,
+    ) -> Result<(), DbErr>
+    where
+        F: Fn(SqliteRebuildPoint) -> Fut,
+        Fut: Future<Output = Result<(), DbErr>>,
+    {
+        let runner = GhostAuthorRebuild {
+            migration: self.migration,
+            staging_suffix: self.staging_suffix,
+            columns: &[],
+            sqlite_tables: std::slice::from_ref(self.table),
+            cascade_warning: self.cascade_warning,
+        };
+        let live_columns = self.live_columns;
+        runner
+            .sqlite_rendered_with_hook(
+                manager,
+                |_| live_columns,
+                |table| Ok(table.body.to_string()),
+                |table| Ok(table.foreign_keys.to_string()),
+                |_| Ok(String::new()),
+                after_step,
+            )
+            .await
     }
 }
 

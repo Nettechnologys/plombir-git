@@ -23,7 +23,7 @@
 | Reachable from the browser | 302 (70%) |
 | Layout modules | 2 |
 | Pages | 72 |
-| Interactive controls | 1041 |
+| Interactive controls | 1042 |
 | Controls calling an API | 366 |
 | Controls from shared components | 423 |
 | Browser sweep: scenarios / inventory entries / routes | 49 / 184 / 175 |
@@ -113,10 +113,10 @@
 | `/[owner]/[repo]/settings/mirror` | 7 | 3 | 2 |
 | `/[owner]/[repo]/settings/tags` | 7 | 2 | 2 |
 | `/settings/signing-keys` | 7 | 2 | 2 |
+| `/[owner]/[repo]/settings/ci-secrets` | 6 | 2 | 2 |
 | `/admin` 🔒 | 6 | 0 | 0 |
 | `/settings/ssh-keys` | 6 | 2 | 2 |
 | `/settings/tokens` | 6 | 2 | 2 |
-| `/[owner]/[repo]/settings/ci-secrets` | 5 | 2 | 2 |
 | `/help` | 5 | 0 | 0 |
 | `/reset-password` | 5 | 1 | 0 |
 | `/[owner]` | 4 | 0 | 0 |
@@ -764,10 +764,12 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:settings.ci_secrets.name | :102 | `PUT /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+web+browser |
-| i18n:settings.ci_secrets.name | :102 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust+web+browser |
-| i18n:common.delete | :102 | `DELETE /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+web+browser |
-| i18n:common.delete | :102 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust+web |
+| i18n:settings.ci_secrets.name | :111 | `PUT /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+web+browser |
+| i18n:settings.ci_secrets.name | :111 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust+web+browser |
+| i18n:settings.ci_secrets.name | :111 | `GET /api/v1/repos/{owner}/{name}/actions/environments` | `RepoRead` | rust+web |
+| i18n:common.delete | :111 | `DELETE /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+web+browser |
+| i18n:common.delete | :111 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust+web |
+| i18n:common.delete | :111 | `GET /api/v1/repos/{owner}/{name}/actions/environments` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/settings/collaborators`
 

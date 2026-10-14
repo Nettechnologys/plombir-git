@@ -827,6 +827,7 @@ impl PipelineRunner {
         let job_result = self
             .run_job(
                 job.id,
+                job.environment_id,
                 &job.script,
                 job.image.as_deref(),
                 job.variables.as_deref(),
@@ -961,6 +962,7 @@ impl PipelineRunner {
     async fn run_job(
         &self,
         job_id: i64,
+        environment_id: Option<i64>,
         script: &str,
         image: Option<&str>,
         variables: Option<&str>,
@@ -1051,7 +1053,7 @@ impl PipelineRunner {
             None
         };
         let (job_environment, secret_values, ignored_variables) = self
-            .job_environment(ci_job_token.as_deref(), variables)
+            .job_environment(ci_job_token.as_deref(), variables, environment_id)
             .await?;
         let cache = cache_spec(cache_key, cache_paths, &job_environment)?;
         // A cache failure never fails the job, so the server log is the only
@@ -1388,6 +1390,7 @@ impl PipelineRunner {
         &self,
         ci_job_token: Option<&str>,
         variables: Option<&str>,
+        environment_id: Option<i64>,
     ) -> Result<(Vec<(String, String)>, Vec<String>, Vec<String>)> {
         let pipeline = pipeline_ops::get_pipeline(&self.db, self.pipeline_id)
             .await?
@@ -1409,8 +1412,12 @@ impl PipelineRunner {
         if self.repo_id > 0 {
             if let Some(encryption_key) = &self.encryption_key {
                 let key = rg_core::auth::encryption::derive_key(encryption_key);
+                // The repository-wide scope, plus this job's environment's
+                // own when it declares one: a job without `environment:` never
+                // reads an environment secret, whatever branch it runs from.
                 for secret in
-                    rg_db::ops::ci_secret_ops::list_by_repo(&self.db, self.repo_id).await?
+                    rg_db::ops::ci_secret_ops::list_for_job(&self.db, self.repo_id, environment_id)
+                        .await?
                 {
                     if !valid_environment_name(&secret.name)
                         || is_reserved_ci_variable(&secret.name)
@@ -2442,6 +2449,104 @@ mod tests {
         cache_runner_on(db, root, repository.id, "refs/heads/main").await
     }
 
+    /// PR #16: the embedded runner hands a job the repository-wide secrets,
+    /// plus its own environment's when it declares one, and the environment's
+    /// value of a name both scopes set.
+    #[tokio::test]
+    async fn a_job_reads_only_its_own_environment_scope() {
+        use sea_orm::ActiveModelTrait as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut runner = cache_runner(temp.path()).await;
+        let encryption_key = "runner-at-rest-encryption-key";
+        runner.set_encryption_key(encryption_key.into());
+        let key = rg_core::auth::encryption::derive_key(encryption_key);
+        let now = chrono::Utc::now();
+        let mut environments = Vec::new();
+        for name in ["staging", "production"] {
+            let environment = rg_db::entities::ci_environment::ActiveModel {
+                repo_id: Set(runner.repo_id),
+                name: Set(name.into()),
+                protected: Set(false),
+                required_approvals: Set(0),
+                allowed_approver_ids: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&runner.db)
+            .await
+            .unwrap();
+            environments.push(environment.id);
+        }
+        let (staging, production) = (environments[0], environments[1]);
+        let owner = rg_db::ops::repo_ops::find_by_id(&runner.db, runner.repo_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_id;
+        for (environment, name, value) in [
+            (None, "DEPLOY_TOKEN", "repository-deploy"),
+            (None, "REPO_KEY", "repo-value"),
+            (Some(staging), "STAGING_KEY", "staging-value"),
+            (Some(production), "DEPLOY_TOKEN", "production-deploy"),
+        ] {
+            let encrypted = rg_core::auth::encryption::encrypt(value, &key).unwrap();
+            rg_db::ops::ci_secret_ops::upsert(
+                &runner.db,
+                runner.repo_id,
+                environment,
+                name,
+                &encrypted,
+                owner,
+            )
+            .await
+            .unwrap();
+        }
+
+        let read = |environment: Option<i64>| {
+            let runner = &runner;
+            async move {
+                let (variables, _, _) = runner
+                    .job_environment(None, None, environment)
+                    .await
+                    .unwrap();
+                variables
+                    .into_iter()
+                    .filter(|(name, _)| name.ends_with("_KEY") || name == "DEPLOY_TOKEN")
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            }
+        };
+        let pairs = |items: &[(&str, &str)]| {
+            items
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            read(None).await,
+            pairs(&[
+                ("DEPLOY_TOKEN", "repository-deploy"),
+                ("REPO_KEY", "repo-value")
+            ])
+        );
+        assert_eq!(
+            read(Some(staging)).await,
+            pairs(&[
+                ("DEPLOY_TOKEN", "repository-deploy"),
+                ("REPO_KEY", "repo-value"),
+                ("STAGING_KEY", "staging-value"),
+            ])
+        );
+        assert_eq!(
+            read(Some(production)).await,
+            pairs(&[
+                ("DEPLOY_TOKEN", "production-deploy"),
+                ("REPO_KEY", "repo-value")
+            ])
+        );
+    }
+
     /// card_a79579f79c29: a name the runner keeps for itself is dropped and
     /// named, never a reason to fail the job, and the runner's own value wins.
     #[tokio::test]
@@ -2452,6 +2557,7 @@ mod tests {
             .job_environment(
                 None,
                 Some(r#"{"CI":"false","CI_JOB_TOKEN":"forged","BAD-NAME":"x","DEPLOY":"prod"}"#),
+                None,
             )
             .await
             .unwrap();
@@ -3983,6 +4089,7 @@ esac
         let outcome = runner
             .run_job(
                 job.id,
+                job.environment_id,
                 &job.script,
                 None,
                 None,
@@ -4151,7 +4258,7 @@ esac
             &rg_core::auth::encryption::derive_key(encryption_key),
         )
         .unwrap();
-        rg_db::ops::ci_secret_ops::upsert(&db, repo.id, "DEPLOY_SECRET", &encrypted, user.id)
+        rg_db::ops::ci_secret_ops::upsert(&db, repo.id, None, "DEPLOY_SECRET", &encrypted, user.id)
             .await
             .unwrap();
 

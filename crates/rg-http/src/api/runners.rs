@@ -677,7 +677,8 @@ pub async fn poll_job(
                         variables.remove(reserved);
                     }
                     let mut mask_secrets = Vec::new();
-                    match decrypted_repo_secrets(&state, pipeline.repo_id).await {
+                    match decrypted_repo_secrets(&state, pipeline.repo_id, job.environment_id).await
+                    {
                         Ok(secrets) => {
                             for (name, value) in secrets {
                                 mask_secrets.push(value.clone());
@@ -1694,13 +1695,18 @@ fn cache_content_hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// The secrets one job is handed: the repository-wide scope, plus its
+/// environment's own when it declares one, one value per name.
 async fn decrypted_repo_secrets(
     state: &AppState,
     repo_id: i64,
+    environment_id: Option<i64>,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let mut values = Vec::new();
-    for secret in rg_db::ops::ci_secret_ops::list_by_repo(&state.db, repo_id).await? {
+    for secret in
+        rg_db::ops::ci_secret_ops::list_for_job(&state.db, repo_id, environment_id).await?
+    {
         values.push((
             secret.name,
             rg_core::auth::encryption::decrypt(&secret.encrypted_value, &key)?,
@@ -1728,6 +1734,12 @@ fn decrypt_job_mask(
     Ok(serde_json::from_str(&values)?)
 }
 
+/// Every secret value of the job's repository, in every scope, for masking
+/// its log.
+///
+/// Wider than what the job was handed on purpose: masking a value the job
+/// never saw costs nothing, while scoping the mask the way delivery is scoped
+/// would let a value through the day those two rules drift apart.
 async fn secrets_for_job(state: &AppState, stage_id: i64) -> anyhow::Result<Vec<String>> {
     let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, stage_id)
         .await?
@@ -1735,11 +1747,12 @@ async fn secrets_for_job(state: &AppState, stage_id: i64) -> anyhow::Result<Vec<
     let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("pipeline not found"))?;
-    Ok(decrypted_repo_secrets(state, pipeline.repo_id)
+    let key = rg_core::auth::encryption::derive_key(&state.encryption_key);
+    rg_db::ops::ci_secret_ops::list_by_repo(&state.db, pipeline.repo_id)
         .await?
         .into_iter()
-        .map(|(_, value)| value)
-        .collect())
+        .map(|secret| rg_core::auth::encryption::decrypt(&secret.encrypted_value, &key))
+        .collect()
 }
 
 /// POST /api/v1/runners/:id/jobs/:job_id/finish

@@ -2,7 +2,7 @@ use crate::api::access_audit::{grant_actor, record_grant};
 use crate::api::repo_access::RepoAdmin;
 use crate::{error::AppError, AppState};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -13,18 +13,39 @@ use utoipa::ToSchema;
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct PutSecretRequest {
     pub value: String,
+    /// The environment to scope the secret to, by name. Absent, `null` or
+    /// empty keeps it repository-wide, read by every job; an environment's
+    /// secret reaches only that environment's jobs, after its gate.
+    #[serde(default)]
+    pub environment: Option<String>,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SecretScopeQuery {
+    /// The environment scope to delete from, by name. Absent or empty means
+    /// the repository-wide secret.
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SecretResponse {
     pub name: String,
+    /// The environment the secret is scoped to, or `null` when it is
+    /// repository-wide.
+    pub environment: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-fn response(secret: rg_db::entities::ci_secret::Model) -> SecretResponse {
+fn response(
+    secret: rg_db::entities::ci_secret::Model,
+    environment: Option<String>,
+) -> SecretResponse {
     SecretResponse {
         name: secret.name,
+        environment,
         created_at: secret.created_at,
         updated_at: secret.updated_at,
     }
@@ -39,16 +60,58 @@ pub(crate) fn valid_secret_name(name: &str) -> bool {
         && !matches!(name, "HOME" | "PATH")
 }
 
+/// The environment a request addresses: `None` for the repository-wide scope,
+/// otherwise the id and name of one of this repository's environments.
+///
+/// Addressed by name, stored by id, so a renamed environment keeps its secrets
+/// and a deleted one takes them with it. A name this repository does not have
+/// is a 404, never a silent fall-back to the repository-wide scope: that
+/// would widen a production secret to every branch.
+async fn environment_scope(
+    state: &AppState,
+    repo_id: i64,
+    environment: Option<&str>,
+) -> Result<Option<(i64, String)>, AppError> {
+    let Some(name) = environment.filter(|name| !name.is_empty()) else {
+        return Ok(None);
+    };
+    match rg_db::ops::ci_environment_ops::find_by_name(&state.db, repo_id, name).await {
+        Ok(Some(environment)) => Ok(Some((environment.id, environment.name))),
+        Ok(None) => Err(AppError::not_found("CI environment not found")),
+        Err(error) => Err(AppError::from(error)),
+    }
+}
+
 #[utoipa::path(get, path = "/repos/{owner}/{name}/actions/secrets", tag = "CI/CD", params(("owner" = String, Path), ("name" = String, Path)), responses((status = 200, body = [SecretResponse]), (status = 403, body = serde_json::Value)))]
 pub async fn list(
     State(state): State<AppState>,
     Path((_, _)): Path<(String, String)>,
     RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
+    // Environments first: a secret read afterwards whose environment was
+    // deleted in between is gone with it (`ON DELETE CASCADE`), so every row
+    // the second read returns has a name in this map.
+    let environments = match rg_db::ops::ci_environment_ops::list(&state.db, repo.id).await {
+        Ok(environments) => environments
+            .into_iter()
+            .map(|environment| (environment.id, environment.name))
+            .collect::<std::collections::HashMap<_, _>>(),
+        Err(e) => return AppError::from(e).into_response(),
+    };
     match rg_db::ops::ci_secret_ops::list_by_repo(&state.db, repo.id).await {
         Ok(items) => (
             StatusCode::OK,
-            Json(items.into_iter().map(response).collect::<Vec<_>>()),
+            Json(
+                items
+                    .into_iter()
+                    .map(|item| {
+                        let environment = item
+                            .environment_id
+                            .and_then(|id| environments.get(&id).cloned());
+                        response(item, environment)
+                    })
+                    .collect::<Vec<_>>(),
+            ),
         )
             .into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -63,9 +126,10 @@ pub async fn put(
     headers: HeaderMap,
     Json(body): Json<PutSecretRequest>,
 ) -> impl IntoResponse {
-    // A CI secret is repository-scoped, so it goes through the repository
-    // journal rather than the account one: every job of this repository reads
-    // it, which makes writing one a change to what a push can reach.
+    // A CI secret belongs to its repository, so it goes through the
+    // repository journal rather than the account one: every job its scope
+    // reaches reads it, which makes writing one a change to what a push can
+    // reach.
     let audit_actor = match grant_actor(&state, actor_id).await {
         Ok(actor) => actor,
         Err(error) => return error.into_response(),
@@ -76,13 +140,25 @@ pub async fn put(
     if body.value.len() < 4 || body.value.len() > 65_536 {
         return AppError::bad_request("secret value must contain 4-65536 bytes").into_response();
     }
+    let environment = match environment_scope(&state, repo.id, body.environment.as_deref()).await {
+        Ok(environment) => environment,
+        Err(error) => return error.into_response(),
+    };
+    let (environment_id, environment_name) = environment.unzip();
     let key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let encrypted = match rg_core::auth::encryption::encrypt(&body.value, &key) {
         Ok(v) => v,
         Err(e) => return AppError::from(e).into_response(),
     };
-    match rg_db::ops::ci_secret_ops::upsert(&state.db, repo.id, &secret_name, &encrypted, actor_id)
-        .await
+    match rg_db::ops::ci_secret_ops::upsert(
+        &state.db,
+        repo.id,
+        environment_id,
+        &secret_name,
+        &encrypted,
+        actor_id,
+    )
+    .await
     {
         Ok(Some(item)) => {
             // The name, and whether this replaced a value that was already
@@ -97,20 +173,25 @@ pub async fn put(
                 &owner,
                 &repo,
                 &headers,
-                serde_json::json!({ "secret": item.name, "rotated": rotated }),
+                serde_json::json!({
+                    "secret": item.name,
+                    "environment": environment_name,
+                    "rotated": rotated,
+                }),
             )
             .await;
-            (StatusCode::CREATED, Json(response(item))).into_response()
+            (StatusCode::CREATED, Json(response(item, environment_name))).into_response()
         }
         Ok(None) => AppError::not_found("CI secret not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }
 
-#[utoipa::path(delete, path = "/repos/{owner}/{name}/actions/secrets/{secret_name}", tag = "CI/CD", params(("owner" = String, Path), ("name" = String, Path), ("secret_name" = String, Path)), responses((status = 204), (status = 403, body = serde_json::Value), (status = 404, body = serde_json::Value)))]
+#[utoipa::path(delete, path = "/repos/{owner}/{name}/actions/secrets/{secret_name}", tag = "CI/CD", params(("owner" = String, Path), ("name" = String, Path), ("secret_name" = String, Path), SecretScopeQuery), responses((status = 204), (status = 403, body = serde_json::Value), (status = 404, body = serde_json::Value)))]
 pub async fn delete(
     State(state): State<AppState>,
     Path((owner, _, secret_name)): Path<(String, String, String)>,
+    Query(scope): Query<SecretScopeQuery>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -118,7 +199,18 @@ pub async fn delete(
         Ok(actor) => actor,
         Err(error) => return error.into_response(),
     };
-    match rg_db::ops::ci_secret_ops::delete_by_repo_and_name(&state.db, repo.id, &secret_name).await
+    let environment = match environment_scope(&state, repo.id, scope.environment.as_deref()).await {
+        Ok(environment) => environment,
+        Err(error) => return error.into_response(),
+    };
+    let (environment_id, environment_name) = environment.unzip();
+    match rg_db::ops::ci_secret_ops::delete_by_repo_and_name(
+        &state.db,
+        repo.id,
+        environment_id,
+        &secret_name,
+    )
+    .await
     {
         Ok(true) => {
             record_grant(
@@ -128,7 +220,10 @@ pub async fn delete(
                 &owner,
                 &repo,
                 &headers,
-                serde_json::json!({ "secret": secret_name }),
+                serde_json::json!({
+                    "secret": secret_name,
+                    "environment": environment_name,
+                }),
             )
             .await;
             StatusCode::NO_CONTENT.into_response()

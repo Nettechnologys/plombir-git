@@ -1242,6 +1242,7 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     let created = rg_db::ops::ci_secret_ops::upsert(
         db,
         repo_id,
+        None,
         "PORTABLE_DEPLOY_TOKEN",
         "ciphertext-initial",
         actor_id,
@@ -1252,6 +1253,7 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     let updated = rg_db::ops::ci_secret_ops::upsert(
         db,
         repo_id,
+        None,
         "PORTABLE_DEPLOY_TOKEN",
         "ciphertext-rotated",
         actor_id,
@@ -1284,6 +1286,7 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     let stored = rg_db::ops::ci_secret_ops::upsert(
         db,
         repo_id,
+        None,
         "PORTABLE_DEPLOY_TOKEN",
         &encrypted,
         actor_id,
@@ -1291,11 +1294,15 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     .await
     .expect("store the maximum CI secret ciphertext")
     .expect("the CI secret still exists");
-    let reread =
-        rg_db::ops::ci_secret_ops::find_by_repo_and_name(db, repo_id, "PORTABLE_DEPLOY_TOKEN")
-            .await
-            .expect("read the maximum CI secret")
-            .expect("the maximum CI secret exists");
+    let reread = rg_db::ops::ci_secret_ops::find_by_repo_and_name(
+        db,
+        repo_id,
+        None,
+        "PORTABLE_DEPLOY_TOKEN",
+    )
+    .await
+    .expect("read the maximum CI secret")
+    .expect("the maximum CI secret exists");
     assert_eq!(reread.id, stored.id);
     assert_eq!(
         rg_core::auth::encryption::decrypt(&reread.encrypted_value, &key).unwrap(),
@@ -1305,6 +1312,7 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     assert!(rg_db::ops::ci_secret_ops::delete_by_repo_and_name(
         db,
         repo_id,
+        None,
         "PORTABLE_DEPLOY_TOKEN",
     )
     .await

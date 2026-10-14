@@ -86,7 +86,7 @@ async fn live_instance(db: &DatabaseConnection, secret: &str) -> i64 {
 
     let ci = encryption::encrypt(CI_SECRET_PLAINTEXT, &encryption::derive_key(secret))
         .expect("encrypt ci secret");
-    rg_db::ops::ci_secret_ops::upsert(db, repo.id, "DEPLOY_TOKEN", &ci, user.id)
+    rg_db::ops::ci_secret_ops::upsert(db, repo.id, None, "DEPLOY_TOKEN", &ci, user.id)
         .await
         .expect("store ci secret");
 

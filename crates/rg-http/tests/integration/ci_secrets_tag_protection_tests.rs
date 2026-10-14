@@ -58,10 +58,11 @@ async fn ci_secrets_are_admin_only_encrypted_and_never_return_values() {
         .await
         .unwrap()
         .unwrap();
-    let stored = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, "DEPLOY_TOKEN")
-        .await
-        .unwrap()
-        .unwrap();
+    let stored =
+        rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, None, "DEPLOY_TOKEN")
+            .await
+            .unwrap()
+            .unwrap();
     assert_ne!(stored.encrypted_value, "plain-secret-value");
     let key = rg_core::auth::encryption::derive_key(TEST_ENCRYPTION_KEY);
     assert_eq!(
@@ -104,7 +105,7 @@ async fn maximum_ci_secret_is_accepted_and_reads_back_after_encryption() {
         .await
         .unwrap()
         .unwrap();
-    let stored = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, "MAX_SECRET")
+    let stored = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, None, "MAX_SECRET")
         .await
         .unwrap()
         .unwrap();
@@ -148,7 +149,7 @@ async fn maximum_ci_secret_roundtrips_through_http_on_server_database() {
         .await
         .unwrap()
         .unwrap();
-    let stored = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, "MAX_SECRET")
+    let stored = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, None, "MAX_SECRET")
         .await
         .unwrap()
         .unwrap();
@@ -183,10 +184,11 @@ async fn ci_secret_deleted_after_the_upsert_read_is_404_and_publishes_no_audit()
             .await
             .expect("read the repository")
             .expect("the repository exists");
-    let secret = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, "DEPLOY_TOKEN")
-        .await
-        .expect("read the secret before the race")
-        .expect("the secret exists before the race");
+    let secret =
+        rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, None, "DEPLOY_TOKEN")
+            .await
+            .expect("read the secret before the race")
+            .expect("the secret exists before the race");
     let (_, audit_before) =
         rg_db::ops::audit_log_ops::list_paginated(&db, 0, 10, None, None, None, None, None)
             .await
@@ -223,7 +225,7 @@ async fn ci_secret_deleted_after_the_upsert_read_is_404_and_publishes_no_audit()
     assert!(!body.contains("rotated-plaintext"));
     assert!(!body.contains("encrypted_value"));
     assert!(
-        rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, "DEPLOY_TOKEN")
+        rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, None, "DEPLOY_TOKEN")
             .await
             .expect("look for a resurrected CI secret")
             .is_none(),

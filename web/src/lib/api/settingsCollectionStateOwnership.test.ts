@@ -6,7 +6,9 @@ import TagsPage from '../../routes/[owner]/[repo]/settings/tags/+page.svelte';
 import { setTestPage } from '../test/app';
 import { ciEnvironments, ciSecrets, resetTestClient, tagProtections } from '../test/client';
 import {
+	answerConfirm,
 	button,
+	change,
 	click,
 	element,
 	input,
@@ -30,7 +32,12 @@ function deferred<T>(): Deferred<T> {
 }
 
 const timestamp = '2026-08-26T00:00:00Z';
-const secret = (name: string) => ({ name, created_at: timestamp, updated_at: timestamp });
+const secret = (name: string, scope: string | null = null) => ({
+	name,
+	environment: scope,
+	created_at: timestamp,
+	updated_at: timestamp,
+});
 const environment = (id: number, name: string) => ({
 	id,
 	name,
@@ -54,6 +61,9 @@ let rendered: RenderedComponent | undefined;
 
 beforeEach(() => {
 	resetTestClient();
+	// The CI-secrets page reads the environments it can scope a secret to
+	// beside the secrets themselves, and renders nothing until both arrive.
+	ciEnvironments.list.mockResolvedValue([]);
 	setTestPage('/alice/demo/settings', { owner: 'alice', repo: 'demo' });
 });
 
@@ -141,6 +151,31 @@ describe('repository settings collection state ownership', () => {
 		await settle();
 		expect(rendered.container.textContent).toContain('current-*');
 		expect(rendered.container.textContent).not.toContain('stale-*');
+	});
+
+	it('saves and deletes a CI secret in the scope it belongs to', async () => {
+		ciEnvironments.list.mockResolvedValue([environment(7, 'production')]);
+		ciSecrets.list.mockResolvedValue([
+			secret('DEPLOY_TOKEN'),
+			secret('DEPLOY_TOKEN', 'production'),
+		]);
+		ciSecrets.put.mockResolvedValueOnce(secret('NPM_TOKEN', 'production'));
+		ciSecrets.delete.mockResolvedValueOnce(undefined);
+		rendered = await renderComponent(CiSecretsPage);
+
+		expect(rendered.container.querySelectorAll('article')).toHaveLength(2);
+		expect(rendered.container.textContent).toContain('Environment: production');
+
+		await input(element(rendered.container, '#secret-name'), 'npm_token');
+		await change(element<HTMLSelectElement>(rendered.container, '#secret-environment'), 'production');
+		await input(element(rendered.container, '#secret-value'), 'scoped value');
+		await submit(element(rendered.container, 'form'));
+		expect(ciSecrets.put).toHaveBeenCalledWith('alice', 'demo', 'NPM_TOKEN', 'scoped value', 'production');
+
+		const scopedRow = rendered.container.querySelectorAll('article')[1];
+		await click(button(scopedRow, 'Delete'));
+		expect(await answerConfirm()).toContain('production');
+		expect(ciSecrets.delete).toHaveBeenCalledWith('alice', 'demo', 'DEPLOY_TOKEN', 'production');
 	});
 
 	it('shares the CI-secret row claim between replace and delete', async () => {

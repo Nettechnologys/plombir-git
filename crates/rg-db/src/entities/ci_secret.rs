@@ -16,6 +16,12 @@ pub struct Model {
     /// outlives the collaborator who set it
     /// (`m20260805_000004_repo_config_outlives_its_author`).
     pub created_by_id: Option<i64>,
+    /// The environment this secret is scoped to, or `None` for the
+    /// repository-wide scope every job reads. An environment's secrets reach
+    /// only that environment's jobs, after its gate
+    /// (`m20261014_000002_ci_secret_environments`). The generated `scope_key`
+    /// column the uniqueness is declared on is not mapped: nothing writes it.
+    pub environment_id: Option<i64>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }
@@ -34,5 +40,11 @@ pub enum Relation {
         to = "super::user::Column::Id"
     )]
     CreatedBy,
+    #[sea_orm(
+        belongs_to = "super::ci_environment::Entity",
+        from = "Column::EnvironmentId",
+        to = "super::ci_environment::Column::Id"
+    )]
+    Environment,
 }
 impl ActiveModelBehavior for ActiveModel {}

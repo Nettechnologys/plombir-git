@@ -385,6 +385,14 @@ pub async fn delete(
         Ok(false) => {}
         Err(error) => return AppError::from(error).into_response(),
     }
+    // The environment's secrets go with it (`ON DELETE CASCADE`), and that is
+    // the part of the deletion an auditor cannot reconstruct afterwards: the
+    // rows are gone. Read before the DELETE; a secret written in between is
+    // removed without being named, which is the narrower of the two failures.
+    let secrets = match rg_db::ops::ci_secret_ops::names_in_environment(&state.db, id).await {
+        Ok(names) => names,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     match rg_db::ops::ci_environment_ops::delete(&state.db, id).await {
         Ok(true) => {
             record_grant(
@@ -397,6 +405,7 @@ pub async fn delete(
                 serde_json::json!({
                     "environment": removed.name,
                     "protected": removed.protected,
+                    "secrets": secrets,
                 }),
             )
             .await;
