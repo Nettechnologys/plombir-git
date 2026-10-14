@@ -209,3 +209,20 @@ async fn a_single_kind_search_still_pages_the_way_it_did() {
         );
     }
 }
+
+/// A page past anything the database can offset to is an empty page, not a
+/// database error. `page` is straight off the query string; saturating
+/// `(page - 1) * per_page` stopped the wrap but still handed SQL an `OFFSET`
+/// above `i64::MAX` (card_6a490a48d411, from the PR #14 audit).
+#[tokio::test]
+async fn a_page_beyond_any_offset_is_an_empty_page() {
+    let base = spawn_test_app().await;
+    let (token, _) = register_full(&base, "deep-owner", "deep-owner@example.com").await;
+    seed(&base, &token, "deep-owner").await;
+
+    for search_type in ["repos", "issues", "wiki", "pulls", "users", "code", "all"] {
+        let (total, results) = search_page(&base, &token, search_type, u64::MAX, 100).await;
+        assert!(results.is_empty(), "{search_type}: {results:?}");
+        assert!(total >= 0, "{search_type}: total {total}");
+    }
+}

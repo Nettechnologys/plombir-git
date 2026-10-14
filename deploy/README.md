@@ -183,8 +183,9 @@ trusted_proxies = ["172.16.0.0/12"]
 **`trusted_proxies` is not optional behind a proxy.** Without it every request
 comes from the proxy as far as the server can tell: every limiter is keyed by
 the proxy's address — ten logins a minute for the *whole instance*, which one
-client can spend for everybody — and every audit and login entry names the
-proxy. The server says so once in its log when it sees forwarded requests from a
+client can spend for everybody, and sixty anonymous searches a minute
+(`[rate_limit].search_max`) that one scraper spends for every visitor — and
+every audit and login entry names the proxy. The server says so once in its log when it sees forwarded requests from a
 private address with the list empty.
 
 Which address to list is where people go wrong. A proxy on the host that

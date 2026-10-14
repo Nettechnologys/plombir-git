@@ -243,6 +243,11 @@ pub(crate) struct RateLimitConfig {
     pub(crate) agent_max: Option<u32>,
     /// Window (seconds) for the bot-account limiter.
     pub(crate) agent_window_secs: Option<u64>,
+    /// Per-client cap on global search requests that carry no session or
+    /// token. `0` disables it.
+    pub(crate) search_max: Option<u32>,
+    /// Window (seconds) for the anonymous-search limiter.
+    pub(crate) search_window_secs: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -727,6 +732,12 @@ pub(crate) const DEFAULT_AUTH_RATE_LIMIT_WINDOW: u64 = 60;
 pub(crate) const DEFAULT_AGENT_RATE_LIMIT_MAX: u32 = 600;
 pub(crate) const DEFAULT_AGENT_RATE_LIMIT_WINDOW: u64 = 60;
 
+/// The anonymous-search limiter: every global search runs full-text queries
+/// across six backends, and the global limiter is off by default. On by
+/// default, spent only by requests without a session or token.
+pub(crate) const DEFAULT_SEARCH_RATE_LIMIT_MAX: u32 = 60;
+pub(crate) const DEFAULT_SEARCH_RATE_LIMIT_WINDOW: u64 = 60;
+
 /// `[audit].enabled`: on by default, because an audit log that is never trimmed
 /// grows until the disk does.
 pub(crate) const DEFAULT_AUDIT_ENABLED: bool = true;
@@ -768,6 +779,10 @@ pub(crate) fn resolve_mirror_transport_policy(
         cfg.and_then(|config| config.mirror.allow_insecure_http)
             .unwrap_or(DEFAULT_MIRROR_ALLOW_INSECURE_HTTP),
     )
+    .with_max_clone_size_mb(
+        cfg.and_then(|config| config.mirror.max_clone_size_mb)
+            .unwrap_or(DEFAULT_MIRROR_MAX_CLONE_SIZE_MB),
+    )
 }
 
 /// Resolve the process-wide outbound webhook transport policy.
@@ -777,10 +792,6 @@ pub(crate) fn resolve_webhook_transport_policy(
     rg_core::webhook::transport::WebhookTransportPolicy::new(
         cfg.and_then(|config| config.webhooks.allow_insecure_http)
             .unwrap_or(DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP),
-    )
-    .with_max_clone_size_mb(
-        cfg.and_then(|config| config.mirror.max_clone_size_mb)
-            .unwrap_or(DEFAULT_MIRROR_MAX_CLONE_SIZE_MB),
     )
 }
 
@@ -2099,6 +2110,18 @@ mod tests {
                 super::DEFAULT_AGENT_RATE_LIMIT_WINDOW.to_string(),
             ),
             row(
+                "rate_limit",
+                "search_max",
+                "DEFAULT_SEARCH_RATE_LIMIT_MAX",
+                super::DEFAULT_SEARCH_RATE_LIMIT_MAX.to_string(),
+            ),
+            row(
+                "rate_limit",
+                "search_window_secs",
+                "DEFAULT_SEARCH_RATE_LIMIT_WINDOW",
+                super::DEFAULT_SEARCH_RATE_LIMIT_WINDOW.to_string(),
+            ),
+            row(
                 "logging",
                 "max_size_mb",
                 "DEFAULT_LOG_MAX_SIZE_MB",
@@ -2226,6 +2249,18 @@ mod tests {
             ),
             row(
                 "mirror",
+                "max_clone_size_mb",
+                "DEFAULT_MIRROR_MAX_CLONE_SIZE_MB",
+                super::DEFAULT_MIRROR_MAX_CLONE_SIZE_MB.to_string(),
+            ),
+            row(
+                "imports",
+                "max_clone_size_mb",
+                "DEFAULT_IMPORTS_MAX_CLONE_SIZE_MB",
+                super::DEFAULT_IMPORTS_MAX_CLONE_SIZE_MB.to_string(),
+            ),
+            row(
+                "mirror",
                 "poll_interval_secs",
                 "mirror::scheduler::DEFAULT_POLL_INTERVAL_SECS",
                 rg_core::mirror::scheduler::DEFAULT_POLL_INTERVAL_SECS.to_string(),
@@ -2247,18 +2282,6 @@ mod tests {
                 "allow_insecure_http",
                 "DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP",
                 super::DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP.to_string(),
-            ),
-            row(
-                "mirror",
-                "max_clone_size_mb",
-                "DEFAULT_MIRROR_MAX_CLONE_SIZE_MB",
-                super::DEFAULT_MIRROR_MAX_CLONE_SIZE_MB.to_string(),
-            ),
-            row(
-                "imports",
-                "max_clone_size_mb",
-                "DEFAULT_IMPORTS_MAX_CLONE_SIZE_MB",
-                super::DEFAULT_IMPORTS_MAX_CLONE_SIZE_MB.to_string(),
             ),
             row(
                 "smtp",
@@ -3275,21 +3298,6 @@ trusted_origins = ["http://127.0.0.1:8443"]
             .is_err());
     }
 
-    #[test]
-    fn malformed_trusted_import_origin_fails_config_resolution() {
-        let config: ConfigFile = toml::from_str(
-            r#"
-[imports]
-trusted_origins = ["https://*.internal.example"]
-"#,
-        )
-        .expect("the TOML shape itself is valid");
-
-        let error = super::resolve_trusted_import_origins(Some(&config))
-            .expect_err("wildcard trust must fail");
-        assert!(format!("{error:#}").contains("[imports].trusted_origins"));
-    }
-
     /// The two clone budgets resolve independently, default to the decided
     /// 10240 MiB when the key is absent, and read `0` as "no ceiling" rather
     /// than as a ceiling of nothing.
@@ -3333,6 +3341,21 @@ max_clone_size_mb = 512
                 .max_bytes(),
             Some(512 * MIB)
         );
+    }
+
+    #[test]
+    fn malformed_trusted_import_origin_fails_config_resolution() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[imports]
+trusted_origins = ["https://*.internal.example"]
+"#,
+        )
+        .expect("the TOML shape itself is valid");
+
+        let error = super::resolve_trusted_import_origins(Some(&config))
+            .expect_err("wildcard trust must fail");
+        assert!(format!("{error:#}").contains("[imports].trusted_origins"));
     }
 
     #[test]

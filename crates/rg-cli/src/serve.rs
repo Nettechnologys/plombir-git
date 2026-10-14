@@ -25,7 +25,7 @@ use crate::config::{
     DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER, DEFAULT_CI_DOCKER,
     DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_HSTS_PRELOAD,
     DEFAULT_METRICS_ENABLED, DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
-    DEFAULT_RETENTION_ENABLED,
+    DEFAULT_RETENTION_ENABLED, DEFAULT_SEARCH_RATE_LIMIT_MAX, DEFAULT_SEARCH_RATE_LIMIT_WINDOW,
 };
 use crate::dbconn;
 use crate::telemetry;
@@ -383,7 +383,8 @@ fn resolve_smtp_config(
 /// Knobs that *do* document `0` as "disable the bound" are deliberately never
 /// routed through here: `timeouts.git_stream_secs` (see `with_git_timeout`),
 /// `timeouts.job_secs` (see `PipelineRunner::set_job_timeout`),
-/// `rate_limit.max`, `rate_limit.max_keys`, and `rate_limit.auth_max`.
+/// `rate_limit.max`, `rate_limit.max_keys`, `rate_limit.auth_max`, and
+/// `rate_limit.search_max`.
 fn require_positive(key: &str, value: u64) -> anyhow::Result<()> {
     if value == 0 {
         anyhow::bail!(
@@ -1167,6 +1168,14 @@ pub(crate) async fn run_serve(
         .as_ref()
         .and_then(|c| c.rate_limit.agent_window_secs)
         .unwrap_or(DEFAULT_AGENT_RATE_LIMIT_WINDOW);
+    let resolved_rate_limit_search_max = cfg
+        .as_ref()
+        .and_then(|c| c.rate_limit.search_max)
+        .unwrap_or(DEFAULT_SEARCH_RATE_LIMIT_MAX);
+    let resolved_rate_limit_search_window = cfg
+        .as_ref()
+        .and_then(|c| c.rate_limit.search_window_secs)
+        .unwrap_or(DEFAULT_SEARCH_RATE_LIMIT_WINDOW);
     let resolved_package_upload_max_bytes = resolve_package_upload_max_bytes(cfg.as_ref())?;
     let resolved_storage_limits = crate::config::resolve_storage_limits(cfg.as_ref())?;
     let resolved_trusted_import_origins = resolve_trusted_import_origins(cfg.as_ref())?;
@@ -1305,6 +1314,11 @@ pub(crate) async fn run_serve(
     require_positive(
         "rate_limit.agent_window_secs",
         resolved_rate_limit_agent_window,
+    )?;
+    // `search_max = 0` disables that limiter; a zero window would not.
+    require_positive(
+        "rate_limit.search_window_secs",
+        resolved_rate_limit_search_window,
     )?;
     require_positive(
         "database.max_connections",
@@ -1814,6 +1828,8 @@ pub(crate) async fn run_serve(
         rate_limit_auth_window_secs: resolved_rate_limit_auth_window,
         rate_limit_agent_max: resolved_rate_limit_agent_max,
         rate_limit_agent_window_secs: resolved_rate_limit_agent_window,
+        rate_limit_search_max: resolved_rate_limit_search_max,
+        rate_limit_search_window_secs: resolved_rate_limit_search_window,
         smtp_config: smtp_config.clone(),
         tls_config,
         external_url: resolved_external_url.clone(),

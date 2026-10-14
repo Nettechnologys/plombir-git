@@ -289,3 +289,64 @@ async fn the_eleventh_reset_request_in_a_window_is_refused() {
         .status();
     assert_eq!(eleventh, 429);
 }
+
+/// Anonymous global search has a budget of its own, and a signed-in caller
+/// never spends it (card_6a490a48d411, from the PR #14 audit). The global and
+/// credential limiters are off here, so a 429 can only come from this one.
+#[tokio::test]
+async fn anonymous_search_carries_its_own_rate_limiter() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let state = build_test_app_state(db, repo_root);
+    let app = rg_http::create_router_for_test_with_all_rate_limits(
+        state,
+        rg_http::rate_limit::RateLimiter::new(0, 60),
+        rg_http::rate_limit::RateLimiter::new(0, 60),
+        rg_http::rate_limit::RateLimiter::new(2, 60),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_listener(&addr.to_string()).await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let search = format!("{base}/api/v1/search?q=anything");
+
+    for attempt in 1..=2 {
+        let status = client.get(&search).send().await.unwrap().status();
+        assert_eq!(
+            status, 200,
+            "anonymous search {attempt} is inside the budget"
+        );
+    }
+    let refused = client.get(&search).send().await.unwrap();
+    assert_eq!(
+        refused.status(),
+        429,
+        "the third anonymous search is over it"
+    );
+
+    let (token, _) = crate::common::register_full(&base, "searcher", "searcher@example.com").await;
+    for attempt in 1..=3 {
+        let status = client
+            .get(&search)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            status, 200,
+            "signed-in search {attempt} spends no anonymous budget"
+        );
+    }
+}

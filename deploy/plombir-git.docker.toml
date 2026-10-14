@@ -100,6 +100,11 @@ auth_window_secs = 60
 # Per-account limit shared by every token of one bot account (AI agent).
 agent_max = 600
 agent_window_secs = 60
+# Per-client limit on global search without a session or token. Keyed by
+# address: behind the proxy above it needs `trusted_proxies`, or all anonymous
+# visitors share one budget. 0 disables it.
+search_max = 60
+search_window_secs = 60
 
 [logging]
 # Left unset on purpose: with no `file`, the server logs to stdout, which is

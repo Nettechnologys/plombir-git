@@ -2401,7 +2401,7 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 28] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 30] = [
         (
             "DEFAULT_LOG_MAX_SIZE_MB",
             "the size cap is inactive until explicitly set; presenting 10 MB as an active default would mislead operators",
@@ -2480,6 +2480,14 @@ const AFTER: &str = "after";
         (
             "DEFAULT_AGENT_RATE_LIMIT_WINDOW",
             "config-file-only: `[rate_limit].agent_window_secs` has no CLI flag",
+        ),
+        (
+            "DEFAULT_SEARCH_RATE_LIMIT_MAX",
+            "config-file-only: `[rate_limit].search_max` has no CLI flag",
+        ),
+        (
+            "DEFAULT_SEARCH_RATE_LIMIT_WINDOW",
+            "config-file-only: `[rate_limit].search_window_secs` has no CLI flag",
         ),
         (
             "DEFAULT_AUDIT_ENABLED",

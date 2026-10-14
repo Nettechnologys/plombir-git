@@ -203,6 +203,15 @@ auth_window_secs = 60
 # request per tool call. Independent of `max`; on by default. 0 disables it.
 agent_max = 600
 agent_window_secs = 60
+# Per-client limit on global search (/api/v1/search) for requests that carry no
+# session or token; signed-in users are not counted here. Every search runs
+# full-text queries across repositories, issues, wiki, pull requests, users and
+# code, so it gets its own budget even while `max = 0`. Keyed by client address
+# like the limits above: behind a reverse proxy it needs `trusted_proxies`, or
+# every anonymous visitor counts as the proxy and one scraper spends the whole
+# instance's anonymous search budget. 0 disables it.
+search_max = 60
+search_window_secs = 60
 
 [smtp]
 # Mail is on when host, user, pass and from are all set, off when none are;

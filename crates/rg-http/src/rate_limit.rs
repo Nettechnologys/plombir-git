@@ -382,19 +382,58 @@ pub async fn rate_limit_middleware(
     if limiter.allow(&key) {
         next.run(request).await
     } else {
-        // Record metric for observability
-        if let Some(c) = crate::metrics::rate_limit::BLOCKED.get() {
-            c.inc();
-        }
-        let path = request.uri().path();
-        let message = "Too many requests. Please try again later.";
-        crate::refusal::pre_router_refusal_response(
-            path,
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            || crate::error::AppError::rate_limited(message).into_response(),
-            rg_core::package_registry::oci::types::error_codes::TOO_MANY_REQUESTS,
-            message,
-        )
+        too_many_requests(request.uri().path())
+    }
+}
+
+/// The 429 every per-client limiter answers with, so a refusal reads the same
+/// whichever budget ran out.
+fn too_many_requests(path: &str) -> Response {
+    // Record metric for observability
+    if let Some(c) = crate::metrics::rate_limit::BLOCKED.get() {
+        c.inc();
+    }
+    let message = "Too many requests. Please try again later.";
+    crate::refusal::pre_router_refusal_response(
+        path,
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        || crate::error::AppError::rate_limited(message).into_response(),
+        rg_core::package_registry::oci::types::error_codes::TOO_MANY_REQUESTS,
+        message,
+    )
+}
+
+/// The budget for anonymous global search: spent per client by requests that
+/// carry no valid session or token, and only by those.
+///
+/// Every search runs full-text queries across six backends, and it is the most
+/// expensive read an unauthenticated caller can ask for — while the global
+/// limiter is off by default. A signed-in caller is not throttled here: whether
+/// a request is anonymous is decided by the same reading the search handler
+/// uses to scope its results, so the two cannot disagree about who is asking.
+///
+/// Keyed by client address like the other limiters, so behind a reverse proxy
+/// it needs `[rate_limit].trusted_proxies`: without it every anonymous visitor
+/// is the proxy, and one scraper spends the whole instance's anonymous budget.
+pub async fn anonymous_search_rate_limit(
+    axum::extract::State((limiter, jwt_secret)): axum::extract::State<(
+        RateLimiter,
+        std::sync::Arc<String>,
+    )>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if crate::api::auth::extract_user_id(&headers, &jwt_secret).is_some() {
+        return next.run(request).await;
+    }
+    let resolved = request.extensions().get::<ClientIp>().copied();
+    let key = limiter.client_key(resolved, &headers, addr);
+    if limiter.allow(&key) {
+        next.run(request).await
+    } else {
+        too_many_requests(request.uri().path())
     }
 }
 

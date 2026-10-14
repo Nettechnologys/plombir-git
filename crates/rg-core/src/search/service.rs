@@ -187,9 +187,16 @@ pub async fn search(
 ) -> Result<(Vec<SearchResult>, i64)> {
     // `page` is whatever the caller put in the query string, so the product is
     // saturated rather than left to wrap: an overflowed offset would silently
-    // hand back page one under the name of page 10^18.
-    let offset = page.saturating_sub(1).saturating_mul(per_page);
+    // hand back page one under the name of page 10^18. Saturating is not
+    // enough on its own: SQL `OFFSET` is a signed 64-bit integer, and an offset
+    // past `i64::MAX` reached the database as an error instead of an empty
+    // page. The offset is also taken from the page size actually served, so a
+    // caller asking for more than 100 rows does not skip the ones in between.
     let limit = per_page.min(100);
+    let offset = page
+        .saturating_sub(1)
+        .saturating_mul(limit)
+        .min(i64::MAX as u64);
 
     let filters = SearchFilters::parse(raw_query);
     let raw_text = filters.query.as_str();

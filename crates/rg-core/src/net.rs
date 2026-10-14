@@ -382,17 +382,79 @@ pub fn ssrf_safe_outbound_client() -> &'static reqwest::Client {
 ///
 /// Covers loopback, private (RFC 1918), link-local (incl. the
 /// `169.254.169.254` cloud-metadata address), unspecified, broadcast,
-/// multicast, documentation, CGNAT (RFC 6598) for v4, and loopback /
-/// unspecified / multicast / unique-local / link-local for v6 (plus
-/// IPv4-mapped v6 folded back to its v4 check).
+/// multicast, documentation, CGNAT (RFC 6598), benchmarking (RFC 2544), IETF
+/// protocol assignments (RFC 6890) and the reserved `240.0.0.0/4` for v4; for
+/// v6 loopback, unspecified, multicast, unique-local, link-local, site-local
+/// and every special-purpose range that is never globally reachable.
+///
+/// A v6 address that carries a v4 one is judged by the v4 one wherever the
+/// network delivers it there: IPv4-mapped, the well-known NAT64 prefix (an
+/// IPv6-only host behind DNS64 reaches every public server through it, so it
+/// cannot be refused wholesale) and 6to4. Transition formats that are never a
+/// legitimate destination for a server-side fetch are refused whole.
 pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_forbidden_v4(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(mapped) => is_forbidden_v4(mapped),
+        IpAddr::V6(v6) => match embedded_ipv4(v6) {
+            Some(v4) => is_forbidden_v4(v4),
             None => is_forbidden_v6(v6),
         },
     }
+}
+
+/// The v4 address a v6 one is delivered to, for the formats that have one:
+/// IPv4-mapped `::ffff:0:0/96`, NAT64 `64:ff9b::/96` (RFC 6052) and 6to4
+/// `2002::/16` (RFC 3056).
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let bits = u128::from(ip);
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    if in_v6_prefix(ip, NAT64_WELL_KNOWN, 96) {
+        return Some(Ipv4Addr::from(bits as u32));
+    }
+    if in_v6_prefix(ip, SIX_TO_FOUR, 16) {
+        return Some(Ipv4Addr::from((bits >> 80) as u32));
+    }
+    None
+}
+
+const NAT64_WELL_KNOWN: Ipv6Addr = Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0);
+const SIX_TO_FOUR: Ipv6Addr = Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0);
+
+/// v6 special-purpose ranges that are never a destination a server-side fetch
+/// may reach: each is either not globally routable at all or a transition
+/// format whose far end this server cannot judge.
+const FORBIDDEN_V6_RANGES: [(Ipv6Addr, u32); 10] = [
+    // IPv4-compatible (deprecated, RFC 4291); `::` and `::1` sit inside too.
+    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 96),
+    // IPv4-translated (RFC 2765).
+    (Ipv6Addr::new(0, 0, 0, 0, 0xffff, 0, 0, 0), 96),
+    // Local-use NAT64 (RFC 8215): never global, whatever layout it carries.
+    (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
+    // Discard-only (RFC 6666).
+    (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64),
+    // Teredo (RFC 4380): relayed to a host behind somebody's NAT.
+    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32),
+    // Benchmarking (RFC 5180).
+    (Ipv6Addr::new(0x2001, 0x2, 0, 0, 0, 0, 0, 0), 48),
+    // Documentation (RFC 3849, RFC 9637).
+    (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32),
+    (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
+    // SRv6 SIDs (RFC 9602): segment identifiers inside one operator's domain.
+    (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16),
+    // Site-local (deprecated, RFC 3879) — still routed inside old networks.
+    (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
+];
+
+fn in_v6_prefix(ip: Ipv6Addr, prefix: Ipv6Addr, len: u32) -> bool {
+    let mask = u128::MAX.checked_shl(128 - len).unwrap_or(0);
+    u128::from(ip) & mask == u128::from(prefix) & mask
+}
+
+fn in_v4_prefix(ip: Ipv4Addr, prefix: Ipv4Addr, len: u32) -> bool {
+    let mask = u32::MAX.checked_shl(32 - len).unwrap_or(0);
+    u32::from(ip) & mask == u32::from(prefix) & mask
 }
 
 fn is_forbidden_v4(ip: Ipv4Addr) -> bool {
@@ -405,6 +467,9 @@ fn is_forbidden_v4(ip: Ipv4Addr) -> bool {
         || ip.is_documentation()
         || is_shared_cgnat(ip) // 100.64/10 (RFC 6598)
         || ip.octets()[0] == 0 // 0.0.0.0/8 "this network"
+        || in_v4_prefix(ip, Ipv4Addr::new(192, 0, 0, 0), 24) // IETF protocol assignments
+        || in_v4_prefix(ip, Ipv4Addr::new(198, 18, 0, 0), 15) // benchmarking (RFC 2544)
+        || in_v4_prefix(ip, Ipv4Addr::new(240, 0, 0, 0), 4) // reserved (RFC 1112)
 }
 
 /// 100.64.0.0/10 — carrier-grade NAT space, treated as internal.
@@ -419,6 +484,9 @@ fn is_forbidden_v6(ip: Ipv6Addr) -> bool {
         || ip.is_multicast()       // ff00::/8
         || is_unique_local(ip)     // fc00::/7
         || is_unicast_link_local(ip) // fe80::/10
+        || FORBIDDEN_V6_RANGES
+            .iter()
+            .any(|&(prefix, len)| in_v6_prefix(ip, prefix, len))
 }
 
 /// fc00::/7 — IPv6 unique-local (the `is_unique_local` std method is unstable).
@@ -961,6 +1029,91 @@ mod tests {
         ] {
             let ip: IpAddr = s.parse().unwrap();
             assert!(is_forbidden_ip(ip), "{s} should be forbidden");
+        }
+    }
+
+    /// Special-purpose v4 ranges that are never globally reachable
+    /// (card_6a490a48d411, from the PR #14 audit).
+    #[test]
+    fn classifies_v4_special_purpose_ranges() {
+        for s in [
+            "192.0.0.8",       // IETF protocol assignments
+            "198.18.0.1",      // benchmarking, low half
+            "198.19.255.254",  // benchmarking, high half
+            "240.0.0.1",       // reserved
+            "254.255.255.255", // reserved, just below broadcast
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_forbidden_ip(ip), "{s} should be forbidden");
+        }
+        for s in [
+            "198.17.255.255",
+            "198.20.0.0",
+            "192.0.1.1",
+            "239.255.255.255",
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            // 239/8 is multicast and refused for that reason; the neighbours of
+            // the new ranges stay exactly as they were.
+            if s.starts_with("239.") {
+                assert!(is_forbidden_ip(ip));
+            } else {
+                assert!(!is_forbidden_ip(ip), "{s} should be allowed");
+            }
+        }
+    }
+
+    /// A v6 address that carries a v4 one is judged by where the network
+    /// delivers it — public through NAT64 or 6to4 is public, internal is not.
+    #[test]
+    fn embedded_v4_decides_nat64_and_6to4() {
+        for s in [
+            "64:ff9b::7f00:1",    // NAT64 → 127.0.0.1
+            "64:ff9b::a9fe:a9fe", // NAT64 → 169.254.169.254
+            "64:ff9b::a00:1",     // NAT64 → 10.0.0.1
+            "2002:7f00:1::1",     // 6to4 → 127.0.0.1
+            "2002:c0a8:101::",    // 6to4 → 192.168.1.1
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_forbidden_ip(ip), "{s} should be forbidden");
+        }
+        for s in ["64:ff9b::808:808", "2002:808:808::1"] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(
+                !is_forbidden_ip(ip),
+                "{s} carries a public v4 address; an IPv6-only host behind DNS64 reaches \
+                 every public remote this way"
+            );
+        }
+    }
+
+    /// v6 ranges refused whole, whatever they carry.
+    #[test]
+    fn classifies_v6_special_purpose_ranges() {
+        for s in [
+            "64:ff9b:1::808:808", // local-use NAT64, even with a public tail
+            "64:ff9b:1:ffff::1",  // local-use NAT64, another layout
+            "::808:808",          // IPv4-compatible
+            "::ffff:0:808:808",   // IPv4-translated
+            "100::1",             // discard-only
+            "2001:0:4136:e378:8000:63bf:f7f7:f7f7", // Teredo
+            "2001:2::1",          // benchmarking
+            "2001:db8::1",        // documentation
+            "3fff:fff::1",        // documentation (RFC 9637)
+            "5f00::1",            // SRv6 SIDs
+            "fec0::1",            // site-local
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_forbidden_ip(ip), "{s} should be forbidden");
+        }
+        for s in [
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "4000::1",
+            "2001:3::1",
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!is_forbidden_ip(ip), "{s} should be allowed");
         }
     }
 

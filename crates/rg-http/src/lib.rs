@@ -565,6 +565,10 @@ pub struct HttpServerConfig {
     pub rate_limit_agent_max: u32,
     /// Window duration (seconds) for the bot-account limiter.
     pub rate_limit_agent_window_secs: u64,
+    /// Requests one client may make to global search without a session or
+    /// token, per `rate_limit_search_window_secs`. `0` disables the limiter.
+    pub rate_limit_search_max: u32,
+    pub rate_limit_search_window_secs: u64,
     /// SMTP configuration for email notifications (None = disabled).
     pub smtp_config: Option<rg_core::email::SmtpConfig>,
     /// TLS configuration: (cert_path, key_path). None = HTTP only.
@@ -673,10 +677,19 @@ async fn run_with_listener(
         config.rate_limit_agent_max,
         config.rate_limit_agent_window_secs,
     );
+    // Anonymous global search: keyed by client address like the credential
+    // limiter, on by default while the global limiter is not.
+    let search_rate_limiter = rate_limit::RateLimiter::with_resolver(
+        config.rate_limit_search_max,
+        config.rate_limit_search_window_secs,
+        client_ip.clone(),
+    )
+    .with_max_keys(config.rate_limit_max_keys);
 
     rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
     auth_rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
     agent_rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
+    search_rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
 
     // Detached webhook delivery is triggered below rg-http from many domains,
     // so publish the one-instance-per-process policy before any route or
@@ -810,7 +823,12 @@ async fn run_with_listener(
     // third clone of the global one that nothing ever read — a handler reaching
     // for "the limiter in the state" would have taken an object whose budget
     // nobody spends, i.e. a limit that limits nothing (card_11cba7708615).
-    let app = routes::create_router(state.clone(), rate_limiter, auth_rate_limiter);
+    let app = routes::create_router(
+        state.clone(),
+        rate_limiter,
+        auth_rate_limiter,
+        search_rate_limiter,
+    );
 
     tokio::spawn(api::ci_retention::run_cleanup_loop(
         state.clone(),
@@ -1043,7 +1061,7 @@ pub fn create_router_for_test_with_static_files(state: AppState) -> Router {
 
 /// Create the production router in tests with both rate limiters supplied.
 ///
-/// The two limiters are the only thing production's stack carries that the test
+/// The per-client limiters are the only thing production's stack carries that the test
 /// router does not (see `routes::apply_middleware`), which makes them the only
 /// thing no ordinary integration test can notice going missing. A test that
 /// wants to prove they are mounted builds the router here with a budget small
@@ -1055,7 +1073,23 @@ pub fn create_router_for_test_with_rate_limits(
     rate_limiter: rate_limit::RateLimiter,
     auth_rate_limiter: rate_limit::RateLimiter,
 ) -> Router {
-    routes::create_router(state, rate_limiter, auth_rate_limiter)
+    create_router_for_test_with_all_rate_limits(
+        state,
+        rate_limiter,
+        auth_rate_limiter,
+        rate_limit::RateLimiter::new(0, 60),
+    )
+}
+
+/// [`create_router_for_test_with_rate_limits`] with the anonymous-search
+/// limiter too, for the test that proves it is mounted.
+pub fn create_router_for_test_with_all_rate_limits(
+    state: AppState,
+    rate_limiter: rate_limit::RateLimiter,
+    auth_rate_limiter: rate_limit::RateLimiter,
+    search_rate_limiter: rate_limit::RateLimiter,
+) -> Router {
+    routes::create_router(state, rate_limiter, auth_rate_limiter, search_rate_limiter)
 }
 
 /// The test router plus the declared access level of every route in it.
