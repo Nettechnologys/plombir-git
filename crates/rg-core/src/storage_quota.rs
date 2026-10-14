@@ -2,10 +2,11 @@
 //! consult before they store another byte.
 //!
 //! Bytes land in several unrelated stores — LFS, release assets, attachments,
-//! CI caches and artifacts, packages, OCI blobs (git does not count: the
-//! object database is the repository itself) — and each one had its own
-//! per-request ceiling or none, so an account could fill the volume that holds
-//! the git data and the database through whichever store had no total.
+//! CI caches and artifacts, packages, OCI blobs, manifests and the staging of
+//! open upload sessions (git does not count: the object database is the
+//! repository itself) — and each one had its own per-request ceiling or none,
+//! so an account could fill the volume that holds the git data and the
+//! database through whichever store had no total.
 //! [`usage`] answers the sum, [`check_room`] answers whether an incoming write
 //! fits, and the routes answer 413 (LFS: the spec's per-object 507) when it
 //! does not.
@@ -34,7 +35,8 @@ use sea_orm::DatabaseConnection;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct StorageLimits {
     /// Total bytes one repository may hold across LFS, releases, attachments,
-    /// CI caches and artifacts, packages and OCI blobs.
+    /// CI caches and artifacts, packages, and OCI blobs, manifests and open
+    /// upload sessions.
     pub repo_quota_bytes: Option<u64>,
     /// Cumulative bytes of **one OCI upload session**, across all its PATCHes
     /// and the final PUT. The HTTP body limit bounds a single request, not a
@@ -67,6 +69,13 @@ pub struct StorageUsage {
     pub package_files: u64,
     pub oci_bytes: u64,
     pub oci_blobs: u64,
+    pub oci_manifest_bytes: u64,
+    pub oci_manifests: u64,
+    /// What open upload sessions hold in staging, by the offsets they
+    /// acknowledge. Counted so that sessions run side by side share one
+    /// budget instead of each being checked as if it were alone.
+    pub oci_staging_bytes: u64,
+    pub oci_sessions: u64,
 }
 
 impl StorageUsage {
@@ -81,6 +90,8 @@ impl StorageUsage {
             self.artifact_bytes,
             self.package_bytes,
             self.oci_bytes,
+            self.oci_manifest_bytes,
+            self.oci_staging_bytes,
         ]
         .into_iter()
         .fold(0_u64, u64::saturating_add)
@@ -175,6 +186,10 @@ pub async fn usage(db: &DatabaseConnection, repo_id: i64) -> Result<StorageUsage
     let (package_files, package_bytes) =
         rg_db::ops::package_file_ops::repo_usage(db, repo_id).await?;
     let (oci_blobs, oci_bytes) = rg_db::ops::oci_ops::repo_blob_usage(db, repo_id).await?;
+    let (oci_manifests, oci_manifest_bytes) =
+        rg_db::ops::oci_ops::repo_manifest_usage(db, repo_id).await?;
+    let (oci_sessions, oci_staging_bytes) =
+        rg_db::ops::oci_ops::repo_upload_usage(db, repo_id).await?;
 
     let bytes = |value: i64| u64::try_from(value).unwrap_or(0);
     Ok(StorageUsage {
@@ -191,6 +206,10 @@ pub async fn usage(db: &DatabaseConnection, repo_id: i64) -> Result<StorageUsage
         package_files,
         oci_bytes: bytes(oci_bytes),
         oci_blobs,
+        oci_manifest_bytes: bytes(oci_manifest_bytes),
+        oci_manifests,
+        oci_staging_bytes: bytes(oci_staging_bytes),
+        oci_sessions,
     })
 }
 
@@ -236,9 +255,11 @@ mod tests {
             artifact_bytes: 7,
             package_bytes: 5,
             oci_bytes: 6,
+            oci_manifest_bytes: 8,
+            oci_staging_bytes: 9,
             ..Default::default()
         };
-        assert_eq!(usage.total_bytes(), 28);
+        assert_eq!(usage.total_bytes(), 45);
     }
 
     #[test]

@@ -1568,6 +1568,28 @@ pub async fn put_manifest(
         }
     }
 
+    // The repository's budget, before the manifest is stored. The same digest
+    // pushed again (a re-tag) stores nothing new and is not charged.
+    if state.storage_limits.repo_quota_bytes.is_some() {
+        let refusal = match rg_db::ops::oci_ops::find_manifest_by_digest(
+            &state.db,
+            oci_repo.id,
+            &parsed.digest,
+        )
+        .await
+        {
+            Ok(Some(_)) => None,
+            Ok(None) => budget_refusal(&state, oci_repo.repo_id, body.len() as i64).await,
+            Err(error) => Some(oci_internal(
+                anyhow::Error::new(error)
+                    .context("failed to look the manifest up before the storage budget check"),
+            )),
+        };
+        if let Some(refusal) = refusal {
+            return refusal;
+        }
+    }
+
     // Store manifest on disk, under a lease on the key it is stored at.
     //
     // `store_manifest` deduplicates the same way `finalize_upload` does, and
@@ -2299,6 +2321,14 @@ async fn handle_mount(
         Err(error) => return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
     };
 
+    // A mount is a write to the destination like an upload is: the blob gets
+    // a row of its own there, and on a backend without links its own bytes.
+    if let Some(refusal) =
+        mount_budget_refusal(state, &oci_repo, from_owner, from_repo, mount_digest).await
+    {
+        return refusal;
+    }
+
     // Copy blob file via hardlink (or fallback to streaming copy) — avoids
     // memory copy. Same publication protocol as a finalized upload: a mount
     // publishes into the destination repository's content-addressed key, so a
@@ -2335,6 +2365,52 @@ async fn handle_mount(
         // push is still holding are retryable and a flat `500` says they are
         // not — ask the error which.
         Err(e) => oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
+    }
+}
+
+/// Whether `oci_repo`'s repository has room for the blob a mount would give it.
+///
+/// A digest the destination already stores adds nothing. Otherwise the blob's
+/// size is the source row's, read before anything is copied; a source with
+/// bytes but no row is a blob no read path serves either, and is answered as
+/// missing rather than mounted at a size nobody recorded.
+async fn mount_budget_refusal(
+    state: &AppState,
+    oci_repo: &rg_db::entities::oci_repository::Model,
+    from_owner: &str,
+    from_repo: &str,
+    digest: &str,
+) -> Option<Response> {
+    state.storage_limits.repo_quota_bytes?;
+    match rg_db::ops::oci_ops::find_blob(&state.db, oci_repo.id, digest).await {
+        Ok(Some(_)) => return None,
+        Ok(None) => {}
+        Err(error) => {
+            return Some(oci_internal(
+                anyhow::Error::new(error)
+                    .context("failed to look the mounted blob up in its destination"),
+            ))
+        }
+    }
+    let source = match find_oci_repo(&state.db, from_owner, from_repo).await {
+        Ok(Some(source)) => source,
+        Ok(None) => {
+            return Some(oci_not_found(
+                error_codes::BLOB_UNKNOWN,
+                "mount source blob not found",
+            ))
+        }
+        Err(error) => return Some(oci_internal(error)),
+    };
+    match rg_db::ops::oci_ops::find_blob(&state.db, source.id, digest).await {
+        Ok(Some(blob)) => budget_refusal(state, oci_repo.repo_id, blob.size).await,
+        Ok(None) => Some(oci_not_found(
+            error_codes::BLOB_UNKNOWN,
+            "mount source blob not found",
+        )),
+        Err(error) => Some(oci_internal(
+            anyhow::Error::new(error).context("failed to look the mount source blob up"),
+        )),
     }
 }
 
@@ -2615,7 +2691,8 @@ pub async fn chunk_upload(
             // fails the next request's accountability check and the digest at
             // finalize, which would read as the client's corruption.
             if let Some(refusal) =
-                session_budget_refusal(&state, upload.oci_repository_id, total_size).await
+                session_budget_refusal(&state, upload.oci_repository_id, total_size - recorded_size)
+                    .await
             {
                 return refuse_after_append(&file_path, recorded_size, refusal).await;
             }
@@ -3065,7 +3142,8 @@ pub async fn complete_upload(
         {
             Ok(Some(_)) => None,
             Ok(None) => {
-                session_budget_refusal(&state, upload.oci_repository_id, staged.total).await
+                session_budget_refusal(&state, upload.oci_repository_id, staged.total - recorded)
+                    .await
             }
             Err(error) => Some(oci_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3369,41 +3447,46 @@ async fn stream_body_to_file(
     })
 }
 
-/// Whether a session holding `staged_total` bytes may continue under its
-/// repository's budget: `None` when it fits (or no budget is set, which asks
-/// nothing), else the response to give. A database that cannot answer is a
-/// 500, never a 413.
+/// Whether a session may add `incoming` bytes under its repository's budget:
+/// `None` when they fit (or no budget is set, which asks nothing), else the
+/// response to give. A database that cannot answer is a 500, never a 413.
+///
+/// `incoming` is what the session holds beyond the offset its row
+/// acknowledges. The acknowledged bytes are already in the budget — every open
+/// session's staging is — so charging the session's whole total again would
+/// count them twice, and charging nothing for staging at all let K sessions
+/// side by side each pass alone.
 async fn session_budget_refusal(
     state: &AppState,
     oci_repository_id: i64,
-    staged_total: i64,
+    incoming: i64,
 ) -> Option<Response> {
     state.storage_limits.repo_quota_bytes?;
-    let internal = |error: anyhow::Error| {
-        oci_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "UNKNOWN",
-            &format!("{error:#}"),
-        )
-    };
     let repo_id = match rg_db::ops::oci_ops::find_repo_row_by_id(&state.db, oci_repository_id).await
     {
         Ok(Some(row)) => row.repo_id,
         Ok(None) => {
-            return Some(internal(anyhow::anyhow!(
+            return Some(oci_internal(anyhow::anyhow!(
                 "OCI repository {oci_repository_id} of an upload session is missing"
             )))
         }
         Err(error) => {
-            return Some(internal(anyhow::Error::new(error).context(
+            return Some(oci_internal(anyhow::Error::new(error).context(
                 "failed to resolve the repository of an OCI upload session",
             )))
         }
     };
+    budget_refusal(state, repo_id, incoming).await
+}
+
+/// Whether `repo_id`'s budget has room for `incoming` more bytes, answered
+/// the way the registry answers: `None`, a 413 `SIZE_INVALID` that names the
+/// numbers, or a 500 for a database that could not say.
+async fn budget_refusal(state: &AppState, repo_id: i64, incoming: i64) -> Option<Response> {
     match rg_core::storage_quota::check_room(
         &state.db,
         repo_id,
-        u64::try_from(staged_total).unwrap_or(0),
+        u64::try_from(incoming).unwrap_or(0),
         &state.storage_limits,
     )
     .await
@@ -3414,8 +3497,16 @@ async fn session_budget_refusal(
             error_codes::SIZE_INVALID,
             &exceeded.message,
         )),
-        Err(rg_core::storage_quota::QuotaError::Db(error)) => Some(internal(error)),
+        Err(rg_core::storage_quota::QuotaError::Db(error)) => Some(oci_internal(error)),
     }
+}
+
+fn oci_internal(error: anyhow::Error) -> Response {
+    oci_err(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "UNKNOWN",
+        &format!("{error:#}"),
+    )
 }
 
 /// Answer `refusal` for a request whose bytes are already in staging, after

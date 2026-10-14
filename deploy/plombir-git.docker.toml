@@ -153,8 +153,9 @@ allow_insecure_http_origins = []
 # Storage ceilings, every one opt-in: 0 (the default) is no ceiling, so an
 # upgrade never starts refusing pushes to a repository that already holds more.
 # repo_quota_mb is one repository's total across LFS objects, release assets,
-# attachments, CI caches and artifacts, packages and OCI blobs (git itself is
-# not counted); a write that would pass it answers 413, an LFS batch object 507.
+# attachments, CI caches and artifacts, packages, and OCI blobs, manifests and
+# open uploads (git itself is not counted); a write that would pass it answers
+# 413, an LFS batch object 507.
 repo_quota_mb = 0
 # Cumulative size of one OCI blob upload (a `docker push` layer) across every
 # chunk and the final PUT; the HTTP body limit bounds one request only.

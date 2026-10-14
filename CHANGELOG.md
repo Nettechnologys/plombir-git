@@ -25,8 +25,9 @@ This project records user-facing changes here. The format follows
   an instance administrator from the shell, or promotes an existing account.
 - `[limits]`: opt-in storage ceilings. `repo_quota_mb` caps one
   repository's total across LFS objects, release assets, attachments, CI
-  caches and artifacts, packages and OCI blobs, whichever way the bytes
-  arrive: the embedded CI runner, a pull mirror or an import fetching LFS
+  caches and artifacts, packages, and OCI blobs, manifests and the staging of
+  open upload sessions (which therefore share one budget), whichever way the
+  bytes arrive — an OCI cross-repository mount included: the embedded CI runner, a pull mirror or an import fetching LFS
   objects (an object past the budget is reported as missing, by oid), a fork
   copying them and a fork pull request merge adopting them (both refused with
   `413` before anything moves); `oci_blob_max_mb` caps one OCI upload

@@ -696,6 +696,289 @@ async fn oci_completion_rechecks_the_repository_budget() {
     );
 }
 
+/// Push one blob through a whole session, returning its digest.
+async fn push_oci_blob(base: &str, token: &str, owner: &str, repo: &str, payload: &[u8]) -> String {
+    let client = reqwest::Client::new();
+    let (location, _) = start_oci_upload(base, token, owner, repo).await;
+    let patched = client
+        .patch(format!("{base}{location}"))
+        .bearer_auth(token)
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), 202, "blob chunk failed");
+    let digest = sha256(payload);
+    let finished = client
+        .put(format!("{base}{location}"))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_blob_push_created(finished, payload.len()).await;
+    digest
+}
+
+/// Store `size` bytes of attachment directly, to fill a repository's budget.
+async fn fill_with_attachment(
+    db: &rg_db::DatabaseConnection,
+    repo_id: i64,
+    owner_id: i64,
+    size: i64,
+) {
+    rg_db::ops::attachment_ops::create(
+        db,
+        rg_db::entities::attachment::ActiveModel {
+            id: sea_orm::NotSet,
+            uuid: Set(uuid::Uuid::new_v4().to_string()),
+            repo_id: Set(repo_id),
+            uploader_id: Set(Some(owner_id)),
+            issue_id: Set(None),
+            pull_request_id: Set(None),
+            issue_comment_id: Set(None),
+            review_comment_id: Set(None),
+            filename: Set("filler.bin".to_string()),
+            blob_key: Set(format!("attachments/{repo_id}/{}", uuid::Uuid::new_v4())),
+            content_type: Set("application/octet-stream".to_string()),
+            size: Set(size),
+            download_count: Set(0),
+            created_at: Set(chrono::Utc::now()),
+            sha256: Set(None),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Every session was checked as if it were alone, so K sessions side by side
+/// could each stage up to the whole budget. A session's acknowledged staging
+/// now counts against every other write.
+#[tokio::test]
+async fn oci_sessions_side_by_side_share_one_budget() {
+    let (base, db) = spawn_test_app_with_overrides(overrides_with(|limits| {
+        limits.repo_quota_bytes = Some(300);
+    }))
+    .await;
+    let (token, _) = register_full(&base, "oci-pair-owner", "oci-pair-owner@example.com").await;
+    create_repo(&base, &token, "oci-pair").await;
+    let client = reqwest::Client::new();
+
+    let (first, first_uuid) = start_oci_upload(&base, &token, "oci-pair-owner", "oci-pair").await;
+    let (second, second_uuid) = start_oci_upload(&base, &token, "oci-pair-owner", "oci-pair").await;
+    // Two chunks: the second is charged the 50 bytes it adds, not the 200 the
+    // session would then hold on top of the 150 it already acknowledged.
+    for (range, len) in [("0-149", 150), ("150-199", 50)] {
+        let staged = client
+            .patch(format!("{base}{first}"))
+            .bearer_auth(&token)
+            .header("content-range", range)
+            .body(vec![b'a'; len])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            staged.status(),
+            202,
+            "the first session fits alone ({range})"
+        );
+    }
+
+    let refused = client
+        .patch(format!("{base}{second}"))
+        .bearer_auth(&token)
+        .header("content-range", "0-199")
+        .body(vec![b'b'; 200])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        413,
+        "the second session must see what the first one staged"
+    );
+    let second_row = rg_db::ops::oci_ops::find_upload(&db, &second_uuid)
+        .await
+        .unwrap()
+        .expect("the refused session stays resumable");
+    assert_eq!(second_row.bytes_uploaded, 0);
+
+    // The first session is charged only what it adds: its own staging is
+    // already in the sum, and completing it does not count it twice.
+    let digest = sha256(&[b'a'; 200]);
+    let finished = client
+        .put(format!("{base}{first}"))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_blob_push_created(finished, 200).await;
+    assert!(
+        rg_db::ops::oci_ops::find_upload(&db, &first_uuid)
+            .await
+            .unwrap()
+            .is_none(),
+        "the completed session is gone"
+    );
+}
+
+/// A cross-repository mount gives the destination a blob of its own, and was
+/// never asked about the destination's budget.
+#[tokio::test]
+async fn an_oci_mount_past_the_destination_budget_is_refused() {
+    let (base, db) = spawn_test_app_with_overrides(overrides_with(|limits| {
+        limits.repo_quota_bytes = Some(300);
+    }))
+    .await;
+    let (token, owner_id) =
+        register_full(&base, "oci-mount-quota", "oci-mount-quota@example.com").await;
+    create_repo(&base, &token, "oci-source").await;
+    let target_id = create_repo(&base, &token, "oci-target").await;
+    let roomy_id = create_repo(&base, &token, "oci-roomy").await;
+
+    let digest = push_oci_blob(&base, &token, "oci-mount-quota", "oci-source", &[b'm'; 200]).await;
+    fill_with_attachment(&db, target_id, owner_id, 150).await;
+
+    let mount = |repo: &'static str| {
+        let (base, token, digest) = (base.clone(), token.clone(), digest.clone());
+        async move {
+            reqwest::Client::new()
+                .post(format!("{base}/v2/oci-mount-quota/{repo}/blobs/uploads/"))
+                .query(&[
+                    ("mount", digest.as_str()),
+                    ("from", "oci-mount-quota/oci-source"),
+                ])
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let refused = mount("oci-target").await;
+    assert_eq!(refused.status(), 413, "150 held + 200 mounted > 300");
+    let body = refused.text().await.unwrap();
+    assert!(
+        body.contains("repo_quota_mb"),
+        "the refusal names the budget: {body}"
+    );
+    assert_eq!(
+        rg_db::ops::oci_ops::repo_blob_usage(&db, target_id)
+            .await
+            .unwrap(),
+        (0, 0),
+        "a refused mount must not record the blob"
+    );
+
+    assert_eq!(mount("oci-roomy").await.status(), 201, "a mount that fits");
+    assert_eq!(
+        rg_db::ops::oci_ops::repo_blob_usage(&db, roomy_id)
+            .await
+            .unwrap(),
+        (1, 200)
+    );
+}
+
+/// Manifests were stored and never counted. One past the budget is refused
+/// before it is stored; the same manifest under another tag stores nothing new
+/// and is not charged again.
+#[tokio::test]
+async fn an_oci_manifest_past_the_budget_is_refused_and_a_retag_is_free() {
+    let (base, db) = spawn_test_app_with_overrides(overrides_with(|limits| {
+        limits.repo_quota_bytes = Some(4096);
+    }))
+    .await;
+    let (token, owner_id) = register_full(
+        &base,
+        "oci-manifest-quota",
+        "oci-manifest-quota@example.com",
+    )
+    .await;
+    let repo_id = create_repo(&base, &token, "oci-manifest").await;
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let layer = b"one small layer";
+    let config_digest =
+        push_oci_blob(&base, &token, "oci-manifest-quota", "oci-manifest", config).await;
+    let layer_digest =
+        push_oci_blob(&base, &token, "oci-manifest-quota", "oci-manifest", layer).await;
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": config.len(),
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar",
+            "digest": layer_digest,
+            "size": layer.len(),
+        }],
+        "annotations": {"padding": "p".repeat(1024)},
+    })
+    .to_string();
+    let put = |tag: &'static str| {
+        let (base, token, manifest) = (base.clone(), token.clone(), manifest.clone());
+        async move {
+            reqwest::Client::new()
+                .put(format!(
+                    "{base}/v2/oci-manifest-quota/oci-manifest/manifests/{tag}"
+                ))
+                .bearer_auth(&token)
+                .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                .body(manifest)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Leave less room than the manifest needs.
+    let used = rg_core::storage_quota::usage(&db, repo_id)
+        .await
+        .unwrap()
+        .total_bytes();
+    fill_with_attachment(&db, repo_id, owner_id, (4096 - used - 100) as i64).await;
+    let refused = put("v1").await;
+    assert_eq!(
+        refused.status(),
+        413,
+        "the manifest does not fit what is left"
+    );
+    assert_eq!(
+        rg_db::ops::oci_ops::repo_manifest_usage(&db, repo_id)
+            .await
+            .unwrap(),
+        (0, 0),
+        "a refused manifest must not be stored"
+    );
+
+    // With room it stores, and counts.
+    rg_db::entities::attachment::Entity::delete_many()
+        .filter(rg_db::entities::attachment::Column::RepoId.eq(repo_id))
+        .exec(&db)
+        .await
+        .unwrap();
+    assert_eq!(put("v1").await.status(), 201);
+    let (manifests, manifest_bytes) = rg_db::ops::oci_ops::repo_manifest_usage(&db, repo_id)
+        .await
+        .unwrap();
+    assert_eq!((manifests, manifest_bytes), (1, manifest.len() as i64));
+
+    // Full to the last byte: another tag for the same digest still goes in.
+    let used = rg_core::storage_quota::usage(&db, repo_id)
+        .await
+        .unwrap()
+        .total_bytes();
+    fill_with_attachment(&db, repo_id, owner_id, (4096 - used) as i64).await;
+    assert_eq!(
+        put("latest").await.status(),
+        201,
+        "a re-tag stores nothing new and must not be charged"
+    );
+}
+
 // ── Packages ─────────────────────────────────────────────────
 
 #[tokio::test]

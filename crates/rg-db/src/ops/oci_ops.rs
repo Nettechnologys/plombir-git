@@ -613,13 +613,57 @@ pub async fn upsert_tag_manifest(
 
 // ── OCI Blob ────────────────────────────────────────────────
 
-/// How many blobs `repo_id` has stored, and how many bytes they declare.
-pub async fn repo_blob_usage(db: &DatabaseConnection, repo_id: i64) -> anyhow::Result<(u64, i64)> {
-    let oci_repository_ids = oci_repository::Entity::find()
+/// The ids of `repo_id`'s OCI repositories, as a subquery the usage sums
+/// filter on.
+fn oci_repository_ids_of(repo_id: i64) -> sea_orm::sea_query::SelectStatement {
+    oci_repository::Entity::find()
         .select_only()
         .column(oci_repository::Column::Id)
         .filter(oci_repository::Column::RepoId.eq(repo_id))
-        .into_query();
+        .into_query()
+}
+
+/// How many manifests `repo_id` has stored, and how many bytes they declare.
+pub async fn repo_manifest_usage(
+    db: &DatabaseConnection,
+    repo_id: i64,
+) -> anyhow::Result<(u64, i64)> {
+    super::aggregate::count_and_sum(
+        db,
+        oci_manifest::Entity::find().filter(
+            oci_manifest::Column::OciRepositoryId.in_subquery(oci_repository_ids_of(repo_id)),
+        ),
+        oci_manifest::Column::Id,
+        oci_manifest::Column::Size,
+        "db: sum the OCI manifests of a repository",
+    )
+    .await
+}
+
+/// How many upload sessions `repo_id` has open, and how many bytes their
+/// staging files hold by the offsets the sessions acknowledge.
+///
+/// Expired sessions count until the sweep removes them: their staging is on
+/// the volume until then.
+pub async fn repo_upload_usage(
+    db: &DatabaseConnection,
+    repo_id: i64,
+) -> anyhow::Result<(u64, i64)> {
+    super::aggregate::count_and_sum(
+        db,
+        oci_upload::Entity::find().filter(
+            oci_upload::Column::OciRepositoryId.in_subquery(oci_repository_ids_of(repo_id)),
+        ),
+        oci_upload::Column::Id,
+        oci_upload::Column::BytesUploaded,
+        "db: sum the staged OCI uploads of a repository",
+    )
+    .await
+}
+
+/// How many blobs `repo_id` has stored, and how many bytes they declare.
+pub async fn repo_blob_usage(db: &DatabaseConnection, repo_id: i64) -> anyhow::Result<(u64, i64)> {
+    let oci_repository_ids = oci_repository_ids_of(repo_id);
     super::aggregate::count_and_sum(
         db,
         oci_blob::Entity::find()

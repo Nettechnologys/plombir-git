@@ -9,8 +9,9 @@
 //! PostgreSQL and MySQL smoke jobs for exactly that reason.
 
 use rg_db::entities::{
-    attachment, ci_cache_entry, issue, lfs_object, oci_blob, oci_repository, package, package_file,
-    package_registry, package_version, release, release_asset, repository, time_entry,
+    attachment, ci_cache_entry, issue, lfs_object, oci_blob, oci_manifest, oci_repository, package,
+    package_file, package_registry, package_version, release, release_asset, repository,
+    time_entry,
 };
 use rg_db::sea_orm::{ActiveModelTrait, DatabaseConnection, NotSet, Set};
 
@@ -400,6 +401,43 @@ async fn storage_budget_sums_decode_in_every_store_on_every_backend() {
             .await
             .expect("OCI blob SUM must decode"),
         (2, BIG + 11)
+    );
+    for (index, size) in [BIG, 19].into_iter().enumerate() {
+        oci_manifest::ActiveModel {
+            oci_repository_id: Set(oci_repo.id),
+            digest: Set(format!("sha256:{:064x}", index + 100)),
+            media_type: Set("application/vnd.oci.image.manifest.v1+json".to_string()),
+            size: Set(size),
+            manifest_json: Set("{}".to_string()),
+            schema_version: Set(2),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("store an OCI manifest");
+    }
+    assert_eq!(
+        rg_db::ops::oci_ops::repo_manifest_usage(&db, repo_id)
+            .await
+            .expect("OCI manifest SUM must decode"),
+        (2, BIG + 19)
+    );
+    for (index, size) in [BIG, 23].into_iter().enumerate() {
+        let session =
+            rg_db::ops::oci_ops::create_upload(&db, oci_repo.id, &format!("{tag}-{index}"), "")
+                .await
+                .expect("open an OCI upload session");
+        rg_db::ops::oci_ops::update_upload_progress(&db, oci_repo.id, &session.uuid, size)
+            .await
+            .expect("record the session's progress");
+    }
+    assert_eq!(
+        rg_db::ops::oci_ops::repo_upload_usage(&db, repo_id)
+            .await
+            .expect("OCI staging SUM must decode"),
+        (2, BIG + 23)
     );
     assert_eq!(
         rg_db::ops::oci_ops::find_repo_row_by_id(&db, oci_repo.id)
