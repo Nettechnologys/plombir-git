@@ -17,7 +17,6 @@ tokio = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 futures = { workspace = true }
-fs2 = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -38,15 +37,22 @@ uuid = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
 prometheus = { version = "0.13", default-features = false }
-tokio-util = { version = "0.7", features = ["io", "rt"] }
-http-body-util = "0.1"
-tokio-stream = "0.1"
-zstd = "0.13"
-http-body = "1"
-tempfile = "3"
-urlencoding = "2"
+tokio-util = { workspace = true, features = ["io", "rt"] }
+http-body-util = { workspace = true }
+tokio-stream = { workspace = true }
+zstd = { workspace = true }
+http-body = { workspace = true }
+tempfile = { workspace = true }
+urlencoding = { workspace = true }
+
+[features]
+# `create_router_for_test*`: the production route set without its per-client
+# rate limiters. Only this crate's integration tests build them, through the
+# self dev-dependency below; a binary linking rg-http never sees them.
+test-support = []
 
 [dev-dependencies]
+rg-http = { path = ".", features = ["test-support"] }
 sea-orm-migration = { workspace = true }
 # The MCP server's tools are thin wrappers over these routes, and nothing in
 # `rg-mcp` can tell whether the path one of them builds is a route this crate
@@ -61,8 +67,8 @@ rg-runner = { path = "../rg-runner" }
 reqwest = { workspace = true, features = ["multipart"] }
 serde_urlencoded = "0.7"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
-tar = "0.4"
-flate2 = "1"
+tar = { workspace = true }
+flate2 = { workspace = true }
 zip = { workspace = true }
 socket2 = "0.5"
 jsonwebtoken = { workspace = true }

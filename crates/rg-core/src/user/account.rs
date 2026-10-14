@@ -967,6 +967,55 @@ mod tests {
         .unwrap()
     }
 
+    /// The token a confirmation mail carries (`new_link_token`) is the one
+    /// [`confirm`] spends, and a token next to it is not (card_1274e045904e):
+    /// each side hashes on its own.
+    #[tokio::test]
+    async fn an_issued_confirmation_token_is_the_one_confirm_accepts() {
+        static POLICY: std::sync::OnceLock<crate::auth::ldap::LdapTransportPolicy> =
+            std::sync::OnceLock::new();
+        let directories = LdapDirectories {
+            encryption_key: "test-encryption-key",
+            transport_policy: POLICY.get_or_init(Default::default),
+        };
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            1,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = local_account(&db, "confirm-owner").await;
+        let (token, token_hash) = new_link_token();
+        rg_db::ops::email_confirmation_ops::replace_pending_email_verification(
+            &db,
+            user.id,
+            &user.email,
+            &token_hash,
+            Utc::now() + EMAIL_CONFIRMATION_LIFETIME,
+        )
+        .await
+        .unwrap();
+
+        let mut altered = token.clone();
+        let last = altered.pop().expect("a non-empty token");
+        altered.push(if last == '0' { '1' } else { '0' });
+        assert!(
+            confirm(&db, directories, None, &altered).await.is_err(),
+            "a token that was never issued confirms nothing"
+        );
+
+        match confirm(&db, directories, None, &token)
+            .await
+            .expect("the issued token confirms the address")
+        {
+            Confirmed::EmailVerified(verified) => assert_eq!(verified.id, user.id),
+            _ => panic!("an address verification link verified something else"),
+        }
+    }
+
     /// A generated password has to clear the rule every password here follows,
     /// or an administrator would hand over one its holder cannot even log in
     /// with to replace.

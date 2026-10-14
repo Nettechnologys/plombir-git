@@ -245,6 +245,7 @@ pub async fn trigger_pull_request_ci(
         .trigger
         .trigger_pipeline(crate::ci::TriggerPipelineParams {
             db,
+            repo_root,
             repo_path: &repo_path,
             repo_id: repository.id,
             commit_sha: head_sha,

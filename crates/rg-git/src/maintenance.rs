@@ -219,13 +219,13 @@ fn sweep_stale_quarantine(repo_path: &Path) -> Result<()> {
             let lock_path = candidate.path().join("active.lock");
             let _lock = if lock_path.is_file() {
                 let lock = std::fs::File::open(lock_path)?;
-                match fs2::FileExt::try_lock_exclusive(&lock) {
+                match lock.try_lock() {
                     Ok(()) => Some(lock),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(std::fs::TryLockError::WouldBlock) => {
                         // Another process still owns this request.
                         continue;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
                 }
             } else {
                 None
@@ -270,7 +270,7 @@ mod tests {
         let stale = objects.join(".receive-quarantine-stale");
         std::fs::create_dir(&stale).unwrap();
         let active = std::fs::File::create(stale.join("active.lock")).unwrap();
-        fs2::FileExt::lock_exclusive(&active).unwrap();
+        active.lock().unwrap();
         let old = SystemTime::now() - STALE_QUARANTINE - Duration::from_secs(60);
         std::fs::File::open(&stale)
             .unwrap()

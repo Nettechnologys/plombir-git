@@ -2902,14 +2902,14 @@ async fn acquire_upload_file_lock(file_path: &std::path::Path) -> anyhow::Result
         .into_std()
         .await;
     loop {
-        match fs2::FileExt::try_lock_exclusive(&file) {
+        match file.try_lock() {
             Ok(()) => return Ok(UploadFileLock { _file: file }),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(std::fs::TryLockError::WouldBlock) => {
                 // An async wait keeps a slow first upload from occupying a
                 // Tokio blocking-pool thread per retry.
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            Err(error) => {
+            Err(std::fs::TryLockError::Error(error)) => {
                 return Err(anyhow::anyhow!(
                     "failed to lock OCI upload file {} for an upload operation: {error}",
                     file_path.display()

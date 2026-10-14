@@ -524,30 +524,26 @@ pub async fn create_bot_token(
         Err(error) => return error.into_response(),
     };
 
-    // Generated only after every field is known to be valid: a rejected
-    // request never mints even a transient raw token.
-    let raw_token = super::users::generate_token();
-    let model = rg_db::entities::access_token::ActiveModel {
-        id: sea_orm::NotSet,
-        user_id: sea_orm::Set(bot.id),
-        name: sea_orm::Set(body.name),
-        token_hash: sea_orm::Set(rg_db::token_digest(&raw_token)),
-        scopes: sea_orm::Set(BOT_TOKEN_SCOPES.to_string()),
-        expires_at: sea_orm::Set(expires_at),
-        last_used_at: sea_orm::Set(None),
-        created_at: sea_orm::Set(chrono::Utc::now()),
-        repo_restricted: sea_orm::Set(narrowing.repository_ids.is_some()),
-        mcp_tools: sea_orm::Set(narrowing.mcp_tools),
-        deny_protected_merge: sea_orm::Set(narrowing.deny_protected_merge),
-    };
-    let token = match rg_db::ops::token_ops::create(
+    // Issued only after every field is known to be valid: a rejected request
+    // never mints even a transient raw token.
+    let rg_core::auth::access_token::IssuedAccessToken {
+        raw: raw_token,
+        token,
+    } = match rg_core::auth::access_token::issue(
         &state.db,
-        model,
-        narrowing.repository_ids.as_deref().unwrap_or_default(),
+        rg_core::auth::access_token::NewAccessToken {
+            user_id: bot.id,
+            name: body.name,
+            scopes: BOT_TOKEN_SCOPES.to_string(),
+            expires_at,
+            repository_ids: narrowing.repository_ids,
+            mcp_tools: narrowing.mcp_tools,
+            deny_protected_merge: narrowing.deny_protected_merge,
+        },
     )
     .await
     {
-        Ok(token) => token,
+        Ok(issued) => issued,
         Err(error) => return AppError::from(error).into_response(),
     };
     // The token's name, scope and narrowing; never the token or its hash.

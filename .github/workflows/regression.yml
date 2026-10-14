@@ -544,13 +544,14 @@ jobs:
 
       # MySQL's default collation hands one repository to several spellings of
       # its address, and only here can a durable key built from the request's
-      # spelling show (card_7e82c1b1f642, card_3f1936e7d4a7).
+      # spelling show (card_7e82c1b1f642, card_3f1936e7d4a7, card_3b3d49c60ab1).
       - name: Prove storage follows the rows' spelling, and names fold, on MySQL
         run: >-
           cargo test -p rg-http --test integration -j 6 -- --ignored --nocapture
           oci_namespace_spelling_tests::
           repo_rebind_spelling_tests::
           repo_name_case_tests::
+          repo_address_spelling_tests::
 
       - name: Prove remote column widening keeps live MySQL rows
         run: cargo test -p rg-db --test integration -j 6 widened_columns_keep_live_rows_and_hold_accepted_values -- --nocapture

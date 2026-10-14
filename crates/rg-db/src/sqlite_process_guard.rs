@@ -101,9 +101,9 @@ fn acquire(database_url: &str, purpose: Purpose) -> Result<Option<SqliteProcessG
             )
         })?;
 
-    match fs2::FileExt::try_lock_exclusive(&file) {
+    match file.try_lock() {
         Ok(()) => Ok(Some(SqliteProcessGuard { _file: file })),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => match purpose {
+        Err(std::fs::TryLockError::WouldBlock) => match purpose {
             Purpose::Server => anyhow::bail!(
                 "SQLite database `{}` is already in use by another Plombir Git server or offline \
                  database operation; stop that process before starting this server",
@@ -127,7 +127,7 @@ fn acquire(database_url: &str, purpose: Purpose) -> Result<Option<SqliteProcessG
                 database_path.display()
             ),
         },
-        Err(error) => Err(error).with_context(|| {
+        Err(std::fs::TryLockError::Error(error)) => Err(error).with_context(|| {
             format!(
                 "acquire SQLite process lease `{}` for database `{}`",
                 lock_path.display(),

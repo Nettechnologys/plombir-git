@@ -1005,342 +1005,477 @@ fn read_setup_token_file(path: &Path) -> anyhow::Result<Option<String>> {
     Ok(Some(secret))
 }
 
-/// Initialise and run the Plombir Git server (HTTP + SSH).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_serve(
-    repo_root: Option<String>,
-    http_addr: Option<String>,
-    ssh_addr: Option<String>,
-    host_key: Option<String>,
-    db_url: Option<String>,
-    jwt_secret: Option<String>,
-    encryption_key: Option<String>,
-    docker: bool,
-    external_runners: bool,
-    allow_host_runner: bool,
-    rate_limit_max: Option<u32>,
-    rate_limit_window: Option<u64>,
-    rate_limit_trusted_proxies: Vec<String>,
+/// What `serve` was given on its command line, before the config file and the
+/// built-in defaults fill in the rest.
+pub(crate) struct ServeArgs {
+    pub(crate) repo_root: Option<String>,
+    pub(crate) http_addr: Option<String>,
+    pub(crate) ssh_addr: Option<String>,
+    pub(crate) host_key: Option<String>,
+    pub(crate) db_url: Option<String>,
+    pub(crate) jwt_secret: Option<String>,
+    pub(crate) encryption_key: Option<String>,
+    pub(crate) docker: bool,
+    pub(crate) external_runners: bool,
+    pub(crate) allow_host_runner: bool,
+    pub(crate) rate_limit_max: Option<u32>,
+    pub(crate) rate_limit_window: Option<u64>,
+    pub(crate) rate_limit_trusted_proxies: Vec<String>,
+    pub(crate) smtp_host: Option<String>,
+    pub(crate) smtp_port: Option<u16>,
+    pub(crate) smtp_user: Option<String>,
+    pub(crate) smtp_pass: Option<String>,
+    pub(crate) smtp_from: Option<String>,
+    pub(crate) tls_cert: Option<String>,
+    pub(crate) tls_key: Option<String>,
+    pub(crate) config: Option<String>,
+    pub(crate) log_file: Option<String>,
+    pub(crate) log_format: Option<crate::config::LogFormat>,
+    pub(crate) log_max_size_mb: Option<u64>,
+    pub(crate) log_max_files: Option<usize>,
+    pub(crate) listen_address_file: Option<String>,
+}
+
+/// The CLI values that are resolved only once logging is up, because their
+/// resolution can fail with a message an operator has to see.
+struct DeferredServeArgs {
     smtp_host: Option<String>,
-    smtp_port: Option<u16>,
     smtp_user: Option<String>,
     smtp_pass: Option<String>,
     smtp_from: Option<String>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
-    config: Option<String>,
-    log_file: Option<String>,
-    log_format: Option<crate::config::LogFormat>,
-    log_max_size_mb: Option<u64>,
-    log_max_files: Option<usize>,
     listen_address_file: Option<String>,
-) -> anyhow::Result<()> {
-    // ── Load config file (if specified) ────────────────────────
-    let cfg = if let Some(config_path) = &config {
-        Some(load_config_file(config_path.as_str())?)
-    } else {
-        None
-    };
+}
 
-    // Whether anyone *asked* for a size cap decides the rotation strategy
-    // below: explicitly set means size rotation, absent means daily rotation
-    // (the built-in default is only ever a placeholder for the config table).
-    let log_max_size_mb_was_set = log_max_size_mb.is_some()
-        || cfg
-            .as_ref()
-            .is_some_and(|c| c.logging.max_size_mb.is_some());
-    let resolved_log_format = log_format
-        .or_else(|| cfg.as_ref().and_then(|c| c.logging.format))
-        .unwrap_or_default();
+/// The per-client limiter knobs, each from the config file or its default.
+struct RateLimits {
+    trusted_proxies: Vec<rg_http::client_ip::TrustedProxy>,
+    max_keys: usize,
+    auth_max: u32,
+    auth_window: u64,
+    agent_max: u32,
+    agent_window: u64,
+    search_max: u32,
+    search_window: u64,
+}
 
-    // Resolve every dual-source knob in one place: CLI args > config file >
-    // built-in default.
-    let ResolvedSettings {
-        repo_root: resolved_repo_root,
-        state_permissions: resolved_state_permissions,
-        http_addr: resolved_http_addr,
-        ssh_addr: resolved_ssh_addr,
-        host_key: resolved_host_key,
-        db_url: resolved_db_url,
-        rate_limit_max: resolved_rate_limit_max,
-        rate_limit_window: resolved_rate_limit_window,
-        smtp_port: resolved_smtp_port,
-        log_max_size_mb: resolved_log_max_size_mb,
-        log_max_files: resolved_log_max_files,
-    } = resolve_settings(
-        CliSettings {
+/// The transport policies of every outbound client that may carry a
+/// credential somewhere an operator allowed to be plaintext.
+struct TransportPolicies {
+    import: rg_core::import::trust::ImportTransportPolicy,
+    oidc: rg_core::auth::sso::OidcTransportPolicy,
+    ldap: rg_core::auth::ldap::LdapTransportPolicy,
+    mirror: rg_core::mirror::transport::MirrorTransportPolicy,
+    webhook: rg_core::webhook::transport::WebhookTransportPolicy,
+}
+
+/// The configured timeouts and pool size, each from the config file or its
+/// default.
+struct ServeTimeouts {
+    job: u64,
+    git: u64,
+    git_stream: u64,
+    git_idle: u64,
+    db_connect: u64,
+    db_idle: u64,
+    db_max_connections: u32,
+    shutdown_grace: u64,
+}
+
+/// Every setting `serve` runs with: CLI args > config file > built-in default,
+/// resolved and range-checked before anything is created.
+///
+/// Resolving logs nothing. The subscriber is installed only after this, so a
+/// line written here went nowhere — which is how the warnings about plaintext
+/// credential transports and an open `/metrics` came to be printed to nobody.
+/// They are [`Self::announce`]d once logging is up.
+struct ServeSettings {
+    cfg: Option<crate::config::ConfigFile>,
+    log_max_size_mb_was_set: bool,
+    log_format: crate::config::LogFormat,
+    log_file: Option<String>,
+    base: ResolvedSettings,
+    encryption_key_file: PathBuf,
+    auth_secrets: AuthSecrets,
+    docker: bool,
+    external_runners: bool,
+    allow_host_runner: bool,
+    runner_labels: Vec<String>,
+    registration: rg_core::user::registration::RegistrationMode,
+    registration_source: RegistrationSource,
+    attestation_enabled: bool,
+    source_url: String,
+    rate_limits: RateLimits,
+    package_upload_max_bytes: usize,
+    storage_limits: rg_core::storage_quota::StorageLimits,
+    trusted_import_origins: rg_core::import::trust::TrustedImportOrigins,
+    transports: TransportPolicies,
+    external_url: Option<String>,
+    hsts_preload: bool,
+    external_webhook_secret: Option<String>,
+    metrics_enabled: bool,
+    metrics_token: Option<String>,
+    timeouts: ServeTimeouts,
+}
+
+impl ServeSettings {
+    fn resolve(args: ServeArgs) -> anyhow::Result<(Self, DeferredServeArgs)> {
+        let ServeArgs {
             repo_root,
             http_addr,
             ssh_addr,
             host_key,
             db_url,
+            jwt_secret,
+            encryption_key,
+            docker,
+            external_runners,
+            allow_host_runner,
             rate_limit_max,
             rate_limit_window,
+            rate_limit_trusted_proxies,
+            smtp_host,
             smtp_port,
+            smtp_user,
+            smtp_pass,
+            smtp_from,
+            tls_cert,
+            tls_key,
+            config,
+            log_file,
+            log_format,
             log_max_size_mb,
             log_max_files,
-        },
-        cfg.as_ref(),
-    );
+            listen_address_file,
+        } = args;
+        let cfg = config.as_deref().map(load_config_file).transpose()?;
 
-    // Git, gix, SQLite, the registry stores and embedded CI all create state.
-    // Several of those writers do not expose an open mode, so install the one
-    // policy they all inherit before the first creating filesystem call below
-    // (the optional log appender is the first one).
-    resolved_state_permissions.install();
+        // Whether anyone *asked* for a size cap decides the rotation strategy:
+        // explicitly set means size rotation, absent means daily rotation (the
+        // built-in default is only ever a placeholder for the config table).
+        let log_max_size_mb_was_set = log_max_size_mb.is_some()
+            || cfg
+                .as_ref()
+                .is_some_and(|c| c.logging.max_size_mb.is_some());
+        let log_format = log_format
+            .or_else(|| cfg.as_ref().and_then(|c| c.logging.format))
+            .unwrap_or_default();
 
-    let encryption_key_file =
-        resolve_encryption_key_file(cfg.as_ref(), resolved_host_key.as_deref());
-    let mut resolved_auth_secrets = resolve_auth_secrets(
-        cfg.as_ref(),
-        jwt_secret,
-        encryption_key,
-        &encryption_key_file,
-    )?;
+        // Resolve every dual-source knob in one place: CLI args > config file >
+        // built-in default.
+        let base = resolve_settings(
+            CliSettings {
+                repo_root,
+                http_addr,
+                ssh_addr,
+                host_key,
+                db_url,
+                rate_limit_max,
+                rate_limit_window,
+                smtp_port,
+                log_max_size_mb,
+                log_max_files,
+            },
+            cfg.as_ref(),
+        );
 
-    let resolved_docker = docker
-        || cfg
-            .as_ref()
-            .and_then(|c| c.ci.docker)
-            .unwrap_or(DEFAULT_CI_DOCKER);
-    let resolved_external_runners = external_runners
-        || cfg
-            .as_ref()
-            .and_then(|c| c.ci.external_runners)
-            .unwrap_or(DEFAULT_CI_EXTERNAL_RUNNERS);
-    let resolved_allow_host_runner = allow_host_runner
-        || cfg
-            .as_ref()
-            .and_then(|c| c.ci.allow_host_runner)
-            .unwrap_or(DEFAULT_CI_ALLOW_HOST_RUNNER);
-    // An operator who writes `runner_labels = []` means it: the embedded runner
-    // then answers to nothing and every job carrying a label is refused. So the
-    // fallback is keyed on the setting being *absent*, not on the list being
-    // empty — `unwrap_or_default()` here would silently turn "answer to
-    // nothing" into "answer to everything the default claims".
-    let resolved_runner_labels = cfg
-        .as_ref()
-        .and_then(|c| c.ci.runner_labels.clone())
-        .unwrap_or_else(rg_core::ci::default_runner_labels);
-    let (resolved_registration, registration_source) = resolve_registration_mode(
-        cfg.as_ref(),
-        std::env::var("PLOMBIR_GIT_REGISTRATION").ok().as_deref(),
-    )?;
-    // Env var wins over config file; both default off (opt-in).
-    let resolved_attestation_enabled = match std::env::var("PLOMBIR_GIT_ATTESTATION_ENABLED") {
+        let encryption_key_file =
+            resolve_encryption_key_file(cfg.as_ref(), base.host_key.as_deref());
+        let auth_secrets = resolve_auth_secrets(
+            cfg.as_ref(),
+            jwt_secret,
+            encryption_key,
+            &encryption_key_file,
+        )?;
+        let (registration, registration_source) = resolve_registration_mode(
+            cfg.as_ref(),
+            std::env::var("PLOMBIR_GIT_REGISTRATION").ok().as_deref(),
+        )?;
+        let source_url = crate::config::resolve_source_url(cfg.as_ref())?;
+        let rate_limits = resolve_rate_limits(cfg.as_ref(), rate_limit_trusted_proxies)?;
+        let timeouts = resolve_serve_timeouts(cfg.as_ref(), &base.db_url)?;
+
+        // Range-check the numeric knobs before anything consumes them: reject a
+        // silently-accepted `0` (e.g. `db_connect_secs = 0`) with a clear
+        // message rather than booting into a churning pool or a nonsensical
+        // rate window.
+        validate_numeric_ranges(
+            timeouts.git,
+            timeouts.db_connect,
+            timeouts.db_idle,
+            base.rate_limit_window,
+            rate_limits.auth_window,
+        )?;
+        require_positive("rate_limit.agent_window_secs", rate_limits.agent_window)?;
+        // `search_max = 0` disables that limiter; a zero window would not.
+        require_positive("rate_limit.search_window_secs", rate_limits.search_window)?;
+        require_positive(
+            "database.max_connections",
+            u64::from(timeouts.db_max_connections),
+        )?;
+
+        let settings = Self {
+            log_max_size_mb_was_set,
+            log_format,
+            // Logging: CLI takes precedence, fallback to config (rotation sizes
+            // are resolved alongside the other dual-source knobs above).
+            log_file: log_file.or_else(|| cfg.as_ref().and_then(|c| c.logging.file.clone())),
+            encryption_key_file,
+            auth_secrets,
+            docker: ci_switch(docker, cfg.as_ref(), |c| c.ci.docker, DEFAULT_CI_DOCKER),
+            external_runners: ci_switch(
+                external_runners,
+                cfg.as_ref(),
+                |c| c.ci.external_runners,
+                DEFAULT_CI_EXTERNAL_RUNNERS,
+            ),
+            allow_host_runner: ci_switch(
+                allow_host_runner,
+                cfg.as_ref(),
+                |c| c.ci.allow_host_runner,
+                DEFAULT_CI_ALLOW_HOST_RUNNER,
+            ),
+            // An operator who writes `runner_labels = []` means it: the embedded
+            // runner then answers to nothing and every job carrying a label is
+            // refused. So the fallback is keyed on the setting being *absent*,
+            // not on the list being empty — `unwrap_or_default()` here would
+            // silently turn "answer to nothing" into "answer to everything the
+            // default claims".
+            runner_labels: cfg
+                .as_ref()
+                .and_then(|c| c.ci.runner_labels.clone())
+                .unwrap_or_else(rg_core::ci::default_runner_labels),
+            registration,
+            registration_source,
+            attestation_enabled: resolve_attestation_enabled(cfg.as_ref()),
+            source_url,
+            rate_limits,
+            package_upload_max_bytes: resolve_package_upload_max_bytes(cfg.as_ref())?,
+            storage_limits: crate::config::resolve_storage_limits(cfg.as_ref())?,
+            trusted_import_origins: resolve_trusted_import_origins(cfg.as_ref())?,
+            transports: TransportPolicies {
+                import: resolve_import_transport_policy(cfg.as_ref())?,
+                oidc: resolve_oidc_transport_policy(cfg.as_ref())?,
+                ldap: resolve_ldap_transport_policy(cfg.as_ref())?,
+                mirror: resolve_mirror_transport_policy(cfg.as_ref()),
+                webhook: resolve_webhook_transport_policy(cfg.as_ref()),
+            },
+            // External URL: the top-level key first, then `[server]`.
+            external_url: cfg
+                .as_ref()
+                .and_then(|c| c.external_url.clone())
+                .or_else(|| cfg.as_ref().and_then(|c| c.server.external_url.clone())),
+            hsts_preload: cfg
+                .as_ref()
+                .and_then(|c| c.server.hsts_preload)
+                .unwrap_or(DEFAULT_HSTS_PRELOAD),
+            // Inbound-webhook HMAC secret: env var wins, fallback to config
+            // file. Unset ⇒ signature verification stays off (endpoints are
+            // auth-gated).
+            external_webhook_secret: env_secret("PLOMBIR_GIT_EXTERNAL_WEBHOOK_SECRET")
+                .or_else(|| {
+                    cfg.as_ref()
+                        .and_then(|c| c.webhooks.external_secret.clone())
+                })
+                .filter(|secret| !secret.trim().is_empty()),
+            // `GET /metrics` sits on the main HTTP port: behind the recommended
+            // proxy it is on the internet unless the proxy refuses it or a
+            // token guards it (card_ab8a1ca92a56). Env var wins, then the
+            // config file.
+            metrics_enabled: cfg
+                .as_ref()
+                .and_then(|c| c.observability.metrics_enabled)
+                .unwrap_or(DEFAULT_METRICS_ENABLED),
+            metrics_token: env_secret("PLOMBIR_GIT_METRICS_TOKEN")
+                .or_else(|| {
+                    cfg.as_ref()
+                        .and_then(|c| c.observability.metrics_token.clone())
+                })
+                .filter(|token| !token.trim().is_empty()),
+            timeouts,
+            base,
+            cfg,
+        };
+        let deferred = DeferredServeArgs {
+            smtp_host,
+            smtp_user,
+            smtp_pass,
+            smtp_from,
+            tls_cert,
+            tls_key,
+            listen_address_file,
+        };
+        Ok((settings, deferred))
+    }
+
+    /// What the resolved settings mean for an operator, said once the
+    /// subscriber exists to say it.
+    fn announce(&self) {
+        announce_source_link(&self.source_url);
+        if self.transports.import.allows_insecure_http() {
+            tracing::warn!(
+                "Import credentials may traverse explicitly allowlisted plaintext HTTP origins \
+                 because [imports].allow_insecure_http_origins is non-empty"
+            );
+        }
+        if self.transports.oidc.allows_insecure_http() {
+            tracing::warn!(
+                "Custom OIDC discovery, client secrets, and access tokens may traverse explicitly \
+                 allowlisted plaintext HTTP origins because \
+                 [auth].allow_insecure_oidc_origins is non-empty"
+            );
+        }
+        if self.transports.ldap.allows_insecure_ldap() {
+            tracing::warn!(
+                "LDAP service bind and user passwords may traverse explicitly allowlisted \
+                 plaintext endpoints because [auth].allow_insecure_ldap_endpoints is non-empty"
+            );
+        }
+        if self.transports.mirror.allows_insecure_http() {
+            tracing::warn!(
+                "Mirror credentials and repository content may traverse plaintext HTTP because \
+                 [mirror].allow_insecure_http is enabled"
+            );
+        }
+        if self.transports.webhook.allows_insecure_http() {
+            tracing::warn!(
+                "Outbound webhook delivery over plaintext HTTP is enabled by \
+                 [webhooks].allow_insecure_http"
+            );
+        }
+        if self.external_webhook_secret.is_some() {
+            tracing::info!("Inbound external-webhook HMAC-SHA256 verification enabled");
+        }
+        if !self.metrics_enabled {
+            tracing::info!(
+                "GET /metrics is switched off ([observability].metrics_enabled = false)"
+            );
+        } else if self.metrics_token.is_some() {
+            tracing::info!("GET /metrics requires the configured bearer token");
+        } else {
+            tracing::warn!(
+                "GET /metrics is open to anyone who reaches the HTTP port: set \
+                 [observability].metrics_token (or PLOMBIR_GIT_METRICS_TOKEN), or have the \
+                 reverse proxy refuse /metrics"
+            );
+        }
+    }
+
+    fn metrics_access(&self) -> rg_http::metrics::MetricsAccess {
+        rg_http::metrics::MetricsAccess::new(
+            self.metrics_enabled,
+            self.metrics_token.as_deref().map(str::trim),
+        )
+    }
+}
+
+/// A CI switch: on when the CLI flag is set, else the config file's value,
+/// else `default`.
+fn ci_switch(
+    flag: bool,
+    cfg: Option<&crate::config::ConfigFile>,
+    pick: fn(&crate::config::ConfigFile) -> Option<bool>,
+    default: bool,
+) -> bool {
+    flag || cfg.and_then(pick).unwrap_or(default)
+}
+
+/// Env var wins over config file; both default off (opt-in).
+fn resolve_attestation_enabled(cfg: Option<&crate::config::ConfigFile>) -> bool {
+    match std::env::var("PLOMBIR_GIT_ATTESTATION_ENABLED") {
         Ok(v) => matches!(v.trim(), "1" | "true" | "yes" | "on"),
         Err(_) => cfg
-            .as_ref()
             .and_then(|c| c.releases.attestation_enabled)
             .unwrap_or(DEFAULT_ATTESTATION_ENABLED),
-    };
-    let resolved_source_url = crate::config::resolve_source_url(cfg.as_ref())?;
-    announce_source_link(&resolved_source_url);
-    let resolved_rate_limit_trusted_proxy_values = if !rate_limit_trusted_proxies.is_empty() {
-        rate_limit_trusted_proxies
+    }
+}
+
+/// The limiter knobs. The trusted proxies come from the CLI when given there;
+/// the rest are config-file-only (no CLI flag): memory cap + credential-endpoint
+/// limiter. 0 = use the library default cap; auth defaults are always-on so
+/// registration spam is throttled even when the global limiter is disabled.
+fn resolve_rate_limits(
+    cfg: Option<&crate::config::ConfigFile>,
+    cli_trusted_proxies: Vec<String>,
+) -> anyhow::Result<RateLimits> {
+    let trusted_proxy_values = if !cli_trusted_proxies.is_empty() {
+        cli_trusted_proxies
     } else {
-        cfg.as_ref()
-            .map(|c| c.rate_limit.trusted_proxies.clone())
+        cfg.map(|c| c.rate_limit.trusted_proxies.clone())
             .unwrap_or_default()
     };
-    let resolved_rate_limit_trusted_proxies =
-        parse_rate_limit_trusted_proxies(&resolved_rate_limit_trusted_proxy_values)?;
-    // Config-file-only knobs (no CLI flag): memory cap + credential-endpoint
-    // limiter. 0 = use the library default cap; auth defaults are always-on so
-    // registration spam is throttled even when the global limiter is disabled.
-    let resolved_rate_limit_max_keys = cfg
-        .as_ref()
-        .and_then(|c| c.rate_limit.max_keys)
-        .unwrap_or(DEFAULT_RATE_LIMIT_MAX_KEYS);
-    let resolved_rate_limit_auth_max = cfg
-        .as_ref()
-        .and_then(|c| c.rate_limit.auth_max)
-        .unwrap_or(DEFAULT_AUTH_RATE_LIMIT_MAX);
-    let resolved_rate_limit_auth_window = cfg
-        .as_ref()
-        .and_then(|c| c.rate_limit.auth_window_secs)
-        .unwrap_or(DEFAULT_AUTH_RATE_LIMIT_WINDOW);
-    let resolved_rate_limit_agent_max = cfg
-        .as_ref()
-        .and_then(|c| c.rate_limit.agent_max)
-        .unwrap_or(DEFAULT_AGENT_RATE_LIMIT_MAX);
-    let resolved_rate_limit_agent_window = cfg
-        .as_ref()
-        .and_then(|c| c.rate_limit.agent_window_secs)
-        .unwrap_or(DEFAULT_AGENT_RATE_LIMIT_WINDOW);
-    let resolved_rate_limit_search_max = cfg
-        .as_ref()
-        .and_then(|c| c.rate_limit.search_max)
-        .unwrap_or(DEFAULT_SEARCH_RATE_LIMIT_MAX);
-    let resolved_rate_limit_search_window = cfg
-        .as_ref()
-        .and_then(|c| c.rate_limit.search_window_secs)
-        .unwrap_or(DEFAULT_SEARCH_RATE_LIMIT_WINDOW);
-    let resolved_package_upload_max_bytes = resolve_package_upload_max_bytes(cfg.as_ref())?;
-    let resolved_storage_limits = crate::config::resolve_storage_limits(cfg.as_ref())?;
-    let resolved_trusted_import_origins = resolve_trusted_import_origins(cfg.as_ref())?;
-    let resolved_import_transport_policy = resolve_import_transport_policy(cfg.as_ref())?;
-    if resolved_import_transport_policy.allows_insecure_http() {
-        tracing::warn!(
-            "Import credentials may traverse explicitly allowlisted plaintext HTTP origins because \
-             [imports].allow_insecure_http_origins is non-empty"
-        );
-    }
-    let resolved_oidc_transport_policy = resolve_oidc_transport_policy(cfg.as_ref())?;
-    if resolved_oidc_transport_policy.allows_insecure_http() {
-        tracing::warn!(
-            "Custom OIDC discovery, client secrets, and access tokens may traverse explicitly \
-             allowlisted plaintext HTTP origins because \
-             [auth].allow_insecure_oidc_origins is non-empty"
-        );
-    }
-    let resolved_ldap_transport_policy = resolve_ldap_transport_policy(cfg.as_ref())?;
-    if resolved_ldap_transport_policy.allows_insecure_ldap() {
-        tracing::warn!(
-            "LDAP service bind and user passwords may traverse explicitly allowlisted plaintext \
-             endpoints because [auth].allow_insecure_ldap_endpoints is non-empty"
-        );
-    }
-    let resolved_mirror_transport_policy = resolve_mirror_transport_policy(cfg.as_ref());
-    if resolved_mirror_transport_policy.allows_insecure_http() {
-        tracing::warn!(
-            "Mirror credentials and repository content may traverse plaintext HTTP because \
-             [mirror].allow_insecure_http is enabled"
-        );
-    }
-    let resolved_webhook_transport_policy = resolve_webhook_transport_policy(cfg.as_ref());
-    if resolved_webhook_transport_policy.allows_insecure_http() {
-        tracing::warn!(
-            "Outbound webhook delivery over plaintext HTTP is enabled by \
-             [webhooks].allow_insecure_http"
-        );
-    }
-
-    // Logging: CLI takes precedence, fallback to config (rotation sizes are
-    // resolved alongside the other dual-source knobs above).
-    let resolved_log_file = log_file.or_else(|| cfg.as_ref().and_then(|c| c.logging.file.clone()));
-
-    // External URL: CLI takes precedence, fallback to config
-    let resolved_external_url = cfg
-        .as_ref()
-        .and_then(|c| c.external_url.clone())
-        .or_else(|| cfg.as_ref().and_then(|c| c.server.external_url.clone()));
-    let resolved_hsts_preload = cfg
-        .as_ref()
-        .and_then(|c| c.server.hsts_preload)
-        .unwrap_or(DEFAULT_HSTS_PRELOAD);
-
-    // Inbound-webhook HMAC secret: env var wins, fallback to config file.
-    // Unset ⇒ signature verification stays off (endpoints are auth-gated).
-    let resolved_external_webhook_secret = env_secret("PLOMBIR_GIT_EXTERNAL_WEBHOOK_SECRET")
-        .or_else(|| {
-            cfg.as_ref()
-                .and_then(|c| c.webhooks.external_secret.clone())
-        })
-        .filter(|secret| !secret.trim().is_empty());
-    if resolved_external_webhook_secret.is_some() {
-        tracing::info!("Inbound external-webhook HMAC-SHA256 verification enabled");
-    }
-
-    // `GET /metrics` sits on the main HTTP port: behind the recommended proxy
-    // it is on the internet unless the proxy refuses it or a token guards it
-    // (card_ab8a1ca92a56). Env var wins, then the config file.
-    let resolved_metrics_enabled = cfg
-        .as_ref()
-        .and_then(|c| c.observability.metrics_enabled)
-        .unwrap_or(DEFAULT_METRICS_ENABLED);
-    let resolved_metrics_token = env_secret("PLOMBIR_GIT_METRICS_TOKEN")
-        .or_else(|| {
-            cfg.as_ref()
-                .and_then(|c| c.observability.metrics_token.clone())
-        })
-        .filter(|token| !token.trim().is_empty());
-    if !resolved_metrics_enabled {
-        tracing::info!("GET /metrics is switched off ([observability].metrics_enabled = false)");
-    } else if resolved_metrics_token.is_some() {
-        tracing::info!("GET /metrics requires the configured bearer token");
-    } else {
-        tracing::warn!(
-            "GET /metrics is open to anyone who reaches the HTTP port: set \
-             [observability].metrics_token (or PLOMBIR_GIT_METRICS_TOKEN), or have the reverse \
-             proxy refuse /metrics"
-        );
-    }
-    let resolved_metrics_access = rg_http::metrics::MetricsAccess::new(
-        resolved_metrics_enabled,
-        resolved_metrics_token.as_deref().map(str::trim),
-    );
-
-    // Timeouts from config (with defaults)
-    let resolved_job_timeout = cfg
-        .as_ref()
-        .map(|c| c.timeouts.job_secs)
-        .unwrap_or_else(default_job_timeout);
-    let resolved_git_timeout = cfg
-        .as_ref()
-        .map(|c| c.timeouts.git_cmd_secs)
-        .unwrap_or_else(default_git_timeout);
-    let resolved_git_stream_timeout = cfg
-        .as_ref()
-        .map(|c| c.timeouts.git_stream_secs)
-        .unwrap_or_else(default_git_stream_timeout);
-    let resolved_git_idle_timeout = cfg
-        .as_ref()
-        .map(|c| c.timeouts.git_idle_secs)
-        .unwrap_or_else(default_git_idle_timeout);
-    let resolved_db_connect_timeout = cfg
-        .as_ref()
-        .map(|c| c.timeouts.db_connect_secs)
-        .unwrap_or_else(default_db_connect_timeout);
-    let resolved_db_idle_timeout = cfg
-        .as_ref()
-        .map(|c| c.timeouts.db_idle_secs)
-        .unwrap_or_else(default_db_idle_timeout);
-    let resolved_db_max_connections = match cfg.as_ref().and_then(|c| c.database.max_connections) {
-        Some(configured) => configured,
-        None => rg_db::default_max_connections(&resolved_db_url)?,
+    let knob = |pick: fn(&crate::config::ConfigFile) -> Option<u64>, default: u64| {
+        cfg.and_then(pick).unwrap_or(default)
     };
+    let count = |pick: fn(&crate::config::ConfigFile) -> Option<u32>, default: u32| {
+        cfg.and_then(pick).unwrap_or(default)
+    };
+    Ok(RateLimits {
+        trusted_proxies: parse_rate_limit_trusted_proxies(&trusted_proxy_values)?,
+        max_keys: cfg
+            .and_then(|c| c.rate_limit.max_keys)
+            .unwrap_or(DEFAULT_RATE_LIMIT_MAX_KEYS),
+        auth_max: count(|c| c.rate_limit.auth_max, DEFAULT_AUTH_RATE_LIMIT_MAX),
+        auth_window: knob(
+            |c| c.rate_limit.auth_window_secs,
+            DEFAULT_AUTH_RATE_LIMIT_WINDOW,
+        ),
+        agent_max: count(|c| c.rate_limit.agent_max, DEFAULT_AGENT_RATE_LIMIT_MAX),
+        agent_window: knob(
+            |c| c.rate_limit.agent_window_secs,
+            DEFAULT_AGENT_RATE_LIMIT_WINDOW,
+        ),
+        search_max: count(|c| c.rate_limit.search_max, DEFAULT_SEARCH_RATE_LIMIT_MAX),
+        search_window: knob(
+            |c| c.rate_limit.search_window_secs,
+            DEFAULT_SEARCH_RATE_LIMIT_WINDOW,
+        ),
+    })
+}
 
-    // Range-check the numeric knobs before anything consumes them: reject a
-    // silently-accepted `0` (e.g. `db_connect_secs = 0`) with a clear message
-    // rather than booting into a churning pool or a nonsensical rate window.
-    validate_numeric_ranges(
-        resolved_git_timeout,
-        resolved_db_connect_timeout,
-        resolved_db_idle_timeout,
-        resolved_rate_limit_window,
-        resolved_rate_limit_auth_window,
-    )?;
-    require_positive(
-        "rate_limit.agent_window_secs",
-        resolved_rate_limit_agent_window,
-    )?;
-    // `search_max = 0` disables that limiter; a zero window would not.
-    require_positive(
-        "rate_limit.search_window_secs",
-        resolved_rate_limit_search_window,
-    )?;
-    require_positive(
-        "database.max_connections",
-        u64::from(resolved_db_max_connections),
-    )?;
+/// Timeouts from config (with defaults), and the pool size, whose default
+/// depends on the database the URL names.
+fn resolve_serve_timeouts(
+    cfg: Option<&crate::config::ConfigFile>,
+    db_url: &str,
+) -> anyhow::Result<ServeTimeouts> {
+    let timeout = |pick: fn(&crate::config::ConfigFile) -> u64, default: fn() -> u64| {
+        cfg.map(pick).unwrap_or_else(default)
+    };
+    Ok(ServeTimeouts {
+        job: timeout(|c| c.timeouts.job_secs, default_job_timeout),
+        git: timeout(|c| c.timeouts.git_cmd_secs, default_git_timeout),
+        git_stream: timeout(|c| c.timeouts.git_stream_secs, default_git_stream_timeout),
+        git_idle: timeout(|c| c.timeouts.git_idle_secs, default_git_idle_timeout),
+        db_connect: timeout(|c| c.timeouts.db_connect_secs, default_db_connect_timeout),
+        db_idle: timeout(|c| c.timeouts.db_idle_secs, default_db_idle_timeout),
+        db_max_connections: match cfg.and_then(|c| c.database.max_connections) {
+            Some(configured) => configured,
+            None => rg_db::default_max_connections(db_url)?,
+        },
+        shutdown_grace: cfg
+            .and_then(|c| c.server.shutdown_grace_secs)
+            .unwrap_or_else(default_shutdown_grace),
+    })
+}
 
-    // ── Initialize logging + tracing ───────────────────────────
-    // Build the log writer (rolling file or stdout), then let `telemetry::init`
-    // compose the fmt layer with an optional OTLP export layer. The returned
-    // guard owns the non-blocking appender worker and the OTLP tracer provider;
-    // it is flushed on shutdown at the end of this function.
+/// Build the log writer (rolling file or stdout), then let `telemetry::init`
+/// compose the fmt layer with an optional OTLP export layer. The returned
+/// guard owns the non-blocking appender worker and the OTLP tracer provider;
+/// it is flushed on shutdown at the end of [`run_serve`].
+fn init_logging(settings: &ServeSettings) -> anyhow::Result<telemetry::TelemetryGuard> {
     use tracing_subscriber::fmt::writer::BoxMakeWriter;
     let (log_writer, appender_guard): (
         BoxMakeWriter,
         Option<tracing_appender::non_blocking::WorkerGuard>,
-    ) = if let Some(ref log_path) = resolved_log_file {
+    ) = if let Some(ref log_path) = settings.log_file {
         let log_path = std::path::Path::new(log_path);
         let appender = open_file_log_appender(
             log_path,
-            log_max_size_mb_was_set,
-            resolved_log_max_size_mb,
-            resolved_log_max_files,
+            settings.log_max_size_mb_was_set,
+            settings.base.log_max_size_mb,
+            settings.base.log_max_files,
         )?;
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
         (BoxMakeWriter::new(non_blocking), Some(guard))
@@ -1348,60 +1483,62 @@ pub(crate) async fn run_serve(
         (BoxMakeWriter::new(std::io::stdout), None)
     };
 
+    let cfg = settings.cfg.as_ref();
     let otel_config = telemetry::resolve_otel_config(
-        cfg.as_ref()
-            .and_then(|c| c.observability.otlp_endpoint.clone()),
-        cfg.as_ref()
-            .and_then(|c| c.observability.service_name.clone()),
-        cfg.as_ref().and_then(|c| c.observability.sample_ratio),
+        cfg.and_then(|c| c.observability.otlp_endpoint.clone()),
+        cfg.and_then(|c| c.observability.service_name.clone()),
+        cfg.and_then(|c| c.observability.sample_ratio),
     );
 
     let telemetry_guard =
-        telemetry::init(log_writer, appender_guard, otel_config, resolved_log_format)?;
+        telemetry::init(log_writer, appender_guard, otel_config, settings.log_format)?;
 
+    let permissions = &settings.base.state_permissions;
     tracing::info!(
-        state_permissions = %resolved_state_permissions,
-        umask = %format!("{:04o}", resolved_state_permissions.umask()),
-        regular_file_mode = %format!("{:04o}", resolved_state_permissions.regular_file_mode()),
-        directory_mode = %format!("{:04o}", resolved_state_permissions.directory_mode()),
+        state_permissions = %permissions,
+        umask = %format!("{:04o}", permissions.umask()),
+        regular_file_mode = %format!("{:04o}", permissions.regular_file_mode()),
+        directory_mode = %format!("{:04o}", permissions.directory_mode()),
         "Installed the process-wide creation policy for server-owned state"
     );
 
-    match resolved_log_file {
-        Some(ref log_path) => {
-            if log_max_size_mb_was_set {
-                tracing::info!(
-                    file = %log_path,
-                    format = resolved_log_format.as_str(),
-                    max_size_mb = resolved_log_max_size_mb,
-                    max_files = resolved_log_max_files,
-                    "Logging to file with size rotation"
-                );
-            } else {
-                tracing::info!(
-                    file = %log_path,
-                    format = resolved_log_format.as_str(),
-                    "Logging to file with daily rotation"
-                );
-            }
-        }
-        None => tracing::info!(format = resolved_log_format.as_str(), "Logging to stdout"),
+    let format = settings.log_format.as_str();
+    match settings.log_file {
+        Some(ref log_path) if settings.log_max_size_mb_was_set => tracing::info!(
+            file = %log_path,
+            format,
+            max_size_mb = settings.base.log_max_size_mb,
+            max_files = settings.base.log_max_files,
+            "Logging to file with size rotation"
+        ),
+        Some(ref log_path) => tracing::info!(
+            file = %log_path,
+            format,
+            "Logging to file with daily rotation"
+        ),
+        None => tracing::info!(format, "Logging to stdout"),
     }
+    Ok(telemetry_guard)
+}
 
-    // A half-written `[smtp]` or `[tls]` stops the start here, before the
-    // first directory or database is created, rather than quietly disabling
-    // mail or downgrading the listener to plain HTTP.
-    let smtp_config = resolve_smtp_config(
-        cfg.as_ref(),
-        smtp_host,
-        resolved_smtp_port,
-        smtp_user,
-        smtp_pass,
-        smtp_from,
-    )?;
-    let tls_config = resolve_tls_config(cfg.as_ref(), tls_cert, tls_key)?;
+/// The storage and database a started server owns, ready for its first
+/// request.
+struct ServeStorage {
+    repo_root: PathBuf,
+    /// The connection that holds the SQLite process lease. Never read: it is
+    /// here to be dropped last, after the shutdown sequence.
+    _lease: dbconn::GuardedDatabaseConnection,
+    db: rg_db::DatabaseConnection,
+    db_write: rg_db::DatabaseConnection,
+    setup_token: rg_core::user::registration::SetupToken,
+    instance_key: std::sync::Arc<rg_core::auth::instance_key::InstanceKey>,
+}
 
-    let repo_root = PathBuf::from(&resolved_repo_root);
+/// Create the repository root, finish what a previous run left half-done, open
+/// and migrate the database, and bring every stored secret up to the format
+/// this build reads — before anything can serve or sync.
+async fn init_storage(settings: &mut ServeSettings) -> anyhow::Result<ServeStorage> {
+    let repo_root = PathBuf::from(&settings.base.repo_root);
     // What lives below this root is the *content* of every private repository
     // on the instance, so a root the server creates is created `0700` — a bare
     // `create_dir_all` takes its mode from the ambient umask (`0755` on a stock
@@ -1420,26 +1557,7 @@ pub(crate) async fn run_serve(
     // job that reaches it by group.
     rg_core::platform::fs::warn_if_others_can_reach("repo_root", &repo_root);
 
-    // ── Staging sweep ─────────────────────────────────────────────
-    // Upload spools under `repo_root/.tmp/` are retired by a destructor, which
-    // a `SIGKILL`, the OOM killer and a container restart all skip. Nothing
-    // else ever reads those directories, so without this pass an interrupted
-    // 512 MiB publish is a permanent 512 MiB. The same pass walks the storage
-    // root for the spools that are written *beside* their destination instead —
-    // an LFS object is up to 10 GiB of them — because those have no directory
-    // of their own to list. Best-effort and never fatal: an unswept spool costs
-    // disk, refusing to serve costs the instance. See `rg_core::staging` for the
-    // age bound and why it is not zero.
-    let sweep =
-        rg_core::staging::sweep_stale_spools(&repo_root, rg_core::staging::STALE_SPOOL_AGE).await;
-    if sweep != rg_core::staging::SweepReport::default() {
-        tracing::info!(
-            removed = sweep.removed,
-            retained = sweep.retained,
-            failed = sweep.failed,
-            "swept upload spools left behind by a previous run"
-        );
-    }
+    sweep_stale_spools(&repo_root).await;
 
     // ── Git CLI gateway (seed configured command timeout) ─────────
     // Fatal, not a warning. The constructor is also the git version floor
@@ -1448,21 +1566,23 @@ pub(crate) async fn run_serve(
     // resolver — after the SSRF guard looked, with the stored credential
     // attached — so a server on such a host, or on one with no git at all,
     // must not come up and wait for the first import to find out.
-    rg_git::cli_gateway::init_global_gateway(std::time::Duration::from_secs(resolved_git_timeout))
+    let git_timeout = settings.timeouts.git;
+    rg_git::cli_gateway::init_global_gateway(std::time::Duration::from_secs(git_timeout))
         .context("git is required to serve: install git 2.38 or newer and put it on PATH")?;
-    tracing::info!(git_cmd_secs = resolved_git_timeout, "Git CLI gateway ready");
+    tracing::info!(git_cmd_secs = git_timeout, "Git CLI gateway ready");
 
     // ── Database ──────────────────────────────────────────────────
+    let db_url = settings.base.db_url.clone();
     tracing::info!(
         "Connecting to database: {}",
-        rg_db::redact_database_url(&resolved_db_url)
+        rg_db::redact_database_url(&db_url)
     );
     let server_db = dbconn::connect_server_with_timeouts(
-        &resolved_db_url,
+        &db_url,
         &repo_root,
-        resolved_db_connect_timeout,
-        resolved_db_idle_timeout,
-        resolved_db_max_connections,
+        settings.timeouts.db_connect,
+        settings.timeouts.db_idle,
+        settings.timeouts.db_max_connections,
     )
     .await?;
     let db = server_db.connection().clone();
@@ -1471,27 +1591,90 @@ pub(crate) async fn run_serve(
 
     // Open the dedicated writer before starting any background database work.
     let db_write = rg_db::open_write_pool(
-        &resolved_db_url,
-        resolved_db_connect_timeout,
-        resolved_db_idle_timeout,
+        &db_url,
+        settings.timeouts.db_connect,
+        settings.timeouts.db_idle,
         &db,
     )
     .await
-    .map_err(|e| dbconn::annotate_db_open_error(e, &resolved_db_url))?;
+    .map_err(|e| dbconn::annotate_db_open_error(e, &db_url))?;
 
-    // ── Interrupted storage mutations ─────────────────────────────
-    // The spool sweep above retires drafts; this pass finishes journalled
-    // deletions, moves, repository creations and attachment publications.
-    // Deletes and moves carry a
-    // marker that decides whether bytes return or stay retired. A create is the
-    // inverse: it claims the final Git path before inserting its row, and a
-    // process can die after that insert but before its marker write. The pass
-    // therefore runs only after migrations and asks the database before it
-    // removes a create path. Failure is never guessed through: the entry and
-    // path remain for the next start or an operator.
+    recover_interrupted_storage(&db, &repo_root).await;
+
+    // ── At-rest encryption key preflight ──────────────────────────
+    // Refuse to serve with a key that cannot open what is already stored. On a
+    // first boot this also creates the durable key file and its database marker
+    // before any other startup path writes encrypted state.
+    establish_encryption_key(&db, &mut settings.auth_secrets).await?;
+    let setup_token = establish_setup_token(&db, &settings.encryption_key_file).await?;
+
+    upgrade_stored_secrets(&db, &settings.auth_secrets.encryption_key).await?;
+    report_unaddressable_owners_and_repositories(&db).await;
+
+    // ── Instance provenance identity ──────────────────────────────
+    // The Ed25519 key that signs release attestations and backs the CI OIDC
+    // JWKS. Loaded from the database — on the first start it adopts exactly the
+    // key the old `jwt_secret` derivation produced, so nothing that was already
+    // signed stops verifying, and from then on the identity outlives every
+    // rotation of either secret (card_3aecf3708ebe).
+    let instance_key = std::sync::Arc::new(
+        rg_core::auth::instance_key::load_or_adopt(
+            &db,
+            &settings.auth_secrets.jwt_secret,
+            &settings.auth_secrets.encryption_key,
+        )
+        .await?,
+    );
+    tracing::info!(kid = %instance_key.kid(), "instance provenance signing key ready");
+
+    Ok(ServeStorage {
+        repo_root,
+        _lease: server_db,
+        db,
+        db_write,
+        setup_token,
+        instance_key,
+    })
+}
+
+/// ── Staging sweep ─────────────────────────────────────────────
+///
+/// Upload spools under `repo_root/.tmp/` are retired by a destructor, which a
+/// `SIGKILL`, the OOM killer and a container restart all skip. Nothing else
+/// ever reads those directories, so without this pass an interrupted 512 MiB
+/// publish is a permanent 512 MiB. The same pass walks the storage root for the
+/// spools that are written *beside* their destination instead — an LFS object
+/// is up to 10 GiB of them — because those have no directory of their own to
+/// list. Best-effort and never fatal: an unswept spool costs disk, refusing to
+/// serve costs the instance. See `rg_core::staging` for the age bound and why
+/// it is not zero.
+async fn sweep_stale_spools(repo_root: &Path) {
+    let sweep =
+        rg_core::staging::sweep_stale_spools(repo_root, rg_core::staging::STALE_SPOOL_AGE).await;
+    if sweep != rg_core::staging::SweepReport::default() {
+        tracing::info!(
+            removed = sweep.removed,
+            retained = sweep.retained,
+            failed = sweep.failed,
+            "swept upload spools left behind by a previous run"
+        );
+    }
+}
+
+/// ── Interrupted storage mutations ─────────────────────────────
+///
+/// The spool sweep retires drafts; this pass finishes journalled deletions,
+/// moves, repository creations and attachment publications. Deletes and moves
+/// carry a marker that decides whether bytes return or stay retired. A create
+/// is the inverse: it claims the final Git path before inserting its row, and a
+/// process can die after that insert but before its marker write. The pass
+/// therefore runs only after migrations and asks the database before it removes
+/// a create path. Failure is never guessed through: the entry and path remain
+/// for the next start or an operator.
+async fn recover_interrupted_storage(db: &rg_db::DatabaseConnection, repo_root: &Path) {
     let recovered = rg_core::deletion_recovery::recover_interrupted_storage_at(
-        &db,
-        &repo_root,
+        db,
+        repo_root,
         rg_core::deletion_recovery::INTERRUPTED_DELETION_AGE,
     )
     .await;
@@ -1507,24 +1690,24 @@ pub(crate) async fn run_serve(
             "finished storage mutations a previous run did not survive"
         );
     }
+}
 
-    // ── At-rest encryption key preflight ──────────────────────────
-    // Refuse to serve with a key that cannot open what is already stored. On a
-    // first boot this also creates the durable key file and its database marker
-    // before any other startup path writes encrypted state.
-    establish_encryption_key(&db, &mut resolved_auth_secrets).await?;
-    let setup_token = establish_setup_token(&db, &encryption_key_file).await?;
-
+/// Bring credentials stored by older builds to the form this one reads, with
+/// the key the preflight just verified.
+async fn upgrade_stored_secrets(
+    db: &rg_db::DatabaseConnection,
+    encryption_key: &str,
+) -> anyhow::Result<()> {
     // Webhook delivery is detached from the request that caused it and signs
     // with an encrypted column, so it is the one reader that cannot be handed
     // the key as a parameter. Publish before anything can dispatch.
-    rg_core::auth::at_rest_key::publish(&resolved_auth_secrets.encryption_key);
+    rg_core::auth::at_rest_key::publish(encryption_key);
 
     // The migration renamed `webhooks.secret` to `secret_encrypted`; sealing the
     // values it already holds needs the key, which only exists here. Fatal on
     // failure: a half-sealed column is exactly what this pass exists to prevent,
     // and the write uses the key the preflight above just verified.
-    rg_core::webhook::service::seal_legacy_secrets(&db, &resolved_auth_secrets.encryption_key)
+    rg_core::webhook::service::seal_legacy_secrets(db, encryption_key)
         .await
         .context("seal webhook signing secrets at rest")?;
 
@@ -1535,147 +1718,116 @@ pub(crate) async fn run_serve(
     // or deliver, which is where such a URL would be quoted into a persisted
     // error. Fatal for the same reason as the sealing above: a half-converted
     // column is exactly what the pass exists to prevent.
-    rg_core::mirror::service::lift_legacy_url_credentials(
-        &db,
-        &resolved_auth_secrets.encryption_key,
-    )
-    .await
-    .context("move credentials out of mirror remote URLs")?;
-    rg_core::import::service::strip_legacy_source_url_credentials(&db)
+    rg_core::mirror::service::lift_legacy_url_credentials(db, encryption_key)
+        .await
+        .context("move credentials out of mirror remote URLs")?;
+    rg_core::import::service::strip_legacy_source_url_credentials(db)
         .await
         .context("remove tokens from import source URLs")?;
-    rg_core::webhook::service::strip_legacy_url_credentials(&db)
+    rg_core::webhook::service::strip_legacy_url_credentials(db)
         .await
         .context("remove credentials from webhook URLs")?;
+    Ok(())
+}
 
-    // An owner registered before the reservation existed keeps a name the
-    // application answers for itself, and its `/{owner}` page is unreachable
-    // for good. Read-only and never fatal: renaming somebody's account is the
-    // operator's decision, and a boot pass has no business making it.
-    rg_core::namespace::report_owners_holding_reserved_names(&db).await;
-    rg_core::namespace::report_names_held_by_an_account_and_an_organization(&db).await;
-    rg_core::namespace::report_owner_names_that_differ_only_in_case(&db).await;
-    rg_core::namespace::report_repository_names_that_differ_only_in_case(&db).await;
-    rg_core::namespace::report_repositories_the_transport_cannot_address(&db).await;
-    rg_core::namespace::report_repositories_with_names_that_are_not_ascii(&db).await;
+/// An owner registered before the reservation existed keeps a name the
+/// application answers for itself, and its `/{owner}` page is unreachable for
+/// good. Read-only and never fatal: renaming somebody's account is the
+/// operator's decision, and a boot pass has no business making it.
+async fn report_unaddressable_owners_and_repositories(db: &rg_db::DatabaseConnection) {
+    rg_core::namespace::report_owners_holding_reserved_names(db).await;
+    rg_core::namespace::report_names_held_by_an_account_and_an_organization(db).await;
+    rg_core::namespace::report_owner_names_that_differ_only_in_case(db).await;
+    rg_core::namespace::report_repository_names_that_differ_only_in_case(db).await;
+    rg_core::namespace::report_repositories_the_transport_cannot_address(db).await;
+    rg_core::namespace::report_repositories_with_names_that_are_not_ascii(db).await;
+}
 
-    // ── Instance provenance identity ──────────────────────────────
-    // The Ed25519 key that signs release attestations and backs the CI OIDC
-    // JWKS. Loaded from the database — on the first start it adopts exactly the
-    // key the old `jwt_secret` derivation produced, so nothing that was already
-    // signed stops verifying, and from then on the identity outlives every
-    // rotation of either secret (card_3aecf3708ebe).
-    let instance_key = std::sync::Arc::new(
-        rg_core::auth::instance_key::load_or_adopt(
-            &db,
-            &resolved_auth_secrets.jwt_secret,
-            &resolved_auth_secrets.encryption_key,
-        )
-        .await?,
-    );
-    tracing::info!(kid = %instance_key.kid(), "instance provenance signing key ready");
+/// Start the maintenance workers the configuration asks for, returning their
+/// handles for the caller to hold as long as the server runs. Each `spawn_*`
+/// range-checks its knobs and probes its directory, so a `0` or an unusable
+/// directory fails the start here rather than an hour later inside the loop.
+fn spawn_maintenance_tasks(
+    cfg: Option<&crate::config::ConfigFile>,
+    storage: &ServeStorage,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let mut workers = vec![rg_git::maintenance::spawn_daily(
+        storage.repo_root.clone(),
+        shutdown_rx.clone(),
+    )];
+    workers.extend(spawn_audit_archiver(cfg, storage, shutdown_rx)?);
+    workers.extend(spawn_db_backup(cfg, storage, shutdown_rx)?);
+    workers.extend(spawn_retention(cfg, storage, shutdown_rx)?);
+    Ok(workers)
+}
 
-    // ── Graceful shutdown signal ──────────────────────────────────
-    // A single `watch` channel fans the SIGTERM/ctrl_c signal out to the HTTP
-    // server and every background worker so they can drain and exit cleanly.
-    let resolved_shutdown_grace = cfg
-        .as_ref()
-        .and_then(|c| c.server.shutdown_grace_secs)
-        .unwrap_or_else(default_shutdown_grace);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let _git_maintenance_handle =
-        rg_git::maintenance::spawn_daily(repo_root.clone(), shutdown_rx.clone());
-    let signal_shutdown_tx = shutdown_tx.clone();
-    tokio::spawn(async move {
-        wait_for_shutdown_signal().await;
-        if signal_shutdown_tx.send(true).is_err() {
-            // Every receiver has already shut down.
-        }
-    });
-
-    let audit_config = cfg.as_ref().map(|config| &config.audit);
-    let _audit_archiver_handle = if audit_config
+fn spawn_audit_archiver(
+    cfg: Option<&crate::config::ConfigFile>,
+    storage: &ServeStorage,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let audit_config = cfg.map(|config| &config.audit);
+    if !audit_config
         .and_then(|config| config.enabled)
         .unwrap_or(DEFAULT_AUDIT_ENABLED)
     {
-        // Note: `spawn_archiver_with_shutdown` below range-checks the numeric
-        // knobs (archive_after_days / interval_minutes / batch_size) and then
-        // creates + write-probes `archive_dir`, so a 0 or an unusable directory
-        // fails the start here rather than an hour later inside the loop.
-        let archive_dir = audit_config
-            .and_then(|config| config.archive_dir.as_deref())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| default_audit_archive_dir(&repo_root));
-        // Log the *absolute* destination: the historical default resolved
-        // against the process cwd, so an operator reading `./data/audit-archive`
-        // had no way to tell the archive was landing inside an ephemeral
-        // container layer instead of on the data volume.
-        tracing::info!(
-            archive_dir = %std::path::absolute(&archive_dir)
-                .unwrap_or_else(|_| archive_dir.clone())
-                .display(),
-            "Audit log archival enabled"
-        );
-        let archive_config = rg_core::audit::archiver::AuditArchiveConfig {
-            archive_dir,
-            archive_after_days: audit_config
-                .and_then(|config| config.archive_after_days)
-                .unwrap_or(rg_core::audit::archiver::DEFAULT_ARCHIVE_AFTER_DAYS),
-            interval_minutes: audit_config
-                .and_then(|config| config.interval_minutes)
-                .unwrap_or(rg_core::audit::archiver::DEFAULT_INTERVAL_MINUTES),
-            batch_size: audit_config
-                .and_then(|config| config.batch_size)
-                .unwrap_or(rg_core::audit::archiver::DEFAULT_BATCH_SIZE),
-        };
-        Some(rg_core::audit::archiver::spawn_archiver_with_shutdown(
-            db.clone(),
-            db_write.clone(),
+        tracing::info!("Audit log archival disabled by configuration");
+        return Ok(None);
+    }
+    let archive_dir = audit_config
+        .and_then(|config| config.archive_dir.as_deref())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_audit_archive_dir(&storage.repo_root));
+    // Log the *absolute* destination: the historical default resolved against
+    // the process cwd, so an operator reading `./data/audit-archive` had no way
+    // to tell the archive was landing inside an ephemeral container layer
+    // instead of on the data volume.
+    tracing::info!(
+        archive_dir = %std::path::absolute(&archive_dir)
+            .unwrap_or_else(|_| archive_dir.clone())
+            .display(),
+        "Audit log archival enabled"
+    );
+    let archive_config = rg_core::audit::archiver::AuditArchiveConfig {
+        archive_dir,
+        archive_after_days: audit_config
+            .and_then(|config| config.archive_after_days)
+            .unwrap_or(rg_core::audit::archiver::DEFAULT_ARCHIVE_AFTER_DAYS),
+        interval_minutes: audit_config
+            .and_then(|config| config.interval_minutes)
+            .unwrap_or(rg_core::audit::archiver::DEFAULT_INTERVAL_MINUTES),
+        batch_size: audit_config
+            .and_then(|config| config.batch_size)
+            .unwrap_or(rg_core::audit::archiver::DEFAULT_BATCH_SIZE),
+    };
+    Ok(Some(
+        rg_core::audit::archiver::spawn_archiver_with_shutdown(
+            storage.db.clone(),
+            storage.db_write.clone(),
             archive_config,
             Some(shutdown_rx.clone()),
-        )?)
-    } else {
-        tracing::info!("Audit log archival disabled by configuration");
-        None
-    };
+        )?,
+    ))
+}
 
-    // ── Scheduled database backups ────────────────────────────────
-    // The point of doing this in-process rather than in a cron entry on one
-    // host: the schedule travels with the config file, the snapshot is taken
-    // from the pool the server itself is using (so it cannot address a
-    // different database, the way a `backup-db` without `--config` does), and
-    // an unusable backup directory fails the start instead of surfacing a day
-    // later as a warning.
-    let backup_config = cfg.as_ref().map(|config| &config.backup);
-    let _db_backup_handle = if backup_config
+/// ── Scheduled database backups ────────────────────────────────
+///
+/// The point of doing this in-process rather than in a cron entry on one host:
+/// the schedule travels with the config file, the snapshot is taken from the
+/// pool the server itself is using (so it cannot address a different database,
+/// the way a `backup-db` without `--config` does), and an unusable backup
+/// directory fails the start instead of surfacing a day later as a warning.
+fn spawn_db_backup(
+    cfg: Option<&crate::config::ConfigFile>,
+    storage: &ServeStorage,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let backup_config = cfg.map(|config| &config.backup);
+    if !backup_config
         .and_then(|config| config.enabled)
         .unwrap_or(DEFAULT_BACKUP_ENABLED)
     {
-        let backup_dir = backup_config
-            .and_then(|config| config.dir.as_deref())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| default_db_backup_dir(&repo_root));
-        tracing::info!(
-            backup_dir = %std::path::absolute(&backup_dir)
-                .unwrap_or_else(|_| backup_dir.clone())
-                .display(),
-            "Scheduled database backups enabled"
-        );
-        let db_backup_config = rg_core::backup::DbBackupConfig {
-            dir: backup_dir,
-            interval_hours: backup_config
-                .and_then(|config| config.interval_hours)
-                .unwrap_or(rg_core::backup::DEFAULT_INTERVAL_HOURS),
-            keep_last: backup_config
-                .and_then(|config| config.keep_last)
-                .unwrap_or(rg_core::backup::DEFAULT_KEEP_LAST),
-        };
-        Some(rg_core::backup::spawn_db_backup_with_shutdown(
-            db.clone(),
-            db_backup_config,
-            Some(shutdown_rx.clone()),
-        )?)
-    } else {
         // Said out loud on purpose: an operator who greps the log for "backup"
         // must not have to infer the answer from the absence of a line.
         tracing::info!(
@@ -1683,91 +1835,212 @@ pub(crate) async fn run_serve(
              up when someone runs `plombir-git backup-db`. Note that repositories under repo_root \
              are never covered by a database backup — snapshot the data volume for those."
         );
-        None
+        return Ok(None);
+    }
+    let backup_dir = backup_config
+        .and_then(|config| config.dir.as_deref())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_db_backup_dir(&storage.repo_root));
+    tracing::info!(
+        backup_dir = %std::path::absolute(&backup_dir)
+            .unwrap_or_else(|_| backup_dir.clone())
+            .display(),
+        "Scheduled database backups enabled"
+    );
+    let db_backup_config = rg_core::backup::DbBackupConfig {
+        dir: backup_dir,
+        interval_hours: backup_config
+            .and_then(|config| config.interval_hours)
+            .unwrap_or(rg_core::backup::DEFAULT_INTERVAL_HOURS),
+        keep_last: backup_config
+            .and_then(|config| config.keep_last)
+            .unwrap_or(rg_core::backup::DEFAULT_KEEP_LAST),
     };
+    Ok(Some(rg_core::backup::spawn_db_backup_with_shutdown(
+        storage.db.clone(),
+        db_backup_config,
+        Some(shutdown_rx.clone()),
+    )?))
+}
 
-    // ── Retention of append-only tables ───────────────────────────
-    // Webhook deliveries, notifications and login attempts are written on
-    // every event and nothing else ever deletes them. The windows are
-    // range-checked here, so a 0 fails the start rather than the first pass.
-    let retention_config = cfg.as_ref().map(|config| &config.retention);
-    let _retention_handle = if retention_config
+/// ── Retention of append-only tables ───────────────────────────
+///
+/// Webhook deliveries, notifications and login attempts are written on every
+/// event and nothing else ever deletes them. The windows are range-checked
+/// here, so a 0 fails the start rather than the first pass.
+fn spawn_retention(
+    cfg: Option<&crate::config::ConfigFile>,
+    storage: &ServeStorage,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let retention_config = cfg.map(|config| &config.retention);
+    if !retention_config
         .and_then(|config| config.enabled)
         .unwrap_or(DEFAULT_RETENTION_ENABLED)
     {
-        let defaults = rg_core::retention::RetentionConfig::default();
-        let config = rg_core::retention::RetentionConfig {
-            webhook_delivery_days: retention_config
-                .and_then(|config| config.webhook_delivery_days)
-                .unwrap_or(defaults.webhook_delivery_days),
-            notification_read_days: retention_config
-                .and_then(|config| config.notification_read_days)
-                .unwrap_or(defaults.notification_read_days),
-            notification_unread_days: retention_config
-                .and_then(|config| config.notification_unread_days)
-                .unwrap_or(defaults.notification_unread_days),
-            login_log_days: retention_config
-                .and_then(|config| config.login_log_days)
-                .unwrap_or(defaults.login_log_days),
-            interval_minutes: retention_config
-                .and_then(|config| config.interval_minutes)
-                .unwrap_or(defaults.interval_minutes),
-            batch_size: retention_config
-                .and_then(|config| config.batch_size)
-                .unwrap_or(defaults.batch_size),
-        };
-        tracing::info!(
-            webhook_delivery_days = config.webhook_delivery_days,
-            notification_read_days = config.notification_read_days,
-            notification_unread_days = config.notification_unread_days,
-            login_log_days = config.login_log_days,
-            "Retention sweep enabled"
-        );
-        Some(rg_core::retention::spawn_retention_with_shutdown(
-            rg_core::db::Db::new(db.clone(), db_write.clone()),
-            config,
-            Some(shutdown_rx.clone()),
-        )?)
-    } else {
         // Said out loud, as for backups: "does this instance ever trim these
         // tables?" should be answerable from the log.
         tracing::info!(
             "Retention sweep is OFF ([retention].enabled): webhook deliveries, notifications \
              and login attempts are kept forever"
         );
-        None
+        return Ok(None);
+    }
+    let defaults = rg_core::retention::RetentionConfig::default();
+    let config = rg_core::retention::RetentionConfig {
+        webhook_delivery_days: retention_config
+            .and_then(|config| config.webhook_delivery_days)
+            .unwrap_or(defaults.webhook_delivery_days),
+        notification_read_days: retention_config
+            .and_then(|config| config.notification_read_days)
+            .unwrap_or(defaults.notification_read_days),
+        notification_unread_days: retention_config
+            .and_then(|config| config.notification_unread_days)
+            .unwrap_or(defaults.notification_unread_days),
+        login_log_days: retention_config
+            .and_then(|config| config.login_log_days)
+            .unwrap_or(defaults.login_log_days),
+        interval_minutes: retention_config
+            .and_then(|config| config.interval_minutes)
+            .unwrap_or(defaults.interval_minutes),
+        batch_size: retention_config
+            .and_then(|config| config.batch_size)
+            .unwrap_or(defaults.batch_size),
     };
+    tracing::info!(
+        webhook_delivery_days = config.webhook_delivery_days,
+        notification_read_days = config.notification_read_days,
+        notification_unread_days = config.notification_unread_days,
+        login_log_days = config.login_log_days,
+        "Retention sweep enabled"
+    );
+    Ok(Some(rg_core::retention::spawn_retention_with_shutdown(
+        rg_core::db::Db::new(storage.db.clone(), storage.db_write.clone()),
+        config,
+        Some(shutdown_rx.clone()),
+    )?))
+}
 
-    // ── HTTP server ───────────────────────────────────────────────
+/// ── Scheduled mirror sync ─────────────────────────────────────
+///
+/// The periodic half of the mirror feature. `POST .../mirror` has always taken
+/// a `sync_interval_seconds` and written a `next_sync_at` that the settings UI
+/// renders as "next sync at …", but nothing in the process ever called
+/// `sync_due_mirrors`: only the manual "Sync now" button refreshed a mirror,
+/// and it was also the only thing that ever moved `next_sync_at`
+/// (card_d2fd29942436).
+fn spawn_mirror_sync(
+    settings: &ServeSettings,
+    storage: &ServeStorage,
+    post_push_context: &rg_core::push_hooks::PostPushContext,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let mirror_config = settings.cfg.as_ref().map(|config| &config.mirror);
+    if !mirror_config
+        .and_then(|config| config.enabled)
+        .unwrap_or(DEFAULT_MIRROR_ENABLED)
+    {
+        // Said out loud for the same reason as the backup line: an operator
+        // whose mirror shows a next-sync time must be able to find out from the
+        // log that nothing is going to act on it.
+        tracing::info!(
+            "Scheduled mirror sync is OFF ([mirror].enabled): configured mirrors are only \
+             refreshed when someone triggers a sync from the repository's mirror settings."
+        );
+        return Ok(None);
+    }
+    let sync_config = rg_core::mirror::scheduler::MirrorSyncConfig {
+        poll_interval_secs: mirror_config
+            .and_then(|config| config.poll_interval_secs)
+            .unwrap_or(rg_core::mirror::scheduler::DEFAULT_POLL_INTERVAL_SECS),
+        batch_size: mirror_config
+            .and_then(|config| config.batch_size)
+            .unwrap_or(rg_core::mirror::scheduler::DEFAULT_BATCH_SIZE),
+        transport_policy: settings.transports.mirror,
+        storage_limits: settings.storage_limits,
+    };
+    tracing::info!(
+        poll_interval_secs = sync_config.poll_interval_secs,
+        batch_size = sync_config.batch_size,
+        "Scheduled mirror sync enabled"
+    );
+    // The secret is `encryption_key`, never `jwt_secret`: the mirror's stored
+    // remote credential is encrypted at rest with the former, and the two
+    // stopped being the same value in card_d740512de0a8. With the post-push
+    // wiring: a pass that moves a branch owes the open pull requests on it
+    // their new head (card_dbc5a1debb0a).
+    Ok(Some(
+        rg_core::mirror::scheduler::spawn_mirror_sync_with_shutdown(
+            storage.db.clone(),
+            storage.repo_root.clone(),
+            settings.auth_secrets.encryption_key.clone(),
+            sync_config,
+            Some(post_push_context.clone()),
+            Some(shutdown_rx.clone()),
+        )?,
+    ))
+}
+
+/// The checks that need the whole configuration and the database at once,
+/// and the startup notices that follow from them.
+fn preflight_http(
+    settings: &ServeSettings,
+    storage: &ServeStorage,
+    smtp_configured: bool,
+    tls_config: &Option<(PathBuf, PathBuf)>,
+) -> anyhow::Result<()> {
     // A reset link may only name the configured public address — one taken
     // from the request `Host` would let an anonymous requester choose where a
     // victim's token is sent — so `forgot-password` refuses mail without it
     // (card_e67aeb8c09ca). Say so now rather than at the first locked-out user.
-    if smtp_config.is_some() && resolved_external_url.is_none() {
+    if smtp_configured && settings.external_url.is_none() {
         tracing::warn!(
             "SMTP is configured but [server].external_url is not: password reset emails will be refused until external_url names this instance's public URL"
         );
     }
 
-    validate_config(&resolved_auth_secrets.jwt_secret, &repo_root, &tls_config)?;
+    validate_config(
+        &settings.auth_secrets.jwt_secret,
+        &storage.repo_root,
+        tls_config,
+    )?;
     require_mail_for_registration(
-        resolved_registration,
-        smtp_config.is_some(),
-        resolved_external_url.is_some(),
+        settings.registration,
+        smtp_configured,
+        settings.external_url.is_some(),
     )?;
 
     // Logged after the subscriber is up, so the one line an operator greps for
     // when a colleague "cannot sign up" actually reaches the log.
-    match registration_startup_notice(resolved_registration, registration_source) {
+    match registration_startup_notice(settings.registration, settings.registration_source) {
         Some((tracing::Level::WARN, notice)) => tracing::warn!("{notice}"),
         Some((_, notice)) => tracing::info!("{notice}"),
         None => {}
     }
     tracing::info!(
-        max_bytes = resolved_package_upload_max_bytes,
+        max_bytes = settings.package_upload_max_bytes,
         "Package upload artifact ceiling configured"
     );
+    Ok(())
+}
 
+/// Both transports, configured, and the workers that hang off them.
+struct Transports {
+    http: rg_http::HttpServerConfig,
+    ssh: rg_ssh::SshServerConfig,
+    /// Notification mail and mirror sync, when configured.
+    workers: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Wire the HTTP and SSH servers to one CI engine, one notification hub and
+/// one post-push context, so a push behaves the same over either transport.
+fn build_transports(
+    settings: ServeSettings,
+    storage: &ServeStorage,
+    smtp_config: Option<rg_core::email::SmtpConfig>,
+    tls_config: Option<(PathBuf, PathBuf)>,
+    shutdown_rx: &tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<Transports> {
     // One CI engine and one WebSocket hub for the whole process: the SSH
     // transport's post-push hooks trigger pipelines and push `ci_triggered` /
     // `push` events to the very clients the HTTP server's sockets belong to, so
@@ -1783,11 +2056,11 @@ pub(crate) async fn run_serve(
             notifier: Some(std::sync::Arc::new(notification_hub.clone())),
             smtp_config: smtp_config.clone(),
         },
-        resolved_job_timeout,
-        resolved_runner_labels.clone(),
+        settings.timeouts.job,
+        settings.runner_labels.clone(),
         shutdown_rx.clone(),
-        db_write.clone(),
-        resolved_storage_limits,
+        storage.db_write.clone(),
+        settings.storage_limits,
     );
     tracing::info!(
         job_timeout_secs = ci_engine.job_timeout_secs(),
@@ -1798,220 +2071,190 @@ pub(crate) async fn run_serve(
         std::sync::Arc::new(ci_engine);
     let instance_settings = rg_core::instance::InstanceSettingsCache::default();
 
-    let http_config = rg_http::HttpServerConfig {
-        listen_addr: resolved_http_addr,
-        repo_root: repo_root.clone(),
-        spa_build_dir: resolve_spa_build_dir(cfg.as_ref()),
-        db: db.clone(),
-        db_write: Some(db_write.clone()),
-        jwt_secret: resolved_auth_secrets.jwt_secret.clone(),
-        encryption_key: resolved_auth_secrets.encryption_key.clone(),
-        instance_key,
-        external_webhook_secret: resolved_external_webhook_secret,
-        docker_enabled: resolved_docker,
-        external_runners: resolved_external_runners,
-        allow_host_runner: resolved_allow_host_runner,
-        registration: resolved_registration,
-        setup_token,
-        trusted_import_origins: resolved_trusted_import_origins,
-        import_transport_policy: resolved_import_transport_policy,
-        oidc_transport_policy: resolved_oidc_transport_policy,
-        ldap_transport_policy: resolved_ldap_transport_policy,
-        mirror_transport_policy: resolved_mirror_transport_policy,
-        webhook_transport_policy: resolved_webhook_transport_policy,
-        package_upload_max_bytes: resolved_package_upload_max_bytes,
-        storage_limits: resolved_storage_limits,
-        rate_limit_max: resolved_rate_limit_max,
-        rate_limit_window_secs: resolved_rate_limit_window,
-        rate_limit_trusted_proxies: resolved_rate_limit_trusted_proxies,
-        rate_limit_max_keys: resolved_rate_limit_max_keys,
-        rate_limit_auth_max: resolved_rate_limit_auth_max,
-        rate_limit_auth_window_secs: resolved_rate_limit_auth_window,
-        rate_limit_agent_max: resolved_rate_limit_agent_max,
-        rate_limit_agent_window_secs: resolved_rate_limit_agent_window,
-        rate_limit_search_max: resolved_rate_limit_search_max,
-        rate_limit_search_window_secs: resolved_rate_limit_search_window,
-        smtp_config: smtp_config.clone(),
-        tls_config,
-        external_url: resolved_external_url.clone(),
-        hsts_preload: resolved_hsts_preload,
-        job_timeout_secs: resolved_job_timeout,
-        git_stream_timeout_secs: resolved_git_stream_timeout,
-        git_idle_timeout_secs: resolved_git_idle_timeout,
-        // M-14: Inject CiEngine via trait object, decoupling rg-http from rg-ci.
-        ci_engine: ci_engine.clone(),
-        shutdown_rx: shutdown_rx.clone(),
-        shutdown_grace_secs: resolved_shutdown_grace,
-        attestation_enabled: resolved_attestation_enabled,
-        source_url: resolved_source_url,
-        notification_hub: Some(notification_hub.clone()),
-        instance_settings: instance_settings.clone(),
-        metrics_access: resolved_metrics_access,
-    };
-
-    // ── SSH server ────────────────────────────────────────────────
-    let host_key_path = resolved_host_key.unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/.ssh/id_ed25519", home)
-    });
-
     // A push over SSH must run the same automation as a push over HTTPS — CI,
     // webhooks, open-PR head-SHA refresh, auto-merge / merge-queue. These hooks
     // used to be private to `rg-http`, so SSH (the default once a key is
     // registered) ran none of them (card_b4fefeee8abf).
-    // LFS for clones made from the SSH address: `git-lfs-authenticate` sends the
-    // client to the HTTP side, and the only address it can honestly name is the
-    // configured public one (card_d8d274ed134d).
-    let ssh_lfs = resolved_external_url
-        .clone()
-        .map(|external_url| rg_ssh::SshLfsConfig {
-            external_url,
-            signing_secret: resolved_auth_secrets.jwt_secret.clone(),
-        });
+    let post_push_context = rg_core::push_hooks::PostPushContext {
+        repo_root: storage.repo_root.clone(),
+        docker_enabled: settings.docker,
+        external_runners: settings.external_runners,
+        allow_host_runner: settings.allow_host_runner,
+        jwt_secret: Some(settings.auth_secrets.jwt_secret.clone()),
+        encryption_key: Some(settings.auth_secrets.encryption_key.clone()),
+        smtp_config: smtp_config.clone(),
+        ci_engine: ci_engine.clone(),
+        external_url: settings.external_url.clone(),
+        notifier: Some(std::sync::Arc::new(notification_hub.clone())),
+        delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
+        write_pool: Some(storage.db_write.clone()),
+        storage_limits: settings.storage_limits,
+    };
 
     // Notification mail, batched per person (card_349c2b6a0d7c). Without SMTP
     // the rows are still written — the inbox is the notification — and nothing
     // waits to mail them.
-    let _notification_mail_handle = smtp_config.clone().map(|smtp| {
+    let notification_mail = smtp_config.clone().map(|smtp| {
         rg_core::notification::mail::spawn_dispatcher(
-            rg_core::db::Db::new(db.clone(), db_write.clone()),
+            rg_core::db::Db::new(storage.db.clone(), storage.db_write.clone()),
             smtp,
-            resolved_external_url.clone(),
+            settings.external_url.clone(),
             Some(shutdown_rx.clone()),
         )
     });
+    let mirror_sync = spawn_mirror_sync(&settings, storage, &post_push_context, shutdown_rx)?;
 
-    let mirror_encryption_key = resolved_auth_secrets.encryption_key.clone();
-    let post_push_context = rg_core::push_hooks::PostPushContext {
-        repo_root: repo_root.clone(),
-        docker_enabled: resolved_docker,
-        external_runners: resolved_external_runners,
-        allow_host_runner: resolved_allow_host_runner,
-        jwt_secret: Some(resolved_auth_secrets.jwt_secret.clone()),
-        encryption_key: Some(resolved_auth_secrets.encryption_key),
-        smtp_config,
-        ci_engine,
-        external_url: resolved_external_url,
-        notifier: Some(std::sync::Arc::new(notification_hub)),
-        delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
-        write_pool: Some(db_write.clone()),
-        storage_limits: resolved_storage_limits,
-    };
-
-    // ── Scheduled mirror sync ─────────────────────────────────────
-    // The periodic half of the mirror feature. `POST .../mirror` has always
-    // taken a `sync_interval_seconds` and written a `next_sync_at` that the
-    // settings UI renders as "next sync at …", but nothing in the process ever
-    // called `sync_due_mirrors`: only the manual "Sync now" button refreshed a
-    // mirror, and it was also the only thing that ever moved `next_sync_at`
-    // (card_d2fd29942436).
-    let mirror_config = cfg.as_ref().map(|config| &config.mirror);
-    let _mirror_sync_handle = if mirror_config
-        .and_then(|config| config.enabled)
-        .unwrap_or(DEFAULT_MIRROR_ENABLED)
-    {
-        let sync_config = rg_core::mirror::scheduler::MirrorSyncConfig {
-            poll_interval_secs: mirror_config
-                .and_then(|config| config.poll_interval_secs)
-                .unwrap_or(rg_core::mirror::scheduler::DEFAULT_POLL_INTERVAL_SECS),
-            batch_size: mirror_config
-                .and_then(|config| config.batch_size)
-                .unwrap_or(rg_core::mirror::scheduler::DEFAULT_BATCH_SIZE),
-            transport_policy: resolved_mirror_transport_policy,
-            storage_limits: resolved_storage_limits,
-        };
-        tracing::info!(
-            poll_interval_secs = sync_config.poll_interval_secs,
-            batch_size = sync_config.batch_size,
-            "Scheduled mirror sync enabled"
-        );
-        // The secret is `encryption_key`, never `jwt_secret`: the mirror's
-        // stored remote credential is encrypted at rest with the former, and
-        // the two stopped being the same value in card_d740512de0a8.
-        // With the post-push wiring: a pass that moves a branch owes the open
-        // pull requests on it their new head (card_dbc5a1debb0a).
-        Some(rg_core::mirror::scheduler::spawn_mirror_sync_with_shutdown(
-            db.clone(),
-            repo_root.clone(),
-            mirror_encryption_key,
-            sync_config,
-            Some(post_push_context.clone()),
-            Some(shutdown_rx.clone()),
-        )?)
-    } else {
-        // Said out loud for the same reason as the backup line below it: an
-        // operator whose mirror shows a next-sync time must be able to find out
-        // from the log that nothing is going to act on it.
-        tracing::info!(
-            "Scheduled mirror sync is OFF ([mirror].enabled): configured mirrors are only \
-             refreshed when someone triggers a sync from the repository's mirror settings."
-        );
-        None
-    };
-
-    let ssh_config = rg_ssh::SshServerConfig {
+    // LFS for clones made from the SSH address: `git-lfs-authenticate` sends the
+    // client to the HTTP side, and the only address it can honestly name is the
+    // configured public one (card_d8d274ed134d).
+    let ssh_lfs = settings
+        .external_url
+        .clone()
+        .map(|external_url| rg_ssh::SshLfsConfig {
+            external_url,
+            signing_secret: settings.auth_secrets.jwt_secret.clone(),
+        });
+    let host_key_path = settings.base.host_key.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{}/.ssh/id_ed25519", home)
+    });
+    let ssh = rg_ssh::SshServerConfig {
         host_key_path: PathBuf::from(&host_key_path),
-        listen_addr: resolved_ssh_addr,
-        repo_root: repo_root.clone(),
-        db: db.clone(),
-        db_write,
-        git_stream_timeout_secs: resolved_git_stream_timeout,
-        git_idle_timeout_secs: resolved_git_idle_timeout,
+        listen_addr: settings.base.ssh_addr.clone(),
+        repo_root: storage.repo_root.clone(),
+        db: storage.db.clone(),
+        db_write: storage.db_write.clone(),
+        git_stream_timeout_secs: settings.timeouts.git_stream,
+        git_idle_timeout_secs: settings.timeouts.git_idle,
         post_push: Some(std::sync::Arc::new(post_push_context)),
         lfs: ssh_lfs,
-        instance_settings,
-        // The second consumer of the fan-out above. It used to be the one the
-        // channel never reached, so a `SIGTERM` cut an SSH push mid-objects
+        instance_settings: instance_settings.clone(),
+        // The second consumer of the shutdown fan-out. It used to be the one
+        // the channel never reached, so a `SIGTERM` cut an SSH push mid-objects
         // while the same push over HTTP was drained (card_5317e172fd25).
         shutdown: Some(shutdown_rx.clone()),
-        shutdown_grace_secs: resolved_shutdown_grace,
+        shutdown_grace_secs: settings.timeouts.shutdown_grace,
     };
 
-    let (http_handle, ssh_handle) = if let Some(address_file) = listen_address_file {
-        if http_config.tls_config.is_some() {
-            anyhow::bail!("--listen-address-file is only supported for plain HTTP");
-        }
+    let metrics_access = settings.metrics_access();
+    let http = rg_http::HttpServerConfig {
+        listen_addr: settings.base.http_addr,
+        repo_root: storage.repo_root.clone(),
+        spa_build_dir: resolve_spa_build_dir(settings.cfg.as_ref()),
+        db: storage.db.clone(),
+        db_write: Some(storage.db_write.clone()),
+        jwt_secret: settings.auth_secrets.jwt_secret,
+        encryption_key: settings.auth_secrets.encryption_key,
+        instance_key: storage.instance_key.clone(),
+        external_webhook_secret: settings.external_webhook_secret,
+        docker_enabled: settings.docker,
+        external_runners: settings.external_runners,
+        allow_host_runner: settings.allow_host_runner,
+        registration: settings.registration,
+        setup_token: storage.setup_token.clone(),
+        trusted_import_origins: settings.trusted_import_origins,
+        import_transport_policy: settings.transports.import,
+        oidc_transport_policy: settings.transports.oidc,
+        ldap_transport_policy: settings.transports.ldap,
+        mirror_transport_policy: settings.transports.mirror,
+        webhook_transport_policy: settings.transports.webhook,
+        package_upload_max_bytes: settings.package_upload_max_bytes,
+        storage_limits: settings.storage_limits,
+        rate_limit_max: settings.base.rate_limit_max,
+        rate_limit_window_secs: settings.base.rate_limit_window,
+        rate_limit_trusted_proxies: settings.rate_limits.trusted_proxies,
+        rate_limit_max_keys: settings.rate_limits.max_keys,
+        rate_limit_auth_max: settings.rate_limits.auth_max,
+        rate_limit_auth_window_secs: settings.rate_limits.auth_window,
+        rate_limit_agent_max: settings.rate_limits.agent_max,
+        rate_limit_agent_window_secs: settings.rate_limits.agent_window,
+        rate_limit_search_max: settings.rate_limits.search_max,
+        rate_limit_search_window_secs: settings.rate_limits.search_window,
+        smtp_config,
+        tls_config,
+        external_url: settings.external_url,
+        hsts_preload: settings.hsts_preload,
+        job_timeout_secs: settings.timeouts.job,
+        git_stream_timeout_secs: settings.timeouts.git_stream,
+        git_idle_timeout_secs: settings.timeouts.git_idle,
+        // M-14: Inject CiEngine via trait object, decoupling rg-http from rg-ci.
+        ci_engine,
+        shutdown_rx: shutdown_rx.clone(),
+        shutdown_grace_secs: settings.timeouts.shutdown_grace,
+        attestation_enabled: settings.attestation_enabled,
+        source_url: settings.source_url,
+        notification_hub: Some(notification_hub),
+        instance_settings,
+        metrics_access,
+    };
+    Ok(Transports {
+        http,
+        ssh,
+        workers: notification_mail.into_iter().chain(mirror_sync).collect(),
+    })
+}
 
-        let http_listener = tokio::net::TcpListener::bind(&http_config.listen_addr)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to bind HTTP listener to {}",
-                    http_config.listen_addr
-                )
-            })?;
-        let ssh_listener = tokio::net::TcpListener::bind(&ssh_config.listen_addr)
-            .await
-            .with_context(|| {
-                format!("failed to bind SSH listener to {}", ssh_config.listen_addr)
-            })?;
-        let http_addr = http_listener
-            .local_addr()
-            .context("failed to read bound HTTP listener address")?;
-        let ssh_addr = ssh_listener
-            .local_addr()
-            .context("failed to read bound SSH listener address")?;
-
-        publish_listen_addresses(Path::new(&address_file), http_addr, ssh_addr)?;
-
-        let http_handle =
-            tokio::spawn(async move { rg_http::run_on_listener(http_config, http_listener).await });
-        let ssh_handle = tokio::spawn(async move {
-            if let Err(e) = rg_ssh::start_ssh_server_on_listener(ssh_config, ssh_listener).await {
-                tracing::error!("SSH server error (HTTP unaffected): {:#}", e);
-            }
-        });
-        (http_handle, ssh_handle)
-    } else {
+/// Start both transports — on listeners bound here when the caller wants the
+/// bound addresses published — and wait for HTTP, the primary one, to stop.
+async fn run_transports(
+    http_config: rg_http::HttpServerConfig,
+    ssh_config: rg_ssh::SshServerConfig,
+    listen_address_file: Option<String>,
+) -> anyhow::Result<(
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let Some(address_file) = listen_address_file else {
         let http_handle = tokio::spawn(async move { rg_http::run(http_config).await });
         let ssh_handle = tokio::spawn(async move {
             if let Err(e) = rg_ssh::start_ssh_server(ssh_config).await {
                 tracing::error!("SSH server error (HTTP unaffected): {:#}", e);
             }
         });
-        (http_handle, ssh_handle)
+        return Ok((http_handle, ssh_handle));
     };
+    if http_config.tls_config.is_some() {
+        anyhow::bail!("--listen-address-file is only supported for plain HTTP");
+    }
 
+    let http_listener = tokio::net::TcpListener::bind(&http_config.listen_addr)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to bind HTTP listener to {}",
+                http_config.listen_addr
+            )
+        })?;
+    let ssh_listener = tokio::net::TcpListener::bind(&ssh_config.listen_addr)
+        .await
+        .with_context(|| format!("failed to bind SSH listener to {}", ssh_config.listen_addr))?;
+    let http_addr = http_listener
+        .local_addr()
+        .context("failed to read bound HTTP listener address")?;
+    let ssh_addr = ssh_listener
+        .local_addr()
+        .context("failed to read bound SSH listener address")?;
+
+    publish_listen_addresses(Path::new(&address_file), http_addr, ssh_addr)?;
+
+    let http_handle =
+        tokio::spawn(async move { rg_http::run_on_listener(http_config, http_listener).await });
+    let ssh_handle = tokio::spawn(async move {
+        if let Err(e) = rg_ssh::start_ssh_server_on_listener(ssh_config, ssh_listener).await {
+            tracing::error!("SSH server error (HTTP unaffected): {:#}", e);
+        }
+    });
+    Ok((http_handle, ssh_handle))
+}
+
+/// Wait for HTTP to stop, raise the shutdown signal if it failed, and give SSH
+/// a bounded chance to follow. HTTP's own result is the process's.
+async fn await_transports(
+    http_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    ssh_handle: tokio::task::JoinHandle<()>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_grace: u64,
+) -> anyhow::Result<()> {
     let http_result = match http_handle.await {
         Ok(result) => result,
         Err(error) => Err(anyhow::Error::new(error).context("HTTP server task terminated")),
@@ -2025,7 +2268,7 @@ pub(crate) async fn run_serve(
     // ordinary entry point still bypasses that shutdown-aware accept path
     // (reopened card_5317e172fd25), so the timeout remains a necessary backstop.
     match tokio::time::timeout(
-        std::time::Duration::from_secs(resolved_shutdown_grace) * 2,
+        std::time::Duration::from_secs(shutdown_grace) * 2,
         ssh_handle,
     )
     .await
@@ -2033,12 +2276,18 @@ pub(crate) async fn run_serve(
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::error!("SSH server task terminated: {:#}", e),
         Err(_) => tracing::warn!(
-            grace_secs = resolved_shutdown_grace,
+            grace_secs = shutdown_grace,
             "SSH server did not stop within twice its grace window — releasing the database lease \
              anyway"
         ),
     }
+    http_result
+}
 
+/// Wait, bounded, for the work the transports left running: embedded CI
+/// runners first, then the deliveries they and late SSH pushes spawned.
+async fn drain_after_transports(shutdown_grace: u64) {
+    let grace = std::time::Duration::from_secs(shutdown_grace);
     // Now the executor. HTTP has stopped and SSH has either stopped or exhausted
     // its bounded wait, so nothing new should be triggered; the open wiring gap
     // above remains operator-visible rather than being described as success.
@@ -2055,15 +2304,10 @@ pub(crate) async fn run_serve(
     let ci_tracker = rg_core::task_tracker::ci_tracker();
     ci_tracker.close();
     if !ci_tracker.is_empty() {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(resolved_shutdown_grace),
-            ci_tracker.wait(),
-        )
-        .await
-        {
+        match tokio::time::timeout(grace, ci_tracker.wait()).await {
             Ok(()) => tracing::info!("embedded CI runners stopped and handed their jobs back"),
             Err(_) => tracing::warn!(
-                grace_secs = resolved_shutdown_grace,
+                grace_secs = shutdown_grace,
                 "embedded CI runners did not stop within the grace window; the jobs they held \
                  stay `running` until the stuck-job sweep reclaims them"
             ),
@@ -2080,19 +2324,69 @@ pub(crate) async fn run_serve(
     let delivery_tracker = rg_core::task_tracker::delivery_tracker();
     delivery_tracker.close();
     if !delivery_tracker.is_empty() {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(resolved_shutdown_grace),
-            delivery_tracker.wait(),
-        )
-        .await
-        {
+        match tokio::time::timeout(grace, delivery_tracker.wait()).await {
             Ok(()) => tracing::info!("post-shutdown delivery tasks drained"),
             Err(_) => tracing::warn!(
-                grace_secs = resolved_shutdown_grace,
+                grace_secs = shutdown_grace,
                 "delivery tasks spawned after the HTTP drain did not finish within the grace window"
             ),
         }
     }
+}
+
+/// Initialise and run the Plombir Git server (HTTP + SSH).
+pub(crate) async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
+    let (mut settings, deferred) = ServeSettings::resolve(args)?;
+    // Git, gix, SQLite, the registry stores and embedded CI all create state.
+    // Several of those writers do not expose an open mode, so install the one
+    // policy they all inherit before the first creating filesystem call (the
+    // optional log appender in `init_logging` is the first one). Resolving the
+    // settings reads files and creates none.
+    let resolved_state_permissions = settings.base.state_permissions;
+    resolved_state_permissions.install();
+    let telemetry_guard = init_logging(&settings)?;
+    settings.announce();
+
+    // A half-written `[smtp]` or `[tls]` stops the start here, before the
+    // first directory or database is created, rather than quietly disabling
+    // mail or downgrading the listener to plain HTTP.
+    let smtp_config = resolve_smtp_config(
+        settings.cfg.as_ref(),
+        deferred.smtp_host,
+        settings.base.smtp_port,
+        deferred.smtp_user,
+        deferred.smtp_pass,
+        deferred.smtp_from,
+    )?;
+    let tls_config =
+        resolve_tls_config(settings.cfg.as_ref(), deferred.tls_cert, deferred.tls_key)?;
+
+    let storage = init_storage(&mut settings).await?;
+
+    // ── Graceful shutdown signal ──────────────────────────────────
+    // A single `watch` channel fans the SIGTERM/ctrl_c signal out to the HTTP
+    // server and every background worker so they can drain and exit cleanly.
+    let shutdown_grace = settings.timeouts.shutdown_grace;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let _background = spawn_maintenance_tasks(settings.cfg.as_ref(), &storage, &shutdown_rx)?;
+    let signal_shutdown_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        if signal_shutdown_tx.send(true).is_err() {
+            // Every receiver has already shut down.
+        }
+    });
+
+    preflight_http(&settings, &storage, smtp_config.is_some(), &tls_config)?;
+    let transports = build_transports(settings, &storage, smtp_config, tls_config, &shutdown_rx)?;
+    let Transports {
+        http,
+        ssh,
+        workers: _workers,
+    } = transports;
+    let (http_handle, ssh_handle) = run_transports(http, ssh, deferred.listen_address_file).await?;
+    let http_result = await_transports(http_handle, ssh_handle, &shutdown_tx, shutdown_grace).await;
+    drain_after_transports(shutdown_grace).await;
 
     // Flush the OTLP exporter (and the non-blocking log appender) before exit so
     // the final batch of spans reaches the collector.
@@ -2101,7 +2395,7 @@ pub(crate) async fn run_serve(
     // Release the SQLite process lease after the bounded transport/worker
     // shutdown sequence above. The remaining ordinary-SSH timeout gap is
     // tracked by card_5317e172fd25 rather than hidden behind a stronger claim.
-    drop(server_db);
+    drop(storage);
 
     http_result
 }
@@ -2185,29 +2479,51 @@ mod serve_tests {
              intends to wait for it — and nobody did"
         );
 
-        let awaited = code
-            .find("ssh_handle,")
-            .or_else(|| code.find("ssh_handle)"))
-            .or_else(|| code.find("ssh_handle."))
-            .expect("`run_serve` must do something with the SSH task handle");
-        let released = code
-            .find("drop(server_db)")
-            .expect("`run_serve` must release the database lease");
+        // The lease is the `ServeStorage` `run_serve` drops last; the SSH
+        // handle is waited for in `await_transports`, which runs before it.
         assert!(
-            awaited < released,
-            "the SSH task is used at byte {awaited} and the database lease is dropped at \
-             {released}: the lease has to outlive the transport that is still reading through it"
+            code.contains("_lease: server_db"),
+            "the database lease must be held by `ServeStorage`, the value `run_serve` drops last"
+        );
+        let awaited =
+            rust_source::production_function_call_sites(source, "run_serve", &["await_transports"]);
+        let released = rust_source::production_function_call_sites(source, "run_serve", &["drop"]);
+        let ([awaited], [released]) = (awaited.as_slice(), released.as_slice()) else {
+            panic!(
+                "`run_serve` must wait for the transports once and release the lease once; \
+                 found {} wait(s) and {} drop(s)",
+                awaited.len(),
+                released.len()
+            );
+        };
+        assert!(
+            awaited.open_paren < released.open_paren,
+            "the transports are waited for at byte {} and the lease is dropped at {}: the lease \
+             has to outlive the transport that is still reading through it",
+            awaited.open_paren,
+            released.open_paren
+        );
+        assert!(
+            code.contains("drop(storage)"),
+            "the value `run_serve` drops must be the storage that holds the lease"
         );
 
         // The wait itself, not merely a mention of the handle: a bare
         // `drop(ssh_handle)` would satisfy the ordering above and wait for
         // nothing.
-        let waits = rust_source::production_function_call_sites(source, "run_serve", &["timeout"]);
+        let ssh_waits =
+            rust_source::production_function_call_sites(source, "await_transports", &["timeout"]);
+        let drain_waits = rust_source::production_function_call_sites(
+            source,
+            "drain_after_transports",
+            &["timeout"],
+        );
         assert!(
-            waits.len() >= 3,
-            "`run_serve` must bound each of its shutdown waits — the SSH transport, the embedded \
-             CI runners and the delivery tasks; found {} `timeout` call(s)",
-            waits.len()
+            ssh_waits.len() == 1 && drain_waits.len() >= 2,
+            "the shutdown must bound each of its waits — the SSH transport, the embedded CI \
+             runners and the delivery tasks; found {} + {} `timeout` call(s)",
+            ssh_waits.len(),
+            drain_waits.len()
         );
     }
 
@@ -2228,16 +2544,36 @@ mod serve_tests {
         let source = include_str!("serve.rs");
         let code = rust_source::production_rust_code_only(source);
 
-        let drained = code
-            .find("ci_tracker.wait()")
-            .expect("`run_serve` must wait for the embedded CI runners to unwind");
-        let released = code
-            .find("drop(server_db)")
-            .expect("`run_serve` must release the database lease");
         assert!(
-            drained < released,
-            "the CI drain is at byte {drained} and the lease is dropped at {released}: a runner \
-             handing its job back writes through that lease"
+            code.contains("ci_tracker.wait()")
+                && !rust_source::production_function_call_sites(
+                    source,
+                    "drain_after_transports",
+                    &["wait"],
+                )
+                .is_empty(),
+            "`drain_after_transports` must wait for the embedded CI runners to unwind"
+        );
+        let drained = rust_source::production_function_call_sites(
+            source,
+            "run_serve",
+            &["drain_after_transports"],
+        );
+        let released = rust_source::production_function_call_sites(source, "run_serve", &["drop"]);
+        let ([drained], [released]) = (drained.as_slice(), released.as_slice()) else {
+            panic!(
+                "`run_serve` must drain once and release the lease once; found {} drain(s) and \
+                 {} drop(s)",
+                drained.len(),
+                released.len()
+            );
+        };
+        assert!(
+            drained.open_paren < released.open_paren,
+            "the CI drain is at byte {} and the lease is dropped at {}: a runner handing its job \
+             back writes through that lease",
+            drained.open_paren,
+            released.open_paren
         );
 
         // And the signal has to reach them, or the drain waits for a whole

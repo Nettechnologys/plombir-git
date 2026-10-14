@@ -1849,7 +1849,8 @@ async fn clone_repo(
                 REPO_ROOT_HINT,
             )
         })?;
-        fs2::FileExt::lock_exclusive(&import_lock)
+        import_lock
+            .lock()
             .context("failed to lock import target directory")?;
         if target_holds_history(&target_for_clone) {
             return Ok(None);
@@ -5980,7 +5981,7 @@ mod clone_effect_tests {
         let parent_for_lock = parent.clone();
         let lock_holder = std::thread::spawn(move || {
             let guard = std::fs::File::open(parent_for_lock).expect("open owner directory");
-            fs2::FileExt::lock_exclusive(&guard).expect("lock owner directory");
+            guard.lock().expect("lock owner directory");
             entered_tx.send(()).expect("signal held lock");
             std::thread::sleep(Duration::from_secs(1));
         });

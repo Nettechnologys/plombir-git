@@ -505,6 +505,7 @@ async fn resume_pipeline_with_engine(
     }
     spawn_internal_runner(
         params.db,
+        params.repo_root,
         params.repo_path,
         params.repo_id,
         params.pipeline_id,
@@ -596,6 +597,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
 ) -> Result<i64> {
     let TriggerPipelineParams {
         db,
+        repo_root,
         repo_path,
         repo_id,
         commit_sha,
@@ -810,7 +812,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
     {
         evaluate_initial_success(
             db,
-            repo_path,
+            repo_root,
             repo_id,
             commit_sha,
             docker_enabled,
@@ -829,6 +831,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
     if !external_runners {
         spawn_internal_runner(
             db,
+            repo_root,
             repo_path,
             repo_id,
             pipeline_id,
@@ -1235,7 +1238,7 @@ async fn resolve_job_environment(
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_initial_success(
     db: &sea_orm::DatabaseConnection,
-    repo_path: &std::path::Path,
+    repo_root: &std::path::Path,
     repo_id: i64,
     commit_sha: &str,
     docker_enabled: bool,
@@ -1246,9 +1249,6 @@ async fn evaluate_initial_success(
     external_url: Option<&str>,
     engine: &CiEngine,
 ) {
-    let Some(repo_root) = repo_path.parent().and_then(std::path::Path::parent) else {
-        return;
-    };
     post_push_context(
         repo_root,
         docker_enabled,
@@ -1321,6 +1321,7 @@ fn nested_engine(engine: &CiEngine) -> std::sync::Arc<CiEngine> {
 #[allow(clippy::too_many_arguments)]
 fn spawn_internal_runner(
     db: &sea_orm::DatabaseConnection,
+    repo_root: &std::path::Path,
     repo_path: &std::path::Path,
     repo_id: i64,
     pipeline_id: i64,
@@ -1333,6 +1334,7 @@ fn spawn_internal_runner(
 ) {
     let db_clone = db.clone();
     let engine = engine.clone();
+    let repo_root_owned = repo_root.to_path_buf();
     let repo_path_owned = repo_path.to_path_buf();
     let jwt_secret_owned = jwt_secret.map(str::to_string);
     let encryption_key_owned = encryption_key.map(str::to_string);
@@ -1359,6 +1361,7 @@ fn spawn_internal_runner(
         async move {
             let runner = build_internal_runner(
                 db_clone,
+                &repo_root_owned,
                 &repo_path_owned,
                 repo_id,
                 pipeline_id,
@@ -1379,6 +1382,7 @@ fn spawn_internal_runner(
 #[allow(clippy::too_many_arguments)]
 fn build_internal_runner(
     db: sea_orm::DatabaseConnection,
+    repo_root: &std::path::Path,
     repo_path: &std::path::Path,
     repo_id: i64,
     pipeline_id: i64,
@@ -1390,10 +1394,17 @@ fn build_internal_runner(
     engine: &CiEngine,
 ) -> PipelineRunner {
     let mut runner = if docker_enabled {
-        PipelineRunner::new_with_job_timeout(db, repo_path, pipeline_id, engine.job_timeout_secs)
+        PipelineRunner::new_with_job_timeout(
+            db,
+            repo_root,
+            repo_path,
+            pipeline_id,
+            engine.job_timeout_secs,
+        )
     } else {
         PipelineRunner::new_local_only_with_job_timeout(
             db,
+            repo_root,
             repo_path,
             pipeline_id,
             engine.job_timeout_secs,
@@ -3003,6 +3014,7 @@ mod notification_wiring_tests {
 
         let runner = build_internal_runner(
             db.clone(),
+            std::path::Path::new("/srv/repos"),
             std::path::Path::new("/srv/repos/o/r.git"),
             1,
             1,
@@ -3023,6 +3035,7 @@ mod notification_wiring_tests {
         // channel nobody owns.
         let standalone = build_internal_runner(
             db,
+            std::path::Path::new("/srv/repos"),
             std::path::Path::new("/srv/repos/o/r.git"),
             1,
             1,
@@ -3100,6 +3113,7 @@ mod notification_wiring_tests {
 
         spawn_internal_runner(
             &db,
+            std::path::Path::new("/nonexistent"),
             std::path::Path::new("/nonexistent/owner/repo.git"),
             1,
             pipeline_id,
@@ -3133,6 +3147,7 @@ mod notification_wiring_tests {
         for docker_enabled in [false, true] {
             let runner = build_internal_runner(
                 db.clone(),
+                std::path::Path::new("/srv/repos"),
                 std::path::Path::new("/srv/repos/o/r.git"),
                 1,
                 2,
@@ -3362,6 +3377,7 @@ mod matrix_tests {
         let pipeline_id = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
+                repo_root: temp.path(),
                 repo_path: temp.path(),
                 repo_id: repo.id,
                 commit_sha: &sha,
@@ -3466,6 +3482,7 @@ mod matrix_tests {
         let all_skipped_pipeline_id = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
+                repo_root: temp.path(),
                 repo_path: temp.path(),
                 repo_id: repo.id,
                 commit_sha: &sha,
@@ -3601,6 +3618,7 @@ mod matrix_tests {
         let error = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
+                repo_root: temp.path(),
                 repo_path: temp.path(),
                 repo_id: repo.id,
                 commit_sha: &sha,
@@ -3767,6 +3785,7 @@ mod matrix_tests {
     ) -> TriggerPipelineParams<'a> {
         TriggerPipelineParams {
             db,
+            repo_root: repo_path,
             repo_path,
             repo_id,
             commit_sha: sha,
@@ -4371,6 +4390,7 @@ mod matrix_tests {
         let error = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
+                repo_root: temp.path(),
                 repo_path: temp.path(),
                 repo_id: repo.id,
                 commit_sha: &sha,
@@ -4510,6 +4530,7 @@ mod matrix_tests {
         let error = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
+                repo_root: temp.path(),
                 repo_path: temp.path(),
                 repo_id: repo.id,
                 commit_sha: &sha,
@@ -4573,6 +4594,7 @@ mod matrix_tests {
         let storage_error = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
+                repo_root: temp.path(),
                 repo_path: temp.path(),
                 repo_id: repo.id,
                 commit_sha: &sha,
@@ -4684,6 +4706,7 @@ mod matrix_tests {
                 trigger_pipeline(
                     TriggerPipelineParams {
                         db: &db,
+                        repo_root: &path,
                         repo_path: &path,
                         repo_id,
                         commit_sha: &sha,
@@ -5000,6 +5023,7 @@ mod matrix_tests {
         let pipeline_id = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
+                repo_root: repo_dir.path(),
                 repo_path: repo_dir.path(),
                 repo_id: repo.id,
                 commit_sha: &sha,
@@ -5851,6 +5875,7 @@ mod matrix_tests {
             trigger_pipeline(
                 TriggerPipelineParams {
                     db: &db,
+                    repo_root: repo_path,
                     repo_path,
                     repo_id: 1,
                     commit_sha: sha,
@@ -5931,6 +5956,7 @@ mod matrix_tests {
             trigger_pipeline(
                 TriggerPipelineParams {
                     db: &db,
+                    repo_root: repo_path,
                     repo_path,
                     repo_id: 1,
                     commit_sha: sha,
@@ -6097,6 +6123,7 @@ mod matrix_tests {
         let error = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
+                repo_root: temp.path(),
                 repo_path: temp.path(),
                 repo_id: 1,
                 commit_sha: &sha,
@@ -7357,6 +7384,7 @@ mod matrix_tests {
         let pipeline_id = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
+                repo_root: temp.path(),
                 repo_path: temp.path(),
                 repo_id: repo.id,
                 commit_sha: &sha,
@@ -8277,6 +8305,7 @@ jobs:
     ) -> TriggerPipelineParams<'a> {
         TriggerPipelineParams {
             db,
+            repo_root: repo_path,
             repo_path,
             repo_id,
             commit_sha: sha,
@@ -9346,6 +9375,7 @@ mod artifact_publication_tests {
     /// awaits rather than a detached task it has to guess the timing of.
     async fn trigger_graph(
         db: &rg_db::DatabaseConnection,
+        repo_root: &std::path::Path,
         repo_path: &std::path::Path,
         repo_id: i64,
         sha: &str,
@@ -9354,6 +9384,7 @@ mod artifact_publication_tests {
         trigger_pipeline(
             TriggerPipelineParams {
                 db,
+                repo_root,
                 repo_path,
                 repo_id,
                 commit_sha: sha,
@@ -9401,8 +9432,8 @@ mod artifact_publication_tests {
     /// row says nothing, and the run goes green having produced no artifact.
     #[tokio::test]
     async fn a_workflow_upload_step_reaches_the_job_row_as_a_declaration() {
-        let (_temp, sha, db, user, repo, repo_path) = workflow_fixture(WORKFLOW).await;
-        let pipeline_id = trigger_graph(&db, &repo_path, repo.id, &sha, user.id).await;
+        let (temp, sha, db, user, repo, repo_path) = workflow_fixture(WORKFLOW).await;
+        let pipeline_id = trigger_graph(&db, temp.path(), &repo_path, repo.id, &sha, user.id).await;
 
         let job = only_job(&db, pipeline_id).await;
         let declared: serde_json::Value = serde_json::from_str(
@@ -9415,16 +9446,58 @@ mod artifact_publication_tests {
         assert_eq!(declared["paths"], serde_json::json!(["out/report.txt"]));
     }
 
+    /// The runner publishes under the storage root it is handed — the root the
+    /// HTTP side reads artifacts from — and not under a directory guessed from
+    /// where the repository sits (card_a3fbb5635ad1). Here the root is not two
+    /// levels above the repository, which is the one layout the guess got right.
+    #[tokio::test]
+    async fn an_artifact_lands_under_the_storage_root_the_runner_is_handed() {
+        let (temp, sha, db, user, repo, repo_path) = workflow_fixture(WORKFLOW).await;
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let pipeline_id =
+            trigger_graph(&db, &storage_root, &repo_path, repo.id, &sha, user.id).await;
+
+        let mut runner =
+            PipelineRunner::new_local_only(db.clone(), &storage_root, &repo_path, pipeline_id);
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+
+        let artifacts = rg_db::ops::artifact_ops::list_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        assert_eq!(artifacts.len(), 1);
+        let key = rg_core::blob_storage::BlobKey::new(artifacts[0].file_path.clone()).unwrap();
+        // Read the way the download route reads: `LocalBlobStorage` over the
+        // instance's root.
+        let served = rg_core::blob_storage::LocalBlobStorage::new(&storage_root);
+        assert!(
+            rg_core::blob_storage::BlobStorage::get(&served, &key)
+                .await
+                .is_ok(),
+            "the artifact is not where the download route looks"
+        );
+        let guessed = rg_core::blob_storage::LocalBlobStorage::new(temp.path());
+        assert!(
+            rg_core::blob_storage::BlobStorage::get(&guessed, &key)
+                .await
+                .is_err(),
+            "the artifact was written under the directory two levels above the repository"
+        );
+    }
+
     /// The whole chain: the committed workflow, the job the engine built from
     /// it, the runner that executed it, and the artifact row plus the bytes a
     /// download would serve.
     #[tokio::test]
     async fn a_workflow_declared_artifact_is_published_by_the_run_that_produced_it() {
         let (temp, sha, db, user, repo, repo_path) = workflow_fixture(WORKFLOW).await;
-        let pipeline_id = trigger_graph(&db, &repo_path, repo.id, &sha, user.id).await;
+        let pipeline_id = trigger_graph(&db, temp.path(), &repo_path, repo.id, &sha, user.id).await;
         let job = only_job(&db, pipeline_id).await;
 
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline_id);
+        let mut runner =
+            PipelineRunner::new_local_only(db.clone(), temp.path(), &repo_path, pipeline_id);
         runner.set_repo_id(repo.id);
         runner.set_allow_host_runner(true);
         runner.run().await.unwrap();
@@ -9521,13 +9594,14 @@ mod artifact_publication_tests {
     #[tokio::test]
     async fn embedded_artifact_publication_refuses_an_unwritable_journal() {
         let (temp, sha, db, user, repo, repo_path) = workflow_fixture(WORKFLOW).await;
-        let pipeline_id = trigger_graph(&db, &repo_path, repo.id, &sha, user.id).await;
+        let pipeline_id = trigger_graph(&db, temp.path(), &repo_path, repo.id, &sha, user.id).await;
         let job = only_job(&db, pipeline_id).await;
 
         std::fs::create_dir_all(temp.path().join("_deleted")).unwrap();
         std::fs::write(temp.path().join("_deleted/journal"), b"not a directory").unwrap();
 
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline_id);
+        let mut runner =
+            PipelineRunner::new_local_only(db.clone(), temp.path(), &repo_path, pipeline_id);
         runner.set_repo_id(repo.id);
         runner.set_allow_host_runner(true);
         runner.run().await.unwrap();
@@ -9571,11 +9645,12 @@ mod artifact_publication_tests {
     #[tokio::test]
     async fn a_declaration_that_matched_nothing_publishes_nothing_and_says_so() {
         const MISSING: &[u8] = b"name: build\non: [push]\njobs:\n  build:\n    steps:\n      - run: echo built nothing\n      - uses: actions/upload-artifact@v4\n        with:\n          name: build-report\n          path: out/report.txt\n";
-        let (_temp, sha, db, user, repo, repo_path) = workflow_fixture(MISSING).await;
-        let pipeline_id = trigger_graph(&db, &repo_path, repo.id, &sha, user.id).await;
+        let (temp, sha, db, user, repo, repo_path) = workflow_fixture(MISSING).await;
+        let pipeline_id = trigger_graph(&db, temp.path(), &repo_path, repo.id, &sha, user.id).await;
         let job = only_job(&db, pipeline_id).await;
 
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline_id);
+        let mut runner =
+            PipelineRunner::new_local_only(db.clone(), temp.path(), &repo_path, pipeline_id);
         runner.set_repo_id(repo.id);
         runner.set_allow_host_runner(true);
         runner.run().await.unwrap();

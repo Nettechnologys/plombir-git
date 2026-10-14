@@ -83,7 +83,7 @@ async fn run() -> anyhow::Result<()> {
             log_max_files,
             listen_address_file,
         } => {
-            serve::run_serve(
+            serve::run_serve(serve::ServeArgs {
                 repo_root,
                 http_addr,
                 ssh_addr,
@@ -110,7 +110,7 @@ async fn run() -> anyhow::Result<()> {
                 log_max_size_mb,
                 log_max_files,
                 listen_address_file,
-            )
+            })
             .await?;
         }
 

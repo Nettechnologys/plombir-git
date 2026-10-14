@@ -1162,6 +1162,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
         .ci_engine
         .trigger_pipeline(crate::ci::TriggerPipelineParams {
             db: params.db,
+            repo_root: params.repo_root,
             repo_path: &target.path,
             repo_id: target.repo_id,
             commit_sha: &update.new_sha,

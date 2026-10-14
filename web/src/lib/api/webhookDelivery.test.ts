@@ -133,6 +133,17 @@ describe('redelivery refresh', () => {
   });
 });
 
+/**
+ * The timers the page itself has pending. Since 5.57 Svelte clears its
+ * delegated-event slot on a zero-delay timer after a click, so under fake
+ * timers that timer counted as the page's poll and the count depended on
+ * which test clicked first. Run what is due now, then count.
+ */
+async function pendingPageTimers(): Promise<number> {
+	await vi.advanceTimersByTimeAsync(0);
+	return vi.getTimerCount();
+}
+
 describe('the webhook settings page', () => {
 	it('loads and renders the recorded delivery diagnostics', async () => {
 		rendered = await renderComponent(WebhooksPage);
@@ -167,7 +178,7 @@ describe('the webhook settings page', () => {
 		await click(button(rendered.container, 'Redeliver'));
 
 		expect(webhooks.deliveries).toHaveBeenCalledTimes(2);
-		expect(vi.getTimerCount()).toBe(1);
+		expect(await pendingPageTimers()).toBe(1);
 
 		await rendered.destroy();
 		rendered = undefined;
@@ -188,7 +199,7 @@ describe('the webhook settings page', () => {
 		await click(button(rendered.container, 'Redeliver'));
 
 		expect(webhooks.deliveries).toHaveBeenCalledTimes(2);
-		expect(vi.getTimerCount()).toBe(1);
+		expect(await pendingPageTimers()).toBe(1);
 
 		setTestPage('/bob/other/settings/webhooks', { owner: 'bob', repo: 'other' });
 		await settle();

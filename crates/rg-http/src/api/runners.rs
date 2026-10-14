@@ -494,42 +494,7 @@ pub async fn poll_job(
 
     // Use tokio::time::timeout to wrap a polling loop
     let poll_future = async {
-        // Fetch the immutable repository capability and labels together. A
-        // legacy row has no trustworthy scope and is therefore revoked until
-        // the operator explicitly re-registers it.
-        let (runner_repo_id, runner_labels): (i64, Vec<String>) =
-            match rg_db::ops::runner_ops::find_by_id(&state.db, runner_id).await {
-                Ok(Some(runner)) => {
-                    let Some(repo_id) = runner.repo_id else {
-                        return Err(AppError::forbidden(
-                            "runner is not repository-scoped; re-register it for owner/repo",
-                        )
-                        .into_response());
-                    };
-                    match serde_json::from_str(&runner.labels) {
-                        Ok(labels) => (repo_id, labels),
-                        Err(error) => {
-                            tracing::error!(
-                                runner_id,
-                                error = %error,
-                                "poll_job: stored runner labels are invalid JSON"
-                            );
-                            return Err(AppError::internal("invalid runner labels").into_response());
-                        }
-                    }
-                }
-                Ok(None) => {
-                    return Err(AppError::not_found("runner not found").into_response());
-                }
-                Err(error) => {
-                    tracing::error!(
-                        runner_id,
-                        error = %format!("{error:#}"),
-                        "poll_job: runner lookup failed"
-                    );
-                    return Err(AppError::from(error).into_response());
-                }
-            };
+        let (runner_repo_id, runner_labels) = poll_scope(&state, runner_id).await?;
 
         loop {
             match crate::metrics::time_db(
@@ -543,296 +508,18 @@ pub async fn poll_job(
             .await
             {
                 Ok(Some(job)) => {
-                    // Decode every runner-facing JSON column BEFORE claiming the
-                    // job. Both used to be decoded after the assignment and with
-                    // the error thrown away: a corrupt `variables` collapsed into
-                    // an empty map and a corrupt `cache_paths` into `None`, so the
-                    // runner got a `200` and started work with its mandatory
-                    // environment missing and caching silently off — while the row
-                    // was already `running` and owned by that runner, so no other
-                    // runner could pick it up either. Refusing here answers 5xx and
-                    // leaves the row `pending` and unassigned.
-                    //
-                    // `NULL` still means "this optional column was never set" and
-                    // keeps its previous meaning; only undecodable text is refused.
-                    let mut variables = match job.variables.as_deref() {
-                        Some(json) => match serde_json::from_str::<
-                            serde_json::Map<String, serde_json::Value>,
-                        >(json)
-                        {
-                            Ok(variables) => variables,
-                            Err(error) => {
-                                tracing::error!(
-                                    job_id = job.id,
-                                    runner_id,
-                                    error = %error,
-                                    "poll_job: stored job variables are invalid JSON"
-                                );
-                                return Err(
-                                    AppError::internal("invalid job variables").into_response()
-                                );
-                            }
-                        },
-                        None => serde_json::Map::new(),
-                    };
-                    let cache_paths = match job.cache_paths.as_deref() {
-                        Some(json) => match serde_json::from_str::<Vec<String>>(json) {
-                            Ok(cache_paths) => Some(cache_paths),
-                            Err(error) => {
-                                tracing::error!(
-                                    job_id = job.id,
-                                    runner_id,
-                                    error = %error,
-                                    "poll_job: stored job cache_paths are invalid JSON"
-                                );
-                                return Err(
-                                    AppError::internal("invalid job cache paths").into_response()
-                                );
-                            }
-                        },
-                        None => None,
-                    };
-                    // Decoded on the same terms as `cache_paths` above, and for
-                    // a sharper reason: an artifact declaration that collapses
-                    // into `None` produces a green job that publishes nothing,
-                    // and the artifact list a user opens afterwards is empty
-                    // with no failure anywhere to explain it.
-                    let (artifact_name, artifact_paths) = match job.artifacts.as_deref() {
-                        Some(json) => match serde_json::from_str::<StoredJobArtifacts>(json) {
-                            Ok(artifacts) => (Some(artifacts.name), Some(artifacts.paths)),
-                            Err(error) => {
-                                tracing::error!(
-                                    job_id = job.id,
-                                    runner_id,
-                                    error = %error,
-                                    "poll_job: stored job artifacts are invalid JSON"
-                                );
-                                return Err(
-                                    AppError::internal("invalid job artifacts").into_response()
-                                );
-                            }
-                        },
-                        None => (None, None),
-                    };
-
-                    // Fetch stage to get pipeline_id
-                    let stage =
-                        match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id)
-                            .await
-                        {
-                            Ok(Some(stage)) => stage,
-                            Ok(None) => {
-                                tracing::error!(
-                                    job_id = job.id,
-                                    stage_id = job.stage_id,
-                                    "poll_job: candidate job has no pipeline stage"
-                                );
-                                return Err(AppError::internal(
-                                    "candidate job has no pipeline stage",
-                                )
-                                .into_response());
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    job_id = job.id,
-                                    stage_id = job.stage_id,
-                                    error = %format!("{error:#}"),
-                                    "poll_job: candidate pipeline stage lookup failed"
-                                );
-                                return Err(AppError::from(error).into_response());
-                            }
-                        };
-                    let pipeline_id = stage.pipeline_id;
-                    let pipeline = match rg_db::ops::pipeline_ops::get_pipeline(
-                        &state.db,
-                        pipeline_id,
-                    )
-                    .await
-                    {
-                        Ok(Some(pipeline)) => pipeline,
-                        Ok(None) => {
-                            tracing::error!(
-                                job_id = job.id,
-                                stage_id = job.stage_id,
-                                pipeline_id,
-                                "poll_job: candidate job has no pipeline"
-                            );
-                            return Err(
-                                AppError::internal("candidate job has no pipeline").into_response()
-                            );
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                job_id = job.id,
-                                stage_id = job.stage_id,
-                                pipeline_id,
-                                error = %format!("{error:#}"),
-                                "poll_job: candidate pipeline lookup failed"
-                            );
-                            return Err(AppError::from(error).into_response());
-                        }
-                    };
-
-                    for reserved in rg_core::ci::BUILTIN_CI_VARIABLES {
-                        variables.remove(reserved);
-                    }
-                    let mut mask_secrets = Vec::new();
-                    match decrypted_repo_secrets(&state, pipeline.repo_id, job.environment_id).await
-                    {
-                        Ok(secrets) => {
-                            for (name, value) in secrets {
-                                mask_secrets.push(value.clone());
-                                variables.insert(name, serde_json::json!(value));
-                            }
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                pipeline_id,
-                                error = %format!("{error:#}"),
-                                "failed to load CI secrets for external runner"
-                            );
-                            return Err(AppError::from(error).into_response());
-                        }
-                    }
-                    variables.insert("CI".into(), serde_json::json!("true"));
-                    variables.insert("PLOMBIR_GIT".into(), serde_json::json!("true"));
-                    variables.insert("CI_PIPELINE_ID".into(), serde_json::json!(pipeline_id));
-                    variables.insert(
-                        "CI_COMMIT_SHA".into(),
-                        serde_json::json!(pipeline.commit_sha),
-                    );
-                    variables.insert("CI_SHA".into(), serde_json::json!(pipeline.commit_sha));
-                    variables.insert("CI_REF".into(), serde_json::json!(pipeline.ref_name));
-                    variables.insert("CI_EVENT".into(), serde_json::json!(pipeline.trigger_type));
-                    let (repository_owner, repository_name) =
-                        match rg_core::repo::service::repository_identity(
-                            &state.db,
-                            pipeline.repo_id,
-                        )
-                        .await
-                        {
-                            Ok(identity) => identity,
-                            Err(error) => {
-                                tracing::error!(
-                                    pipeline_id,
-                                    error = %format!("{error:#}"),
-                                    "poll_job: repository identity lookup failed after assignment"
-                                );
-                                return Err(AppError::from(error).into_response());
-                            }
-                        };
-                    variables.insert(
-                        "CI_REPOSITORY".into(),
-                        serde_json::json!(format!("{repository_owner}/{repository_name}")),
-                    );
-                    variables.insert(
-                        "CI_REPOSITORY_OWNER".into(),
-                        serde_json::json!(repository_owner),
-                    );
-                    // One resolution for both the token's lifetime and the
-                    // deadline the runner is handed, sharing the range the
-                    // config validator enforces.
-                    let timeout_secs = rg_core::ci::resolve_job_timeout_secs(
-                        job.id,
-                        job.timeout_seconds,
-                        state.job_timeout_secs,
-                    );
-                    match rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
-                        pipeline.repo_id,
-                        pipeline.id,
-                        job.id,
-                        "repo:read packages:read",
-                        &state.jwt_secret,
-                        rg_core::ci::ci_job_token_ttl_secs(timeout_secs),
-                    ) {
-                        Ok(token) => {
-                            variables.insert("CI_JOB_TOKEN".into(), serde_json::json!(token));
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                job_id = job.id,
-                                pipeline_id,
-                                error = %format!("{error:#}"),
-                                "failed to generate CI job token for external runner"
-                            );
-                            return Err(AppError::internal("failed to prepare job environment")
-                                .into_response());
-                        }
-                    }
-                    if let Some(url) = state.external_url.as_deref() {
-                        variables.insert(
-                            "CI_OIDC_TOKEN_URL".into(),
-                            serde_json::json!(format!(
-                                "{}/api/v1/ci/oidc/token",
-                                url.trim_end_matches('/')
-                            )),
-                        );
-                    }
-
-                    let encrypted_mask = match encrypt_job_mask(&state, &mask_secrets) {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            tracing::error!(job_id = job.id, error = %format!("{error:#}"), "failed to seal runner log mask");
-                            return Err(AppError::internal("failed to prepare job log mask")
-                                .into_response());
-                        }
-                    };
-
-                    let resp = PollJobResponse {
-                        job_id: job.id,
-                        pipeline_id,
-                        stage_id: job.stage_id,
-                        name: job.name,
-                        script: job.script.lines().map(|s| s.to_string()).collect(),
-                        image: job.image,
-                        variables: Some(serde_json::Value::Object(variables)),
-                        cache_key: job.cache_key,
-                        cache_paths,
-                        artifact_name,
-                        artifact_paths,
-                        timeout: rg_core::ci::dispatched_job_timeout_secs(timeout_secs),
-                    };
-
+                    let (resp, encrypted_mask) = prepare_dispatch(&state, runner_id, job).await?;
                     // Everything the response needs is prepared before the
                     // irreversible claim. The long-poll future can be dropped
                     // at any `.await` (its own timeout, a disconnected client,
                     // or server shutdown); claiming earlier stranded the row as
                     // `assigned` while the only response carrying it vanished.
                     // Keep this as the final await before returning the body.
-                    //
-                    // The candidate still came from a snapshot, so `assign_job`
-                    // re-asserts `pending AND runner_id IS NULL` and makes the
-                    // database choose between a concurrent cancellation or
-                    // poller. A refused claim needs no backoff: the candidate
-                    // query can no longer return that row in the same state.
-                    match rg_db::ops::pipeline_ops::assign_job_with_mask_snapshot(
-                        &state.db,
-                        resp.job_id,
-                        runner_id,
-                        &encrypted_mask,
-                    )
-                    .await
+                    if claim_dispatched_job(&state, runner_id, resp.job_id, &encrypted_mask).await?
                     {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::info!(
-                                job_id = resp.job_id,
-                                runner_id,
-                                "poll_job: candidate was claimed or settled before this runner could take it"
-                            );
-                            continue;
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                job_id = resp.job_id,
-                                runner_id,
-                                error = %format!("{error:#}"),
-                                "poll_job: failed to assign job"
-                            );
-                            return Err(AppError::from(error).into_response());
-                        }
+                        return Ok((StatusCode::OK, Json(resp)));
                     }
-                    return Ok((StatusCode::OK, Json(resp)));
+                    continue;
                 }
                 Ok(None) => {
                     // No job yet — wait and retry
@@ -858,6 +545,359 @@ pub async fn poll_job(
                 "poll_job: long-poll elapsed without an available job"
             );
             (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response()
+        }
+    }
+}
+
+/// The repository a polling runner serves and the labels it matches jobs by.
+///
+/// Fetched together: the repository is the runner's immutable capability. A
+/// legacy row has no trustworthy scope and is therefore revoked until the
+/// operator explicitly re-registers it.
+async fn poll_scope(state: &AppState, runner_id: i64) -> Result<(i64, Vec<String>), Response> {
+    match rg_db::ops::runner_ops::find_by_id(&state.db, runner_id).await {
+        Ok(Some(runner)) => {
+            let Some(repo_id) = runner.repo_id else {
+                return Err(AppError::forbidden(
+                    "runner is not repository-scoped; re-register it for owner/repo",
+                )
+                .into_response());
+            };
+            match serde_json::from_str(&runner.labels) {
+                Ok(labels) => Ok((repo_id, labels)),
+                Err(error) => {
+                    tracing::error!(
+                        runner_id,
+                        error = %error,
+                        "poll_job: stored runner labels are invalid JSON"
+                    );
+                    Err(AppError::internal("invalid runner labels").into_response())
+                }
+            }
+        }
+        Ok(None) => Err(AppError::not_found("runner not found").into_response()),
+        Err(error) => {
+            tracing::error!(
+                runner_id,
+                error = %format!("{error:#}"),
+                "poll_job: runner lookup failed"
+            );
+            Err(AppError::from(error).into_response())
+        }
+    }
+}
+
+/// The runner-facing JSON columns of a candidate job, decoded.
+struct DecodedJobColumns {
+    variables: serde_json::Map<String, serde_json::Value>,
+    cache_paths: Option<Vec<String>>,
+    artifact_name: Option<String>,
+    artifact_paths: Option<Vec<String>>,
+}
+
+/// Decode every runner-facing JSON column BEFORE the job is claimed.
+///
+/// Both used to be decoded after the assignment and with the error thrown
+/// away: a corrupt `variables` collapsed into an empty map and a corrupt
+/// `cache_paths` into `None`, so the runner got a `200` and started work with
+/// its mandatory environment missing and caching silently off — while the row
+/// was already `running` and owned by that runner, so no other runner could
+/// pick it up either. Refusing here answers 5xx and leaves the row `pending`
+/// and unassigned.
+///
+/// `NULL` still means "this optional column was never set" and keeps its
+/// previous meaning; only undecodable text is refused.
+fn decode_job_columns(
+    job: &rg_db::entities::pipeline_job::Model,
+    runner_id: i64,
+) -> Result<DecodedJobColumns, AppError> {
+    let variables = match job.variables.as_deref() {
+        Some(json) => {
+            match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json) {
+                Ok(variables) => variables,
+                Err(error) => {
+                    tracing::error!(
+                        job_id = job.id,
+                        runner_id,
+                        error = %error,
+                        "poll_job: stored job variables are invalid JSON"
+                    );
+                    return Err(AppError::internal("invalid job variables"));
+                }
+            }
+        }
+        None => serde_json::Map::new(),
+    };
+    let cache_paths = match job.cache_paths.as_deref() {
+        Some(json) => match serde_json::from_str::<Vec<String>>(json) {
+            Ok(cache_paths) => Some(cache_paths),
+            Err(error) => {
+                tracing::error!(
+                    job_id = job.id,
+                    runner_id,
+                    error = %error,
+                    "poll_job: stored job cache_paths are invalid JSON"
+                );
+                return Err(AppError::internal("invalid job cache paths"));
+            }
+        },
+        None => None,
+    };
+    // Decoded on the same terms as `cache_paths` above, and for a sharper
+    // reason: an artifact declaration that collapses into `None` produces a
+    // green job that publishes nothing, and the artifact list a user opens
+    // afterwards is empty with no failure anywhere to explain it.
+    let (artifact_name, artifact_paths) = match job.artifacts.as_deref() {
+        Some(json) => match serde_json::from_str::<StoredJobArtifacts>(json) {
+            Ok(artifacts) => (Some(artifacts.name), Some(artifacts.paths)),
+            Err(error) => {
+                tracing::error!(
+                    job_id = job.id,
+                    runner_id,
+                    error = %error,
+                    "poll_job: stored job artifacts are invalid JSON"
+                );
+                return Err(AppError::internal("invalid job artifacts"));
+            }
+        },
+        None => (None, None),
+    };
+    Ok(DecodedJobColumns {
+        variables,
+        cache_paths,
+        artifact_name,
+        artifact_paths,
+    })
+}
+
+/// The pipeline a candidate job belongs to, through its stage.
+async fn candidate_pipeline(
+    state: &AppState,
+    job: &rg_db::entities::pipeline_job::Model,
+) -> Result<rg_db::entities::pipeline::Model, Response> {
+    let stage = match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await {
+        Ok(Some(stage)) => stage,
+        Ok(None) => {
+            tracing::error!(
+                job_id = job.id,
+                stage_id = job.stage_id,
+                "poll_job: candidate job has no pipeline stage"
+            );
+            return Err(AppError::internal("candidate job has no pipeline stage").into_response());
+        }
+        Err(error) => {
+            tracing::error!(
+                job_id = job.id,
+                stage_id = job.stage_id,
+                error = %format!("{error:#}"),
+                "poll_job: candidate pipeline stage lookup failed"
+            );
+            return Err(AppError::from(error).into_response());
+        }
+    };
+    let pipeline_id = stage.pipeline_id;
+    match rg_db::ops::pipeline_ops::get_pipeline(&state.db, pipeline_id).await {
+        Ok(Some(pipeline)) => Ok(pipeline),
+        Ok(None) => {
+            tracing::error!(
+                job_id = job.id,
+                stage_id = job.stage_id,
+                pipeline_id,
+                "poll_job: candidate job has no pipeline"
+            );
+            Err(AppError::internal("candidate job has no pipeline").into_response())
+        }
+        Err(error) => {
+            tracing::error!(
+                job_id = job.id,
+                stage_id = job.stage_id,
+                pipeline_id,
+                error = %format!("{error:#}"),
+                "poll_job: candidate pipeline lookup failed"
+            );
+            Err(AppError::from(error).into_response())
+        }
+    }
+}
+
+/// Lay the server-owned environment over the job's declared variables: the
+/// repository's secrets (each one also a value the log mask hides), the
+/// built-in `CI_*` variables and the job token. Returns the secrets to mask.
+async fn add_server_variables(
+    state: &AppState,
+    job: &rg_db::entities::pipeline_job::Model,
+    pipeline: &rg_db::entities::pipeline::Model,
+    timeout_secs: u64,
+    variables: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<String>, Response> {
+    let pipeline_id = pipeline.id;
+    for reserved in rg_core::ci::BUILTIN_CI_VARIABLES {
+        variables.remove(reserved);
+    }
+    let mut mask_secrets = Vec::new();
+    match decrypted_repo_secrets(state, pipeline.repo_id, job.environment_id).await {
+        Ok(secrets) => {
+            for (name, value) in secrets {
+                mask_secrets.push(value.clone());
+                variables.insert(name, serde_json::json!(value));
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                pipeline_id,
+                error = %format!("{error:#}"),
+                "failed to load CI secrets for external runner"
+            );
+            return Err(AppError::from(error).into_response());
+        }
+    }
+    variables.insert("CI".into(), serde_json::json!("true"));
+    variables.insert("PLOMBIR_GIT".into(), serde_json::json!("true"));
+    variables.insert("CI_PIPELINE_ID".into(), serde_json::json!(pipeline_id));
+    variables.insert(
+        "CI_COMMIT_SHA".into(),
+        serde_json::json!(pipeline.commit_sha),
+    );
+    variables.insert("CI_SHA".into(), serde_json::json!(pipeline.commit_sha));
+    variables.insert("CI_REF".into(), serde_json::json!(pipeline.ref_name));
+    variables.insert("CI_EVENT".into(), serde_json::json!(pipeline.trigger_type));
+    let (repository_owner, repository_name) =
+        match rg_core::repo::service::repository_identity(&state.db, pipeline.repo_id).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::error!(
+                    pipeline_id,
+                    error = %format!("{error:#}"),
+                    "poll_job: repository identity lookup failed after assignment"
+                );
+                return Err(AppError::from(error).into_response());
+            }
+        };
+    variables.insert(
+        "CI_REPOSITORY".into(),
+        serde_json::json!(format!("{repository_owner}/{repository_name}")),
+    );
+    variables.insert(
+        "CI_REPOSITORY_OWNER".into(),
+        serde_json::json!(repository_owner),
+    );
+    match rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
+        pipeline.repo_id,
+        pipeline.id,
+        job.id,
+        "repo:read packages:read",
+        &state.jwt_secret,
+        rg_core::ci::ci_job_token_ttl_secs(timeout_secs),
+    ) {
+        Ok(token) => {
+            variables.insert("CI_JOB_TOKEN".into(), serde_json::json!(token));
+        }
+        Err(error) => {
+            tracing::error!(
+                job_id = job.id,
+                pipeline_id,
+                error = %format!("{error:#}"),
+                "failed to generate CI job token for external runner"
+            );
+            return Err(AppError::internal("failed to prepare job environment").into_response());
+        }
+    }
+    if let Some(url) = state.external_url.as_deref() {
+        variables.insert(
+            "CI_OIDC_TOKEN_URL".into(),
+            serde_json::json!(format!(
+                "{}/api/v1/ci/oidc/token",
+                url.trim_end_matches('/')
+            )),
+        );
+    }
+    Ok(mask_secrets)
+}
+
+/// Everything a runner is handed for `job`, and the sealed log mask the claim
+/// records with it — all of it prepared before anything irreversible happens.
+async fn prepare_dispatch(
+    state: &AppState,
+    runner_id: i64,
+    job: rg_db::entities::pipeline_job::Model,
+) -> Result<(PollJobResponse, String), Response> {
+    let DecodedJobColumns {
+        mut variables,
+        cache_paths,
+        artifact_name,
+        artifact_paths,
+    } = decode_job_columns(&job, runner_id).map_err(IntoResponse::into_response)?;
+    let pipeline = candidate_pipeline(state, &job).await?;
+    // One resolution for both the token's lifetime and the deadline the runner
+    // is handed, sharing the range the config validator enforces.
+    let timeout_secs =
+        rg_core::ci::resolve_job_timeout_secs(job.id, job.timeout_seconds, state.job_timeout_secs);
+    let mask_secrets =
+        add_server_variables(state, &job, &pipeline, timeout_secs, &mut variables).await?;
+
+    let encrypted_mask = match encrypt_job_mask(state, &mask_secrets) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::error!(job_id = job.id, error = %format!("{error:#}"), "failed to seal runner log mask");
+            return Err(AppError::internal("failed to prepare job log mask").into_response());
+        }
+    };
+
+    let resp = PollJobResponse {
+        job_id: job.id,
+        pipeline_id: pipeline.id,
+        stage_id: job.stage_id,
+        name: job.name,
+        script: job.script.lines().map(|s| s.to_string()).collect(),
+        image: job.image,
+        variables: Some(serde_json::Value::Object(variables)),
+        cache_key: job.cache_key,
+        cache_paths,
+        artifact_name,
+        artifact_paths,
+        timeout: rg_core::ci::dispatched_job_timeout_secs(timeout_secs),
+    };
+    Ok((resp, encrypted_mask))
+}
+
+/// Claim a prepared job for `runner_id`: `Ok(false)` when another poller or a
+/// cancellation got there first.
+///
+/// The candidate came from a snapshot, so `assign_job` re-asserts `pending AND
+/// runner_id IS NULL` and makes the database choose between a concurrent
+/// cancellation or poller. A refused claim needs no backoff: the candidate
+/// query can no longer return that row in the same state.
+async fn claim_dispatched_job(
+    state: &AppState,
+    runner_id: i64,
+    job_id: i64,
+    encrypted_mask: &str,
+) -> Result<bool, Response> {
+    match rg_db::ops::pipeline_ops::assign_job_with_mask_snapshot(
+        &state.db,
+        job_id,
+        runner_id,
+        encrypted_mask,
+    )
+    .await
+    {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            tracing::info!(
+                job_id,
+                runner_id,
+                "poll_job: candidate was claimed or settled before this runner could take it"
+            );
+            Ok(false)
+        }
+        Err(error) => {
+            tracing::error!(
+                job_id,
+                runner_id,
+                error = %format!("{error:#}"),
+                "poll_job: failed to assign job"
+            );
+            Err(AppError::from(error).into_response())
         }
     }
 }
@@ -2192,50 +2232,87 @@ mod poll_job_delivery_tests {
         ));
     }
 
-    fn claim_is_the_last_await_before_delivery(source: &str) -> Result<(), String> {
-        let claims = rust_source::production_function_call_sites(
-            source,
-            "poll_job",
-            &["assign_job_with_mask_snapshot"],
-        );
-        let [claim] = claims.as_slice() else {
-            return Err(format!(
-                "expected one production `assign_job_with_mask_snapshot` in `poll_job`, found {}",
-                claims.len()
-            ));
-        };
+    /// The one call of `callee` inside `function`.
+    fn only_call(
+        source: &str,
+        function: &str,
+        callee: &str,
+    ) -> Result<rust_source::CallSite, String> {
+        let calls = rust_source::production_function_call_sites(source, function, &[callee]);
+        match calls.as_slice() {
+            [call] => Ok(*call),
+            _ => Err(format!(
+                "expected one production `{callee}` in `{function}`, found {}",
+                calls.len()
+            )),
+        }
+    }
 
+    fn claim_is_the_last_await_before_delivery(source: &str) -> Result<(), String> {
         let code = rust_source::production_rust_code_only(source);
-        let response_marker = "let resp = PollJobResponse {";
-        let responses: Vec<usize> = code
-            .match_indices(response_marker)
-            .map(|(at, _)| at)
-            .collect();
-        let [response_at] = responses.as_slice() else {
+
+        // The irreversible write lives in one helper and is that helper's last
+        // await: nothing fallible runs after it before the helper returns.
+        let claim = only_call(
+            source,
+            "claim_dispatched_job",
+            "assign_job_with_mask_snapshot",
+        )?;
+        let helper_end = code[claim.open_paren..]
+            .find("\n}\n")
+            .map(|end| claim.open_paren + end)
+            .ok_or("`claim_dispatched_job` has no end")?;
+        let helper_awaits = code[claim.open_paren..helper_end].matches(".await").count();
+        if helper_awaits != 1 {
             return Err(format!(
-                "expected one production PollJobResponse construction, found {}",
-                responses.len()
+                "expected only the claim's own await in `claim_dispatched_job`, found \
+                 {helper_awaits} after runners.rs:{}",
+                claim.line
             ));
-        };
-        if *response_at >= claim.open_paren {
-            return Err("the response is constructed after the irreversible claim".to_string());
+        }
+        for function in ["poll_job", "prepare_dispatch"] {
+            if !rust_source::production_function_call_sites(
+                source,
+                function,
+                &["assign_job_with_mask_snapshot"],
+            )
+            .is_empty()
+            {
+                return Err(format!(
+                    "`{function}` claims the job itself instead of through `claim_dispatched_job`"
+                ));
+            }
+        }
+
+        // `poll_job` prepares the whole body first, claims, and hands the
+        // prepared body over with no await in between.
+        let prepared = only_call(source, "poll_job", "prepare_dispatch")?;
+        let claimed = only_call(source, "poll_job", "claim_dispatched_job")?;
+        if prepared.open_paren >= claimed.open_paren {
+            return Err("the response is prepared after the irreversible claim".to_string());
+        }
+        let responses = code.matches("let resp = PollJobResponse {").count();
+        if responses != 1 {
+            return Err(format!(
+                "expected one production PollJobResponse construction, found {responses}"
+            ));
         }
 
         let return_marker = "return Ok((StatusCode::OK, Json(resp)))";
-        let Some(relative_return) = code[claim.open_paren..].find(return_marker) else {
+        let Some(relative_return) = code[claimed.open_paren..].find(return_marker) else {
             return Err(format!(
                 "the successful response is not returned after the claim at runners.rs:{}",
-                claim.line
+                claimed.line
             ));
         };
-        let delivery_at = claim.open_paren + relative_return;
-        let awaits = code[claim.open_paren..delivery_at]
+        let delivery_at = claimed.open_paren + relative_return;
+        let awaits = code[claimed.open_paren..delivery_at]
             .match_indices(".await")
             .count();
         if awaits != 1 {
             return Err(format!(
                 "expected only the claim's own await before delivery, found {awaits} awaits after runners.rs:{}",
-                claim.line
+                claimed.line
             ));
         }
         Ok(())
@@ -2251,23 +2328,69 @@ mod poll_job_delivery_tests {
             .unwrap_or_else(|error| panic!("{error}"));
     }
 
-    /// Mutation proof for the old ordering: moving the claim back above async
-    /// preparation must make the structural contract red even though the same
-    /// calls and successful return are all still present.
-    #[test]
-    fn guard_rejects_the_pre_fix_claim_order() {
-        const PRE_FIX_ORDER: &str = r#"
-            pub async fn poll_job() {
-                match assign_job_with_mask_snapshot().await {}
-                let stage = get_stage_by_id().await;
-                let resp = PollJobResponse {};
-                return Ok((StatusCode::OK, Json(resp)));
-            }
-        "#;
+    /// The shape the guard holds, written small, so each mutation below is
+    /// one edit away from it.
+    const FIXED: &str = r#"
+pub async fn poll_job() {
+    let (resp, mask) = prepare_dispatch().await?;
+    if claim_dispatched_job(mask).await? {
+        return Ok((StatusCode::OK, Json(resp)));
+    }
+}
 
+async fn prepare_dispatch() {
+    let stage = get_stage_by_id().await;
+    let resp = PollJobResponse {};
+}
+
+async fn claim_dispatched_job() {
+    match assign_job_with_mask_snapshot().await {}
+}
+"#;
+
+    #[test]
+    fn guard_accepts_the_fixed_shape() {
+        claim_is_the_last_await_before_delivery(FIXED).unwrap();
+    }
+
+    /// Mutation proofs: each one breaks a different half of the contract
+    /// while every call and the successful return are still present.
+    #[test]
+    fn guard_rejects_a_claim_moved_back_above_preparation() {
+        let mutated = FIXED.replace(
+            "let (resp, mask) = prepare_dispatch().await?;\n    if claim_dispatched_job(mask).await? {",
+            "if claim_dispatched_job(mask).await? {\n    let (resp, mask) = prepare_dispatch().await?;",
+        );
+        assert_ne!(mutated, FIXED, "the mutation did not apply");
         assert!(
-            claim_is_the_last_await_before_delivery(PRE_FIX_ORDER).is_err(),
-            "moving `assign_job_with_mask_snapshot` back above response preparation must fail the guard"
+            claim_is_the_last_await_before_delivery(&mutated).is_err(),
+            "claiming before the response is prepared must fail the guard"
+        );
+    }
+
+    #[test]
+    fn guard_rejects_async_work_after_the_claim_inside_the_helper() {
+        let mutated = FIXED.replace(
+            "match assign_job_with_mask_snapshot().await {}",
+            "match assign_job_with_mask_snapshot().await {}\n    record_claim().await;",
+        );
+        assert_ne!(mutated, FIXED, "the mutation did not apply");
+        assert!(
+            claim_is_the_last_await_before_delivery(&mutated).is_err(),
+            "an await after the claim inside `claim_dispatched_job` must fail the guard"
+        );
+    }
+
+    #[test]
+    fn guard_rejects_a_claim_made_in_poll_job_itself() {
+        let mutated = FIXED.replace(
+            "let (resp, mask) = prepare_dispatch().await?;",
+            "match assign_job_with_mask_snapshot().await {}\n    let (resp, mask) = prepare_dispatch().await?;",
+        );
+        assert_ne!(mutated, FIXED, "the mutation did not apply");
+        assert!(
+            claim_is_the_last_await_before_delivery(&mutated).is_err(),
+            "a second, direct claim in `poll_job` must fail the guard"
         );
     }
 }

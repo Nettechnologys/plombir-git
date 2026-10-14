@@ -123,6 +123,14 @@ pub struct PipelineRunner {
     /// sees its own `tx`, so nothing holds this pool while asking it for a
     /// second connection. `db` itself until [`Self::set_write_pool`].
     db_write: DatabaseConnection,
+    /// The directory every repository on this instance lives under — the same
+    /// root the HTTP process hands to `LocalBlobStorage`, so an artifact this
+    /// runner publishes is found under the key the download route resolves.
+    /// Handed in by whoever triggered the pipeline, never inferred from
+    /// `repo_path`: a namespace layout with another depth would have put
+    /// workspaces, caches and artifacts somewhere the HTTP side never looks
+    /// (card_a3fbb5635ad1).
+    storage_root: std::path::PathBuf,
     repo_path: std::path::PathBuf,
     pipeline_id: i64,
     repo_id: i64,
@@ -177,9 +185,15 @@ pub struct PipelineRunner {
 }
 
 impl PipelineRunner {
-    pub fn new(db: DatabaseConnection, repo_path: &std::path::Path, pipeline_id: i64) -> Self {
+    pub fn new(
+        db: DatabaseConnection,
+        storage_root: &std::path::Path,
+        repo_path: &std::path::Path,
+        pipeline_id: i64,
+    ) -> Self {
         Self::new_with_job_timeout(
             db,
+            storage_root,
             repo_path,
             pipeline_id,
             rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
@@ -188,6 +202,7 @@ impl PipelineRunner {
 
     pub fn new_with_job_timeout(
         db: DatabaseConnection,
+        storage_root: &std::path::Path,
         repo_path: &std::path::Path,
         pipeline_id: i64,
         job_timeout_secs: u64,
@@ -196,6 +211,7 @@ impl PipelineRunner {
             db_write: db.clone(),
             db,
             runner_id: uuid::Uuid::new_v4(),
+            storage_root: storage_root.to_path_buf(),
             repo_path: repo_path.to_path_buf(),
             pipeline_id,
             repo_id: 0,
@@ -217,11 +233,13 @@ impl PipelineRunner {
     /// Create a runner with Docker disabled (local-only mode).
     pub fn new_local_only(
         db: DatabaseConnection,
+        storage_root: &std::path::Path,
         repo_path: &std::path::Path,
         pipeline_id: i64,
     ) -> Self {
         Self::new_local_only_with_job_timeout(
             db,
+            storage_root,
             repo_path,
             pipeline_id,
             rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
@@ -230,6 +248,7 @@ impl PipelineRunner {
 
     pub fn new_local_only_with_job_timeout(
         db: DatabaseConnection,
+        storage_root: &std::path::Path,
         repo_path: &std::path::Path,
         pipeline_id: i64,
         job_timeout_secs: u64,
@@ -238,6 +257,7 @@ impl PipelineRunner {
             db_write: db.clone(),
             db,
             runner_id: uuid::Uuid::new_v4(),
+            storage_root: storage_root.to_path_buf(),
             repo_path: repo_path.to_path_buf(),
             pipeline_id,
             repo_id: 0,
@@ -919,14 +939,11 @@ impl PipelineRunner {
     /// for the head commit. These are best-effort side effects: failures are
     /// logged, never propagated back to the pipeline result.
     async fn run_success_followups(&self) -> Result<()> {
-        let (Some(repo_root), Some(pipeline)) = (
-            self.repo_path.parent().and_then(std::path::Path::parent),
-            pipeline_ops::get_pipeline(&self.db, self.pipeline_id).await?,
-        ) else {
+        let Some(pipeline) = pipeline_ops::get_pipeline(&self.db, self.pipeline_id).await? else {
             return Ok(());
         };
 
-        self.post_push_context(repo_root)
+        self.post_push_context(&self.storage_root)
             .evaluate_merges_and_spawn_hooks(&self.db, pipeline.repo_id, &pipeline.commit_sha, None)
             .await;
 
@@ -1594,14 +1611,9 @@ impl PipelineRunner {
             .join(self.repo_id.to_string())
     }
 
-    /// The directory every repository on this instance lives under — the same
-    /// root the HTTP process hands to `LocalBlobStorage`, so an artifact this
-    /// runner publishes is found under the key the download route resolves.
+    /// See the field: the root every repository lives under.
     fn storage_root(&self) -> &std::path::Path {
-        self.repo_path
-            .parent()
-            .and_then(std::path::Path::parent)
-            .unwrap_or_else(|| self.repo_path.parent().unwrap_or(&self.repo_path))
+        &self.storage_root
     }
 
     /// Restore `key` from this pipeline's ref, or else from the default
@@ -2322,6 +2334,7 @@ mod tests {
         .unwrap();
         let mut runner = PipelineRunner::new_local_only_with_job_timeout(
             db,
+            std::path::Path::new("/srv/repos"),
             std::path::Path::new("/srv/repos/o/r.git"),
             1,
             731,
@@ -2353,8 +2366,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut runner =
-            PipelineRunner::new_local_only(db, std::path::Path::new("/srv/repos/o/r.git"), 1);
+        let mut runner = PipelineRunner::new_local_only(
+            db,
+            std::path::Path::new("/srv/repos"),
+            std::path::Path::new("/srv/repos/o/r.git"),
+            1,
+        );
         let limits = rg_core::storage_quota::StorageLimits {
             repo_quota_bytes: Some(4096),
             ..Default::default()
@@ -2379,8 +2396,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut runner =
-            PipelineRunner::new_local_only(db, std::path::Path::new("/srv/repos/o/r.git"), 1);
+        let mut runner = PipelineRunner::new_local_only(
+            db,
+            std::path::Path::new("/srv/repos"),
+            std::path::Path::new("/srv/repos/o/r.git"),
+            1,
+        );
         runner.set_runner_labels(vec!["MY-GPU-BOX".into()]);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         runner.set_shutdown(Some(shutdown_rx));
@@ -2393,6 +2414,7 @@ mod tests {
         let engine = runner.engine_one_hop_down();
         let nested = crate::build_internal_runner(
             runner.db.clone(),
+            std::path::Path::new("/srv/repos"),
             std::path::Path::new("/srv/repos/o/r.git"),
             1,
             2,
@@ -2697,7 +2719,8 @@ mod tests {
                 .unwrap();
         let repo_path = root.join("repos/owner/repo.git");
         std::fs::create_dir_all(&repo_path).unwrap();
-        let mut runner = PipelineRunner::new_local_only(db, &repo_path, pipeline.id);
+        let mut runner =
+            PipelineRunner::new_local_only(db, &root.join("repos"), &repo_path, pipeline.id);
         runner.set_repo_id(repo_id);
         runner
     }
@@ -2841,7 +2864,12 @@ mod tests {
         // read.
         let repo_path = temp.path().join("repos/workspace-owner/repo.git");
         std::fs::create_dir_all(&repo_path).unwrap();
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            pipeline.id,
+        );
         runner.set_repo_id(repository.id);
 
         let error = runner
@@ -3345,9 +3373,9 @@ mod tests {
         .await
         .unwrap();
         let mut runner = if image.is_some() {
-            PipelineRunner::new(db.clone(), &repo_path, pipeline.id)
+            PipelineRunner::new(db.clone(), &temp.join("repos"), &repo_path, pipeline.id)
         } else {
-            PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id)
+            PipelineRunner::new_local_only(db.clone(), &temp.join("repos"), &repo_path, pipeline.id)
         };
         runner.set_repo_id(repo.id);
         if image.is_none() {
@@ -3521,7 +3549,8 @@ esac
             60,
         )
         .await;
-        let mut second = PipelineRunner::new(db, &first.repo_path, first.pipeline_id);
+        let mut second =
+            PipelineRunner::new(db, &first.storage_root, &first.repo_path, first.pipeline_id);
         let first_name = first.job_container_name(job.id);
         let second_name = second.job_container_name(job.id);
         assert_ne!(first_name, second_name);
@@ -3971,7 +4000,12 @@ esac
         .unwrap();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            pipeline.id,
+        );
         runner.set_repo_id(repo.id);
         runner.set_allow_host_runner(true);
         runner.set_shutdown(Some(shutdown_rx));
@@ -4077,7 +4111,12 @@ esac
         )
         .await
         .unwrap();
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.join("repos"),
+            &repo_path,
+            pipeline.id,
+        );
         runner.set_repo_id(repo.id);
         runner.set_allow_host_runner(true);
         (runner, db, job, pipeline.id)
@@ -4447,7 +4486,12 @@ esac
             .await
             .unwrap();
 
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            pipeline.id,
+        );
         runner.set_repo_id(repo.id);
         runner.set_jwt_secret(jwt_secret.into());
         runner.set_encryption_key(encryption_key.into());
@@ -4536,7 +4580,12 @@ esac
         .await
         .unwrap();
 
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, manual_pipeline.id);
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            manual_pipeline.id,
+        );
         runner.set_allow_host_runner(true);
         runner.run().await.unwrap();
         assert_eq!(
@@ -4576,7 +4625,12 @@ esac
             .await
             .unwrap()
         );
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, manual_pipeline.id);
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            manual_pipeline.id,
+        );
         runner.set_allow_host_runner(true);
         runner.run().await.unwrap();
         assert_eq!(
@@ -4731,7 +4785,12 @@ esac
 
         // Host execution is ON, so nothing but the routing rule can stop this.
         let (pipeline_id, job_id) = queue_job("echo should-not-run").await;
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline_id);
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            pipeline_id,
+        );
         runner.set_repo_id(repo.id);
         runner.set_allow_host_runner(true);
         runner.run().await.unwrap();
@@ -4763,7 +4822,12 @@ esac
         // leave the assertions above green over a runner that refuses
         // everything.
         let (covered_pipeline, covered_job) = queue_job("echo did-run").await;
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, covered_pipeline);
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            covered_pipeline,
+        );
         runner.set_repo_id(repo.id);
         runner.set_allow_host_runner(true);
         runner.set_runner_labels(vec!["MY-GPU-BOX".into()]);
@@ -4894,7 +4958,12 @@ esac
 
         // Default runner: host shell execution is NOT allowed, so an imageless
         // job must be refused and its script must never run.
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            pipeline.id,
+        );
         runner.set_repo_id(repo.id);
         runner.run().await.unwrap();
 
@@ -4945,7 +5014,12 @@ esac
         )
         .await
         .unwrap();
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, allow_pipeline.id);
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            allow_pipeline.id,
+        );
         runner.set_repo_id(repo.id);
         runner.set_allow_host_runner(true);
         runner.run().await.unwrap();
@@ -5031,7 +5105,12 @@ esac
 
         let pipelines_before = PIPELINE_OUTCOMES.lock().expect("pipeline sink").len();
 
-        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            pipeline.id,
+        );
         runner.set_repo_id(repo.id);
         runner.set_allow_host_runner(true);
         runner.run().await.unwrap();

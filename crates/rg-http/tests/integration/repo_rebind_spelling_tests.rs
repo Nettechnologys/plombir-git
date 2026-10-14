@@ -2,13 +2,16 @@
 //! the storage the request's spelling of its address would name
 //! (card_3f1936e7d4a7).
 //!
-//! On MySQL's default collation `alice/myrepo` finds `Alice/MyRepo`. The
-//! rebind used to build every source it moves from the request's spelling —
+//! On MySQL's default collation `alice/myrepo` used to find `Alice/MyRepo`.
+//! The rebind built every source it moves from the request's spelling —
 //! `<owner>/<repo>.git`, the LFS and OCI prefixes, the recovery journal — so a
 //! rename addressed in lowercase looked for directories that do not exist, and
 //! a transfer addressed that way renamed the repository as a side effect.
-//! SQLite and PostgreSQL compare names exactly, so only a server database with
-//! a case-insensitive collation can show it.
+//! Since card_3b3d49c60ab1 an address resolves only by its rows' spelling on
+//! every backend, so the lowercase request is refused at the door; the rebind
+//! still moves what the row names, and the OCI layer docker pushed in
+//! lowercase is what proves it. SQLite and PostgreSQL compare names exactly,
+//! so only a server database with a case-insensitive collation can show it.
 
 use sha2::{Digest, Sha256};
 
@@ -135,7 +138,7 @@ async fn objects_under(repo_root: &std::path::Path, segments: [&str; 3]) -> usiz
 
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at disposable MySQL (case-insensitive collation)"]
-async fn a_rename_and_a_transfer_addressed_in_lowercase_move_the_rows_storage() {
+async fn a_rename_and_a_transfer_move_the_rows_storage_and_refuse_another_spelling() {
     let _shared = crate::common::SHARED_SERVER_DB.lock().await;
     crate::common::install_test_tracing();
     let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
@@ -192,10 +195,22 @@ async fn a_rename_and_a_transfer_addressed_in_lowercase_move_the_rows_storage() 
         1
     );
 
-    // The rename, addressed the way a lowercasing client spells it.
+    // Addressed the way a lowercasing client spells it, the rename finds no
+    // repository and moves nothing.
     let (status, body) = send(
         reqwest::Method::PATCH,
         format!("{base}/api/v1/repos/{lower_owner}/myrepo"),
+        &token,
+        serde_json::json!({ "name": "Renamed" }),
+    )
+    .await;
+    assert_eq!(status, 404, "another spelling of the address: {body}");
+    assert!(repo_root.join(format!("{owner}/MyRepo.git")).is_dir());
+
+    // Addressed by the row's spelling, it moves what the row names.
+    let (status, body) = send(
+        reqwest::Method::PATCH,
+        format!("{base}/api/v1/repos/{owner}/MyRepo"),
         &token,
         serde_json::json!({ "name": "Renamed" }),
     )
@@ -217,11 +232,19 @@ async fn a_rename_and_a_transfer_addressed_in_lowercase_move_the_rows_storage() 
         "the LFS object did not follow the rename"
     );
 
-    // The transfer, addressed in lowercase too: the repository keeps the name
-    // its row spells, and its storage moves with it.
+    // The transfer: in lowercase it is refused, and it cannot rename the
+    // repository as a side effect; by the row's spelling its storage moves.
     let (status, body) = send(
         reqwest::Method::POST,
         format!("{base}/api/v1/repos/{lower_owner}/renamed/transfer"),
+        &token,
+        serde_json::json!({ "new_owner": org }),
+    )
+    .await;
+    assert_eq!(status, 404, "another spelling of the address: {body}");
+    let (status, body) = send(
+        reqwest::Method::POST,
+        format!("{base}/api/v1/repos/{owner}/Renamed/transfer"),
         &token,
         serde_json::json!({ "new_owner": org }),
     )

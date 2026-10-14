@@ -67,19 +67,33 @@ pub async fn find_by_ids(db: &DatabaseConnection, ids: &[i64]) -> Result<Vec<Rep
 /// For the organization side use [`find_by_org_and_name`]; to resolve an
 /// `owner/name` pair where `owner` may be either, use
 /// `rg_core::repo::service::find_repo_by_owner_name`.
+///
+/// The name matches exactly, on every backend — see [`exactly_named`].
 pub async fn find_personal_by_owner_and_name(
     db: &DatabaseConnection,
     owner_id: i64,
     name: &str,
 ) -> Result<Option<Repo>> {
-    RepoEntity::find()
+    let candidates = RepoEntity::find()
         .filter(repository::Column::OwnerId.eq(owner_id))
         .filter(repository::Column::OrgId.is_null())
         .filter(repository::Column::Name.eq(name))
         .filter(repository::Column::DeletedAt.is_null())
-        .one(db)
+        .all(db)
         .await
-        .context("db: find personal repo by owner and name")
+        .context("db: find personal repo by owner and name")?;
+    Ok(exactly_named(candidates, name))
+}
+
+/// The row among `candidates` whose name is `name` byte for byte.
+///
+/// `name = ?` compares on the column's collation: exact on SQLite and
+/// PostgreSQL, case-insensitive on MySQL's default, where `myrepo` finds
+/// `MyRepo` — and where a pair that predates the case rule could even answer
+/// with both. A repository address resolves by the spelling its row carries
+/// (card_3b3d49c60ab1), so the collation narrows and this decides.
+fn exactly_named(candidates: Vec<Repo>, name: &str) -> Option<Repo> {
+    candidates.into_iter().find(|repo| repo.name == name)
 }
 
 /// Every non-deleted repo whose `owner_id` is this user, in **both** namespaces.
@@ -187,19 +201,21 @@ pub async fn list_personal_by_owner_visible_to(
     Ok((repos, total))
 }
 
-/// Find a repo by (org_id, name). Excludes soft-deleted repos.
+/// Find a repo by (org_id, name), the name matching exactly on every backend
+/// (see [`exactly_named`]). Excludes soft-deleted repos.
 pub async fn find_by_org_and_name(
     db: &DatabaseConnection,
     org_id: i64,
     name: &str,
 ) -> Result<Option<Repo>> {
-    RepoEntity::find()
+    let candidates = RepoEntity::find()
         .filter(repository::Column::OrgId.eq(org_id))
         .filter(repository::Column::Name.eq(name))
         .filter(repository::Column::DeletedAt.is_null())
-        .one(db)
+        .all(db)
         .await
-        .context("db: find repo by org and name")
+        .context("db: find repo by org and name")?;
+    Ok(exactly_named(candidates, name))
 }
 
 /// The live repository of one namespace whose name is `name` in any case —

@@ -519,6 +519,44 @@ mod tests {
         (raw, token.id)
     }
 
+    /// A token issued by `rg_core::auth::access_token::issue` — the one path
+    /// both the PAT and the bot-token handlers mint through — is the token this
+    /// resolver accepts, and nothing near it is (card_1274e045904e). Issuance
+    /// and verification each hash on their own side; this is where they have
+    /// to meet.
+    #[tokio::test]
+    async fn an_issued_access_token_is_the_one_the_resolver_accepts() {
+        let (db, _, _) = pat_fixture().await;
+        let issued = rg_core::auth::access_token::issue(
+            &db,
+            rg_core::auth::access_token::NewAccessToken {
+                user_id: 1,
+                name: "issued".to_string(),
+                scopes: "repo".to_string(),
+                expires_at: None,
+                repository_ids: None,
+                mcp_tools: None,
+                deny_protected_merge: false,
+            },
+        )
+        .await
+        .expect("issue a token");
+
+        let (token, owner) = resolve_pat(&db, &db, &issued.raw)
+            .await
+            .expect("resolve")
+            .expect("the issued token authenticates");
+        assert_eq!((token.id, owner.id), (issued.token.id, 1));
+
+        let mut altered = issued.raw.clone();
+        let last = altered.pop().expect("a non-empty token");
+        altered.push(if last == '0' { '1' } else { '0' });
+        assert!(resolve_pat(&db, &db, &altered)
+            .await
+            .expect("resolve")
+            .is_none());
+    }
+
     /// card_a84b25c9efbe: the usage stamp is a write on every door a PAT opens,
     /// so it queues on the write pool; the credential lookups stay on the
     /// shared one. On a file-backed SQLite database the two are separate pools.

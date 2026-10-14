@@ -384,7 +384,7 @@ impl IncomingObjects {
             .prefix(".receive-quarantine-")
             .tempdir_in(&live)?;
         let active = std::fs::File::create(directory.path().join("active.lock"))?;
-        fs2::FileExt::lock_exclusive(&active)?;
+        active.lock()?;
         let objects = directory.path().join("objects");
         std::fs::create_dir(&objects)?;
         std::fs::create_dir(objects.join("pack"))?;

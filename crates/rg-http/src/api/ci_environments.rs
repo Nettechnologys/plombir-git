@@ -685,6 +685,7 @@ async fn release_if_ready(
             .ci_engine
             .resume_pipeline(rg_core::ci::ResumePipelineParams {
                 db: &state.db,
+                repo_root: &state.repo_root,
                 repo_path: &repo_path,
                 repo_id: ctx.repo.id,
                 pipeline_id,

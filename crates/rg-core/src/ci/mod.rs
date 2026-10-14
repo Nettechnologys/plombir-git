@@ -285,6 +285,12 @@ pub fn ci_job_token_ttl_secs(execution_timeout_secs: u64) -> i64 {
 /// dependency.
 pub struct TriggerPipelineParams<'a> {
     pub db: &'a DatabaseConnection,
+    /// The directory every repository on this instance lives under: where the
+    /// embedded runner keeps workspaces, caches and artifacts, and the root
+    /// the HTTP side reads them back from. Passed by the producer, which built
+    /// `repo_path` from it, rather than guessed back out of `repo_path`
+    /// (card_a3fbb5635ad1).
+    pub repo_root: &'a Path,
     pub repo_path: &'a Path,
     pub repo_id: i64,
     pub commit_sha: &'a str,
@@ -338,6 +344,8 @@ pub struct TriggerPipelineParams<'a> {
 /// Parameters for resuming an existing pipeline after a manual gate.
 pub struct ResumePipelineParams<'a> {
     pub db: &'a DatabaseConnection,
+    /// See [`TriggerPipelineParams::repo_root`].
+    pub repo_root: &'a Path,
     pub repo_path: &'a Path,
     pub repo_id: i64,
     pub pipeline_id: i64,

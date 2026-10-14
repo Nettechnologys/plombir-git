@@ -601,6 +601,7 @@ pub async fn play_job(
         .ci_engine
         .resume_pipeline(rg_core::ci::ResumePipelineParams {
             db: &state.db,
+            repo_root: &state.repo_root,
             repo_path: &repo_path,
             repo_id: repo.id,
             pipeline_id,
@@ -712,6 +713,7 @@ pub async fn trigger_pipeline(
         .ci_engine
         .trigger_pipeline(rg_core::ci::TriggerPipelineParams {
             db: &state.db,
+            repo_root: &state.repo_root,
             repo_path: &repo_path,
             repo_id: repo.id,
             commit_sha: &commit_sha,
@@ -829,6 +831,7 @@ pub async fn retry_pipeline(
         .ci_engine
         .trigger_pipeline(rg_core::ci::TriggerPipelineParams {
             db: &state.db,
+            repo_root: &state.repo_root,
             repo_path: &repo_path,
             repo_id: pipeline.repo_id,
             commit_sha: &pipeline.commit_sha,

@@ -279,7 +279,12 @@ pub(crate) struct Routers {
     v2: Router<AppState>,
     /// OpenAPI JSON and the Swagger UI.
     docs: Router<AppState>,
-    /// `(method, path, access)` for every route above.
+    /// `(method, path, access)` for every route above. Read by the test
+    /// router, which hands them to the route-access sweep.
+    #[cfg_attr(
+        not(feature = "test-support"),
+        allow(dead_code, reason = "only the `test-support` router reads the table")
+    )]
     facts: Vec<RouteFact>,
 }
 
@@ -3085,6 +3090,7 @@ pub(crate) fn build_all_routes(
 }
 
 /// Create the Axum router for testing (no rate limiter, no static file serving).
+#[cfg(feature = "test-support")]
 pub(crate) fn build_test_router(state: AppState) -> Router {
     build_test_router_with_facts(state).0
 }
@@ -3094,6 +3100,7 @@ pub(crate) fn build_test_router(state: AppState) -> Router {
 /// The sweep test drives the same router the other integration tests use, and
 /// reads the declarations out of the very build that produced it — there is no
 /// second enumeration to fall out of step.
+#[cfg(feature = "test-support")]
 pub(crate) fn build_test_router_with_facts(mut state: AppState) -> (Router, Vec<RouteFact>) {
     state.mcp_router = api::mcp::McpRouterSlot::default();
     let slot = state.mcp_router.clone();

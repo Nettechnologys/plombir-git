@@ -23,14 +23,14 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 home = { workspace = true }
 rg-process = { path = "../rg-process" }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { workspace = true, features = ["io"] }
 futures = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
 tar = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

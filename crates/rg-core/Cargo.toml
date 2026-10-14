@@ -17,7 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 quick-xml = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { workspace = true, features = ["rt"] }
 futures = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
@@ -34,8 +34,7 @@ sha1 = { workspace = true }
 md-5 = { workspace = true }
 hex = { workspace = true }
 lettre = { workspace = true }
-zstd = "0.13"
-home = { workspace = true }
+zstd = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
@@ -52,17 +51,16 @@ aes-gcm = { workspace = true }
 ed25519-dalek = { workspace = true }
 subtle = { workspace = true }
 rand = { workspace = true }
-urlencoding = "2.1"
-http = "1"
+urlencoding = { workspace = true }
+http = { workspace = true }
 # Package uploads are spooled to a request-private temporary file rather than
 # collected in heap; `PackageArtifact` owns that `TempPath`.
-tempfile = "3"
-fs2 = { workspace = true }
+tempfile = { workspace = true }
 
 # Effective uid/gid of the running process, for the bind-mount ownership
 # diagnostic in `platform::fs::ownership_hint` (std exposes no uid API).
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
 tokio-rustls = { workspace = true }

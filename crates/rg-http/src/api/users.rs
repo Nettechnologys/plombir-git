@@ -747,22 +747,6 @@ pub struct AccessTokenResponse {
     pub narrowing: super::bots::TokenNarrowingResponse,
 }
 
-/// Generate a cryptographically strong Personal Access Token.
-///
-/// 32 random bytes (256 bits) drawn from the OS CSPRNG (`OsRng`), hex-encoded
-/// and prefixed with `ifp_` so the token type stays recognisable (GitHub
-/// `ghp_` style) and scannable by secret-detection tools. Every byte of
-/// entropy comes from the CSPRNG — there is deliberately no timestamp- or
-/// PID-derived fallback that could make a token predictable. Mirrors
-/// `generate_jwt_secret` in `rg-cli`. If the OS entropy source is unavailable
-/// `fill_bytes` panics rather than emitting a guessable token.
-pub(crate) fn generate_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    format!("ifp_{}", hex::encode(bytes))
-}
-
 pub(crate) fn parse_token_expiration(
     value: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
@@ -868,32 +852,26 @@ pub async fn create_token(
             Ok(narrowing) => narrowing,
             Err(error) => return error.into_response(),
         };
-    // Generate the credential only after every client-supplied field is known
-    // to be valid. A rejected request must never mint even a transient raw PAT.
-    let raw_token = generate_token();
-    let token_hash = rg_db::token_digest(&raw_token);
-    let now = chrono::Utc::now();
-    let model = rg_db::entities::access_token::ActiveModel {
-        id: sea_orm::NotSet,
-        user_id: sea_orm::Set(user_id),
-        name: sea_orm::Set(body.name),
-        token_hash: sea_orm::Set(token_hash),
-        scopes: sea_orm::Set(scopes),
-        expires_at: sea_orm::Set(expires_at),
-        last_used_at: sea_orm::Set(None),
-        created_at: sea_orm::Set(now),
-        repo_restricted: sea_orm::Set(narrowing.repository_ids.is_some()),
-        mcp_tools: sea_orm::Set(narrowing.mcp_tools),
-        deny_protected_merge: sea_orm::Set(narrowing.deny_protected_merge),
-    };
-    match rg_db::ops::token_ops::create(
+    // Issued only after every client-supplied field is known to be valid. A
+    // rejected request must never mint even a transient raw PAT.
+    match rg_core::auth::access_token::issue(
         &state.db,
-        model,
-        narrowing.repository_ids.as_deref().unwrap_or_default(),
+        rg_core::auth::access_token::NewAccessToken {
+            user_id,
+            name: body.name,
+            scopes,
+            expires_at,
+            repository_ids: narrowing.repository_ids,
+            mcp_tools: narrowing.mcp_tools,
+            deny_protected_merge: narrowing.deny_protected_merge,
+        },
     )
     .await
     {
-        Ok(token) => {
+        Ok(rg_core::auth::access_token::IssuedAccessToken {
+            raw: raw_token,
+            token,
+        }) => {
             // The name and the scopes, and nothing else. `raw_token` is the
             // credential and `token_hash` is what the server authenticates by;
             // either in the journal would turn a list operators read into a
@@ -1307,59 +1285,5 @@ mod finalized_login_user_tests {
         let error = finalized_login_user(7, Ok(None))
             .expect_err("an account that is gone must not be handed a session");
         assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
-    }
-}
-
-#[cfg(test)]
-mod token_tests {
-    use super::generate_token;
-    use std::collections::HashSet;
-
-    #[test]
-    fn pat_has_expected_prefix_and_length() {
-        let token = generate_token();
-        // `ifp_` (4) + 32 bytes as hex (64) = 68 chars.
-        assert!(
-            token.starts_with("ifp_"),
-            "PAT must carry the ifp_ prefix: {token}"
-        );
-        assert_eq!(token.len(), 68, "unexpected PAT length: {token}");
-    }
-
-    #[test]
-    fn pat_body_is_256_bits_of_hex_entropy() {
-        let token = generate_token();
-        let body = token.strip_prefix("ifp_").expect("prefix");
-        assert!(
-            body.chars().all(|c| c.is_ascii_hexdigit()),
-            "PAT body must be pure hex: {body}"
-        );
-        let bytes = hex::decode(body).expect("PAT body must be valid hex");
-        assert_eq!(
-            bytes.len(),
-            32,
-            "PAT must carry 32 bytes (256 bits) of entropy"
-        );
-    }
-
-    #[test]
-    fn pat_is_unique_across_many_calls() {
-        // A CSPRNG token — not a timestamp/PID — must never collide, even when
-        // minted in a tight loop within the same process/instant.
-        let mut seen = HashSet::new();
-        for _ in 0..1000 {
-            assert!(
-                seen.insert(generate_token()),
-                "PAT collision — entropy too weak"
-            );
-        }
-    }
-
-    #[test]
-    fn distinct_tokens_hash_distinctly() {
-        assert_ne!(
-            rg_db::token_digest(&generate_token()),
-            rg_db::token_digest(&generate_token())
-        );
     }
 }

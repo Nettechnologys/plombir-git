@@ -513,19 +513,31 @@ pub async fn find_repo_and_namespace_for_registry(
 
 /// [`find_repo_by_owner_name`], plus the owner's name as its row spells it.
 ///
-/// The address a request names and the namespace it resolves to are not the
-/// same string everywhere: on MySQL's default collation `alice/myrepo` finds
-/// `Alice/MyRepo`. Whatever derives a durable name from the address — a
-/// storage key, a path on disk — takes it from here rather than from the
-/// request, so two spellings of one repository cannot write two copies of it.
-/// The repository's own spelling is `repository.name`.
+/// An address resolves only by the exact spelling its rows carry, on every
+/// backend (card_3b3d49c60ab1). SQLite and PostgreSQL compare names that way;
+/// MySQL's default collation does not, and there `alice/myrepo` used to find
+/// `Alice/MyRepo` while some forty call sites went on to build
+/// `<owner>/<repo>.git`, LFS keys and staging paths from the request — a path
+/// that does not exist, or a second copy of the data under another prefix.
+/// Refusing the other spelling here, once, makes the request's spelling the
+/// row's for every caller that got an answer, including the ones not yet
+/// written. The lookups below still run on the column's collation; the
+/// comparison after them is what holds on all three.
+///
+/// A client that cannot spell the address as the rows do — docker, which
+/// lowercases image paths — goes through
+/// [`find_repo_and_namespace_for_registry`] and builds keys from the spellings
+/// it returns.
 pub async fn find_repo_and_namespace_by_owner_name(
     db: &DatabaseConnection,
     owner: &str,
     repo_name: &str,
 ) -> Result<Option<(rg_db::entities::repository::Model, String)>> {
     // Try as user
-    if let Some(user) = user_ops::find_by_username(db, owner).await? {
+    if let Some(user) = user_ops::find_by_username(db, owner)
+        .await?
+        .filter(|user| user.username == owner)
+    {
         return Ok(
             repo_ops::find_personal_by_owner_and_name(db, user.id, repo_name)
                 .await?
@@ -534,7 +546,10 @@ pub async fn find_repo_and_namespace_by_owner_name(
     }
 
     // Try as organization
-    if let Some(org) = rg_db::ops::org_ops::get_org_by_name(db, owner).await? {
+    if let Some(org) = rg_db::ops::org_ops::get_org_by_name(db, owner)
+        .await?
+        .filter(|org| org.name == owner)
+    {
         return Ok(repo_ops::find_by_org_and_name(db, org.id, repo_name)
             .await?
             .map(|repository| (repository, org.name)));
@@ -2655,11 +2670,75 @@ pub async fn delete_repo(
     // `owner/name` pair a task that has not resolved its target yet carries.
     let namespace = repository_namespace_name(db, repo.owner_id, repo.org_id).await?;
     ensure_repository_deletion_is_quiescent(db, repo.id, &namespace, &repo.name).await?;
+    let (plan, journal_entry) =
+        plan_repository_deletion(db, repo_root, oci_storage, repo, &namespace).await?;
+
+    // Everything above only *named* things; nothing has moved yet, which is what
+    // makes this the last moment a complete journal entry can be written. Every
+    // rename below is reversible only by a process that survives to reverse it,
+    // and this entry is what lets the next process do it instead.
+    deletion_recovery::open(blob_storage, &plan.deletion_id, "repository", journal_entry).await?;
+
+    let staged =
+        stage_repository_deletion(blob_storage, oci_storage, repo, &namespace, plan).await?;
+
+    // A trigger already past its repository lookup can race the first check.
+    // Recheck after every storage namespace is staged; if it published work in
+    // that window, restore everything and make the caller retry only after the
+    // pipeline has settled.
+    if let Err(error) =
+        ensure_repository_deletion_is_quiescent(db, repo.id, &namespace, &repo.name).await
+    {
+        staged.unwind(blob_storage, oci_storage, repo.id).await;
+        return Err(error);
+    }
+
+    if let Err(error) = retire_repository_row(db, repo.id).await {
+        staged.unwind(blob_storage, oci_storage, repo.id).await;
+        return Err(error);
+    }
+
+    invalidate_perm_cache_repo(db, repo.id);
+
+    // Count the deletion here (not in the HTTP handler) so the REST path, the
+    // organization retirement and the account retirement all funnel through one
+    // recording site. It sits directly after the commit rather than at the end
+    // of the function: everything below is post-commit cleanup, and a repository
+    // whose staged bytes could not be swept is still a repository that left the
+    // live set — the gauge already dropped it.
+    crate::metrics_hook::record_repo_deleted();
+
+    let cleanup_error =
+        record_committed_repository_deletion(db, blob_storage, repo, &staged.deletion_id).await;
+    staged
+        .retire(blob_storage, oci_storage, repo.id, cleanup_error)
+        .await
+        .map_or(Ok(()), Err)
+}
+
+/// What a repository deletion will move, named before anything moves.
+struct RepositoryDeletionPlan {
+    deletion_id: String,
+    repo_path: std::path::PathBuf,
+    staged_path: std::path::PathBuf,
+    prefixes: Vec<StagedBlobPrefix>,
+    planned_directories: Vec<StagedRepositoryFilesystemDirectory>,
+}
+
+/// Name every namespace `repo` owns and the journal entry that lets a later
+/// process undo or finish the deletion. Nothing is moved here.
+async fn plan_repository_deletion(
+    db: &DatabaseConnection,
+    repo_root: &std::path::Path,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
+    repo: &rg_db::entities::repository::Model,
+    namespace: &str,
+) -> Result<(RepositoryDeletionPlan, Vec<deletion_recovery::StagedBytes>)> {
     let repo_path = repo_root.join(format!("{namespace}/{}.git", repo.name));
     let deletion_id = uuid::Uuid::new_v4().simple().to_string();
     // Validate every backend-neutral namespace before moving any live data. A
     // malformed historical name must fail without leaving Git staged aside.
-    let mut prefixes = repository_blob_prefixes(&namespace, repo, &deletion_id)?;
+    let mut prefixes = repository_blob_prefixes(namespace, repo, &deletion_id)?;
     // Same rule for the artifact namespaces, which additionally need the
     // database to name them: a failed inventory is a failed deletion, not a
     // deletion that quietly keeps the artifacts.
@@ -2679,7 +2758,7 @@ pub async fn delete_repo(
     let legacy_package_files = legacy_package_file_paths(db, repo.id).await?;
     let filesystem_directories = repository_filesystem_directories(
         repo_root,
-        &namespace,
+        namespace,
         repo,
         &job_ids,
         &legacy_package_files,
@@ -2694,10 +2773,6 @@ pub async fn delete_repo(
         deletion_id
     ));
 
-    // Everything above only *named* things; nothing has moved yet, which is what
-    // makes this the last moment a complete journal entry can be written. Every
-    // rename below is reversible only by a process that survives to reverse it,
-    // and this entry is what lets the next process do it instead.
     let planned_directories =
         plan_repository_filesystem_directories(filesystem_directories, repo.id, &deletion_id)?;
     let mut journal_entry = vec![deletion_recovery::StagedBytes::path(
@@ -2711,14 +2786,54 @@ pub async fn delete_repo(
     );
     journal_entry.extend(planned_filesystem_journal(&planned_directories)?);
     journal_entry.extend(oci_storage.planned_repository_deletion_journal(
-        &namespace,
+        namespace,
         &repo.name,
         repo.id,
         &deletion_id,
     )?);
-    deletion_recovery::open(blob_storage, &deletion_id, "repository", journal_entry).await?;
+    Ok((
+        RepositoryDeletionPlan {
+            deletion_id,
+            repo_path,
+            staged_path,
+            prefixes,
+            planned_directories,
+        },
+        journal_entry,
+    ))
+}
 
-    let staged = match repo_path.try_exists() {
+/// The namespaces of a repository being deleted, moved aside so that the row
+/// can still be kept: [`Self::unwind`] puts them back, [`Self::retire`]
+/// destroys them once the row is gone.
+struct StagedRepositoryDeletion {
+    deletion_id: String,
+    repo_path: std::path::PathBuf,
+    staged_path: std::path::PathBuf,
+    /// Whether there was a Git directory to move aside.
+    git_staged: bool,
+    blobs: Vec<StagedBlobPrefix>,
+    directories: Vec<StagedRepositoryFilesystemDirectory>,
+    oci: Option<crate::package_registry::oci::storage::StagedOciRepository>,
+}
+
+/// Move every namespace of `plan` aside, Git first. A step that fails puts back
+/// what the steps before it moved and closes the journal entry.
+async fn stage_repository_deletion(
+    blob_storage: &dyn BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
+    repo: &rg_db::entities::repository::Model,
+    namespace: &str,
+    plan: RepositoryDeletionPlan,
+) -> Result<StagedRepositoryDeletion> {
+    let RepositoryDeletionPlan {
+        deletion_id,
+        repo_path,
+        staged_path,
+        prefixes,
+        planned_directories,
+    } = plan;
+    let git_staged = match repo_path.try_exists() {
         Ok(true) => {
             std::fs::rename(&repo_path, &staged_path)
                 .map_err(|error| {
@@ -2751,104 +2866,177 @@ pub async fn delete_repo(
             ));
         }
     };
-
-    let staged_blobs = match stage_blob_prefixes(blob_storage, prefixes, repo.id).await {
-        Ok(staged_blobs) => staged_blobs,
-        Err(error) => {
-            if staged {
-                restore_repository_directory(&staged_path, &repo_path, repo.id);
-            }
-            deletion_recovery::close(blob_storage, &deletion_id).await;
-            return Err(error);
-        }
+    let mut staged = StagedRepositoryDeletion {
+        deletion_id,
+        repo_path,
+        staged_path,
+        git_staged,
+        blobs: Vec::new(),
+        directories: Vec::new(),
+        oci: None,
     };
 
-    let staged_directories =
-        match stage_repository_filesystem_directories(planned_directories, repo.id) {
-            Ok(staged_directories) => staged_directories,
-            Err(error) => {
-                restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
-                if staged {
-                    restore_repository_directory(&staged_path, &repo_path, repo.id);
-                }
-                deletion_recovery::close(blob_storage, &deletion_id).await;
-                return Err(error);
-            }
-        };
-
-    let staged_oci = match oci_storage
-        .stage_repository_deletion(&namespace, &repo.name, repo.id, &deletion_id)
+    match stage_blob_prefixes(blob_storage, prefixes, repo.id).await {
+        Ok(blobs) => staged.blobs = blobs,
+        Err(error) => {
+            staged.unwind(blob_storage, oci_storage, repo.id).await;
+            return Err(error);
+        }
+    }
+    match stage_repository_filesystem_directories(planned_directories, repo.id) {
+        Ok(directories) => staged.directories = directories,
+        Err(error) => {
+            staged.unwind(blob_storage, oci_storage, repo.id).await;
+            return Err(error);
+        }
+    }
+    match oci_storage
+        .stage_repository_deletion(namespace, &repo.name, repo.id, &staged.deletion_id)
         .await
     {
-        Ok(staged_oci) => staged_oci,
+        Ok(oci) => staged.oci = Some(oci),
         Err(error) => {
-            restore_repository_filesystem_directories(&staged_directories, repo.id);
-            restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
-            if staged {
-                restore_repository_directory(&staged_path, &repo_path, repo.id);
-            }
-            deletion_recovery::close(blob_storage, &deletion_id).await;
+            staged.unwind(blob_storage, oci_storage, repo.id).await;
             return Err(error);
         }
-    };
+    }
+    Ok(staged)
+}
 
-    // A trigger already past its repository lookup can race the first check.
-    // Recheck after every storage namespace is staged; if it published work in
-    // that window, restore everything and make the caller retry only after the
-    // pipeline has settled.
-    if let Err(error) =
-        ensure_repository_deletion_is_quiescent(db, repo.id, &namespace, &repo.name).await
-    {
-        oci_storage.restore_repository(staged_oci).await;
-        restore_repository_filesystem_directories(&staged_directories, repo.id);
-        restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
-        if staged {
-            restore_repository_directory(&staged_path, &repo_path, repo.id);
+impl StagedRepositoryDeletion {
+    /// Put every staged namespace back, newest first, and close the journal
+    /// entry: the repository stays as it was.
+    async fn unwind(
+        self,
+        blob_storage: &dyn BlobStorage,
+        oci_storage: &crate::package_registry::oci::storage::OciStorage,
+        repo_id: i64,
+    ) {
+        if let Some(oci) = self.oci {
+            oci_storage.restore_repository(oci).await;
         }
-        deletion_recovery::close(blob_storage, &deletion_id).await;
-        return Err(error);
+        restore_repository_filesystem_directories(&self.directories, repo_id);
+        restore_blob_prefixes(blob_storage, &self.blobs, repo_id).await;
+        if self.git_staged {
+            restore_repository_directory(&self.staged_path, &self.repo_path, repo_id);
+        }
+        deletion_recovery::close(blob_storage, &self.deletion_id).await;
     }
 
-    // The row leaves the live set here, and this is the last statement that can
-    // still be taken back. A mirror pass is the one writer whose claim can be
-    // read and refused *atomically* with the write — it holds a lease row — so
-    // that check rides inside this transaction rather than in front of it. See
-    // `soft_delete_unless_mirror_syncing` for why the update comes before the
-    // read there and what each interleaving resolves to.
-    let committed = match rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
+    /// Destroy the staged namespaces of a repository whose row is gone, keeping
+    /// `cleanup_error` (the first failure wins) and closing the journal entry
+    /// only when everything went.
+    async fn retire(
+        self,
+        blob_storage: &dyn BlobStorage,
+        oci_storage: &crate::package_registry::oci::storage::OciStorage,
+        repo_id: i64,
+        mut cleanup_error: Option<anyhow::Error>,
+    ) -> Option<anyhow::Error> {
+        if self.git_staged {
+            if let Err(error) = remove_staged_repository_directory(&self.staged_path, repo_id) {
+                cleanup_error.get_or_insert(error);
+            }
+        }
+
+        if let Err(error) = retire_repository_filesystem_directories(self.directories, repo_id) {
+            cleanup_error.get_or_insert(error);
+        }
+
+        for prefix in self.blobs {
+            if let Err(error) = blob_storage.delete_prefix(&prefix.staged).await {
+                tracing::warn!(
+                    repo_id,
+                    staged_prefix = %prefix.staged,
+                    live_prefix = %prefix.live,
+                    %error,
+                    "repository is deleted and its live blob namespace is free, but its staged blobs remain and must be removed by hand"
+                );
+                cleanup_error.get_or_insert_with(|| {
+                    anyhow::Error::new(error).context(format!(
+                        "failed to retire staged repository blobs at {}",
+                        prefix.staged
+                    ))
+                });
+            }
+        }
+
+        if let Some(oci) = self.oci {
+            if let Err(error) = oci_storage.discard_repository(oci).await {
+                cleanup_error.get_or_insert_with(|| {
+                    error.context("failed to retire deleted repository registry data")
+                });
+            }
+        }
+
+        // Closed only when the whole post-commit cleanup went through. The
+        // marker is down, so an entry that survives a failed removal is what
+        // lets the next startup pass destroy what is left instead of leaving
+        // every staged namespace to an operator.
+        if cleanup_error.is_none() {
+            deletion_recovery::close(blob_storage, &self.deletion_id).await;
+        }
+        cleanup_error
+    }
+}
+
+/// Remove a deleted repository's staged Git directory; one already gone is
+/// not a failure.
+fn remove_staged_repository_directory(staged_path: &std::path::Path, repo_id: i64) -> Result<()> {
+    match std::fs::remove_dir_all(staged_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            tracing::warn!(
+                repo_id,
+                path = %staged_path.display(),
+                error = %error,
+                "repository is deleted and its canonical name is free, but its old Git data \
+                 remains on disk and must be removed by hand"
+            );
+            Err(crate::platform::fs::path_error(
+                "staged repository directory",
+                staged_path,
+                &error,
+                crate::platform::fs::REPO_ROOT_HINT,
+            )
+            .context("failed to retire deleted repository Git data"))
+        }
+    }
+}
+
+/// Take the repository row out of the live set — the last step of a deletion
+/// that can still be taken back.
+///
+/// A mirror pass is the one writer whose claim can be read and refused
+/// *atomically* with the write — it holds a lease row — so that check rides
+/// inside this transaction rather than in front of it. See
+/// `soft_delete_unless_mirror_syncing` for why the update comes before the read
+/// there and what each interleaving resolves to.
+async fn retire_repository_row(db: &DatabaseConnection, repo_id: i64) -> Result<()> {
+    match rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(
         db,
-        repo.id,
+        repo_id,
         Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
     )
-    .await
+    .await?
     {
-        Ok(rg_db::ops::repo_ops::RepositoryRetirement::Deleted) => Ok(()),
-        Ok(rg_db::ops::repo_ops::RepositoryRetirement::MirrorSyncInFlight) => {
+        rg_db::ops::repo_ops::RepositoryRetirement::Deleted => Ok(()),
+        rg_db::ops::repo_ops::RepositoryRetirement::MirrorSyncInFlight => {
             Err(mirror_sync_in_flight())
         }
-        Err(error) => Err(error),
-    };
-    if let Err(error) = committed {
-        oci_storage.restore_repository(staged_oci).await;
-        restore_repository_filesystem_directories(&staged_directories, repo.id);
-        restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
-        if staged {
-            restore_repository_directory(&staged_path, &repo_path, repo.id);
-        }
-        deletion_recovery::close(blob_storage, &deletion_id).await;
-        return Err(error);
     }
+}
 
-    invalidate_perm_cache_repo(db, repo.id);
-
-    // Count the deletion here (not in the HTTP handler) so the REST path, the
-    // organization retirement and the account retirement all funnel through one
-    // recording site. It sits directly after the commit rather than at the end
-    // of the function: everything below is post-commit cleanup, and a repository
-    // whose staged bytes could not be swept is still a repository that left the
-    // live set — the gauge already dropped it.
-    crate::metrics_hook::record_repo_deleted();
-
+/// The bookkeeping that follows a committed repository deletion: the journal
+/// marker, the code search index and the source's fork counter. Each failure is
+/// reported rather than allowed to stop the rest.
+async fn record_committed_repository_deletion(
+    db: &DatabaseConnection,
+    blob_storage: &dyn BlobStorage,
+    repo: &rg_db::entities::repository::Model,
+    deletion_id: &str,
+) -> Option<anyhow::Error> {
     let mut cleanup_error = None;
 
     // Everything below is post-commit cleanup, so the tombstone is now a
@@ -2857,7 +3045,7 @@ pub async fn delete_repo(
     // pass would put a deleted repository's storage back under a name the row
     // no longer holds. See `StagedPackageVersion::retire` for why a failure
     // here is reported rather than allowed to stop the cleanup.
-    if let Err(error) = deletion_recovery::mark_committed(blob_storage, &deletion_id).await {
+    if let Err(error) = deletion_recovery::mark_committed(blob_storage, deletion_id).await {
         tracing::warn!(
             repo_id = repo.id,
             error = %format!("{error:#}"),
@@ -2907,83 +3095,16 @@ pub async fn delete_repo(
                 "fork is deleted, but its source's cached forks_count still counts it and must be \
                  refreshed by hand"
             );
-            if cleanup_error.is_none() {
-                cleanup_error = Some(error.context(format!(
+            cleanup_error.get_or_insert_with(|| {
+                error.context(format!(
                     "repository {} is deleted, but the cached forks_count of its source repository {} \
                      could not be refreshed",
                     repo.id, origin_repo_id
-                )));
-            }
+                ))
+            });
         }
     }
-
-    if staged {
-        match std::fs::remove_dir_all(&staged_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(
-                repo_id = repo.id,
-                path = %staged_path.display(),
-                error = %error,
-                "repository is deleted and its canonical name is free, but its old Git data \
-                 remains on disk and must be removed by hand"
-                );
-                if cleanup_error.is_none() {
-                    cleanup_error = Some(
-                        crate::platform::fs::path_error(
-                            "staged repository directory",
-                            &staged_path,
-                            &error,
-                            crate::platform::fs::REPO_ROOT_HINT,
-                        )
-                        .context("failed to retire deleted repository Git data"),
-                    );
-                }
-            }
-        }
-    }
-
-    if let Err(error) = retire_repository_filesystem_directories(staged_directories, repo.id) {
-        if cleanup_error.is_none() {
-            cleanup_error = Some(error);
-        }
-    }
-
-    for prefix in staged_blobs {
-        if let Err(error) = blob_storage.delete_prefix(&prefix.staged).await {
-            tracing::warn!(
-                repo_id = repo.id,
-                staged_prefix = %prefix.staged,
-                live_prefix = %prefix.live,
-                %error,
-                "repository is deleted and its live blob namespace is free, but its staged blobs remain and must be removed by hand"
-            );
-            if cleanup_error.is_none() {
-                cleanup_error = Some(anyhow::Error::new(error).context(format!(
-                    "failed to retire staged repository blobs at {}",
-                    prefix.staged
-                )));
-            }
-        }
-    }
-
-    if let Err(error) = oci_storage.discard_repository(staged_oci).await {
-        if cleanup_error.is_none() {
-            cleanup_error =
-                Some(error.context("failed to retire deleted repository registry data"));
-        }
-    }
-
-    // Closed only when the whole post-commit cleanup went through. The
-    // marker is down, so an entry that survives a failed removal is what lets
-    // the next startup pass destroy what is left instead of leaving every
-    // staged namespace to an operator.
-    if cleanup_error.is_none() {
-        deletion_recovery::close(blob_storage, &deletion_id).await;
-    }
-
-    cleanup_error.map_or(Ok(()), Err)
+    cleanup_error
 }
 
 /// A repository that was just forked, and the namespace name it landed under.
@@ -3521,7 +3642,7 @@ pub(crate) async fn lock_default_branch(repo_path: &std::path::Path) -> Result<s
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("open default branch lock: {lock_path:?}"))?;
-        fs2::FileExt::lock_exclusive(&file)
+        file.lock()
             .with_context(|| format!("lock repository default branch: {lock_path:?}"))?;
         Ok(file)
     })

@@ -2,7 +2,10 @@
 //! if needed, then poll-and-execute loop).
 
 use anyhow::{Context, Result};
-use rg_process::client_policy::{is_loopback_host, same_origin_redirect_policy};
+use rg_process::client_policy::{
+    credential_server_transport, same_origin_redirect_policy, CredentialServerRefusal as Refusal,
+    CredentialTransport,
+};
 
 use crate::api::{
     deregister_runner, download_workspace, finish_job, job_liveness, poll_job, publish_artifact,
@@ -225,28 +228,26 @@ fn build_runner_client() -> reqwest::Client {
 }
 
 fn require_confidential_runner_server(server: &str, allow_insecure_http: bool) -> Result<()> {
-    let url = reqwest::Url::parse(server)
-        .with_context(|| "runner server must be an absolute http(s) URL")?;
-    if url.host_str().is_none() {
-        anyhow::bail!("runner server URL must name a host");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        anyhow::bail!("runner server URL must not contain user information");
-    }
-
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" if is_loopback_host(&url) => Ok(()),
-        "http" if allow_insecure_http => {
+    match credential_server_transport(server, true, allow_insecure_http) {
+        Ok(CredentialTransport::InsecureHttpAllowed) => {
             tracing::warn!(
                 "allow_insecure_http is enabled: runner credentials may cross plaintext HTTP"
             );
             Ok(())
         }
-        "http" => anyhow::bail!(
+        Ok(_) => Ok(()),
+        Err(Refusal::NotAUrl(error)) => Err(anyhow::Error::msg(error)
+            .context("runner server must be an absolute http(s) URL")),
+        Err(Refusal::NoHost) => anyhow::bail!("runner server URL must name a host"),
+        Err(Refusal::UserInfo) => {
+            anyhow::bail!("runner server URL must not contain user information")
+        }
+        Err(Refusal::PlaintextRemote) => anyhow::bail!(
             "runner server uses plaintext HTTP on a non-loopback host; use HTTPS, keep local development on localhost/loopback, or explicitly set --allow-insecure-http / allow_insecure_http = true"
         ),
-        scheme => anyhow::bail!("runner server URL must use http or https, not {scheme}"),
+        Err(Refusal::UnsupportedScheme(scheme)) => {
+            anyhow::bail!("runner server URL must use http or https, not {scheme}")
+        }
     }
 }
 

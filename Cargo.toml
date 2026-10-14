@@ -209,6 +209,18 @@ gix = { version = "0.84", features = [
 flate2 = "1"
 tar = "0.4"
 zip = "2"
+zstd = "0.13"
+
+# HTTP plumbing below axum, and stream helpers
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tokio-stream = "0.1"
+tokio-util = "0.7"
+urlencoding = "2.1"
+
+# Test and staging scratch space
+tempfile = "3"
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
@@ -216,7 +228,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 semver = "1"
 regex = "1"
 home = "0.5"
-fs2 = "0.4"
 
 # DB migration
 sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "runtime-tokio-rustls"] }

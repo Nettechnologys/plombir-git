@@ -335,14 +335,21 @@ for (const [variant, mask] of [
 
 const serveCode = productionRustCode(readFileSync(join(root, CLI_SERVE), 'utf8'));
 const serveWriter = fnBody(serveCode, 'run_serve');
+const loggingInit = fnBody(serveCode, 'init_logging');
 const logAppender = fnBody(serveCode, 'open_file_log_appender');
 if (!serveWriter) {
   failures.push(`${CLI_SERVE}: \`run_serve\` is gone — server startup policy cannot be read.`);
+} else if (!loggingInit || !loggingInit.includes('open_file_log_appender(')) {
+  failures.push(
+    `${CLI_SERVE}: \`init_logging\` no longer opens the log appender, so the server startup's `
+      + 'first file creation cannot be located.',
+  );
 } else {
   const installed = serveWriter.indexOf('resolved_state_permissions.install');
-  // Both daily and size rotation now create their file in this helper. Check
-  // the call in run_serve so moving it above the umask still makes the gate red.
-  const firstWrite = serveWriter.indexOf('open_file_log_appender(');
+  // Both daily and size rotation create their file in `open_file_log_appender`,
+  // reached only through `init_logging`. Check the order of the two calls in
+  // run_serve so moving the install below logging still makes the gate red.
+  const firstWrite = serveWriter.indexOf('init_logging(');
   if (installed < 0) {
     failures.push(`${CLI_SERVE}: \`run_serve\` no longer installs resolved state permissions.`);
   } else if (firstWrite < 0 || installed > firstWrite) {

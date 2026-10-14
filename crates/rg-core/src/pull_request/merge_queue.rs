@@ -1657,6 +1657,7 @@ async fn ensure_merge_group_ci(
                 .trigger
                 .trigger_pipeline(crate::ci::TriggerPipelineParams {
                     db,
+                    repo_root,
                     repo_path: &repo_path,
                     repo_id: repository.id,
                     commit_sha: &group_sha,

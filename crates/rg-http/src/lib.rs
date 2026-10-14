@@ -59,6 +59,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+#[cfg(feature = "test-support")]
 use axum::Router;
 use rg_core::package_registry::oci::OciStorage;
 use sea_orm::DatabaseConnection;
@@ -1059,6 +1060,11 @@ async fn load_tls_config(
 
 /// Create the Axum router for testing: the production route set, stack and
 /// fallback, minus the two rate limiters.
+///
+/// This and the other `create_router_for_test*` builders exist only under the
+/// `test-support` feature: a router without the per-client limiters is not
+/// something a binary linking this library should be able to serve.
+#[cfg(feature = "test-support")]
 pub fn create_router_for_test(state: AppState) -> Router {
     routes::build_test_router(state)
 }
@@ -1069,6 +1075,7 @@ pub fn create_router_for_test(state: AppState) -> Router {
 /// this one only by those limiters. Serve this one with
 /// `into_make_service_with_connect_info`: the limiter layer extracts
 /// `ConnectInfo`, which a plain `axum::serve` does not supply.
+#[cfg(feature = "test-support")]
 pub fn create_router_for_test_with_static_files(state: AppState) -> Router {
     // Both limiters disabled (`max_requests = 0`), so the layers are mounted —
     // the `ConnectInfo` extractor with them — but never reject anything.
@@ -1088,6 +1095,7 @@ pub fn create_router_for_test_with_static_files(state: AppState) -> Router {
 /// enough to spend, and serves it with
 /// `into_make_service_with_connect_info::<SocketAddr>()` — the limiter
 /// middleware extracts `ConnectInfo`, which the plain harness does not supply.
+#[cfg(feature = "test-support")]
 pub fn create_router_for_test_with_rate_limits(
     state: AppState,
     rate_limiter: rate_limit::RateLimiter,
@@ -1103,6 +1111,7 @@ pub fn create_router_for_test_with_rate_limits(
 
 /// [`create_router_for_test_with_rate_limits`] with the anonymous-search
 /// limiter too, for the test that proves it is mounted.
+#[cfg(feature = "test-support")]
 pub fn create_router_for_test_with_all_rate_limits(
     state: AppState,
     rate_limiter: rate_limit::RateLimiter,
@@ -1116,6 +1125,7 @@ pub fn create_router_for_test_with_all_rate_limits(
 ///
 /// The route-access sweep needs both, and needs them to come from one build —
 /// a table assembled separately from the router is a table that can drift.
+#[cfg(feature = "test-support")]
 pub fn create_router_for_test_with_routes(
     state: AppState,
 ) -> (Router, Vec<route_table::RouteFact>) {
@@ -1585,6 +1595,7 @@ async fn recover_one_pipeline(
         .ci_engine
         .resume_pipeline(rg_core::ci::ResumePipelineParams {
             db: &state.db,
+            repo_root: &state.repo_root,
             repo_path: &repo_path,
             repo_id: repo.id,
             pipeline_id: pipeline.id,

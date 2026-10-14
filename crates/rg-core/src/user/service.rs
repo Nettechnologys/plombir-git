@@ -1457,9 +1457,7 @@ async fn forgot_password_inner(
     // Invalidate old unused tokens
     rg_db::ops::password_reset_token_ops::invalidate_user_tokens(db, user.id).await?;
 
-    // Generate a random token
-    let raw_token = uuid::Uuid::new_v4().to_string();
-    let token_hash = rg_db::token_digest(&raw_token);
+    let (raw_token, token_hash) = new_reset_token();
 
     // Token valid for 15 minutes
     let expires_at = Utc::now() + Duration::minutes(15);
@@ -1515,6 +1513,14 @@ async fn forgot_password_inner(
         user_id: user.id,
         username: user.username,
     }))
+}
+
+/// A fresh reset token for the mailed link, and the digest that is stored for
+/// it — the one [`reset_password`] looks a presented token up by.
+fn new_reset_token() -> (String, String) {
+    let raw_token = uuid::Uuid::new_v4().to_string();
+    let token_hash = rg_db::token_digest(&raw_token);
+    (raw_token, token_hash)
 }
 
 /// Reset a password using a valid reset token.
@@ -1607,6 +1613,60 @@ pub async fn reset_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The token `forgot_password` mails (`new_reset_token`) is the one
+    /// `reset_password` accepts, and a token next to it is not
+    /// (card_1274e045904e): each side hashes on its own.
+    #[tokio::test]
+    async fn an_issued_reset_token_is_the_one_reset_password_accepts() {
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            1,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = user_ops::create_user(
+            &db,
+            "reset-owner",
+            "reset-owner@example.test",
+            &password::hash_password("Old$pass1").await.unwrap(),
+            "",
+        )
+        .await
+        .unwrap();
+        let (raw, hash) = new_reset_token();
+        rg_db::ops::password_reset_token_ops::create(
+            &db,
+            user.id,
+            &hash,
+            Utc::now() + Duration::minutes(15),
+        )
+        .await
+        .unwrap();
+
+        let mut altered = raw.clone();
+        let last = altered.pop().expect("a non-empty token");
+        altered.push(if last == '0' { '1' } else { '0' });
+        let Err(refused) = reset_password(&db, &altered, "New$pass2x", "jwt-secret").await else {
+            panic!("a token that was never issued is refused");
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains("invalid or expired reset token"),
+            "{refused:#}"
+        );
+
+        assert!(matches!(
+            reset_password(&db, &raw, "New$pass2x", "jwt-secret")
+                .await
+                .expect("the issued token resets the password"),
+            PasswordResetOutcome::Session(_)
+        ));
+    }
 
     fn ldap_provider(secret: &str) -> rg_db::entities::sso_provider::Model {
         let key = crate::auth::encryption::derive_key(secret);

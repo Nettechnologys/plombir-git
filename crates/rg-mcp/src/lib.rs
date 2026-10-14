@@ -25,7 +25,10 @@ pub mod tools;
 // Re-export for convenience
 pub use error::{Error, Result};
 
-use rg_process::client_policy::{is_loopback_host, same_origin_redirect_policy};
+use rg_process::client_policy::{
+    credential_server_transport, same_origin_redirect_policy, CredentialServerRefusal as Refusal,
+    CredentialTransport,
+};
 
 /// The Plombir Git API this server talks to when `PLOMBIR_GIT_URL` is unset.
 ///
@@ -74,38 +77,30 @@ fn require_confidential_bearer_server(
     pat: &str,
     allow_insecure_http: bool,
 ) -> Result<()> {
-    let url = reqwest::Url::parse(api_base).map_err(|error| {
-        Error::Config(format!(
-            "PLOMBIR_GIT_URL must be an absolute http(s) URL: {error}"
-        ))
-    })?;
-    if url.host_str().is_none() {
-        return Err(Error::Config(
-            "PLOMBIR_GIT_URL must name a server host".to_string(),
-        ));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(Error::Config(
-            "PLOMBIR_GIT_URL must not contain user information".to_string(),
-        ));
-    }
-
-    match url.scheme() {
-        "https" => Ok(()),
-        // An unauthenticated MCP can still read public data over HTTP. The
-        // confidentiality boundary starts when the cached client carries PAT.
-        "http" if pat.is_empty() || is_loopback_host(&url) => Ok(()),
-        "http" if allow_insecure_http => {
+    // An unauthenticated MCP can still read public data over HTTP. The
+    // confidentiality boundary starts when the cached client carries PAT.
+    match credential_server_transport(api_base, !pat.is_empty(), allow_insecure_http) {
+        Ok(CredentialTransport::InsecureHttpAllowed) => {
             tracing::warn!(
                 "PLOMBIR_GIT_ALLOW_INSECURE_HTTP=true: the MCP PAT may cross plaintext HTTP"
             );
             Ok(())
         }
-        "http" => Err(Error::Config(
+        Ok(_) => Ok(()),
+        Err(Refusal::NotAUrl(error)) => Err(Error::Config(format!(
+            "PLOMBIR_GIT_URL must be an absolute http(s) URL: {error}"
+        ))),
+        Err(Refusal::NoHost) => Err(Error::Config(
+            "PLOMBIR_GIT_URL must name a server host".to_string(),
+        )),
+        Err(Refusal::UserInfo) => Err(Error::Config(
+            "PLOMBIR_GIT_URL must not contain user information".to_string(),
+        )),
+        Err(Refusal::PlaintextRemote) => Err(Error::Config(
             "PLOMBIR_GIT_URL uses plaintext HTTP for a non-loopback server while PLOMBIR_GIT_PAT is set; use HTTPS, keep local development on localhost/loopback, or explicitly set PLOMBIR_GIT_ALLOW_INSECURE_HTTP=true"
                 .to_string(),
         )),
-        scheme => Err(Error::Config(format!(
+        Err(Refusal::UnsupportedScheme(scheme)) => Err(Error::Config(format!(
             "PLOMBIR_GIT_URL must use http or https, not {scheme}"
         ))),
     }

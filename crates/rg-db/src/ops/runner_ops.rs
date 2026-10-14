@@ -213,6 +213,63 @@ fn generate_token() -> String {
 mod tests {
     use super::*;
 
+    /// `register_runner` mints and `find_by_token` — what `authenticate_runner`
+    /// asks for every runner request — verifies. Each hashes on its own side,
+    /// so this is where a change to one of them has to show (card_1274e045904e).
+    #[tokio::test]
+    async fn a_registered_runner_token_is_the_one_its_lookup_accepts() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options)
+            .await
+            .expect("in-memory database");
+        crate::run_migrations(&db).await.expect("migrations");
+        let user =
+            crate::ops::user_ops::create_user(&db, "runner-owner", "ro@example.test", "", "")
+                .await
+                .expect("owner");
+        let now = Utc::now();
+        let repo = crate::ops::repo_ops::create(
+            &db,
+            repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("runner-repo".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("repository");
+
+        let (runner, token) =
+            register_runner(&db, repo.id, "issued", r#"["linux"]"#, None, None, None)
+                .await
+                .expect("register");
+        let found = find_by_token(&db, &token)
+            .await
+            .expect("lookup")
+            .expect("the issued token authenticates");
+        assert_eq!(found.id, runner.id);
+
+        let mut altered = token.clone();
+        let last = altered.pop().expect("a non-empty token");
+        altered.push(if last == '0' { '1' } else { '0' });
+        assert!(find_by_token(&db, &altered)
+            .await
+            .expect("lookup")
+            .is_none());
+    }
+
     /// The floor this whole change rests on: the token is a v4 UUID's 122 bits
     /// of CSPRNG output, so the unsalted hash has nothing to attack. If the
     /// generator is ever weakened to something guessable, that is the moment

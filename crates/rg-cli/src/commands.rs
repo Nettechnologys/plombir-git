@@ -4,7 +4,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use rg_process::client_policy::is_loopback_host;
 use tracing_subscriber::EnvFilter;
 
 use crate::admin;
@@ -914,28 +913,28 @@ fn require_confidential_package_server(
     server_url: &str,
     allow_insecure_http: bool,
 ) -> anyhow::Result<()> {
-    let url = reqwest::Url::parse(server_url)
-        .with_context(|| "--server-url must be an absolute http(s) URL")?;
-    if url.host_str().is_none() {
-        anyhow::bail!("--server-url must name a host");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        anyhow::bail!("--server-url must not contain user information");
-    }
+    use rg_process::client_policy::{
+        credential_server_transport, CredentialServerRefusal as Refusal, CredentialTransport,
+    };
 
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" if is_loopback_host(&url) => Ok(()),
-        "http" if allow_insecure_http => {
+    match credential_server_transport(server_url, true, allow_insecure_http) {
+        Ok(CredentialTransport::InsecureHttpAllowed) => {
             tracing::warn!(
                 "--allow-insecure-http is enabled: the package token may cross plaintext HTTP"
             );
             Ok(())
         }
-        "http" => anyhow::bail!(
+        Ok(_) => Ok(()),
+        Err(Refusal::NotAUrl(error)) => Err(anyhow::Error::msg(error)
+            .context("--server-url must be an absolute http(s) URL")),
+        Err(Refusal::NoHost) => anyhow::bail!("--server-url must name a host"),
+        Err(Refusal::UserInfo) => anyhow::bail!("--server-url must not contain user information"),
+        Err(Refusal::PlaintextRemote) => anyhow::bail!(
             "--server-url uses plaintext HTTP on a non-loopback host; use HTTPS, keep local development on localhost/loopback, or explicitly pass --allow-insecure-http"
         ),
-        scheme => anyhow::bail!("--server-url must use http or https, not {scheme}"),
+        Err(Refusal::UnsupportedScheme(scheme)) => {
+            anyhow::bail!("--server-url must use http or https, not {scheme}")
+        }
     }
 }
 
