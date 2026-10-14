@@ -432,4 +432,50 @@ async fn storage_budget_sums_decode_in_every_store_on_every_backend() {
             .expect("attachment SUM must decode"),
         BIG + 13
     );
+
+    // Artifacts reach their repository through job → stage → pipeline: the
+    // nested subqueries have to resolve on every backend, not only the SUM.
+    assert_eq!(
+        rg_db::ops::artifact_ops::repo_usage(&db, repo_id)
+            .await
+            .unwrap(),
+        (0, 0)
+    );
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo_id,
+        "1111111111111111111111111111111111111111",
+        "refs/heads/main",
+        "push",
+        None,
+    )
+    .await
+    .expect("create a pipeline");
+    let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "build", 0)
+        .await
+        .expect("create a stage");
+    let job = rg_db::ops::pipeline_ops::create_job(
+        &db, stage.id, "build", "true", None, None, None, None, None, None, false, None, None, None,
+    )
+    .await
+    .expect("create a job");
+    for (index, size) in [BIG, 17].into_iter().enumerate() {
+        rg_db::ops::artifact_ops::create_artifact(
+            &db,
+            job.id,
+            &format!("artifact-{index}"),
+            &format!("artifacts/{tag}/{index}"),
+            size,
+            None,
+            None,
+        )
+        .await
+        .expect("store a CI artifact");
+    }
+    assert_eq!(
+        rg_db::ops::artifact_ops::repo_usage(&db, repo_id)
+            .await
+            .expect("CI artifact SUM must decode"),
+        (2, BIG + 17)
+    );
 }

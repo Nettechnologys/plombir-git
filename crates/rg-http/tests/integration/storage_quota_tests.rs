@@ -747,6 +747,112 @@ async fn package_publish_over_the_repository_budget_is_refused() {
     );
 }
 
+// ── CI artifacts ─────────────────────────────────────────────
+
+/// Stage `payload` as the job's artifact archive and publish it under `name`,
+/// returning the publish response.
+async fn stage_and_publish_artifact(
+    base: &str,
+    runner_id: i64,
+    runner_token: &str,
+    job_id: i64,
+    name: &str,
+    payload: &[u8],
+) -> reqwest::Response {
+    let client = reqwest::Client::new();
+    let staged = client
+        .put(format!(
+            "{base}/api/v1/runners/{runner_id}/jobs/{job_id}/artifacts/staging"
+        ))
+        .bearer_auth(runner_token)
+        .header("content-type", "application/x-tar")
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        staged.status(),
+        201,
+        "staging is not where the budget bites"
+    );
+    let staged: Value = staged.json().await.unwrap();
+    client
+        .post(format!(
+            "{base}/api/v1/runners/{runner_id}/jobs/{job_id}/artifacts"
+        ))
+        .bearer_auth(runner_token)
+        .json(&serde_json::json!({
+            "name": name,
+            "file_path": staged["file_path"].as_str().expect("staged path"),
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// CI artifacts were neither counted nor checked: a repository at its budget
+/// could still take a gigabyte per job. Both halves now hold — the publish is
+/// refused, and an artifact already stored counts against the next write in
+/// another store.
+#[tokio::test]
+async fn ci_artifacts_are_checked_and_counted_against_the_budget() {
+    let (base, db) = spawn_test_app_with_overrides(overrides_with(|limits| {
+        limits.repo_quota_bytes = Some(64);
+    }))
+    .await;
+    let (token, _) = register_full(&base, "artifact-quota", "artifact-quota@example.com").await;
+    let repo_id = create_initialised_repo(&base, &token, "artifact-quota").await;
+    let (runner, runner_token) =
+        rg_db::ops::runner_ops::register_runner(&db, repo_id, "quota-runner", "", None, None, None)
+            .await
+            .unwrap();
+
+    let job = create_cached_job(&db, repo_id, runner.id, "artifacts").await;
+    let refused =
+        stage_and_publish_artifact(&base, runner.id, &runner_token, job, "big", &[7_u8; 65]).await;
+    assert_eq!(
+        refused.status(),
+        413,
+        "an artifact past the budget is refused"
+    );
+    let body = refused.text().await.unwrap();
+    assert!(
+        body.contains("repo_quota_mb"),
+        "the refusal names the knob: {body}"
+    );
+    assert_eq!(
+        rg_db::ops::artifact_ops::repo_usage(&db, repo_id)
+            .await
+            .unwrap(),
+        (0, 0),
+        "a refused artifact leaves no row"
+    );
+
+    let stored =
+        stage_and_publish_artifact(&base, runner.id, &runner_token, job, "small", &[7_u8; 40])
+            .await;
+    assert_eq!(stored.status(), 201, "an artifact that fits is stored");
+
+    // 40 bytes held by the artifact leave 24: a 30-byte release asset that
+    // would have fitted an empty repository no longer does.
+    let release_id = create_release(&base, &token, "artifact-quota", "artifact-quota", "v1").await;
+    let asset = upload_release_asset(
+        &base,
+        &token,
+        "artifact-quota",
+        "artifact-quota",
+        release_id,
+        "asset.bin",
+        &[1_u8; 30],
+    )
+    .await;
+    assert_eq!(
+        asset.status(),
+        413,
+        "the stored artifact must count against the shared budget"
+    );
+}
+
 // ── The default asks nothing ─────────────────────────────────
 
 /// A stored LFS object of `size` bytes, written straight into the table: the

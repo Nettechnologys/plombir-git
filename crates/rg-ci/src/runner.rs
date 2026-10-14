@@ -171,6 +171,9 @@ pub struct PipelineRunner {
     /// read, learns whether it was canceled. [`JOB_HEARTBEAT_INTERVAL`] in
     /// production; a test shortens it rather than waiting half a minute.
     job_heartbeat_interval: std::time::Duration,
+    /// `[limits]` — what the caches and artifacts this runner publishes are
+    /// held to. See [`PipelineRunner::set_storage_limits`].
+    storage_limits: rg_core::storage_quota::StorageLimits,
 }
 
 impl PipelineRunner {
@@ -207,6 +210,7 @@ impl PipelineRunner {
             shutdown: None,
             docker_program: "docker".into(),
             job_heartbeat_interval: JOB_HEARTBEAT_INTERVAL,
+            storage_limits: rg_core::storage_quota::StorageLimits::default(),
         }
     }
 
@@ -248,7 +252,19 @@ impl PipelineRunner {
             shutdown: None,
             docker_program: "docker".into(),
             job_heartbeat_interval: JOB_HEARTBEAT_INTERVAL,
+            storage_limits: rg_core::storage_quota::StorageLimits::default(),
         }
+    }
+
+    /// Hold the caches and artifacts this runner publishes to the instance's
+    /// `[limits]`.
+    ///
+    /// The external runners' routes check the repository budget before they
+    /// store anything; this runner publishes through the same core functions
+    /// without a route in front of it, so the limits have to be handed to it
+    /// or a job here stores what a job on an external runner could not.
+    pub fn set_storage_limits(&mut self, limits: rg_core::storage_quota::StorageLimits) {
+        self.storage_limits = limits;
     }
 
     /// Set the repository ID (for CI_JOB_TOKEN generation).
@@ -1687,6 +1703,7 @@ impl PipelineRunner {
             spool,
             size,
             &digest,
+            &self.storage_limits,
         )
         .await?;
         Ok(())
@@ -1791,12 +1808,14 @@ impl PipelineRunner {
         rg_core::artifact::publish_from_file(
             &self.db,
             &storage,
+            self.repo_id,
             job_id,
             name,
             archive,
             size,
             Some(sha256),
             expires_at,
+            &self.storage_limits,
         )
         .await?;
         Ok(())
@@ -2793,6 +2812,81 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(workspace.join("target/cache.txt")).unwrap(),
             "cached"
+        );
+    }
+
+    /// The embedded runner publishes without a route in front of it, so the
+    /// repository budget has to hold here as it does on the runner routes: a
+    /// cache or an artifact past it is refused and leaves no row behind, and
+    /// the same runner without a budget stores both.
+    #[tokio::test]
+    async fn caches_and_artifacts_past_the_repository_budget_are_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runner = cache_runner(temp.path()).await;
+        runner.set_storage_limits(rg_core::storage_quota::StorageLimits {
+            repo_quota_bytes: Some(1),
+            ..Default::default()
+        });
+        let refused = |error: anyhow::Error| {
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::PayloadTooLarge>()
+                    .is_some(),
+                "a budget refusal must stay a typed 413, got {error:#}"
+            );
+        };
+
+        refused(
+            save_workspace_cache(&runner, "build-main", "more than one byte")
+                .await
+                .expect_err("a cache past the budget must be refused"),
+        );
+        assert_eq!(
+            rg_db::ops::ci_retention_ops::repo_cache_usage(&runner.db, runner.repo_id)
+                .await
+                .unwrap(),
+            (0, 0)
+        );
+
+        let stage = pipeline_ops::create_stage(&runner.db, runner.pipeline_id, "build", 0)
+            .await
+            .unwrap();
+        let job = pipeline_ops::create_job(
+            &runner.db, stage.id, "build", "true", None, None, None, None, None, None, false, None,
+            None, None,
+        )
+        .await
+        .unwrap();
+        let workspace = runner.workspace_path();
+        std::fs::create_dir_all(workspace.join("dist")).unwrap();
+        std::fs::write(workspace.join("dist/app.bin"), "built").unwrap();
+        refused(
+            runner
+                .publish_artifact(job.id, "dist", &["dist".into()])
+                .await
+                .expect_err("an artifact past the budget must be refused"),
+        );
+        assert_eq!(
+            rg_db::ops::artifact_ops::repo_usage(&runner.db, runner.repo_id)
+                .await
+                .unwrap(),
+            (0, 0)
+        );
+
+        runner.set_storage_limits(rg_core::storage_quota::StorageLimits::default());
+        save_workspace_cache(&runner, "build-main", "more than one byte")
+            .await
+            .expect("no budget, no refusal");
+        runner
+            .publish_artifact(job.id, "dist", &["dist".into()])
+            .await
+            .expect("no budget, no refusal");
+        assert_eq!(
+            rg_db::ops::artifact_ops::repo_usage(&runner.db, runner.repo_id)
+                .await
+                .unwrap()
+                .0,
+            1
         );
     }
 

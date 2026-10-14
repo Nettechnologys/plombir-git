@@ -21,17 +21,28 @@ use crate::blob_storage::{BlobKey, BlobStorage};
 /// of losing the only name of the orphan. Ownership of `source` transfers once
 /// its final blob write succeeds; before that point the caller keeps the staged
 /// file and can retry or let its own spool sweep reclaim it.
+///
+/// `repo_id` is the repository the job's pipeline belongs to, and `limits` its
+/// budget: checked before the blob is written, so a refused artifact leaves
+/// nothing behind but the caller's staged file. Both publishers — the runner
+/// route and the embedded runner — come through here, so neither can store an
+/// artifact the other would have refused.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_from_file(
     db: &rg_db::DatabaseConnection,
     storage: &dyn BlobStorage,
+    repo_id: i64,
     job_id: i64,
     name: &str,
     source: &Path,
     size: i64,
     sha256: Option<String>,
     expires_at: Option<DateTime<Utc>>,
+    limits: &crate::storage_quota::StorageLimits,
 ) -> Result<rg_db::entities::artifact::Model> {
+    crate::storage_quota::check_room(db, repo_id, u64::try_from(size).unwrap_or(0), limits)
+        .await
+        .map_err(crate::storage_quota::QuotaError::into_service_error)?;
     let job_segment = job_id.to_string();
     let object = format!("{}-{name}", Uuid::new_v4());
     let key = BlobKey::from_segments(["artifacts", "jobs", &job_segment, &object])?;

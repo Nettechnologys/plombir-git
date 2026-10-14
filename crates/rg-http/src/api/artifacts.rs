@@ -415,7 +415,7 @@ async fn discard_stale_staging(directory: &FsPath) {
     responses(
         (status = 201, description = "Artifact created", body = UploadArtifactResponse),
         (status = 400, description = "Invalid artifact metadata", body = serde_json::Value),
-        (status = 413, description = "Artifact metadata exceeds 64 KiB"),
+        (status = 413, description = "Artifact metadata exceeds 64 KiB, or the repository's `[limits].repo_quota_mb` budget has no room for the artifact"),
         (status = 404, description = "Job not found", body = serde_json::Value),
         (status = 409, description = "The job is no longer active (canceled or settled); nothing was published", body = serde_json::Value),
     ),
@@ -453,6 +453,7 @@ pub async fn upload_artifact(
     let published = rg_core::artifact::publish_from_file(
         &state.db,
         &*state.blob_storage,
+        repo_id,
         job_id,
         &upload.name,
         &upload.file_path,
@@ -461,6 +462,7 @@ pub async fn upload_artifact(
         Some(rg_db::ops::ci_retention_ops::expires_after(
             policy.artifact_retention_days,
         )),
+        &state.storage_limits,
     )
     .await;
 

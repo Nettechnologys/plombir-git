@@ -103,6 +103,10 @@ pub struct CiEngine {
     /// (`rg_db::open_write_pool`, card_a84b25c9efbe). Process configuration
     /// like the rest; `None` writes through the database the trigger hands in.
     write_pool: Option<sea_orm::DatabaseConnection>,
+    /// `[limits]` — the budget the caches and artifacts its embedded runners
+    /// publish are held to, the same one the runner routes check. Process
+    /// configuration like the rest; unset by default.
+    storage_limits: rg_core::storage_quota::StorageLimits,
 }
 
 impl Default for CiEngine {
@@ -113,6 +117,7 @@ impl Default for CiEngine {
             shutdown: None,
             runner_labels: rg_core::ci::default_runner_labels(),
             write_pool: None,
+            storage_limits: rg_core::storage_quota::StorageLimits::default(),
         }
     }
 }
@@ -180,6 +185,14 @@ impl CiEngine {
         self
     }
 
+    /// Hold the caches and artifacts every embedded runner this engine spawns
+    /// publishes to `[limits]` — see
+    /// [`crate::runner::PipelineRunner::set_storage_limits`].
+    pub fn with_storage_limits(mut self, limits: rg_core::storage_quota::StorageLimits) -> Self {
+        self.storage_limits = limits;
+        self
+    }
+
     /// The instance-wide fallback handed to every embedded runner this engine
     /// creates. Exposed for startup diagnostics and contract tests.
     pub fn job_timeout_secs(&self) -> u64 {
@@ -190,6 +203,12 @@ impl CiEngine {
     /// [`Self::job_timeout_secs`] is.
     pub fn runner_labels(&self) -> &[String] {
         &self.runner_labels
+    }
+
+    /// The `[limits]` every embedded runner is held to. Exposed for the same
+    /// reason [`Self::job_timeout_secs`] is.
+    pub fn storage_limits(&self) -> rg_core::storage_quota::StorageLimits {
+        self.storage_limits
     }
 }
 
@@ -1393,6 +1412,7 @@ fn build_internal_runner(
         runner.set_oidc_token_url(url);
     }
     runner.set_shutdown(engine.shutdown.clone());
+    runner.set_storage_limits(engine.storage_limits);
     if let Some(write_pool) = &engine.write_pool {
         runner.set_write_pool(write_pool.clone());
     }

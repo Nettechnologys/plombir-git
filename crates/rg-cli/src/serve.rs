@@ -44,11 +44,13 @@ fn configured_ci_engine(
     runner_labels: Vec<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     write_pool: rg_db::DatabaseConnection,
+    storage_limits: rg_core::storage_quota::StorageLimits,
 ) -> rg_ci::CiEngine {
     rg_ci::CiEngine::with_notifications_and_job_timeout(notifications, job_timeout_secs)
         .with_runner_labels(runner_labels)
         .with_shutdown(shutdown)
         .with_write_pool(write_pool)
+        .with_storage_limits(storage_limits)
 }
 
 fn publish_listen_addresses(
@@ -1770,6 +1772,7 @@ pub(crate) async fn run_serve(
         resolved_runner_labels.clone(),
         shutdown_rx.clone(),
         db_write.clone(),
+        resolved_storage_limits,
     );
     tracing::info!(
         job_timeout_secs = ci_engine.job_timeout_secs(),
@@ -3062,9 +3065,32 @@ mod serve_tests {
             rg_core::ci::default_runner_labels(),
             shutdown_rx,
             rg_db::DatabaseConnection::Disconnected,
+            rg_core::storage_quota::StorageLimits::default(),
         );
 
         assert_eq!(engine.job_timeout_secs(), 731);
+    }
+
+    /// The embedded runner publishes caches and artifacts without a route in
+    /// front of it, so `[limits]` reaches it only through the engine.
+    #[test]
+    fn configured_storage_limits_reach_the_ci_engine() {
+        let config: ConfigFile =
+            toml::from_str("[limits]\nrepo_quota_mb = 5\n").expect("limits config");
+        let limits = crate::config::resolve_storage_limits(Some(&config)).expect("resolve limits");
+        assert_eq!(limits.repo_quota_bytes, Some(5 * 1024 * 1024));
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let engine = super::configured_ci_engine(
+            rg_ci::CiNotifications::default(),
+            rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
+            rg_core::ci::default_runner_labels(),
+            shutdown_rx,
+            rg_db::DatabaseConnection::Disconnected,
+            limits,
+        );
+
+        assert_eq!(engine.storage_limits(), limits);
     }
 
     /// `serve` shares one resolution path with the one-shot subcommands, so the

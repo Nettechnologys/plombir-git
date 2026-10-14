@@ -108,6 +108,39 @@ pub fn spool_in(directory: &Path) -> std::io::Result<tempfile::NamedTempFile> {
         .tempfile_in(directory)
 }
 
+/// Whether an archive of `size` bytes may be stored under a key whose current
+/// entry is `replaced`, against `[limits]`.
+///
+/// Replacing an entry adds no key and only the difference in bytes, so a
+/// refresh at the limit is not refused for room the old archive already holds.
+/// With neither ceiling set this asks the database nothing.
+async fn refuse_over_budget(
+    db: &rg_db::DatabaseConnection,
+    repo_id: i64,
+    replaced: Option<&rg_db::entities::ci_cache_entry::Model>,
+    size: i64,
+    limits: &crate::storage_quota::StorageLimits,
+) -> Result<()> {
+    if let (None, Some(max_entries)) = (replaced, limits.ci_cache_max_entries_per_repo) {
+        let (entries, _bytes) = rg_db::ops::ci_retention_ops::repo_cache_usage(db, repo_id).await?;
+        if entries >= max_entries {
+            // No eviction: the owner cannot list caches, so a key dropped to
+            // make room would vanish without a trace. Entries leave on their
+            // retention window.
+            return Err(crate::error::payload_too_large(format!(
+                "the repository already holds the maximum of {max_entries} CI cache entries \
+                 ([limits].ci_cache_max_entries_per_repo); older entries leave when their \
+                 retention window expires"
+            )));
+        }
+    }
+    let held = replaced.map_or(0, |entry| u64::try_from(entry.size).unwrap_or(0));
+    let incoming = u64::try_from(size).unwrap_or(0).saturating_sub(held);
+    crate::storage_quota::check_room(db, repo_id, incoming, limits)
+        .await
+        .map_err(crate::storage_quota::QuotaError::into_service_error)
+}
+
 /// Publish a complete cache spool and upsert the row that owns it.
 ///
 /// Ownership of `spool` transfers only after its final rename succeeds. Every
@@ -115,6 +148,12 @@ pub fn spool_in(directory: &Path) -> std::io::Result<tempfile::NamedTempFile> {
 /// intent, final write, metadata upsert, commit marker, intent close. A failed
 /// cleanup deliberately leaves the intent behind so startup can retry after
 /// proving the exact `(repo_id, file_path)` has no owner.
+///
+/// `limits` is checked here rather than by each caller: the HTTP route and the
+/// embedded runner both publish through this function, and a check that lived
+/// in the route alone let a job on the embedded runner store caches past every
+/// ceiling. A refusal drops `spool`, which deletes it.
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_from_spool(
     db: &rg_db::DatabaseConnection,
     repo_root: &Path,
@@ -123,6 +162,7 @@ pub async fn publish_from_spool(
     spool: tempfile::TempPath,
     size: i64,
     sha256: &str,
+    limits: &crate::storage_quota::StorageLimits,
 ) -> Result<rg_db::entities::ci_cache_entry::Model> {
     let directory = archive_dir(repo_root, repo_id);
     tokio::fs::create_dir_all(&directory)
@@ -135,9 +175,9 @@ pub async fn publish_from_spool(
         })?;
 
     let policy = rg_db::ops::ci_retention_ops::get_policy(db, repo_id).await?;
-    let replaced = rg_db::ops::ci_retention_ops::find_cache_entry(db, repo_id, key_hash)
-        .await?
-        .map(|entry| entry.file_path);
+    let replaced = rg_db::ops::ci_retention_ops::find_cache_entry(db, repo_id, key_hash).await?;
+    refuse_over_budget(db, repo_id, replaced.as_ref(), size, limits).await?;
+    let replaced = replaced.map(|entry| entry.file_path);
     let publication_id = Uuid::new_v4().simple().to_string();
     let archive = directory.join(format!("{key_hash}.{publication_id}.tar"));
     let journal = LocalBlobStorage::new(repo_root.to_path_buf());

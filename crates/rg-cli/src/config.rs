@@ -484,7 +484,7 @@ pub(crate) fn default_job_timeout() -> u64 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct LimitsConfig {
     /// Total MiB one repository may hold across LFS, releases, attachments,
-    /// CI caches, packages and OCI blobs.
+    /// CI caches and artifacts, packages and OCI blobs.
     pub(crate) repo_quota_mb: Option<u64>,
     /// Cumulative MiB of one OCI blob upload session, across every PATCH and
     /// the final PUT.

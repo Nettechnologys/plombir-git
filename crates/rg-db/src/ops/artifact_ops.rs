@@ -77,6 +77,41 @@ pub async fn list_by_pipeline(db: &DatabaseConnection, pipeline_id: i64) -> Resu
         .context("db: list artifacts by pipeline")
 }
 
+/// How many artifacts `repo_id`'s pipelines published, and how many bytes they
+/// declare.
+///
+/// An artifact names its repository only through its job, stage and pipeline,
+/// so the filter walks that chain as nested subqueries — one statement, no
+/// per-pipeline round trips. Expired rows count: their archive occupies the
+/// volume until the retention sweep retires it.
+pub async fn repo_usage(db: &DatabaseConnection, repo_id: i64) -> Result<(u64, i64)> {
+    use crate::entities::{pipeline, pipeline_job, pipeline_stage};
+
+    let pipelines = pipeline::Entity::find()
+        .select_only()
+        .column(pipeline::Column::Id)
+        .filter(pipeline::Column::RepoId.eq(repo_id))
+        .into_query();
+    let stages = pipeline_stage::Entity::find()
+        .select_only()
+        .column(pipeline_stage::Column::Id)
+        .filter(pipeline_stage::Column::PipelineId.in_subquery(pipelines))
+        .into_query();
+    let jobs = pipeline_job::Entity::find()
+        .select_only()
+        .column(pipeline_job::Column::Id)
+        .filter(pipeline_job::Column::StageId.in_subquery(stages))
+        .into_query();
+    super::aggregate::count_and_sum(
+        db,
+        ArtifactEntity::find().filter(Column::JobId.in_subquery(jobs)),
+        Column::Id,
+        Column::Size,
+        "db: sum the CI artifacts of a repository",
+    )
+    .await
+}
+
 /// Get a single artifact by ID.
 pub async fn get_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Artifact>> {
     ArtifactEntity::find_by_id(id)

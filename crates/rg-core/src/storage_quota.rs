@@ -2,12 +2,19 @@
 //! consult before they store another byte.
 //!
 //! Bytes land in several unrelated stores — LFS, release assets, attachments,
-//! CI caches, packages, OCI blobs (git does not count: the object database is
-//! the repository itself) — and each one had its own per-request ceiling or
-//! none, so an account could fill the volume that holds the git data and the
-//! database through whichever store had no total. [`usage`] answers the sum,
-//! [`check_room`] answers whether an incoming write fits, and the routes answer
-//! 413 (LFS: the spec's per-object 507) when it does not.
+//! CI caches and artifacts, packages, OCI blobs (git does not count: the
+//! object database is the repository itself) — and each one had its own
+//! per-request ceiling or none, so an account could fill the volume that holds
+//! the git data and the database through whichever store had no total.
+//! [`usage`] answers the sum, [`check_room`] answers whether an incoming write
+//! fits, and the routes answer 413 (LFS: the spec's per-object 507) when it
+//! does not.
+//!
+//! A write reaches a store by more doors than its upload route: the embedded
+//! CI runner, a mirror or an import fetching LFS objects, a fork copying them,
+//! a pull request merge adopting them, an OCI cross-repository mount. Each of
+//! those checks the same budget, and the check lives in the core function the
+//! door calls wherever the door is not a route of its own.
 //!
 //! **Every ceiling is opt-in.** An instance that sets none of them behaves as
 //! before, and none of these checks reaches the database: an upgrade must not
@@ -27,7 +34,7 @@ use sea_orm::DatabaseConnection;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct StorageLimits {
     /// Total bytes one repository may hold across LFS, releases, attachments,
-    /// CI caches, packages and OCI blobs.
+    /// CI caches and artifacts, packages and OCI blobs.
     pub repo_quota_bytes: Option<u64>,
     /// Cumulative bytes of **one OCI upload session**, across all its PATCHes
     /// and the final PUT. The HTTP body limit bounds a single request, not a
@@ -54,6 +61,8 @@ pub struct StorageUsage {
     pub attachment_bytes: u64,
     pub ci_cache_bytes: u64,
     pub ci_cache_entries: u64,
+    pub artifact_bytes: u64,
+    pub artifacts: u64,
     pub package_bytes: u64,
     pub package_files: u64,
     pub oci_bytes: u64,
@@ -69,6 +78,7 @@ impl StorageUsage {
             self.release_bytes,
             self.attachment_bytes,
             self.ci_cache_bytes,
+            self.artifact_bytes,
             self.package_bytes,
             self.oci_bytes,
         ]
@@ -161,6 +171,7 @@ pub async fn usage(db: &DatabaseConnection, repo_id: i64) -> Result<StorageUsage
     let attachment_bytes = rg_db::ops::attachment_ops::repo_size(db, repo_id).await?;
     let (ci_cache_entries, ci_cache_bytes) =
         rg_db::ops::ci_retention_ops::repo_cache_usage(db, repo_id).await?;
+    let (artifacts, artifact_bytes) = rg_db::ops::artifact_ops::repo_usage(db, repo_id).await?;
     let (package_files, package_bytes) =
         rg_db::ops::package_file_ops::repo_usage(db, repo_id).await?;
     let (oci_blobs, oci_bytes) = rg_db::ops::oci_ops::repo_blob_usage(db, repo_id).await?;
@@ -174,6 +185,8 @@ pub async fn usage(db: &DatabaseConnection, repo_id: i64) -> Result<StorageUsage
         attachment_bytes: bytes(attachment_bytes),
         ci_cache_bytes: bytes(ci_cache_bytes),
         ci_cache_entries,
+        artifact_bytes: bytes(artifact_bytes),
+        artifacts,
         package_bytes: bytes(package_bytes),
         package_files,
         oci_bytes: bytes(oci_bytes),
@@ -220,11 +233,12 @@ mod tests {
             release_bytes: 2,
             attachment_bytes: 3,
             ci_cache_bytes: 4,
+            artifact_bytes: 7,
             package_bytes: 5,
             oci_bytes: 6,
             ..Default::default()
         };
-        assert_eq!(usage.total_bytes(), 21);
+        assert_eq!(usage.total_bytes(), 28);
     }
 
     #[test]
