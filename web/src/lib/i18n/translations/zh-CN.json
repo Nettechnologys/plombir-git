@@ -2005,6 +2005,24 @@
     "find_imports": "导入仓库"
   },
   "account_security": {
+    "sudo": {
+      "title": "确认是你本人",
+      "description": "创建凭据或更改第二因素需要再次输入密码。十分钟内不会再次询问。",
+      "provider_description": "你的账号通过 {provider} 登录。请在那里重新登录以继续，完成后会回到本页面。",
+      "sign_in_again": "通过 {provider} 重新登录",
+      "use_passkey": "改用通行密钥",
+      "password": "密码",
+      "directory_password": "目录密码",
+      "code": "验证器代码",
+      "backup_code": "备用代码",
+      "use_code": "使用验证器代码",
+      "use_backup_code": "使用备用代码",
+      "confirm": "确认",
+      "confirming": "正在确认…",
+      "password_required": "请输入密码。",
+      "code_required": "请输入验证器代码或备用代码。",
+      "failed": "无法确认你的身份。"
+    },
     "title": "安全",
     "description": "管理网页登录和 Git/API 访问的账号保护措施。",
     "status_unknown": "未知",

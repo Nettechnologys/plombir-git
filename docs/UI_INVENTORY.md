@@ -19,7 +19,7 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 431 |
+| Router routes (with declared `Access`) | 433 |
 | Reachable from the browser | 302 (70%) |
 | Layout modules | 2 |
 | Pages | 72 |
@@ -36,7 +36,7 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 109 | 70 | 4 | 0 |
 | `RepoWrite` | 86 | 67 | 13 | 2 |
-| `User` | 55 | 44 | 6 | 0 |
+| `User` | 57 | 44 | 6 | 0 |
 | `RepoAdmin` | 39 | 39 | 0 | 0 |
 | `InstanceAdmin` | 32 | 27 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
@@ -1327,6 +1327,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | POST | `/api/v1/users/register` | `Public` | rust+web+smoke |
 | POST | `/api/v1/users/login` | `Public` | rust+web+smoke |
 | POST | `/api/v1/users/logout` | `User` | rust+web |
+| POST | `/api/v1/users/me/sudo` | `User` | rust+smoke |
 | POST | `/api/v1/users/password/initial` | `Public` | rust+web |
 | GET | `/api/v1/avatars/{username}` | `Public` | rust |
 | POST | `/api/v1/users/mfa/verify` | `Public` | rust |
@@ -1336,6 +1337,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | POST | `/api/v1/users/passkeys/login/finish` | `Public` | rust |
 | GET | `/api/v1/auth/sso/{slug}` | `Public` | rust |
 | GET | `/api/v1/auth/sso/{slug}/callback` | `Public` | rust |
+| POST | `/api/v1/auth/sso/{slug}/reauthenticate` | `User` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/labels/{id}` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/issue_config/validate` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/issues/{number}/labels` | `RepoRead` | rust |

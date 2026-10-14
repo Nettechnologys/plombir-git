@@ -32,6 +32,13 @@ export interface Me {
   bio: string | null;
   /** `local` accounts have a password and an address of their own here. */
   auth_provider: string;
+  /** Whether a second factor is enrolled. */
+  mfa_enabled?: boolean;
+  /**
+   * Whether the account has a password here. Without one it proves itself
+   * again by signing in through its provider, or with a passkey.
+   */
+  has_password?: boolean;
   /** When the address was proved by a mailed link; `null` when it was not. */
   email_verified_at?: string | null;
 }
@@ -66,6 +73,16 @@ export interface SsoLink {
   provider_enabled: boolean;
 }
 
+/**
+ * What `POST /users/me/sudo` asks for: the password (the directory's, for an
+ * LDAP account), plus one second-factor spelling when MFA is enrolled.
+ */
+export interface SudoConfirmation {
+  password: string;
+  totp_code?: string;
+  backup_code?: string;
+}
+
 export const auth = {
   register: (username: string, email: string, password: string) =>
     request<RegisterResponse>('/users/register', {
@@ -83,6 +100,22 @@ export const auth = {
       body: JSON.stringify({ username, code, backup }),
     }),
   me: () => request<Me>('/users/me'),
+  // Sudo mode: the same session re-issued for ten minutes, answered like
+  // `login`. `request` calls the prompt that calls this when a route answers
+  // `reason: sudo_required`.
+  sudo: (confirmation: SudoConfirmation) =>
+    request<AuthLoginResponse>('/users/me/sudo', {
+      method: 'POST',
+      body: JSON.stringify(confirmation),
+    }),
+  // Sudo mode for an account whose password lives with its provider: the
+  // browser goes to `authorize_url`, signs in there again, and comes back to
+  // `returnTo` with a session in sudo mode.
+  reauthenticateSso: (slug: string, returnTo: string) =>
+    request<{ authorize_url: string }>(`/auth/sso/${encodeURIComponent(slug)}/reauthenticate`, {
+      method: 'POST',
+      body: JSON.stringify({ return_to: returnTo }),
+    }),
   // Signs every other session out; this one continues with the token in the
   // answer, which the HttpOnly cookie already carries.
   changePassword: (currentPassword: string, newPassword: string) =>

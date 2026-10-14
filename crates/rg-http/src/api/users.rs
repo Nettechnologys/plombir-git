@@ -13,7 +13,7 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::auth::{AuthUser, SessionUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{AuthUser, SudoUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -381,7 +381,7 @@ pub async fn login(
                 mfa_required: false,
             };
             if !mfa_required {
-                resp.token = match rg_core::auth::jwt::generate_token(
+                resp.token = match rg_core::auth::jwt::generate_authenticated_token(
                     finalized.id,
                     &finalized.username,
                     finalized.session_version,
@@ -666,6 +666,10 @@ pub async fn me(State(state): State<AppState>, AuthUser(user_id): AuthUser) -> i
                 "avatar_url": user.avatar_url,
                 "bio": user.bio,
                 "auth_provider": user.auth_provider,
+                // What the sudo prompt asks for: a second factor besides the
+                // password, or — with no password here — a provider sign-in.
+                "mfa_enabled": user.mfa_enabled,
+                "has_password": crate::api::mfa::has_local_password(&user),
                 "is_admin": user.is_admin,
                 "created_at": user.created_at,
                 "email_verified_at": user.email_verified_at,
@@ -792,7 +796,7 @@ pub async fn list_tokens(
 )]
 pub async fn create_token(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    SudoUser(user_id): SudoUser,
     headers: HeaderMap,
     Json(body): Json<CreateTokenRequest>,
 ) -> impl IntoResponse {

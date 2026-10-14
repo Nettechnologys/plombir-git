@@ -31,7 +31,7 @@ use tracing;
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{AuthUser, SessionUser};
+use crate::api::auth::{AuthUser, SessionUser, SudoUser};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -43,6 +43,13 @@ const SSO_VERIFIER_COOKIE: &str = "plombir_git_sso_code_verifier";
 /// Set by [`start_link`] only: which signed-in account asked to link the
 /// identity this round trip returns with. See [`link_intent_cookie_value`].
 const SSO_LINK_COOKIE: &str = "plombir_git_sso_link";
+/// Set by [`reauthenticate`] only: which signed-in account is re-proving
+/// itself through the provider in this round trip, the same shape as the link
+/// intent under its own MAC domain.
+const SSO_REAUTH_COOKIE: &str = "plombir_git_sso_reauth";
+/// Where a re-authentication returns the browser to. Signed like the state
+/// cookies, and checked to be a path on this site before it is used.
+const SSO_RETURN_COOKIE: &str = "plombir_git_sso_return";
 
 fn append_set_cookie(response: &mut axum::response::Response, cookie: String) {
     if let Ok(header_value) = HeaderValue::from_str(&cookie) {
@@ -172,15 +179,42 @@ fn sign_cookie_value(value: &str, secret: &str) -> String {
 
 // ── Link intent ──────────────────────────────────────────────────
 
-/// The MAC behind a link intent: which account, under which session
-/// generation, asked to link which provider, in which OAuth round trip.
+/// What a session intent cookie asks the callback to do. Each purpose is its
+/// own MAC domain, so a link intent can never verify as a re-authentication
+/// or the other way round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntentPurpose {
+    Link,
+    Reauthenticate,
+}
+
+impl IntentPurpose {
+    fn domain(self) -> &'static str {
+        match self {
+            Self::Link => "sso-link",
+            Self::Reauthenticate => "sso-reauth",
+        }
+    }
+
+    fn cookie(self) -> &'static str {
+        match self {
+            Self::Link => SSO_LINK_COOKIE,
+            Self::Reauthenticate => SSO_REAUTH_COOKIE,
+        }
+    }
+}
+
+/// The MAC behind a session intent: which account, under which session
+/// generation, asked to link — or re-authenticate through — which provider, in
+/// which OAuth round trip.
 ///
 /// The provider slug and the CSRF state are covered by the MAC but not carried
 /// in the cookie — the callback supplies both from its own request, so an
 /// intent minted for one provider or one round trip verifies against no other.
 /// The domain prefix keeps this MAC from ever equalling the plain value MAC of
 /// [`sign_cookie_value`], which signs a random state string under the same key.
-fn link_intent_mac(
+fn intent_mac(
+    purpose: IntentPurpose,
     user_id: i64,
     session_version: i64,
     slug: &str,
@@ -191,7 +225,13 @@ fn link_intent_mac(
     // HMAC accepts a key of any length, so init cannot fail.
     let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts keys of any length");
-    mac.update(format!("sso-link\0{user_id}\0{session_version}\0{slug}\0{csrf_state}").as_bytes());
+    mac.update(
+        format!(
+            "{}\0{user_id}\0{session_version}\0{slug}\0{csrf_state}",
+            purpose.domain()
+        )
+        .as_bytes(),
+    );
     mac
 }
 
@@ -208,8 +248,26 @@ fn link_intent_cookie_value(
     csrf_state: &str,
     secret: &str,
 ) -> String {
+    intent_cookie_value(
+        IntentPurpose::Link,
+        user_id,
+        session_version,
+        slug,
+        csrf_state,
+        secret,
+    )
+}
+
+fn intent_cookie_value(
+    purpose: IntentPurpose,
+    user_id: i64,
+    session_version: i64,
+    slug: &str,
+    csrf_state: &str,
+    secret: &str,
+) -> String {
     use hmac::Mac;
-    let signature = link_intent_mac(user_id, session_version, slug, csrf_state, secret)
+    let signature = intent_mac(purpose, user_id, session_version, slug, csrf_state, secret)
         .finalize()
         .into_bytes();
     format!("{user_id}.{session_version}.{}", hex::encode(signature))
@@ -231,6 +289,10 @@ enum LinkIntent {
 /// The raw link-intent cookie, verified or not. Its presence alone says the
 /// round trip started on the security settings page.
 fn link_cookie_raw(headers: &HeaderMap) -> Option<&str> {
+    intent_cookie_raw(headers, SSO_LINK_COOKIE)
+}
+
+fn intent_cookie_raw<'a>(headers: &'a HeaderMap, cookie: &str) -> Option<&'a str> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -238,16 +300,26 @@ fn link_cookie_raw(headers: &HeaderMap) -> Option<&str> {
         .flat_map(|value| value.split(';'))
         .find_map(|part| {
             part.trim()
-                .strip_prefix(SSO_LINK_COOKIE)
+                .strip_prefix(cookie)
                 .and_then(|rest| rest.strip_prefix('='))
         })
         .filter(|value| !value.is_empty())
 }
 
 fn read_link_intent(headers: &HeaderMap, slug: &str, csrf_state: &str, secret: &str) -> LinkIntent {
+    read_intent(IntentPurpose::Link, headers, slug, csrf_state, secret)
+}
+
+fn read_intent(
+    purpose: IntentPurpose,
+    headers: &HeaderMap,
+    slug: &str,
+    csrf_state: &str,
+    secret: &str,
+) -> LinkIntent {
     use hmac::Mac;
 
-    let Some(raw) = link_cookie_raw(headers) else {
+    let Some(raw) = intent_cookie_raw(headers, purpose.cookie()) else {
         return LinkIntent::Absent;
     };
 
@@ -265,7 +337,7 @@ fn read_link_intent(headers: &HeaderMap, slug: &str, csrf_state: &str, secret: &
         return LinkIntent::Invalid;
     };
     // Constant-time comparison, as for the state cookies.
-    if link_intent_mac(user_id, session_version, slug, csrf_state, secret)
+    if intent_mac(purpose, user_id, session_version, slug, csrf_state, secret)
         .verify_slice(&signature)
         .is_err()
     {
@@ -600,7 +672,7 @@ pub struct SsoLinkStart {
 )]
 pub async fn start_link(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    SudoUser(user_id): SudoUser,
     headers: HeaderMap,
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -660,6 +732,272 @@ pub async fn start_link(
         ),
     );
     Ok(response)
+}
+
+// ── Re-authenticate through the provider (sudo mode) ─────────────
+
+/// Where the browser goes to sign in again.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SsoReauthenticateStart {
+    authorize_url: String,
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct SsoReauthenticateRequest {
+    /// A path on this site to come back to, such as the settings page that
+    /// asked; anything else is replaced by the security settings page.
+    #[serde(default)]
+    return_to: Option<String>,
+}
+
+/// How recently an OIDC provider must have signed the person in for the
+/// round trip to count, in seconds: the sudo window itself.
+const REAUTH_MAX_AGE_SECONDS: i64 = rg_core::auth::jwt::SUDO_TTL.num_seconds();
+
+/// The page a re-authentication returns to: a path on this site, never a URL
+/// that could send the browser somewhere else.
+fn safe_return_path(requested: Option<&str>) -> String {
+    const DEFAULT: &str = "/settings/security";
+    let Some(path) = requested.map(str::trim) else {
+        return DEFAULT.to_string();
+    };
+    let local = path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.starts_with("/\\")
+        && !path.starts_with("/api/")
+        && path.len() <= 512
+        && path
+            .chars()
+            .all(|ch| ch.is_ascii_graphic() && !matches!(ch, '\\' | '"' | '<' | '>'));
+    if local {
+        path.to_string()
+    } else {
+        DEFAULT.to_string()
+    }
+}
+
+/// POST /auth/sso/{slug}/reauthenticate
+///
+/// Sudo mode for an account whose password lives with its SSO provider
+/// (decision #10): the person signs in again through the provider, and the
+/// callback answers a session that starts in sudo mode — provided the
+/// identity that comes back is linked to the account that asked. An OIDC
+/// provider is asked for `max_age`, so it re-prompts rather than answering
+/// from a session of its own. A thief holding only this instance's session
+/// cookie cannot complete the round trip as the owner.
+#[utoipa::path(
+    post,
+    path = "/auth/sso/{slug}/reauthenticate",
+    tag = "SSO",
+    params(("slug" = String, Path, description = "SSO provider slug")),
+    request_body = SsoReauthenticateRequest,
+    responses(
+        (status = 200, description = "Provider authorization URL to send the browser to", body = SsoReauthenticateStart),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "A login session is required, or the provider is disabled"),
+        (status = 404, description = "SSO provider not found, or no identity from it is linked to this account"),
+    ),
+)]
+pub async fn reauthenticate(
+    State(state): State<AppState>,
+    SessionUser(user_id): SessionUser,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Json(body): Json<SsoReauthenticateRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let provider = resolve_usable_provider(&state, &slug).await?;
+    let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
+        .await
+        .map_err(AppError::from)?
+        .filter(|user| user.is_usable())
+        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
+    // Asked before the round trip, so the person is told now rather than after
+    // signing in at the provider; the callback asks again.
+    let linked = rg_db::ops::oauth_account_ops::find_by_user_id(&state.db, user.id)
+        .await
+        .map_err(AppError::from)?
+        .into_iter()
+        .any(|link| link.provider == provider.slug);
+    if !linked {
+        return Err(AppError::not_found(format!(
+            "no {} identity is linked to this account",
+            provider.name
+        )));
+    }
+
+    let base_url = get_api_base_url(&state, &headers)?;
+    let redirect_url = format!("{}/auth/sso/{}/callback", base_url, slug);
+    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
+    let config = provider_config(
+        &provider,
+        &enc_key,
+        redirect_url,
+        &state.oidc_transport_policy,
+    )?;
+    let (authorize_url, csrf_state, code_verifier) =
+        rg_core::auth::sso::oauth2_reauthenticate_url(&config, REAUTH_MAX_AGE_SECONDS)
+            .await
+            .map_err(|e| {
+                tracing::error!("SSO re-authentication authorize error: {}", e);
+                AppError::internal("SSO authorization failed")
+            })?;
+
+    let return_to = safe_return_path(body.return_to.as_deref());
+    let mut response = Json(SsoReauthenticateStart { authorize_url }).into_response();
+    set_state_cookie(
+        &mut response,
+        SSO_STATE_COOKIE,
+        &csrf_state,
+        &state.jwt_secret,
+    );
+    set_state_cookie(
+        &mut response,
+        SSO_VERIFIER_COOKIE,
+        &code_verifier,
+        &state.jwt_secret,
+    );
+    set_state_cookie(
+        &mut response,
+        SSO_RETURN_COOKIE,
+        &return_to,
+        &state.jwt_secret,
+    );
+    // One round trip, one purpose.
+    clear_state_cookie(&mut response, SSO_LINK_COOKIE);
+    append_set_cookie(
+        &mut response,
+        format!(
+            "{SSO_REAUTH_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600",
+            intent_cookie_value(
+                IntentPurpose::Reauthenticate,
+                user.id,
+                user.session_version,
+                &provider.slug,
+                &csrf_state,
+                &state.jwt_secret,
+            )
+        ),
+    );
+    Ok(response)
+}
+
+/// Finish a re-authentication: the identity that came back must be linked to
+/// the account that asked, under the session generation it asked with.
+async fn complete_reauthentication(
+    state: &AppState,
+    headers: &HeaderMap,
+    provider: &rg_db::entities::sso_provider::Model,
+    user_info: &rg_core::auth::sso::SsoIdentity,
+    requester: (i64, i64),
+) -> Result<axum::response::Response, SsoRefusal> {
+    let (user_id, session_version) = requester;
+    let db = &state.db;
+    let user = rg_db::ops::user_ops::find_by_id(db, user_id)
+        .await
+        .map_err(AppError::from)?
+        .filter(|user| user.is_usable() && user.session_version == session_version)
+        .ok_or_else(|| {
+            SsoRefusal::new(
+                SsoFailure::SessionEnded,
+                AppError::unauthorized(
+                    "the session that asked to confirm it has ended; sign in again",
+                ),
+            )
+        })?;
+    if user
+        .locked_until
+        .is_some_and(|locked_until| locked_until > chrono::Utc::now())
+    {
+        return Err(SsoRefusal::new(
+            SsoFailure::AccountLocked,
+            AppError::unauthorized("account is temporarily locked"),
+        ));
+    }
+    let link = rg_db::ops::oauth_account_ops::find_by_provider_and_uid(
+        db,
+        &provider.slug,
+        &user_info.provider_user_id,
+    )
+    .await
+    .map_err(AppError::from)?
+    .filter(|link| link.user_id == user.id)
+    .ok_or_else(|| {
+        SsoRefusal::new(
+            SsoFailure::LinkedElsewhere,
+            AppError::forbidden(format!(
+                "that {} identity is not the one linked to this account",
+                provider.name
+            )),
+        )
+    })?;
+    sign_in_through_link(db, link).await?;
+
+    let is_https = crate::public_url::request_is_https(state, headers);
+    let return_to = verify_state_cookie(headers, SSO_RETURN_COOKIE, &state.jwt_secret)
+        .map(|path| safe_return_path(Some(&path)))
+        .unwrap_or_else(|| safe_return_path(None));
+
+    // An account with a second factor proves it too, through the login's own
+    // second step, which answers a session in sudo mode.
+    if user.mfa_enabled {
+        let challenge = rg_core::auth::jwt::generate_mfa_challenge(
+            user.id,
+            &user.username,
+            &provider.slug,
+            &state.jwt_secret,
+        )
+        .map_err(AppError::from)?;
+        let target = format!(
+            "/login?sso_mfa_required=1&username={}",
+            encode_query_component(&user.username)
+        );
+        let mut redirect = Redirect::temporary(&target).into_response();
+        append_set_cookie(
+            &mut redirect,
+            crate::api::mfa::build_mfa_challenge_cookie(&challenge, is_https),
+        );
+        clear_round_trip_cookies(&mut redirect);
+        return Ok(redirect);
+    }
+
+    let token = rg_core::auth::jwt::generate_authenticated_token(
+        user.id,
+        &user.username,
+        user.session_version,
+        &state.jwt_secret,
+        7,
+    )
+    .map_err(AppError::from)?;
+    let actor = grant_actor(state, user.id).await?;
+    record_credential(
+        state,
+        &actor,
+        "user.sudo",
+        user.id,
+        headers,
+        serde_json::json!({
+            "method": "sso",
+            "provider": provider.slug,
+            "window_seconds": rg_core::auth::jwt::SUDO_TTL.num_seconds(),
+        }),
+    )
+    .await;
+
+    let mut redirect = Redirect::temporary(&return_to).into_response();
+    append_set_cookie(&mut redirect, build_auth_cookie(&token, is_https));
+    clear_round_trip_cookies(&mut redirect);
+    Ok(redirect)
+}
+
+fn clear_round_trip_cookies(response: &mut axum::response::Response) {
+    for cookie in [
+        SSO_STATE_COOKIE,
+        SSO_VERIFIER_COOKIE,
+        SSO_REAUTH_COOKIE,
+        SSO_RETURN_COOKIE,
+    ] {
+        clear_state_cookie(response, cookie);
+    }
 }
 
 /// One identity per provider per account.
@@ -824,7 +1162,8 @@ pub async fn callback(
     // a machine code that page turns into a sentence — never the JSON error
     // envelope, which nobody but a browser ever receives here
     // (card_0d7c54cae647).
-    let started_from_settings = link_cookie_raw(&headers).is_some();
+    let started_from_settings = link_cookie_raw(&headers).is_some()
+        || intent_cookie_raw(&headers, SSO_REAUTH_COOKIE).is_some();
     let page_slug = slug.clone();
     match callback_inner(state, headers, slug, query).await {
         Ok(response) => response,
@@ -1023,6 +1362,19 @@ async fn callback_inner(
             "this provider link request is invalid or has expired; start linking again from your security settings",
         ));
     }
+    let reauth_intent = read_intent(
+        IntentPurpose::Reauthenticate,
+        &headers,
+        &slug,
+        query.state.as_deref().unwrap_or_default(),
+        &state.jwt_secret,
+    );
+    if reauth_intent == LinkIntent::Invalid {
+        tracing::warn!(provider = %slug, "SSO re-authentication intent cookie did not verify");
+        return Err(state_invalid(
+            "this confirmation is invalid or has expired; start it again",
+        ));
+    }
 
     // ── Get provider config ──────────────────────────────────────
     let provider = resolve_usable_provider(&state, &slug)
@@ -1086,6 +1438,22 @@ async fn callback_inner(
             &user_info,
             (user_id, session_version),
             &headers,
+        )
+        .await;
+    }
+
+    // ── A re-authentication proves an existing link, nothing more ─
+    if let LinkIntent::Valid {
+        user_id,
+        session_version,
+    } = reauth_intent
+    {
+        return complete_reauthentication(
+            &state,
+            &headers,
+            &provider,
+            &user_info,
+            (user_id, session_version),
         )
         .await;
     }

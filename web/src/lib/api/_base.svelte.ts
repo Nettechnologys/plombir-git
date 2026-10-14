@@ -103,9 +103,49 @@ export function setToken(token: string | null) {
 /** Default request timeout: 30 seconds. */
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+/**
+ * The `reason` of a `403` whose session is fine but has to prove itself again:
+ * the routes that mint keys, tokens, passkeys and SSO links, and the MFA
+ * changes of an account without a password here, answer it to a session
+ * outside its ten-minute sudo window.
+ */
+export const SUDO_REQUIRED = 'sudo_required';
+
+/**
+ * Asks the person to prove it is them, stores the re-issued session and
+ * resolves `true`; resolves `false` when they cancel or leave for their SSO
+ * provider. Registered by the one `SudoPrompt` in the root layout.
+ */
+export type SudoPrompt = () => Promise<boolean>;
+
+let sudoPrompt: SudoPrompt | null = null;
+let pendingSudo: Promise<boolean> | null = null;
+
+export function setSudoPrompt(prompt: SudoPrompt | null): void {
+  sudoPrompt = prompt;
+}
+
+/**
+ * Run the registered prompt. Concurrent refusals share one prompt: two requests
+ * refused in the same tick must not stack two dialogs.
+ */
+export function requestSudo(): Promise<boolean> {
+  if (!sudoPrompt) return Promise.resolve(false);
+  if (!pendingSudo) {
+    pendingSudo = sudoPrompt().finally(() => {
+      pendingSudo = null;
+    });
+  }
+  return pendingSudo;
+}
+
+export function isSudoRequired(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.status === 403 && error.reason === SUDO_REQUIRED;
+}
+
 async function responseError(res: Response): Promise<ApiError> {
   const body: any = await res.json().catch(() => ({}));
-  // Backend error envelope is { error: { code, message, request_id } }.
+  // Backend error envelope is { error: { code, message, request_id, reason? } }.
   // Keep the older/plain shapes readable, but never discard the HTTP status:
   // consumers need it to separate a real absence from a failed read.
   const detail = body?.error && typeof body.error === 'object' ? body.error : null;
@@ -115,10 +155,18 @@ async function responseError(res: Response): Promise<ApiError> {
     res.status,
     typeof detail?.code === 'string' ? detail.code : null,
     typeof detail?.request_id === 'string' ? detail.request_id : null,
+    typeof detail?.reason === 'string' ? detail.reason : null,
   );
 }
 
-export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+/** `RequestInit` plus the knobs `request` reads itself. */
+type RequestOptions = RequestInit & {
+  timeoutMs?: number;
+  /** Set on the one retry a sudo step-up earns, so a second refusal is final. */
+  sudoRetried?: boolean;
+};
+
+export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -130,16 +178,23 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
 
   // M-3: Add timeout via AbortSignal to prevent indefinite hangs.
   // If the caller already provided a signal, respect it.
-  const timeoutMs = (options as { timeoutMs?: number }).timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  let signal = options.signal;
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, sudoRetried = false, ...init } = options;
+  let signal = init.signal;
   if (!signal && timeoutMs > 0) {
     signal = AbortSignal.timeout(timeoutMs);
   }
 
-  const res = await fetch(withApiBase(path), { ...options, headers, signal, credentials: 'include' });
+  const res = await fetch(withApiBase(path), { ...init, headers, signal, credentials: 'include' });
 
   if (!res.ok) {
-    throw await responseError(res);
+    const error = await responseError(res);
+    // A sudo refusal is a question, not an answer: ask once, then send the
+    // same request again on the re-issued session. Once — a second refusal
+    // means something other than the window and reaches the caller.
+    if (!sudoRetried && isSudoRequired(error) && (await requestSudo())) {
+      return request<T>(path, { ...options, sudoRetried: true });
+    }
+    throw error;
   }
 
   if (res.status === 204) {

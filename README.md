@@ -757,7 +757,9 @@ a registered runner polls without ever being given one.
 Registration mints the runner's identity, and it needs an **admin user's JWT** —
 not a runner token, which is what registration produces. Pass it as
 `--auth-token`, or as `PLOMBIR_GIT_AUTH_TOKEN` to keep the secret out of the
-process list:
+process list. A runner token outlives the session that registered it, so the
+JWT must be in sudo mode: a login from the last ten minutes, or the token
+`POST /api/v1/users/me/sudo` answers after confirming the password:
 
 ```bash
 PLOMBIR_GIT_AUTH_TOKEN="$ADMIN_JWT" plombir-git-runner register \

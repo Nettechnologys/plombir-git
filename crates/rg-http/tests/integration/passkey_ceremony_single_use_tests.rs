@@ -174,7 +174,7 @@ fn login_finish_spends_its_challenge_before_it_issues_anything() {
         "login_finish must still store the advanced signature counter",
     );
     let token_at = handler.call_at_or_panic(
-        "generate_token(",
+        "generate_authenticated_token(",
         "login_finish must still mint a session token",
     );
 
@@ -262,10 +262,10 @@ fn both_ceremonies_mint_a_fresh_nonce_when_they_start() {
 #[test]
 fn ceremony_guards_ignore_non_code_decoys_and_keep_live_calls() {
     const DECOYS: &str = r###"
-let normal = "finish_authentication( spend_ceremony( touch_and_update( generate_token(";
+let normal = "finish_authentication( spend_ceremony( touch_and_update( generate_authenticated_token(";
 let raw = r#"finish_registration( spend_ceremony( passkey_credential_ops::create("#;
 let bytes = b"spend_ceremony( new_ceremony_id()";
-// finish_authentication( spend_ceremony( touch_and_update( generate_token(
+// finish_authentication( spend_ceremony( touch_and_update( generate_authenticated_token(
 /* finish_registration( spend_ceremony( passkey_credential_ops::create( */
 "###;
 
@@ -275,7 +275,7 @@ let bytes = b"spend_ceremony( new_ceremony_id()";
         "finish_registration(",
         "spend_ceremony(",
         "touch_and_update(",
-        "generate_token(",
+        "generate_authenticated_token(",
         "passkey_credential_ops::create(",
     ] {
         assert_eq!(

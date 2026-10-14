@@ -68,25 +68,106 @@ impl FromRequestParts<crate::AppState> for SessionUser {
         parts: &mut Parts,
         state: &crate::AppState,
     ) -> Result<Self, Self::Rejection> {
-        let claims = extract_token_from_cookie(&parts.headers)
-            .and_then(|token| rg_core::auth::jwt::validate_token(&token, &state.jwt_secret))
-            .or_else(|| extract_bearer_claims(&parts.headers, &state.jwt_secret))
-            .ok_or_else(|| crate::error::AppError::unauthorized("authentication required"))?;
-        if claims.pat_id.is_some()
-            || parts
-                .extensions
-                .get::<crate::agent_scope::TokenGrant>()
-                .is_some()
-        {
-            return Err(crate::error::AppError::forbidden(
-                "credential creation requires a login session",
-            ));
-        }
-        let user_id = claims
-            .sub
-            .parse::<i64>()
-            .map_err(|_| crate::error::AppError::unauthorized("authentication required"))?;
+        let (user_id, _) = login_session(parts, state)?;
         Ok(SessionUser(user_id))
+    }
+}
+
+/// A login session together with the claims it was minted with, for the one
+/// handler that re-issues it (`POST /users/me/sudo`). Refuses a PAT as
+/// [`SessionUser`] does.
+#[derive(Debug, Clone)]
+pub struct LoginSession {
+    pub user_id: i64,
+    pub claims: Claims,
+}
+
+impl FromRequestParts<crate::AppState> for LoginSession {
+    type Rejection = crate::error::AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &crate::AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (user_id, claims) = login_session(parts, state)?;
+        Ok(LoginSession { user_id, claims })
+    }
+}
+
+/// The login session a request presents: its account and the claims it was
+/// minted with. A PAT is refused in either spelling — the `pat_id` claim of
+/// the translated token, or the `TokenGrant` the PAT middleware attached.
+fn login_session(
+    parts: &Parts,
+    state: &crate::AppState,
+) -> Result<(i64, Claims), crate::error::AppError> {
+    let claims = session_claims(&parts.headers, &state.jwt_secret)
+        .ok_or_else(|| crate::error::AppError::unauthorized("authentication required"))?;
+    if claims.pat_id.is_some()
+        || parts
+            .extensions
+            .get::<crate::agent_scope::TokenGrant>()
+            .is_some()
+    {
+        return Err(crate::error::AppError::forbidden(
+            "credential creation requires a login session",
+        ));
+    }
+    let user_id = claims
+        .sub
+        .parse::<i64>()
+        .map_err(|_| crate::error::AppError::unauthorized("authentication required"))?;
+    Ok((user_id, claims))
+}
+
+/// The session claims a request presents: the HttpOnly cookie first, then
+/// `Authorization: Bearer`. One reading for [`SessionUser`], [`SudoUser`] and
+/// `POST /users/me/sudo`, which re-issues exactly the token they read.
+pub(crate) fn session_claims(headers: &HeaderMap, jwt_secret: &str) -> Option<Claims> {
+    extract_token_from_cookie(headers)
+        .and_then(|token| rg_core::auth::jwt::validate_token(&token, jwt_secret))
+        .or_else(|| extract_bearer_claims(headers, jwt_secret))
+}
+
+/// A login session whose holder authenticated within
+/// [`rg_core::auth::jwt::SUDO_TTL`] — "sudo mode".
+///
+/// [`SessionUser`] answers which credential a request carries; this answers
+/// how recently its holder proved who they are. The routes that mint
+/// something outliving the session — SSH, deploy and signing keys, personal
+/// and bot tokens, passkeys, SSO links, runner tokens — take this, so a stolen
+/// session cannot turn itself into permanent access. A session outside the
+/// window is answered `403` with `reason: "sudo_required"`, which the web
+/// client turns into a prompt and one retry.
+///
+/// A session enters the window by a login that proved a secret here
+/// (password, directory password, passkey, second factor), by
+/// `POST /users/me/sudo`, or by re-authenticating through its SSO provider
+/// (`POST /auth/sso/{slug}/reauthenticate`).
+#[derive(Debug, Clone, Copy)]
+pub struct SudoUser(pub i64);
+
+impl FromRequestParts<crate::AppState> for SudoUser {
+    type Rejection = crate::error::AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &crate::AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (user_id, claims) = login_session(parts, state)?;
+        require_sudo(&claims)?;
+        Ok(SudoUser(user_id))
+    }
+}
+
+/// Refuse a session outside its sudo window.
+pub(crate) fn require_sudo(claims: &Claims) -> Result<(), crate::error::AppError> {
+    if claims.sudo_active_at(chrono::Utc::now().timestamp()) {
+        Ok(())
+    } else {
+        Err(crate::error::AppError::sudo_required(
+            "confirm it is you before creating credentials or changing the second factor",
+        ))
     }
 }
 

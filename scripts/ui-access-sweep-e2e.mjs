@@ -831,6 +831,29 @@ async function runScenarioForPersona({
   }
 }
 
+/**
+ * A persona's token with at least five minutes of sudo mode left.
+ *
+ * Registration answers a session in sudo mode for ten minutes, and the routes
+ * that mint keys, tokens, passkeys and runners refuse a session outside it
+ * (`reason: sudo_required`), which in the browser opens the confirmation
+ * prompt instead of the scenario's request. The sweep outlasts ten minutes, so
+ * a scenario starts from a session that confirmed itself recently — through
+ * the same `POST /users/me/sudo` the prompt calls.
+ */
+async function withSudoWindow(backendUrl, token) {
+  const [, payload] = token.split('.');
+  const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+  if ((claims.sudo_exp ?? 0) - Date.now() / 1000 > 300) return token;
+  const body = await jsonRequest(`${backendUrl}/api/v1/users/me/sudo`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify({ password: PASSWORD }),
+  });
+  if (!body?.token) throw new Error('sudo step-up returned no token');
+  return body.token;
+}
+
 export async function main() {
   const frontendUrl = requiredLoopbackUrl('STAND_FRONTEND_URL');
   const backendUrl = requiredLoopbackUrl('STAND_BACKEND_URL');
@@ -870,6 +893,7 @@ export async function main() {
       const personaOrder = scenario.personaOrder || REQUIRED_PERSONAS;
       for (const persona of personaOrder) {
         process.stdout.write(`  ${scenario.id} [${persona}] ... `);
+        tokens[persona] = await withSudoWindow(backendUrl, tokens[persona]);
         const responses = await runScenarioForPersona({
           scenario,
           runner,

@@ -107,6 +107,96 @@ async fn record_failed_mfa_attempt(
     locked
 }
 
+/// The second factor a request presents.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SecondFactor<'a> {
+    Totp(&'a str),
+    BackupCode(&'a str),
+}
+
+impl<'a> SecondFactor<'a> {
+    fn from_flag(code: &'a str, backup: bool) -> Self {
+        if backup {
+            Self::BackupCode(code)
+        } else {
+            Self::Totp(code)
+        }
+    }
+
+    /// The kind, for a journal entry.
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            Self::Totp(_) => "totp",
+            Self::BackupCode(_) => "backup_code",
+        }
+    }
+}
+
+/// Verify a second factor the way every door that asks for one does: a TOTP
+/// step is spent, a backup code is consumed, and a wrong one strikes the
+/// account-wide counter and is filed under `channel` in the login log.
+///
+/// The login's second step and `POST /users/me/sudo` both call this, so the
+/// accounting cannot drift between them. `metric` names the flow in the
+/// authentication metrics.
+pub(crate) async fn confirm_second_factor(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &rg_db::entities::user::Model,
+    factor: SecondFactor<'_>,
+    channel: &str,
+    metric: &'static str,
+) -> Result<(), AppError> {
+    let valid = match factor {
+        SecondFactor::BackupCode(code) => {
+            rg_db::ops::mfa_backup_code_ops::verify_and_consume(&state.db, user.id, code)
+                .await
+                .map_err(AppError::from)?
+        }
+        SecondFactor::Totp(code) => {
+            let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
+            let totp_secret = user
+                .totp_secret
+                .as_ref()
+                .ok_or_else(|| AppError::internal("MFA secret missing"))?;
+            let secret = rg_core::auth::encryption::decrypt(totp_secret, &enc_key)
+                .map_err(AppError::from)?;
+
+            // Two statements, not one check: a TOTP code is a pure function of the
+            // secret and the clock, so verifying it proves possession but consumes
+            // nothing. With `skew = 1` over a 30-second step, one intercepted code
+            // used to pass this gate for its whole ~90-second window, and two
+            // concurrent requests carrying it were answered two sessions. RFC 6238
+            // §5.2 requires the second attempt to be refused, which needs the step
+            // the code came from to be *spent* — see `consume_totp_step`.
+            //
+            // A replay therefore lands in the branch below, indistinguishable from a
+            // wrong code: same `401`, same lockout accounting. Telling the two apart
+            // would confirm to whoever replayed it that the code was genuine.
+            match rg_core::auth::totp::verify_code_step(&secret, code).map_err(AppError::from)? {
+                Some(step) => rg_db::ops::user_ops::consume_totp_step(&state.db, user.id, step)
+                    .await
+                    .map_err(AppError::from)?,
+                None => false,
+            }
+        }
+    };
+    if valid {
+        return Ok(());
+    }
+    let locked = record_failed_mfa_attempt(state, headers, user, channel).await;
+    crate::metrics::recorder::auth_event(metric, "failure");
+    crate::metrics::recorder::failed_login("mfa");
+    Err(AppError::unauthorized(if locked {
+        "account is temporarily locked"
+    } else {
+        match factor {
+            SecondFactor::Totp(_) => "invalid TOTP code",
+            SecondFactor::BackupCode(_) => "invalid backup code",
+        }
+    }))
+}
+
 async fn finalize_mfa_login(
     state: &AppState,
     headers: &HeaderMap,
@@ -426,73 +516,21 @@ pub async fn verify_mfa(
         return Err(AppError::bad_request("MFA not enabled"));
     }
 
-    if req.backup {
-        // Verify backup code
-        let valid =
-            rg_db::ops::mfa_backup_code_ops::verify_and_consume(&state.db, user.id, &req.code)
-                .await
-                .map_err(AppError::from)?;
-
-        if !valid {
-            let locked =
-                record_failed_mfa_attempt(&state, &headers, &user, &challenge.auth_provider).await;
-            crate::metrics::recorder::auth_event("mfa", "failure");
-            crate::metrics::recorder::failed_login("mfa");
-            return Err(AppError::unauthorized(if locked {
-                "account is temporarily locked"
-            } else {
-                "invalid backup code"
-            }));
-        }
-    } else {
-        // Verify TOTP code
-        let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
-        let totp_secret = user
-            .totp_secret
-            .as_ref()
-            .ok_or_else(|| AppError::internal("MFA secret missing"))?;
-
-        let secret =
-            rg_core::auth::encryption::decrypt(totp_secret, &enc_key).map_err(AppError::from)?;
-
-        // Two statements, not one check: a TOTP code is a pure function of the
-        // secret and the clock, so verifying it proves possession but consumes
-        // nothing. With `skew = 1` over a 30-second step, one intercepted code
-        // used to pass this gate for its whole ~90-second window, and two
-        // concurrent requests carrying it were answered two sessions. RFC 6238
-        // §5.2 requires the second attempt to be refused, which needs the step
-        // the code came from to be *spent* — see `consume_totp_step`.
-        //
-        // A replay therefore lands in the branch below, indistinguishable from a
-        // wrong code: same `401`, same lockout accounting. Telling the two apart
-        // would confirm to whoever replayed it that the code was genuine.
-        let valid = match rg_core::auth::totp::verify_code_step(&secret, &req.code)
-            .map_err(AppError::from)?
-        {
-            Some(step) => rg_db::ops::user_ops::consume_totp_step(&state.db, user.id, step)
-                .await
-                .map_err(AppError::from)?,
-            None => false,
-        };
-
-        if !valid {
-            let locked =
-                record_failed_mfa_attempt(&state, &headers, &user, &challenge.auth_provider).await;
-            crate::metrics::recorder::auth_event("mfa", "failure");
-            crate::metrics::recorder::failed_login("mfa");
-            return Err(AppError::unauthorized(if locked {
-                "account is temporarily locked"
-            } else {
-                "invalid TOTP code"
-            }));
-        }
-    }
+    confirm_second_factor(
+        &state,
+        &headers,
+        &user,
+        SecondFactor::from_flag(&req.code, req.backup),
+        &challenge.auth_provider,
+        "mfa",
+    )
+    .await?;
 
     let user = finalize_mfa_login(&state, &headers, user.id, &challenge.auth_provider).await?;
     crate::metrics::recorder::auth_event("mfa", "success");
 
     // Issue JWT
-    let token = rg_core::auth::jwt::generate_token(
+    let token = rg_core::auth::jwt::generate_authenticated_token(
         user.id,
         &user.username,
         user.session_version,
@@ -583,6 +621,13 @@ pub struct DisableMfaRequest {
 ///
 /// `channel` names the door in the attempt record; the strike itself is the
 /// account-wide one `POST /users/login`, SSH and `docker login` record.
+/// Whether the account has a password of its own here. An account created
+/// through an SSO provider or a directory has an empty hash: its password, if
+/// any, lives with the provider.
+pub(crate) fn has_local_password(user: &rg_db::entities::user::Model) -> bool {
+    !user.password_hash.is_empty()
+}
+
 pub(crate) async fn confirm_account_password(
     state: &AppState,
     user: &rg_db::entities::user::Model,
@@ -590,6 +635,19 @@ pub(crate) async fn confirm_account_password(
     channel: &'static str,
     headers: &HeaderMap,
 ) -> Result<(), AppError> {
+    // Neither of these is a guess, so neither strikes the lockout: a request
+    // with no password is malformed, and an account whose password lives with
+    // its identity provider has nothing here to compare it to (and used to be
+    // answered `500` for it, by a verifier handed an empty hash).
+    if !has_local_password(user) {
+        return Err(AppError::bad_request(format!(
+            "this account signs in through {} and has no password here",
+            user.auth_provider
+        )));
+    }
+    if password.is_empty() {
+        return Err(AppError::bad_request("the account password is required"));
+    }
     // `map_err(|_| unauthorized(...))` would answer "invalid password" to a
     // hash the verifier could not use and throw the reason away — the caller
     // here is already authenticated, so that tells a legitimate user their own

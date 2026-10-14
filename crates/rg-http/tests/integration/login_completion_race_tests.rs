@@ -353,7 +353,7 @@ fn every_http_login_path_finalizes_before_it_publishes_success() {
     let mfa = function_body("api/mfa.rs", "verify_mfa");
     assert!(
         code_position(&mfa, "finalize_mfa_login(", "MFA verify")
-            < code_position(&mfa, "generate_token(", "MFA verify"),
+            < code_position(&mfa, "generate_authenticated_token(", "MFA verify"),
         "MFA verification minted a session before lifecycle finalization"
     );
 

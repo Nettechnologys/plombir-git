@@ -222,7 +222,7 @@ fn login_finish_cannot_issue_a_token_without_the_counter_write() {
         .find("finalized_login_user(")
         .expect("login_finish must finalize the account lifecycle");
     let token_at = code
-        .find("generate_token(")
+        .find("generate_authenticated_token(")
         .expect("login_finish must still mint a session token");
     let login_log_at = code
         .find("login_log_ops::log_attempt(")
@@ -285,15 +285,19 @@ fn login_finish_cannot_issue_a_token_without_the_counter_write() {
 #[test]
 fn the_counter_write_guard_ignores_non_code_decoys_and_keeps_live_code() {
     const DECOYS: &str = r###"
-// passkey_to_json( touch_and_update( generate_token( map_err(AppError::from)?
+// passkey_to_json( touch_and_update( generate_authenticated_token( map_err(AppError::from)?
 /* passkey_to_json( touch_and_update( map_err(AppError::from)? */
-let normal = "passkey_to_json( touch_and_update( generate_token( map_err(AppError::from)?";
-let raw = r#"touch_and_update( generate_token( map_err(AppError::from)?"#;
-let bytes = b"generate_token( map_err(AppError::from)?";
+let normal = "passkey_to_json( touch_and_update( generate_authenticated_token( map_err(AppError::from)?";
+let raw = r#"touch_and_update( generate_authenticated_token( map_err(AppError::from)?"#;
+let bytes = b"generate_authenticated_token( map_err(AppError::from)?";
 "###;
 
     let decoys = code_view(DECOYS);
-    for call in ["passkey_to_json(", "touch_and_update(", "generate_token("] {
+    for call in [
+        "passkey_to_json(",
+        "touch_and_update(",
+        "generate_authenticated_token(",
+    ] {
         assert_eq!(
             decoys.find(call),
             None,

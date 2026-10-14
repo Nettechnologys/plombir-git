@@ -332,6 +332,28 @@ pub struct OAuth2TokenResponse {
 /// Generate OAuth2 / OIDC authorization URL with PKCE S256.
 /// Returns (auth_url, csrf_state, code_verifier).
 pub async fn oauth2_authorize_url(config: &SsoProviderConfig) -> Result<(String, String, String)> {
+    authorize_url(config, None).await
+}
+
+/// The authorization URL of a deliberate re-authentication (sudo mode).
+///
+/// An OIDC provider is asked for `max_age`, so it signs the person in again
+/// unless it did so within that many seconds, instead of answering from a
+/// session of its own that may be days old. A plain OAuth2 provider has no
+/// such parameter, so for it this is the ordinary URL: the round trip itself
+/// is the proof, and a thief holding only this instance's session cookie
+/// cannot make it.
+pub async fn oauth2_reauthenticate_url(
+    config: &SsoProviderConfig,
+    max_age_seconds: i64,
+) -> Result<(String, String, String)> {
+    authorize_url(config, Some(max_age_seconds)).await
+}
+
+async fn authorize_url(
+    config: &SsoProviderConfig,
+    max_age_seconds: Option<i64>,
+) -> Result<(String, String, String)> {
     // PKCE: generate code_verifier (43-128 URL-safe chars per RFC 7636)
     let code_verifier: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
@@ -358,7 +380,7 @@ pub async fn oauth2_authorize_url(config: &SsoProviderConfig) -> Result<(String,
             .ok_or_else(|| anyhow::anyhow!("no auth URL for provider: {}", config.slug))?,
     };
 
-    let url = format!(
+    let mut url = format!(
         "{}?client_id={}&redirect_uri={}&scope={}&state={}&response_type=code&code_challenge={}&code_challenge_method=S256",
         base_url,
         urlencoding::encode(&config.client_id),
@@ -367,6 +389,9 @@ pub async fn oauth2_authorize_url(config: &SsoProviderConfig) -> Result<(String,
         urlencoding::encode(&csrf_state),
         urlencoding::encode(&code_challenge),
     );
+    if let Some(max_age) = max_age_seconds.filter(|_| config.provider_type == "oidc") {
+        url.push_str(&format!("&max_age={max_age}"));
+    }
 
     Ok((url, csrf_state, code_verifier))
 }

@@ -15,6 +15,15 @@ This project records user-facing changes here. The format follows
 
 ### Changed
 
+- **Breaking:** creating an SSH, deploy or signing key, a personal or bot
+  token, a passkey, an SSO link or a runner token needs a session in sudo
+  mode: one that signed in within the last ten minutes or confirmed itself
+  through `POST /api/v1/users/me/sudo` (password, the directory password for
+  LDAP, plus the second factor when enrolled). An account without a password
+  here confirms by signing in again through its SSO provider
+  (`POST /api/v1/auth/sso/{slug}/reauthenticate`, which asks an OIDC provider
+  for `max_age=600`) or with a passkey. Otherwise these routes answer `403`
+  with `reason: "sudo_required"`; the web UI asks and retries on its own.
 - **Breaking:** the `sub` claim of CI OIDC tokens is now
   `repo:<owner>/<name>:ref:<ref>`, or `repo:<owner>/<name>:environment:<env>`
   for a job with an environment. Trust policies that match the old

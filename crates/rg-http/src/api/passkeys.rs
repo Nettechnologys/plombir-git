@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{AuthUser, SessionUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{AuthUser, SudoUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 use rg_core::auth::webauthn as wa;
@@ -487,7 +487,7 @@ async fn load_passkeys_for_rp(
 )]
 pub async fn register_start(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    SudoUser(user_id): SudoUser,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
@@ -562,7 +562,7 @@ pub struct RegisterFinishRequest {
 )]
 pub async fn register_finish(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    SudoUser(user_id): SudoUser,
     headers: HeaderMap,
     Json(req): Json<RegisterFinishRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1068,7 +1068,7 @@ pub async fn login_finish(
         tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to record passkey login attempt");
     }
 
-    let token = rg_core::auth::jwt::generate_token(
+    let token = rg_core::auth::jwt::generate_authenticated_token(
         user.id,
         &user.username,
         user.session_version,

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_grant};
-use crate::api::auth::SessionUser;
+use crate::api::auth::SudoUser;
 use crate::api::repo_access::RepoAdmin;
 use crate::{error::AppError, AppState};
 
@@ -123,7 +123,7 @@ pub async fn create_deploy_key(
     State(state): State<AppState>,
     Path((owner, _)): Path<(String, String)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
-    SessionUser(_session_user): SessionUser,
+    SudoUser(_session_user): SudoUser,
     headers: HeaderMap,
     Json(body): Json<CreateDeployKeyRequest>,
 ) -> impl IntoResponse {

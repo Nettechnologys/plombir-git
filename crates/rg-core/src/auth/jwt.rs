@@ -34,6 +34,19 @@ pub struct Claims {
     /// (card_e4e177acd095).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pat_id: Option<i64>,
+    /// Until when (Unix seconds) this session counts as freshly
+    /// authenticated — "sudo mode". `None` for a session whose holder has not
+    /// proved anything since it was minted.
+    ///
+    /// Seven days is the right length for reading and writing code and the
+    /// wrong one for minting a credential that outlives the session: a stolen
+    /// session that can add an SSH key, a token or a passkey is permanent
+    /// access, not seven days of it. Those routes demand this window, and it
+    /// travels in the token so a logout or a password change, which move
+    /// `session_version` on, revoke it together with the session. A token
+    /// minted before the claim existed decodes as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sudo_exp: Option<i64>,
     /// Issued-at (Unix timestamp seconds).
     pub iat: i64,
     /// Expiry (Unix timestamp seconds).
@@ -49,6 +62,21 @@ pub struct MfaChallengeClaims {
     pub exp: i64,
 }
 
+/// How long a fresh authentication keeps a session in sudo mode.
+///
+/// Long enough to add a key, mint a token and register a passkey in one
+/// sitting; short enough that a session stolen afterwards is an ordinary one
+/// again before it is likely to be used. Counted from the proof, never
+/// extended by use.
+pub const SUDO_TTL: Duration = Duration::minutes(10);
+
+impl Claims {
+    /// Whether this session is in sudo mode at `now` (Unix seconds).
+    pub fn sudo_active_at(&self, now: i64) -> bool {
+        self.sudo_exp.is_some_and(|until| until > now)
+    }
+}
+
 fn mfa_challenge_key(secret: &str) -> String {
     format!("plombir-git:mfa-challenge:{secret}")
 }
@@ -61,7 +89,38 @@ pub fn generate_token(
     secret: &str,
     ttl_days: i64,
 ) -> Result<String> {
-    encode_claims(user_id, username, session_version, None, secret, ttl_days)
+    encode_claims(
+        user_id,
+        username,
+        session_version,
+        None,
+        false,
+        secret,
+        ttl_days,
+    )
+}
+
+/// The session a login answers when the holder has just proved a secret here
+/// — the password, the directory password, a passkey, a second factor — or
+/// re-authenticated through their provider on purpose: it starts in sudo mode
+/// for [`SUDO_TTL`], so the credential they came to create does not ask for
+/// the same proof twice.
+pub fn generate_authenticated_token(
+    user_id: i64,
+    username: &str,
+    session_version: i64,
+    secret: &str,
+    ttl_days: i64,
+) -> Result<String> {
+    encode_claims(
+        user_id,
+        username,
+        session_version,
+        None,
+        true,
+        secret,
+        ttl_days,
+    )
 }
 
 /// Generate the synthetic session a presented personal access token is
@@ -82,6 +141,7 @@ pub fn generate_token_for_pat(
         username,
         session_version,
         Some(pat_id),
+        false,
         secret,
         ttl_days,
     )
@@ -92,6 +152,7 @@ fn encode_claims(
     username: &str,
     session_version: i64,
     pat_id: Option<i64>,
+    sudo: bool,
     secret: &str,
     ttl_days: i64,
 ) -> Result<String> {
@@ -102,6 +163,7 @@ fn encode_claims(
         username: username.to_string(),
         session_version,
         pat_id,
+        sudo_exp: sudo.then(|| (now + SUDO_TTL).timestamp().min(exp.timestamp())),
         iat: now.timestamp(),
         exp: exp.timestamp(),
     };
@@ -111,6 +173,35 @@ fn encode_claims(
         &EncodingKey::from_secret(secret.as_bytes()),
     )
     .context("jwt encode failed")
+}
+
+/// Re-issue a session in sudo mode: the same subject, generation and expiry,
+/// with the window starting now.
+///
+/// The expiry is kept on purpose: proving the password again is not a new
+/// login, and a session that was going to end tomorrow still does. The window
+/// is clamped to it, and a PAT's synthetic session is refused — the step-up
+/// exists to tell a person at the keyboard from a delegated token.
+pub fn reissue_with_sudo(claims: &Claims, secret: &str) -> Result<String> {
+    if claims.pat_id.is_some() {
+        anyhow::bail!("a personal access token cannot enter sudo mode");
+    }
+    let now = Utc::now();
+    let reissued = Claims {
+        sub: claims.sub.clone(),
+        username: claims.username.clone(),
+        session_version: claims.session_version,
+        pat_id: None,
+        sudo_exp: Some((now + SUDO_TTL).timestamp().min(claims.exp)),
+        iat: now.timestamp(),
+        exp: claims.exp,
+    };
+    encode(
+        &Header::default(),
+        &reissued,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .context("sudo jwt encode failed")
 }
 
 /// Validate and decode a JWT. Returns `None` if invalid/expired.
@@ -222,6 +313,65 @@ mod tests {
     fn test_malformed_token_fails() {
         assert!(validate_token("aaa.bbb", "secret").is_none());
         assert!(validate_token("aaa.bbb.ccc.ddd", "secret").is_none());
+    }
+
+    /// A plain session carries no window, an authenticated login a bounded
+    /// one, and a re-issue moves nothing but the window.
+    #[test]
+    fn sudo_windows_are_bounded_and_reissue_keeps_the_session() {
+        let secret = "sudo-secret";
+        let plain =
+            validate_token(&generate_token(42, "alice", 3, secret, 7).unwrap(), secret).unwrap();
+        assert_eq!(plain.sudo_exp, None);
+        assert!(!plain.sudo_active_at(Utc::now().timestamp()));
+
+        let fresh = validate_token(
+            &generate_authenticated_token(42, "alice", 3, secret, 7).unwrap(),
+            secret,
+        )
+        .unwrap();
+        let now = Utc::now().timestamp();
+        assert!(fresh.sudo_active_at(now));
+        assert!(fresh.sudo_exp.unwrap() <= now + SUDO_TTL.num_seconds());
+
+        let elevated = validate_token(&reissue_with_sudo(&plain, secret).unwrap(), secret).unwrap();
+        assert_eq!(
+            (
+                elevated.sub.as_str(),
+                elevated.session_version,
+                elevated.exp
+            ),
+            ("42", 3, plain.exp),
+            "stepping up is not a new login"
+        );
+        let until = elevated.sudo_exp.unwrap();
+        assert!(elevated.sudo_active_at(until - 1));
+        assert!(!elevated.sudo_active_at(until), "the window is half-open");
+    }
+
+    /// The window never outlives the session, and a PAT cannot step up.
+    #[test]
+    fn sudo_is_clamped_to_the_session_and_refused_to_a_pat() {
+        let secret = "sudo-secret";
+        let short = Claims {
+            sub: "1".into(),
+            username: "short".into(),
+            session_version: 0,
+            pat_id: None,
+            sudo_exp: None,
+            iat: Utc::now().timestamp(),
+            exp: Utc::now().timestamp() + 60,
+        };
+        let elevated = validate_token(&reissue_with_sudo(&short, secret).unwrap(), secret).unwrap();
+        assert_eq!(elevated.sudo_exp, Some(short.exp));
+
+        let pat = validate_token(
+            &generate_token_for_pat(7, "bot", 0, 99, secret, 1).unwrap(),
+            secret,
+        )
+        .unwrap();
+        assert!(reissue_with_sudo(&pat, secret).is_err());
+        assert_eq!(pat.sudo_exp, None);
     }
 
     #[test]

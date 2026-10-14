@@ -489,6 +489,17 @@
     },
     {
       "method": "POST",
+      "url": "/api/v1/users/me/sudo",
+      "access": "User",
+      "handler": "api::sudo::step_up",
+      "testedIn": [
+        "rust",
+        "smoke"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "POST",
       "url": "/api/v1/users/password/initial",
       "access": "Public",
       "handler": "api::account::set_initial_password",
@@ -952,6 +963,16 @@
         "web"
       ],
       "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/auth/sso/{slug}/reauthenticate",
+      "access": "User",
+      "handler": "api::sso::reauthenticate",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
     },
     {
       "method": "DELETE",

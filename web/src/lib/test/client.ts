@@ -97,6 +97,10 @@ export const connectNotificationWebSocket = vi.fn();
 export const getToken = vi.fn(() => 'test-token');
 export const isPasskeySupported = vi.fn(() => true);
 export const setToken = vi.fn();
+// The root layout mounts the sudo prompt, which registers itself here.
+export const setSudoPrompt = vi.fn();
+export const requestSudo = vi.fn(async () => false);
+export const isSudoRequired = vi.fn(() => false);
 export const API_BASE = '/api/v1';
 
 export function resetTestClient(): void {
@@ -111,9 +115,14 @@ export function resetTestClient(): void {
 		getToken,
 		isPasskeySupported,
 		setToken,
+		setSudoPrompt,
+		requestSudo,
+		isSudoRequired,
 	]) {
 		fn.mockReset();
 	}
+	requestSudo.mockResolvedValue(false);
+	isSudoRequired.mockReturnValue(false);
 	getToken.mockReturnValue('test-token');
 	isPasskeySupported.mockReturnValue(true);
 }

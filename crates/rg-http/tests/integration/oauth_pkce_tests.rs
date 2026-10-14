@@ -886,3 +886,204 @@ async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_t
     app_server.abort();
     oidc_server.abort();
 }
+
+/// Decision #10: an account whose password lives with its SSO provider steps
+/// up by signing in through that provider again. A plain SSO session cannot
+/// mint a key; the re-authentication round trip asks an OIDC provider for
+/// `max_age`, proves the identity linked to the account that asked, and comes
+/// back in sudo mode to a path on this site only.
+#[tokio::test]
+async fn an_sso_account_steps_up_by_signing_in_again_through_its_provider() {
+    let oidc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let oidc_addr = oidc_listener.local_addr().unwrap().to_string();
+    let oidc_base = format!("http://{oidc_addr}");
+    let oidc_app = Router::new()
+        .route("/.well-known/openid-configuration", get(discovery))
+        .route("/token", post(token))
+        .route("/userinfo", get(userinfo))
+        .with_state(MockOidcState {
+            base_url: oidc_base.clone(),
+            token_calls: Arc::new(AtomicUsize::new(0)),
+            last_verifier: Arc::new(Mutex::new(None)),
+        });
+    tokio::spawn(async move {
+        axum::serve(oidc_listener, oidc_app).await.unwrap();
+    });
+    crate::common::wait_for_listener(&oidc_addr).await;
+
+    let (db, app_dir) = setup_test_db().await;
+    let repo_root = app_dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    rg_db::ops::sso_provider_ops::create(
+        &db,
+        rg_db::ops::sso_provider_ops::SsoProviderInput {
+            name: "Mock OIDC",
+            slug: "oidc-sudo",
+            provider_type: "oidc",
+            client_id: Some("client-id"),
+            discovery_url: Some(&format!("{oidc_base}/.well-known/openid-configuration")),
+            scopes: Some("openid profile email"),
+            enabled: true,
+            auto_provision: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let app = rg_http::create_router_for_test(oidc_test_state(db.clone(), repo_root, &oidc_base));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let base = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _app_dir = app_dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    crate::common::wait_for_listener(&addr).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let ssh_key = |token: String| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let response = client
+                .post(format!("{base}/api/v1/users/ssh-keys"))
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "title": "laptop",
+                    "key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC sso@plombir-git",
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            (
+                status,
+                response
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_default(),
+            )
+        }
+    };
+
+    // An ordinary sign-in through the provider: a session, not sudo mode.
+    let authorize = client
+        .get(format!("{base}/api/v1/auth/sso/oidc-sudo"))
+        .send()
+        .await
+        .unwrap();
+    let state_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_state");
+    let verifier_cookie = cookie_pair(authorize.headers(), "plombir_git_sso_code_verifier");
+    let callback = client
+        .get(format!(
+            "{base}/api/v1/auth/sso/oidc-sudo/callback?code=valid-code&state={}",
+            signed_cookie_value(&state_cookie)
+        ))
+        .header(header::COOKIE, format!("{state_cookie}; {verifier_cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(callback.status().is_redirection(), "{}", callback.status());
+    let session = cookie_pair(callback.headers(), "plombir_git_token")
+        .split_once('=')
+        .unwrap()
+        .1
+        .to_string();
+    let (status, body) = ssh_key(session.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["reason"], "sudo_required");
+
+    // No password here to confirm with.
+    let no_password = client
+        .post(format!("{base}/api/v1/users/me/sudo"))
+        .bearer_auth(&session)
+        .json(&serde_json::json!({ "password": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_password.status(), StatusCode::BAD_REQUEST);
+
+    // The re-authentication round trip.
+    let start = |return_to: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        let session = session.clone();
+        async move {
+            client
+                .post(format!("{base}/api/v1/auth/sso/oidc-sudo/reauthenticate"))
+                .bearer_auth(session)
+                .json(&serde_json::json!({ "return_to": return_to }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let started = start("/settings/keys").await;
+    assert_eq!(started.status(), StatusCode::OK);
+    let cookies = [
+        "plombir_git_sso_state",
+        "plombir_git_sso_code_verifier",
+        "plombir_git_sso_reauth",
+        "plombir_git_sso_return",
+    ]
+    .map(|name| cookie_pair(started.headers(), name));
+    let state = signed_cookie_value(&cookies[0]);
+    let authorize_url = started.json::<serde_json::Value>().await.unwrap()["authorize_url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        authorize_url.contains("&max_age=600"),
+        "an OIDC re-authentication must ask the provider for max_age: {authorize_url}"
+    );
+    let returned = client
+        .get(format!(
+            "{base}/api/v1/auth/sso/oidc-sudo/callback?code=valid-code&state={state}"
+        ))
+        .header(header::COOKIE, cookies.join("; "))
+        .send()
+        .await
+        .unwrap();
+    assert!(returned.status().is_redirection(), "{}", returned.status());
+    assert_eq!(returned.headers()[header::LOCATION], "/settings/keys");
+    let elevated = cookie_pair(returned.headers(), "plombir_git_token")
+        .split_once('=')
+        .unwrap()
+        .1
+        .to_string();
+    let (status, body) = ssh_key(elevated).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A return path off this site is replaced.
+    let started = start("https://evil.example/").await;
+    let cookies = [
+        "plombir_git_sso_state",
+        "plombir_git_sso_code_verifier",
+        "plombir_git_sso_reauth",
+        "plombir_git_sso_return",
+    ]
+    .map(|name| cookie_pair(started.headers(), name));
+    let returned = client
+        .get(format!(
+            "{base}/api/v1/auth/sso/oidc-sudo/callback?code=valid-code&state={}",
+            signed_cookie_value(&cookies[0])
+        ))
+        .header(header::COOKIE, cookies.join("; "))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(returned.headers()[header::LOCATION], "/settings/security");
+
+    // An account with no identity from this provider has nothing to re-prove.
+    let (local, _) = crate::common::register_full(&base, "local_user", "local@example.com").await;
+    let refused = client
+        .post(format!("{base}/api/v1/auth/sso/oidc-sudo/reauthenticate"))
+        .bearer_auth(local)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+}

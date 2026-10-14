@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::access_audit::{grant_actor, record_instance_credential, InstanceResource};
 use crate::api::admin::InstanceAdmin;
-use crate::api::auth::SessionUser;
+use crate::api::auth::SudoUser;
 use crate::error::AppError;
 use crate::AppState;
 use utoipa::{IntoParams, ToSchema};
@@ -204,7 +204,7 @@ pub async fn get_runner_admin(
 pub async fn register(
     State(state): State<AppState>,
     InstanceAdmin(actor_id): InstanceAdmin,
-    SessionUser(_session_user): SessionUser,
+    SudoUser(_session_user): SudoUser,
     headers: HeaderMap,
     Json(req): Json<RegisterRunnerRequest>,
 ) -> impl IntoResponse {

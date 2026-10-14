@@ -1165,6 +1165,7 @@ pub(crate) fn build_all_routes(
         .patch(User, "/users/me", api::account::update_profile)
         .delete(User, "/users/me", api::account::delete_account)
         .put(User, "/users/me/password", api::account::change_password)
+        .post_with(User, "/users/me/sudo", api::sudo::step_up, &auth_rl)
         .post_with(
             Public,
             "/users/password/initial",
@@ -1303,6 +1304,12 @@ pub(crate) fn build_all_routes(
         // The only door through which an identity joins an account that
         // already exists — from inside that account's session.
         .post(User, "/auth/sso/{slug}/link", api::sso::start_link)
+        // Sudo mode for an account whose password lives with its provider.
+        .post(
+            User,
+            "/auth/sso/{slug}/reauthenticate",
+            api::sso::reauthenticate,
+        )
         .delete(
             User,
             "/auth/sso/{slug}/unlink",

@@ -1046,3 +1046,57 @@ async fn an_unreachable_directory_holds_registration_closed() {
     );
     assert!(harness.account_named("newcomer").await.is_none());
 }
+
+/// Decision #10: an LDAP account steps up by binding against its directory
+/// again. The right password re-issues the session in sudo mode; a wrong one
+/// is a strike, an empty one is not.
+#[tokio::test]
+async fn an_ldap_account_steps_up_with_its_directory_password() {
+    let harness = Harness::start(Behaviour::Healthy).await;
+    let user_id = harness.user_id.unwrap();
+    let stale =
+        rg_core::auth::jwt::generate_token(user_id, USERNAME, 0, "test-secret-key", 7).unwrap();
+    let sudo = |password: &'static str| {
+        let request = harness
+            .client
+            .post(format!("{}/api/v1/users/me/sudo", harness.base))
+            .bearer_auth(&stale)
+            .json(&serde_json::json!({ "password": password }));
+        async move { request.send().await.unwrap() }
+    };
+
+    let empty = sudo("").await;
+    assert_eq!(empty.status().as_u16(), 400);
+    assert_eq!(
+        harness.login_attempts().await,
+        0,
+        "an empty password is not a guess"
+    );
+
+    let stepped = sudo(PASSWORD).await;
+    assert_eq!(stepped.status().as_u16(), 200);
+    let token = stepped.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let claims = rg_core::auth::jwt::validate_token(&token, "test-secret-key").unwrap();
+    assert!(claims.sudo_active_at(chrono::Utc::now().timestamp()));
+}
+
+#[tokio::test]
+async fn a_wrong_directory_password_on_sudo_is_a_strike() {
+    let harness = Harness::start(Behaviour::WrongPassword).await;
+    let user_id = harness.user_id.unwrap();
+    let stale =
+        rg_core::auth::jwt::generate_token(user_id, USERNAME, 0, "test-secret-key", 7).unwrap();
+    let response = harness
+        .client
+        .post(format!("{}/api/v1/users/me/sudo", harness.base))
+        .bearer_auth(&stale)
+        .json(&serde_json::json!({ "password": "not-it" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+    assert_eq!(harness.login_attempts().await, 1);
+}

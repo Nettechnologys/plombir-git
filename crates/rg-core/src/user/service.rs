@@ -243,7 +243,14 @@ pub async fn register(
         .context("failed to hash password")?;
 
     let user = create_registered_account(db, permit, username, email, password_hash, false).await?;
-    let token = jwt::generate_token(user.id, &user.username, user.session_version, jwt_secret, 7)?;
+    // The password was proved a moment ago by choosing it.
+    let token = jwt::generate_authenticated_token(
+        user.id,
+        &user.username,
+        user.session_version,
+        jwt_secret,
+        7,
+    )?;
 
     Ok(AuthResponse {
         token,

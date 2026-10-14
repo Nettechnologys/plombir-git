@@ -2005,6 +2005,24 @@
     "find_imports": "Import repositories"
   },
   "account_security": {
+    "sudo": {
+      "title": "Confirm it is you",
+      "description": "Creating a credential or changing your second factor needs your password again. You will not be asked again for ten minutes.",
+      "provider_description": "Your account signs in through {provider}. Sign in there again to continue; you will come back to this page.",
+      "sign_in_again": "Sign in again with {provider}",
+      "use_passkey": "Use a passkey instead",
+      "password": "Password",
+      "directory_password": "Directory password",
+      "code": "Authenticator code",
+      "backup_code": "Backup code",
+      "use_code": "Use an authenticator code",
+      "use_backup_code": "Use a backup code",
+      "confirm": "Confirm",
+      "confirming": "Confirming…",
+      "password_required": "Enter your password.",
+      "code_required": "Enter the code from your authenticator or a backup code.",
+      "failed": "Could not confirm it is you."
+    },
     "title": "Security",
     "description": "Manage account protections for web login and Git/API access.",
     "status_unknown": "Unknown",

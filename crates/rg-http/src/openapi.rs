@@ -279,6 +279,7 @@ pub(crate) fn stamp_security(
         // Users
         crate::api::users::register,
         crate::api::users::login,
+        crate::api::sudo::step_up,
         crate::api::users::logout,
         crate::api::users::me,
         crate::api::users::list_tokens,
@@ -334,6 +335,7 @@ pub(crate) fn stamp_security(
         crate::api::sso::authorize,
         crate::api::sso::callback,
         crate::api::sso::start_link,
+        crate::api::sso::reauthenticate,
         crate::api::sso::unlink_oauth_account,
         crate::api::sso::list_my_links,
         // Repositories
@@ -691,6 +693,7 @@ pub(crate) fn stamp_security(
             crate::api::users::RegisterRequest,
             crate::api::users::LoginRequest,
             crate::api::users::AuthResponse,
+            crate::api::sudo::SudoRequest,
             crate::api::users::UserProfile,
             crate::api::users::CreateTokenRequest,
             crate::api::bots::TokenNarrowing,
@@ -741,6 +744,8 @@ pub(crate) fn stamp_security(
             crate::api::sso::SsoProviderInfo,
             crate::api::sso::SsoLinkInfo,
             crate::api::sso::SsoLinkStart,
+            crate::api::sso::SsoReauthenticateStart,
+            crate::api::sso::SsoReauthenticateRequest,
             crate::api::webhooks_external::ExternalCiWebhook,
             crate::api::webhooks_external::ExternalCiResponse,
             crate::api::audit::AuditLogEntry,

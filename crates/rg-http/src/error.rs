@@ -63,7 +63,15 @@ pub struct ErrorBody {
     /// Request ID (injected by request-id middleware for error responses).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// A machine-readable qualifier for a refusal the client can act on
+    /// rather than only show: `sudo_required` says the session is fine and
+    /// has to prove itself again first. Absent everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
 }
+
+/// The `reason` of a [`AppError::SudoRequired`] refusal.
+pub const SUDO_REQUIRED_REASON: &str = "sudo_required";
 
 /// Unified application error type for all HTTP handlers.
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +84,11 @@ pub enum AppError {
     Unauthorized(String),
     #[error("{0}")]
     Forbidden(String),
+    /// 403 with `reason: "sudo_required"` — a login session that has not
+    /// re-authenticated within `rg_core::auth::jwt::SUDO_TTL`, on a route that
+    /// mints something outliving it. The client asks for the proof and retries.
+    #[error("{0}")]
+    SudoRequired(String),
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
@@ -112,7 +125,7 @@ impl AppError {
             Self::NotFound(_) => "NOT_FOUND",
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Unauthorized(_) => "UNAUTHORIZED",
-            Self::Forbidden(_) => "FORBIDDEN",
+            Self::Forbidden(_) | Self::SudoRequired(_) => "FORBIDDEN",
             Self::Conflict(_) => "CONFLICT",
             Self::Gone(_) => "GONE",
             Self::TooManyRequests(_) => "RATE_LIMITED",
@@ -130,7 +143,7 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
-            Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::Forbidden(_) | Self::SudoRequired(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Gone(_) => StatusCode::GONE,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
@@ -177,6 +190,7 @@ impl IntoResponse for AppError {
                 code,
                 message: sanitized_message,
                 request_id: None,
+                reason: matches!(self, Self::SudoRequired(_)).then_some(SUDO_REQUIRED_REASON),
             },
         };
         (status, axum::Json(body)).into_response()
@@ -284,6 +298,7 @@ pub(crate) async fn api_rejection_envelope(response: Response) -> Response {
             code,
             message,
             request_id: None,
+            reason: None,
         },
     })
     .expect("ErrorResponse contains only serializable primitives");
@@ -541,6 +556,10 @@ impl AppError {
 
     pub fn forbidden(msg: impl std::fmt::Display) -> Self {
         Self::Forbidden(msg.to_string())
+    }
+
+    pub fn sudo_required(msg: impl std::fmt::Display) -> Self {
+        Self::SudoRequired(msg.to_string())
     }
 
     pub fn conflict(msg: impl std::fmt::Display) -> Self {

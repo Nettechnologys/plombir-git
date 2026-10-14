@@ -17,7 +17,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::auth::{AuthUser, SessionUser};
+use super::auth::{AuthUser, SudoUser};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -499,7 +499,7 @@ pub async fn list_bot_tokens(
 )]
 pub async fn create_bot_token(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    SudoUser(user_id): SudoUser,
     headers: HeaderMap,
     Path(bot): Path<String>,
     Json(body): Json<CreateBotTokenRequest>,
