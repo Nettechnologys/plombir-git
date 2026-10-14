@@ -65,6 +65,7 @@ pub mod task_tracker; // Drain-aware tracker for detached fire-and-forget delive
 pub mod yaml; // The one parser entry point for untrusted YAML (budgets, alias limits)
 
 pub mod blocking; // Keep synchronous Git/IO phases off Tokio's worker threads
+pub mod clone_budget; // Bytes one outbound clone or mirror fetch may write
 pub(crate) mod committed_blob; // Size a committed file before it is read whole into memory
 pub(crate) mod db_retry; // One retry policy for the bounded database-write loops
 pub mod error; // Domain error types (CoreError)

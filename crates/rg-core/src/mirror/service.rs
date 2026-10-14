@@ -1299,14 +1299,44 @@ fn run_git_clone_mirror(
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let invocation = remote.bind_invocation(credential_invocation(credentials))?;
     let destination = path.to_string_lossy();
-    invocation
-        .run(
+    let budget = transport_policy.clone_budget();
+    let cloned = invocation
+        .run_under_disk_budget(
             git,
             &["clone", "--mirror", remote.url(), &destination],
             None,
-        )?
-        .ensure_success()
-        .context("git clone --mirror")
+            budget.for_clone(path).as_ref(),
+        )
+        .and_then(|output| output.ensure_success().context("git clone --mirror"));
+    if let Err(error) = cloned {
+        // git removes its own destination when it fails on its own, but not
+        // when the deadline or the disk budget kills it: then the directory
+        // stays, `HEAD` already in it, and the next pass reads that as an
+        // existing mirror and fetches into the partial copy instead of
+        // cloning. Whatever is there now is what this attempt left.
+        discard_mirror_clone(path);
+        return Err(budget.explain(error));
+    }
+    Ok(())
+}
+
+/// Remove a mirror's clone after a pass that cannot leave it usable.
+///
+/// The clone is a working copy, not what the repository serves — the served
+/// refs are published from it only after a pass succeeds — so dropping it costs
+/// one fresh clone on the next pass, under the clone budget again. A failure to
+/// remove is logged, not propagated: the pass already failed for a reason the
+/// row is about to record, and that reason is the one worth reading.
+fn discard_mirror_clone(path: &Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "the partial mirror clone could not be removed; the next pass may fetch into it"
+        ),
+    }
 }
 
 /// Refresh an existing mirror clone from `url`.
@@ -1346,10 +1376,27 @@ fn run_git_remote_update(
         )?
         .ensure_success()
         .context("git remote set-url origin")?;
+    // The budget is a growth allowance: what the mirror holds now plus the
+    // ceiling. Only the first clone used to be bounded, so an upstream could
+    // stay small for that one and grow without limit on every sync after it.
+    let budget = transport_policy.clone_budget();
     invocation
-        .run(git, &["remote", "update", "--prune"], Some(path))?
-        .ensure_success()
-        .context("git remote update")
+        .run_under_disk_budget(
+            git,
+            &["remote", "update", "--prune"],
+            Some(path),
+            budget.for_fetch(path)?.as_ref(),
+        )
+        .and_then(|output| output.ensure_success().context("git remote update"))
+        .map_err(|error| {
+            if crate::clone_budget::CloneBudget::refused(&error) {
+                // The killed fetch leaves its packs behind, and the next
+                // pass would count them into its starting size — every
+                // refused sync would raise the ceiling it is held to.
+                discard_mirror_clone(path);
+            }
+            budget.explain(error)
+        })
 }
 
 #[cfg(test)]
@@ -2199,5 +2246,144 @@ mod tests {
             !parent.exists(),
             "the sink prepared its destination before rejecting the transport"
         );
+    }
+
+    /// The clone budget tests clone from a bare repository on local disk over
+    /// `file://`: the budget is about bytes on this server's disk, and the
+    /// transport that brings them does not change what the directory holds.
+    mod clone_budget {
+        use super::*;
+
+        fn git(dir: &Path, args: &[&str]) {
+            let mut full = vec![
+                "-c",
+                "user.name=Upstream",
+                "-c",
+                "user.email=upstream@example.invalid",
+                "-c",
+                "init.defaultBranch=main",
+            ];
+            full.extend_from_slice(args);
+            global_gateway()
+                .as_ref()
+                .expect("git gateway")
+                .run(&full, Some(dir))
+                .expect("run git")
+                .ensure_success()
+                .unwrap_or_else(|error| panic!("git {args:?} in {}: {error:#}", dir.display()));
+        }
+
+        /// Bytes zlib cannot shrink, so the pack is as large as the file.
+        fn incompressible(len: usize, mut seed: u64) -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed as u8
+                })
+                .collect()
+        }
+
+        /// An upstream with one commit holding `bytes` of incompressible data,
+        /// plus the work tree that pushes further commits into it.
+        fn upstream(root: &Path, bytes: usize) -> (std::path::PathBuf, std::path::PathBuf) {
+            let bare = root.join("upstream.git");
+            let work = root.join("work");
+            std::fs::create_dir_all(&bare).unwrap();
+            std::fs::create_dir_all(&work).unwrap();
+            git(&bare, &["init", "--bare", "--quiet"]);
+            git(&work, &["init", "--quiet"]);
+            grow(&work, "seed.bin", bytes, 1);
+            git(&work, &["remote", "add", "origin", &bare.to_string_lossy()]);
+            git(&work, &["push", "--quiet", "origin", "main"]);
+            (bare, work)
+        }
+
+        fn grow(work: &Path, name: &str, bytes: usize, seed: u64) {
+            std::fs::write(work.join(name), incompressible(bytes, seed)).unwrap();
+            git(work, &["add", name]);
+            git(work, &["commit", "--quiet", "-m", name]);
+        }
+
+        fn remote(bare: &Path) -> crate::net::GuardedGitRemote {
+            crate::net::GuardedGitRemote::unbound_for_test(&format!("file://{}", bare.display()))
+        }
+
+        const ONE_MIB_BUDGET: MirrorTransportPolicy =
+            MirrorTransportPolicy::new(false).with_max_clone_size_mb(1);
+
+        /// A hostile upstream stays small for the one clone that used to be
+        /// bounded, then grows past the ceiling before the next sync
+        /// (card_75c4398981a8). The fetch is refused, and its partial packs
+        /// are not kept to become the next pass's starting size.
+        #[test]
+        fn an_upstream_that_grows_past_the_budget_between_syncs_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let (bare, work) = upstream(dir.path(), 64 * 1024);
+            let mirror = dir.path().join("7.mirror");
+
+            run_git_clone_mirror(ONE_MIB_BUDGET, &remote(&bare), &mirror, None)
+                .expect("a small upstream clones under the budget");
+            grow(&work, "small.bin", 64 * 1024, 2);
+            git(&work, &["push", "--quiet", "origin", "main"]);
+            run_git_remote_update(ONE_MIB_BUDGET, &mirror, &remote(&bare), None)
+                .expect("growth inside the budget is an ordinary sync");
+
+            grow(&work, "payload.bin", 3 * 1024 * 1024, 3);
+            git(&work, &["push", "--quiet", "origin", "main"]);
+            let error = run_git_remote_update(ONE_MIB_BUDGET, &mirror, &remote(&bare), None)
+                .expect_err("growth past the budget must be refused");
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("`[mirror].max_clone_size_mb`"),
+                "{message}"
+            );
+            assert!(
+                !mirror.exists(),
+                "the refused fetch left its packs behind for the next pass to count as its base"
+            );
+        }
+
+        /// git cleans up a clone it fails on its own, but not one the budget
+        /// killed — and a directory with `HEAD` in it is what the next pass
+        /// reads as an existing mirror to fetch into without the clone ceiling.
+        #[test]
+        fn a_first_clone_past_the_budget_leaves_no_mirror_behind() {
+            let dir = tempfile::tempdir().unwrap();
+            let (bare, _work) = upstream(dir.path(), 3 * 1024 * 1024);
+            let mirror = dir.path().join("7.mirror");
+
+            let error = run_git_clone_mirror(ONE_MIB_BUDGET, &remote(&bare), &mirror, None)
+                .expect_err("a clone past the budget must be refused");
+
+            assert!(
+                format!("{error:#}").contains("`[mirror].max_clone_size_mb`"),
+                "{error:#}"
+            );
+            assert!(
+                !mirror.exists(),
+                "the refused clone left {}",
+                mirror.display()
+            );
+        }
+
+        /// `0` is the documented way out, and it means no ceiling at all.
+        #[test]
+        fn a_zero_budget_clones_without_a_ceiling() {
+            let dir = tempfile::tempdir().unwrap();
+            let (bare, _work) = upstream(dir.path(), 3 * 1024 * 1024);
+            let mirror = dir.path().join("7.mirror");
+
+            run_git_clone_mirror(
+                MirrorTransportPolicy::new(false).with_max_clone_size_mb(0),
+                &remote(&bare),
+                &mirror,
+                None,
+            )
+            .expect("no ceiling, no refusal");
+            assert!(mirror.join("HEAD").exists());
+        }
     }
 }

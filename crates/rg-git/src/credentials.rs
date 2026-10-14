@@ -106,6 +106,24 @@ impl OutboundGitInvocation {
         args: &[&str],
         repo_path: Option<&Path>,
     ) -> Result<GitOutput> {
+        self.run_under_disk_budget(git, args, repo_path, None)
+    }
+
+    /// [`Self::run`], killed once what it has written beneath
+    /// `disk_budget.path` passes `disk_budget.max_bytes`.
+    ///
+    /// For an operation that fills a directory with content the remote chose —
+    /// a clone, a fetch into a mirror. The caller names the directory the
+    /// operation is expected to fill, never one that holds other repositories.
+    /// `None` runs exactly as [`Self::run`], so a call site states its argument
+    /// list once whether or not the operator configured a ceiling.
+    pub fn run_under_disk_budget(
+        &self,
+        git: &GitCommandGateway,
+        args: &[&str],
+        repo_path: Option<&Path>,
+        disk_budget: Option<&rg_process::DiskBudget>,
+    ) -> Result<GitOutput> {
         let mut full_args: Vec<&str> = self.args.iter().map(String::as_str).collect();
         full_args.extend_from_slice(args);
         let env: Vec<(&str, &str)> = self
@@ -117,7 +135,16 @@ impl OutboundGitInvocation {
             .filter_map(|(key, _)| is_ambient_transport_env(&key).then_some(key))
             .collect();
 
-        git.run_with_env_removed(&full_args, repo_path, &env, &inherited_env_to_remove)
+        match disk_budget {
+            Some(disk_budget) => git.run_with_env_removed_under_disk_budget(
+                &full_args,
+                repo_path,
+                &env,
+                &inherited_env_to_remove,
+                disk_budget,
+            ),
+            None => git.run_with_env_removed(&full_args, repo_path, &env, &inherited_env_to_remove),
+        }
     }
 }
 

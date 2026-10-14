@@ -2401,7 +2401,7 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 26] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 28] = [
         (
             "DEFAULT_LOG_MAX_SIZE_MB",
             "the size cap is inactive until explicitly set; presenting 10 MB as an active default would mislead operators",
@@ -2515,6 +2515,14 @@ const AFTER: &str = "after";
         (
             "DEFAULT_MIRROR_ALLOW_INSECURE_HTTP",
             "config-file-only: `[mirror].allow_insecure_http` has no CLI flag",
+        ),
+        (
+            "DEFAULT_MIRROR_MAX_CLONE_SIZE_MB",
+            "config-file-only: `[mirror].max_clone_size_mb` has no CLI flag",
+        ),
+        (
+            "DEFAULT_IMPORTS_MAX_CLONE_SIZE_MB",
+            "config-file-only: `[imports].max_clone_size_mb` has no CLI flag",
         ),
         (
             "DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP",

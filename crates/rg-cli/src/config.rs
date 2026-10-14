@@ -362,6 +362,9 @@ pub(crate) struct MirrorConfig {
     /// native `git://` is always disabled and does not inherit this exception.
     #[serde(default)]
     pub(crate) allow_insecure_http: Option<bool>,
+    /// MiB one mirror clone, or one sync's growth of an existing mirror, may
+    /// write to disk before the transfer is stopped. `0` removes the ceiling.
+    pub(crate) max_clone_size_mb: Option<u64>,
 }
 
 /// `[imports]` — operator-owned trust exceptions for private self-hosted
@@ -378,6 +381,9 @@ pub(crate) struct ImportConfig {
     /// reachability and transport confidentiality are independent decisions.
     #[serde(default)]
     pub(crate) allow_insecure_http_origins: Vec<String>,
+    /// MiB one import's repository or wiki clone may write to disk before the
+    /// transfer is stopped. `0` removes the ceiling.
+    pub(crate) max_clone_size_mb: Option<u64>,
 }
 
 /// `[observability]` — OpenTelemetry distributed-tracing (OTLP) export. All
@@ -747,6 +753,12 @@ pub(crate) const DEFAULT_BACKUP_ENABLED: bool = false;
 pub(crate) const DEFAULT_MIRROR_ENABLED: bool = true;
 /// `[mirror].allow_insecure_http`: an omitted/new section is always secure.
 pub(crate) const DEFAULT_MIRROR_ALLOW_INSECURE_HTTP: bool = false;
+/// `[mirror].max_clone_size_mb`: the clone budget every outbound clone shares.
+pub(crate) const DEFAULT_MIRROR_MAX_CLONE_SIZE_MB: u64 =
+    rg_core::clone_budget::DEFAULT_MAX_CLONE_SIZE_MB;
+/// `[imports].max_clone_size_mb`: the same budget, for import clones.
+pub(crate) const DEFAULT_IMPORTS_MAX_CLONE_SIZE_MB: u64 =
+    rg_core::clone_budget::DEFAULT_MAX_CLONE_SIZE_MB;
 
 /// Resolve the instance-owned outbound mirror transport policy.
 pub(crate) fn resolve_mirror_transport_policy(
@@ -765,6 +777,10 @@ pub(crate) fn resolve_webhook_transport_policy(
     rg_core::webhook::transport::WebhookTransportPolicy::new(
         cfg.and_then(|config| config.webhooks.allow_insecure_http)
             .unwrap_or(DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP),
+    )
+    .with_max_clone_size_mb(
+        cfg.and_then(|config| config.mirror.max_clone_size_mb)
+            .unwrap_or(DEFAULT_MIRROR_MAX_CLONE_SIZE_MB),
     )
 }
 
@@ -854,8 +870,12 @@ pub(crate) fn resolve_trusted_import_origins(
     let values = cfg
         .map(|config| config.imports.trusted_origins.as_slice())
         .unwrap_or_default();
-    rg_core::import::trust::TrustedImportOrigins::parse(values)
-        .context("invalid config `[imports].trusted_origins`")
+    let max_clone_size_mb = cfg
+        .and_then(|config| config.imports.max_clone_size_mb)
+        .unwrap_or(DEFAULT_IMPORTS_MAX_CLONE_SIZE_MB);
+    Ok(rg_core::import::trust::TrustedImportOrigins::parse(values)
+        .context("invalid config `[imports].trusted_origins`")?
+        .with_max_clone_size_mb(max_clone_size_mb))
 }
 
 /// Parse the exact origins on which import credentials may cross plaintext
@@ -2229,6 +2249,18 @@ mod tests {
                 super::DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP.to_string(),
             ),
             row(
+                "mirror",
+                "max_clone_size_mb",
+                "DEFAULT_MIRROR_MAX_CLONE_SIZE_MB",
+                super::DEFAULT_MIRROR_MAX_CLONE_SIZE_MB.to_string(),
+            ),
+            row(
+                "imports",
+                "max_clone_size_mb",
+                "DEFAULT_IMPORTS_MAX_CLONE_SIZE_MB",
+                super::DEFAULT_IMPORTS_MAX_CLONE_SIZE_MB.to_string(),
+            ),
+            row(
                 "smtp",
                 "port",
                 "DEFAULT_SMTP_PORT",
@@ -3256,6 +3288,51 @@ trusted_origins = ["https://*.internal.example"]
         let error = super::resolve_trusted_import_origins(Some(&config))
             .expect_err("wildcard trust must fail");
         assert!(format!("{error:#}").contains("[imports].trusted_origins"));
+    }
+
+    /// The two clone budgets resolve independently, default to the decided
+    /// 10240 MiB when the key is absent, and read `0` as "no ceiling" rather
+    /// than as a ceiling of nothing.
+    #[test]
+    fn clone_budgets_resolve_per_section_with_zero_as_no_ceiling() {
+        const MIB: u64 = 1024 * 1024;
+        let bare: ConfigFile = toml::from_str("").expect("an empty config still parses");
+        assert_eq!(
+            super::resolve_mirror_transport_policy(Some(&bare))
+                .clone_budget()
+                .max_bytes(),
+            Some(10_240 * MIB)
+        );
+        assert_eq!(
+            super::resolve_trusted_import_origins(Some(&bare))
+                .expect("resolve")
+                .clone_budget()
+                .max_bytes(),
+            Some(10_240 * MIB)
+        );
+
+        let config: ConfigFile = toml::from_str(
+            r#"
+[mirror]
+max_clone_size_mb = 0
+[imports]
+max_clone_size_mb = 512
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(
+            super::resolve_mirror_transport_policy(Some(&config))
+                .clone_budget()
+                .max_bytes(),
+            None
+        );
+        assert_eq!(
+            super::resolve_trusted_import_origins(Some(&config))
+                .expect("resolve")
+                .clone_budget()
+                .max_bytes(),
+            Some(512 * MIB)
+        );
     }
 
     #[test]

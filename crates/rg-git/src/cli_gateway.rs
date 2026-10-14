@@ -52,6 +52,21 @@ pub enum GitCliError {
     #[error("git command timed out after {timeout:?}: {command}")]
     Timeout { command: String, timeout: Duration },
 
+    /// The command wrote past the disk budget its caller attached, and its
+    /// process tree was killed. `bytes` is what the directory held when the
+    /// poll saw the overrun.
+    #[error(
+        "git command wrote {bytes} bytes under {path}, past its {limit_bytes}-byte disk budget, \
+         and was stopped: {command}",
+        path = path.display()
+    )]
+    DiskBudgetExceeded {
+        command: String,
+        path: std::path::PathBuf,
+        bytes: u64,
+        limit_bytes: u64,
+    },
+
     #[error("git command failed (exit {exit_code}): {command}")]
     Failed { command: String, exit_code: String },
 
@@ -168,6 +183,24 @@ pub const DEFAULT_STDOUT_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 /// message never approaches this size, and a stream that does is the same
 /// class of pathology as an oversized `stdout`.
 pub const DEFAULT_STDERR_LIMIT_BYTES: u64 = 1024 * 1024;
+
+/// Everything `run_inner` bounds besides time: the two captured pipes, and —
+/// for a command that fills a directory with content somebody else chose —
+/// the bytes it may write there.
+#[derive(Clone, Copy)]
+struct Capture<'a> {
+    stdout_limit_bytes: u64,
+    stderr_limit_bytes: u64,
+    disk_budget: Option<&'a rg_process::DiskBudget>,
+}
+
+impl Capture<'_> {
+    const DEFAULT: Capture<'static> = Capture {
+        stdout_limit_bytes: DEFAULT_STDOUT_LIMIT_BYTES,
+        stderr_limit_bytes: DEFAULT_STDERR_LIMIT_BYTES,
+        disk_budget: None,
+    };
+}
 
 // ── Output ──────────────────────────────────────────────────────
 
@@ -463,14 +496,7 @@ impl GitCommandGateway {
     ///   with an explicit ceiling — the size becomes visible in the source.
     /// - Returns `GitOutput` with the captured stdout, stderr, and status.
     pub fn run(&self, args: &[&str], repo_path: Option<&Path>) -> Result<GitOutput> {
-        self.run_inner(
-            args,
-            repo_path,
-            None,
-            &[],
-            DEFAULT_STDOUT_LIMIT_BYTES,
-            DEFAULT_STDERR_LIMIT_BYTES,
-        )
+        self.run_inner(args, repo_path, None, &[], Capture::DEFAULT)
     }
 
     /// Run a git command with an explicit stdout ceiling.
@@ -493,8 +519,10 @@ impl GitCommandGateway {
             repo_path,
             None,
             &[],
-            stdout_limit_bytes,
-            DEFAULT_STDERR_LIMIT_BYTES,
+            Capture {
+                stdout_limit_bytes,
+                ..Capture::DEFAULT
+            },
         )
     }
 
@@ -510,14 +538,7 @@ impl GitCommandGateway {
         repo_path: Option<&Path>,
         env: &[(&str, &str)],
     ) -> Result<GitOutput> {
-        self.run_inner(
-            args,
-            repo_path,
-            Some(env),
-            &[],
-            DEFAULT_STDOUT_LIMIT_BYTES,
-            DEFAULT_STDERR_LIMIT_BYTES,
-        )
+        self.run_inner(args, repo_path, Some(env), &[], Capture::DEFAULT)
     }
 
     /// Run with explicit environment overrides after removing selected values
@@ -545,8 +566,36 @@ impl GitCommandGateway {
             repo_path,
             Some(env),
             inherited_env_to_remove,
-            DEFAULT_STDOUT_LIMIT_BYTES,
-            DEFAULT_STDERR_LIMIT_BYTES,
+            Capture::DEFAULT,
+        )
+    }
+
+    /// [`Self::run_with_env_removed`], killed the moment what it has written
+    /// beneath `disk_budget.path` passes `disk_budget.max_bytes`.
+    ///
+    /// The timeout bounds time, not bytes, and a clone of a repository somebody
+    /// else controls can fill the volume well inside it. Crate-private for the
+    /// same reason as `run_with_env_removed`: the outbound invocation policy is
+    /// what decides a command needs it. The refusal is
+    /// [`GitCliError::DiskBudgetExceeded`]; what the command wrote stays where
+    /// it is for the caller to keep or remove.
+    pub(crate) fn run_with_env_removed_under_disk_budget(
+        &self,
+        args: &[&str],
+        repo_path: Option<&Path>,
+        env: &[(&str, &str)],
+        inherited_env_to_remove: &[OsString],
+        disk_budget: &rg_process::DiskBudget,
+    ) -> Result<GitOutput> {
+        self.run_inner(
+            args,
+            repo_path,
+            Some(env),
+            inherited_env_to_remove,
+            Capture {
+                disk_budget: Some(disk_budget),
+                ..Capture::DEFAULT
+            },
         )
     }
 
@@ -557,8 +606,7 @@ impl GitCommandGateway {
         repo_path: Option<&Path>,
         env: Option<&[(&str, &str)]>,
         inherited_env_to_remove: &[OsString],
-        stdout_limit_bytes: u64,
-        stderr_limit_bytes: u64,
+        capture: Capture<'_>,
     ) -> Result<GitOutput> {
         let full_cmd = self.build_command_line(args, repo_path);
         let command_str = full_cmd.join(" ");
@@ -582,12 +630,15 @@ impl GitCommandGateway {
         // and the only bound on the way was the 120-second deadline — for a
         // command whose output size is chosen by a repository's content, this
         // is exactly no bound. `_and_limit` stops reading at the caller's
-        // ceiling and reports the refusal by variant, not by exit code.
-        let output = match rg_process::output_in_process_tree_with_timeout_and_limit(
+        // ceiling and reports the refusal by variant, not by exit code. The
+        // disk budget, when the caller attached one, is the same bound in
+        // bytes written to disk.
+        let output = match rg_process::output_in_process_tree_with_timeout_limit_and_disk_budget(
             &mut builder,
             self.timeout,
-            stdout_limit_bytes,
-            stderr_limit_bytes,
+            capture.stdout_limit_bytes,
+            capture.stderr_limit_bytes,
+            capture.disk_budget,
         )
         .map_err(|error| match error {
             rg_process::ProcessOutputError::Spawn(error)
@@ -616,6 +667,19 @@ impl GitCommandGateway {
                     stream,
                     limit_bytes: limit,
                     bytes_read,
+                }
+                .into());
+            }
+            rg_process::TimedOutput::DiskBudgetExceeded {
+                path,
+                bytes,
+                limit_bytes,
+            } => {
+                return Err(GitCliError::DiskBudgetExceeded {
+                    command: command_str,
+                    path,
+                    bytes,
+                    limit_bytes,
                 }
                 .into());
             }
@@ -900,6 +964,47 @@ mod tests {
         assert!(std::ptr::eq(g1.as_ref().unwrap(), g2.as_ref().unwrap()));
     }
 
+    /// A command filling a directory past its budget comes back as the typed
+    /// refusal naming that directory and ceiling — not as whatever exit code
+    /// the killed git happened to leave behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_writing_past_its_disk_budget_is_a_typed_refusal() {
+        let gateway = GitCommandGateway::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("clone");
+        let alias = format!(
+            "alias.fill=!mkdir -p '{dest}'; i=0; while :; do i=$((i + 1)); \
+             dd if=/dev/zero of='{dest}'/blob-$i bs=65536 count=4 2>/dev/null; done",
+            dest = destination.display()
+        );
+        let budget = rg_process::DiskBudget::new(&destination, 1024 * 1024);
+
+        let error = gateway
+            .run_with_env_removed_under_disk_budget(
+                &["-c", &alias, "fill"],
+                None,
+                &[],
+                &[],
+                &budget,
+            )
+            .expect_err("the disk budget must stop the writing command");
+
+        match error.downcast_ref::<GitCliError>() {
+            Some(GitCliError::DiskBudgetExceeded {
+                path,
+                bytes,
+                limit_bytes,
+                ..
+            }) => {
+                assert_eq!(path, &destination);
+                assert_eq!(*limit_bytes, 1024 * 1024);
+                assert!(bytes > limit_bytes);
+            }
+            other => panic!("expected DiskBudgetExceeded, got {other:?}"),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_bounded_refuses_output_that_would_exceed_the_ceiling() {
@@ -1002,7 +1107,7 @@ mod tests {
         let bounded = rust_source::production_function_call_sites(
             source,
             "run_inner",
-            &["output_in_process_tree_with_timeout_and_limit"],
+            &["output_in_process_tree_with_timeout_limit_and_disk_budget"],
         );
         assert_eq!(
             bounded.len(),

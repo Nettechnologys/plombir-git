@@ -1856,9 +1856,24 @@ async fn clone_repo(
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         let invocation = remote.bind_invocation(credential_invocation(credentials.as_ref()))?;
         let destination = staged_clone.path.to_string_lossy();
+        // Measured on the staging directory this clone fills — never on the
+        // owner directory, where other repositories live. A refused clone is
+        // removed with the rest of the staging on the way out.
+        let budget = remote.clone_budget();
         invocation
-            .run(git, &["clone", "--bare", remote.url(), &destination], None)
-            .and_then(|output| output.ensure_success().context("git clone --bare"))?;
+            .run_under_disk_budget(
+                git,
+                &["clone", "--bare", remote.url(), &destination],
+                None,
+                budget
+                    .and_then(|budget| budget.for_clone(&staged_clone.path))
+                    .as_ref(),
+            )
+            .and_then(|output| output.ensure_success().context("git clone --bare"))
+            .map_err(|error| match budget {
+                Some(budget) => budget.explain(error),
+                None => error,
+            })?;
         Ok(Some((import_lock, staged_clone)))
     })
     .await?;
@@ -2451,8 +2466,9 @@ async fn import_wiki_pages_from_destination(
             // `--depth 1`: only the pages as they stand are imported. A Plombir Git wiki
             // keeps its own revision history from the first edit onwards, and there is
             // nowhere to put the source's.
+            let budget = remote.clone_budget();
             let cloned = invocation
-                .run(
+                .run_under_disk_budget(
                     git,
                     &[
                         "clone",
@@ -2463,8 +2479,15 @@ async fn import_wiki_pages_from_destination(
                         &destination,
                     ],
                     None,
+                    budget
+                        .and_then(|budget| budget.for_clone(&staged_clone.path))
+                        .as_ref(),
                 )
-                .and_then(|output| output.ensure_success().context("git clone --bare (wiki)"));
+                .and_then(|output| output.ensure_success().context("git clone --bare (wiki)"))
+                .map_err(|error| match budget {
+                    Some(budget) => budget.explain(error),
+                    None => error,
+                });
             let outcome = match cloned {
                 Err(error) => WikiCloneOutcome::CloneFailed(error),
                 Ok(()) => match collect_wiki_pages(&staged_clone.path)? {
@@ -5702,6 +5725,61 @@ mod clone_effect_tests {
             .expect("read the upstream commit");
         head.ensure_success().expect("rev-parse succeeds");
         head.stdout_str().trim().to_string()
+    }
+
+    /// A clone past `[imports].max_clone_size_mb` is refused naming that key,
+    /// and neither its staging nor a target is left in the owner directory —
+    /// the staging guard removes what the killed clone wrote.
+    #[tokio::test]
+    async fn a_clone_past_the_import_budget_is_refused_and_leaves_nothing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        let upstream_arg = upstream.to_str().expect("UTF-8 path");
+        git(&["init", "-q", "--bare", "-b", "main", upstream_arg], None);
+        let worktree = tempfile::tempdir().expect("upstream worktree");
+        let path = worktree.path();
+        git(&["init", "-q", "-b", "main", path.to_str().unwrap()], None);
+        git(&["config", "user.name", "Import fixture"], Some(path));
+        git(
+            &["config", "user.email", "import-fixture@example.invalid"],
+            Some(path),
+        );
+        // Incompressible, so the pack is as large as the file.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let payload: Vec<u8> = (0..3 * 1024 * 1024)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        std::fs::write(path.join("payload.bin"), payload).expect("write payload");
+        git(&["add", "."], Some(path));
+        git(&["commit", "-qm", "payload"], Some(path));
+        git(&["push", "-q", upstream_arg, "main"], Some(path));
+
+        let repo_root = directory.path().join("repo_root");
+        let remote = crate::net::GuardedGitRemote::unbound_for_test(upstream_arg)
+            .with_clone_budget(crate::clone_budget::CloneBudget::from_mb(
+                crate::import::trust::MAX_CLONE_SIZE_KEY,
+                1,
+            ));
+
+        let error = match clone_repo(remote, &repo_root, "alice", "site", None).await {
+            Ok(_) => panic!("a clone past the budget must be refused"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("`[imports].max_clone_size_mb`"),
+            "{error:#}"
+        );
+        let left: Vec<_> = std::fs::read_dir(repo_root.join("alice"))
+            .expect("the owner directory was created")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert!(left.is_empty(), "the refused clone left {left:?}");
     }
 
     pub(super) async fn importing_user() -> DatabaseConnection {

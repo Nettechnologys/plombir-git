@@ -148,6 +148,9 @@ trusted_origins = []
 # origin again here as a separate acknowledgement of that exposure.
 allow_insecure_http_origins = []
 # Example exact origins: ["http://gitlab.internal.example:8080"]
+# MiB one import clone may write before it is stopped and removed; 0 = no
+# ceiling. Raise it for a source repository that is legitimately larger.
+max_clone_size_mb = 10240
 
 [limits]
 # Storage ceilings, every one opt-in: 0 (the default) is no ceiling, so an
@@ -176,5 +179,8 @@ enabled = true
 # instance-operator exception and never relaxes the separate SSRF policy. This
 # is HTTP-only: native git:// remains disabled, including for legacy rows.
 allow_insecure_http = false
+# MiB one mirror clone, or one sync's growth of an existing mirror, may write
+# before it is stopped and the partial copy removed; 0 = no ceiling.
+max_clone_size_mb = 10240
 poll_interval_secs = 60
 batch_size = 10

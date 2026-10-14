@@ -9,18 +9,43 @@
 
 use anyhow::{Context, Result};
 
-/// Whether this instance deliberately permits plaintext HTTP mirror remotes.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// The key an operator raises the mirror clone budget with.
+pub const MAX_CLONE_SIZE_KEY: &str = "[mirror].max_clone_size_mb";
+
+/// Whether this instance deliberately permits plaintext HTTP mirror remotes,
+/// and how much one mirror clone or fetch may write to disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MirrorTransportPolicy {
     allow_insecure_http: bool,
+    clone_budget: crate::clone_budget::CloneBudget,
+}
+
+impl Default for MirrorTransportPolicy {
+    fn default() -> Self {
+        Self::new(false)
+    }
 }
 
 impl MirrorTransportPolicy {
-    /// Build the policy resolved from `[mirror].allow_insecure_http`.
+    /// Build the policy resolved from `[mirror].allow_insecure_http`, with the
+    /// built-in clone budget.
     pub const fn new(allow_insecure_http: bool) -> Self {
         Self {
             allow_insecure_http,
+            clone_budget: crate::clone_budget::CloneBudget::default_for(MAX_CLONE_SIZE_KEY),
         }
+    }
+
+    /// Replace the clone budget with `[mirror].max_clone_size_mb` (`0` = none).
+    pub const fn with_max_clone_size_mb(mut self, max_clone_size_mb: u64) -> Self {
+        self.clone_budget =
+            crate::clone_budget::CloneBudget::from_mb(MAX_CLONE_SIZE_KEY, max_clone_size_mb);
+        self
+    }
+
+    /// What one clone of, or fetch into, a mirror may write.
+    pub const fn clone_budget(self) -> crate::clone_budget::CloneBudget {
+        self.clone_budget
     }
 
     /// Whether plaintext HTTP is an explicit operator exception.

@@ -12,10 +12,30 @@ use anyhow::{Context, Result};
 
 use crate::net::HttpOrigin as ImportOrigin;
 
+/// The key an operator raises the import clone budget with.
+pub const MAX_CLONE_SIZE_KEY: &str = "[imports].max_clone_size_mb";
+
 /// Exact origins an administrator has allowed imports to reach even when they
-/// resolve to a private, loopback, or link-local address.
-#[derive(Clone, Debug, Default)]
-pub struct TrustedImportOrigins(Arc<HashSet<ImportOrigin>>);
+/// resolve to a private, loopback, or link-local address — and the ceiling every
+/// git remote this hands out is cloned under.
+///
+/// The ceiling lives here because this is the one place an import's git
+/// destinations come from: a repository or wiki clone cannot obtain a remote
+/// without it, so it cannot obtain one without its budget either.
+#[derive(Clone, Debug)]
+pub struct TrustedImportOrigins {
+    origins: Arc<HashSet<ImportOrigin>>,
+    clone_budget: crate::clone_budget::CloneBudget,
+}
+
+impl Default for TrustedImportOrigins {
+    fn default() -> Self {
+        Self {
+            origins: Arc::default(),
+            clone_budget: crate::clone_budget::CloneBudget::default_for(MAX_CLONE_SIZE_KEY),
+        }
+    }
+}
 
 /// A validated import API destination coupled to the only client builder that
 /// may connect to it.
@@ -42,11 +62,26 @@ impl TrustedImportOrigins {
         for value in values {
             origins.insert(ImportOrigin::from_config(value, "trusted import origin")?);
         }
-        Ok(Self(Arc::new(origins)))
+        Ok(Self {
+            origins: Arc::new(origins),
+            ..Self::default()
+        })
+    }
+
+    /// Replace the clone budget with `[imports].max_clone_size_mb` (`0` = none).
+    pub fn with_max_clone_size_mb(mut self, max_clone_size_mb: u64) -> Self {
+        self.clone_budget =
+            crate::clone_budget::CloneBudget::from_mb(MAX_CLONE_SIZE_KEY, max_clone_size_mb);
+        self
+    }
+
+    /// What one import clone may write.
+    pub fn clone_budget(&self) -> crate::clone_budget::CloneBudget {
+        self.clone_budget
     }
 
     fn contains(&self, raw: &str) -> bool {
-        ImportOrigin::from_target(raw).is_some_and(|origin| self.0.contains(&origin))
+        ImportOrigin::from_target(raw).is_some_and(|origin| self.origins.contains(&origin))
     }
 
     /// DNS-free request-time check. Trusted origins bypass only the private-IP
@@ -63,11 +98,15 @@ impl TrustedImportOrigins {
     /// Exact configured origins take the explicit private-address exception,
     /// but still return a bound destination: operator trust is not permission
     /// for a second, independent DNS lookup.
+    /// The remote carries the import clone budget, so whatever clones it is
+    /// held to `[imports].max_clone_size_mb`.
     pub(crate) async fn git_destination(&self, raw: &str) -> Result<crate::net::GuardedGitRemote> {
-        if self.contains(raw) {
-            return crate::net::guard_trusted_git_url(raw).await;
-        }
-        crate::net::guard_git_url(raw).await
+        let remote = if self.contains(raw) {
+            crate::net::guard_trusted_git_url(raw).await?
+        } else {
+            crate::net::guard_git_url(raw).await?
+        };
+        Ok(remote.with_clone_budget(self.clone_budget()))
     }
 
     /// Validate an API base URL and bind its reachability decision to the
@@ -99,7 +138,7 @@ impl TrustedImportOrigins {
             ));
         }
 
-        let builder = if self.0.contains(&origin) {
+        let builder = if self.origins.contains(&origin) {
             crate::net::outbound_client_builder()
         } else {
             crate::net::check_url_static(trimmed).context("invalid import API URL")?;

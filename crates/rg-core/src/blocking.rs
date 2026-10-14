@@ -115,7 +115,12 @@ mod tests {
         let pulls = include_str!("pull_request/service.rs");
 
         for (source, function, boundary_count, blocking_calls) in [
-            (import, "clone_repo", 1, &["run"] as &[&str]),
+            (
+                import,
+                "clone_repo",
+                1,
+                &["run_under_disk_budget"] as &[&str],
+            ),
             (
                 mirror,
                 "run_sync_pass",
@@ -189,7 +194,7 @@ mod tests {
         let wiki_git_calls = rust_source::production_function_call_sites(
             import,
             "import_wiki_pages_from_destination",
-            &["run"],
+            &["run", "run_under_disk_budget"],
         );
         assert_eq!(
             wiki_git_calls.len(),

@@ -109,6 +109,12 @@ fn run_gpg(home: &Path, args: &[&str]) -> Result<Output> {
         rg_process::TimedOutput::OutputTooLarge { .. } => {
             bail!("GPG verifier output was too large")
         }
+        // No budget is attached above, so this cannot come back; spelled out
+        // rather than folded into a wildcard so a new variant is a compile
+        // error here too.
+        rg_process::TimedOutput::DiskBudgetExceeded { .. } => {
+            bail!("GPG verifier wrote past a disk budget it was never given")
+        }
     };
     if !output.status.success() {
         bail!("GPG rejected the public key or trust material");

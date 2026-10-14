@@ -326,6 +326,12 @@ trusted_origins = []
 # origin again here as a separate acknowledgement of that exposure.
 allow_insecure_http_origins = []
 # Example exact origins: ["http://gitlab.internal.example:8080"]
+# The most one import's repository or wiki clone may write to this server's
+# disk, in MiB. The clone deadline bounds time, not bytes, and a source that
+# never stops sending would otherwise fill the volume every repository lives
+# on. When the ceiling is crossed the clone is stopped, its partial copy is
+# removed, and the import fails naming this key. 0 removes the ceiling.
+max_clone_size_mb = 10240
 
 [mirror]
 # The background schedule that refreshes repository mirrors. A mirror is
@@ -346,6 +352,13 @@ enabled = true
 # HTTP-only: native git:// is unencrypted and remains disabled even when true;
 # legacy git:// mirror rows fail closed until repointed to HTTPS.
 allow_insecure_http = false
+# The most one mirror clone may write to this server's disk, in MiB — and, for
+# a mirror that already exists, the most one sync may grow it by. The sync
+# deadline bounds time, not bytes: an upstream can stay small for the first
+# clone and balloon later. Past the ceiling the transfer is stopped, the
+# partial clone removed, and the mirror shows an error naming this key; the
+# next sync starts from a fresh clone. 0 removes the ceiling.
+max_clone_size_mb = 10240
 # How often the server looks for mirrors whose next sync is due. This is polling
 # granularity, not a mirror's schedule — a pass only touches mirrors that are
 # already due, so lowering it does not sync anything more often than its own

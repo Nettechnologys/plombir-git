@@ -168,6 +168,100 @@ pub enum TimedOutput {
         limit: u64,
         bytes_read: u64,
     },
+    /// The tree was killed because what it had written beneath
+    /// [`DiskBudget::path`] passed [`DiskBudget::max_bytes`] before the
+    /// deadline did. `bytes` is what the poll measured; the tree may have
+    /// written a little more between that poll and the kill.
+    DiskBudgetExceeded {
+        path: std::path::PathBuf,
+        bytes: u64,
+        limit_bytes: u64,
+    },
+}
+
+/// A ceiling on what a command may write beneath one directory.
+///
+/// The deadline bounds time, not bytes: a `git clone` of a repository somebody
+/// else controls can fill a volume well inside two minutes. The directory is
+/// measured while the command runs, so this bounds the download — it is not an
+/// atomic quota, and the child can overshoot by what it writes between two
+/// polls. A directory that does not exist yet (a clone destination before git
+/// creates it) measures as empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskBudget {
+    pub path: std::path::PathBuf,
+    pub max_bytes: u64,
+}
+
+impl DiskBudget {
+    pub fn new(path: impl Into<std::path::PathBuf>, max_bytes: u64) -> Self {
+        Self {
+            path: path.into(),
+            max_bytes,
+        }
+    }
+
+    /// What the directory holds now, or `None` when it cannot be read at all.
+    pub fn measure(&self) -> Option<u64> {
+        directory_size(&self.path)
+    }
+
+    /// `Some(bytes)` once the directory holds more than the ceiling.
+    fn overrun(&self) -> Option<u64> {
+        self.measure().filter(|&bytes| bytes > self.max_bytes)
+    }
+}
+
+/// How often a [`DiskBudget`] is measured: often enough that a fast local
+/// clone stops within a second of crossing it, rarely enough that the walk is
+/// noise next to the clone itself.
+const DISK_BUDGET_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a tree killed over its [`DiskBudget`] is given to be reaped before
+/// the refusal is returned anyway.
+const DISK_BUDGET_KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// The bytes of the regular files beneath `root`. Symlinks are neither followed
+/// nor counted, so the walk cannot leave the measured directory.
+///
+/// `None` only when `root` itself exists and cannot be read. A missing root is
+/// empty, and an entry that vanishes mid-walk counts as nothing: git renames
+/// its temporary pack and index files as it goes, and failing the whole walk on
+/// one of them would skip the very poll that should have stopped the clone.
+fn directory_size(root: &std::path::Path) -> Option<u64> {
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    if !metadata.is_dir() {
+        return Some(if metadata.is_file() {
+            metadata.len()
+        } else {
+            0
+        });
+    }
+    let mut total = 0u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) if dir != root => continue,
+            Err(_) => return None,
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    Some(total)
 }
 
 /// Which pipe grew past its caller-declared ceiling.
@@ -474,6 +568,32 @@ pub fn output_in_process_tree_with_timeout_and_limit(
     stdout_limit_bytes: u64,
     stderr_limit_bytes: u64,
 ) -> Result<TimedOutput, ProcessOutputError> {
+    output_in_process_tree_with_timeout_limit_and_disk_budget(
+        command,
+        timeout,
+        stdout_limit_bytes,
+        stderr_limit_bytes,
+        None,
+    )
+}
+
+/// [`output_in_process_tree_with_timeout_and_limit`], plus an optional ceiling
+/// on what the tree writes beneath one directory.
+///
+/// With a budget the wait is cut into one-second slices and the directory is
+/// measured between them; the moment it holds more than the ceiling the tree is
+/// killed and the answer is [`TimedOutput::DiskBudgetExceeded`], without
+/// waiting out the deadline. A run that exits on its own is measured once more,
+/// so one that crossed the ceiling between two polls is refused too. Nothing
+/// removes what the tree wrote: the caller named the directory and decides
+/// whether it survives.
+pub fn output_in_process_tree_with_timeout_limit_and_disk_budget(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    stdout_limit_bytes: u64,
+    stderr_limit_bytes: u64,
+    disk_budget: Option<&DiskBudget>,
+) -> Result<TimedOutput, ProcessOutputError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -511,7 +631,11 @@ pub fn output_in_process_tree_with_timeout_and_limit(
     let mut tree = Some(tree);
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        match receiver.recv_timeout(remaining) {
+        let slice = match disk_budget {
+            Some(_) => remaining.min(DISK_BUDGET_POLL_INTERVAL),
+            None => remaining,
+        };
+        match receiver.recv_timeout(slice) {
             Ok(WaiterEvent::ChildExited) => {
                 // The direct child is reaped while the readers may still be
                 // blocked on a pipe a background descendant inherited. Killing
@@ -525,9 +649,47 @@ pub fn output_in_process_tree_with_timeout_and_limit(
                 // so the guard SIGKILLs anything still holding a captured pipe.
                 drop(tree.take());
                 join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                // One last measure once nothing writes any more: a run fast
+                // enough to finish between two polls wrote just as much, and
+                // the bytes are on disk all the same.
+                if let Some(budget) = disk_budget {
+                    if let Some(bytes) = budget.overrun() {
+                        return Ok(TimedOutput::DiskBudgetExceeded {
+                            path: budget.path.clone(),
+                            bytes,
+                            limit_bytes: budget.max_bytes,
+                        });
+                    }
+                }
                 return result.map_err(ProcessOutputError::Wait);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let overrun =
+                    disk_budget.and_then(|budget| budget.overrun().map(|bytes| (budget, bytes)));
+                if let Some((budget, bytes)) = overrun {
+                    // Killed before anything else, so a descendant writing
+                    // into the measured directory stops here, not at the
+                    // deadline. The caller usually removes that directory
+                    // next, so the direct child is given a moment to be
+                    // reaped first; past that the waiter is detached like on
+                    // a timeout, so an escaped pipe holder cannot stretch the
+                    // refusal.
+                    drop(tree.take());
+                    match receiver.recv_timeout(DISK_BUDGET_KILL_GRACE) {
+                        Ok(WaiterEvent::Finished(_)) => {
+                            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+                        }
+                        _ => drop(waiter),
+                    }
+                    return Ok(TimedOutput::DiskBudgetExceeded {
+                        path: budget.path.clone(),
+                        bytes,
+                        limit_bytes: budget.max_bytes,
+                    });
+                }
+                if slice < remaining {
+                    continue;
+                }
                 drop(tree.take());
                 // A process that called setsid may still own a pipe end. Its
                 // reader cannot be joined without losing the deadline. The
@@ -1449,5 +1611,175 @@ mod windows_tests {
         for pid in pids {
             assert_process_stops(pid);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod disk_budget_tests {
+    use super::*;
+
+    /// A command that writes a fresh 256 KiB file into `destination` per
+    /// iteration until it is killed. Each iteration names its own file — one
+    /// file overwritten in place would never cross any ceiling.
+    fn filling_command(destination: &std::path::Path) -> std::process::Command {
+        let script = format!(
+            "mkdir -p '{dest}'; i=0; while :; do i=$((i + 1)); \
+             dd if=/dev/zero of='{dest}'/blob-$i bs=65536 count=4 2>/dev/null; done",
+            dest = destination.display()
+        );
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", &script]);
+        command
+    }
+
+    #[test]
+    fn a_writing_tree_is_killed_once_its_directory_passes_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("clone");
+        let budget = DiskBudget::new(&destination, 1024 * 1024);
+
+        let started = std::time::Instant::now();
+        let result = output_in_process_tree_with_timeout_limit_and_disk_budget(
+            &mut filling_command(&destination),
+            Duration::from_secs(60),
+            65_536,
+            65_536,
+            Some(&budget),
+        )
+        .unwrap();
+
+        match result {
+            TimedOutput::DiskBudgetExceeded {
+                path,
+                bytes,
+                limit_bytes,
+            } => {
+                assert_eq!(path, destination);
+                assert_eq!(limit_bytes, 1024 * 1024);
+                assert!(bytes > limit_bytes, "killed below the ceiling: {bytes}");
+            }
+            other => panic!("expected DiskBudgetExceeded, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the budget, not the 60-second deadline, must end the run"
+        );
+
+        // Killed means stopped: nothing grows the directory once the refusal
+        // is back, which is what lets the caller remove it.
+        let after_kill = budget.measure().unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            budget.measure().unwrap(),
+            after_kill,
+            "the tree kept writing"
+        );
+    }
+
+    #[test]
+    fn a_tree_that_stays_under_its_budget_completes_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("small");
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "mkdir -p '{dest}' && sleep 1.5 && head -c 4096 /dev/zero > '{dest}/blob' && echo done",
+                dest = destination.display()
+            ),
+        ]);
+
+        let result = output_in_process_tree_with_timeout_limit_and_disk_budget(
+            &mut command,
+            Duration::from_secs(30),
+            65_536,
+            65_536,
+            Some(&DiskBudget::new(&destination, 1024 * 1024)),
+        )
+        .unwrap();
+
+        match result {
+            TimedOutput::Completed(output) => {
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"done\n");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Faster than the poll: the run writes 2 MiB and exits well inside the
+    /// first second, so only the measure after it exits can see the overrun.
+    #[test]
+    fn a_run_that_finishes_between_two_polls_is_still_held_to_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("fast");
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "mkdir -p '{dest}' && head -c 2097152 /dev/zero > '{dest}/blob'",
+                dest = destination.display()
+            ),
+        ]);
+
+        let result = output_in_process_tree_with_timeout_limit_and_disk_budget(
+            &mut command,
+            Duration::from_secs(30),
+            65_536,
+            65_536,
+            Some(&DiskBudget::new(&destination, 1024 * 1024)),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                result,
+                TimedOutput::DiskBudgetExceeded {
+                    bytes: 2_097_152,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn the_deadline_still_ends_a_slow_tree_under_a_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+
+        let started = std::time::Instant::now();
+        let result = output_in_process_tree_with_timeout_limit_and_disk_budget(
+            &mut command,
+            Duration::from_millis(2500),
+            65_536,
+            65_536,
+            Some(&DiskBudget::new(dir.path().join("never"), 1024)),
+        )
+        .unwrap();
+
+        assert!(matches!(result, TimedOutput::TimedOut), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn the_measure_counts_nested_files_and_skips_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("objects/pack")).unwrap();
+        std::fs::write(root.join("HEAD"), [0u8; 100]).unwrap();
+        std::fs::write(root.join("objects/pack/a.pack"), [0u8; 4000]).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, [0u8; 50_000]).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), root.join("dirlink")).unwrap();
+
+        assert_eq!(directory_size(&root), Some(4100));
+        assert_eq!(
+            directory_size(&dir.path().join("absent")),
+            Some(0),
+            "a destination git has not created yet is empty"
+        );
     }
 }

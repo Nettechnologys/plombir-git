@@ -62,6 +62,10 @@ const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct GuardedGitRemote {
     url: String,
     binding: Option<GitHttpBinding>,
+    /// The ceiling the operation that resolved this remote holds a clone of it
+    /// to, when that operation attaches one (see
+    /// [`crate::clone_budget::CloneBudget`]).
+    clone_budget: Option<crate::clone_budget::CloneBudget>,
 }
 
 struct GitHttpBinding {
@@ -91,11 +95,23 @@ impl GuardedGitRemote {
         }
     }
 
+    /// Hold a clone of this remote to `budget`.
+    pub(crate) fn with_clone_budget(mut self, budget: crate::clone_budget::CloneBudget) -> Self {
+        self.clone_budget = Some(budget);
+        self
+    }
+
+    /// The ceiling a clone of this remote is held to, if one was attached.
+    pub(crate) fn clone_budget(&self) -> Option<crate::clone_budget::CloneBudget> {
+        self.clone_budget
+    }
+
     #[cfg(test)]
     pub(crate) fn unbound_for_test(raw: &str) -> Self {
         Self {
             url: raw.to_owned(),
             binding: None,
+            clone_budget: None,
         }
     }
 
@@ -111,6 +127,7 @@ impl GuardedGitRemote {
         Ok(Self {
             url: path.to_string_lossy().into_owned(),
             binding: None,
+            clone_budget: None,
         })
     }
 }
@@ -596,6 +613,7 @@ async fn resolve_git_http_remote(
         return Ok(GuardedGitRemote {
             url: trimmed.to_owned(),
             binding: None,
+            clone_budget: None,
         });
     }
 
@@ -627,6 +645,7 @@ async fn resolve_git_http_remote(
             port,
             addresses,
         }),
+        clone_budget: None,
     })
 }
 
@@ -656,6 +675,7 @@ pub(crate) fn guard_git_url_with_addresses(
             port,
             addresses,
         }),
+        clone_budget: None,
     })
 }
 
