@@ -293,6 +293,56 @@ pub async fn report_repositories_with_names_that_are_not_ascii(db: &rg_db::Datab
     );
 }
 
+/// Name every repository whose name another repository of its namespace
+/// already has in a different case.
+///
+/// The repository sibling of [`report_owner_names_that_differ_only_in_case`]:
+/// creation, rename and transfer refuse new pairs like `Payments` /
+/// `payments`, and the folded key refuses them in the database
+/// (card_552648b36416). This says which pairs came through before. A lowercasing
+/// client — Docker always is one — reaches the older repository of each pair,
+/// never the younger; renaming one of them is the owner's call.
+pub async fn report_repository_names_that_differ_only_in_case(db: &rg_db::DatabaseConnection) {
+    let described = match describe_repository_case_twins(db).await {
+        Ok(described) => described,
+        // Silence here reads exactly like "none", which is the answer the
+        // operator would act on.
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "could not check whether any repository name differs from another only in case"
+            );
+            return;
+        }
+    };
+    if described.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        repositories = described.join(", "),
+        "these repositories share their name with an older repository of the same owner, \
+         differing only in case, so a link or a client that lowercases the name reaches the \
+         older one; they predate the rule and renaming one of each pair is a decision for the \
+         owner, not for the server"
+    );
+}
+
+/// `owner/twin (as owner/holder)` for every pair the report names.
+async fn describe_repository_case_twins(
+    db: &rg_db::DatabaseConnection,
+) -> anyhow::Result<Vec<String>> {
+    let mut described = Vec::new();
+    for (twin, holder) in rg_db::ops::repo_ops::list_names_held_only_in_another_case(db).await? {
+        let owner =
+            crate::repo::service::repository_namespace_name(db, twin.owner_id, twin.org_id).await?;
+        described.push(format!(
+            "{owner}/{} (as {owner}/{})",
+            twin.name, holder.name
+        ));
+    }
+    Ok(described)
+}
+
 /// The two lists the warning above is made of, separated so the finding can be
 /// asserted on rather than read out of a log line.
 async fn find_owners_holding_reserved_names(

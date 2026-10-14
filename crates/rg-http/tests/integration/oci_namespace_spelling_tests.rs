@@ -151,3 +151,106 @@ async fn a_lowercase_push_lands_in_the_rows_namespace_and_leaves_with_it() {
         );
     }
 }
+
+/// card_7383819049c9: on a database that compares names exactly, the address
+/// Docker is able to send — lowercase — used to reach nothing at all for an
+/// owner or a repository with a capital letter. The registry resolves it in
+/// any case, and still keys storage by the rows' spellings.
+#[tokio::test]
+async fn a_lowercase_address_reaches_a_mixed_case_owner_and_repository() {
+    let (base, db) = crate::common::spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "MixedCase", "mixedcase@example.com").await;
+    create_repo(&base, &token, "MyApp").await;
+    let client = reqwest::Client::new();
+
+    let payload = b"a layer docker could only address in lowercase";
+    let digest = sha256(payload);
+    let start = client
+        .post(format!("{base}/v2/mixedcase/myapp/blobs/uploads/"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 202, "{}", start.text().await.unwrap());
+    let location = start
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("start upload must return a Location")
+        .to_string();
+    let chunk = client
+        .patch(format!("{base}{location}"))
+        .bearer_auth(&token)
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chunk.status(), 202);
+    let finish = client
+        .put(format!("{base}{location}"))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    crate::common::assert_blob_push_created(finish, payload.len()).await;
+
+    let repository = rg_core::repo::service::find_repo_by_owner_name(&db, "MixedCase", "MyApp")
+        .await
+        .unwrap()
+        .expect("the repository row");
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, repository.id)
+        .await
+        .unwrap()
+        .expect("the OCI repository row");
+    let blob = rg_db::ops::oci_ops::find_blob(&db, oci_repo.id, &digest)
+        .await
+        .unwrap()
+        .expect("the blob row");
+    assert!(
+        blob.storage_path.starts_with("oci/MixedCase/MyApp/"),
+        "the key follows the rows' spelling, not the request's: {}",
+        blob.storage_path
+    );
+    for spelling in ["MixedCase/MyApp", "mixedcase/myapp", "MIXEDCASE/MYAPP"] {
+        let response = client
+            .head(format!("{base}/v2/{spelling}/blobs/{digest}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "HEAD under {spelling}");
+    }
+
+    // The scoped-token flow docker takes, asked for the lowercase name.
+    let granted = client
+        .get(format!("{base}/v2/auth/token"))
+        .query(&[
+            ("service", "plombir-git-registry"),
+            ("scope", "repository:mixedcase/myapp:pull,push"),
+        ])
+        .basic_auth("MixedCase", Some("Qz7$wRtm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(granted.status(), 200);
+    let granted: serde_json::Value = granted.json().await.unwrap();
+    let scoped = granted["token"].as_str().expect("a scoped token");
+    let pulled = client
+        .get(format!("{base}/v2/mixedcase/myapp/blobs/{digest}"))
+        .bearer_auth(scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pulled.status(), 200, "the scoped token pulls the layer");
+    assert_eq!(pulled.bytes().await.unwrap().as_ref(), payload);
+
+    // An owner nobody holds in any case is still nobody.
+    let missing = client
+        .post(format!("{base}/v2/mixedcase2/myapp/blobs/uploads/"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(missing.status(), 202);
+}

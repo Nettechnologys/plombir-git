@@ -261,6 +261,59 @@ async fn docker_pushes_and_pulls_a_private_repository() {
     forget(config, &registry.reference);
 }
 
+/// card_7383819049c9: Docker refuses an upper-case letter anywhere in an image
+/// path, so for an owner and a repository spelled with capitals the only
+/// address the stock client can send is the lowercase one — and it has to
+/// reach the repository, and land its layers under the rows' spellings.
+// Multi-threaded for the reason the push/pull test above is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a working Docker daemon; run with --ignored"]
+async fn docker_pushes_and_pulls_a_mixed_case_owner_and_repository() {
+    let (base_url, db) = spawn_test_app_with_db().await;
+    let user = "OciLiveMixed";
+    let (token, _id) = register_full(&base_url, user, "ocilivemixed@example.invalid").await;
+    let created = reqwest::Client::new()
+        .post(format!("{base_url}/api/v1/repos"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"name": "MyImages", "is_private": true}))
+        .send()
+        .await
+        .expect("create the private repository");
+    assert_eq!(created.status(), 201, "create private repo");
+
+    let host = registry_host(&base_url).to_string();
+    let reference = format!("{host}/ocilivemixed/myimages:v1");
+    let logged_in = tempfile::tempdir().expect("docker config dir");
+    let config = logged_in.path();
+    docker_ok(config, &["login", &host, "-u", user, "-p", "Qz7$wRtm"]);
+
+    tiny_image(config, &reference);
+    docker_ok(config, &["push", &reference]);
+    forget(config, &reference);
+    docker_ok(config, &["pull", &reference]);
+    forget(config, &reference);
+
+    let repository = rg_core::repo::service::find_repo_by_owner_name(&db, user, "MyImages")
+        .await
+        .unwrap()
+        .expect("the repository row");
+    let oci_repo = rg_db::ops::oci_ops::find_repo_by_id(&db, repository.id)
+        .await
+        .unwrap()
+        .expect("the push created the OCI repository row");
+    let blobs = rg_db::ops::oci_ops::list_blobs(&db, oci_repo.id)
+        .await
+        .unwrap();
+    assert!(!blobs.is_empty(), "docker push must have stored blobs");
+    for blob in blobs {
+        assert!(
+            blob.storage_path.starts_with("oci/OciLiveMixed/MyImages/"),
+            "the key follows the rows' spelling: {}",
+            blob.storage_path
+        );
+    }
+}
+
 /// card_87107a1e40bd: what a client actually does with the `401` that
 /// `oci_unauthorized` returns.
 ///

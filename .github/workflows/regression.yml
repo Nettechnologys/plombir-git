@@ -180,7 +180,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev git
+          sudo apt-get install -y pkg-config libssl-dev libsqlite3-dev git git-lfs
 
       - name: Install Rust
         run: rustup toolchain install --no-self-update
@@ -210,6 +210,16 @@ jobs:
       # rg-http's 42 integration binaries that `--workspace` already covers.
       - name: Run workspace tests
         run: cargo nextest run --workspace
+
+      # The stock clients against the registry and the LFS API: `docker` and
+      # `git lfs`, not our idea of what they send. `#[ignore]`d because a
+      # developer machine may lack either; this runner has both, and until this
+      # step nothing ran them anywhere (card_7404df85da21).
+      - name: Run stock Docker and Git LFS client tests
+        run: >-
+          cargo nextest run -p rg-http --test integration --run-ignored only
+          -E 'test(/^oci_live_client_tests::/) | test(/^lfs_locks_stock_client_tests::/)
+          | test(old_url_clone_with_lfs_checks_out_the_file_content)'
 
       # nextest does not run doc-tests (upstream limitation), so they need
       # their own step or they silently stop being checked.
@@ -431,6 +441,11 @@ jobs:
       - name: Prove remote values and repository credential retirement on PostgreSQL
         run: "cargo test -p rg-http --test integration -j 6 remote_storage_lifecycle_tests:: -- --ignored --nocapture"
 
+      # PostgreSQL compares repository names exactly; the folded key is what
+      # makes `payments` next to `Payments` a conflict here (card_552648b36416).
+      - name: Prove a repository name is taken in any case on PostgreSQL
+        run: "cargo test -p rg-http --test integration -j 6 repo_name_case_tests:: -- --ignored --nocapture"
+
       - name: Prove remote column widening keeps live PostgreSQL rows
         run: cargo test -p rg-db --test integration -j 6 widened_columns_keep_live_rows_and_hold_accepted_values -- --nocapture
 
@@ -526,6 +541,16 @@ jobs:
 
       - name: Prove remote values and repository credential retirement on MySQL
         run: "cargo test -p rg-http --test integration -j 6 remote_storage_lifecycle_tests:: -- --ignored --nocapture"
+
+      # MySQL's default collation hands one repository to several spellings of
+      # its address, and only here can a durable key built from the request's
+      # spelling show (card_7e82c1b1f642, card_3f1936e7d4a7).
+      - name: Prove storage follows the rows' spelling, and names fold, on MySQL
+        run: >-
+          cargo test -p rg-http --test integration -j 6 -- --ignored --nocapture
+          oci_namespace_spelling_tests::
+          repo_rebind_spelling_tests::
+          repo_name_case_tests::
 
       - name: Prove remote column widening keeps live MySQL rows
         run: cargo test -p rg-db --test integration -j 6 widened_columns_keep_live_rows_and_hold_accepted_values -- --nocapture

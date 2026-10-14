@@ -202,6 +202,88 @@ pub async fn find_by_org_and_name(
         .context("db: find repo by org and name")
 }
 
+/// The live repository of one namespace whose name is `name` in any case —
+/// `org_id` for an organization, `owner_id`'s personal account otherwise.
+///
+/// The question "is this name taken here" has to be asked this way since
+/// `m20261014_000004_repositories_name_fold_case`: `Payments` and `payments`
+/// are one name to a reader and to a lowercasing client. `LOWER(name)` rather
+/// than the stored key, so a twin that predates the rule and holds no key still
+/// counts as taken. Repository names are ASCII, so the two folds agree.
+pub async fn find_in_namespace_in_any_case(
+    db: &DatabaseConnection,
+    owner_id: i64,
+    org_id: Option<i64>,
+    name: &str,
+) -> Result<Vec<Repo>> {
+    let namespace = match org_id {
+        Some(org_id) => Condition::all().add(repository::Column::OrgId.eq(org_id)),
+        None => Condition::all()
+            .add(repository::Column::OwnerId.eq(owner_id))
+            .add(repository::Column::OrgId.is_null()),
+    };
+    RepoEntity::find()
+        .filter(namespace)
+        .filter(
+            Expr::expr(Func::lower(Expr::col(repository::Column::Name)))
+                .eq(name.to_ascii_lowercase()),
+        )
+        .filter(repository::Column::DeletedAt.is_null())
+        .order_by_asc(repository::Column::Id)
+        .all(db)
+        .await
+        .context("db: find repo in namespace in any case")
+}
+
+/// The live repository of one namespace that holds the folded key of `name`
+/// — the one a lowercasing client means when it names `name` in any case.
+///
+/// A twin that predates the case rule holds no key, so it is never the answer:
+/// the older repository of the pair is (`m20261014_000004`).
+pub async fn find_in_namespace_by_name_key(
+    db: &DatabaseConnection,
+    owner_id: i64,
+    org_id: Option<i64>,
+    name: &str,
+) -> Result<Option<Repo>> {
+    let namespace = match org_id {
+        Some(org_id) => Condition::all().add(repository::Column::OrgId.eq(org_id)),
+        None => Condition::all()
+            .add(repository::Column::OwnerId.eq(owner_id))
+            .add(repository::Column::OrgId.is_null()),
+    };
+    RepoEntity::find()
+        .filter(namespace)
+        .filter(Expr::col(sea_orm::sea_query::Alias::new("name_key")).eq(name.to_ascii_lowercase()))
+        .filter(repository::Column::DeletedAt.is_null())
+        .one(db)
+        .await
+        .context("db: find repo by folded name key")
+}
+
+/// Every live repository that predates the case rule and shares its folded
+/// name with an older repository of its namespace, as `(twin, holder)`.
+pub async fn list_names_held_only_in_another_case(
+    db: &DatabaseConnection,
+) -> Result<Vec<(Repo, Repo)>> {
+    let keyless = RepoEntity::find()
+        .filter(Expr::col(sea_orm::sea_query::Alias::new("name_key")).is_null())
+        .filter(repository::Column::DeletedAt.is_null())
+        .order_by_asc(repository::Column::Id)
+        .all(db)
+        .await
+        .context("db: list repos without a folded name key")?;
+    let mut pairs = Vec::new();
+    for twin in keyless {
+        if let Some(holder) =
+            find_in_namespace_by_name_key(db, twin.owner_id, twin.org_id, &twin.name).await?
+        {
+            pairs.push((twin, holder));
+        }
+    }
+    Ok(pairs)
+}
+
 /// List all non-deleted repos belonging to an organization.
 pub async fn list_by_org(db: &DatabaseConnection, org_id: i64) -> Result<Vec<Repo>> {
     RepoEntity::find()

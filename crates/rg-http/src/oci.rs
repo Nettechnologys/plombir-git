@@ -507,13 +507,14 @@ async fn check_access(
     repo: &str,
     required_action: &str,
 ) -> Result<(bool, Option<i64>), AppError> {
-    let repo_model = match rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, repo)
-        .await
-        .map_err(AppError::from)?
-    {
-        Some(repo) => repo,
-        None => return Ok((false, None)),
-    };
+    let repo_model =
+        match rg_core::repo::service::find_repo_and_namespace_for_registry(&state.db, owner, repo)
+            .await
+            .map_err(AppError::from)?
+        {
+            Some((repo, _)) => repo,
+            None => return Ok((false, None)),
+        };
 
     // A normal Plombir Git JWT is a user, so the answer is the same one the REST
     // API would give that user for this repository.
@@ -977,25 +978,28 @@ async fn grant_repository_scope(
     let Some((scope_owner, scope_repo)) = parse_namespace(&parsed.name) else {
         return Ok(None);
     };
-    let repo_model =
-        match rg_core::repo::service::find_repo_by_owner_name(&state.db, scope_owner, scope_repo)
-            .await
-            .map_err(AppError::from)?
+    let repo_model = match rg_core::repo::service::find_repo_and_namespace_for_registry(
+        &state.db,
+        scope_owner,
+        scope_repo,
+    )
+    .await
+    .map_err(AppError::from)?
+    {
+        Some((repo, _)) => repo,
+        // A name a rename left behind: a reader of the repository it led to
+        // gets a pull scope on the old name, which opens nothing there, so
+        // the client comes back with it and is told where the repository
+        // went (`renamed_for_reader`) instead of bouncing off `401`.
+        None if parsed.has_action("pull")
+            && renamed_for_reader(state, scope_owner, scope_repo, authenticated_user_id)
+                .await
+                .is_some() =>
         {
-            Some(repo) => repo,
-            // A name a rename left behind: a reader of the repository it led to
-            // gets a pull scope on the old name, which opens nothing there, so
-            // the client comes back with it and is told where the repository
-            // went (`renamed_for_reader`) instead of bouncing off `401`.
-            None if parsed.has_action("pull")
-                && renamed_for_reader(state, scope_owner, scope_repo, authenticated_user_id)
-                    .await
-                    .is_some() =>
-            {
-                return Ok(Some(format!("repository:{}:pull", parsed.name)));
-            }
-            None => return Ok(None),
-        };
+            return Ok(Some(format!("repository:{}:pull", parsed.name)));
+        }
+        None => return Ok(None),
+    };
 
     // Minting a scope *is* an access decision — it hands out a capability the
     // pull/push handlers then trust without re-deriving it — so it is taken by
@@ -3653,7 +3657,7 @@ async fn resolve_storage_namespace(
     )>,
 > {
     let Some((repository, canonical_owner)) =
-        rg_core::repo::service::find_repo_and_namespace_by_owner_name(db, owner, repo).await?
+        rg_core::repo::service::find_repo_and_namespace_for_registry(db, owner, repo).await?
     else {
         return Ok(None);
     };
@@ -3722,7 +3726,7 @@ async fn find_or_create_oci_repo(
     repo: &str,
 ) -> anyhow::Result<(rg_db::entities::oci_repository::Model, StorageNamespace)> {
     let (plombir_git_repo, canonical_owner) =
-        rg_core::repo::service::find_repo_and_namespace_by_owner_name(db, owner, repo)
+        rg_core::repo::service::find_repo_and_namespace_for_registry(db, owner, repo)
             .await?
             .ok_or_else(|| anyhow::anyhow!("repository {}/{} not found", owner, repo))?;
 

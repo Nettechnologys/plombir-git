@@ -57,3 +57,32 @@ pub async fn list_names_held_only_in_another_case(
         })
         .collect()
 }
+
+/// Which owner holds the folded key of `name`, as `(kind, owner_id)` — `kind`
+/// is `"user"` or `"org"`. The holder a lowercasing client means when it names
+/// `name` in any case; a name that predates the rule and holds no key is never
+/// the answer (`m20261014_000001_owner_names_fold_case`).
+pub async fn find_holder_in_any_case(
+    db: &DatabaseConnection,
+    name: &str,
+) -> Result<Option<(String, i64)>> {
+    let query = Query::select()
+        .columns([Alias::new("kind"), Alias::new("owner_id")])
+        .from(Alias::new("owner_names"))
+        .and_where(Expr::col(Alias::new("name_key")).eq(name.to_ascii_lowercase()))
+        .limit(1)
+        .to_owned();
+    let Some(row) = db
+        .query_one(db.get_database_backend().build(&query))
+        .await
+        .context("db: find an owner name's holder in any case")?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        row.try_get::<String>("", "kind")
+            .context("db: read owner name kind")?,
+        row.try_get::<i64>("", "owner_id")
+            .context("db: read owner name holder")?,
+    )))
+}

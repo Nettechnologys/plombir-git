@@ -467,6 +467,50 @@ pub async fn find_repo_by_owner_name(
         .map(|(repository, _)| repository))
 }
 
+/// [`find_repo_and_namespace_by_owner_name`] for a client that cannot spell the
+/// address the way its rows do: the exact spelling first, then the owner and
+/// repository whose folded names match.
+///
+/// Docker refuses an upper-case letter anywhere in an image path, so for
+/// `Zubrenok/MyApp` the registry is only ever asked for `zubrenok/myapp`
+/// (card_7383819049c9). Only the registry resolves this way: everywhere else a
+/// durable path is still built from the request (`<owner>/<repo>.git`), and a
+/// case-folded resolution there would point at a directory that does not
+/// exist. The caller builds keys from the returned spellings, never from the
+/// request's. A twin that predates the case rules holds no folded key, so the
+/// fold reaches the older of the pair and the twin stays reachable by its
+/// exact spelling.
+pub async fn find_repo_and_namespace_for_registry(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo_name: &str,
+) -> Result<Option<(rg_db::entities::repository::Model, String)>> {
+    if let Some(found) = find_repo_and_namespace_by_owner_name(db, owner, repo_name).await? {
+        return Ok(Some(found));
+    }
+    let Some((kind, holder_id)) =
+        rg_db::ops::owner_name_ops::find_holder_in_any_case(db, owner).await?
+    else {
+        return Ok(None);
+    };
+    let (owner_id, org_id, owner_name) = if kind == "org" {
+        let Some(org) = rg_db::ops::org_ops::get_org(db, holder_id).await? else {
+            return Ok(None);
+        };
+        (org.owner_id, Some(org.id), org.name)
+    } else {
+        let Some(user) = user_ops::find_by_id(db, holder_id).await? else {
+            return Ok(None);
+        };
+        (user.id, None, user.username)
+    };
+    Ok(
+        repo_ops::find_in_namespace_by_name_key(db, owner_id, org_id, repo_name)
+            .await?
+            .map(|repository| (repository, owner_name)),
+    )
+}
+
 /// [`find_repo_by_owner_name`], plus the owner's name as its row spells it.
 ///
 /// The address a request names and the namespace it resolves to are not the
@@ -579,11 +623,12 @@ async fn ensure_repo_name_free(
         found.filter(|repo| Some(repo.id) != except_repo_id)
     };
 
-    let taken = match org_id {
-        Some(org_id) => repo_ops::find_by_org_and_name(db, org_id, name).await?,
-        None => repo_ops::find_personal_by_owner_and_name(db, owner_id, name).await?,
-    };
-    if occupies(taken).is_some() {
+    // In any case: `payments` next to `Payments` is one name to a reader and
+    // to a lowercasing client (card_552648b36416). This is the friendly first
+    // answer; the guarantee is the folded unique key
+    // (`m20261014_000004_repositories_name_fold_case`).
+    let taken = repo_ops::find_in_namespace_in_any_case(db, owner_id, org_id, name).await?;
+    if taken.into_iter().any(|repo| occupies(Some(repo)).is_some()) {
         return Err(crate::error::conflict(taken_message.to_string()));
     }
 
@@ -925,6 +970,66 @@ impl Drop for UncommittedRepositoryStorage {
         if self.armed {
             discard_unreferenced_repo_dir(&self.path, &self.consequence);
         }
+    }
+}
+
+/// card_552648b36416: the door, apart from the database's key behind it. With
+/// the key alone a twin still costs a created directory (or a moved one) before
+/// the insert is refused; the door refuses it before anything is touched.
+#[cfg(test)]
+mod repo_name_case_tests {
+    use super::ensure_repo_name_free;
+    use sea_orm::Set;
+
+    #[tokio::test]
+    async fn a_name_is_taken_in_any_case_but_never_by_the_repository_claiming_it() {
+        let db = crate::test_support::migrated_memory_database().await;
+        let owner = rg_db::ops::user_ops::create_user(&db, "door", "door@example.invalid", "", "")
+            .await
+            .expect("seed the owner");
+        let now = chrono::Utc::now();
+        let held = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(owner.id),
+                name: Set("Payments".to_string()),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed the repository");
+
+        for spelling in ["Payments", "payments", "PAYMENTS"] {
+            let refused = ensure_repo_name_free(&db, owner.id, None, spelling, None, "taken")
+                .await
+                .expect_err(spelling);
+            assert!(
+                refused.downcast_ref::<crate::error::Conflict>().is_some(),
+                "{spelling}: {refused:#}"
+            );
+        }
+        ensure_repo_name_free(&db, owner.id, None, "payments", Some(held.id), "taken")
+            .await
+            .expect("a repository may take another case of its own name");
+        ensure_repo_name_free(&db, owner.id, None, "payments-v2", None, "taken")
+            .await
+            .expect("a free name");
+        ensure_repo_name_free(
+            &db,
+            owner.id,
+            Some(held.id + 100),
+            "payments",
+            None,
+            "taken",
+        )
+        .await
+        .expect("another namespace holds no spelling of it");
     }
 }
 
@@ -3370,7 +3475,9 @@ where
         owner,
         repo_name,
         new_owner,
-        repo_name,
+        // A transfer keeps the repository's own name, as its row spells it —
+        // not as the request happened to (card_3f1936e7d4a7).
+        None,
         repo_root,
         blob_storage,
         oci_storage,
@@ -4045,10 +4152,14 @@ pub async fn rename_repo(
     oci_storage: &crate::package_registry::oci::storage::OciStorage,
 ) -> Result<rg_db::entities::repository::Model> {
     crate::validate_repo_name(new_name)?;
-    if new_name == repo_name {
-        return find_repo_by_owner_name(db, owner, repo_name)
-            .await?
-            .ok_or_else(|| crate::error::not_found("repository"));
+    // Compared with the row's spelling, not the request's: on MySQL's default
+    // collation `alice/myrepo` reaches `Alice/MyRepo`, and a request to call it
+    // `myrepo` is a rename, not a no-op (card_3f1936e7d4a7).
+    let repo = find_repo_by_owner_name(db, owner, repo_name)
+        .await?
+        .ok_or_else(|| crate::error::not_found("repository"))?;
+    if new_name == repo.name {
+        return Ok(repo);
     }
     rebind_repository_with_after_commit(
         db,
@@ -4056,7 +4167,7 @@ pub async fn rename_repo(
         owner,
         repo_name,
         owner,
-        new_name,
+        Some(new_name),
         repo_root,
         blob_storage,
         oci_storage,
@@ -4068,7 +4179,12 @@ pub async fn rename_repo(
 /// Move a repository to `new_owner/new_repo_name` — a transfer, a rename, or
 /// both. `required_owner` is the account that alone may do it, when the
 /// caller has not already decided that (a transfer: only the owner gives a
-/// repository away).
+/// repository away). `new_repo_name` is `None` when the name stays.
+///
+/// `owner` and `repo_name` only find the repository. Every path, key and
+/// journal entry below is built from the names its rows spell: on MySQL's
+/// default collation `alice/myrepo` finds `Alice/MyRepo`, and storage sits
+/// under the second spelling only (card_3f1936e7d4a7).
 #[allow(clippy::too_many_arguments)]
 async fn rebind_repository_with_after_commit<F, Fut>(
     db: &DatabaseConnection,
@@ -4076,7 +4192,7 @@ async fn rebind_repository_with_after_commit<F, Fut>(
     owner: &str,
     repo_name: &str,
     new_owner: &str,
-    new_repo_name: &str,
+    new_repo_name: Option<&str>,
     repo_root: &std::path::Path,
     blob_storage: &dyn BlobStorage,
     oci_storage: &crate::package_registry::oci::storage::OciStorage,
@@ -4086,9 +4202,13 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let repo = find_repo_by_owner_name(db, owner, repo_name)
+    let (repo, owner) = find_repo_and_namespace_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))?;
+    let owner = owner.as_str();
+    let repo_name = repo.name.clone();
+    let repo_name = repo_name.as_str();
+    let new_repo_name = new_repo_name.unwrap_or(repo_name);
 
     // The personal namespace's rule is the row's own: `owner_id`, nobody else.
     // An organization repository's rule is its membership's `owner` role,
