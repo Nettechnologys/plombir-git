@@ -113,7 +113,7 @@ pub fn run_args(job: &JobContainer<'_>) -> Result<Vec<String>, JobContainerRefus
         args.extend(["--user".to_string(), user.clone()]);
     }
     for (key, _) in job.variables {
-        if key != "HOME" {
+        if crate::job_environment::reaches_container(key) {
             args.extend(["-e".to_string(), key.clone()]);
         }
     }
@@ -129,18 +129,63 @@ pub fn run_args(job: &JobContainer<'_>) -> Result<Vec<String>, JobContainerRefus
     Ok(args)
 }
 
-/// Give a `docker` command the job's variables as its environment.
+/// Give a `docker` command its environment: the operator's, reduced to what
+/// the CLI and its credential helpers read, plus the job's variables.
 ///
 /// The values travel in the environment of the Docker CLI, so the daemon can
 /// forward them with `-e NAME` and they never show up in the host's process
-/// arguments. A job's `HOME` is skipped: it is the host path, and the CLI reads
-/// its own configuration from its own `HOME`.
+/// arguments. That environment belongs to a host process, so it starts empty
+/// and a job variable that would reconfigure the CLI or a helper it starts
+/// (`LD_PRELOAD`, `DOCKER_HOST`, `AWS_CONFIG_FILE`, …) is left out — see
+/// [`crate::job_environment`] and [`left_out_variables`].
 pub fn apply_environment(command: &mut tokio::process::Command, variables: &[(String, String)]) {
+    command
+        .env_clear()
+        .envs(crate::job_environment::docker_cli_environment());
     for (key, value) in variables {
-        if key != "HOME" {
+        if crate::job_environment::reaches_container(key) {
             command.env(key, value);
         }
     }
+}
+
+/// Variables both runners give every job for running on the host: the host's
+/// `PATH` and `LANG`, and the workspace as `HOME`. A container takes these from
+/// its image, so leaving them out is not something to report.
+const RUNNER_PROVIDED_VARIABLES: &[&str] = &["PATH", "LANG", "HOME"];
+
+/// The job's variables a container does not receive, by name, sorted.
+pub fn left_out_variables(variables: &[(String, String)]) -> Vec<String> {
+    variables
+        .iter()
+        .map(|(key, _)| key)
+        .filter(|key| {
+            !crate::job_environment::reaches_container(key)
+                && !RUNNER_PROVIDED_VARIABLES.contains(&key.as_str())
+        })
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The line a job log gets for [`left_out_variables`], if there are any. Each
+/// runner prefixes it the way it marks its own lines.
+///
+/// The pipeline still runs: refusing it for `env: HTTP_PROXY` or `LANG` would
+/// break configurations that are common in the wild, and the container never
+/// needed the runner's copy. The author reads the log, so that is where the
+/// names go.
+pub fn left_out_variables_notice(variables: &[(String, String)]) -> Option<String> {
+    let left_out = left_out_variables(variables);
+    (!left_out.is_empty()).then(|| {
+        format!(
+            "WARNING: not passed to the container: {}. These names configure the runner's own \
+             docker client or are not valid variable names; set the value under another name and \
+             export it in the script if the job needs it.",
+            left_out.join(", ")
+        )
+    })
 }
 
 /// A `docker` client that is dropped with its future.
@@ -203,6 +248,82 @@ mod tests {
         assert!(
             !args.iter().any(|arg| arg == "secret"),
             "secret leaked: {args:?}"
+        );
+    }
+
+    /// card_a79579f79c29: a job variable became the environment of the host
+    /// `docker` CLI, so `LD_PRELOAD` or `DOCKER_HOST` reconfigured a process
+    /// outside the container.
+    #[test]
+    fn a_host_sensitive_job_variable_reaches_neither_the_argv_nor_the_notice_silently() {
+        let variables = [
+            ("DEPLOY_TARGET".to_string(), "prod".to_string()),
+            ("LD_PRELOAD".to_string(), "/workspace/evil.so".to_string()),
+            (
+                "DOCKER_HOST".to_string(),
+                "tcp://203.0.113.9:2375".to_string(),
+            ),
+            ("node-version".to_string(), "20".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("HOME".to_string(), "/srv/runner/jobs/7".to_string()),
+        ];
+        let args = run_args(&job(Path::new("/srv/repo"), &variables)).unwrap();
+        assert!(has_pair(&args, "-e", "DEPLOY_TARGET"), "{args:?}");
+        for name in ["LD_PRELOAD", "DOCKER_HOST", "node-version", "PATH"] {
+            assert!(!has_pair(&args, "-e", name), "{name}: {args:?}");
+        }
+        assert_eq!(
+            left_out_variables(&variables),
+            ["DOCKER_HOST", "LD_PRELOAD", "node-version"]
+        );
+        let notice = left_out_variables_notice(&variables).expect("a notice");
+        assert!(
+            notice.contains("WARNING") && notice.contains("DOCKER_HOST, LD_PRELOAD, node-version"),
+            "{notice}"
+        );
+        assert_eq!(
+            left_out_variables_notice(&variables[..1]),
+            None,
+            "nothing was left out, so nothing is reported"
+        );
+    }
+
+    /// The CLI's environment is built, not inherited: the runner's own
+    /// variables stay behind unless the CLI needs them, and a job variable is
+    /// only there when a container may receive it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_docker_client_environment_is_the_allow_list_plus_container_variables() {
+        assert!(
+            std::env::var_os("CARGO_PKG_NAME").is_some(),
+            "cargo sets this in every test process; it is the runner-side canary"
+        );
+        let variables = [
+            ("DEPLOY_TARGET".to_string(), "prod".to_string()),
+            ("LD_PRELOAD".to_string(), "/workspace/evil.so".to_string()),
+            (
+                "DOCKER_HOST".to_string(),
+                "tcp://203.0.113.9:2375".to_string(),
+            ),
+        ];
+        let mut command = client("env");
+        apply_environment(&mut command, &variables);
+        let output = command.output().await.expect("run env");
+        let environment = String::from_utf8(output.stdout).expect("utf-8 env");
+        let names: Vec<&str> = environment
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+            .collect();
+        assert!(names.contains(&"DEPLOY_TARGET"), "{names:?}");
+        for name in ["LD_PRELOAD", "CARGO_PKG_NAME"] {
+            assert!(
+                !names.contains(&name),
+                "{name} reached the docker client: {names:?}"
+            );
+        }
+        assert!(
+            !environment.contains("203.0.113.9"),
+            "the job's DOCKER_HOST reached the docker client"
         );
     }
 

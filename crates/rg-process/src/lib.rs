@@ -14,6 +14,7 @@ use std::time::Duration;
 pub mod client_policy;
 pub mod docker_job;
 pub mod image_reference;
+pub mod job_environment;
 mod retired_environment;
 pub mod workspace_archive;
 

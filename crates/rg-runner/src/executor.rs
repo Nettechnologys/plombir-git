@@ -219,6 +219,14 @@ pub(crate) async fn run_job_docker(
             if code != 0 && log.is_empty() {
                 log = format!("Docker exited with code {}", code);
             }
+            if let Some(notice) = rg_process::docker_job::left_out_variables_notice(variables) {
+                if !log.is_empty() && !log.ends_with('\n') {
+                    log.push('\n');
+                }
+                log.push_str("[plombir-git-runner] ");
+                log.push_str(&notice);
+                log.push('\n');
+            }
             (code, log)
         }
         Err(e) => (-1, format!("Failed to run docker: {}", e)),

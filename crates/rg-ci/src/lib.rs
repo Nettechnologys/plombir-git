@@ -1054,6 +1054,23 @@ impl PipelineGraph<'_> {
                         },
                     )?;
                 }
+                // A name a process cannot carry is never delivered, and
+                // `PATH=/tmp` would be read as `PATH`: that is the file being
+                // wrong, so it is refused here. A *valid* name the runner keeps
+                // for itself (`CI`, `LANG`, `HTTP_PROXY`) is not — the runner
+                // drops it and says so in the job log (card_a79579f79c29).
+                if let Some(name) = variant
+                    .variables
+                    .keys()
+                    .find(|name| !rg_process::job_environment::valid_environment_name(name))
+                {
+                    return Err(rg_core::error::invalid_request(format!(
+                        "job '{}' sets the variable '{}', which is not a valid environment \
+                         variable name (letters, digits and '_', not starting with a digit)",
+                        variant.name,
+                        name.escape_debug()
+                    )));
+                }
                 let tags_json = fields
                     .tags
                     .as_ref()
@@ -1833,6 +1850,10 @@ fn resolve_action_job_fields(
     })
 }
 
+fn matrix_variable_name(key: &str) -> String {
+    format!("MATRIX_{}", key.to_ascii_uppercase().replace('-', "_"))
+}
+
 fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<MatrixVariant>> {
     let base: std::collections::BTreeMap<String, String> = config
         .variables
@@ -1868,6 +1889,20 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
             "job '{job_name}' matrix expands to {count} variants; maximum is 256"
         )));
     }
+    // A matrix key is what the variant is labelled with, and its variable is
+    // the derived `MATRIX_<KEY>`: `node-version` is a common key and becomes
+    // `MATRIX_NODE_VERSION`. That derived name has to be one a process can
+    // carry; the key itself only becomes a variable as well when it already is.
+    for key in matrix.keys() {
+        let derived = matrix_variable_name(key);
+        if !rg_process::job_environment::valid_environment_name(&derived) {
+            return Err(rg_core::error::invalid_request(format!(
+                "job '{job_name}' matrix key '{key}' gives the variable name '{derived}', which is \
+                 not a valid environment variable name (letters, digits and '_', and '-' in the \
+                 key)"
+            )));
+        }
+    }
     let mut variants = vec![(Vec::<(String, String)>::new(), base)];
     for (key, values) in matrix {
         let mut next = Vec::new();
@@ -1876,11 +1911,10 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
                 let mut labels = labels.clone();
                 labels.push((key.clone(), value.clone()));
                 let mut variables = variables.clone();
-                variables.insert(key.clone(), value.clone());
-                variables.insert(
-                    format!("MATRIX_{}", key.to_ascii_uppercase().replace('-', "_")),
-                    value.clone(),
-                );
+                if rg_process::job_environment::valid_environment_name(key) {
+                    variables.insert(key.clone(), value.clone());
+                }
+                variables.insert(matrix_variable_name(key), value.clone());
                 next.push((labels, variables));
             }
         }
@@ -3910,6 +3944,71 @@ mod matrix_tests {
                 .0
                 .is_empty()
         );
+    }
+
+    /// card_a79579f79c29: a hyphenated matrix key and a variable the runner
+    /// sets itself (`CI`) are ordinary in the wild and must keep triggering.
+    /// The matrix variable is the derived `MATRIX_NODE_VERSION`; the raw key is
+    /// not a name a process can carry and is not stored as one.
+    #[tokio::test]
+    async fn a_hyphenated_matrix_key_and_a_reserved_variable_still_trigger() {
+        let (temp, sha, db, user, repo) = concurrency_fixture(
+            b"build:\n  script: [echo one]\n  variables:\n    CI: 'true'\n    LANG: C.UTF-8\n  matrix:\n    node-version: ['18', '20']\n",
+            "hyphen-matrix.db",
+        )
+        .await;
+
+        let pipeline_id = trigger_pipeline_with_barrier(
+            concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push"),
+            &CiNotifications::default(),
+            None,
+        )
+        .await
+        .expect("a hyphenated matrix key and `CI: true` must not refuse the pipeline");
+
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        let mut versions: Vec<String> = jobs
+            .iter()
+            .map(|job| {
+                let variables: std::collections::BTreeMap<String, String> =
+                    serde_json::from_str(job.variables.as_deref().expect("job variables")).unwrap();
+                assert!(
+                    !variables.contains_key("node-version"),
+                    "the raw key is not a variable name: {variables:?}"
+                );
+                assert_eq!(variables.get("CI").map(String::as_str), Some("true"));
+                variables["MATRIX_NODE_VERSION"].clone()
+            })
+            .collect();
+        versions.sort();
+        assert_eq!(versions, ["18", "20"]);
+    }
+
+    /// The 400 is kept for a name no process can carry.
+    #[tokio::test]
+    async fn a_variable_name_no_process_can_carry_stops_the_trigger() {
+        let (temp, sha, db, user, repo) = concurrency_fixture(
+            b"build:\n  script: [echo one]\n  variables:\n    BAD-NAME: x\n",
+            "bad-variable-name.db",
+        )
+        .await;
+
+        let error = trigger_pipeline_with_barrier(
+            concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push"),
+            &CiNotifications::default(),
+            None,
+        )
+        .await
+        .expect_err("a variable name a process cannot carry must be refused");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("'BAD-NAME'"), "{error:#}");
     }
 
     async fn seed_environment(db: &rg_db::DatabaseConnection, repo_id: i64, name: &str) {

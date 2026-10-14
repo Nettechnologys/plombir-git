@@ -167,6 +167,12 @@ So a default instance — Docker execution off, host execution off, no external
 runners — runs no job at all. The operator turns one of the three on first; with
 Docker on, every job wants an `image`.
 
+The value must be an image reference, `[registry[:port]/]path[:tag][@digest]`
+(an IPv6 registry is written in brackets, digests are `sha256:`, `sha384:` or
+`sha512:`). Anything else — `--privileged`, `-v/:/host` — is refused when the
+pipeline is created, with the job and the rule in the error, and the runners
+refuse it again before `docker run`.
+
 ### `only`
 
 Plain string equality against the ref — no globs, no patterns. Each entry is
@@ -177,8 +183,17 @@ nothing is left out of the pipeline.
 ### `variables`
 
 Exported into the job's environment. Names must look like `[A-Za-z_][A-Za-z0-9_]*`;
-a name that does not, or one that collides with a reserved runner variable
-(`CI_*`), is ignored with a warning rather than overriding the runner.
+a name that does not is refused when the pipeline is created. A name the runner
+sets itself (`CI`, `CI_*`) is ignored, and the job log says which ones.
+
+A job that runs in a container gets its variables through the runner's own
+`docker` client, which runs on the host. Names that would reconfigure that
+client or a credential helper it starts — `PATH`, `HOME`, `LANG`, `LC_*`,
+`TMPDIR`, `LD_*`, `DOCKER_*`, `*_PROXY`, `SSL_CERT_*`, the Go runtime's
+`GOMAXPROCS`/`GOGC`/`GODEBUG`/…, `AWS_*` other than the access key, secret,
+session token and region, `GOOGLE_APPLICATION_CREDENTIALS`, `CLOUDSDK_*` — are
+not passed to the container, and the job log names each one. Set the value
+under another name and export it in the script if the job needs it.
 
 The runner supplies these on its own: `CI_PIPELINE_ID`, `CI_COMMIT_SHA`,
 `CI_SHA`, `CI_REF`, `CI_EVENT`, `CI_REPOSITORY`, `CI_REPOSITORY_OWNER`, and —
@@ -302,7 +317,9 @@ test:
 - Each variant is named after the job plus its coordinates, e.g.
   `test [features=default, os=linux]`.
 - Each dimension is exported to the script upper-cased and prefixed:
-  `MATRIX_OS`, `MATRIX_FEATURES`. The job's own `variables` are present too.
+  `MATRIX_OS`, `MATRIX_FEATURES`; a `-` in the key becomes `_`, so
+  `node-version` is `MATRIX_NODE_VERSION`. The job's own `variables` are present
+  too.
 - The product is capped at **256 variants**, and a dimension with an empty list
   is refused — both name the job in the error.
 

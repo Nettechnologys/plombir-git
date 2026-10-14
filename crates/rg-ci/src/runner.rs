@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 
 use rg_db::ops::pipeline_ops;
+use rg_process::job_environment::valid_environment_name;
 
 /// A healthy embedded job must report liveness well inside the HTTP watchdog's
 /// ten-minute stale window. External runners do the same through their 30s
@@ -1049,7 +1050,7 @@ impl PipelineRunner {
         } else {
             None
         };
-        let (job_environment, secret_values) = self
+        let (job_environment, secret_values, ignored_variables) = self
             .job_environment(ci_job_token.as_deref(), variables)
             .await?;
         let cache = cache_spec(cache_key, cache_paths, &job_environment)?;
@@ -1058,6 +1059,22 @@ impl PipelineRunner {
         // is reading the job log, not the server's. Collected here and appended
         // to the job output below.
         let mut cache_notices: Vec<String> = Vec::new();
+        // The same goes for a variable the job set and does not get. Refusing
+        // the pipeline over `env: CI: true` or `LANG` would break files that are
+        // common in the wild (card_a79579f79c29), so the variable is dropped and
+        // the author is told by name.
+        if !ignored_variables.is_empty() {
+            cache_notices.push(format!(
+                "WARNING: CI variables ignored: {}. The runner sets these names itself, or they \
+                 are not valid variable names.",
+                ignored_variables.join(", ")
+            ));
+        }
+        if image.is_some() {
+            cache_notices.extend(rg_process::docker_job::left_out_variables_notice(
+                &job_environment,
+            ));
+        }
         if let Some((key, _)) = &cache {
             if let Err(error) = self.restore_cache(key).await {
                 tracing::warn!(
@@ -1371,12 +1388,13 @@ impl PipelineRunner {
         &self,
         ci_job_token: Option<&str>,
         variables: Option<&str>,
-    ) -> Result<(Vec<(String, String)>, Vec<String>)> {
+    ) -> Result<(Vec<(String, String)>, Vec<String>, Vec<String>)> {
         let pipeline = pipeline_ops::get_pipeline(&self.db, self.pipeline_id)
             .await?
             .context("pipeline not found while preparing job environment")?;
         let mut env = std::collections::BTreeMap::new();
         let mut secret_values = Vec::new();
+        let mut ignored = std::collections::BTreeSet::new();
         if let Some(json) = variables {
             let configured: std::collections::HashMap<String, String> =
                 serde_json::from_str(json).context("invalid stored CI job variables")?;
@@ -1384,7 +1402,7 @@ impl PipelineRunner {
                 if valid_environment_name(&key) && !is_reserved_ci_variable(&key) {
                     env.insert(key, value);
                 } else {
-                    tracing::warn!(variable = %key, "ignoring invalid or reserved CI variable");
+                    ignored.insert(key);
                 }
             }
         }
@@ -1397,6 +1415,7 @@ impl PipelineRunner {
                     if !valid_environment_name(&secret.name)
                         || is_reserved_ci_variable(&secret.name)
                     {
+                        ignored.insert(secret.name);
                         continue;
                     }
                     let value = rg_core::auth::encryption::decrypt(&secret.encrypted_value, &key)
@@ -1439,7 +1458,11 @@ impl PipelineRunner {
             "HOME".into(),
             self.workspace_path().to_string_lossy().into_owned(),
         );
-        Ok((env.into_iter().collect(), secret_values))
+        Ok((
+            env.into_iter().collect(),
+            secret_values,
+            ignored.into_iter().collect(),
+        ))
     }
 
     fn workspace_path(&self) -> std::path::PathBuf {
@@ -2026,12 +2049,6 @@ fn cache_spec(
     Ok(Some((key, paths)))
 }
 
-fn valid_environment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
-        && chars.all(|ch| matches!(ch, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
-}
-
 fn is_reserved_ci_variable(name: &str) -> bool {
     rg_core::ci::is_builtin_ci_variable(name) || matches!(name, "HOME" | "PATH")
 }
@@ -2423,6 +2440,32 @@ mod tests {
         .await
         .unwrap();
         cache_runner_on(db, root, repository.id, "refs/heads/main").await
+    }
+
+    /// card_a79579f79c29: a name the runner keeps for itself is dropped and
+    /// named, never a reason to fail the job, and the runner's own value wins.
+    #[tokio::test]
+    async fn reserved_and_invalid_job_variables_are_ignored_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = cache_runner(temp.path()).await;
+        let (environment, _, ignored) = runner
+            .job_environment(
+                None,
+                Some(r#"{"CI":"false","CI_JOB_TOKEN":"forged","BAD-NAME":"x","DEPLOY":"prod"}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ignored, ["BAD-NAME", "CI", "CI_JOB_TOKEN"]);
+        let value = |name: &str| {
+            environment
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(value("CI"), Some("true"));
+        assert_eq!(value("DEPLOY"), Some("prod"));
+        assert_eq!(value("CI_JOB_TOKEN"), None);
+        assert_eq!(value("BAD-NAME"), None);
     }
 
     /// A runner for a pipeline on `ref_name` of `repo_id`, in `db`.

@@ -287,7 +287,9 @@ Jobs run on the **embedded runner** by default, or on **external runners**
 Jobs with an `image` can be executed in Docker (`--docker`). The image must be
 an image reference (`rg_process::image_reference`): it is checked when the
 pipeline is created and again by both runners, and `docker run` receives it
-after `--`. Each stream of a job's output is kept to a bounded beginning and a
+after `--`. The `docker` client starts from an allow-listed copy of the
+operator's environment, and a job variable that would reconfigure it is not
+passed (`rg_process::job_environment`). Each stream of a job's output is kept to a bounded beginning and a
 bounded end, with the omitted middle marked (`rg_process::CapturedStream`). Job
 logs stream to the UI over a WebSocket (`/ws/job/:job_id`); artifacts are stored
 and served through the REST API.
