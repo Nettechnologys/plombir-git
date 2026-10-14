@@ -761,6 +761,25 @@ async fn run_with_listener(
         config.repo_root.join("_oci_uploads"),
         Some(config.repo_root.clone()),
     ));
+    // Before the registry serves anything: layers and manifests written under
+    // another spelling of a repository's namespace — on a collation that
+    // equates `alice/myrepo` with `Alice/MyRepo` — move to the row's own, where
+    // deletion and transfer look for them (card_7e82c1b1f642). A no-op on a
+    // database that matches names exactly; never fails the start.
+    let folded = rg_core::package_registry::oci::namespace::fold_variant_namespaces(
+        &config.db,
+        &oci_storage,
+    )
+    .await;
+    if folded != rg_core::package_registry::oci::namespace::FoldReport::default() {
+        tracing::info!(
+            namespaces = folded.namespaces,
+            objects = folded.objects,
+            rows = folded.rows,
+            failed = folded.failed,
+            "moved OCI objects stored under another spelling of their repository's namespace"
+        );
+    }
 
     let db_write = config.db_write.clone().unwrap_or_else(|| config.db.clone());
     // The log queue serializes appends and full-log replacements, and each

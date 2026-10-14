@@ -462,14 +462,38 @@ pub async fn find_repo_by_owner_name(
     owner: &str,
     repo_name: &str,
 ) -> Result<Option<rg_db::entities::repository::Model>> {
+    Ok(find_repo_and_namespace_by_owner_name(db, owner, repo_name)
+        .await?
+        .map(|(repository, _)| repository))
+}
+
+/// [`find_repo_by_owner_name`], plus the owner's name as its row spells it.
+///
+/// The address a request names and the namespace it resolves to are not the
+/// same string everywhere: on MySQL's default collation `alice/myrepo` finds
+/// `Alice/MyRepo`. Whatever derives a durable name from the address — a
+/// storage key, a path on disk — takes it from here rather than from the
+/// request, so two spellings of one repository cannot write two copies of it.
+/// The repository's own spelling is `repository.name`.
+pub async fn find_repo_and_namespace_by_owner_name(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo_name: &str,
+) -> Result<Option<(rg_db::entities::repository::Model, String)>> {
     // Try as user
     if let Some(user) = user_ops::find_by_username(db, owner).await? {
-        return repo_ops::find_personal_by_owner_and_name(db, user.id, repo_name).await;
+        return Ok(
+            repo_ops::find_personal_by_owner_and_name(db, user.id, repo_name)
+                .await?
+                .map(|repository| (repository, user.username)),
+        );
     }
 
     // Try as organization
     if let Some(org) = rg_db::ops::org_ops::get_org_by_name(db, owner).await? {
-        return repo_ops::find_by_org_and_name(db, org.id, repo_name).await;
+        return Ok(repo_ops::find_by_org_and_name(db, org.id, repo_name)
+            .await?
+            .map(|repository| (repository, org.name)));
     }
 
     Ok(None)

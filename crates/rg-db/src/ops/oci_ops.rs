@@ -703,6 +703,38 @@ pub async fn list_mature_blobs(
         .await
 }
 
+/// Every blob row of one OCI repository, for the startup pass that folds
+/// blobs stored under another spelling of its namespace into the row's own.
+pub async fn list_blobs(
+    db: &DatabaseConnection,
+    oci_repo_id: i64,
+) -> Result<Vec<oci_blob::Model>, DbErr> {
+    oci_blob::Entity::find()
+        .filter(oci_blob::Column::OciRepositoryId.eq(oci_repo_id))
+        .order_by_asc(oci_blob::Column::Id)
+        .all(db)
+        .await
+}
+
+/// Point a blob row at the key its bytes live under now. Keyed by id, so the
+/// write cannot reach another row whatever the collation thinks of the old key.
+pub async fn set_blob_storage_path(
+    db: &DatabaseConnection,
+    id: i64,
+    storage_path: &str,
+) -> Result<bool, DbErr> {
+    Ok(oci_blob::Entity::update_many()
+        .col_expr(
+            oci_blob::Column::StoragePath,
+            Expr::value(storage_path.to_string()),
+        )
+        .filter(oci_blob::Column::Id.eq(id))
+        .exec(db)
+        .await?
+        .rows_affected
+        > 0)
+}
+
 pub async fn delete_blob_by_id(db: &DatabaseConnection, id: i64) -> Result<bool, DbErr> {
     Ok(oci_blob::Entity::delete_by_id(id)
         .exec(db)

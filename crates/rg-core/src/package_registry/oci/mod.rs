@@ -6,6 +6,7 @@
 //! - Chunked upload support
 
 pub mod manifest;
+pub mod namespace;
 pub mod publication;
 pub mod storage;
 pub mod types;

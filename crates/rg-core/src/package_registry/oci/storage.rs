@@ -895,6 +895,195 @@ impl OciStorage {
             .filter(|path| path.is_file()))
     }
 
+    /// The key a blob row recorded, when it is not the one `owner/repo` spells
+    /// now: a blob written under another spelling of the same namespace, before
+    /// storage keys followed the repository row (card_7e82c1b1f642).
+    ///
+    /// Only a key of the same shape, for the same digest, is ever tried — the
+    /// row narrows which namespace spelling, never which object.
+    fn recorded_blob_key(
+        &self,
+        owner: &str,
+        repo: &str,
+        digest: &str,
+        recorded: Option<&str>,
+    ) -> anyhow::Result<Option<BlobKey>> {
+        let Some(recorded) = recorded else {
+            return Ok(None);
+        };
+        let canonical = self.blob_key(owner, repo, digest)?;
+        let recorded = BlobKey::new(recorded)?;
+        let tail = |key: &BlobKey| -> Option<(String, String)> {
+            let segments: Vec<&str> = key.as_str().split('/').collect();
+            (segments.len() == 7 && segments[0] == "oci")
+                .then(|| (segments[0].to_string(), segments[3..].join("/")))
+        };
+        let same_object = matches!(
+            (tail(&canonical), tail(&recorded)),
+            (Some(canonical_tail), Some(recorded_tail)) if canonical_tail == recorded_tail
+        );
+        Ok((same_object && recorded != canonical).then_some(recorded))
+    }
+
+    /// [`Self::blob_exists`], then the key the blob's row recorded.
+    pub async fn blob_exists_or_recorded(
+        &self,
+        owner: &str,
+        repo: &str,
+        digest: &str,
+        recorded: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        if self.blob_exists(owner, repo, digest).await? {
+            return Ok(true);
+        }
+        match self.recorded_blob_key(owner, repo, digest, recorded)? {
+            Some(key) => Ok(self.backend.exists(&key).await?),
+            None => Ok(false),
+        }
+    }
+
+    /// [`Self::blob_local_path`], then the key the blob's row recorded.
+    pub fn blob_local_path_or_recorded(
+        &self,
+        owner: &str,
+        repo: &str,
+        digest: &str,
+        recorded: Option<&str>,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        if let Some(path) = self.blob_local_path(owner, repo, digest)? {
+            return Ok(Some(path));
+        }
+        Ok(self
+            .recorded_blob_key(owner, repo, digest, recorded)?
+            .and_then(|key| self.backend.local_path(&key))
+            .filter(|path| path.is_file()))
+    }
+
+    /// [`Self::read_blob`], then the key the blob's row recorded.
+    pub async fn read_blob_or_recorded(
+        &self,
+        owner: &str,
+        repo: &str,
+        digest: &str,
+        recorded: Option<&str>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let error = match self.read_blob(owner, repo, digest).await {
+            Err(error) if error.downcast_ref::<crate::error::NotFound>().is_some() => error,
+            other => return other,
+        };
+        let Some(key) = self.recorded_blob_key(owner, repo, digest, recorded)? else {
+            return Err(error);
+        };
+        match self.backend.get(&key).await {
+            Ok(data) => Ok(data),
+            Err(crate::blob_storage::BlobStorageError::NotFound(_)) => Err(error),
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    /// The key prefix every completed blob and manifest of `owner/repo` lives
+    /// under — percent-encoded the way every key is.
+    pub fn repository_prefix(owner: &str, repo: &str) -> anyhow::Result<BlobKey> {
+        Self::repository_blob_prefix(owner, repo)
+    }
+
+    /// Fold every object stored under the namespace prefix `source` (as a key
+    /// spells it, e.g. `oci/alice/myrepo`) into `owner/repo` — the spelling the
+    /// repository's row carries.
+    ///
+    /// On a database whose collation equates `alice/myrepo` with
+    /// `Alice/MyRepo`, keys used to be built from whichever spelling the request
+    /// used, so one repository's layers and manifests could sit under several
+    /// prefixes while deletion and transfer walk only the row's. Returns how
+    /// many objects moved.
+    ///
+    /// Keys are content-addressed, so an object already present under the
+    /// destination is the same bytes and the source copy is simply dropped. On
+    /// a case-insensitive filesystem the two spellings are one directory: an
+    /// object that is its own destination is left alone, never deleted.
+    pub async fn merge_namespace(
+        &self,
+        source: &BlobKey,
+        owner: &str,
+        repo: &str,
+    ) -> anyhow::Result<usize> {
+        let destination = Self::repository_blob_prefix(owner, repo)?;
+        if source.as_str().split('/').count() != 3 || !source.as_str().starts_with("oci/") {
+            anyhow::bail!("{source} is not an OCI repository namespace prefix");
+        }
+        let source = source.clone();
+        if source == destination {
+            return Ok(0);
+        }
+        let objects = self.backend.list(Some(&source)).await?;
+        if objects.is_empty() {
+            return Ok(0);
+        }
+        // One rename when the row's spelling holds nothing yet. A backend
+        // without an atomic prefix move, or a destination directory that
+        // exists empty, falls through to the object-by-object path.
+        if self.backend.list(Some(&destination)).await?.is_empty()
+            && matches!(
+                self.backend.move_prefix(&source, &destination).await,
+                Ok(true)
+            )
+        {
+            return Ok(objects.len());
+        }
+
+        let mut moved = 0;
+        for object in objects {
+            let Some(rest) = object
+                .key
+                .as_str()
+                .strip_prefix(source.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+            else {
+                continue;
+            };
+            let target = BlobKey::new(format!("{}/{rest}", destination.as_str()))?;
+            if self.is_same_object(&object.key, &target) {
+                continue;
+            }
+            if !self.backend.exists(&target).await? {
+                match self.backend.local_path(&object.key) {
+                    Some(path) => self.backend.put_file(&target, &path).await?,
+                    None => {
+                        let data = self.backend.get(&object.key).await?;
+                        self.backend.put(&target, &data).await?
+                    }
+                };
+            }
+            self.backend.delete(&object.key).await?;
+            moved += 1;
+        }
+        Ok(moved)
+    }
+
+    /// Whether the backend holds an object under exactly `storage_path` — no
+    /// legacy layout, no fallback.
+    pub(crate) async fn has_object(&self, storage_path: &str) -> anyhow::Result<bool> {
+        Ok(self.backend.exists(&BlobKey::new(storage_path)?).await?)
+    }
+
+    /// Whether two keys name one file on disk — two spellings of a path on a
+    /// case-insensitive filesystem. Keys of a backend without local paths are
+    /// distinct whenever their strings are.
+    fn is_same_object(&self, left: &BlobKey, right: &BlobKey) -> bool {
+        match (
+            self.backend.local_path(left),
+            self.backend.local_path(right),
+        ) {
+            (Some(left), Some(right)) => {
+                match (std::fs::canonicalize(&left), std::fs::canonicalize(&right)) {
+                    (Ok(left), Ok(right)) => left == right,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     pub async fn copy_blob_file(
         &self,
         src_owner: &str,
