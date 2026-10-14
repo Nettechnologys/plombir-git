@@ -59,6 +59,40 @@ async fn an_unreachable_smtp_relay_fails_no_probe() {
     );
 }
 
+/// `/readyz` and `/health` are public: a failed check names its state in the
+/// body and its cause — the errno, the absolute `repo_root`, a database
+/// error — in the log only (card_16bc00d453c0).
+#[tokio::test]
+async fn a_failed_probe_names_its_state_and_not_its_cause() {
+    let (db, dir) = crate::common::setup_test_db().await;
+    let repo_root = dir.path().join("not-mounted").join("repos");
+    let state = crate::common::build_test_app_state_with(
+        db,
+        repo_root.clone(),
+        crate::common::StateOverrides::default(),
+    );
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+
+    for probe in ["/readyz", "/health"] {
+        let resp = client.get(format!("{base}{probe}")).send().await.unwrap();
+        assert_eq!(resp.status(), 503, "{probe}");
+        let text = resp.text().await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["checks"]["filesystem"], "missing", "{probe}: {body}");
+        assert!(
+            !text.contains("not-mounted") && !text.contains("No such file"),
+            "{probe} put the cause in a public body: {text}"
+        );
+    }
+    drop(dir);
+}
+
 // ── User registration ────────────────────────────────────────────
 
 #[tokio::test]

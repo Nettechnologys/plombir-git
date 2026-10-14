@@ -380,9 +380,8 @@ async fn authorize_url(
             .ok_or_else(|| anyhow::anyhow!("no auth URL for provider: {}", config.slug))?,
     };
 
-    let mut url = format!(
-        "{}?client_id={}&redirect_uri={}&scope={}&state={}&response_type=code&code_challenge={}&code_challenge_method=S256",
-        base_url,
+    let mut ours = format!(
+        "client_id={}&redirect_uri={}&scope={}&state={}&response_type=code&code_challenge={}&code_challenge_method=S256",
         urlencoding::encode(&config.client_id),
         urlencoding::encode(&config.redirect_url),
         urlencoding::encode(&scopes),
@@ -390,10 +389,21 @@ async fn authorize_url(
         urlencoding::encode(&code_challenge),
     );
     if let Some(max_age) = max_age_seconds.filter(|_| config.provider_type == "oidc") {
-        url.push_str(&format!("&max_age={max_age}"));
+        ours.push_str(&format!("&max_age={max_age}"));
     }
+    // Appended to whatever query the endpoint already carries rather than
+    // after a literal `?`: Azure AD B2C names its policy in the authorization
+    // endpoint itself (`…/authorize?p=b2c_1_signin`), and a second `?` would
+    // fold our parameters into the value of `p`.
+    let mut url = reqwest::Url::parse(&base_url)
+        .with_context(|| format!("invalid authorization endpoint '{base_url}'"))?;
+    let query = match url.query().filter(|query| !query.is_empty()) {
+        Some(existing) => format!("{existing}&{ours}"),
+        None => ours,
+    };
+    url.set_query(Some(&query));
 
-    Ok((url, csrf_state, code_verifier))
+    Ok((url.into(), csrf_state, code_verifier))
 }
 
 // ── Talking to a host we do not own ──────────────────────────────
@@ -809,7 +819,19 @@ struct OidcEndpoints {
 }
 
 impl OidcEndpoints {
+    /// All three endpoints the discovery document names, the authorization one
+    /// included: the browser carries the PKCE challenge and `state` there, and
+    /// a plaintext hop is where an on-path attacker swaps the login page.
+    ///
+    /// The document's `issuer` is deliberately not compared with the discovery
+    /// URL. The operator chose that URL and TLS authenticated its server; the
+    /// comparison breaks Microsoft Entra multi-tenant (`/common/` publishes
+    /// the literal `https://login.microsoftonline.com/{tenantid}/v2.0`) and
+    /// Azure AD B2C (a discovery URL with a `?p=` query), and protects nothing
+    /// here — the login never validates an `id_token`'s `iss`, the profile comes
+    /// from userinfo, and whoever serves the document can echo any issuer.
     fn require_confidential_transport(&self, policy: &OidcTransportPolicy) -> Result<()> {
+        policy.require_confidential_endpoint(&self.authorization_endpoint, "authorization")?;
         policy.require_confidential_endpoint(&self.token_endpoint, "token")?;
         policy.require_confidential_endpoint(&self.userinfo_endpoint, "userinfo")
     }
@@ -928,6 +950,147 @@ fn default_oidc_token_url(slug: &str) -> Option<String> {
     match slug {
         "google" => Some("https://oauth2.googleapis.com/token".into()),
         _ => None,
+    }
+}
+
+/// Discovery documents of real multi-tenant providers, served from loopback
+/// (card_16bc00d453c0, decision card_b62b4302e488).
+#[cfg(test)]
+mod discovery_tests {
+    use super::{oauth2_authorize_url, OidcTransportPolicy, SsoProviderConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Answer every request with `document`; returns the discovery URL (with
+    /// `query`, as B2C spells it) and the loopback origin it is served from.
+    async fn serve_discovery(document: serde_json::Value, query: &str) -> (String, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local IdP");
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let body = document.to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                // A client that hung up early is not this test's concern.
+                drop(socket.write_all(response.as_bytes()).await);
+            }
+        });
+        (
+            format!("{origin}/tenant/v2.0/.well-known/openid-configuration{query}"),
+            origin,
+        )
+    }
+
+    fn provider(discovery_url: String, origin: String) -> SsoProviderConfig {
+        SsoProviderConfig {
+            slug: "entra".into(),
+            provider_type: "oidc".into(),
+            client_id: "client-id".into(),
+            client_secret: "client-secret".into(),
+            redirect_url: "https://git.example/api/v1/auth/sso/entra/callback".into(),
+            scopes: vec!["openid".into(), "email".into()],
+            discovery_url: Some(discovery_url),
+            transport_policy: OidcTransportPolicy::parse(&[origin]).expect("loopback origin"),
+        }
+    }
+
+    /// `/common/v2.0` publishes the literal `{tenantid}` placeholder as its
+    /// issuer, which matches no discovery URL. A login must not depend on it.
+    #[tokio::test]
+    async fn entra_multi_tenant_discovery_with_a_placeholder_issuer_logs_in() {
+        let (discovery, origin) = serve_discovery(
+            serde_json::json!({
+                "issuer": "https://login.microsoftonline.com/{tenantid}/v2.0",
+                "authorization_endpoint": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+                "token_endpoint": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                "userinfo_endpoint": "https://graph.microsoft.com/oidc/userinfo",
+            }),
+            "",
+        )
+        .await;
+
+        let (url, state, _verifier) = oauth2_authorize_url(&provider(discovery, origin))
+            .await
+            .expect("an Entra multi-tenant discovery document must be usable");
+
+        assert!(
+            url.starts_with(
+                "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=client-id&"
+            ),
+            "{url}"
+        );
+        assert!(url.contains(&format!("&state={state}&")), "{url}");
+    }
+
+    /// B2C names its policy in a query on both the discovery URL and the
+    /// authorization endpoint; our parameters join that query instead of
+    /// starting a second one inside the value of `p`.
+    #[tokio::test]
+    async fn a_b2c_policy_query_survives_into_the_authorization_request() {
+        let (discovery, origin) = serve_discovery(
+            serde_json::json!({
+                "issuer": "https://tenant.b2clogin.com/0000-tenant-id/v2.0/",
+                "authorization_endpoint": "https://tenant.b2clogin.com/tenant.onmicrosoft.com/oauth2/v2.0/authorize?p=b2c_1_susi",
+                "token_endpoint": "https://tenant.b2clogin.com/tenant.onmicrosoft.com/oauth2/v2.0/token?p=b2c_1_susi",
+                "userinfo_endpoint": "https://tenant.b2clogin.com/tenant.onmicrosoft.com/openid/v2.0/userinfo?p=b2c_1_susi",
+            }),
+            "?p=b2c_1_susi",
+        )
+        .await;
+
+        let (url, _state, _verifier) = oauth2_authorize_url(&provider(discovery, origin))
+            .await
+            .expect("a B2C discovery URL with a policy query must be usable");
+
+        assert_eq!(url.matches('?').count(), 1, "{url}");
+        let parsed = reqwest::Url::parse(&url).expect("a valid URL");
+        let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+        assert!(
+            pairs.contains(&("p".into(), "b2c_1_susi".into())),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("client_id".into(), "client-id".into())),
+            "{pairs:?}"
+        );
+    }
+
+    /// The authorization endpoint is held to the same transport rule as the
+    /// token and userinfo endpoints: the browser carries `state` and the PKCE
+    /// challenge there.
+    #[tokio::test]
+    async fn a_plaintext_authorization_endpoint_is_refused() {
+        let (discovery, origin) = serve_discovery(
+            serde_json::json!({
+                "authorization_endpoint": "http://idp.example/authorize",
+                "token_endpoint": "https://idp.example/token",
+                "userinfo_endpoint": "https://idp.example/userinfo",
+            }),
+            "",
+        )
+        .await;
+
+        let error = oauth2_authorize_url(&provider(discovery, origin))
+            .await
+            .expect_err("a plaintext authorization endpoint must be refused");
+        assert!(
+            format!("{error:#}").contains("OIDC authorization endpoint uses plaintext HTTP"),
+            "{error:#}"
+        );
     }
 }
 
