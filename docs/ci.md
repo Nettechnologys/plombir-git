@@ -225,7 +225,9 @@ when the pipeline is triggered, naming the job and the reason.
 
 The name of an environment **the repository already has**, 1–255 characters, no
 control characters. If that environment is marked protected, the job waits for
-an approval instead of running.
+an approval instead of running. The job reads that environment's
+[secrets](#secrets-and-workload-identity), and its OIDC token names the
+environment instead of the ref.
 
 Environments are not created by naming them here. A name the repository has no
 environment for is refused when the pipeline is triggered, naming the job, the
@@ -290,6 +292,73 @@ the key:
 > job rows. If the setting is turned off and such a pipeline is retried, the
 > trigger-time check is long behind it — the runner's own refusal is what stops
 > those jobs from running here.
+
+## Secrets and workload identity
+
+Secrets are configured per repository under **Settings → CI secrets**. Each one
+is stored encrypted at rest, injected into a job's environment, and masked in
+the stored job log.
+
+A secret is either **repository-wide** or scoped to one **environment** of the
+repository:
+
+- A repository-wide secret reaches every job.
+- An environment's secret reaches only a job that declares that environment
+  with [`environment:`](#environment), and, when the environment is
+  protected, only after an approval has released the job to a runner. A job
+  that declares no environment reads no environment's secrets, whichever
+  branch or pull request it runs from, and a `staging` job never sees
+  `production`'s.
+- The same name can be set once per scope. Where a job reads both scopes and
+  both set a name, it gets the **environment's** value: a production deploy
+  receives production's `DEPLOY_TOKEN`, never the repository-wide one.
+
+An environment's secrets are only as strong as its protection. On an
+unprotected environment, any branch that can trigger a pipeline can declare
+the environment and read them; put deploy credentials behind a protected one.
+Deleting an environment deletes its secrets, and the audit entry for the
+deletion lists their names.
+
+### OIDC tokens
+
+A job also receives `CI_OIDC_TOKEN_URL` beside `CI_JOB_TOKEN`.
+`GET <CI_OIDC_TOKEN_URL>?audience=<audience>` with
+`Authorization: Bearer $CI_JOB_TOKEN` answers a short-lived, Ed25519-signed JWT
+that a cloud provider's OIDC federation verifies against the instance's public
+keys at `/api/v1/ci/oidc/jwks`, with no shared secret. The token is bound to the
+running job: a finished job, a retried pipeline or a stale job token is refused.
+
+| Claim | Value |
+|-------|-------|
+| `iss` | The instance's OIDC issuer (`…/api/v1/ci/oidc`) |
+| `aud` | The requested audience |
+| `sub` | `repo:<owner>/<name>:environment:<env>` for a job with an environment, `repo:<owner>/<name>:ref:<ref>` otherwise |
+| `repository` / `repository_id` / `repository_owner` | `owner/name`, the numeric repository id, the owner |
+| `ref` / `ref_type` / `sha` | The full ref, its kind (`branch`, `tag`, `pull_request`, `unknown`), the commit |
+| `environment` | The job's environment; absent for a job without one |
+| `pipeline_id` / `job_id` | The pipeline and the job |
+| `actor` | The account that triggered the pipeline; absent when none did |
+
+Write the trust policy on the cloud side like this:
+
+- **Match the whole `sub`, not a prefix.** The environment name is copied into
+  the subject as it is, so `…:environment:production` is also the start of
+  `…:environment:production-eu`.
+- **Also require `repository_id`.** `owner/name` is a name, and names are
+  reused: after a rename or a transfer, or when a deleted repository's name is
+  created again, a different repository produces the same subject. The numeric
+  id is never reused.
+- **Give a production role to a protected environment only**, for example
+  `sub = repo:acme/app:environment:production` together with
+  `repository_id = 42`, where `production` is **protected** with required
+  approvals. An unprotected environment can be declared from any branch.
+- A pull request's ref is `refs/pull/<n>/head`, so it can never produce
+  `repo:acme/app:ref:refs/heads/main`.
+
+> Until this release the subject was `repo:<repository id>:pipeline:<id>:job:<id>`,
+> which only let a policy trust `repo:<id>:*`: every branch and every pull
+> request. Policies written for that format no longer match and the exchange
+> with the cloud provider fails until they are updated; see the changelog.
 
 ## Matrix
 

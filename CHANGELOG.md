@@ -9,6 +9,23 @@ This project records user-facing changes here. The format follows
 ### Added
 
 - Public security reporting and contributor guidance.
+- CI secrets can be scoped to an environment. Only jobs that declare the
+  environment read them, after its approval when it is protected, and an
+  environment's value overrides a repository-wide secret of the same name.
+
+### Changed
+
+- **Breaking:** the `sub` claim of CI OIDC tokens is now
+  `repo:<owner>/<name>:ref:<ref>`, or `repo:<owner>/<name>:environment:<env>`
+  for a job with an environment. Trust policies that match the old
+  `repo:<repository id>:pipeline:<id>:job:<id>` (usually as `repo:<id>:*`) stop
+  matching, and the token exchange with the cloud provider fails until they are
+  rewritten. Match the whole new subject and also require the
+  `repository_id` claim; see [CI: OIDC tokens](docs/ci.md#oidc-tokens). Tokens
+  also carry `repository`, `repository_owner`, `ref_type`, `environment` and
+  `actor`.
+- Rolling back the CI secret migration refuses while environment-scoped
+  secrets exist, rather than widening them to every job.
 
 ## [0.1.1] - 2026-10-11
 
