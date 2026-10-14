@@ -1089,10 +1089,10 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:imports.refresh | :215 | `GET /api/v1/imports` | `User` | rust+web |
-| GitHub GitLab Gitea Git | :227 | `POST /api/v1/imports` | `User` | rust+web |
-| GitHub GitLab Gitea Git | :227 | `GET /api/v1/imports` | `User` | rust+web |
-| i18n:imports.deleting | :318 | `DELETE /api/v1/imports/{id}` | `User` | rust+web |
+| i18n:imports.refresh | :216 | `GET /api/v1/imports` | `User` | rust+web |
+| GitHub GitLab Gitea Git | :228 | `POST /api/v1/imports` | `User` | rust+web |
+| GitHub GitLab Gitea Git | :228 | `GET /api/v1/imports` | `User` | rust+web |
+| i18n:imports.deleting | :325 | `DELETE /api/v1/imports/{id}` | `User` | rust+web |
 
 ### `/login`
 

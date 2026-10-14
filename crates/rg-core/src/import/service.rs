@@ -2740,6 +2740,38 @@ fn parse_optional_import_date(
 // Import helpers — GitHub
 // ═══════════════════════════════════════════════════════════════════════
 
+/// The colour an imported label is stored with, or `None` once the label is
+/// recorded in `labels_failed`.
+///
+/// GitHub sends `ff0000`, GitLab `#FF0000` (and accepts the `#f00` shorthand).
+/// Whatever the source sent ends up in a `style` attribute in the browser, so it
+/// goes through the same [`crate::validate_hex_color`] rule as a label created
+/// through the API — a source that hands over `#0;x:1;` does not get to write
+/// CSS into the target's pages. The rest of the labels still import.
+fn imported_label_color(name: &str, color: &str, stats: &mut ImportStats) -> Option<String> {
+    let hex = color.strip_prefix('#').unwrap_or(color);
+    let hex = if hex.len() == 3 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        hex.chars().flat_map(|digit| [digit, digit]).collect()
+    } else {
+        hex.to_string()
+    };
+    match crate::validate_hex_color(&format!("#{hex}")) {
+        Ok(color) => Some(color),
+        Err(_) => {
+            tracing::warn!(
+                source = %name,
+                color = ?color,
+                "refused imported label colour"
+            );
+            stats.labels_failed.push(ImportedObjectFailure {
+                source: name.to_string(),
+                reason: "the label colour is not a #rrggbb hex string",
+            });
+            None
+        }
+    }
+}
+
 async fn import_github_labels(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -2755,11 +2787,8 @@ async fn import_github_labels(
         if existing.iter().any(|l| l.name == gl.name) {
             continue;
         }
-        // GitHub colors are "ff0000" without # prefix
-        let color = if gl.color.starts_with('#') {
-            gl.color.clone()
-        } else {
-            format!("#{}", gl.color)
+        let Some(color) = imported_label_color(&gl.name, &gl.color, stats) else {
+            continue;
         };
 
         let model = label::ActiveModel {
@@ -3298,11 +3327,8 @@ async fn import_gitlab_labels(
         if existing.iter().any(|l| l.name == gl.name) {
             continue;
         }
-        // GitLab colors are "#FF0000" with # prefix already
-        let color = if gl.color.starts_with('#') {
-            gl.color.clone()
-        } else {
-            format!("#{}", gl.color)
+        let Some(color) = imported_label_color(&gl.name, &gl.color, stats) else {
+            continue;
         };
 
         let model = label::ActiveModel {
@@ -3805,6 +3831,13 @@ pub async fn start_import(
     let source = crate::net::split_url_credentials(&source_url).context("invalid source URL")?;
     let source_url = source.url_without_secret;
     crate::net::check_remote_url_length(&source_url)?;
+    // The worker refuses a transport it cannot reach, but by then the row is
+    // written, and the import history serves it to the browser as the link to
+    // the source. A `javascript:` address that only fails later is still a
+    // stored link. The HTTP handler checks this too for fast feedback; this is
+    // the check every caller of `start_import` gets, the CLI included
+    // (card_2d0bf653507d).
+    trusted_origins.check_url_static(&source_url)?;
     let auth_token = auth_token
         .filter(|token| !token.is_empty())
         .or(source.password);
@@ -4858,6 +4891,78 @@ mod tests {
         );
     }
 
+    /// card_1f7878b5a282: both providers wrote the source colour straight into
+    /// the label row, so `#0;x:1;` from a hostile source became CSS in the
+    /// target's pages.
+    #[tokio::test]
+    async fn imported_label_colours_pass_the_api_colour_rule() {
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let github_label = |name: &str, color: &str| GitHubLabel {
+            id: 1,
+            name: name.to_string(),
+            color: color.to_string(),
+            description: None,
+        };
+        let gitlab_label = |name: &str, color: &str| GitLabLabel {
+            id: 2,
+            name: name.to_string(),
+            color: color.to_string(),
+            description: None,
+            text_color: None,
+        };
+
+        let github_count = import_github_labels(
+            &db,
+            1,
+            &[
+                github_label("gh-css", "0;x:1"),
+                github_label("gh-upper", "ABCDEF"),
+                github_label("gh-prefixed-css", "#0;x:1;"),
+            ],
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        let gitlab_count = import_gitlab_labels(
+            &db,
+            1,
+            &[
+                gitlab_label("gl-css", "#0;x:1;"),
+                gitlab_label("gl-short", "#F0a"),
+                gitlab_label("gl-name", "red"),
+            ],
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((github_count, gitlab_count), (1, 1));
+        assert_eq!(
+            named(&stats.labels_failed),
+            ["gh-css", "gh-prefixed-css", "gl-css", "gl-name"]
+        );
+        assert!(stats
+            .labels_failed
+            .iter()
+            .all(|failure| failure.reason == "the label colour is not a #rrggbb hex string"));
+        let mut stored: Vec<_> = label_ops::list_by_repo(&db, 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|label| (label.name, label.color))
+            .collect();
+        stored.sort();
+        assert_eq!(
+            stored,
+            [
+                ("gh-upper".to_string(), "#abcdef".to_string()),
+                ("gl-short".to_string(), "#ff00aa".to_string()),
+            ],
+            "only normalised #rrggbb colours reach the label table"
+        );
+    }
+
     /// card_2332150aada0: the totals used to add the length of the source list,
     /// refused rows and GitLab system notes included.
     #[tokio::test]
@@ -5357,8 +5462,8 @@ mod import_target_lifecycle_tests {
     /// accepted: a task that first learns its `repo_id` from its own worker has
     /// nothing to compare against by the time the target could be gone.
     ///
-    /// `file://` is refused by the worker's SSRF guard before it resolves
-    /// anything, so the detached pass cannot race the row this test reads.
+    /// The source is a `.invalid` host and nothing is selected for import, so
+    /// the detached pass never reaches the network.
     #[tokio::test]
     async fn start_import_anchors_the_task_to_a_target_that_already_exists() {
         let db = lifecycle_db().await;
@@ -5369,7 +5474,7 @@ mod import_target_lifecycle_tests {
             &Default::default(),
             1,
             "git".to_string(),
-            "file:///srv/upstream.git".to_string(),
+            "https://source.invalid/upstream.git".to_string(),
             "importer".to_string(),
             "imported".to_string(),
             None,
@@ -5398,7 +5503,7 @@ mod import_target_lifecycle_tests {
             &Default::default(),
             1,
             "git".to_string(),
-            "file:///srv/upstream.git".to_string(),
+            "https://source.invalid/upstream.git".to_string(),
             "importer".to_string(),
             "brand-new".to_string(),
             None,
@@ -5419,6 +5524,58 @@ mod import_target_lifecycle_tests {
             fresh.repo_id, None,
             "an import accepted for a name that does not exist yet must stay \
              free to create it"
+        );
+    }
+
+    /// card_2d0bf653507d: the import history renders `source_url` as the link
+    /// to the source, so a scheme the worker would refuse later must not get a
+    /// row in the first place — whoever called `start_import`.
+    #[tokio::test]
+    async fn start_import_refuses_a_non_git_scheme_before_writing_the_task() {
+        let db = lifecycle_db().await;
+        let repo_root = tempfile::tempdir().expect("temporary repository root");
+
+        for source_url in [
+            "javascript:alert(document.cookie)",
+            "JavaScript://example.com/%0aalert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "file:///srv/upstream.git",
+        ] {
+            let error = start_import(
+                &db,
+                &Default::default(),
+                1,
+                "git".to_string(),
+                source_url.to_string(),
+                "importer".to_string(),
+                "imported".to_string(),
+                None,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                &Default::default(),
+                &Default::default(),
+                repo_root.path(),
+            )
+            .await
+            .expect_err("a non-git scheme must be refused at admission");
+            assert!(
+                error
+                    .downcast_ref::<crate::error::InvalidRequest>()
+                    .is_some(),
+                "`{source_url}` must be the caller's error, not ours: {error:#}"
+            );
+        }
+        assert!(
+            import_task_ops::find_by_user(&db, 1, 100)
+                .await
+                .expect("list import tasks")
+                .is_empty(),
+            "a refused source still left a task row for the history to link"
         );
     }
 

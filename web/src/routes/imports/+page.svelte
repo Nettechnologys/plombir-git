@@ -6,6 +6,7 @@
   import { createT, formatDateTime } from '$lib/i18n';
   import ConfirmModal from '$lib/components/ConfirmModal.svelte';
   import { createConfirmer } from '$lib/confirm.svelte';
+  import { isHttpUrl } from '$lib/utils/url';
 
   const t = createT();
   const confirmer = createConfirmer();
@@ -299,7 +300,13 @@
                 <td>
                   <div class="source">
                     <span class="platform">{task.platform}</span>
-                    <a href={task.source_url} target="_blank" rel="noreferrer">{task.source_url}</a>
+                    <!-- A source URL the backend refuses now may still sit in an older row,
+                         so only an http(s) address becomes a link (card_2d0bf653507d). -->
+                    {#if isHttpUrl(task.source_url)}
+                      <a href={task.source_url} target="_blank" rel="noreferrer">{task.source_url}</a>
+                    {:else}
+                      <span class="source-text">{task.source_url}</span>
+                    {/if}
                   </div>
                   {#if task.error}
                     <div class="task-error">{task.error}</div>
