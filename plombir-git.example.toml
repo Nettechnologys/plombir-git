@@ -33,8 +33,14 @@ package_upload_max_mb = 512
 # endpoint for clones made from the SSH URL. Set it to whatever your reverse
 # proxy serves. Left unset, links name the request's `Host`, over `https` when
 # `[tls]` is configured or a proxy sends `X-Forwarded-Proto: https`, and
-# `git lfs` over SSH needs a manual `lfs.url`.
+# `git lfs` over SSH needs a manual `lfs.url`. Set, its scheme also decides
+# whether the session cookie is `Secure` and whether HSTS is sent, whatever the
+# proxy in front forwards.
 # external_url = "https://git.example.com"
+# Send HSTS with `preload`. Only for a domain whose every subdomain is https:
+# browsers hard-code the refusal to connect over plain http, and leaving the
+# preload list takes months.
+hsts_preload = false
 # Seconds allowed for draining in-flight requests and the CI-log queue after
 # SIGTERM / ctrl-c before the process is forced down. Raise it if a slow clone
 # or a long CI-log flush is being cut off during a rolling restart.

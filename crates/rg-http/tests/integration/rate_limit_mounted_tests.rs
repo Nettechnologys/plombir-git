@@ -238,6 +238,32 @@ async fn every_unauthenticated_credential_door_carries_the_auth_rate_limiter() {
     }
 }
 
+/// The registry's token endpoint is a password door too — `docker login`
+/// presents the account password there as Basic credentials — and it is
+/// anonymous by necessity, being the realm of the registry's challenge. It
+/// carries the same strict budget as `/users/login`.
+#[tokio::test]
+async fn the_registry_token_endpoint_carries_the_auth_rate_limiter() {
+    use base64::Engine as _;
+
+    let base = spawn_prod_app_with_rate_limits(0, 1).await;
+    let client = reqwest::Client::new();
+    let basic = base64::engine::general_purpose::STANDARD.encode("nobody:not-the-password");
+    let attempt = || {
+        client
+            .get(format!("{base}/v2/auth/token?service=plombir-git"))
+            .header("authorization", format!("Basic {basic}"))
+            .send()
+    };
+    let first = attempt().await.unwrap().status();
+    assert_ne!(first, 429, "the first guess is inside the budget");
+    let second = attempt().await.unwrap().status();
+    assert_eq!(
+        second, 429,
+        "/v2/auth/token does not carry the auth rate limiter"
+    );
+}
+
 /// The acceptance of card_0beff149adbd in the shipped numbers: ten reset
 /// requests a minute from one client are answered, the eleventh is not.
 #[tokio::test]

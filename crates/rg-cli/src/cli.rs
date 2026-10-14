@@ -2401,7 +2401,7 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 21] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 22] = [
         (
             "DEFAULT_LOG_MAX_SIZE_MB",
             "the size cap is inactive until explicitly set; presenting 10 MB as an active default would mislead operators",
@@ -2437,6 +2437,10 @@ const AFTER: &str = "after";
             "DEFAULT_ATTESTATION_ENABLED",
             "config-file-only: `[releases].attestation_enabled` has no CLI flag (it is \
              settable as PLOMBIR_GIT_ATTESTATION_ENABLED instead)",
+        ),
+        (
+            "DEFAULT_HSTS_PRELOAD",
+            "config-file-only: `[server].hsts_preload` has no CLI flag",
         ),
         (
             "DEFAULT_RATE_LIMIT_MAX_KEYS",

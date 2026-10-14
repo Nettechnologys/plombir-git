@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use crate::admin::validate_jwt_secret;
+use crate::admin::{validate_jwt_secret, validate_signing_secret};
 use crate::config::{
     default_db_connect_timeout, default_db_idle_timeout, default_git_idle_timeout,
     default_git_stream_timeout, default_git_timeout, default_job_timeout, default_shutdown_grace,
@@ -23,8 +23,9 @@ use crate::config::{
     DEFAULT_AGENT_RATE_LIMIT_WINDOW, DEFAULT_ATTESTATION_ENABLED, DEFAULT_AUDIT_ARCHIVE_DIR,
     DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX, DEFAULT_AUTH_RATE_LIMIT_WINDOW,
     DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER, DEFAULT_CI_DOCKER,
-    DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_METRICS_ENABLED,
-    DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS, DEFAULT_RETENTION_ENABLED,
+    DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_HSTS_PRELOAD,
+    DEFAULT_METRICS_ENABLED, DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
+    DEFAULT_RETENTION_ENABLED,
 };
 use crate::dbconn;
 use crate::telemetry;
@@ -235,8 +236,8 @@ fn validate_config(
     repo_root: &std::path::Path,
     tls_config: &Option<(PathBuf, PathBuf)>,
 ) -> anyhow::Result<()> {
-    // 1. Validate JWT secret (refuse default, warn if too short)
-    validate_jwt_secret(jwt_secret, "config")?;
+    // 1. Validate JWT secret (refuse an empty, a default or a short one)
+    validate_signing_secret(jwt_secret, "config")?;
 
     // 2. Verify repo_root is writable. A bind-mounted host directory owned by
     //    the wrong uid fails exactly here, so the message carries the uid/chown
@@ -623,14 +624,19 @@ pub(crate) fn resolve_auth_secrets(
 ) -> anyhow::Result<AuthSecrets> {
     // Resolve JWT secret: env var > CLI args > config file > error
     let resolved_jwt_secret = if let Some(env_secret) = env_secret("PLOMBIR_GIT_JWT_SECRET") {
-        validate_jwt_secret(&env_secret, "environment variable PLOMBIR_GIT_JWT_SECRET")?;
+        validate_signing_secret(&env_secret, "environment variable PLOMBIR_GIT_JWT_SECRET")?;
         tracing::info!("Using JWT secret from environment variable PLOMBIR_GIT_JWT_SECRET");
         env_secret
     } else if let Some(cli_secret) = jwt_secret {
-        validate_jwt_secret(&cli_secret, "--jwt-secret CLI argument")?;
+        validate_signing_secret(&cli_secret, "--jwt-secret CLI argument")?;
+        // argv is readable by every local account through /proc.
+        tracing::warn!(
+            "--jwt-secret puts the signing key on this process's command line, which every \
+             local account can read through /proc; prefer PLOMBIR_GIT_JWT_SECRET or the config file"
+        );
         cli_secret
     } else if let Some(cfg_secret) = cfg.and_then(|c| c.auth.jwt_secret.clone()) {
-        validate_jwt_secret(&cfg_secret, "config file [auth].jwt_secret")?;
+        validate_signing_secret(&cfg_secret, "config file [auth].jwt_secret")?;
         cfg_secret
     } else {
         anyhow::bail!(
@@ -650,6 +656,10 @@ pub(crate) fn resolve_auth_secrets(
         (env_key, None)
     } else if let Some(cli_key) = encryption_key {
         validate_jwt_secret(&cli_key, "--encryption-key CLI argument")?;
+        tracing::warn!(
+            "--encryption-key puts the at-rest key on this process's command line, which every \
+             local account can read through /proc; prefer PLOMBIR_GIT_ENCRYPTION_KEY or [auth].key_file"
+        );
         tracing::info!("Using at-rest encryption key from --encryption-key");
         (cli_key, None)
     } else if let Some(cfg_key) = cfg.and_then(|c| c.auth.encryption_key.clone()) {
@@ -1203,6 +1213,10 @@ pub(crate) async fn run_serve(
         .as_ref()
         .and_then(|c| c.external_url.clone())
         .or_else(|| cfg.as_ref().and_then(|c| c.server.external_url.clone()));
+    let resolved_hsts_preload = cfg
+        .as_ref()
+        .and_then(|c| c.server.hsts_preload)
+        .unwrap_or(DEFAULT_HSTS_PRELOAD);
 
     // Inbound-webhook HMAC secret: env var wins, fallback to config file.
     // Unset ⇒ signature verification stays off (endpoints are auth-gated).
@@ -1798,6 +1812,7 @@ pub(crate) async fn run_serve(
         smtp_config: smtp_config.clone(),
         tls_config,
         external_url: resolved_external_url.clone(),
+        hsts_preload: resolved_hsts_preload,
         job_timeout_secs: resolved_job_timeout,
         git_stream_timeout_secs: resolved_git_stream_timeout,
         git_idle_timeout_secs: resolved_git_idle_timeout,

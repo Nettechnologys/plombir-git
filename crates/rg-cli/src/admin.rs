@@ -315,6 +315,29 @@ pub(crate) fn validate_jwt_secret(jwt_secret: &str, source: &str) -> anyhow::Res
     Ok(())
 }
 
+/// [`validate_jwt_secret`], and a secret shorter than 16 characters is refused
+/// rather than warned about.
+///
+/// For the session-signing secret and for a *new* at-rest key: the first signs
+/// every session, so a short one is a key an attacker holding one token can
+/// search for offline, and replacing it costs nothing but a sign-in. An at-rest
+/// key already in use stays on [`validate_jwt_secret`]: the data is sealed
+/// under it, `rotate-encryption-key` needs it accepted to move off it, and
+/// refusing it would leave a short key with no way out.
+pub(crate) fn validate_signing_secret(secret: &str, source: &str) -> anyhow::Result<()> {
+    validate_jwt_secret(secret, source)?;
+    if secret.len() < 16 {
+        tracing::error!(
+            secret_len = secret.len(),
+            "FATAL: the secret from {} is shorter than 16 characters. Generate one with \
+             `plombir-git gen-secret`",
+            source
+        );
+        anyhow::bail!("refusing a secret shorter than 16 characters from {source}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod scheduled_backup_restore_tests {
     use rg_db::sea_orm::{self, ConnectionTrait};
@@ -373,7 +396,9 @@ mod scheduled_backup_restore_tests {
 
 #[cfg(test)]
 mod jwt_secret_tests {
-    use super::{generate_jwt_secret, validate_jwt_secret, KNOWN_BAD_JWT_SECRETS};
+    use super::{
+        generate_jwt_secret, validate_jwt_secret, validate_signing_secret, KNOWN_BAD_JWT_SECRETS,
+    };
     use base64::Engine as _;
 
     #[test]
@@ -398,6 +423,18 @@ mod jwt_secret_tests {
         assert!(validate_jwt_secret("", "test").is_err());
         assert!(validate_jwt_secret("   ", "test").is_err());
         assert!(validate_jwt_secret("\n", "test").is_err());
+    }
+
+    /// A signing secret below 16 characters is refused; an at-rest key in use
+    /// is only warned about, because refusing it would leave the data it
+    /// sealed with no way to be re-encrypted.
+    #[test]
+    fn a_short_signing_secret_is_refused_and_a_short_key_in_use_is_not() {
+        assert!(validate_signing_secret("short", "test").is_err());
+        assert!(validate_signing_secret("fifteen-chars!!", "test").is_err());
+        assert!(validate_signing_secret("sixteen-chars!!!", "test").is_ok());
+        assert!(validate_signing_secret("change-me-in-production", "test").is_err());
+        assert!(validate_jwt_secret("fifteen-chars!!", "test").is_ok());
     }
 
     #[test]

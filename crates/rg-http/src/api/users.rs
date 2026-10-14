@@ -518,7 +518,7 @@ pub async fn login(
         Err(error) => {
             // Not every failure of `login_with_configured_auth` is a rejected
             // credential, and the two must not share an answer. A verdict is
-            // one of the three the service bails with, listed in
+            // one of the two the service bails with, listed in
             // `CREDENTIAL_VERDICTS`; anything else — an unreachable database on
             // the account lookup, a stored hash the verifier cannot use, a
             // token that would not sign — never produced a verdict at all.
@@ -533,11 +533,12 @@ pub async fn login(
             // retryable 5xx with the full chain in the operator log, not a
             // silent 401. The old form enumerated one failure
             // (`UnusablePasswordHash`) and called everything else a rejection.
-            const CREDENTIAL_VERDICTS: [&str; 3] = [
-                "invalid credentials",
-                "account is disabled",
-                "account is temporarily locked",
-            ];
+            //
+            // A correct password on a locked account is not a string of its
+            // own: it arrives as `AccountLocked`, which reads as the uniform
+            // `invalid credentials`, and only the downcast below tells it apart
+            // — for the log, never for the client.
+            const CREDENTIAL_VERDICTS: [&str; 2] = ["invalid credentials", "account is disabled"];
 
             // A directory bind that succeeded and a provisioning policy that
             // said no. Neither a rejected credential (the password was right,
@@ -562,6 +563,12 @@ pub async fn login(
                 crate::metrics::recorder::auth_event("login", "failure");
                 return AppError::from(error).into_response();
             }
+            // The right password inside the brute-force lock. No strike: the
+            // one that set the lock is recorded, and counting the owner's
+            // correct retries would keep extending it.
+            let refused_by_lock = error
+                .downcast_ref::<rg_core::auth::lockout::AccountLocked>()
+                .is_some();
 
             // A lookup that could not run is not a lookup that found nobody.
             // Flattening the error away turns a degraded database into "no such
@@ -583,7 +590,7 @@ pub async fn login(
                     None
                 }
             };
-            let mut locked = verdict == "account is temporarily locked";
+            let mut locked = refused_by_lock;
             if !locked && verdict == "invalid credentials" {
                 if let Some(user) = &user {
                     // `false` means "not locked" — which is also what a failed
@@ -642,12 +649,9 @@ pub async fn login(
             };
             crate::metrics::recorder::auth_event("login", "failure");
             crate::metrics::recorder::failed_login(reason);
-            AppError::unauthorized(if locked {
-                "account is temporarily locked"
-            } else {
-                "invalid credentials"
-            })
-            .into_response()
+            // One text for every rejection. A lock worded apart from a wrong
+            // password names a real account to anyone who asks five times.
+            AppError::unauthorized("invalid credentials").into_response()
         }
     }
 }

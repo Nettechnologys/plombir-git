@@ -477,7 +477,7 @@ pub(crate) async fn cmd_rotate_encryption_key(
             crate::serve::resolve_auth_secrets(cfg, jwt_secret, None, &key_file)?.encryption_key
         }
     };
-    admin::validate_jwt_secret(&new, "--new")?;
+    admin::validate_signing_secret(&new, "--new")?;
 
     if !dry_run && !yes {
         anyhow::bail!(

@@ -57,6 +57,26 @@ This project records user-facing changes here. The format follows
   `actor`.
 - Rolling back the CI secret migration refuses while environment-scoped
   secrets exist, rather than widening them to every job.
+- With `[server].external_url` set, its scheme decides whether the session
+  cookie is `Secure` and whether HSTS is sent, instead of the listener or
+  `X-Forwarded-Proto`. HSTS no longer carries `preload` unless
+  `[server].hsts_preload = true`.
+- **Breaking:** a `jwt_secret` shorter than 16 characters refuses to start,
+  and so does a shorter `--new` key for `rotate-encryption-key`. An at-rest
+  key already in use is still only warned about, so it can be rotated away.
+  `--jwt-secret` and `--encryption-key` warn that argv is readable by every
+  local account.
+
+### Security
+
+- `POST /api/v1/users/login` and `POST /api/v1/users/password/initial`
+  answer an account inside its brute-force lock with the same
+  `invalid credentials` as a wrong password, and the login checks the
+  password before the lock. The lock told anyone who asked five times that
+  the name was a real account. An LDAP account that is deactivated is named
+  so only after the directory accepted the password.
+- `GET /v2/auth/token`, where `docker login` presents a password, carries the
+  same credential rate limiter as the web login.
 
 ## [0.1.1] - 2026-10-11
 

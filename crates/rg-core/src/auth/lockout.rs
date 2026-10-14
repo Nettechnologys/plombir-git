@@ -71,10 +71,9 @@ pub enum PasswordAttempt {
     ///
     /// Kept apart from `Rejected` on purpose. It is only ever reached by a
     /// caller who already presented the correct password, so naming the reason
-    /// out loud discloses nothing a guesser could use — the same reason
-    /// `POST /users/login` may answer "account is temporarily locked" in words
-    /// — and the account's owner otherwise has no way to learn why the password
-    /// that works in the browser stopped working here.
+    /// out loud discloses nothing a guesser could use, and the account's owner
+    /// otherwise has no way to learn why the password that works in the browser
+    /// stopped working here.
     SecondFactorRequired,
     /// The password was right, and it is one an administrator chose: a new
     /// account, or a reset handed over by hand. It opens nothing until its
@@ -88,6 +87,23 @@ pub enum PasswordAttempt {
     /// become one); it is for the server's log only — a client that could tell
     /// the two rejections apart would be told which usernames are real.
     Rejected { locked: bool },
+}
+
+/// A correct password refused because the account is inside its brute-force
+/// lock, from a door that reads `locked_until` itself rather than through
+/// [`settle_password_attempt`] — the web login, whose providers verify the
+/// password in several branches.
+///
+/// It must be read *after* the verification that returns it: read before,
+/// five requests against a candidate name answered "this account exists, and
+/// it is locked" without a password. Its [`Display`](std::fmt::Display) is the
+/// uniform rejection on purpose, so no caller can word the lock apart from a
+/// wrong password; `locked_until` is for the server's own log.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid credentials")]
+pub struct AccountLocked {
+    /// When the lock lifts.
+    pub locked_until: chrono::DateTime<Utc>,
 }
 
 /// Where an attempt came from, for the login log.

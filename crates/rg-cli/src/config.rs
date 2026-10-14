@@ -90,6 +90,11 @@ pub(crate) struct ServerConfig {
     /// `<source_url>/tree/<commit the binary was built from>` — the AGPL §13
     /// offer. A fork that modifies the code points this at itself.
     pub(crate) source_url: Option<String>,
+    /// Whether HSTS advertises `preload` (default: false). The header itself
+    /// is sent whenever the instance is reached over https; `preload` asks
+    /// browsers to hard-code that for the domain and every subdomain, which
+    /// only the domain's owner can promise.
+    pub(crate) hsts_preload: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -671,6 +676,9 @@ pub(crate) const DEFAULT_CI_DOCKER: bool = false;
 pub(crate) const DEFAULT_CI_EXTERNAL_RUNNERS: bool = false;
 pub(crate) const DEFAULT_CI_ALLOW_HOST_RUNNER: bool = false;
 pub(crate) const DEFAULT_ATTESTATION_ENABLED: bool = false;
+/// `[server].hsts_preload`: a promise about every subdomain is never made by
+/// default.
+pub(crate) const DEFAULT_HSTS_PRELOAD: bool = false;
 /// `[webhooks].allow_insecure_http`: plaintext transport is never enabled by
 /// an upgrade or by a missing config section.
 pub(crate) const DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP: bool = false;
@@ -1921,6 +1929,12 @@ mod tests {
                 "runner_labels",
                 "rg_core::ci::default_runner_labels",
                 format!("{:?}", rg_core::ci::default_runner_labels()),
+            ),
+            row(
+                "server",
+                "hsts_preload",
+                "DEFAULT_HSTS_PRELOAD",
+                super::DEFAULT_HSTS_PRELOAD.to_string(),
             ),
             row(
                 "releases",

@@ -373,17 +373,11 @@ pub async fn login_with_configured_auth(
     source: Option<std::net::IpAddr>,
 ) -> Result<LoginOutcome> {
     let existing = find_login_user(db, username_or_email).await?;
-    if existing.as_ref().is_some_and(|user| {
-        user.locked_until
-            .is_some_and(|locked_until| locked_until > Utc::now())
-    }) {
-        bail!("account is temporarily locked");
-    }
-    match existing.as_ref().map(|user| user.auth_provider.as_str()) {
-        Some("local") => Ok(LoginOutcome {
+    let outcome = match existing.as_ref().map(|user| user.auth_provider.as_str()) {
+        Some("local") => LoginOutcome {
             user: verify_local_login(db, username_or_email, plaintext_password, source).await?,
             method: LoginMethod::Password,
-        }),
+        },
         Some("ldap") | None => {
             login_via_ldap(
                 db,
@@ -394,7 +388,7 @@ pub async fn login_with_configured_auth(
                 ldap_transport_policy,
                 source,
             )
-            .await
+            .await?
         }
         Some(_) => {
             // Account exists but authenticates through a provider no password
@@ -403,7 +397,21 @@ pub async fn login_with_configured_auth(
             password::burn_dummy_verification(plaintext_password, source).await?;
             bail!("invalid credentials")
         }
+    };
+
+    // The lock is read only now, after the provider has verified the password:
+    // read before the hash, it told anyone willing to spend five requests that
+    // the name was a real, locked account. `AccountLocked` reads as the
+    // uniform `invalid credentials`; the door tells the lock apart for its log
+    // only, and a correct password neither clears nor extends it.
+    if let Some(locked_until) = outcome
+        .user
+        .locked_until
+        .filter(|locked_until| *locked_until > Utc::now())
+    {
+        return Err(crate::auth::lockout::AccountLocked { locked_until }.into());
     }
+    Ok(outcome)
 }
 
 async fn find_login_user(
@@ -467,9 +475,6 @@ async fn login_via_ldap_inner(
     if plaintext_password.is_empty() {
         bail!("invalid credentials");
     }
-    if existing.as_ref().is_some_and(|user| !user.is_usable()) {
-        bail!("account is disabled");
-    }
 
     let lookup = existing
         .as_ref()
@@ -517,6 +522,13 @@ async fn login_via_ldap_inner(
         )
         .await
         {
+            // Only now, with the directory's word that the password is right:
+            // answered before the bind, "account is disabled" told anyone who
+            // typed the name that it was a real account, as the local branch's
+            // order already prevents.
+            Ok(Ok(_)) if existing.as_ref().is_some_and(|user| !user.is_usable()) => {
+                bail!("account is disabled");
+            }
             Ok(Ok(user)) => user,
             Ok(Err(error)) => {
                 let unreachable = error

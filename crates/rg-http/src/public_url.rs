@@ -28,18 +28,39 @@ use crate::AppState;
 
 /// Whether this request reached the client side of the connection over TLS.
 ///
-/// True when this process terminates TLS itself, or when a proxy in front of
-/// it reports `X-Forwarded-Proto: https`. The forwarded header is not a trust
-/// boundary here: it only decides the scheme of URLs handed back to the same
+/// A configured `external_url` decides when it names a scheme: it is the
+/// address the operator published and the one a browser visits, so a proxy
+/// that terminates TLS and forwards no `X-Forwarded-Proto` must not take the
+/// `Secure` attribute off the session cookie, and an `http` URL must not be
+/// talked into `Secure` by a header any client can send. Without one, true when
+/// this process terminates TLS itself or a proxy in front of it reports
+/// `X-Forwarded-Proto: https`. The forwarded header is not a trust boundary in
+/// that case: it only decides the scheme of URLs handed back to the same
 /// caller, who controls `Host` just as fully.
 pub(crate) fn request_is_https(state: &AppState, headers: &HeaderMap) -> bool {
-    transport_is_https(state.tls_enabled, headers)
+    configured_https(state.external_url.as_deref())
+        .unwrap_or_else(|| transport_is_https(state.tls_enabled, headers))
 }
 
-/// [`request_is_https`] for a layer that is handed only the listener's TLS
-/// flag rather than the whole state — the security-headers middleware.
+/// The transport half of [`request_is_https`], for a layer that is handed the
+/// listener's TLS flag rather than the whole state — the security-headers
+/// middleware, which asks [`configured_https`] first itself.
 pub(crate) fn transport_is_https(tls_enabled: bool, headers: &HeaderMap) -> bool {
     tls_enabled || forwarded_https(headers)
+}
+
+/// The scheme a configured `external_url` pins: `Some(true)` for `https`,
+/// `Some(false)` for any other scheme, `None` when no URL is configured or it
+/// names no scheme — the signal to ask the transport instead. Anything but
+/// `https` reads as plain on purpose: the worst a malformed URL may cost is a
+/// cookie without `Secure`, never an HSTS promise the deployment cannot keep.
+pub(crate) fn configured_https(external_url: Option<&str>) -> Option<bool> {
+    let (scheme, _) = external_url?.trim().split_once("://")?;
+    let scheme = scheme.trim();
+    if scheme.is_empty() {
+        return None;
+    }
+    Some(scheme.eq_ignore_ascii_case("https"))
 }
 
 /// This instance's public base URL for this request, without a trailing slash.
@@ -98,6 +119,28 @@ mod tests {
             map.insert(*name, HeaderValue::from_str(value).unwrap());
         }
         map
+    }
+
+    #[test]
+    fn a_configured_public_url_pins_the_scheme() {
+        assert_eq!(
+            configured_https(Some("https://git.example.com")),
+            Some(true)
+        );
+        assert_eq!(
+            configured_https(Some("HTTPS://Git.Example.com/")),
+            Some(true)
+        );
+        assert_eq!(
+            configured_https(Some("http://git.example.com")),
+            Some(false)
+        );
+        assert_eq!(configured_https(Some("ftp://git.example.com")), Some(false));
+        // No scheme at all is no statement about one.
+        assert_eq!(configured_https(Some("git.example.com")), None);
+        assert_eq!(configured_https(Some("git.example.com:443")), None);
+        assert_eq!(configured_https(Some("")), None);
+        assert_eq!(configured_https(None), None);
     }
 
     #[test]

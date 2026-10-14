@@ -168,6 +168,8 @@ pub struct AppState {
     /// hands back, so it has to be the listener's truth, not a guess from the
     /// host name.
     pub tls_enabled: bool,
+    /// Whether HSTS carries `preload` — see [`HttpServerConfig::hsts_preload`].
+    pub hsts_preload: bool,
     /// CI job timeout in seconds.
     pub job_timeout_secs: u64,
     /// Wall-clock timeout (seconds) for streaming git operations
@@ -561,8 +563,14 @@ pub struct HttpServerConfig {
     /// The base of every URL the server hands a client to follow (LFS actions,
     /// OCI realm, OIDC issuer, package indexes, SSO callbacks, reset links) and
     /// the stable WebAuthn relying party. Unset, those fall back to the request
-    /// `Host` with the scheme of the listener — see `tls_config`.
+    /// `Host` with the scheme of the listener — see `tls_config`. Set, its
+    /// scheme also decides whether the session cookie is `Secure` and whether
+    /// HSTS is sent.
     pub external_url: Option<String>,
+    /// Whether HSTS advertises `preload` (`[server].hsts_preload`, default
+    /// false): a promise that the domain and every subdomain are https-only,
+    /// which only the domain's owner can make.
+    pub hsts_preload: bool,
     /// CI job timeout in seconds (default: 3600).
     pub job_timeout_secs: u64,
     /// Wall-clock timeout (seconds) for the streaming git transport
@@ -772,6 +780,7 @@ async fn run_with_listener(
         delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
         external_url: config.external_url,
         tls_enabled: config.tls_config.is_some(),
+        hsts_preload: config.hsts_preload,
         job_timeout_secs: config.job_timeout_secs,
         git_stream_timeout_secs: config.git_stream_timeout_secs,
         git_idle_timeout_secs: config.git_idle_timeout_secs,

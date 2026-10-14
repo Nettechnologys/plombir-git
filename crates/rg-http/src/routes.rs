@@ -445,7 +445,11 @@ fn apply_middleware(
     // request extensions before forwarding, so the deeper SPA fallback still
     // receives exactly the nonce later written into the response header.
     router.layer(axum::middleware::from_fn_with_state(
-        state.tls_enabled,
+        security::SecurityHeaderState {
+            tls_enabled: state.tls_enabled,
+            configured_https: crate::public_url::configured_https(state.external_url.as_deref()),
+            hsts_preload: state.hsts_preload,
+        },
         security::security_headers_middleware,
     ))
 }
@@ -653,7 +657,7 @@ fn assemble(routers: &Routers) -> Router<AppState> {
 /// Nesting would also make the recorded [`RouteFact`] a lie: the fact would
 /// read `/v2/` while the router served `/v2`, and the table is what the access
 /// sweep and the contract checks read.
-fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
+fn build_v2_routes(state: &AppState, auth_rl: &Wrap<'_>) -> (Router<AppState>, Vec<RouteFact>) {
     // 10 GiB body limit for blob upload requests.
     let upload_limit = Wrap::body_limit(10 * 1024 * 1024 * 1024);
     // The manifest push buffers its body whole, so it carries the spec's own
@@ -672,8 +676,10 @@ fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
         .get(OCI_DISCOVERY, "/v2", oci::api_version_check)
         // Token authentication
         // Advertised as the `realm` of the challenge above — the two have to
-        // stay the same path.
-        .get(Public, "/v2/auth/token", oci::get_token)
+        // stay the same path. Public by necessity, and the one anonymous door
+        // besides `/users/login` that checks a password, so it carries the same
+        // stricter credential limiter.
+        .get_with(Public, "/v2/auth/token", oci::get_token, auth_rl)
         // Tags
         .get(OCI_TOKEN, "/v2/{owner}/{repo}/tags/list", oci::list_tags)
         // Manifests
@@ -3024,7 +3030,7 @@ pub(crate) fn build_all_routes(
         error::api_rejection_envelope,
     ));
 
-    let (v2, v2_facts) = build_v2_routes(state);
+    let (v2, v2_facts) = build_v2_routes(state, &auth_rl);
     // The docs router is built last because it needs the REST table: every
     // documented path is mounted under `/api/v1`, and the access level each of
     // them declares is what the published `security` is derived from.

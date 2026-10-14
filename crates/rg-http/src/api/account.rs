@@ -284,13 +284,10 @@ pub async fn set_initial_password(
             )
             .into_response();
         }
-        PasswordAttempt::Rejected { locked } => {
-            return AppError::unauthorized(if locked {
-                "account is temporarily locked"
-            } else {
-                "invalid credentials"
-            })
-            .into_response();
+        // `locked` is for the log: this door is anonymous, and a lock worded
+        // apart from a wrong password would confirm the name to a guesser.
+        PasswordAttempt::Rejected { .. } => {
+            return AppError::unauthorized("invalid credentials").into_response();
         }
     }
     let Some(found) = found else {
