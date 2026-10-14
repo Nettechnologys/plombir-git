@@ -91,10 +91,16 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let _runtime_guard = runtime.enter();
 
-    // Log to stderr so the stdio JSON-RPC channel stays clean.
+    // Log to stderr so the stdio JSON-RPC channel stays clean. Without
+    // RUST_LOG the filter falls back to `info`, as in `forgekeep` and
+    // `forgekeep-runner`: `from_default_env` would keep only ERROR and hide the
+    // startup warnings about plaintext PAT transport and a missing PAT.
     if tracing_subscriber::fmt()
         .with_writer(io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .try_init()
         .is_err()
     {
