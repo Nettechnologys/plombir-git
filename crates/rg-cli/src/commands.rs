@@ -732,6 +732,9 @@ pub(crate) async fn cmd_import(
     let repo_root = config::resolve_repo_root(repo_root, cfg);
     let trusted_import_origins = config::resolve_trusted_import_origins(cfg)?;
     let import_transport_policy = config::resolve_import_transport_policy(cfg)?;
+    // The LFS objects an import fetches are held to `[limits]` like an upload
+    // through the server would be.
+    let storage_limits = config::resolve_storage_limits(cfg)?;
 
     // SSRF guard (fast, DNS-free): reject an internal/loopback/metadata host or a
     // non-git transport (file://, ext::) before doing any work. The background
@@ -856,6 +859,7 @@ pub(crate) async fn cmd_import(
         &trusted_import_origins,
         &import_transport_policy,
         &repo_root,
+        storage_limits,
     )
     .await?;
 

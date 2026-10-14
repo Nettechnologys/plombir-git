@@ -234,6 +234,7 @@ async fn try_auto_merge(
         &fixture.owner.username,
         &fixture.repo.name,
         1,
+        &Default::default(),
     )
     .await
 }
@@ -250,6 +251,7 @@ async fn merge_over_rest(fixture: &Fixture) -> anyhow::Result<rg_core::pull_requ
         rg_core::pull_request::MergeStrategy::Merge,
         None,
         None,
+        &Default::default(),
     )
     .await
 }

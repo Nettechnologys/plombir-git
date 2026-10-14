@@ -17,7 +17,10 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::common::{register_full, spawn_test_app_with_db_and_repo_root};
+use crate::common::{
+    register_full, spawn_test_app_over_db_with, spawn_test_app_with_db_and_repo_root,
+    StateOverrides,
+};
 
 const OWNER: &str = "lfs_merge_owner";
 const FORKER: &str = "lfs_merge_forker";
@@ -134,6 +137,7 @@ async fn download(
 
 struct Fixture {
     base: String,
+    db: rg_db::DatabaseConnection,
     repo_root: std::path::PathBuf,
     owner_token: String,
     forker_token: String,
@@ -141,7 +145,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        let (base, _db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
+        let (base, db, repo_root) = spawn_test_app_with_db_and_repo_root().await;
         let (owner_token, _) = register_full(&base, OWNER, &format!("{OWNER}@example.com")).await;
         let (forker_token, _) =
             register_full(&base, FORKER, &format!("{FORKER}@example.com")).await;
@@ -169,6 +173,7 @@ impl Fixture {
 
         Self {
             base,
+            db,
             repo_root,
             owner_token,
             forker_token,
@@ -205,10 +210,19 @@ impl Fixture {
     }
 
     async fn merge(&self, number: i64, strategy: &str) -> (reqwest::StatusCode, serde_json::Value) {
+        self.merge_through(&self.base, number, strategy).await
+    }
+
+    /// [`Self::merge`] through another server over the same instance.
+    async fn merge_through(
+        &self,
+        server: &str,
+        number: i64,
+        strategy: &str,
+    ) -> (reqwest::StatusCode, serde_json::Value) {
         let response = reqwest::Client::new()
             .post(format!(
-                "{}/api/v1/repos/{OWNER}/{REPO}/pulls/{number}/merge",
-                self.base
+                "{server}/api/v1/repos/{OWNER}/{REPO}/pulls/{number}/merge"
             ))
             .bearer_auth(&self.owner_token)
             .json(&serde_json::json!({"strategy": strategy}))
@@ -320,5 +334,99 @@ async fn a_fork_pull_request_pointing_at_an_object_nobody_stores_is_refused_unti
         download(base, &fixture.owner_token, OWNER, &never_uploaded).await,
         Ok(never_uploaded),
         "the base repository cannot serve the object after the retried merge"
+    );
+}
+
+/// The same instance restarted with `[limits].repo_quota_mb` at `bytes`.
+async fn with_budget(fixture: &Fixture, bytes: u64) -> String {
+    let limits = rg_core::storage_quota::StorageLimits {
+        repo_quota_bytes: Some(bytes),
+        ..Default::default()
+    };
+    spawn_test_app_over_db_with(
+        fixture.db.clone(),
+        fixture.repo_root.clone(),
+        StateOverrides {
+            storage_limits: Some(limits),
+            ..StateOverrides::default()
+        },
+    )
+    .await
+}
+
+/// A merge adopts the fork's LFS objects into the base repository, and a fork
+/// copies its source's: both are writes to a repository that has a budget,
+/// and both went around it. Each is refused before anything moves, and the
+/// merge is charged exactly what the base gains — at a budget the object fits
+/// to the byte, the same pull request merges.
+#[tokio::test]
+async fn a_merge_or_a_fork_past_the_repository_budget_is_refused_before_anything_moves() {
+    let fixture = Fixture::new().await;
+    let base = fixture.base.as_str();
+
+    let payload = b"an LFS object the base repository has no room for".to_vec();
+    upload_object(base, &fixture.forker_token, FORKER, &payload).await;
+    push_branch(
+        &fixture.fork_path(),
+        "too-big",
+        &[("too-big.bin", pointer_for(&payload))],
+    );
+    let number = fixture.open_pr("too-big").await;
+    let tip_before = fixture.base_tip();
+
+    let tight = with_budget(&fixture, payload.len() as u64 - 1).await;
+    let (status, body) = fixture.merge_through(&tight, number, "merge").await;
+    assert_eq!(
+        status, 413,
+        "a merge past the base budget must be refused: {body}"
+    );
+    assert!(
+        body.to_string().contains("repo_quota_mb"),
+        "the refusal must name the budget: {body}"
+    );
+    assert_eq!(
+        fixture.base_tip(),
+        tip_before,
+        "the base branch moved although the merge was refused"
+    );
+    assert!(
+        download(base, &fixture.owner_token, OWNER, &payload)
+            .await
+            .is_err(),
+        "the refused merge still adopted the object"
+    );
+
+    // The fork holds the object, so a fork of the fork would too.
+    let (third_token, _) =
+        register_full(&tight, "lfs_merge_third", "lfs_merge_third@example.com").await;
+    let fork = reqwest::Client::new()
+        .post(format!("{tight}/api/v1/repos/{FORKER}/{REPO}/fork"))
+        .bearer_auth(&third_token)
+        .send()
+        .await
+        .unwrap();
+    let fork_status = fork.status();
+    let fork_body = fork.text().await.unwrap();
+    assert_eq!(
+        fork_status, 413,
+        "a fork past the budget must be refused: {fork_body}"
+    );
+    assert!(
+        !fixture
+            .repo_root
+            .join(format!("lfs_merge_third/{REPO}.git"))
+            .exists(),
+        "the refused fork left a repository on disk"
+    );
+
+    let exact = with_budget(&fixture, payload.len() as u64).await;
+    let (status, body) = fixture.merge_through(&exact, number, "merge").await;
+    assert_eq!(
+        status, 200,
+        "an object that fits the budget to the byte must merge: {body}"
+    );
+    assert_eq!(
+        download(base, &fixture.owner_token, OWNER, &payload).await,
+        Ok(payload),
     );
 }

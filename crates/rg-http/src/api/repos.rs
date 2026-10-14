@@ -807,6 +807,7 @@ impl TargetOwnerOrSelf for ForkRequest {
         (status = 403, description = "Source repository not readable, or destination namespace not writable by this caller", body = serde_json::Value),
         (status = 404, description = "No such source repository", body = serde_json::Value),
         (status = 409, description = "The destination namespace already holds a repository of that name", body = serde_json::Value),
+        (status = 413, description = "The source's LFS objects, which the fork copies, do not fit one repository's `[limits].repo_quota_mb` budget", body = serde_json::Value),
     ),
 )]
 pub async fn fork_repo_handler(
@@ -843,6 +844,7 @@ pub async fn fork_repo_handler(
         &source,
         state.blob_storage.as_ref(),
         &state.repo_root,
+        &state.storage_limits,
     )
     .await
     {

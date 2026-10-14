@@ -50,6 +50,7 @@ pub(crate) struct MirrorLfsPass {
 /// `Err` is this server's own failure — its database, its blob store, a clone
 /// it cannot read. An object the upstream does not give is not an error: it is
 /// in [`MirrorLfsPass::failed`] by oid and path, and the rest still arrive.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_new_objects(
     db: &DatabaseConnection,
     repo_root: &Path,
@@ -58,6 +59,7 @@ pub(crate) async fn fetch_new_objects(
     remote_url: &str,
     credentials: Option<GitCredentials>,
     guard: &dyn LfsSourceGuard,
+    limits: crate::storage_quota::StorageLimits,
 ) -> Result<MirrorLfsPass> {
     let scan_path = clone.to_path_buf();
     let scan = crate::blocking::run_blocking_git("mirror LFS pointer scan", move || {
@@ -88,6 +90,7 @@ pub(crate) async fn fetch_new_objects(
             remote_url,
             credentials,
             guard,
+            limits,
         )?;
         for chunk in pointers.chunks(crate::lfs::fetch::BATCH_SIZE) {
             outcome.absorb(fetcher.fetch(chunk).await?);
@@ -514,9 +517,18 @@ mod tests {
         let pass = |credentials: Option<GitCredentials>| {
             let (db, repo_root, clone, url) = (&db, &repo_root, &clone, source.remote_url());
             async move {
-                fetch_new_objects(db, repo_root, repo_id, clone, &url, credentials, &Loopback)
-                    .await
-                    .expect("a pass that only the upstream can fail")
+                fetch_new_objects(
+                    db,
+                    repo_root,
+                    repo_id,
+                    clone,
+                    &url,
+                    credentials,
+                    &Loopback,
+                    crate::storage_quota::StorageLimits::default(),
+                )
+                .await
+                .expect("a pass that only the upstream can fail")
             }
         };
 

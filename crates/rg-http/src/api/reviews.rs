@@ -402,6 +402,7 @@ pub async fn submit_review(
                     &owner,
                     &repo,
                     number,
+                    &state.storage_limits,
                 )
                 .await
                 {

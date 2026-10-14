@@ -74,6 +74,9 @@ pub struct PostPushParams<'a> {
     /// — including code index refresh and notification fan-out. `None` writes
     /// through `db`.
     pub write_pool: Option<&'a DatabaseConnection>,
+    /// `[limits]`, for the merges these hooks evaluate. See
+    /// [`crate::pull_request::ci::PipelineCi::storage_limits`].
+    pub storage_limits: crate::storage_quota::StorageLimits,
 }
 
 impl PostPushParams<'_> {
@@ -89,6 +92,7 @@ impl PostPushParams<'_> {
             jwt_secret: self.jwt_secret,
             encryption_key: self.encryption_key,
             external_url: self.external_url,
+            storage_limits: self.storage_limits,
         }
     }
 
@@ -127,6 +131,8 @@ pub struct PostPushContext {
     pub delivery_tracker: crate::task_tracker::TaskTracker,
     /// See [`PostPushParams::write_pool`].
     pub write_pool: Option<DatabaseConnection>,
+    /// See [`PostPushParams::storage_limits`].
+    pub storage_limits: crate::storage_quota::StorageLimits,
 }
 
 impl PostPushContext {
@@ -165,6 +171,7 @@ impl PostPushContext {
                 external_url: self.external_url.as_deref(),
                 delivery_tracker: &self.delivery_tracker,
                 write_pool: self.write_pool.as_ref(),
+                storage_limits: self.storage_limits,
             },
             ref_updates,
         )
@@ -207,6 +214,7 @@ impl PostPushContext {
                     external_url: context.external_url.as_deref(),
                     delivery_tracker: &context.delivery_tracker,
                     write_pool: context.write_pool.as_ref(),
+                    storage_limits: context.storage_limits,
                 },
                 &ref_updates,
             )
@@ -226,6 +234,7 @@ impl PostPushContext {
             jwt_secret: self.jwt_secret.as_deref(),
             encryption_key: self.encryption_key.as_deref(),
             external_url: self.external_url.as_deref(),
+            storage_limits: self.storage_limits,
         }
     }
 
@@ -347,6 +356,7 @@ pub async fn evaluate_merges_for_head_commit(
         repo_root,
         source_repo_id,
         commit_sha,
+        &ci.storage_limits,
     )
     .await
     {
@@ -1847,6 +1857,7 @@ mod tests {
             external_url: None,
             delivery_tracker: &tracker,
             write_pool: None,
+            storage_limits: Default::default(),
         };
         trigger_push_webhooks(
             &params,
@@ -1915,6 +1926,7 @@ mod tests {
             external_url: None,
             delivery_tracker: &tracker,
             write_pool: None,
+            storage_limits: Default::default(),
         };
         let update = moved(
             "refs/heads/main",
@@ -2072,6 +2084,7 @@ mod tests {
             notifier: None,
             delivery_tracker: tracker.clone(),
             write_pool: None,
+            storage_limits: Default::default(),
         };
         let delayed_update = RefUpdate {
             old_sha: initial,
@@ -2336,6 +2349,7 @@ mod tests {
             external_url: None,
             delivery_tracker: &tracker,
             write_pool: None,
+            storage_limits: Default::default(),
         };
         let target = HookTarget {
             repo_id: repo.id,
@@ -2624,6 +2638,7 @@ mod seed_lookup_tests {
                 external_url: None,
                 delivery_tracker: &delivery_tracker,
                 write_pool: None,
+                storage_limits: Default::default(),
             },
             &[RefUpdate {
                 old_sha: "0".repeat(40),

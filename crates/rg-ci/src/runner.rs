@@ -949,7 +949,8 @@ impl PipelineRunner {
             self.notifications.clone(),
             self.job_timeout_secs,
         )
-        .with_write_pool(self.db_write.clone());
+        .with_write_pool(self.db_write.clone())
+        .with_storage_limits(self.storage_limits);
         crate::post_push_context(
             repo_root,
             self.docker_enabled,
@@ -2320,6 +2321,33 @@ mod tests {
         notifier.notify(9, "push", serde_json::json!({}));
         assert_eq!(recorder.events(), vec![(9, "push".to_string())]);
         assert!(context.smtp_config.is_some());
+    }
+
+    /// A merge the embedded runner unblocks — auto-merge, the merge queue —
+    /// adopts a fork's LFS objects into the base repository, so the hooks it
+    /// hands off must carry the same budget the runner was given, one hop
+    /// down and in the CI wiring the merges read it from.
+    #[tokio::test]
+    async fn the_post_success_hooks_carry_the_runner_budget() {
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        let mut runner =
+            PipelineRunner::new_local_only(db, std::path::Path::new("/srv/repos/o/r.git"), 1);
+        let limits = rg_core::storage_quota::StorageLimits {
+            repo_quota_bytes: Some(4096),
+            ..Default::default()
+        };
+        runner.set_storage_limits(limits);
+
+        let context = runner.post_push_context(std::path::Path::new("/srv/repos"));
+        assert_eq!(context.storage_limits, limits);
+        assert_eq!(context.pipeline_ci().storage_limits, limits);
     }
 
     #[tokio::test]

@@ -1878,6 +1878,7 @@ pub(crate) async fn run_serve(
         notifier: Some(std::sync::Arc::new(notification_hub)),
         delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
         write_pool: Some(db_write.clone()),
+        storage_limits: resolved_storage_limits,
     };
 
     // ── Scheduled mirror sync ─────────────────────────────────────
@@ -1900,6 +1901,7 @@ pub(crate) async fn run_serve(
                 .and_then(|config| config.batch_size)
                 .unwrap_or(rg_core::mirror::scheduler::DEFAULT_BATCH_SIZE),
             transport_policy: resolved_mirror_transport_policy,
+            storage_limits: resolved_storage_limits,
         };
         tracing::info!(
             poll_interval_secs = sync_config.poll_interval_secs,

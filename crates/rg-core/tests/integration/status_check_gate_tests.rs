@@ -269,6 +269,7 @@ async fn merge_service_requires_current_repository_write_access() {
         rg_core::pull_request::MergeStrategy::Merge,
         None,
         None,
+        &Default::default(),
     )
     .await
     .expect_err("a library caller cannot merge on behalf of an outsider");
@@ -306,6 +307,7 @@ async fn merge_service_requires_an_active_actor() {
         rg_core::pull_request::MergeStrategy::Merge,
         None,
         None,
+        &Default::default(),
     )
     .await
     .expect_err("a durable actor id must not outlive account standing");
@@ -338,6 +340,7 @@ async fn merge_service_rechecks_branch_protection_before_git() {
         rg_core::pull_request::MergeStrategy::Merge,
         None,
         None,
+        &Default::default(),
     )
     .await
     .expect_err("the protected branch has no successful pipeline");

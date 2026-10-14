@@ -621,6 +621,7 @@ pub async fn compare(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 413, description = "The LFS objects a fork pull request brings do not fit the base repository's `[limits].repo_quota_mb` budget", body = serde_json::Value),
     ),
 )]
 pub async fn merge_pr(
@@ -711,6 +712,7 @@ pub async fn merge_pr(
         // (card_9ff26bb95dc9).
         None,
         Some(&state.delivery_tracker),
+        &state.storage_limits,
     )
     .await
     {
@@ -851,6 +853,7 @@ pub async fn enable_auto_merge(
         &owner,
         &repo,
         number,
+        &state.storage_limits,
     )
     .await
     {

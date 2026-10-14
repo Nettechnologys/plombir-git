@@ -3978,6 +3978,7 @@ pub async fn try_auto_merge(
     owner: &str,
     repo_name: &str,
     number: i64,
+    storage_limits: &crate::storage_quota::StorageLimits,
 ) -> Result<AutoMergeOutcome> {
     let pools = db.owned();
     let db = pools.read();
@@ -4059,6 +4060,7 @@ pub async fn try_auto_merge(
         strategy,
         pr.head_sha.as_deref(),
         None,
+        storage_limits,
     )
     .await
     {
@@ -4084,6 +4086,7 @@ pub async fn try_auto_merges_for_head_commit(
     repo_root: &std::path::Path,
     source_repo_id: i64,
     commit_sha: &str,
+    storage_limits: &crate::storage_quota::StorageLimits,
 ) -> Result<Vec<AutoMergeOutcome>> {
     let pools = db.owned();
     let db = pools.read();
@@ -4130,7 +4133,16 @@ pub async fn try_auto_merges_for_head_commit(
                 continue;
             }
         };
-        match try_auto_merge(&pools, repo_root, &namespace, &repository.name, pr.number).await {
+        match try_auto_merge(
+            &pools,
+            repo_root,
+            &namespace,
+            &repository.name,
+            pr.number,
+            storage_limits,
+        )
+        .await
+        {
             Ok(outcome) => outcomes.push(outcome),
             Err(error) => tracing::warn!(
                 pr_id = pr.id,
@@ -4248,6 +4260,7 @@ pub async fn merge_pr(
     strategy: MergeStrategy,
     expected_head_sha: Option<&str>,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
+    storage_limits: &crate::storage_quota::StorageLimits,
 ) -> Result<MergeResult> {
     let pools = db.owned();
     let db = pools.read();
@@ -4319,6 +4332,7 @@ pub async fn merge_pr(
         strategy,
         pinned_head.as_deref(),
         delivery_tracker,
+        storage_limits,
     )
     .await;
     if result.is_err() {
@@ -4344,6 +4358,7 @@ async fn merge_claimed_pr(
     strategy: MergeStrategy,
     expected_head_sha: Option<&str>,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
+    storage_limits: &crate::storage_quota::StorageLimits,
 ) -> Result<MergeResult> {
     let pools = db.owned();
     let db = pools.read();
@@ -4470,6 +4485,7 @@ async fn merge_claimed_pr(
                 name: repo_name,
             },
             &lfs_oids,
+            storage_limits,
         )
         .await
         {
@@ -5288,6 +5304,41 @@ fn discard_fork_ref(repo_path: &std::path::Path, ref_name: &str) {
     }
 }
 
+/// Refuse a fork pull request whose LFS objects would not fit the base
+/// repository's `[limits]` budget, before anything is adopted.
+///
+/// Only what the base would gain is charged: an object it already stores adds
+/// nothing, and one the fork does not store either is left to the "neither
+/// repository has it" refusal below. Before the merge, like that refusal, so
+/// the author is told while the base branch has not moved.
+async fn refuse_adoption_past_budget(
+    db: &DatabaseConnection,
+    fork: LfsRepository<'_>,
+    base: LfsRepository<'_>,
+    oids: &[String],
+    storage_limits: &crate::storage_quota::StorageLimits,
+) -> Result<()> {
+    if storage_limits.repo_quota_bytes.is_none() {
+        return Ok(());
+    }
+    let mut incoming = 0_u64;
+    for oid in oids {
+        let in_base = rg_db::ops::lfs_object_ops::find_by_repo_and_oid(db, base.id, oid).await?;
+        if in_base.is_some_and(|row| row.uploaded) {
+            continue;
+        }
+        if let Some(row) = rg_db::ops::lfs_object_ops::find_by_repo_and_oid(db, fork.id, oid)
+            .await?
+            .filter(|row| row.uploaded)
+        {
+            incoming = incoming.saturating_add(u64::try_from(row.size).unwrap_or(0));
+        }
+    }
+    crate::storage_quota::check_room(db, base.id, incoming, storage_limits)
+        .await
+        .map_err(crate::storage_quota::QuotaError::into_service_error)
+}
+
 /// Give the base repository of a fork pull request every LFS object in
 /// `oids` it does not store yet, taking them from the fork.
 ///
@@ -5302,10 +5353,12 @@ async fn adopt_fork_lfs_objects(
     fork: LfsRepository<'_>,
     base: LfsRepository<'_>,
     oids: &[String],
+    storage_limits: &crate::storage_quota::StorageLimits,
 ) -> Result<()> {
     if oids.is_empty() {
         return Ok(());
     }
+    refuse_adoption_past_budget(db, fork, base, oids, storage_limits).await?;
     let adopted = crate::lfs::service::adopt_objects(
         db,
         &crate::blob_storage::instance_blob_storage(repo_root),

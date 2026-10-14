@@ -31,6 +31,10 @@ pub struct PipelineCi<'a> {
     /// See [`crate::ci::TriggerPipelineParams::encryption_key`].
     pub encryption_key: Option<&'a str>,
     pub external_url: Option<&'a str>,
+    /// `[limits]`: a merge this wiring runs (the merge queue, auto-merge) is a
+    /// write to the base repository — the LFS objects a fork pull request
+    /// brings are adopted into it — and is held to its budget.
+    pub storage_limits: crate::storage_quota::StorageLimits,
 }
 
 /// The event name a pull-request pipeline is created under.
@@ -591,6 +595,7 @@ mod configuration_failure_tests {
                 jwt_secret: None,
                 encryption_key: None,
                 external_url: None,
+                storage_limits: Default::default(),
             },
         )
         .await;

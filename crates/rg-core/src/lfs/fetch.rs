@@ -148,6 +148,9 @@ pub struct LfsFetcher<'a> {
     /// One client per download origin, each built through the guard for that
     /// origin. A source typically serves every object from one or two hosts.
     download_clients: HashMap<HttpOrigin, reqwest::Client>,
+    /// The destination's `[limits]` budget, checked for each object before it
+    /// is downloaded.
+    limits: crate::storage_quota::StorageLimits,
 }
 
 /// The batch endpoint the git-lfs client derives from `remote_url`.
@@ -179,6 +182,13 @@ impl<'a> LfsFetcher<'a> {
     ///
     /// Network-free: the endpoint's address is resolved by the client's guarded
     /// connector when the first batch is sent, never ahead of it.
+    ///
+    /// `limits` is the destination's budget. An object it has no room for is
+    /// one of the [`LfsFetchOutcome::failed`], named with the budget as its
+    /// reason, and is never downloaded: a mirror or an import is a write to
+    /// the repository like an upload is, and was the way around every ceiling
+    /// an upload is held to.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: &'a DatabaseConnection,
         storage: &'a dyn BlobStorage,
@@ -187,6 +197,7 @@ impl<'a> LfsFetcher<'a> {
         remote_url: &str,
         credentials: Option<GitCredentials>,
         guard: &'a dyn LfsSourceGuard,
+        limits: crate::storage_quota::StorageLimits,
     ) -> Result<Self> {
         let endpoint = batch_endpoint(remote_url)?;
         let endpoint_origin = HttpOrigin::from_url(&endpoint)
@@ -208,6 +219,7 @@ impl<'a> LfsFetcher<'a> {
             endpoint_origin,
             batch_client,
             download_clients: HashMap::new(),
+            limits,
         })
     }
 
@@ -388,6 +400,24 @@ impl<'a> LfsFetcher<'a> {
                 "the source offered no download for this object".to_string()
             ));
         };
+        // Checked per object rather than once per batch: each object stored
+        // before this one is already in the sum, so the answer is the one an
+        // upload of this object would get right now. A database that cannot
+        // answer is this server's failure, not the object's.
+        match crate::storage_quota::check_room(
+            self.db,
+            self.destination.id,
+            entry.pointer.size,
+            &self.limits,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(crate::storage_quota::QuotaError::Exceeded(exceeded)) => {
+                return Ok(Err(exceeded.message));
+            }
+            Err(crate::storage_quota::QuotaError::Db(error)) => return Err(error),
+        }
 
         let request = match self.download_request(action) {
             Ok(request) => request,
@@ -948,6 +978,25 @@ mod tests {
         trusted: &TrustedImportOrigins,
         pointers: &[PointerInHistory],
     ) -> LfsFetchOutcome {
+        fetch_within(
+            db,
+            repo_root,
+            remote_url,
+            trusted,
+            pointers,
+            crate::storage_quota::StorageLimits::default(),
+        )
+        .await
+    }
+
+    async fn fetch_within(
+        db: &DatabaseConnection,
+        repo_root: &std::path::Path,
+        remote_url: &str,
+        trusted: &TrustedImportOrigins,
+        pointers: &[PointerInHistory],
+        limits: crate::storage_quota::StorageLimits,
+    ) -> LfsFetchOutcome {
         let storage = crate::blob_storage::instance_blob_storage(repo_root);
         let mut fetcher = LfsFetcher::new(
             db,
@@ -961,12 +1010,104 @@ mod tests {
             remote_url,
             Some(GitCredentials::token("x-access-token", TOKEN)),
             trusted,
+            limits,
         )
         .expect("build fetcher");
         fetcher
             .fetch(pointers)
             .await
             .expect("a source's refusals are not this server's error")
+    }
+
+    /// A mirror or an import writes to the repository the way an upload does,
+    /// and is held to the same budget: objects are stored while they fit, the
+    /// first one that does not is named with the budget as its reason, and its
+    /// bytes are never asked for.
+    #[tokio::test]
+    async fn an_object_past_the_destination_budget_is_named_and_never_downloaded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = dir.path();
+        let db = setup_db().await;
+
+        let first = b"the object that fits the budget".to_vec();
+        let second = b"the object that does not fit any more".to_vec();
+        let (first_oid, second_oid) = (oid_of(&first), oid_of(&second));
+
+        let address = Arc::new(Mutex::new(None::<std::net::SocketAddr>));
+        let handler: Handler = {
+            let address = Arc::clone(&address);
+            let (first, second) = (first.clone(), second.clone());
+            let (first_oid, second_oid) = (first_oid.clone(), second_oid.clone());
+            Arc::new(move |request: &Request| {
+                let origin = format!("http://{}", address.lock().unwrap().expect("address"));
+                match request.path() {
+                    "/team/assets.git/info/lfs/objects/batch" => {
+                        let answer = serde_json::json!({
+                            "transfer": "basic",
+                            "objects": [
+                                {"oid": first_oid, "size": first.len(), "actions": {"download": {
+                                    "href": format!("{origin}/media/{first_oid}"),
+                                }}},
+                                {"oid": second_oid, "size": second.len(), "actions": {"download": {
+                                    "href": format!("{origin}/media/{second_oid}"),
+                                }}},
+                            ],
+                        });
+                        respond("200 OK", LFS_MEDIA_TYPE, answer.to_string().as_bytes())
+                    }
+                    path if path == format!("/media/{first_oid}") => {
+                        respond("200 OK", "application/octet-stream", &first)
+                    }
+                    path if path == format!("/media/{second_oid}") => {
+                        respond("200 OK", "application/octet-stream", &second)
+                    }
+                    other => panic!("unexpected request for {other}"),
+                }
+            })
+        };
+        let (source, requests) = serve(handler).await;
+        *address.lock().unwrap() = Some(source);
+
+        // Room for the first object and not for both.
+        let limits = crate::storage_quota::StorageLimits {
+            repo_quota_bytes: Some((first.len() + second.len() - 1) as u64),
+            ..Default::default()
+        };
+        let outcome = fetch_within(
+            &db,
+            repo_root,
+            &format!("http://{source}/team/assets.git"),
+            &trusting(source),
+            &[
+                pointer(&first_oid, first.len(), "a/first.bin"),
+                pointer(&second_oid, second.len(), "b/second.bin"),
+            ],
+            limits,
+        )
+        .await;
+
+        assert_eq!(outcome.fetched, 1, "failed: {:?}", outcome.failed);
+        assert_eq!(outcome.failed.len(), 1, "{:?}", outcome.failed);
+        let refused = &outcome.failed[0];
+        assert_eq!(
+            (refused.oid.as_str(), refused.path.as_str()),
+            (second_oid.as_str(), "b/second.bin")
+        );
+        assert!(
+            refused.reason.contains("repo_quota_mb"),
+            "the reason must name the budget: {}",
+            refused.reason
+        );
+        assert_eq!(stored_content(repo_root, &first_oid).await, Some(first));
+        assert_eq!(stored_content(repo_root, &second_oid).await, None);
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.path() == format!("/media/{second_oid}")),
+            "an object the budget refuses must not be downloaded"
+        );
     }
 
     #[test]

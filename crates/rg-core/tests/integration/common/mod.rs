@@ -260,6 +260,7 @@ pub async fn run_post_push_hooks(
             external_url: None,
             delivery_tracker: &delivery_tracker,
             write_pool: None,
+            storage_limits: Default::default(),
         },
         ref_updates,
     )

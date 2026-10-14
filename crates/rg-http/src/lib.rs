@@ -411,6 +411,7 @@ impl AppState {
             notifier: Some(Arc::new(self.notification_hub.clone())),
             delivery_tracker: self.delivery_tracker.clone(),
             write_pool: Some(self.db_write.clone()),
+            storage_limits: self.storage_limits,
         }
     }
 
@@ -478,6 +479,7 @@ impl AppState {
             jwt_secret: Some(&self.jwt_secret),
             encryption_key: Some(&self.encryption_key),
             external_url: self.external_url.as_deref(),
+            storage_limits: self.storage_limits,
         }
     }
 }

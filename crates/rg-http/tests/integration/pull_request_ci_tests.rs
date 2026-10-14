@@ -960,6 +960,7 @@ impl Fixture {
             jwt_secret: None,
             encryption_key: None,
             external_url: None,
+            storage_limits: Default::default(),
         };
         rg_core::pull_request::trigger_pull_request_ci(&self.db, &self.repo_root, pr, None, &ci)
             .await

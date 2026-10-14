@@ -1304,6 +1304,7 @@ fn post_push_context(
         notifier: engine.notifications.notifier.clone(),
         delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
         write_pool: engine.write_pool.clone(),
+        storage_limits: engine.storage_limits,
     }
 }
 

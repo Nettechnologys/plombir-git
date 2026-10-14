@@ -486,6 +486,7 @@ pub async fn run_import(
     auth_token: Option<&str>,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
     transport_policy: &crate::import::trust::ImportTransportPolicy,
+    storage_limits: crate::storage_quota::StorageLimits,
 ) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
 
@@ -506,13 +507,40 @@ pub async fn run_import(
 
     match task.platform.as_str() {
         "github" => {
-            run_github_import(db, task, repo_root, auth_token, &mut stats, trusted_origins).await?
+            run_github_import(
+                db,
+                task,
+                repo_root,
+                auth_token,
+                &mut stats,
+                trusted_origins,
+                storage_limits,
+            )
+            .await?
         }
         "gitlab" => {
-            run_gitlab_import(db, task, repo_root, auth_token, &mut stats, trusted_origins).await?
+            run_gitlab_import(
+                db,
+                task,
+                repo_root,
+                auth_token,
+                &mut stats,
+                trusted_origins,
+                storage_limits,
+            )
+            .await?
         }
         "gitea" | "git" => {
-            run_git_import(db, task, repo_root, auth_token, &mut stats, trusted_origins).await?
+            run_git_import(
+                db,
+                task,
+                repo_root,
+                auth_token,
+                &mut stats,
+                trusted_origins,
+                storage_limits,
+            )
+            .await?
         }
         other => anyhow::bail!("unsupported platform: {other}"),
     }
@@ -550,6 +578,7 @@ async fn clone_into_target(
     token: &str,
     progress_when_done: i32,
     stats: &mut ImportStats,
+    storage_limits: crate::storage_quota::StorageLimits,
 ) -> Result<()> {
     let outcome = clone_into_target_with_destination(
         db,
@@ -577,6 +606,7 @@ async fn clone_into_target(
             token,
             progress_when_done,
             stats,
+            storage_limits,
         )
         .await?;
     }
@@ -603,6 +633,7 @@ async fn fetch_lfs_objects(
     token: &str,
     progress: i32,
     stats: &mut ImportStats,
+    storage_limits: crate::storage_quota::StorageLimits,
 ) -> Result<()> {
     let repo_path = repo_root.join(format!("{}/{}.git", task.target_owner, task.target_name));
     let pointers = crate::blocking::run_blocking_git("import LFS pointer scan", move || {
@@ -637,6 +668,7 @@ async fn fetch_lfs_objects(
         clone_url,
         source_credentials(&task.platform, &task.source_url, token),
         trusted_origins,
+        storage_limits,
     )?;
     let mut outcome = crate::lfs::fetch::LfsFetchOutcome::default();
     let mut done = 0;
@@ -939,6 +971,7 @@ async fn run_git_import(
     auth_token: &str,
     stats: &mut ImportStats,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
+    storage_limits: crate::storage_quota::StorageLimits,
 ) -> Result<()> {
     let repo_id = resolve_or_create_target_repo(
         db,
@@ -963,6 +996,7 @@ async fn run_git_import(
             auth_token,
             90,
             stats,
+            storage_limits,
         )
         .await?;
     }
@@ -1035,6 +1069,7 @@ async fn run_github_import(
     token: &str,
     stats: &mut ImportStats,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
+    storage_limits: crate::storage_quota::StorageLimits,
 ) -> Result<()> {
     // Parse the repository identity and its API host together. Computing only
     // owner/repo here used to leave the client's optional base URL at `None`,
@@ -1074,6 +1109,7 @@ async fn run_github_import(
             token,
             10,
             stats,
+            storage_limits,
         )
         .await?;
     }
@@ -1247,6 +1283,7 @@ async fn run_gitlab_import(
     token: &str,
     stats: &mut ImportStats,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
+    storage_limits: crate::storage_quota::StorageLimits,
 ) -> Result<()> {
     // Parse the project identity and its API host together. Computing only the
     // path here used to leave the client's optional base URL at `None`, which
@@ -1293,6 +1330,7 @@ async fn run_gitlab_import(
             token,
             10,
             stats,
+            storage_limits,
         )
         .await?;
     }
@@ -3808,6 +3846,7 @@ pub async fn start_import(
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
     transport_policy: &crate::import::trust::ImportTransportPolicy,
     repo_root: &Path,
+    storage_limits: crate::storage_quota::StorageLimits,
 ) -> Result<ImportTask> {
     // The target name is the client's, whether they typed it or let it be
     // derived from the source URL, so it is refused here rather than inside the
@@ -3909,6 +3948,7 @@ pub async fn start_import(
             auth_token.as_deref(),
             &trusted_origins,
             &transport_policy,
+            storage_limits,
         )
         .await
         {
@@ -5359,6 +5399,7 @@ mod import_target_lifecycle_tests {
             None,
             &trusted_origins,
             &transport_policy,
+            Default::default(),
         )
         .await
         .expect_err("a legacy native-Git task must fail before its wiki path");
@@ -5435,6 +5476,7 @@ mod import_target_lifecycle_tests {
             "",
             90,
             &mut stats,
+            Default::default(),
         )
         .await
         .expect_err("the clone must not run for a repository that no longer exists");
@@ -5488,6 +5530,7 @@ mod import_target_lifecycle_tests {
             &Default::default(),
             &Default::default(),
             repo_root.path(),
+            Default::default(),
         )
         .await
         .expect("start an import into an existing repository");
@@ -5517,6 +5560,7 @@ mod import_target_lifecycle_tests {
             &Default::default(),
             &Default::default(),
             repo_root.path(),
+            Default::default(),
         )
         .await
         .expect("start an import into a name that does not exist yet");
@@ -5560,6 +5604,7 @@ mod import_target_lifecycle_tests {
                 &Default::default(),
                 &Default::default(),
                 repo_root.path(),
+                Default::default(),
             )
             .await
             .expect_err("a non-git scheme must be refused at admission");

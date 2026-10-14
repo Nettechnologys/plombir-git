@@ -359,6 +359,7 @@ async fn an_import_source_url_is_stored_without_its_token() {
         &Default::default(),
         &Default::default(),
         dir.path(),
+        Default::default(),
     )
     .await
     .expect("the import is accepted");

@@ -853,6 +853,31 @@ async fn ci_artifacts_are_checked_and_counted_against_the_budget() {
     );
 }
 
+// ── Merges off the request path ──────────────────────────────
+
+/// The merge queue and auto-merge run off the request, through the CI wiring
+/// and the post-push context rather than the handler's state. Both have to
+/// carry `[limits]`, or a merge they run adopts a fork's LFS objects past the
+/// budget a merge through the route is held to.
+#[tokio::test]
+async fn the_wiring_merges_run_through_carries_the_budget() {
+    let (db, dir) = crate::common::setup_test_db().await;
+    let limits = StorageLimits {
+        repo_quota_bytes: Some(4096),
+        ..StorageLimits::default()
+    };
+    let state = crate::common::build_test_app_state_with(
+        db,
+        dir.path().join("repos"),
+        overrides_with(|configured| *configured = limits),
+    );
+
+    assert_eq!(state.pipeline_ci().storage_limits, limits);
+    let context = state.post_push_context();
+    assert_eq!(context.storage_limits, limits);
+    assert_eq!(context.pipeline_ci().storage_limits, limits);
+}
+
 // ── The default asks nothing ─────────────────────────────────
 
 /// A stored LFS object of `size` bytes, written straight into the table: the

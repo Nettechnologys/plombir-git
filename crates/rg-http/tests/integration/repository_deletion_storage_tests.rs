@@ -333,6 +333,7 @@ async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_
             &state.repo_root,
             Default::default(),
             TEST_ENCRYPTION_KEY,
+            &Default::default(),
             None,
         )
             .await
@@ -359,6 +360,7 @@ async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_
             10,
             Default::default(),
             TEST_ENCRYPTION_KEY,
+            &Default::default(),
             None,
         )
         .await

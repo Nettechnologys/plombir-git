@@ -2827,6 +2827,34 @@ pub struct ForkedRepo {
     pub owner_name: String,
 }
 
+/// Refuse a fork whose copy of the source's LFS objects would not fit one
+/// repository's `[limits]` budget.
+///
+/// The fork starts empty and receives every stored LFS object of its source as
+/// its own (`copy_repository_objects`), so that sum is what it would hold the
+/// moment it exists. Asked before the clone rather than when the copy runs: a
+/// refusal then costs one query instead of a clone that has to be undone.
+async fn refuse_fork_past_budget(
+    db: &DatabaseConnection,
+    source_owner: &str,
+    source_repo: &rg_db::entities::repository::Model,
+    limits: &crate::storage_quota::StorageLimits,
+) -> Result<()> {
+    let Some(limit) = limits.repo_quota_bytes else {
+        return Ok(());
+    };
+    let (_, lfs_bytes) = rg_db::ops::lfs_object_ops::usage(db, source_repo.id).await?;
+    let lfs_bytes = u64::try_from(lfs_bytes).unwrap_or(0);
+    if crate::storage_quota::exceeds(0, lfs_bytes, limit).is_none() {
+        return Ok(());
+    }
+    Err(crate::error::payload_too_large(format!(
+        "a fork of {source_owner}/{} would hold the {lfs_bytes} byte(s) of LFS objects it copies \
+         from its source, beyond the {limit}-byte repository limit ([limits].repo_quota_mb)",
+        source_repo.name
+    )))
+}
+
 /// Fork `source_repo` into a namespace the caller has already authorized.
 ///
 /// **The read gate on the source is the caller's**, which is why the source
@@ -2846,6 +2874,7 @@ pub async fn fork_repo(
     source_repo: &rg_db::entities::repository::Model,
     blob_storage: &dyn BlobStorage,
     repo_root: &std::path::Path,
+    limits: &crate::storage_quota::StorageLimits,
 ) -> Result<ForkedRepo> {
     // Name already taken → 400. Each outcome carries its own type so the clone,
     // the `create_dir_all` and the queries in between keep their 5xx instead of
@@ -2892,6 +2921,7 @@ pub async fn fork_repo(
         &conflict_message,
     )
     .await?;
+    refuse_fork_past_budget(db, source_owner, source_repo, limits).await?;
 
     let source_path = repo_root.join(format!("{source_owner}/{repo_name}.git"));
     let target_path = repo_root.join(format!("{destination_namespace}/{repo_name}.git"));
@@ -6974,6 +7004,7 @@ mod repository_deletion_tests {
                 &source,
                 &crate::blob_storage::LocalBlobStorage::new(repo_root),
                 repo_root,
+                &crate::storage_quota::StorageLimits::default(),
             )
             .await
             .expect("fork the source repository");
@@ -7536,6 +7567,7 @@ mod repository_deletion_tests {
             &upstream,
             &crate::blob_storage::LocalBlobStorage::new(&repo_root),
             &repo_root,
+            &crate::storage_quota::StorageLimits::default(),
         )
         .await
         .map(|forked| forked.repo.id)
@@ -7617,6 +7649,7 @@ mod repository_deletion_tests {
             &upstream,
             &crate::blob_storage::LocalBlobStorage::new(&repo_root),
             &repo_root,
+            &crate::storage_quota::StorageLimits::default(),
         )
         .await
         .map(|forked| forked.repo.id)

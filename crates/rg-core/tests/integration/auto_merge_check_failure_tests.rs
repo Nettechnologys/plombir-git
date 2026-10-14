@@ -110,6 +110,7 @@ async fn a_protection_rule_that_could_not_be_read_is_not_a_pending_merge() {
         "automerger",
         "auto",
         1,
+        &Default::default(),
     )
     .await
     .expect_err("a check that never ran is not a merge that is pending");
@@ -159,6 +160,7 @@ async fn a_rule_that_refused_is_still_a_pending_merge_in_its_own_words() {
         "automerger",
         "auto",
         1,
+        &Default::default(),
     )
     .await
     .expect("a rule that refused is a pending outcome, not a failure");

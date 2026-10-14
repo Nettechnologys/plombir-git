@@ -423,6 +423,7 @@ async fn a_fork_that_loses_the_namespace_race_is_the_caller_s_conflict() {
         &source,
         &rg_core::blob_storage::LocalBlobStorage::new(&repo_root),
         &repo_root,
+        &Default::default(),
     )
     .await
     {

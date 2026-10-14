@@ -977,6 +977,7 @@ async fn process_repository_into(
             // the next pass rebuilds the group on (card_758aa42d9d22).
             Some(verified_head_sha.as_str()),
             None,
+            &ci.storage_limits,
         )
         .await
         {
@@ -2639,6 +2640,7 @@ mod merge_group_config_refusal_tests {
             jwt_secret: None,
             encryption_key: None,
             external_url: None,
+            storage_limits: Default::default(),
         }
     }
 
@@ -3047,6 +3049,7 @@ mod merge_group_conflict_reason_tests {
             jwt_secret: None,
             encryption_key: None,
             external_url: None,
+            storage_limits: Default::default(),
         }
     }
 
@@ -4170,6 +4173,7 @@ mod merge_group_strategy_fidelity_tests {
             jwt_secret: None,
             encryption_key: None,
             external_url: None,
+            storage_limits: Default::default(),
         }
     }
 

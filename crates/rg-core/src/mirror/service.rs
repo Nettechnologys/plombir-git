@@ -586,6 +586,7 @@ pub async fn sync_mirror(
     repo_root: &Path,
     transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
+    storage_limits: &crate::storage_quota::StorageLimits,
     hooks: Option<&PostPushContext>,
 ) -> Result<SyncOutcome> {
     use rg_db::ops::mirror_ops::SyncLeaseBid;
@@ -638,6 +639,7 @@ pub async fn sync_mirror(
         repo_root,
         transport_policy,
         encryption_key,
+        storage_limits,
         hooks,
     )
     .await;
@@ -677,6 +679,7 @@ async fn run_sync_pass(
     repo_root: &Path,
     transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
+    storage_limits: &crate::storage_quota::StorageLimits,
     hooks: Option<&PostPushContext>,
 ) -> Result<()> {
     let repo_path = mirror_clone_path(repo_root, mirror.repo_id);
@@ -742,6 +745,7 @@ async fn run_sync_pass(
         credentials,
         result,
         transport_policy,
+        storage_limits,
         hooks,
     )
     .await
@@ -763,6 +767,7 @@ async fn finish_pass(
     credentials: Option<GitCredentials>,
     result: Result<()>,
     transport_policy: MirrorTransportPolicy,
+    storage_limits: &crate::storage_quota::StorageLimits,
     hooks: Option<&PostPushContext>,
 ) -> Result<()> {
     let mut published = None;
@@ -791,6 +796,7 @@ async fn finish_pass(
                     )
                 }),
                 &transport_policy,
+                *storage_limits,
             )
             .await
             {
@@ -1035,6 +1041,7 @@ pub async fn sync_due_mirrors(
     limit: u64,
     transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
+    storage_limits: &crate::storage_quota::StorageLimits,
     hooks: Option<&PostPushContext>,
 ) -> Result<usize> {
     let mirrors = rg_db::ops::mirror_ops::list_due_sync(db, limit).await?;
@@ -1046,6 +1053,7 @@ pub async fn sync_due_mirrors(
             repo_root,
             transport_policy,
             encryption_key,
+            storage_limits,
             hooks,
         )
         .await
@@ -1076,6 +1084,7 @@ pub async fn trigger_sync(
     repo_root: &Path,
     transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
+    storage_limits: &crate::storage_quota::StorageLimits,
     hooks: Option<&PostPushContext>,
 ) -> Result<()> {
     let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
@@ -1093,6 +1102,7 @@ pub async fn trigger_sync(
         repo_root,
         transport_policy,
         encryption_key,
+        storage_limits,
         hooks,
     )
     .await?
@@ -1506,6 +1516,7 @@ mod tests {
                     None,
                     Ok(()),
                     MirrorTransportPolicy::default(),
+                    &crate::storage_quota::StorageLimits::default(),
                     None,
                 )
                 .await
@@ -1670,6 +1681,7 @@ mod tests {
             notifier: None,
             delivery_tracker: tracker.clone(),
             write_pool: None,
+            storage_limits: Default::default(),
         };
         let pass = |mirror: Mirror| {
             let (db, repo_root, clone, hooks) =
@@ -1683,6 +1695,7 @@ mod tests {
                     None,
                     Ok(()),
                     MirrorTransportPolicy::default(),
+                    &crate::storage_quota::StorageLimits::default(),
                     Some(&hooks),
                 )
                 .await

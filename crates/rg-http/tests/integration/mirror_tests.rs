@@ -640,6 +640,7 @@ async fn a_due_mirror_is_synced_by_the_scheduler_with_no_manual_trigger() {
             poll_interval_secs: 1,
             batch_size: 10,
             transport_policy: Default::default(),
+            storage_limits: Default::default(),
         },
         None,
         None,
@@ -829,6 +830,7 @@ async fn a_mirror_whose_sync_failed_is_still_picked_up_by_the_next_sweep() {
         10,
         Default::default(),
         TEST_ENCRYPTION_KEY,
+        &Default::default(),
         None,
     )
     .await
@@ -857,6 +859,7 @@ async fn a_mirror_whose_sync_failed_is_still_picked_up_by_the_next_sweep() {
         10,
         Default::default(),
         TEST_ENCRYPTION_KEY,
+        &Default::default(),
         None,
     )
     .await

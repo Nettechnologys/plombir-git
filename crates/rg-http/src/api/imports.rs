@@ -175,6 +175,7 @@ pub async fn start_import(
         &state.trusted_import_origins,
         &state.import_transport_policy,
         &state.repo_root,
+        state.storage_limits,
     )
     .await
     {

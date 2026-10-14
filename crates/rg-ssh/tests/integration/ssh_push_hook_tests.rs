@@ -230,6 +230,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
             notifier: Some(notifier),
             delivery_tracker: delivery_tracker.clone(),
             write_pool: None,
+            storage_limits: Default::default(),
         })),
         lfs: None,
     };

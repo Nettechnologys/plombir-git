@@ -56,6 +56,9 @@ pub struct MirrorSyncConfig {
     /// Instance-owned exception for plaintext HTTP mirror remotes. Native
     /// `git://` remains disabled regardless of this policy value.
     pub transport_policy: super::transport::MirrorTransportPolicy,
+    /// `[limits]`: the LFS objects a pass fetches are held to the mirror
+    /// repository's budget like an upload to it would be.
+    pub storage_limits: crate::storage_quota::StorageLimits,
 }
 
 impl Default for MirrorSyncConfig {
@@ -64,6 +67,7 @@ impl Default for MirrorSyncConfig {
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
             batch_size: DEFAULT_BATCH_SIZE,
             transport_policy: Default::default(),
+            storage_limits: Default::default(),
         }
     }
 }
@@ -106,6 +110,7 @@ pub fn spawn_mirror_sync_with_shutdown(
     let period = Duration::from_secs(config.poll_interval_secs);
     let batch_size = config.batch_size;
     let transport_policy = config.transport_policy;
+    let storage_limits = config.storage_limits;
 
     Ok(tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
@@ -145,6 +150,7 @@ pub fn spawn_mirror_sync_with_shutdown(
                         batch_size,
                         transport_policy,
                         &encryption_key,
+                        &storage_limits,
                         hooks.as_ref(),
                     )
                     .await
