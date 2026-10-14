@@ -401,6 +401,40 @@ pub(crate) enum Commands {
         force: bool,
     },
 
+    /// Create the first instance administrator, or promote an existing account
+    ///
+    /// The host-side alternative to the one-time setup token: on an empty
+    /// instance this creates the account that the web form would otherwise
+    /// need the token for, and the running server stops accepting the token.
+    /// On an instance with accounts it either creates a new administrator or —
+    /// when the username already exists — promotes that account. The password
+    /// is read from the terminal, or from stdin with `--password-stdin`; it is
+    /// never an argument, which `ps` would show to every account on the host.
+    CreateAdmin {
+        /// Username of the administrator to create or promote
+        #[arg(long)]
+        username: String,
+
+        /// Email address of the new account. Required to create one; when the
+        /// account exists, it must be that account's address, if given
+        #[arg(long)]
+        email: Option<String>,
+
+        /// Read the password from standard input (first line) instead of prompting
+        #[arg(long, default_value_t = false)]
+        password_stdin: bool,
+
+        /// Database URL (sqlite://, postgres://, or mysql://)
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
+    },
+
     /// Create a new bare repository (no DB record — for quick testing)
     CreateRepo {
         /// Owner username
@@ -650,6 +684,7 @@ impl Commands {
             | Self::RebuildFts { config, .. }
             | Self::RestoreDb { config, .. }
             | Self::CreateRepo { config, .. }
+            | Self::CreateAdmin { config, .. }
             | Self::Import { config, .. }
             | Self::IndexRepo { config, .. }
             | Self::ResetMfa { config, .. } => StateCreationContract::ServerOwned {
@@ -925,6 +960,7 @@ const AFTER: &str = "after";
             } => (db_url.as_deref(), repo_root.as_deref(), config.as_deref()),
             Commands::Migrate { db_url, config }
             | Commands::RebuildFts { db_url, config }
+            | Commands::CreateAdmin { db_url, config, .. }
             | Commands::BackupDb { db_url, config, .. }
             | Commands::RestoreDb { db_url, config, .. }
             | Commands::RotateInstanceKey { db_url, config, .. }
@@ -973,6 +1009,14 @@ const AFTER: &str = "after";
         &["plombir-git", "backup-db", "out.db"],
         &["plombir-git", "restore-db", "in.db"],
         &["plombir-git", "create-repo", "alice", "site"],
+        &[
+            "plombir-git",
+            "create-admin",
+            "--username",
+            "alice",
+            "--email",
+            "alice@example.com",
+        ],
         &["plombir-git", "rotate-instance-key"],
         &[
             "plombir-git",
@@ -993,6 +1037,88 @@ const AFTER: &str = "after";
         &["plombir-git", "reset-mfa", "alice"],
         &["plombir-git", "package", "list", "alice", "site", "cargo"],
     ];
+
+    /// `create-admin` takes the account as flags and its password never: a
+    /// password on argv is readable in `ps` by every account on the host
+    /// (security audit finding #13).
+    #[test]
+    fn create_admin_takes_a_username_and_email_and_never_a_password_flag() {
+        let cli = Cli::try_parse_from([
+            "plombir-git",
+            "create-admin",
+            "--username",
+            "root",
+            "--email",
+            "root@example.com",
+        ])
+        .expect("the two identity flags are enough");
+        let Commands::CreateAdmin {
+            username,
+            email,
+            password_stdin,
+            db_url,
+            config,
+        } = cli.command
+        else {
+            panic!("parsed into another subcommand");
+        };
+        assert_eq!(username, "root");
+        assert_eq!(email.as_deref(), Some("root@example.com"));
+        assert!(!password_stdin, "the terminal prompt is the default");
+        assert_eq!(db_url, None);
+        assert_eq!(config, None);
+
+        let cli = Cli::try_parse_from([
+            "plombir-git",
+            "create-admin",
+            "--username",
+            "root",
+            "--email",
+            "root@example.com",
+            "--password-stdin",
+            "--db-url",
+            "sqlite:///tmp/x.db",
+        ])
+        .expect("--password-stdin and --db-url are accepted");
+        let Commands::CreateAdmin {
+            password_stdin,
+            db_url,
+            ..
+        } = cli.command
+        else {
+            panic!("parsed into another subcommand");
+        };
+        assert!(password_stdin);
+        assert_eq!(db_url.as_deref(), Some("sqlite:///tmp/x.db"));
+
+        assert!(
+            Cli::try_parse_from(["plombir-git", "create-admin", "--email", "root@example.com"])
+                .is_err(),
+            "--username is required"
+        );
+        let Commands::CreateAdmin { email, .. } =
+            Cli::try_parse_from(["plombir-git", "create-admin", "--username", "root"])
+                .expect("promoting an existing account needs no address")
+                .command
+        else {
+            panic!("parsed into another subcommand");
+        };
+        assert_eq!(email, None);
+        assert!(
+            Cli::try_parse_from([
+                "plombir-git",
+                "create-admin",
+                "--username",
+                "root",
+                "--email",
+                "root@example.com",
+                "--password",
+                "hunter2",
+            ])
+            .is_err(),
+            "a --password flag must not exist"
+        );
+    }
 
     /// The root cause of the ignored-config bug: a clap `default_value` on
     /// `--db-url` / `--repo-root` makes "flag not passed" indistinguishable from
@@ -1526,7 +1652,7 @@ const AFTER: &str = "after";
     /// rather than derived: what a page hands an operator is an editorial fact
     /// about the page, and a derived list would agree with whatever the page
     /// happens to say — including saying nothing.
-    const SUBCOMMANDS_THE_PAGES_HAND_AN_OPERATOR: [&str; 7] = [
+    const SUBCOMMANDS_THE_PAGES_HAND_AN_OPERATOR: [&str; 8] = [
         "serve",
         "migrate",
         "rotate-instance-key",
@@ -1534,6 +1660,7 @@ const AFTER: &str = "after";
         "backup-db",
         "restore-db",
         "create-repo",
+        "create-admin",
     ];
 
     /// The image's default command, the compose files' `command:` blocks and the

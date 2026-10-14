@@ -504,8 +504,18 @@ fn non_blank_env_value(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+/// Where the registration mode came from. A defaulted mode is said out loud at
+/// startup: the default changed from `open` to `closed` (security audit finding
+/// #13), and an instance that never chose has to hear that it is closed now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationSource {
+    Env,
+    Config,
+    Default,
+}
+
 /// Resolve whether this instance accepts self-service registrations:
-/// `PLOMBIR_GIT_REGISTRATION` > `[auth].registration` > `"open"`.
+/// `PLOMBIR_GIT_REGISTRATION` > `[auth].registration` > `"closed"`.
 ///
 /// A value neither source recognises is a **hard startup error**. Every other
 /// unparseable knob in this file behaves the same way, and this one has the
@@ -520,19 +530,49 @@ fn non_blank_env_value(value: Option<String>) -> Option<String> {
 fn resolve_registration_mode(
     cfg: Option<&crate::config::ConfigFile>,
     env_value: Option<&str>,
-) -> anyhow::Result<rg_core::user::registration::RegistrationMode> {
+) -> anyhow::Result<(
+    rg_core::user::registration::RegistrationMode,
+    RegistrationSource,
+)> {
     use rg_core::user::registration::RegistrationMode;
 
     if let Some(raw) = env_value.map(str::trim).filter(|value| !value.is_empty()) {
         return RegistrationMode::parse(raw)
+            .map(|mode| (mode, RegistrationSource::Env))
             .map_err(|reason| anyhow::anyhow!("env PLOMBIR_GIT_REGISTRATION: {reason}"));
     }
 
     match cfg.and_then(|config| config.auth.registration.as_deref()) {
         Some(raw) => RegistrationMode::parse(raw)
+            .map(|mode| (mode, RegistrationSource::Config))
             .map_err(|reason| anyhow::anyhow!("config `[auth].registration`: {reason}")),
-        None => Ok(RegistrationMode::default()),
+        None => Ok((RegistrationMode::default(), RegistrationSource::Default)),
     }
+}
+
+/// The startup line about registration, if there is one to print: a `WARN`
+/// when the mode was not chosen — it is the line an upgraded instance that
+/// used to be open needs to find — and an `INFO` when it was chosen closed.
+fn registration_startup_notice(
+    mode: rg_core::user::registration::RegistrationMode,
+    source: RegistrationSource,
+) -> Option<(tracing::Level, &'static str)> {
+    if source == RegistrationSource::Default {
+        return Some((
+            tracing::Level::WARN,
+            "[auth].registration is not set, so self-service registration is CLOSED (the \
+             built-in default, which used to be open): POST /users/register refuses with \
+             403. The first account on an empty instance is still admitted with the setup token. \
+             Set [auth].registration = \"closed\" to keep this and silence the warning, or \
+             \"open\" (PLOMBIR_GIT_REGISTRATION=open) to let strangers sign up again.",
+        ));
+    }
+    mode.is_closed().then_some((
+        tracing::Level::INFO,
+        "self-service registration is CLOSED ([auth].registration): POST /users/register \
+         refuses with 403. The first account on an empty instance is still admitted with the \
+         setup token, and LDAP/SSO auto-provision is unaffected.",
+    ))
 }
 
 /// `verify-email` registration creates nothing until a mailed link is followed,
@@ -812,6 +852,146 @@ fn resolve_spa_build_dir(cfg: Option<&crate::config::ConfigFile>) -> std::path::
         .unwrap_or_else(|| std::path::PathBuf::from(rg_http::DEFAULT_SPA_BUILD_DIR))
 }
 
+/// Decide whether this start guards a bootstrap registration, and with what.
+///
+/// An instance that has never had a user hands the instance-admin flag to its
+/// first registration whatever `[auth].registration` says, so before the token
+/// the first start was a race against whoever reached the port first (security
+/// audit finding #13). Here, on an empty user table, a 32-byte secret is
+/// generated — or read back, if a previous start left it — written `0600`
+/// beside the encryption key, and printed once; `POST /users/register` then
+/// admits the first account only with it. Once any user exists the file is a
+/// stale secret with no door left to open, so it is removed.
+///
+/// Decided after migrations and the encryption-key preflight, with the same
+/// directory and the same owner-only creation (`create_new_owner_only`): a
+/// losing concurrent first start reads the winner's token instead of
+/// overwriting it, and the token is never wider than `0600` for an instant.
+async fn establish_setup_token(
+    db: &rg_db::DatabaseConnection,
+    encryption_key_file: &Path,
+) -> anyhow::Result<rg_core::user::registration::SetupToken> {
+    use rg_core::user::registration::SetupToken;
+
+    let path = SetupToken::path_beside(encryption_key_file);
+    if rg_db::ops::user_ops::has_any(db).await? {
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                "removed a stale setup token: this instance already has accounts"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "could not remove the stale setup token; it opens nothing, delete it by hand"
+            ),
+        }
+        return Ok(SetupToken::not_required());
+    }
+
+    let secret = ensure_setup_token_file(&path, &SetupToken::generate_secret())?;
+    // The one line the operator has to find: `warn!` so it survives
+    // `RUST_LOG=warn`, and the secret spelled out because the file beside the
+    // key is the only other copy.
+    tracing::warn!(
+        path = %path.display(),
+        setup_token = %secret,
+        "this instance has no account yet. Create the administrator with \
+         `plombir-git create-admin --username <name> --email <address>` on this host, or \
+         register through the web form with this one-time setup token (also kept in the file \
+         above, readable by this user only). The token is deleted once the first account exists."
+    );
+    Ok(SetupToken::required(secret, Some(path)))
+}
+
+/// Read the setup token file, or create it `0600` holding `secret`. The same
+/// shape as [`ensure_key_file`]: a concurrent first start that finds the file
+/// already there reuses its contents rather than replacing them.
+fn ensure_setup_token_file(path: &Path, secret: &str) -> anyhow::Result<String> {
+    if let Some(existing) = read_setup_token_file(path)? {
+        return Ok(existing);
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        rg_core::platform::fs::create_dir_all_owner_only(parent).map_err(|error| {
+            anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+                "setup token directory",
+                parent,
+                &error,
+                "the setup token lives beside [auth].key_file; point that at a directory the server can write to",
+            ))
+        })?;
+    }
+    match rg_core::platform::fs::create_new_owner_only(path) {
+        Ok(mut file) => {
+            file.write_all(secret.as_bytes())
+                .and_then(|()| file.write_all(b"\n"))
+                .and_then(|()| file.sync_all())
+                .map_err(|error| {
+                    anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+                        "setup token file",
+                        path,
+                        &error,
+                        "the server must be able to write and fsync the setup token beside [auth].key_file",
+                    ))
+                })?;
+            Ok(secret.to_owned())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_setup_token_file(path)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "setup token file {} disappeared during creation",
+                    path.display()
+                )
+            })
+        }
+        Err(error) => Err(anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+            "setup token file",
+            path,
+            &error,
+            "the server generates this token on first start and needs write access to the directory of [auth].key_file",
+        ))),
+    }
+}
+
+fn read_setup_token_file(path: &Path) -> anyhow::Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    ensure_regular_file(
+        path,
+        "setup token file",
+        "remove it and let the server create a new one",
+    )?;
+    rg_core::platform::fs::ensure_owner_only(path, "setup token file")?;
+    let secret = std::fs::read_to_string(path).map_err(|error| {
+        anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+            "setup token file",
+            path,
+            &error,
+            "the server must be able to read the setup token beside [auth].key_file",
+        ))
+    })?;
+    let secret = secret.trim().to_owned();
+    if secret.is_empty() {
+        // Unlike the encryption key, nothing depends on the old value: an
+        // empty file is simply not a token, and a new one costs nothing.
+        std::fs::remove_file(path).map_err(|error| {
+            anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+                "setup token file",
+                path,
+                &error,
+                "the empty setup token file must be removable so a new one can be written",
+            ))
+        })?;
+        return Ok(None);
+    }
+    Ok(Some(secret))
+}
+
 /// Initialise and run the Plombir Git server (HTTP + SSH).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_serve(
@@ -929,7 +1109,7 @@ pub(crate) async fn run_serve(
         .as_ref()
         .and_then(|c| c.ci.runner_labels.clone())
         .unwrap_or_else(rg_core::ci::default_runner_labels);
-    let resolved_registration = resolve_registration_mode(
+    let (resolved_registration, registration_source) = resolve_registration_mode(
         cfg.as_ref(),
         std::env::var("PLOMBIR_GIT_REGISTRATION").ok().as_deref(),
     )?;
@@ -1302,6 +1482,7 @@ pub(crate) async fn run_serve(
     // first boot this also creates the durable key file and its database marker
     // before any other startup path writes encrypted state.
     establish_encryption_key(&db, &mut resolved_auth_secrets).await?;
+    let setup_token = establish_setup_token(&db, &encryption_key_file).await?;
 
     // Webhook delivery is detached from the request that caused it and signs
     // with an encrypted column, so it is the one reader that cannot be handed
@@ -1545,12 +1726,10 @@ pub(crate) async fn run_serve(
 
     // Logged after the subscriber is up, so the one line an operator greps for
     // when a colleague "cannot sign up" actually reaches the log.
-    if resolved_registration.is_closed() {
-        tracing::info!(
-            "self-service registration is CLOSED ([auth].registration): POST /users/register \
-             refuses with 403. The first account on an empty instance is still admitted, and \
-             LDAP/SSO auto-provision is unaffected."
-        );
+    match registration_startup_notice(resolved_registration, registration_source) {
+        Some((tracing::Level::WARN, notice)) => tracing::warn!("{notice}"),
+        Some((_, notice)) => tracing::info!("{notice}"),
+        None => {}
     }
     tracing::info!(
         max_bytes = resolved_package_upload_max_bytes,
@@ -1600,6 +1779,7 @@ pub(crate) async fn run_serve(
         external_runners: resolved_external_runners,
         allow_host_runner: resolved_allow_host_runner,
         registration: resolved_registration,
+        setup_token,
         trusted_import_origins: resolved_trusted_import_origins,
         import_transport_policy: resolved_import_transport_policy,
         oidc_transport_policy: resolved_oidc_transport_policy,
@@ -2158,39 +2338,71 @@ mod serve_tests {
     }
 
     #[test]
-    fn the_registration_mode_resolves_env_then_config_then_open() {
+    fn the_registration_mode_resolves_env_then_config_then_closed() {
+        use super::RegistrationSource;
         use rg_core::user::registration::RegistrationMode;
 
         let closed: ConfigFile = toml::from_str("[auth]\nregistration = \"closed\"\n")
             .expect("[auth].registration must be part of the config model");
         assert_eq!(closed.auth.registration.as_deref(), Some("closed"));
 
-        // No config file, no env → the historical behaviour survives an upgrade.
+        // No config file, no env → closed (security audit finding #13): an
+        // instance nobody configured refuses strangers.
         assert_eq!(
             super::resolve_registration_mode(None, None).unwrap(),
-            RegistrationMode::Open
+            (RegistrationMode::Closed, RegistrationSource::Default)
         );
         // Config file alone.
         assert_eq!(
             super::resolve_registration_mode(Some(&closed), None).unwrap(),
-            RegistrationMode::Closed
+            (RegistrationMode::Closed, RegistrationSource::Config)
         );
         // Env wins over the file, in both directions.
         assert_eq!(
             super::resolve_registration_mode(Some(&closed), Some("open")).unwrap(),
-            RegistrationMode::Open
+            (RegistrationMode::Open, RegistrationSource::Env)
         );
         let open: ConfigFile = toml::from_str("[auth]\nregistration = \"open\"\n").unwrap();
         assert_eq!(
             super::resolve_registration_mode(Some(&open), Some("CLOSED")).unwrap(),
-            RegistrationMode::Closed
+            (RegistrationMode::Closed, RegistrationSource::Env)
         );
         // A blank env value is "not set", not "the empty mode" — same `.env`
         // convention the secrets follow.
         assert_eq!(
             super::resolve_registration_mode(Some(&closed), Some("  ")).unwrap(),
-            RegistrationMode::Closed
+            (RegistrationMode::Closed, RegistrationSource::Config)
         );
+    }
+
+    /// The default turned from open to closed, so an instance that never chose
+    /// is warned at every start; one that chose closed hears it at `INFO`, and
+    /// one that chose open hears nothing.
+    #[test]
+    fn a_defaulted_registration_mode_warns_and_an_explicit_one_does_not() {
+        use super::{registration_startup_notice, RegistrationSource};
+        use rg_core::user::registration::RegistrationMode;
+
+        let (level, notice) =
+            registration_startup_notice(RegistrationMode::Closed, RegistrationSource::Default)
+                .expect("a defaulted mode is announced");
+        assert_eq!(level, tracing::Level::WARN);
+        assert!(
+            notice.contains("[auth].registration is not set") && notice.contains("\"open\""),
+            "the warning must say why and how to reopen: {notice}"
+        );
+
+        for source in [RegistrationSource::Config, RegistrationSource::Env] {
+            let (level, notice) = registration_startup_notice(RegistrationMode::Closed, source)
+                .expect("an explicit closed instance still says so");
+            assert_eq!(level, tracing::Level::INFO, "{source:?}");
+            assert!(!notice.contains("is not set"), "{source:?}: {notice}");
+            assert_eq!(
+                registration_startup_notice(RegistrationMode::Open, source),
+                None,
+                "{source:?}: an instance that chose open has nothing to hear"
+            );
+        }
     }
 
     /// The dangerous direction, and the reason this is a hard error: a typo must
@@ -2251,6 +2463,80 @@ mod serve_tests {
         .expect("connect sqlite");
         rg_db::run_migrations(&db).await.expect("run migrations");
         db
+    }
+
+    fn token_on_disk(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path)
+            .expect("the token file")
+            .trim()
+            .to_owned()
+    }
+
+    /// The first start on an empty instance writes the token `0600` beside the
+    /// key; a restart before the first account reuses it, so the line an
+    /// operator copied from the first log keeps working.
+    #[tokio::test]
+    async fn the_setup_token_is_written_owner_only_and_reused_until_an_account_exists() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path()).await;
+        let key_file = dir.path().join("keys").join("encryption_key");
+        let token_file = key_file.with_file_name("setup_token");
+
+        let first = super::establish_setup_token(&db, &key_file).await.unwrap();
+        assert!(first.is_required());
+        let secret = token_on_disk(&token_file);
+        assert_eq!(secret.len(), 43);
+        assert_eq!(
+            std::fs::metadata(&token_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let again = super::establish_setup_token(&db, &key_file).await.unwrap();
+        assert!(again.is_required());
+        assert_eq!(
+            token_on_disk(&token_file),
+            secret,
+            "a restart must not rotate it"
+        );
+
+        // An empty file is no token: a fresh one replaces it.
+        std::fs::write(&token_file, "\n").unwrap();
+        super::establish_setup_token(&db, &key_file).await.unwrap();
+        let replaced = token_on_disk(&token_file);
+        assert_eq!(replaced.len(), 43);
+        assert_ne!(replaced, secret);
+
+        // A token another account on the host could read is refused, not used.
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(super::establish_setup_token(&db, &key_file).await.is_err());
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Once an account exists the file is a stale secret and goes.
+        rg_db::ops::user_ops::create_user(&db, "founder", "founder@example.com", "x", "Founder")
+            .await
+            .unwrap();
+        let after = super::establish_setup_token(&db, &key_file).await.unwrap();
+        assert!(!after.is_required());
+        assert!(!token_file.exists(), "the stale token survived the start");
+    }
+
+    /// A start that finds a token already written keeps it rather than
+    /// writing its own over it — the path a losing concurrent first start
+    /// takes once the winner's file is there.
+    #[test]
+    fn a_token_already_written_is_adopted_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("setup_token");
+        assert_eq!(
+            super::ensure_setup_token_file(&path, "winner").unwrap(),
+            "winner"
+        );
+        assert_eq!(
+            super::ensure_setup_token_file(&path, "loser").unwrap(),
+            "winner"
+        );
     }
 
     fn unresolved_secrets(jwt_secret: &str, key_file: PathBuf) -> super::AuthSecrets {

@@ -306,7 +306,8 @@ pub(crate) async fn create_registered_account(
     })?;
     // The first row is committed, so a waiting registration can now observe a
     // non-empty database. Do not serialise token generation behind the lock.
-    drop(permit);
+    // A bootstrap permit also retires the one-time setup token here.
+    permit.finish();
     Ok(user)
 }
 

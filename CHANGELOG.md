@@ -15,9 +15,23 @@ This project records user-facing changes here. The format follows
 - CI secrets can be scoped to an environment. Only jobs that declare the
   environment read them, after its approval when it is protected, and an
   environment's value overrides a repository-wide secret of the same name.
+- A fresh instance writes a one-time setup token (`setup_token`, `0600`,
+  beside the encryption key; also printed in the startup log). The first
+  account, which becomes the administrator, has to present it as
+  `setup_token` in `POST /api/v1/users/register` or as an `X-Setup-Token`
+  header; the register page asks for it while the instance is empty.
+  `GET /api/v1/instance` reports `setup_required`.
+- `plombir-git create-admin --username <name> [--email <address>]` creates
+  an instance administrator from the shell, or promotes an existing account.
 
 ### Changed
 
+- **Breaking:** self-service registration is closed by default. An instance
+  that sets neither `[auth].registration` nor `PLOMBIR_GIT_REGISTRATION`
+  answers `POST /api/v1/users/register` with `403` once its first account
+  exists, and warns about it at every start. Set `registration = "open"` (or
+  `PLOMBIR_GIT_REGISTRATION=open`) to let strangers sign up as before; set
+  `"closed"` to keep the new behaviour without the warning.
 - **Breaking:** creating an SSH, deploy or signing key, a personal or bot
   token, a passkey, an SSO link or a runner token needs a session in sudo
   mode: one that signed in within the last ten minutes or confirmed itself

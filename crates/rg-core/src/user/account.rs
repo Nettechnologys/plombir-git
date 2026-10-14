@@ -145,23 +145,8 @@ pub async fn create_account(
     display_name: Option<&str>,
     is_admin: bool,
 ) -> Result<ProvisionedAccount> {
-    validate_username(username)?;
-    if !valid_email(email) {
-        return Err(crate::error::invalid_request(
-            "email must contain '@' with a non-empty local and domain part",
-        ));
-    }
     let display_name = normalize_text("display_name", display_name, MAX_DISPLAY_NAME_CHARS)?;
-    if crate::namespace::owner_name_is_taken(db, username).await? {
-        return Err(crate::error::conflict(format!(
-            "username '{username}' is already taken"
-        )));
-    }
-    if user_ops::find_by_email(db, email).await?.is_some() {
-        return Err(crate::error::conflict(format!(
-            "email '{email}' is already registered"
-        )));
-    }
+    ensure_new_identity(db, username, email).await?;
     if ldap_directory_holds(db, directories, username, Some(email)).await? {
         return Err(crate::error::conflict(format!(
             "username '{username}' or email '{email}' belongs to a directory account; \
@@ -202,6 +187,162 @@ pub async fn create_account(
         user,
         temporary_password,
     })
+}
+
+/// A name and an address a new local account may take: well-formed, not a
+/// page of this application, and held by no account or organization.
+async fn ensure_new_identity(db: &DatabaseConnection, username: &str, email: &str) -> Result<()> {
+    validate_username(username)?;
+    if !valid_email(email) {
+        return Err(crate::error::invalid_request(
+            "email must contain '@' with a non-empty local and domain part",
+        ));
+    }
+    if crate::namespace::owner_name_is_taken(db, username).await? {
+        return Err(crate::error::conflict(format!(
+            "username '{username}' is already taken"
+        )));
+    }
+    if user_ops::find_by_email(db, email).await?.is_some() {
+        return Err(crate::error::conflict(format!(
+            "email '{email}' is already registered"
+        )));
+    }
+    Ok(())
+}
+
+// ── Administrators from the host ─────────────────────────────────────────
+
+/// What `plombir-git create-admin` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminBootstrap {
+    /// A new account was created with the instance-admin flag.
+    Created,
+    /// The named account existed and was promoted.
+    Promoted,
+    /// The named account was an instance admin already; nothing changed.
+    AlreadyAdmin,
+}
+
+/// Create an instance administrator from the host.
+///
+/// The host-side door to the account the one-time setup token guards over
+/// HTTP: whoever runs this holds the database, which is the position of trust
+/// the token stands in for. Same rules as [`create_account`] for the name and
+/// the address, and the rule every password here follows. Not routed through
+/// `service::register`, which hands the admin flag to the first row only: a
+/// second administrator added from the shell is asked for on purpose.
+///
+/// The directory check [`create_account`] makes is not made here: it needs
+/// the at-rest key and the transport policy of a running server, and the
+/// operator at the shell already decides who the account belongs to.
+pub async fn create_admin_account(
+    db: &DatabaseConnection,
+    username: &str,
+    email: &str,
+    plaintext_password: &str,
+) -> Result<User> {
+    ensure_new_identity(db, username, email).await?;
+    validate_new_password(plaintext_password, username)?;
+
+    let password_hash = password::hash_password(plaintext_password)
+        .await
+        .context("failed to hash password")?;
+    let now = Utc::now();
+    user_ops::create(
+        db,
+        rg_db::entities::user::ActiveModel {
+            username: Set(username.to_string()),
+            email: Set(email.to_string()),
+            password_hash: Set(password_hash),
+            is_admin: Set(true),
+            is_active: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|error| {
+        if rg_db::is_unique_violation_anyhow(&error) {
+            crate::error::conflict("username or email is already registered")
+        } else {
+            error
+        }
+    })
+}
+
+/// Give an existing account the instance-admin flag, from the host.
+///
+/// Only an account a person signs in with: a deleted account keeps its row as
+/// a tombstone, a deactivated one was switched off by an administrator, and a
+/// bot acts for its owner — none of them is the person the operator means, and
+/// promoting one would hand the flag to whoever brings it back. The same three
+/// conditions guard the write itself, so an account deactivated between the
+/// lookup and the update is not promoted either.
+///
+/// `expected_email`, when given, must be the account's own address, so a typo
+/// in the name cannot promote a stranger.
+pub async fn promote_to_admin(
+    db: &DatabaseConnection,
+    user: User,
+    expected_email: Option<&str>,
+) -> Result<AdminBootstrap> {
+    use rg_db::entities::user::{Column, Entity};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    if user.deleted_at.is_some() {
+        return Err(crate::error::conflict(format!(
+            "the account '{}' was deleted; a deleted account cannot become an administrator",
+            user.username
+        )));
+    }
+    if !user.is_active {
+        return Err(crate::error::conflict(format!(
+            "the account '{}' is deactivated; reactivate it before promoting it",
+            user.username
+        )));
+    }
+    if user.bot_owner_id.is_some() {
+        return Err(crate::error::conflict(format!(
+            "'{}' is a bot account; a bot cannot be an instance administrator",
+            user.username
+        )));
+    }
+    if let Some(expected) = expected_email {
+        if !expected.trim().eq_ignore_ascii_case(user.email.trim()) {
+            return Err(crate::error::conflict(format!(
+                "the account '{}' is registered with a different email address; \
+                 check the name, or leave --email out to promote it as it is",
+                user.username
+            )));
+        }
+    }
+    if user.is_admin {
+        return Ok(AdminBootstrap::AlreadyAdmin);
+    }
+
+    let promoted = Entity::update_many()
+        .col_expr(Column::IsAdmin, sea_orm::sea_query::Expr::value(true))
+        .col_expr(
+            Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(Utc::now()),
+        )
+        .filter(Column::Id.eq(user.id))
+        .filter(Column::DeletedAt.is_null())
+        .filter(Column::IsActive.eq(true))
+        .filter(Column::BotOwnerId.is_null())
+        .exec(db)
+        .await
+        .context("promote the account to instance admin")?;
+    if promoted.rows_affected == 0 {
+        return Err(crate::error::conflict(format!(
+            "the account '{}' changed while it was being promoted; look at it and run again",
+            user.username
+        )));
+    }
+    Ok(AdminBootstrap::Promoted)
 }
 
 /// Give `target_user_id` a new password chosen by an administrator, which its

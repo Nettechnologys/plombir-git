@@ -26899,7 +26899,7 @@
         {
           "tag": "form",
           "label": ")}",
-          "line": 61,
+          "line": 69,
           "via": null,
           "href": null,
           "handler": "handleSubmit",
@@ -26909,7 +26909,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.register.submitting",
-          "line": 86,
+          "line": 102,
           "via": null,
           "href": null,
           "handler": null,
@@ -26919,7 +26919,7 @@
         {
           "tag": "a",
           "label": "i18n:auth.register.footer_link",
-          "line": 94,
+          "line": 110,
           "via": null,
           "href": "/login",
           "handler": null,

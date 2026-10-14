@@ -94,10 +94,17 @@ jwt_secret = "change-me-in-production"
 #
 # Two things "closed" deliberately still allows:
 #  * the FIRST account, on an instance that has never had a user — otherwise a
-#    closed instance could never be initialised;
+#    closed instance could never be initialised. It needs the one-time setup
+#    token the server prints at its first start (and keeps 0600 beside
+#    [auth].key_file as `setup_token`), or `plombir-git create-admin` on the
+#    host; without the token the first visitor to reach the port would own the
+#    instance;
 #  * LDAP / SSO auto-provision on first login, because the operator who wired a
 #    directory into this instance already decided who may have an account.
-registration = "open"
+#
+# "closed" is the built-in default, so an instance that never set this key is
+# closed. Say "open" here when strangers should be able to sign up.
+registration = "closed"
 
 # Custom OIDC discovery, token exchange (`client_secret`) and userinfo (Bearer
 # access token) require HTTPS by default. A legacy private IdP without TLS must

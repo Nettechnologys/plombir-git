@@ -35,6 +35,9 @@ const {
 const USERNAME = 'journey-founder';
 const EMAIL = 'journey-founder@example.com';
 const PASSWORD = 'Qz7$wRtm';
+// The one-time setup token the stand's server generated for its first account;
+// `scripts/ephemeral-stand.sh` reads it from the data directory and exports it.
+const SETUP_TOKEN = requiredEnv('STAND_SETUP_TOKEN');
 const REPO = 'journey-repo';
 const BLOB = 'journey.txt';
 const BLOB_MARKER = 'plombir-git first-user journey reached the blob';
@@ -297,6 +300,11 @@ try {
     await fill(tab, 'input[autocomplete="username"]', USERNAME);
     await fill(tab, 'input[autocomplete="email"]', EMAIL);
     await fill(tab, 'input[autocomplete="new-password"]', PASSWORD);
+    // The first account on an empty instance needs the one-time setup token
+    // (security audit finding #13); the stand exports it from its data
+    // directory, and the page shows the field once `GET /instance` answered.
+    await waitFor(tab, 'the setup token field', `document.querySelector('input[name="setup_token"]') !== null`);
+    await fill(tab, 'input[name="setup_token"]', SETUP_TOKEN);
     await click(tab, 'form button[type="submit"]');
     await waitForPath(tab, '/dashboard');
     await waitFor(tab, 'registered account profile', `(async () => {

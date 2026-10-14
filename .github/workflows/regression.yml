@@ -1025,7 +1025,9 @@ jobs:
           # The image's own state files must land on the volume, not in the
           # container layer: a key kept in `$HOME/.ssh` is gone with the
           # container, and the next start refuses the database it encrypted.
-          for state_file in /data/encryption_key /data/ssh_host_key; do
+          # The one-time setup token for the first account is held to the same
+          # place, since the deploy guide sends the operator to /data for it.
+          for state_file in /data/encryption_key /data/ssh_host_key /data/setup_token; do
             if ! docker exec plombir-git-smoke test -s "${state_file}"; then
               echo "The default command left ${state_file} missing: the server" >&2
               echo "keeps its keys outside the /data volume." >&2
@@ -1062,8 +1064,11 @@ jobs:
           # one GET per advertised path, no registration, no bodies, no delete
           # verbs. The full replay stays a manual tool for a throwaway instance
           # — see scripts/full-interface-regression.mjs.
+          # If the spec sits behind authentication, the smoke registers the
+          # container's first account, which needs the setup token.
           OPENAPI_SMOKE_ROUTING_ONLY=1 \
           BACKEND_URL=http://127.0.0.1:18080 \
+          STAND_SETUP_TOKEN="$(docker exec plombir-git-smoke cat /data/setup_token)" \
             node scripts/openapi-interface-smoke.mjs || {
               echo "The published OpenAPI spec does not match the routes this image serves." >&2
               docker logs plombir-git-smoke >&2 || true

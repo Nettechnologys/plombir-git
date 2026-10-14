@@ -129,8 +129,9 @@ pub(crate) struct AuthConfig {
     /// incoming user's password. A custom port alone never enables plaintext.
     #[serde(default)]
     pub(crate) allow_insecure_ldap_endpoints: Vec<String>,
-    /// Whether `POST /users/register` accepts new accounts: `"open"` (the
-    /// default, and the historical behaviour) or `"closed"`.
+    /// Whether `POST /users/register` accepts new accounts: `"closed"` (the
+    /// default since security audit finding #13), `"open"` (the historical
+    /// behaviour) or `"verify-email"`.
     ///
     /// A string rather than a bool so a third mode (`"invite"`) can be added
     /// without breaking every config file that already spells this out —

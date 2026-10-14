@@ -482,11 +482,18 @@ Back in the first terminal, register a local test user, create a repository
 through the API (which records it in the database), and clone it. The password
 is generated once in this shell; save it if you intend to log in again.
 
+The first account on an empty instance becomes its administrator, so it has to
+present the one-time setup token the server wrote beside its keys on first
+start (`./setup_token` here, also printed in the server log); the server
+deletes the file once that account exists. The `create-admin` subcommand
+creates the same account from the shell instead.
+
 ```bash
 BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
 PASSWORD="$(./target/release/plombir-git gen-secret)Aa1!"
 TOKEN="$(curl -fsS -X POST "$BASE_URL/api/v1/users/register" \
   -H 'Content-Type: application/json' \
+  -H "X-Setup-Token: $(cat ./setup_token)" \
   -d "$(jq -n --arg username testuser --arg email test@example.com \
     --arg password "$PASSWORD" \
     '{username:$username,email:$email,password:$password}')" | jq -er '.token')"
@@ -658,6 +665,7 @@ Beyond `serve`, the `plombir-git` binary offers:
 | `backup-db` / `restore-db` | Create / restore a consistent SQLite backup by hand (for a schedule, use `[backup]` — the server snapshots itself) |
 | `rotate-encryption-key` | Re-encrypt every at-rest secret onto a new encryption key (file-backed SQLite requires the server to be stopped, `--dry-run` included; this is enforced) |
 | `rotate-instance-key` | Mint a new provenance signing identity (invalidates past attestations) |
+| `create-admin --username <name> --email <address>` | Create the first instance administrator from the host (no setup token needed), or promote an existing account; the password is prompted for, or read with `--password-stdin` |
 | `create-repo` | Create a bare repository (no DB record — quick testing) |
 | `runner` | Run as a CI runner (polls and executes jobs) |
 | `import github\|gitlab <url>` | Import a repository (and metadata) from GitHub/GitLab (file-backed SQLite requires the server to be stopped) |
@@ -677,8 +685,8 @@ start.
 
 Every subcommand that touches the database or the repository directory
 (`migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,
-`rotate-encryption-key`, `create-repo`, `import`, `index-repo`, `list-tombstones`,
-`reset-mfa`, `package list`)
+`rotate-encryption-key`, `create-admin`, `create-repo`, `import`, `index-repo`,
+`list-tombstones`, `reset-mfa`, `package list`)
 takes the same `--config` as `serve` and resolves `--db-url` / `--repo-root` as
 **CLI arg > config file > built-in default**. On a config-file deployment, pass
 `--config` rather than repeating the URL: with neither,

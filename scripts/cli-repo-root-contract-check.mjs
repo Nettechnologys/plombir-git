@@ -71,10 +71,11 @@ const DIRECTORY_CREATORS = [
   },
   {
     file: 'crates/rg-cli/src/serve.rs',
-    sites: 3,
+    sites: 4,
     directories: [
       'the directory of `--listen-address-file`',
       'the at-rest encryption key directory',
+      'the setup token directory (the same directory as the key, created the same owner-only way when the token is written first)',
       'the repository storage root',
     ],
     why: '`serve` is the process that defines the instance rather than one addressing an existing one, so a first boot creating its own root is the correct answer and not a mistake about which root',

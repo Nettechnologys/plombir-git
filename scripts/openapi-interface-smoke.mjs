@@ -404,10 +404,17 @@ async function ensureToken() {
     password,
   };
 
+  // On an empty instance the first account needs the one-time setup token
+  // from the server's data directory (the stand and the Docker smoke export
+  // it). A server that already has accounts ignores the header.
+  const setupToken = String(process.env.STAND_SETUP_TOKEN || '');
   const registerUrl = `${API_BASE}/users/register`;
   const regResp = await requestWithTimeout(registerUrl, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(setupToken ? { 'x-setup-token': setupToken } : {}),
+    },
     body: JSON.stringify(registerPayload),
   });
 

@@ -245,11 +245,17 @@ function totpCode(base32Secret, now = Date.now()) {
 
 async function registerPersonas(backendUrl) {
   const tokens = {};
+  // The stand has no account yet (`--no-founder`), so the first registration
+  // becomes the administrator and needs the one-time setup token the server
+  // wrote into the stand's data directory; `ephemeral-stand.sh` exports it.
+  // Once the owner exists the server ignores the header.
+  const setupToken = String(process.env.STAND_SETUP_TOKEN || '');
+  if (!setupToken) throw new Error('STAND_SETUP_TOKEN is empty: the stand has no setup token for its first account');
   for (const persona of REQUIRED_PERSONAS) {
     const account = USER[persona];
     const body = await jsonRequest(`${backendUrl}/api/v1/users/register`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'x-setup-token': setupToken },
       body: JSON.stringify({ username: account.username, email: account.email, password: PASSWORD }),
     });
     if (!body?.token) throw new Error(`registration returned no token for ${persona}`);

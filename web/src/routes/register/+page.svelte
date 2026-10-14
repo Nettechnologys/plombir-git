@@ -2,7 +2,7 @@
   import Logo from '$lib/components/Logo.svelte';
   import { register, getAuthError, getAuthLoading } from '$lib/stores/auth.svelte';
   import { createT } from '$lib/i18n';
-  import { getRegistrationOpen } from '$lib/stores/instance.svelte';
+  import { getRegistrationOpen, getSetupRequired } from '$lib/stores/instance.svelte';
   import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from '$lib/passwordPolicy';
 
   const t = createT();
@@ -10,6 +10,9 @@
   let username = $state('');
   let email = $state('');
   let password = $state('');
+  // Asked for only while the instance has no account yet: the first
+  // registration needs the one-time setup token from the server's startup log.
+  let setupToken = $state('');
   let localError = $state('');
   // The instance creates the account only once the mailed link is followed.
   let confirmationSent = $state(false);
@@ -17,7 +20,12 @@
   async function handleSubmit(e: Event) {
     e.preventDefault();
     localError = '';
-    const ok = await register(username, email, password);
+    const ok = await register(
+      username,
+      email,
+      password,
+      getSetupRequired() && setupToken.trim() ? setupToken.trim() : undefined,
+    );
     if (ok === 'confirmation_sent') {
       confirmationSent = true;
     } else if (ok) {
@@ -82,6 +90,14 @@
         />
         <small id="password-policy" class="hint">{t('auth.password_policy', { min: PASSWORD_MIN_LENGTH })}</small>
       </label>
+
+      {#if getSetupRequired()}
+        <label class="setup-token">
+          {t('auth.register.setup_token')}
+          <input type="password" name="setup_token" bind:value={setupToken} required autocomplete="off" spellcheck={false} />
+          <span class="hint">{t('auth.register.setup_token_hint')}</span>
+        </label>
+      {/if}
 
       <button type="submit" class="btn-primary" disabled={getAuthLoading()}>
         {getAuthLoading() ? t('auth.register.submitting') : t('auth.register.submit')}
@@ -151,6 +167,13 @@
   }
 
   input { padding: 8px 12px; }
+
+  .hint {
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.4;
+    color: var(--text-secondary);
+  }
 
   .btn-primary {
     padding: 8px 16px;

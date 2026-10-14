@@ -35,12 +35,40 @@ docker compose logs -f
 Access: **http://localhost:8080**
 
 This compose file publishes both ports on `127.0.0.1` only, and `.env.example`
-sets `PLOMBIR_GIT_REGISTRATION=closed`. The first account registered on an
-empty instance becomes its administrator — closed registration still admits
-exactly that one — so register yours before anybody else can reach the port.
+sets `PLOMBIR_GIT_REGISTRATION=closed` (also the built-in default). The first
+account on an empty instance becomes its administrator — closed registration
+still admits exactly that one — but not to whoever gets there first: the
+container prints a **one-time setup token** at its first start, and the
+register form (which shows a *Setup token* field while the instance is empty)
+or `POST /api/v1/users/register` has to present it. Read it with
+`docker compose logs plombir-git | grep setup_token` (it is also kept `0600` at
+`/data/setup_token` and deleted once the first account exists). Or skip the
+form altogether and create the administrator from the host:
+
+```bash
+docker compose exec plombir-git plombir-git create-admin \
+  --db-url 'sqlite:///data/plombir-git.db?mode=rwc' \
+  --username yourname --email you@example.com
+```
+
+This stack has no config file inside the container, so `create-admin` is
+pointed at the database the default command uses; without `--db-url` it would
+open an empty `./plombir-git.db` in `/app` and create the account there. With
+`docker-compose.hostdir.yml`, pass `--config /app/plombir-git.toml` instead.
+Several replicas sharing one PostgreSQL each write their own token, and a
+token only opens the replica that wrote it: create the first administrator
+with `create-admin` there.
+
 To open the instance up, put a TLS reverse proxy in front of `127.0.0.1:8080`
 (or drop the `127.0.0.1:` prefixes once you are the admin), and set
 `PLOMBIR_GIT_REGISTRATION=open` only if strangers should be able to sign up.
+
+> **Upgrade note.** `[auth].registration` used to default to `open`. Since
+> security audit finding #13 the built-in default is `closed`: an install that
+> never set the key (and does not set `PLOMBIR_GIT_REGISTRATION`) refuses
+> self-registration after upgrading. Add `registration = "open"` to the config
+> file, or `PLOMBIR_GIT_REGISTRATION=open`, to keep the sign-up page. Existing
+> accounts, LDAP/SSO provisioning and admin-created accounts are unaffected.
 
 ---
 
@@ -238,7 +266,9 @@ host can hash them.
 
 `PLOMBIR_GIT_REGISTRATION=closed` (or `[auth].registration = "closed"`, the env
 var wins) makes `POST /api/v1/users/register` answer `403` before it hashes a
-password or writes anything. Leave it at `open` and the endpoint accepts anyone
+password or writes anything. It is also what an instance that sets neither
+gets, and such an instance says so with a warning at every start. Set it to
+`open` and the endpoint accepts anyone
 who can reach it — `[rate_limit].auth_max` throttles that to 10 accounts per
 60 seconds but never refuses, so it is not a substitute on an instance meant
 for a handful of people.
@@ -247,9 +277,16 @@ Two things `closed` still admits, on purpose:
 
 * **The first account.** An instance that has never had a user accepts exactly
   one registration and creates that account as the instance administrator;
-  every later self-registration creates an ordinary non-admin account. Do that
-  registration before the port is reachable by anyone else — the bootstrap
-  window is open until it is used.
+  every later self-registration creates an ordinary non-admin account. That
+  one registration must carry the one-time setup token the server generated
+  at its first start (`setup_token` in the request body or an `X-Setup-Token`
+  header; the web form asks for it) — printed once in the startup log and kept
+  `0600` as `setup_token` beside `[auth].key_file`, deleted once the first
+  account exists, however it was created. Without it the request is refused with `403`, so the bootstrap
+  window is no longer a race against the first visitor. `plombir-git
+  create-admin --config … --username … --email …` creates the same account from
+  the host without the token (and promotes an existing account to
+  administrator on an instance that already has users).
 * **LDAP / SSO first-login provisioning.** It is a separate channel
   (`plombir_git_auth_events_total{event="provision"}`) with its own switch, per
   provider — see below. `PLOMBIR_GIT_REGISTRATION` does not reach it in either
@@ -498,8 +535,8 @@ docker compose up -d plombir-git
 
 If you deploy with a config file, pass `--config /app/plombir-git.toml` instead of
 `--db-url`: every DB-touching subcommand (`migrate`, `rebuild-fts`, `backup-db`,
-`restore-db`, `rotate-instance-key`, `rotate-encryption-key`, `import`,
-`index-repo`, `reset-mfa`, `package list`) reads `[database].url` from it, so the admin
+`restore-db`, `rotate-instance-key`, `rotate-encryption-key`, `create-admin`,
+`import`, `index-repo`, `reset-mfa`, `package list`) reads `[database].url` from it, so the admin
 command and the server cannot end up pointed at two different databases.
 Passing **neither** falls back to `sqlite://./plombir-git.db?mode=rwc` relative to
 the current directory — the container's `WORKDIR /app` unless `docker exec -w`

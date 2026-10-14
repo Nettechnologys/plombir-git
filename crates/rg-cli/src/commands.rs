@@ -115,6 +115,177 @@ pub(crate) fn cmd_gen_secret() {
     println!("{}", admin::generate_jwt_secret());
 }
 
+/// `plombir-git create-admin` — the host-side way to the first administrator.
+///
+/// Security audit finding #13: the first registration on an empty instance
+/// becomes its administrator, so until the setup token existed the first start
+/// was a race against whoever reached the port first. The token closes the
+/// race over HTTP; this command is the other door, for the operator who has the
+/// database in hand and no browser. It also promotes an existing account, which
+/// is what an instance whose only administrator left needs.
+///
+/// The password is never an argument: `ps` shows argv to every account on the
+/// host for as long as the process runs. It is read from the terminal with echo
+/// off, or from stdin for scripts (`--password-stdin`).
+///
+/// The setup token file is not touched here: the running server owns it, and
+/// retires it the next time it finds the user table no longer empty.
+pub(crate) async fn cmd_create_admin(
+    username: String,
+    email: Option<String>,
+    password_stdin: bool,
+    db_url: Option<String>,
+    cfg: Option<&config::ConfigFile>,
+) -> anyhow::Result<()> {
+    use rg_core::user::account::AdminBootstrap;
+
+    init_cli_logging();
+    let db_url = config::resolve_db_url(db_url, cfg);
+    // An ordinary pool, on purpose: this writes one row through one statement
+    // (an insert, or the admin flag on an existing row), and the usual moment
+    // to run it is while the server is up and waiting for its first account.
+    let db = dbconn::connect_online(
+        &db_url,
+        "plombir-git create-admin",
+        dbconn::OnlineAccess::SingleRowWrite,
+    )
+    .await?;
+
+    let outcome = create_admin_of(&db, &username, email.as_deref(), || {
+        read_new_password(password_stdin)
+    })
+    .await?;
+    match outcome {
+        AdminBootstrap::Created => println!("created instance administrator '{username}'"),
+        AdminBootstrap::Promoted => println!("promoted '{username}' to instance administrator"),
+        AdminBootstrap::AlreadyAdmin => {
+            println!("'{username}' is an instance administrator already; nothing changed")
+        }
+    }
+    Ok(())
+}
+
+/// The work of [`cmd_create_admin`] on an open database. `password` is asked
+/// only when an account is created: promoting one keeps its own.
+pub(crate) async fn create_admin_of(
+    db: &rg_db::DatabaseConnection,
+    username: &str,
+    email: Option<&str>,
+    password: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<rg_core::user::account::AdminBootstrap> {
+    use rg_core::user::account::{self, AdminBootstrap};
+
+    let existing = rg_db::ops::user_ops::find_by_username(db, username)
+        .await
+        .context("look the account up")?;
+    let (outcome, user_id, action) = match existing {
+        Some(user) => {
+            let user_id = user.id;
+            let outcome = account::promote_to_admin(db, user, email).await?;
+            (outcome, user_id, "admin.update_user")
+        }
+        None => {
+            let email = email.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no account named `{username}`: pass --email to create it as a new administrator"
+                )
+            })?;
+            let password = password()?;
+            let user = account::create_admin_account(db, username, email, &password).await?;
+            (AdminBootstrap::Created, user.id, "admin.create_user")
+        }
+    };
+    if outcome != AdminBootstrap::AlreadyAdmin {
+        // The same rows the HTTP doors write, with no actor — the honest
+        // encoding for a shell — and `via: "cli"` so a review can tell them
+        // apart.
+        rg_core::audit::record(
+            db,
+            &rg_core::audit::AuditActor::none(),
+            action,
+            Some("user"),
+            Some(user_id),
+            Some(username),
+            None,
+            Some(serde_json::json!({ "is_admin": true, "via": "cli" })),
+        )
+        .await;
+    }
+    Ok(outcome)
+}
+
+/// The password for a new account: the first line of stdin, or two matching
+/// entries typed at the terminal with echo off.
+fn read_new_password(from_stdin: bool) -> anyhow::Result<String> {
+    use std::io::{BufRead, Write};
+
+    if from_stdin {
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .context("read the password from stdin")?;
+        let password = line.trim_end_matches(['\r', '\n']).to_owned();
+        anyhow::ensure!(
+            !password.is_empty(),
+            "--password-stdin: standard input held no password"
+        );
+        return Ok(password);
+    }
+
+    let mut stderr = std::io::stderr();
+    write!(stderr, "Password for the new administrator: ")?;
+    stderr.flush()?;
+    let first = read_line_without_echo()?;
+    write!(stderr, "Repeat the password: ")?;
+    stderr.flush()?;
+    let second = read_line_without_echo()?;
+    anyhow::ensure!(first == second, "the two passwords differ; nothing created");
+    anyhow::ensure!(!first.is_empty(), "an empty password; nothing created");
+    Ok(first)
+}
+
+/// One line from the terminal with echo switched off for its duration. Falls
+/// back to a plain read when stdin is not a terminal, which is the
+/// `--password-stdin` case spelled without the flag.
+fn read_line_without_echo() -> anyhow::Result<String> {
+    use std::io::BufRead;
+
+    #[cfg(unix)]
+    let restore = {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stdin().as_raw_fd();
+        // SAFETY: `termios` is plain data; both calls take a valid fd and a
+        // pointer to this stack value, and the result is checked.
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } == 0 {
+            let original = unsafe { original.assume_init() };
+            let mut quiet = original;
+            quiet.c_lflag &= !libc::ECHO;
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } == 0 {
+                Some((fd, original))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+
+    #[cfg(unix)]
+    if let Some((fd, original)) = restore {
+        // SAFETY: restoring the attributes read above on the same fd.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+        eprintln!();
+    }
+
+    read.context("read the password from the terminal")?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+}
+
 /// `plombir-git rotate-instance-key` — replace this instance's provenance
 /// signing key.
 ///
@@ -1247,6 +1418,147 @@ mod tests {
             .unwrap();
         assert_eq!(untouched.session_version, after.session_version);
         assert!(super::reset_mfa_of(&db, "nobody").await.is_err());
+    }
+
+    /// `create-admin` on a real database: it creates an administrator with the
+    /// rules every account follows, promotes only an account a person signs in
+    /// with, checks `--email` against the account it promotes, asks for a
+    /// password only when it creates one, and journals what the shell did.
+    #[tokio::test]
+    async fn create_admin_creates_or_promotes_only_a_live_human_account() {
+        use rg_core::user::account::AdminBootstrap;
+        use rg_db::sea_orm::{ActiveModelTrait, Set};
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("admin.db").display()
+        );
+        let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+            .await
+            .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let no_password = || -> anyhow::Result<String> { panic!("promotion must not ask") };
+        let user_of = |name: &'static str| {
+            let db = db.clone();
+            async move {
+                rg_db::ops::user_ops::find_by_username(&db, name)
+                    .await
+                    .unwrap()
+                    .expect("the account exists")
+            }
+        };
+        let journal = || {
+            let db = db.clone();
+            async move {
+                rg_db::ops::audit_log_ops::list_paginated(&db, 0, 50, None, None, None, None, None)
+                    .await
+                    .unwrap()
+                    .0
+            }
+        };
+
+        // A name nobody holds needs an address, and nothing is asked before.
+        let error = super::create_admin_of(&db, "root", None, no_password)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("--email"), "{error:#}");
+        // The password rule every account follows.
+        let error = super::create_admin_of(&db, "root", Some("root@example.com"), || {
+            Ok("short".to_string())
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("password"), "{error:#}");
+        assert!(rg_db::ops::user_ops::find_by_username(&db, "root")
+            .await
+            .unwrap()
+            .is_none());
+
+        assert_eq!(
+            super::create_admin_of(&db, "root", Some("root@example.com"), || {
+                Ok("Qz7$wRtm-Hx4p".to_string())
+            })
+            .await
+            .unwrap(),
+            AdminBootstrap::Created
+        );
+        let root = user_of("root").await;
+        assert!(root.is_admin && root.is_active);
+        let created = journal()
+            .await
+            .into_iter()
+            .find(|row| row.action == "admin.create_user")
+            .expect("the creation is journalled");
+        assert_eq!(created.user_id, None, "a shell has no account to name");
+        assert_eq!(created.resource_id, Some(root.id));
+        assert!(created
+            .details
+            .as_deref()
+            .unwrap_or_default()
+            .contains("\"via\":\"cli\""));
+        assert_eq!(
+            super::create_admin_of(&db, "root", None, no_password)
+                .await
+                .unwrap(),
+            AdminBootstrap::AlreadyAdmin
+        );
+
+        rg_db::ops::user_ops::create_user(&db, "member", "member@example.com", "x", "Member")
+            .await
+            .unwrap();
+        let error = super::create_admin_of(&db, "member", Some("other@example.com"), no_password)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("different email"),
+            "{error:#}"
+        );
+        assert!(!user_of("member").await.is_admin);
+        assert_eq!(
+            super::create_admin_of(&db, "member", Some("MEMBER@example.com"), no_password)
+                .await
+                .unwrap(),
+            AdminBootstrap::Promoted
+        );
+        let member = user_of("member").await;
+        assert!(member.is_admin);
+        assert!(journal()
+            .await
+            .iter()
+            .any(|row| row.action == "admin.update_user" && row.resource_id == Some(member.id)));
+
+        // Accounts no person signs in with stay as they are.
+        let owner = user_of("member").await;
+        for (name, change) in [
+            ("ghost", "deleted"),
+            ("dormant", "deactivated"),
+            ("helper", "bot"),
+        ] {
+            let user = rg_db::ops::user_ops::create_user(
+                &db,
+                name,
+                &format!("{name}@example.com"),
+                "x",
+                name,
+            )
+            .await
+            .unwrap();
+            let when = user.created_at;
+            let mut active: rg_db::entities::user::ActiveModel = user.into();
+            match change {
+                "deleted" => active.deleted_at = Set(Some(when)),
+                "deactivated" => active.is_active = Set(false),
+                _ => active.bot_owner_id = Set(Some(owner.id)),
+            }
+            active.update(&db).await.unwrap();
+
+            let error = super::create_admin_of(&db, name, None, no_password)
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(change), "{name}: {error:#}");
+            assert!(!user_of(name).await.is_admin, "{name} was promoted");
+        }
     }
 
     async fn read_headers(stream: &mut TcpStream) -> String {

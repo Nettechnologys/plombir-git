@@ -41,6 +41,7 @@
 #   stand_open                          — temporary workspace + teardown trap
 #   stand_start_backend                 — sets STAND_BACKEND_URL / STAND_SSH_ADDR
 #   stand_register_founder <user> <mail>— sets STAND_TOKEN / STAND_USERNAME
+#   stand_read_setup_token              — sets STAND_SETUP_TOKEN from the data dir
 #   stand_start_frontend                — sets STAND_FRONTEND_URL
 #   stand_cleanup                       — idempotent teardown (the trap calls it)
 # Set STAND_CONFIG_PATH before `stand_start_backend` to add one explicit
@@ -223,6 +224,15 @@ stand_start_backend() {
   fi
 
   export PLOMBIR_GIT_JWT_SECRET="${STAND_JWT_SECRET}"
+  # The built-in default is `closed` (security audit finding #13). A stand is
+  # a throwaway instance whose scenarios register several accounts over the
+  # API, so it opens registration for itself — explicitly, here, where the
+  # decision is visible, and never in a shipped config. A consumer that wants
+  # the closed behaviour sets STAND_REGISTRATION=closed.
+  export PLOMBIR_GIT_REGISTRATION="${STAND_REGISTRATION:-open}"
+  # Where the server keeps the one-time setup token for its first account:
+  # beside the encryption key, which is beside the host key handed below.
+  STAND_SETUP_TOKEN_FILE="${STAND_WORK_DIR}/setup_token"
   stand_spawn "${STAND_SERVER_LOG}" "${STAND_WORK_DIR}" \
     "${STAND_BIN}" serve \
     "${config_args[@]}" \
@@ -241,9 +251,20 @@ stand_start_backend() {
     stand_backend_healthy || return 1
 }
 
+# The one-time setup token the server generated for its first account, read
+# from the stand's own data directory — the position of trust the token proves.
+# Empty once the first account exists (the server deletes the file).
+stand_read_setup_token() {
+  STAND_SETUP_TOKEN=""
+  if [[ -n "${STAND_SETUP_TOKEN_FILE:-}" && -s "${STAND_SETUP_TOKEN_FILE}" ]]; then
+    STAND_SETUP_TOKEN="$(tr -d '[:space:]' <"${STAND_SETUP_TOKEN_FILE}")"
+  fi
+}
+
 # Create the account the stand acts as. On an empty instance this succeeds even
 # with registration closed, which is what makes the stand usable against a build
-# whose config the test is not allowed to touch.
+# whose config the test is not allowed to touch — provided the request carries
+# the setup token, which the stand reads from its own data directory.
 stand_register_founder() {
   STAND_USERNAME=${1:-stand-founder}
   local email=${2:-${STAND_USERNAME}@example.com}
@@ -254,9 +275,16 @@ stand_register_founder() {
     python3 -c 'import json, os; print(json.dumps({"username": os.environ["STAND_USERNAME"], "email": os.environ["STAND_EMAIL"], "password": os.environ["STAND_PW"]}))' \
     >"${STAND_WORK_DIR}/register.json"
 
+  stand_read_setup_token
+  local token_header=()
+  if [[ -n "${STAND_SETUP_TOKEN}" ]]; then
+    token_header=(-H "X-Setup-Token: ${STAND_SETUP_TOKEN}")
+  fi
+
   local response
   response="$(curl -fsS -X POST "${STAND_BACKEND_URL}/api/v1/users/register" \
     -H "Content-Type: application/json" \
+    "${token_header[@]}" \
     --data-binary "@${STAND_WORK_DIR}/register.json")" || {
     echo "stand: registering ${STAND_USERNAME} failed" >&2
     return 1

@@ -57,6 +57,20 @@ export function setRegistrationOpen(open: boolean | null) {
   registrationOpen = open;
 }
 
+/// Whether the instance is still waiting for its first account, which needs
+/// the one-time setup token from the server's startup log
+/// (`GET /api/v1/instance` → `setup_required`). `false` until that answer
+/// arrives: the register endpoint names the token itself when it refuses.
+let setupRequired = $state(false);
+
+export function getSetupRequired(): boolean {
+  return setupRequired;
+}
+
+export function setSetupRequired(required: boolean) {
+  setupRequired = required;
+}
+
 // ── Keyboard Shortcuts ──────────────────────────────────
 
 /// Call this once in root layout to register global keyboard shortcuts.

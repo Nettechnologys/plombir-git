@@ -231,7 +231,9 @@
       "footer_link": "登录",
       "failed": "注册失败",
       "closed": "此实例已关闭自助注册。请联系管理员为您创建账户。",
-      "confirmation_sent": "请查收邮件：我们已发送一个确认该地址的链接。打开链接后账户才会创建。"
+      "confirmation_sent": "请查收邮件：我们已发送一个确认该地址的链接。打开链接后账户才会创建。",
+      "setup_token": "初始化令牌",
+      "setup_token_hint": "此实例尚无任何账号。请粘贴服务器首次启动日志中打印的一次性初始化令牌（也保存在加密密钥旁的 setup_token 文件中）；第一个账号将成为管理员。"
     },
     "back_to_login": "返回登录",
     "password_rules": {
