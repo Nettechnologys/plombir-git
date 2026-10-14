@@ -155,7 +155,7 @@ const MUTATIONS = [
   },
   {
     name: 'the websocket upgrade is dropped from the proxy',
-    apply: (fixture) => patch(fixture, 'web/vite.config.ts', ', ws: true', ''),
+    apply: (fixture) => patch(fixture, 'web/vite.config.ts', '\t\tws: true,\n', ''),
     expect: 'does not enable websocket proxying',
   },
 ];

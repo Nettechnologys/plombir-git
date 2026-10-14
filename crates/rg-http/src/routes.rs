@@ -396,6 +396,16 @@ fn apply_middleware(
             state.clone(),
             api::auth::session_standing_middleware,
         ))
+        // Inside the request id, so the refusal names one, and inside CORS, so
+        // a documented cross-origin frontend reads it; before the session is
+        // looked at, because a forged request's session is the victim's.
+        .layer(axum::middleware::from_fn_with_state(
+            crate::same_origin::SameOriginPolicy::new(
+                state.clone(),
+                std::env::var("PLOMBIR_GIT_CORS_ORIGINS").ok().as_deref(),
+            ),
+            crate::same_origin::same_origin_guard,
+        ))
         .layer(axum::middleware::from_fn(
             middleware::http_metrics_middleware,
         ))
