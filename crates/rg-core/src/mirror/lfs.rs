@@ -60,6 +60,7 @@ pub(crate) async fn fetch_new_objects(
     credentials: Option<GitCredentials>,
     guard: &dyn LfsSourceGuard,
     limits: crate::storage_quota::StorageLimits,
+    allowance: crate::clone_budget::PassAllowance,
 ) -> Result<MirrorLfsPass> {
     let scan_path = clone.to_path_buf();
     let scan = crate::blocking::run_blocking_git("mirror LFS pointer scan", move || {
@@ -91,7 +92,8 @@ pub(crate) async fn fetch_new_objects(
             credentials,
             guard,
             limits,
-        )?;
+        )?
+        .with_pass_allowance(allowance);
         for chunk in pointers.chunks(crate::lfs::fetch::BATCH_SIZE) {
             outcome.absorb(fetcher.fetch(chunk).await?);
         }
@@ -477,6 +479,79 @@ mod tests {
             })
     }
 
+    /// card_798531f99932: the LFS objects of a pass are paid for out of the
+    /// clone budget its git half already drew on. Pointers are ~130 bytes, so
+    /// a history well inside the ceiling can name objects far past it; the
+    /// ones that no longer fit are named with the key that raises the ceiling
+    /// and never downloaded, and the ones that did arrive stay.
+    #[tokio::test]
+    async fn a_pass_brings_no_more_lfs_than_its_clone_budget_has_left() {
+        let db = crate::test_support::migrated_memory_database().await;
+        let repo_id = repository(&db).await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repo_root = directory.path().join("repos");
+        let upstream = directory.path().join("upstream");
+        std::fs::create_dir_all(&upstream).expect("create upstream");
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&upstream, &["config", "user.name", "mirror lfs test"]);
+        git(
+            &upstream,
+            &["config", "user.email", "mirror@example.invalid"],
+        );
+        let fits: &[u8] = b"twenty bytes of lfs!";
+        let over: &[u8] = b"twenty more, no room";
+        commit_pointers(&upstream, &[("a.bin", fits), ("b.bin", over)], "two");
+        let clone = crate::mirror::service::mirror_clone_path(&repo_root, repo_id);
+        std::fs::create_dir_all(&repo_root).expect("create repo root");
+        git(
+            &repo_root,
+            &[
+                "clone",
+                "--mirror",
+                "-q",
+                upstream.to_str().expect("utf-8 path"),
+                clone.to_str().expect("utf-8 path"),
+            ],
+        );
+        let source = Upstream::spawn().await;
+        source.give(fits);
+        source.give(over);
+
+        // One MiB for the pass, and the git half took all but 30 bytes of it.
+        let allowance = crate::clone_budget::CloneBudget::from_mb("[mirror].max_clone_size_mb", 1)
+            .remaining_after(1024 * 1024 - 30);
+        let outcome = fetch_new_objects(
+            &db,
+            &repo_root,
+            repo_id,
+            &clone,
+            &source.remote_url(),
+            None,
+            &Loopback,
+            crate::storage_quota::StorageLimits::default(),
+            allowance,
+        )
+        .await
+        .expect("a pass that only the budget can fall short of");
+
+        assert_eq!(outcome.fetched, 1, "{:?}", outcome.failed);
+        assert_eq!(outcome.failed.len(), 1);
+        assert!(
+            outcome.failed[0]
+                .reason
+                .contains("`[mirror].max_clone_size_mb`"),
+            "the refusal names the key that raises the ceiling: {}",
+            outcome.failed[0].reason
+        );
+        let (arrived, refused) = if outcome.failed[0].oid == oid_of(over) {
+            (fits, over)
+        } else {
+            (over, fits)
+        };
+        assert_eq!(served(&repo_root, arrived).await.as_deref(), Some(arrived));
+        assert_eq!(served(&repo_root, refused).await, None);
+    }
+
     /// The acceptance of card_f4bc7fe93859: an LFS file added upstream is
     /// served by the mirror after the pass that brought its pointer; a pass
     /// with nothing new asks the upstream nothing; a pass reads only the
@@ -526,6 +601,7 @@ mod tests {
                     credentials,
                     &Loopback,
                     crate::storage_quota::StorageLimits::default(),
+                    crate::clone_budget::PassAllowance::unlimited(),
                 )
                 .await
                 .expect("a pass that only the upstream can fail")

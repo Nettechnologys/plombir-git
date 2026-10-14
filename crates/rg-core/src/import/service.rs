@@ -636,11 +636,19 @@ async fn fetch_lfs_objects(
     storage_limits: crate::storage_quota::StorageLimits,
 ) -> Result<()> {
     let repo_path = repo_root.join(format!("{}/{}.git", task.target_owner, task.target_name));
-    let pointers = crate::blocking::run_blocking_git("import LFS pointer scan", move || {
-        crate::lfs::pointer::objects_in_history(&repo_path)
-    })
-    .await
-    .context("failed to read the LFS pointers of the imported repository")?;
+    // The clone is this import's alone, so all of it is what the git half of
+    // the pass wrote: the LFS objects get what that left of the same budget
+    // (card_798531f99932).
+    let (pointers, git_written) =
+        crate::blocking::run_blocking_git("import LFS pointer scan", move || {
+            let pointers = crate::lfs::pointer::objects_in_history(&repo_path)?;
+            Ok((
+                pointers,
+                crate::clone_budget::CloneBudget::measure(&repo_path),
+            ))
+        })
+        .await
+        .context("failed to read the LFS pointers of the imported repository")?;
     if pointers.is_empty() {
         return Ok(());
     }
@@ -669,7 +677,8 @@ async fn fetch_lfs_objects(
         source_credentials(&task.platform, &task.source_url, token),
         trusted_origins,
         storage_limits,
-    )?;
+    )?
+    .with_pass_allowance(trusted_origins.clone_budget().remaining_after(git_written));
     let mut outcome = crate::lfs::fetch::LfsFetchOutcome::default();
     let mut done = 0;
     for chunk in pointers.chunks(crate::lfs::fetch::BATCH_SIZE) {

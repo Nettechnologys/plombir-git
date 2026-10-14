@@ -699,6 +699,9 @@ async fn run_sync_pass(
         Ok(credentials) => match transport_policy.destination(&mirror.url).await {
             Ok(remote) => {
                 crate::blocking::run_blocking_git("mirror repository sync", move || {
+                    // What the clone held before this pass, so the LFS half is
+                    // paid for out of what the git half left of the budget.
+                    let held_before = crate::clone_budget::CloneBudget::measure(&repo_path);
                     let result = if repo_path.join("HEAD").exists() {
                         // Existing mirror: git remote update
                         run_git_remote_update(
@@ -716,7 +719,9 @@ async fn run_sync_pass(
                             credentials.as_ref(),
                         )
                     };
-                    Ok((credentials, result))
+                    let git_written = crate::clone_budget::CloneBudget::measure(&repo_path)
+                        .saturating_sub(held_before);
+                    Ok((credentials, result.map(|()| git_written)))
                 })
                 .await?
             }
@@ -765,7 +770,8 @@ async fn finish_pass(
     repo_root: &Path,
     clone_path: &Path,
     credentials: Option<GitCredentials>,
-    result: Result<()>,
+    // The bytes the pass's git half wrote, when it succeeded.
+    result: Result<u64>,
     transport_policy: MirrorTransportPolicy,
     storage_limits: &crate::storage_quota::StorageLimits,
     hooks: Option<&PostPushContext>,
@@ -782,7 +788,7 @@ async fn finish_pass(
         // missing binary — but the pass is not reported as a clean one either:
         // the row says which objects are missing, and the sweep retries a
         // mirror in `error` on its next tick.
-        Ok(()) => {
+        Ok(git_written) => {
             let lfs = match super::lfs::fetch_new_objects(
                 db,
                 repo_root,
@@ -797,6 +803,7 @@ async fn finish_pass(
                 }),
                 &transport_policy,
                 *storage_limits,
+                transport_policy.clone_budget().remaining_after(git_written),
             )
             .await
             {
@@ -1561,7 +1568,7 @@ mod tests {
                     &repo_root,
                     &clone,
                     None,
-                    Ok(()),
+                    Ok(0),
                     MirrorTransportPolicy::default(),
                     &crate::storage_quota::StorageLimits::default(),
                     None,
@@ -1740,7 +1747,7 @@ mod tests {
                     &repo_root,
                     &clone,
                     None,
-                    Ok(()),
+                    Ok(0),
                     MirrorTransportPolicy::default(),
                     &crate::storage_quota::StorageLimits::default(),
                     Some(&hooks),

@@ -86,6 +86,31 @@ impl CloneBudget {
         )))
     }
 
+    /// What is left of this budget for the LFS objects of the same pass, once
+    /// its git half wrote `git_written` bytes.
+    ///
+    /// A pass is one budget, not two: the pointers a clone brings are ~130
+    /// bytes each, so a history that fits the ceiling can name millions of
+    /// objects, and each of them used to be fetched up to its own per-object
+    /// limit (card_798531f99932).
+    pub fn remaining_after(self, git_written: u64) -> PassAllowance {
+        PassAllowance {
+            remaining: self
+                .max_bytes
+                .map(|max_bytes| max_bytes.saturating_sub(git_written)),
+            max_bytes: self.max_bytes,
+            config_key: self.config_key,
+        }
+    }
+
+    /// The bytes beneath `path` — what a pass's git half has left there. `0`
+    /// for a directory that is not there or cannot be read: the budget is a
+    /// defence against a remote that never stops sending, and a measurement
+    /// that failed is no reason to refuse the objects it would have bounded.
+    pub fn measure(path: &Path) -> u64 {
+        DiskBudget::new(path, 0).measure().unwrap_or(0)
+    }
+
     /// Whether `error` is this budget refusing a run.
     pub fn refused(error: &anyhow::Error) -> bool {
         matches!(
@@ -110,6 +135,50 @@ impl CloneBudget {
     }
 }
 
+/// What one pass may still bring after its git half: the LFS objects the new
+/// history points at are paid for out of the same [`CloneBudget`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PassAllowance {
+    /// `None` when the operator removed the ceiling.
+    remaining: Option<u64>,
+    max_bytes: Option<u64>,
+    config_key: &'static str,
+}
+
+impl PassAllowance {
+    /// No ceiling at all — a caller that has no budget to share.
+    pub const fn unlimited() -> Self {
+        Self {
+            remaining: None,
+            max_bytes: None,
+            config_key: "",
+        }
+    }
+
+    /// Whether an object of `bytes` still fits; the refusal names the key that
+    /// raises the ceiling, because it is the only thing its reader can act on.
+    pub fn admit(&self, bytes: u64) -> std::result::Result<(), String> {
+        match self.remaining {
+            Some(remaining) if bytes > remaining => Err(format!(
+                "this pass has already brought what the {} MiB one clone or fetch may write to \
+                 this server's disk, its LFS objects included, so this {bytes}-byte object was \
+                 not fetched; if the repository is legitimately that large, raise `{}` (0 \
+                 removes the ceiling)",
+                self.max_bytes.unwrap_or(0) / (1024 * 1024),
+                self.config_key,
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Account for an object of `bytes` that arrived.
+    pub fn charge(&mut self, bytes: u64) {
+        if let Some(remaining) = self.remaining.as_mut() {
+            *remaining = remaining.saturating_sub(bytes);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +199,33 @@ mod tests {
             Some(u64::MAX),
             "an absurd setting saturates instead of wrapping to a tiny ceiling"
         );
+    }
+
+    #[test]
+    fn the_lfs_half_of_a_pass_gets_what_its_git_half_left() {
+        let budget = CloneBudget::from_mb("[mirror].max_clone_size_mb", 3);
+        let mut allowance = budget.remaining_after(2 * 1024 * 1024);
+        allowance.admit(1024 * 1024).expect("one MiB is left");
+        allowance.charge(1024 * 1024);
+        let refused = allowance.admit(1).expect_err("nothing is left");
+        assert!(
+            refused.contains("`[mirror].max_clone_size_mb`"),
+            "{refused}"
+        );
+        assert!(refused.contains("3 MiB"), "{refused}");
+
+        let over = budget.remaining_after(5 * 1024 * 1024);
+        assert!(
+            over.admit(1).is_err(),
+            "a git half past the ceiling leaves nothing"
+        );
+
+        let unbounded =
+            CloneBudget::from_mb("[mirror].max_clone_size_mb", 0).remaining_after(u64::MAX);
+        unbounded.admit(u64::MAX).expect("0 removes the ceiling");
+        PassAllowance::unlimited()
+            .admit(u64::MAX)
+            .expect("no budget to share");
     }
 
     #[test]

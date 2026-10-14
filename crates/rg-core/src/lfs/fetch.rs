@@ -151,6 +151,10 @@ pub struct LfsFetcher<'a> {
     /// The destination's `[limits]` budget, checked for each object before it
     /// is downloaded.
     limits: crate::storage_quota::StorageLimits,
+    /// What the pass this fetch belongs to may still write — its share of the
+    /// mirror's or the import's clone budget. Unlimited unless the caller
+    /// hands one over ([`Self::with_pass_allowance`]).
+    pass_allowance: crate::clone_budget::PassAllowance,
 }
 
 /// The batch endpoint the git-lfs client derives from `remote_url`.
@@ -220,7 +224,16 @@ impl<'a> LfsFetcher<'a> {
             batch_client,
             download_clients: HashMap::new(),
             limits,
+            pass_allowance: crate::clone_budget::PassAllowance::unlimited(),
         })
+    }
+
+    /// Pay for every object out of `allowance`: an object it has no room for
+    /// is one of the [`LfsFetchOutcome::failed`], with the budget's key as its
+    /// reason, and is never downloaded (card_798531f99932).
+    pub fn with_pass_allowance(mut self, allowance: crate::clone_budget::PassAllowance) -> Self {
+        self.pass_allowance = allowance;
+        self
     }
 
     /// Give the destination every object of `pointers` it does not have yet.
@@ -418,6 +431,9 @@ impl<'a> LfsFetcher<'a> {
             }
             Err(crate::storage_quota::QuotaError::Db(error)) => return Err(error),
         }
+        if let Err(reason) = self.pass_allowance.admit(entry.pointer.size) {
+            return Ok(Err(reason));
+        }
 
         let request = match self.download_request(action) {
             Ok(request) => request,
@@ -488,6 +504,7 @@ impl<'a> LfsFetcher<'a> {
                 entry.pointer.oid, self.destination.owner, self.destination.name
             )
         })?;
+        self.pass_allowance.charge(entry.pointer.size);
         Ok(Ok(()))
     }
 
