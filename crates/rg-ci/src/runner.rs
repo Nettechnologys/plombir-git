@@ -933,6 +933,27 @@ impl PipelineRunner {
         Ok(())
     }
 
+    /// The engine the merge commit's pipeline runs through.
+    ///
+    /// Every field of the engine this runner was spawned from, not just the ones
+    /// a merge happens to read: that pipeline's embedded runner is the one that
+    /// has to answer to `ci.runner_labels` and hear SIGTERM, and a field left out
+    /// here fades on the second link of the cascade instead of at the process
+    /// boundary (card_e644d3d3e8df).
+    fn engine_one_hop_down(&self) -> crate::CiEngine {
+        let engine = crate::CiEngine::with_notifications_and_job_timeout(
+            self.notifications.clone(),
+            self.job_timeout_secs,
+        )
+        .with_runner_labels(self.runner_labels.clone())
+        .with_write_pool(self.db_write.clone())
+        .with_storage_limits(self.storage_limits);
+        match &self.shutdown {
+            Some(shutdown) => engine.with_shutdown(shutdown.clone()),
+            None => engine,
+        }
+    }
+
     /// This runner's post-push wiring, for the base-branch moves the merges it
     /// unblocks make.
     ///
@@ -945,12 +966,7 @@ impl PipelineRunner {
         &self,
         repo_root: &std::path::Path,
     ) -> rg_core::push_hooks::PostPushContext {
-        let engine = crate::CiEngine::with_notifications_and_job_timeout(
-            self.notifications.clone(),
-            self.job_timeout_secs,
-        )
-        .with_write_pool(self.db_write.clone())
-        .with_storage_limits(self.storage_limits);
+        let engine = self.engine_one_hop_down();
         crate::post_push_context(
             repo_root,
             self.docker_enabled,
@@ -2348,6 +2364,53 @@ mod tests {
         let context = runner.post_push_context(std::path::Path::new("/srv/repos"));
         assert_eq!(context.storage_limits, limits);
         assert_eq!(context.pipeline_ci().storage_limits, limits);
+    }
+
+    /// The merge commit's pipeline runs through the engine the hooks carry, so
+    /// its embedded runner must answer to the same `ci.runner_labels` and hear
+    /// the same SIGTERM as the runner whose success triggered the merge.
+    #[tokio::test]
+    async fn the_post_success_hooks_carry_the_runner_labels_and_shutdown() {
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        let mut runner =
+            PipelineRunner::new_local_only(db, std::path::Path::new("/srv/repos/o/r.git"), 1);
+        runner.set_runner_labels(vec!["MY-GPU-BOX".into()]);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        runner.set_shutdown(Some(shutdown_rx));
+        let limits = rg_core::storage_quota::StorageLimits {
+            repo_quota_bytes: Some(4096),
+            ..Default::default()
+        };
+        runner.set_storage_limits(limits);
+
+        let engine = runner.engine_one_hop_down();
+        let nested = crate::build_internal_runner(
+            runner.db.clone(),
+            std::path::Path::new("/srv/repos/o/r.git"),
+            1,
+            2,
+            false,
+            false,
+            None,
+            None,
+            None,
+            &engine,
+        );
+        assert_eq!(nested.runner_labels, vec!["MY-GPU-BOX".to_string()]);
+        assert!(
+            nested.hears_shutdown(),
+            "the merge commit's runner must observe the process shutdown"
+        );
+        shutdown_tx.send(true).unwrap();
+        assert!(nested.shutting_down());
+        assert_eq!(nested.storage_limits, limits);
     }
 
     #[tokio::test]
