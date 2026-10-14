@@ -88,7 +88,9 @@ wildcards = "allow"
 # `openssl-sys` is allowed only through webauthn-rs-core and webauthn-attestation-ca,
 # which depend on it unconditionally (not behind a feature), and the `openssl`
 # crate they use. Removing that path means replacing webauthn-rs, a decision of
-# its own, not a feature flag.
+# its own, not a feature flag. That decision was taken on 2026-10-15: the
+# exception stays, and it covers exactly these three wrappers. Any other route
+# to `openssl-sys` is a new decision, not an edit to this list.
 deny = [
     { name = "openssl-sys", wrappers = ["openssl", "webauthn-rs-core", "webauthn-attestation-ca"], reason = "TLS is rustls only; the one allowed path is webauthn-rs's unconditional openssl dependency" },
     { name = "curl-sys", reason = "gix runs without its curl transport; git traffic goes through the git CLI" },
