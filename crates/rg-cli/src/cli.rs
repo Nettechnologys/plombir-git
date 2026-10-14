@@ -2401,7 +2401,7 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 22] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 26] = [
         (
             "DEFAULT_LOG_MAX_SIZE_MB",
             "the size cap is inactive until explicitly set; presenting 10 MB as an active default would mislead operators",
@@ -2441,6 +2441,24 @@ const AFTER: &str = "after";
         (
             "DEFAULT_HSTS_PRELOAD",
             "config-file-only: `[server].hsts_preload` has no CLI flag",
+        ),
+        (
+            "DEFAULT_REPO_QUOTA_MB",
+            "config-file-only: `[limits].repo_quota_mb` has no CLI flag, and 0 means no ceiling",
+        ),
+        (
+            "DEFAULT_OCI_BLOB_MAX_MB",
+            "config-file-only: `[limits].oci_blob_max_mb` has no CLI flag, and 0 means no ceiling",
+        ),
+        (
+            "DEFAULT_CI_CACHE_MAX_ENTRIES_PER_REPO",
+            "config-file-only: `[limits].ci_cache_max_entries_per_repo` has no CLI flag, and 0 \
+             means no ceiling",
+        ),
+        (
+            "DEFAULT_RELEASE_ASSETS_MAX_PER_RELEASE",
+            "config-file-only: `[limits].release_assets_max_per_release` has no CLI flag, and 0 \
+             means no ceiling",
         ),
         (
             "DEFAULT_RATE_LIMIT_MAX_KEYS",

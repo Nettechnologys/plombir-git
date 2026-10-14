@@ -581,6 +581,7 @@ async fn create(
         &content_type,
         &upload_path,
         size,
+        &state.storage_limits,
     )
     .await;
     discard_file_async("attachment staging file", &upload_path).await;

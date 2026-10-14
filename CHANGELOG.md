@@ -23,6 +23,14 @@ This project records user-facing changes here. The format follows
   `GET /api/v1/instance` reports `setup_required`.
 - `plombir-git create-admin --username <name> [--email <address>]` creates
   an instance administrator from the shell, or promotes an existing account.
+- `[limits]`: opt-in storage ceilings. `repo_quota_mb` caps one
+  repository's total across LFS objects, release assets, attachments, CI
+  caches, packages and OCI blobs; `oci_blob_max_mb` caps one OCI upload
+  session; `ci_cache_max_entries_per_repo` and
+  `release_assets_max_per_release` cap entry counts. Every one is `0`, no
+  ceiling, by default, so upgrading changes nothing until a value is set. A
+  write that would pass a ceiling answers `413` (an LFS batch object `507`)
+  with the used, incoming and limit numbers.
 
 ### Changed
 

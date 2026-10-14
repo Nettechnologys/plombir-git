@@ -574,11 +574,36 @@ pub async fn upload_asset(
     )
     .to_string();
 
+    // With `[limits].release_assets_max_per_release` set, a full release is
+    // refused before the body is spooled: the per-file ceiling bounds one
+    // request, not how many a release answers.
+    if let Some(max_assets) = state.storage_limits.release_assets_max_per_release {
+        match rg_db::ops::release_ops::count_assets(&state.db, release.id).await {
+            Ok(count) if count >= max_assets => {
+                return AppError::payload_too_large(format!(
+                    "the release already holds the maximum of {max_assets} asset(s) \
+                     ([limits].release_assets_max_per_release)"
+                ))
+                .into_response();
+            }
+            Ok(_) => {}
+            Err(error) => return AppError::from(error).into_response(),
+        }
+    }
+
     let staged =
         match stage_release_upload(body, &state.repo_root, RELEASE_ASSET_UPLOAD_MAX_BYTES).await {
             Ok(staged) => staged,
             Err(error) => return error.into_response(),
         };
+
+    // The repository's shared budget; the spool is dropped with `staged`.
+    if let Err(error) =
+        rg_core::storage_quota::check_room(&state.db, repo.id, staged.len, &state.storage_limits)
+            .await
+    {
+        return AppError::from(error.into_service_error()).into_response();
+    }
 
     match rg_core::release::service::upload_asset_from_file(
         &state.db,

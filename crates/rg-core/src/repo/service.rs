@@ -7226,6 +7226,7 @@ mod repository_deletion_tests {
                     crate::package_registry::PackageArtifact::from_bytes(b"package bytes".to_vec()),
                 )],
             },
+            &crate::storage_quota::StorageLimits::default(),
         )
         .await
         .expect("publish package before transfer");

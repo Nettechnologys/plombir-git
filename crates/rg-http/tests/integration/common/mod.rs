@@ -333,6 +333,8 @@ pub struct StateOverrides {
     pub webhook_transport_policy: Option<rg_core::webhook::transport::WebhookTransportPolicy>,
     /// Overrides the decoded package artifact ceiling for boundary tests.
     pub package_upload_max_bytes: Option<usize>,
+    /// `[limits]` for this state. The default is production's: no ceiling.
+    pub storage_limits: Option<rg_core::storage_quota::StorageLimits>,
     /// Replaces the bot-account limiter, which the harness leaves disabled so
     /// no test trips over a budget it did not ask for.
     pub agent_rate_limiter: Option<rg_http::rate_limit::RateLimiter>,
@@ -466,6 +468,7 @@ pub fn build_test_app_state_with(
         package_upload_max_bytes: overrides
             .package_upload_max_bytes
             .unwrap_or(rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES),
+        storage_limits: overrides.storage_limits.unwrap_or_default(),
         notification_hub: rg_http::ws::NotificationHub::new(),
         smtp_config: overrides.smtp_config,
         oci_storage: Arc::new(OciStorage::from_backend(

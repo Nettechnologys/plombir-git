@@ -878,6 +878,7 @@ mod tests {
             &db,
             &storage,
             publish_info(author_id, two_files()),
+            &crate::storage_quota::StorageLimits::default(),
         )
         .await
         .unwrap();
@@ -900,6 +901,7 @@ mod tests {
                     ),
                 ],
             ),
+            &crate::storage_quota::StorageLimits::default(),
         )
         .await
         .unwrap();

@@ -95,6 +95,7 @@ async fn create_attachment(
         content_type,
         AttachmentSource::Buffered(data),
         data.len() as u64,
+        &crate::storage_quota::StorageLimits::default(),
     )
     .await
 }
@@ -112,6 +113,7 @@ pub async fn create_attachment_from_file(
     content_type: &str,
     source: &Path,
     size: u64,
+    limits: &crate::storage_quota::StorageLimits,
 ) -> Result<Attachment> {
     let actual_size = tokio::fs::metadata(source)
         .await
@@ -130,6 +132,7 @@ pub async fn create_attachment_from_file(
         content_type,
         AttachmentSource::File(source),
         size,
+        limits,
     )
     .await
 }
@@ -174,8 +177,9 @@ async fn create_attachment_from_source(
     content_type: &str,
     source: AttachmentSource<'_>,
     size: u64,
+    limits: &crate::storage_quota::StorageLimits,
 ) -> Result<Attachment> {
-    let prepared = prepare_attachment(db, repo_id, filename, size).await?;
+    let prepared = prepare_attachment(db, repo_id, filename, size, limits).await?;
     let sha256 = source.sha256().await?;
     let publication_id = Uuid::new_v4().simple().to_string();
     crate::deletion_recovery::open_attachment_creation(storage, &publication_id, &prepared.key)
@@ -228,6 +232,7 @@ async fn prepare_attachment(
     repo_id: i64,
     filename: &str,
     size: u64,
+    limits: &crate::storage_quota::StorageLimits,
 ) -> Result<PreparedAttachment> {
     let filename = validate_filename(filename)?;
     if size == 0 {
@@ -242,6 +247,10 @@ async fn prepare_attachment(
     if current_size.saturating_add(size) > DEFAULT_REPO_ATTACHMENT_QUOTA {
         return Err(invalid_request("repository attachment quota exceeded"));
     }
+    // The repository's shared budget across every store, when one is set.
+    crate::storage_quota::check_room(db, repo_id, size as u64, limits)
+        .await
+        .map_err(crate::storage_quota::QuotaError::into_service_error)?;
 
     let uuid = Uuid::new_v4().to_string();
     let repo_segment = repo_id.to_string();
@@ -967,6 +976,7 @@ mod tests {
             "text/plain",
             &source,
             22,
+            &crate::storage_quota::StorageLimits::default(),
         )
         .await
         .unwrap();

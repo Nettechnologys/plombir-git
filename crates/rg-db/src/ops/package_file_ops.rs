@@ -117,6 +117,36 @@ pub async fn list_storage_paths_by_repo(
         .await
 }
 
+/// How many package files `repo_id` holds, and how many bytes they declare.
+///
+/// The walk is repo → registry → packages → versions → files, as in
+/// [`list_storage_paths_by_repo`], ending in one `COUNT`/`SUM`.
+pub async fn repo_usage(db: &DatabaseConnection, repo_id: i64) -> anyhow::Result<(u64, i64)> {
+    let registry_ids = package_registry::Entity::find()
+        .select_only()
+        .column(package_registry::Column::Id)
+        .filter(package_registry::Column::RepoId.eq(repo_id))
+        .into_query();
+    let package_ids = package::Entity::find()
+        .select_only()
+        .column(package::Column::Id)
+        .filter(package::Column::PackageRegistryId.in_subquery(registry_ids))
+        .into_query();
+    let version_ids = package_version::Entity::find()
+        .select_only()
+        .column(package_version::Column::Id)
+        .filter(package_version::Column::PackageId.in_subquery(package_ids))
+        .into_query();
+    super::aggregate::count_and_sum(
+        db,
+        PackageFile::find().filter(package_file::Column::VersionId.in_subquery(version_ids)),
+        package_file::Column::Id,
+        package_file::Column::Size,
+        "db: sum the package files of a repository",
+    )
+    .await
+}
+
 /// Find a file by id.
 pub async fn find_by_id(
     db: &DatabaseConnection,

@@ -610,6 +610,7 @@ pub async fn batch(
     req: &LfsBatchRequest,
     signing_secret: &[u8],
     actor: Option<LfsActor>,
+    limits: &crate::storage_quota::StorageLimits,
 ) -> Result<LfsBatchResponse> {
     let transfer = negotiate_transfer(req.transfers.as_deref())?.to_string();
 
@@ -643,6 +644,7 @@ pub async fn batch(
                             size,
                             signing_secret,
                             actor,
+                            limits,
                         )
                         .await
                     }
@@ -696,6 +698,7 @@ async fn handle_upload(
     size: i64,
     signing_secret: &[u8],
     actor: Option<LfsActor>,
+    limits: &crate::storage_quota::StorageLimits,
 ) -> Result<LfsObjectResponse> {
     // Check if object already exists
     let existing = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await?;
@@ -721,6 +724,29 @@ async fn handle_upload(
                 });
             }
         }
+    }
+
+    // An object the repository has no room for is refused here, per object,
+    // with the spec's `507 insufficient storage` — before the client spends
+    // the bandwidth and before a pending row is registered for it. `413` would
+    // name the HTTP request, which is not the ceiling that was hit. A database
+    // that cannot answer stays an `Err`: a refusal must be a decision.
+    match crate::storage_quota::check_room(db, repo_id, u64::try_from(size).unwrap_or(0), limits)
+        .await
+    {
+        Ok(()) => {}
+        Err(crate::storage_quota::QuotaError::Exceeded(exceeded)) => {
+            return Ok(LfsObjectResponse {
+                oid: oid.to_string(),
+                size,
+                actions: None,
+                error: Some(LfsError {
+                    code: 507,
+                    message: exceeded.message,
+                }),
+            });
+        }
+        Err(crate::storage_quota::QuotaError::Db(error)) => return Err(error),
     }
 
     // Register object if not yet tracked. Two clients batching the same new

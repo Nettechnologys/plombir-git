@@ -1498,6 +1498,46 @@ pub async fn upload_cache(
         return AppError::bad_request("cache archive must contain 1 byte to 1 GiB").into_response();
     }
     let size = len as i64;
+    let limits = &state.storage_limits;
+    if limits.ci_cache_max_entries_per_repo.is_some() || limits.repo_quota_bytes.is_some() {
+        // The key this upload replaces, if any: replacing an entry adds no key
+        // and only the difference in bytes, so a refresh at the limit is not
+        // refused for room the old archive already holds.
+        let replaced =
+            match rg_db::ops::ci_retention_ops::find_cache_entry(&state.db, repo_id, &key_hash)
+                .await
+            {
+                Ok(entry) => entry,
+                Err(error) => return AppError::from(error).into_response(),
+            };
+        if let (None, Some(max_entries)) = (&replaced, limits.ci_cache_max_entries_per_repo) {
+            let entries =
+                match rg_db::ops::ci_retention_ops::repo_cache_usage(&state.db, repo_id).await {
+                    Ok((entries, _bytes)) => entries,
+                    Err(error) => return AppError::from(error).into_response(),
+                };
+            if entries >= max_entries {
+                // No eviction: the owner cannot list caches, so a key dropped
+                // to make room would vanish without a trace. Entries leave on
+                // their retention window.
+                return AppError::payload_too_large(format!(
+                    "the repository already holds the maximum of {max_entries} CI cache \
+                     entries ([limits].ci_cache_max_entries_per_repo); older entries leave when \
+                     their retention window expires"
+                ))
+                .into_response();
+            }
+        }
+        let held = replaced
+            .as_ref()
+            .map_or(0, |entry| u64::try_from(entry.size).unwrap_or(0));
+        if let Err(error) =
+            rg_core::storage_quota::check_room(&state.db, repo_id, len.saturating_sub(held), limits)
+                .await
+        {
+            return AppError::from(error.into_service_error()).into_response();
+        }
+    }
     if let Err(error) = rg_core::ci_cache::publish_from_spool(
         &state.db,
         &state.repo_root,

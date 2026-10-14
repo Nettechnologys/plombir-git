@@ -8,8 +8,12 @@
 //! the `SUM` of nothing is `NULL` and skips the check. SQLite tests stay green
 //! and the first real upload on a server database turns the query into a 500.
 
+use anyhow::Context;
 use sea_orm::sea_query::{Alias, Expr, Func, SimpleExpr};
-use sea_orm::{ColumnTrait, DbBackend};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, FromQueryResult,
+    QuerySelect, Select,
+};
 
 /// `SUM(column)` as a value every backend decodes into `Option<i64>`.
 ///
@@ -25,6 +29,37 @@ pub(crate) fn sum_i64(backend: DbBackend, column: impl ColumnTrait) -> SimpleExp
         DbBackend::MySql => Func::cast_as(sum, Alias::new("SIGNED")).into(),
         DbBackend::Sqlite => sum,
     }
+}
+
+/// How many rows `select` matches, and the `SUM` of `size` over them, decoded
+/// the same way on every backend. `select` carries the caller's filters and
+/// joins; `what` names the question for the error chain.
+pub(crate) async fn count_and_sum<E: EntityTrait>(
+    db: &DatabaseConnection,
+    select: Select<E>,
+    id: impl ColumnTrait,
+    size: impl ColumnTrait,
+    what: &'static str,
+) -> anyhow::Result<(u64, i64)> {
+    #[derive(Debug, FromQueryResult)]
+    struct Usage {
+        count: i64,
+        bytes: Option<i64>,
+    }
+    let usage = select
+        .select_only()
+        .column_as(id.count(), "count")
+        .column_as(sum_i64(db.get_database_backend(), size), "bytes")
+        .into_model::<Usage>()
+        .one(db)
+        .await
+        .context(what)?;
+    Ok(usage.map_or((0, 0), |usage| {
+        (
+            u64::try_from(usage.count).unwrap_or(0),
+            usage.bytes.unwrap_or(0),
+        )
+    }))
 }
 
 #[cfg(test)]

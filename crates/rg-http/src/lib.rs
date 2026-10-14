@@ -74,6 +74,10 @@ pub struct AppState {
     /// Maximum decoded package artifact size. Protocol envelopes receive only
     /// bounded encoding headroom; this remains the stored-file ceiling.
     pub package_upload_max_bytes: usize,
+    /// `[limits]` — the opt-in per-repository storage budget and the session,
+    /// release and cache entry ceilings, checked through
+    /// [`rg_core::storage_quota`]. Every one unset by default.
+    pub storage_limits: rg_core::storage_quota::StorageLimits,
     /// Directory holding the built SPA bundle. Production resolves it from
     /// `[server].web_root` or [`DEFAULT_SPA_BUILD_DIR`]; tests can inject a
     /// temp fixture without mutating process-global cwd or env.
@@ -535,6 +539,10 @@ pub struct HttpServerConfig {
     pub webhook_transport_policy: rg_core::webhook::transport::WebhookTransportPolicy,
     /// Maximum decoded package artifact size in bytes.
     pub package_upload_max_bytes: usize,
+    /// `[limits]` — the opt-in per-repository storage budget and the session,
+    /// release and cache entry ceilings, checked through
+    /// [`rg_core::storage_quota`]. Every one unset by default.
+    pub storage_limits: rg_core::storage_quota::StorageLimits,
     /// Rate limit: max requests per window (0 = disabled).
     pub rate_limit_max: u32,
     /// Rate limit: window duration in seconds.
@@ -772,6 +780,7 @@ async fn run_with_listener(
         webhook_transport_policy: config.webhook_transport_policy,
         import_workers: Default::default(),
         package_upload_max_bytes: config.package_upload_max_bytes,
+        storage_limits: config.storage_limits,
         notification_hub: notification_hub.clone(),
         smtp_config: config.smtp_config,
         blob_storage,

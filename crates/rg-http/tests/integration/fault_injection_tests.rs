@@ -1311,7 +1311,13 @@ async fn a_publish_that_failed_part_way_keeps_none_of_its_files() {
     let broken = rg_core::package_registry::PackageStorage::from_backend(
         crate::common::fault::RejectOneKey::wrap(root.clone(), "widget-1.0.0.jar"),
     );
-    let failed = rg_core::package_registry::service::publish(&app.db, &broken, info()).await;
+    let failed = rg_core::package_registry::service::publish(
+        &app.db,
+        &broken,
+        info(),
+        &rg_core::storage_quota::StorageLimits::default(),
+    )
+    .await;
     assert!(
         failed.is_err(),
         "a file the blob store refused must fail the publish"
@@ -1329,9 +1335,14 @@ async fn a_publish_that_failed_part_way_keeps_none_of_its_files() {
     // Control: the same publish, with the store healthy, does write that file —
     // so the assertion above is about the rollback and not about a path that is
     // never written in the first place.
-    rg_core::package_registry::service::publish(&app.db, &healthy, info())
-        .await
-        .expect("the publish must succeed once the blob store accepts every file");
+    rg_core::package_registry::service::publish(
+        &app.db,
+        &healthy,
+        info(),
+        &rg_core::storage_quota::StorageLimits::default(),
+    )
+    .await
+    .expect("the publish must succeed once the blob store accepts every file");
     assert!(
         healthy
             .has_files("pkg_part", "half-published", "maven", "widget", "1.0.0")

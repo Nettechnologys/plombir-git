@@ -206,3 +206,29 @@ pub async fn increment_download_count(db: &DatabaseConnection, id: i64) -> Resul
         rows => anyhow::bail!("db: asset download increment affected {rows} rows for id {id}"),
     }
 }
+
+/// How many assets `repo_id` has published, and how many bytes they declare.
+///
+/// `release_assets` carries only `release_id`, and the budget is per
+/// repository, so the filter belongs on the joined release.
+pub async fn repo_asset_usage(db: &DatabaseConnection, repo_id: i64) -> Result<(u64, i64)> {
+    super::aggregate::count_and_sum(
+        db,
+        AssetEntity::find()
+            .join(JoinType::InnerJoin, release_asset::Relation::Release.def())
+            .filter(release::Column::RepoId.eq(repo_id)),
+        release_asset::Column::Id,
+        release_asset::Column::Size,
+        "db: sum the release assets of a repository",
+    )
+    .await
+}
+
+/// How many assets one release holds, for the per-release entry ceiling.
+pub async fn count_assets(db: &DatabaseConnection, release_id: i64) -> Result<u64> {
+    AssetEntity::find()
+        .filter(release_asset::Column::ReleaseId.eq(release_id))
+        .count(db)
+        .await
+        .context("db: count the assets of a release")
+}

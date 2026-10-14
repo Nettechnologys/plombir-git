@@ -242,10 +242,16 @@ fn refuse_reserved_package_name(package_type: &str, name: &str) -> Result<()> {
 }
 
 /// Publish a package version to the registry.
+///
+/// `limits` is the repository budget, checked once the repository is known
+/// and before anything is written: the request's files share one budget, so a
+/// POM, a JAR and a sources JAR are refused together rather than accepted until
+/// the last one crosses the line.
 pub async fn publish(
     db: &DatabaseConnection,
     storage: &PackageStorage,
     mut info: PublishInfo,
+    limits: &crate::storage_quota::StorageLimits,
 ) -> Result<PublishResult> {
     refuse_reserved_package_name(&info.package_type, &info.name)?;
     if let Some(tag) = info.npm_dist_tag.as_deref() {
@@ -282,6 +288,14 @@ pub async fn publish(
     let repo = crate::repo::service::find_repo_by_owner_name(db, &info.owner, &info.repo)
         .await?
         .ok_or_else(|| not_found("repository"))?;
+
+    let incoming = info
+        .files
+        .iter()
+        .fold(0_u64, |total, (_, file)| total.saturating_add(file.len()));
+    crate::storage_quota::check_room(db, repo.id, incoming, limits)
+        .await
+        .map_err(crate::storage_quota::QuotaError::into_service_error)?;
 
     let registry =
         rg_db::ops::package_registry_ops::find_or_create(db, repo.id, &info.package_type).await?;

@@ -532,6 +532,7 @@ pub async fn batch(
         &req,
         state.jwt_secret.as_bytes(),
         actor,
+        &state.storage_limits,
     )
     .await
     {
@@ -643,7 +644,11 @@ pub async fn upload_object(
             // object whose row says something else. Direct authenticated PUTs
             // have no prior row and keep the historical behavior of recording
             // the size that actually arrived.
-            match rg_db::ops::lfs_object_ops::find_by_repo_and_oid(&state.db, repo_id, &oid).await {
+            let already_stored = match rg_db::ops::lfs_object_ops::find_by_repo_and_oid(
+                &state.db, repo_id, &oid,
+            )
+            .await
+            {
                 Ok(Some(object)) if object.size != staged.written as i64 => {
                     discard_file_async("LFS staging file", &temp_path).await;
                     return AppError::bad_request(format!(
@@ -652,11 +657,32 @@ pub async fn upload_object(
                     ))
                     .into_response();
                 }
-                Ok(_) => {}
+                Ok(object) => object.is_some_and(|object| object.uploaded),
                 Err(error) => {
                     discard_file_async("LFS staging file", &temp_path).await;
                     return AppError::from(error).into_response();
                 }
+            };
+
+            // The batch checked the budget before it handed out this URL; two
+            // PUTs that both passed a batch meet here, with the bytes already
+            // spooled, so this can only refuse. An object already stored adds
+            // nothing — a re-PUT at the limit is not charged twice.
+            let incoming = if already_stored {
+                0
+            } else {
+                staged.written as u64
+            };
+            if let Err(error) = rg_core::storage_quota::check_room(
+                &state.db,
+                repo_id,
+                incoming,
+                &state.storage_limits,
+            )
+            .await
+            {
+                discard_file_async("LFS staging file", &temp_path).await;
+                return AppError::from(error.into_service_error()).into_response();
             }
 
             match rg_core::lfs::service::store_object_from_file(

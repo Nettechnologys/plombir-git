@@ -50,6 +50,8 @@ pub(crate) struct ConfigFile {
     #[serde(default)]
     pub(crate) timeouts: TimeoutConfig,
     #[serde(default)]
+    pub(crate) limits: LimitsConfig,
+    #[serde(default)]
     pub(crate) webhooks: WebhooksConfig,
     #[serde(default)]
     pub(crate) observability: ObservabilityConfig,
@@ -475,6 +477,24 @@ impl Default for TimeoutConfig {
 pub(crate) fn default_job_timeout() -> u64 {
     rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS
 }
+/// `[limits]` — the storage ceilings the upload paths enforce. Every one is
+/// opt-in: unset or `0` means no ceiling, so an upgrade never starts refusing
+/// pushes to a repository that already holds more than a number nobody chose.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LimitsConfig {
+    /// Total MiB one repository may hold across LFS, releases, attachments,
+    /// CI caches, packages and OCI blobs.
+    pub(crate) repo_quota_mb: Option<u64>,
+    /// Cumulative MiB of one OCI blob upload session, across every PATCH and
+    /// the final PUT.
+    pub(crate) oci_blob_max_mb: Option<u64>,
+    /// CI cache entries one repository may keep.
+    pub(crate) ci_cache_max_entries_per_repo: Option<u64>,
+    /// Release assets one release may hold.
+    pub(crate) release_assets_max_per_release: Option<u64>,
+}
+
 pub(crate) fn default_git_timeout() -> u64 {
     120
 }
@@ -753,6 +773,55 @@ pub(crate) fn resolve_webhook_transport_policy(
 /// holding the rest of the state rather than inside the container layer.
 pub(crate) const DEFAULT_AUDIT_ARCHIVE_DIR: &str = "./data/audit-archive";
 pub(crate) const DEFAULT_DB_BACKUP_DIR: &str = "./data/backups";
+
+/// `[limits]` defaults: `0`, no ceiling. The storage budget is opt-in — a
+/// default that refused writes would start refusing pushes the day an instance
+/// upgraded, to whatever repository already held more.
+pub(crate) const DEFAULT_REPO_QUOTA_MB: u64 = 0;
+pub(crate) const DEFAULT_OCI_BLOB_MAX_MB: u64 = 0;
+pub(crate) const DEFAULT_CI_CACHE_MAX_ENTRIES_PER_REPO: u64 = 0;
+pub(crate) const DEFAULT_RELEASE_ASSETS_MAX_PER_RELEASE: u64 = 0;
+
+/// One `[limits]` MiB knob in bytes, `None` for `0`. A value whose byte count
+/// does not fit fails startup rather than wrapping into a small ceiling.
+fn limit_bytes(key: &str, mb: u64) -> anyhow::Result<Option<u64>> {
+    if mb == 0 {
+        return Ok(None);
+    }
+    mb.checked_mul(1024 * 1024)
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("config `limits.{key}` is too large: {mb} MiB"))
+}
+
+/// Resolve `[limits]` into the ceilings the upload paths enforce, converting
+/// the MiB knobs once so no handler does arithmetic on a config value.
+pub(crate) fn resolve_storage_limits(
+    cfg: Option<&ConfigFile>,
+) -> anyhow::Result<rg_core::storage_quota::StorageLimits> {
+    let limits = cfg.map(|config| &config.limits);
+    let knob = |pick: fn(&LimitsConfig) -> Option<u64>, default: u64| {
+        limits.and_then(pick).unwrap_or(default)
+    };
+    let count = |value: u64| (value > 0).then_some(value);
+    Ok(rg_core::storage_quota::StorageLimits {
+        repo_quota_bytes: limit_bytes(
+            "repo_quota_mb",
+            knob(|limits| limits.repo_quota_mb, DEFAULT_REPO_QUOTA_MB),
+        )?,
+        oci_blob_max_bytes: limit_bytes(
+            "oci_blob_max_mb",
+            knob(|limits| limits.oci_blob_max_mb, DEFAULT_OCI_BLOB_MAX_MB),
+        )?,
+        ci_cache_max_entries_per_repo: count(knob(
+            |limits| limits.ci_cache_max_entries_per_repo,
+            DEFAULT_CI_CACHE_MAX_ENTRIES_PER_REPO,
+        )),
+        release_assets_max_per_release: count(knob(
+            |limits| limits.release_assets_max_per_release,
+            DEFAULT_RELEASE_ASSETS_MAX_PER_RELEASE,
+        )),
+    })
+}
 
 /// Resolve `[server].package_upload_max_mb` to the byte ceiling consumed by
 /// rg-http. Zero and values that cannot fit the current platform fail startup
@@ -1929,6 +1998,30 @@ mod tests {
                 "runner_labels",
                 "rg_core::ci::default_runner_labels",
                 format!("{:?}", rg_core::ci::default_runner_labels()),
+            ),
+            row(
+                "limits",
+                "repo_quota_mb",
+                "DEFAULT_REPO_QUOTA_MB",
+                super::DEFAULT_REPO_QUOTA_MB.to_string(),
+            ),
+            row(
+                "limits",
+                "oci_blob_max_mb",
+                "DEFAULT_OCI_BLOB_MAX_MB",
+                super::DEFAULT_OCI_BLOB_MAX_MB.to_string(),
+            ),
+            row(
+                "limits",
+                "ci_cache_max_entries_per_repo",
+                "DEFAULT_CI_CACHE_MAX_ENTRIES_PER_REPO",
+                super::DEFAULT_CI_CACHE_MAX_ENTRIES_PER_REPO.to_string(),
+            ),
+            row(
+                "limits",
+                "release_assets_max_per_release",
+                "DEFAULT_RELEASE_ASSETS_MAX_PER_RELEASE",
+                super::DEFAULT_RELEASE_ASSETS_MAX_PER_RELEASE.to_string(),
             ),
             row(
                 "server",
@@ -3764,5 +3857,53 @@ max_files = 7
                 "{value:?} must be refused with {reason:?}, got: {error}"
             );
         }
+    }
+
+    /// `[limits]` is opt-in: no table, an empty one, or `0` is no ceiling; a
+    /// value is converted once, and one whose bytes do not fit fails startup.
+    #[test]
+    fn storage_limits_are_off_unless_set() {
+        use rg_core::storage_quota::StorageLimits;
+
+        assert_eq!(
+            super::resolve_storage_limits(None).unwrap(),
+            StorageLimits::default()
+        );
+        let zeros: ConfigFile = toml::from_str(
+            "[limits]\nrepo_quota_mb = 0\noci_blob_max_mb = 0\n\
+             ci_cache_max_entries_per_repo = 0\nrelease_assets_max_per_release = 0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::resolve_storage_limits(Some(&zeros)).unwrap(),
+            StorageLimits::default()
+        );
+
+        let set: ConfigFile = toml::from_str(
+            "[limits]\nrepo_quota_mb = 2\noci_blob_max_mb = 1\n\
+             ci_cache_max_entries_per_repo = 3\nrelease_assets_max_per_release = 4\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::resolve_storage_limits(Some(&set)).unwrap(),
+            StorageLimits {
+                repo_quota_bytes: Some(2 * 1024 * 1024),
+                oci_blob_max_bytes: Some(1024 * 1024),
+                ci_cache_max_entries_per_repo: Some(3),
+                release_assets_max_per_release: Some(4),
+            }
+        );
+
+        let huge: ConfigFile =
+            toml::from_str(&format!("[limits]\nrepo_quota_mb = {}\n", i64::MAX)).unwrap();
+        let error = super::resolve_storage_limits(Some(&huge))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("limits.repo_quota_mb"), "{error}");
+
+        assert!(
+            toml::from_str::<ConfigFile>("[limits]\nrepo_quota_gb = 1\n").is_err(),
+            "a misspelt key must not be ignored"
+        );
     }
 }

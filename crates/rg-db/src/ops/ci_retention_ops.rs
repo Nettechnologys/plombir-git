@@ -247,6 +247,21 @@ pub async fn list_expired_cache(db: &DatabaseConnection) -> Result<Vec<ci_cache_
         .await
         .context("db: list expired CI caches")
 }
+/// How many cache entries `repo_id` holds, and how many bytes they declare.
+///
+/// Expired rows count: an expired entry still names an archive on disk until
+/// the sweep retires it, and the budget counts what occupies the volume.
+pub async fn repo_cache_usage(db: &DatabaseConnection, repo_id: i64) -> Result<(u64, i64)> {
+    super::aggregate::count_and_sum(
+        db,
+        ci_cache_entry::Entity::find().filter(ci_cache_entry::Column::RepoId.eq(repo_id)),
+        ci_cache_entry::Column::Id,
+        ci_cache_entry::Column::Size,
+        "db: sum the CI cache entries of a repository",
+    )
+    .await
+}
+
 pub async fn find_cache_entry(
     db: &DatabaseConnection,
     repo_id: i64,

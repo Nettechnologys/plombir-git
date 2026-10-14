@@ -37,6 +37,18 @@ pub async fn list_repositories(
     query.all(db).await
 }
 
+/// Find an OCI repository row by its own id — the hop from an upload session,
+/// which carries only `oci_repository_id`, back to the forge repository whose
+/// storage budget governs it.
+pub async fn find_repo_row_by_id(
+    db: &DatabaseConnection,
+    oci_repository_id: i64,
+) -> Result<Option<oci_repository::Model>, DbErr> {
+    oci_repository::Entity::find_by_id(oci_repository_id)
+        .one(db)
+        .await
+}
+
 /// Find or create an OCI repository.
 #[allow(clippy::too_many_arguments)]
 pub async fn find_or_create_repo(
@@ -600,6 +612,24 @@ pub async fn upsert_tag_manifest(
 }
 
 // ── OCI Blob ────────────────────────────────────────────────
+
+/// How many blobs `repo_id` has stored, and how many bytes they declare.
+pub async fn repo_blob_usage(db: &DatabaseConnection, repo_id: i64) -> anyhow::Result<(u64, i64)> {
+    let oci_repository_ids = oci_repository::Entity::find()
+        .select_only()
+        .column(oci_repository::Column::Id)
+        .filter(oci_repository::Column::RepoId.eq(repo_id))
+        .into_query();
+    super::aggregate::count_and_sum(
+        db,
+        oci_blob::Entity::find()
+            .filter(oci_blob::Column::OciRepositoryId.in_subquery(oci_repository_ids)),
+        oci_blob::Column::Id,
+        oci_blob::Column::Size,
+        "db: sum the OCI blobs of a repository",
+    )
+    .await
+}
 
 /// Find a blob by digest.
 pub async fn find_blob(

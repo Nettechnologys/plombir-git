@@ -107,17 +107,15 @@ async fn list_for_target(
 }
 
 pub async fn repo_size(db: &DatabaseConnection, repo_id: i64) -> Result<i64> {
-    let sizes = AttachmentEntity::find()
-        .select_only()
-        .column(attachment::Column::Size)
-        .filter(attachment::Column::RepoId.eq(repo_id))
-        .into_tuple::<i64>()
-        .all(db)
-        .await
-        .context("db: list repository attachment sizes")?;
-    Ok(sizes
-        .into_iter()
-        .fold(0_i64, |total, size| total.saturating_add(size)))
+    let (_, bytes) = super::aggregate::count_and_sum(
+        db,
+        AttachmentEntity::find().filter(attachment::Column::RepoId.eq(repo_id)),
+        attachment::Column::Id,
+        attachment::Column::Size,
+        "db: sum repository attachment sizes",
+    )
+    .await?;
+    Ok(bytes)
 }
 
 pub async fn increment_download_count(db: &DatabaseConnection, id: i64) -> Result<()> {
