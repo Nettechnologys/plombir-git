@@ -1516,6 +1516,10 @@ pub async fn put_manifest(
         }
     }
 
+    if let Some(refusal) = manifest_media_type_refusal(content_type, &parsed) {
+        return refusal;
+    }
+
     let referenced_blobs = parsed.referenced_blobs();
 
     // Verify all referenced blobs exist
@@ -1579,6 +1583,13 @@ pub async fn put_manifest(
             "OCI metadata lease was recovered; retry publication",
         );
     }
+    // Under the metadata lease, because DELETE and the collector retire
+    // manifests under the same one: a child checked before it could be gone by
+    // the time the index naming it is published.
+    if let Err(refusal) = check_manifest_descriptors(&state, oci_repo.id, &parsed).await {
+        release_publication_lease(&state.db, &metadata_lease).await;
+        return refusal;
+    }
     let lease = match acquire_publication_lease(&state.db, &manifest_key).await {
         Ok(lease) => lease,
         Err(e) => {
@@ -1604,6 +1615,113 @@ pub async fn put_manifest(
     release_publication_lease(&state.db, &lease).await;
     release_publication_lease(&state.db, &metadata_lease).await;
     response
+}
+
+/// The `Content-Type` a manifest is pushed under has to be the type its body
+/// is.
+///
+/// The header is what gets stored and what every later pull is served, and a
+/// puller dispatches its parser on it. Nothing compared it to the body, so a
+/// document declaring `mediaType: …oci.image.manifest…` could be published as a
+/// Docker manifest, or an image index as an image. When the body names its
+/// type, the two must be equal; a body without `mediaType` (older clients omit
+/// it) still has to have the shape of the type the header names.
+///
+/// An `Option` for the reason [`blob_digest_refusal`] gives.
+fn manifest_media_type_refusal(content_type: &str, parsed: &ParsedManifest) -> Option<Response> {
+    if let Some(body_type) = parsed.manifest.media_type.as_deref() {
+        if body_type != content_type {
+            return Some(oci_err(
+                StatusCode::BAD_REQUEST,
+                error_codes::MANIFEST_INVALID,
+                &format!(
+                    "manifest Content-Type {content_type} does not match the mediaType \
+                     {body_type} in its body"
+                ),
+            ));
+        }
+    }
+    let header_is_index = matches!(
+        content_type,
+        media_types::OCI_INDEX_V1 | media_types::MANIFEST_LIST_V2
+    );
+    let body_is_index = parsed.manifest.config.is_none() && parsed.manifest.layers.is_empty();
+    let body_has_children = !parsed.manifest.manifests.is_empty();
+    (header_is_index && !body_is_index || !header_is_index && body_has_children).then(|| {
+        oci_err(
+            StatusCode::BAD_REQUEST,
+            error_codes::MANIFEST_INVALID,
+            &format!("manifest body does not have the shape of its Content-Type {content_type}"),
+        )
+    })
+}
+
+/// What a manifest says about the objects it names has to be what the
+/// repository holds.
+///
+/// * A config or layer descriptor's `size` is what a pre-allocating puller
+///   reserves and what a mirror measures progress against. Only the digest was
+///   checked, so a 2 KiB layer could be published as 2 GiB. The `oci_blob` row
+///   was written from the bytes at upload time; a blob with bytes and no row is
+///   refused later, by the reference claim in the manifest write.
+/// * An image index names child manifests, and a pull follows each one. A
+///   child the repository does not hold published cleanly and surfaced as a
+///   `404` halfway through someone's pull — after the push, the only place the
+///   mistake could still be retried.
+async fn check_manifest_descriptors(
+    state: &AppState,
+    oci_repo_id: i64,
+    parsed: &ParsedManifest,
+) -> Result<(), Response> {
+    let lookup_failed =
+        |error: sea_orm::DbErr| oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}"));
+    let blob_descriptors = parsed.manifest.config.iter().chain(&parsed.manifest.layers);
+    for descriptor in blob_descriptors {
+        let stored = rg_db::ops::oci_ops::find_blob(&state.db, oci_repo_id, &descriptor.digest)
+            .await
+            .map_err(lookup_failed)?;
+        if let Some(stored) = stored {
+            if u64::try_from(stored.size).ok() != Some(descriptor.size) {
+                return Err(oci_err(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::MANIFEST_INVALID,
+                    &format!(
+                        "descriptor for blob {} declares {} byte(s), but the stored blob is {} \
+                         byte(s)",
+                        descriptor.digest, descriptor.size, stored.size
+                    ),
+                ));
+            }
+        }
+    }
+    for child in &parsed.manifest.manifests {
+        let stored =
+            rg_db::ops::oci_ops::find_manifest_by_digest(&state.db, oci_repo_id, &child.digest)
+                .await
+                .map_err(lookup_failed)?;
+        let Some(stored) = stored else {
+            return Err(oci_err(
+                StatusCode::BAD_REQUEST,
+                error_codes::MANIFEST_BLOB_UNKNOWN,
+                &format!(
+                    "image index names child manifest {} which this repository does not hold",
+                    child.digest
+                ),
+            ));
+        };
+        if u64::try_from(stored.size).ok() != Some(child.size) {
+            return Err(oci_err(
+                StatusCode::BAD_REQUEST,
+                error_codes::MANIFEST_INVALID,
+                &format!(
+                    "descriptor for child manifest {} declares {} byte(s), but the stored \
+                     manifest is {} byte(s)",
+                    child.digest, child.size, stored.size
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Store the manifest object and record the row that publishes it, with this

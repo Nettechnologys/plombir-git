@@ -1603,3 +1603,269 @@ async fn a_manifest_above_the_declared_ceiling_is_refused() {
         "a refused push must publish nothing under its digest"
     );
 }
+
+/// PUT a manifest and hand back the status with the registry's error code, if
+/// it answered with one.
+async fn put_manifest_code(
+    base: &str,
+    token: &str,
+    path: &str,
+    content_type: &str,
+    body: &str,
+) -> (u16, Option<String>) {
+    let response = reqwest::Client::new()
+        .put(format!("{base}/v2/{path}"))
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let code = response
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|body| body["errors"][0]["code"].as_str().map(str::to_string));
+    (status, code)
+}
+
+async fn manifest_status(base: &str, token: &str, path: &str) -> u16 {
+    reqwest::Client::new()
+        .get(format!("{base}/v2/{path}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// card_07eb4e912aa3 (PR #15, item 1): the `Content-Type` a manifest is pushed
+/// under is what gets stored and served, and pullers pick their parser by it.
+/// Nothing compared it with the body, so a document could be published as a
+/// type it is not.
+#[tokio::test]
+async fn a_manifest_whose_content_type_contradicts_its_body_is_refused() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "oci_ctype", "oci_ctype@example.com").await;
+    create_repo(&base, &token, "images").await;
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_ctype", "images", config).await;
+    let image = |media_type: Option<&str>| {
+        let mut body = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": DOCKER_CONFIG_V1, "size": config.len(), "digest": config_digest},
+            "layers": [],
+        });
+        if let Some(media_type) = media_type {
+            body["mediaType"] = media_type.into();
+        }
+        body.to_string()
+    };
+
+    // The body says OCI image, the header Docker image.
+    assert_eq!(
+        put_manifest_code(
+            &base,
+            &token,
+            "oci_ctype/images/manifests/contradiction",
+            DOCKER_MANIFEST_V2,
+            &image(Some(OCI_MANIFEST_V1)),
+        )
+        .await,
+        (400, Some("MANIFEST_INVALID".to_string()))
+    );
+    // No `mediaType` in the body, but an image manifest is not an index.
+    assert_eq!(
+        put_manifest_code(
+            &base,
+            &token,
+            "oci_ctype/images/manifests/not-an-index",
+            OCI_INDEX_V1,
+            &image(None),
+        )
+        .await,
+        (400, Some("MANIFEST_INVALID".to_string()))
+    );
+    for refused in ["contradiction", "not-an-index"] {
+        assert_eq!(
+            manifest_status(
+                &base,
+                &token,
+                &format!("oci_ctype/images/manifests/{refused}")
+            )
+            .await,
+            404,
+            "a refused push must leave nothing behind under `{refused}`"
+        );
+    }
+
+    // The same bytes under the type they declare, and a body that declares
+    // none under the image type it has the shape of, still publish.
+    assert_eq!(
+        put_manifest_code(
+            &base,
+            &token,
+            "oci_ctype/images/manifests/agreed",
+            OCI_MANIFEST_V1,
+            &image(Some(OCI_MANIFEST_V1)),
+        )
+        .await,
+        (201, None)
+    );
+    assert_eq!(
+        put_manifest_code(
+            &base,
+            &token,
+            "oci_ctype/images/manifests/header-only",
+            DOCKER_MANIFEST_V2,
+            &image(None),
+        )
+        .await,
+        (201, None)
+    );
+}
+
+/// card_07eb4e912aa3 (PR #15, item 2): a pull of an index follows every child
+/// by digest. A child the repository does not hold used to publish cleanly and
+/// surface as a `404` in the middle of somebody's pull.
+#[tokio::test]
+async fn an_image_index_must_name_children_the_repository_holds() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "oci_children", "oci_children@example.com").await;
+    create_repo(&base, &token, "images").await;
+    let config = br#"{"architecture":"arm64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_children", "images", config).await;
+    let child = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {"mediaType": DOCKER_CONFIG_V1, "size": config.len(), "digest": config_digest},
+        "layers": [],
+    })
+    .to_string();
+    let child_digest = sha256(child.as_bytes());
+    let index = |digest: &str, size: usize| {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX_V1,
+            "manifests": [{"mediaType": OCI_MANIFEST_V1, "size": size, "digest": digest,
+                "platform": {"os": "linux", "architecture": "arm64"}}],
+        })
+        .to_string()
+    };
+
+    // The child has not been pushed yet.
+    assert_eq!(
+        put_manifest_code(
+            &base,
+            &token,
+            "oci_children/images/manifests/early",
+            OCI_INDEX_V1,
+            &index(&child_digest, child.len()),
+        )
+        .await,
+        (400, Some("MANIFEST_BLOB_UNKNOWN".to_string()))
+    );
+    assert_eq!(
+        put_manifest_code(
+            &base,
+            &token,
+            &format!("oci_children/images/manifests/{child_digest}"),
+            OCI_MANIFEST_V1,
+            &child,
+        )
+        .await,
+        (201, None)
+    );
+    // Held now, but the descriptor lies about its size.
+    assert_eq!(
+        put_manifest_code(
+            &base,
+            &token,
+            "oci_children/images/manifests/wrong-size",
+            OCI_INDEX_V1,
+            &index(&child_digest, child.len() + 1),
+        )
+        .await,
+        (400, Some("MANIFEST_INVALID".to_string()))
+    );
+    for refused in ["early", "wrong-size"] {
+        assert_eq!(
+            manifest_status(
+                &base,
+                &token,
+                &format!("oci_children/images/manifests/{refused}")
+            )
+            .await,
+            404
+        );
+    }
+    assert_eq!(
+        put_manifest_code(
+            &base,
+            &token,
+            "oci_children/images/manifests/latest",
+            OCI_INDEX_V1,
+            &index(&child_digest, child.len()),
+        )
+        .await,
+        (201, None)
+    );
+}
+
+/// card_07eb4e912aa3 (PR #15, item 3): a descriptor's `size` is what a puller
+/// pre-allocates and a mirror measures progress against. Only the digest was
+/// checked, so any size published.
+#[tokio::test]
+async fn a_descriptor_whose_size_is_not_the_stored_blob_is_refused() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "oci_sizes", "oci_sizes@example.com").await;
+    create_repo(&base, &token, "images").await;
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_sizes", "images", config).await;
+    let layer = b"layer bytes";
+    let layer_digest = push_blob(&base, &token, "oci_sizes", "images", layer).await;
+    let image = |config_size: usize, layer_size: usize| {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": DOCKER_MANIFEST_V2,
+            "config": {"mediaType": DOCKER_CONFIG_V1, "size": config_size, "digest": config_digest},
+            "layers": [{"mediaType": DOCKER_LAYER_GZ, "size": layer_size, "digest": layer_digest}],
+        })
+        .to_string()
+    };
+
+    for (tag, config_size, layer_size) in [
+        ("big-layer", config.len(), 2 * 1024 * 1024 * 1024),
+        ("small-config", config.len() - 1, layer.len()),
+    ] {
+        assert_eq!(
+            put_manifest_code(
+                &base,
+                &token,
+                &format!("oci_sizes/images/manifests/{tag}"),
+                DOCKER_MANIFEST_V2,
+                &image(config_size, layer_size),
+            )
+            .await,
+            (400, Some("MANIFEST_INVALID".to_string())),
+            "`{tag}` declares a size the stored blob does not have"
+        );
+        assert_eq!(
+            manifest_status(&base, &token, &format!("oci_sizes/images/manifests/{tag}")).await,
+            404
+        );
+    }
+    assert_eq!(
+        put_manifest_code(
+            &base,
+            &token,
+            "oci_sizes/images/manifests/latest",
+            DOCKER_MANIFEST_V2,
+            &image(config.len(), layer.len()),
+        )
+        .await,
+        (201, None)
+    );
+}
