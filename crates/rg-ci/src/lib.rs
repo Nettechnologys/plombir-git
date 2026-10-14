@@ -1039,6 +1039,21 @@ impl PipelineGraph<'_> {
                     commit_sha,
                     repository,
                 )?;
+                // Both executors refuse a value that is not an image reference
+                // before it reaches `docker run`, but by then the pipeline is
+                // published and the job just fails. Checked here, after a
+                // matrix value has been rendered into it, the author gets the
+                // rule back when the file is read (card_857c0d4ab7a6).
+                if let Some(image) = fields.image.as_deref() {
+                    rg_process::image_reference::validate_image_reference(image).map_err(
+                        |rule| {
+                            rg_core::error::invalid_request(format!(
+                                "job '{}': {rule}",
+                                variant.name
+                            ))
+                        },
+                    )?;
+                }
                 let tags_json = fields
                     .tags
                     .as_ref()
@@ -3856,6 +3871,44 @@ mod matrix_tests {
                 .0
                 .is_empty(),
             "the refusal must land before the pipeline row, not after it"
+        );
+    }
+
+    /// card_857c0d4ab7a6: `image:` used to reach `docker run` as written, where
+    /// `--privileged` is a flag. The trigger refuses it before the pipeline row
+    /// exists, so the author sees the rule instead of a failed job.
+    #[tokio::test]
+    async fn an_image_that_is_not_a_reference_stops_the_trigger() {
+        let (temp, sha, db, user, repo) = concurrency_fixture(
+            b"build:\n  image: '--privileged'\n  script: [echo one]\n",
+            "flag-image.db",
+        )
+        .await;
+
+        let error = trigger_pipeline_with_barrier(
+            concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push"),
+            &CiNotifications::default(),
+            None,
+        )
+        .await
+        .expect_err("an image the executors would refuse must not publish a pipeline");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "the refusal is the author's to fix: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("build") && message.contains("'--privileged'"),
+            "the refusal must name the job and the value: {message}"
+        );
+        assert!(
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 100)
+                .await
+                .unwrap()
+                .0
+                .is_empty()
         );
     }
 

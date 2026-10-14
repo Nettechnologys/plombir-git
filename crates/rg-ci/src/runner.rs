@@ -1297,7 +1297,7 @@ impl PipelineRunner {
             .await
             .context("failed to spawn job process")?;
 
-        Ok((output.output.status.code().unwrap_or(-1), output.log()))
+        Ok((output.status.code().unwrap_or(-1), output.log()))
     }
 
     /// Execute script inside a Docker container.
@@ -1353,7 +1353,7 @@ impl PipelineRunner {
             .await
             .context("failed to spawn docker run")?;
 
-        let exit_code = output.output.status.code().unwrap_or(-1);
+        let exit_code = output.status.code().unwrap_or(-1);
         let mut log = output.log();
 
         // If docker run itself failed (e.g. image not found), provide a clear message

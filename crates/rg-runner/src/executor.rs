@@ -157,7 +157,7 @@ pub(crate) async fn run_job_local(
     };
 
     match output {
-        Ok(o) => (o.output.status.code().unwrap_or(-1), o.log()),
+        Ok(o) => (o.status.code().unwrap_or(-1), o.log()),
         Err(e) => (-1, format!("Failed to spawn job: {}", e)),
     }
 }
@@ -214,7 +214,7 @@ pub(crate) async fn run_job_docker(
     rg_process::docker_job::apply_environment(&mut command, variables);
     match rg_process::output_ci_job_in_process_tree(&mut command).await {
         Ok(o) => {
-            let code = o.output.status.code().unwrap_or(-1);
+            let code = o.status.code().unwrap_or(-1);
             let mut log = o.log();
             if code != 0 && log.is_empty() {
                 log = format!("Docker exited with code {}", code);

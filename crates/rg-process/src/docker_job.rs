@@ -24,17 +24,26 @@ pub const CPU_LIMIT: &str = "2";
 /// credentials, which must not be forwarded either.
 const CONTAINER_HOME: &str = "HOME=/tmp";
 
-/// The job's workspace path cannot be handed to `docker -v` without changing it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WorkspacePathNotUtf8;
+/// Why a job container's `docker run` was not built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobContainerRefused {
+    /// The job's workspace path cannot be handed to `docker -v` without
+    /// changing it.
+    WorkspacePathNotUtf8,
+    /// The job's `image:` is not an image reference; the rule it broke.
+    Image(String),
+}
 
-impl std::fmt::Display for WorkspacePathNotUtf8 {
+impl std::fmt::Display for JobContainerRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("repo path is not valid UTF-8")
+        match self {
+            Self::WorkspacePathNotUtf8 => f.write_str("repo path is not valid UTF-8"),
+            Self::Image(rule) => f.write_str(rule),
+        }
     }
 }
 
-impl std::error::Error for WorkspacePathNotUtf8 {}
+impl std::error::Error for JobContainerRefused {}
 
 /// Everything a job container's `docker run` depends on.
 pub struct JobContainer<'a> {
@@ -62,8 +71,19 @@ pub struct JobContainer<'a> {
 /// The Docker socket is never mounted and `--privileged` is never passed, so the
 /// job has no path to the daemon or to host devices. Secret values never appear
 /// on the command line: only variable names do.
-pub fn run_args(job: &JobContainer<'_>) -> Result<Vec<String>, WorkspacePathNotUtf8> {
-    let workspace = job.workspace.to_str().ok_or(WorkspacePathNotUtf8)?;
+///
+/// The image is the one argument the repository author picks. It is checked
+/// against the image reference grammar and placed after `--`, so a value like
+/// `--privileged` can neither be read as a flag nor reach `docker` at all —
+/// whether it came from a file accepted before the check existed or from a
+/// caller that skipped it.
+pub fn run_args(job: &JobContainer<'_>) -> Result<Vec<String>, JobContainerRefused> {
+    crate::image_reference::validate_image_reference(job.image)
+        .map_err(JobContainerRefused::Image)?;
+    let workspace = job
+        .workspace
+        .to_str()
+        .ok_or(JobContainerRefused::WorkspacePathNotUtf8)?;
     let mut args: Vec<String> = [
         "run",
         "--rm",
@@ -100,6 +120,7 @@ pub fn run_args(job: &JobContainer<'_>) -> Result<Vec<String>, WorkspacePathNotU
     args.extend([
         "-e".to_string(),
         CONTAINER_HOME.to_string(),
+        "--".to_string(),
         job.image.to_string(),
         "sh".to_string(),
         "-c".to_string(),
@@ -204,9 +225,26 @@ mod tests {
         let args = run_args(&job(Path::new("/srv/repo"), &variables)).unwrap();
 
         assert_eq!(
-            &args[args.len() - 4..],
-            &["alpine:3.20", "sh", "-c", "echo hi"]
+            &args[args.len() - 5..],
+            &["--", "alpine:3.20", "sh", "-c", "echo hi"]
         );
+    }
+
+    /// card_857c0d4ab7a6: the image used to follow the runner's flags with
+    /// nothing in between, so `image: --privileged` was a flag to `docker`.
+    #[test]
+    fn an_image_that_is_not_a_reference_never_reaches_the_argv() {
+        let variables: [(String, String); 0] = [];
+        for image in ["--privileged", "-v/:/host", "--env-file=/etc/passwd"] {
+            let mut container = job(Path::new("/srv/repo"), &variables);
+            container.image = image;
+            match run_args(&container) {
+                Err(JobContainerRefused::Image(rule)) => {
+                    assert!(rule.contains(image), "{rule}")
+                }
+                other => panic!("`{image}` was not refused: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -228,6 +266,9 @@ mod tests {
         let path = Path::new(OsStr::from_bytes(b"/srv/repo-\xff"));
         let variables: [(String, String); 0] = [];
 
-        assert_eq!(run_args(&job(path, &variables)), Err(WorkspacePathNotUtf8));
+        assert_eq!(
+            run_args(&job(path, &variables)),
+            Err(JobContainerRefused::WorkspacePathNotUtf8)
+        );
     }
 }

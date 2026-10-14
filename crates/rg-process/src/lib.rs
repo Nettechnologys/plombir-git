@@ -13,6 +13,7 @@ use std::time::Duration;
 
 pub mod client_policy;
 pub mod docker_job;
+pub mod image_reference;
 mod retired_environment;
 pub mod workspace_archive;
 
@@ -232,47 +233,108 @@ const ORPHANED_PIPE_GRACE: Duration = Duration::from_secs(5);
 /// request limit with room for notices.
 pub const MAX_JOB_LOG_BYTES: usize = 2 * 1024 * 1024;
 
-/// The beginning of a retained tail can bisect a secret. Drop enough bytes
-/// to cover the largest accepted CI secret (64 KiB), including its base64
-/// representation and line wrapping, before either runner masks the log.
+/// How much of each stream's half of [`MAX_JOB_LOG_BYTES`] is kept from its
+/// beginning. The rest is a ring buffer over its end.
+///
+/// The tail is where a failing command says why, so it gets most of the
+/// budget. The head is what says what the job was doing in the first place —
+/// the toolchain it found, the dependency it resolved, the first warning — and
+/// a log that keeps only the last megabyte of a chatty build has none of it.
+const JOB_LOG_HEAD_BYTES: usize = MAX_JOB_LOG_BYTES / 2 / 4;
+
+/// Either side of a cut can bisect a secret, and the masker that runs over the
+/// finished log only recognises a secret whole. Drop enough bytes on both
+/// sides of the cut to cover the largest accepted CI secret (64 KiB), including
+/// its base64 representation and line wrapping, before either runner masks the
+/// log.
 const TRUNCATED_LOG_BOUNDARY_BYTES: usize = 128 * 1024;
 
-/// Captured tail of each stream. The pipes are drained after their limits
-/// are reached, so a chatty job still finishes with its real exit status.
+/// One output stream of a job: its first bytes, its last bytes, and how many
+/// fell between them.
+///
+/// The pipe is drained to the end whatever it says, so a chatty job still
+/// finishes with its real exit status; only the middle is not kept.
+pub struct CapturedStream {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    head_limit: usize,
+    tail_limit: usize,
+    dropped: u64,
+}
+
+impl CapturedStream {
+    fn new(limit: usize) -> Self {
+        let head_limit = JOB_LOG_HEAD_BYTES.min(limit / 2);
+        Self {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            head_limit,
+            tail_limit: limit - head_limit,
+            dropped: 0,
+        }
+    }
+
+    fn push(&mut self, mut bytes: &[u8]) {
+        let into_head = self
+            .head_limit
+            .saturating_sub(self.head.len())
+            .min(bytes.len());
+        self.head.extend_from_slice(&bytes[..into_head]);
+        bytes = &bytes[into_head..];
+
+        let overflow = (self.tail.len() + bytes.len()).saturating_sub(self.tail_limit);
+        let from_tail = overflow.min(self.tail.len());
+        self.tail.drain(..from_tail);
+        let from_chunk = bytes.len().saturating_sub(self.tail_limit);
+        self.tail.extend(&bytes[from_chunk..]);
+        self.dropped += (from_tail + from_chunk) as u64;
+    }
+
+    /// Whether anything between the head and the tail was dropped.
+    pub fn truncated(&self) -> bool {
+        self.dropped > 0
+    }
+
+    /// Every byte of the stream, when nothing was dropped.
+    pub fn bytes(&self) -> Option<Vec<u8>> {
+        (!self.truncated()).then(|| self.head.iter().chain(&self.tail).copied().collect())
+    }
+
+    /// The stream as the job log shows it, with the omitted middle marked
+    /// where it was.
+    fn visible(&self, stream: &str) -> String {
+        let Some(whole) = self.bytes() else {
+            let head_end = self.head.len().saturating_sub(TRUNCATED_LOG_BOUNDARY_BYTES);
+            let tail: Vec<u8> = self.tail.iter().copied().collect();
+            let tail_start = TRUNCATED_LOG_BOUNDARY_BYTES.min(tail.len());
+            let omitted = self.dropped + (self.head.len() - head_end + tail_start) as u64;
+            return format!(
+                "{}\n[plombir-git-runner] {omitted} bytes of {stream} omitted here; the first \
+                 and the last part of it are kept\n{}",
+                String::from_utf8_lossy(&self.head[..head_end]),
+                String::from_utf8_lossy(&tail[tail_start..]),
+            );
+        };
+        String::from_utf8_lossy(&whole).into_owned()
+    }
+}
+
+/// What a CI job left behind: its exit status and both captured streams.
 pub struct CappedJobOutput {
-    pub output: Output,
-    pub stdout_truncated: bool,
-    pub stderr_truncated: bool,
+    pub status: std::process::ExitStatus,
+    pub stdout: CapturedStream,
+    pub stderr: CapturedStream,
 }
 
 impl CappedJobOutput {
     pub fn log(&self) -> String {
-        let visible = |bytes: &[u8], truncated: bool| {
-            let skip = if truncated {
-                TRUNCATED_LOG_BOUNDARY_BYTES.min(bytes.len())
-            } else {
-                0
-            };
-            String::from_utf8_lossy(&bytes[skip..]).into_owned()
-        };
-        let mut log = visible(&self.output.stdout, self.stdout_truncated);
-        if !self.output.stderr.is_empty() {
+        let mut log = self.stdout.visible("stdout");
+        let stderr = self.stderr.visible("stderr");
+        if !stderr.is_empty() {
             if !log.is_empty() {
                 log.push('\n');
             }
-            log.push_str(&visible(&self.output.stderr, self.stderr_truncated));
-        }
-        if self.stdout_truncated {
-            log.push_str(&format!(
-                "\n[forgekeep-runner] stdout truncated to a {}-byte window; earlier output discarded",
-                MAX_JOB_LOG_BYTES / 2
-            ));
-        }
-        if self.stderr_truncated {
-            log.push_str(&format!(
-                "\n[forgekeep-runner] stderr truncated to a {}-byte window; earlier output discarded",
-                MAX_JOB_LOG_BYTES / 2
-            ));
+            log.push_str(&stderr);
         }
         log
     }
@@ -293,9 +355,7 @@ pub async fn output_ci_job_in_process_tree(
 
 async fn read_to_capture_limit<R: tokio::io::AsyncRead + Unpin>(
     pipe: &mut R,
-    captured: &mut std::collections::VecDeque<u8>,
-    truncated: &mut bool,
-    limit: usize,
+    captured: &mut CapturedStream,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt as _;
 
@@ -308,13 +368,7 @@ async fn read_to_capture_limit<R: tokio::io::AsyncRead + Unpin>(
         if read == 0 {
             return Ok(());
         }
-        let overflow = captured.len().saturating_add(read).saturating_sub(limit);
-        if overflow > 0 {
-            *truncated = true;
-            captured.drain(..overflow.min(captured.len()));
-        }
-        let start = read.saturating_sub(limit);
-        captured.extend(&chunk[start..read]);
+        captured.push(&chunk[..read]);
     }
 }
 
@@ -341,17 +395,15 @@ async fn output_in_process_tree_with_capture_limit(
         .take()
         .ok_or_else(|| std::io::Error::other("stderr was not piped"))?;
 
-    let mut stdout = std::collections::VecDeque::new();
-    let mut stderr = std::collections::VecDeque::new();
-    let mut stdout_truncated = false;
-    let mut stderr_truncated = false;
+    let mut stdout = CapturedStream::new(limit);
+    let mut stderr = CapturedStream::new(limit);
     let status = {
         // The pipes are read while the child runs: a child that fills a pipe
         // buffer nobody drains blocks forever on its next write.
         let drain = async {
             tokio::try_join!(
-                read_to_capture_limit(&mut stdout_pipe, &mut stdout, &mut stdout_truncated, limit),
-                read_to_capture_limit(&mut stderr_pipe, &mut stderr, &mut stderr_truncated, limit),
+                read_to_capture_limit(&mut stdout_pipe, &mut stdout),
+                read_to_capture_limit(&mut stderr_pipe, &mut stderr),
             )
             .map(drop)
         };
@@ -388,13 +440,9 @@ async fn output_in_process_tree_with_capture_limit(
     };
 
     Ok(CappedJobOutput {
-        output: Output {
-            status,
-            stdout: stdout.into_iter().collect(),
-            stderr: stderr.into_iter().collect(),
-        },
-        stdout_truncated,
-        stderr_truncated,
+        status,
+        stdout,
+        stderr,
     })
 }
 
@@ -841,7 +889,7 @@ mod ci_job_output_tests {
     use super::*;
 
     #[tokio::test]
-    async fn both_streams_are_capped_and_the_reason_is_at_the_end() {
+    async fn both_streams_are_capped_and_each_cut_is_marked() {
         let mut command = tokio::process::Command::new("sh");
         command.args([
             "-c",
@@ -850,36 +898,104 @@ mod ci_job_output_tests {
         let output = output_ci_job_in_process_tree(&mut command)
             .await
             .expect("job completed");
-        assert_eq!(output.output.status.code(), Some(7));
-        assert_eq!(output.output.stdout.len(), MAX_JOB_LOG_BYTES / 2);
-        assert_eq!(output.output.stderr.len(), MAX_JOB_LOG_BYTES / 2);
-        assert!(output.stdout_truncated);
-        assert!(output.stderr_truncated);
+        assert_eq!(output.status.code(), Some(7));
+        assert!(output.stdout.truncated());
+        assert!(output.stderr.truncated());
         let log = output.log();
-        assert!(log.contains("stdout truncated to a 1048576-byte window"));
         assert!(
-            log.ends_with("stderr truncated to a 1048576-byte window; earlier output discarded")
+            log.contains("bytes of stdout omitted here"),
+            "{}",
+            log.len()
+        );
+        assert!(
+            log.contains("bytes of stderr omitted here"),
+            "{}",
+            log.len()
         );
         assert!(log.len() < 8 * 1024 * 1024);
     }
 
-    #[test]
-    fn truncated_tail_keeps_final_error_without_exposing_a_split_secret() {
-        let mut output = std::process::Command::new("true")
-            .output()
-            .expect("create test status");
-        output.stdout = vec![b'x'; MAX_JOB_LOG_BYTES / 2];
-        output.stdout[..65_536].fill(b'S');
-        output.stdout.extend_from_slice(b"FINAL_ERROR");
-        let captured = CappedJobOutput {
-            output,
-            stdout_truncated: true,
-            stderr_truncated: false,
+    /// card_857c0d4ab7a6: the capture used to keep only each stream's last
+    /// window, so a chatty build lost the lines that said what it was doing;
+    /// the error at the end of stdout and on stderr has to survive as well.
+    #[tokio::test]
+    async fn a_flooded_job_keeps_its_first_lines_and_its_final_error() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf 'HEAD_LINE\\n'; head -c 5000000 /dev/zero; printf 'STDOUT_LAST\\n'; \
+             echo 'fatal: build failed' >&2; exit 3",
+        ]);
+        let output = output_ci_job_in_process_tree(&mut command)
+            .await
+            .expect("job completed");
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.truncated());
+        assert_eq!(
+            output.stderr.bytes().as_deref(),
+            Some(&b"fatal: build failed\n"[..])
+        );
+        let log = output.log();
+        let at = |needle: &str| {
+            log.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is missing from the log"))
         };
-        let log = captured.log();
-        assert!(log.contains("FINAL_ERROR"));
-        assert!(!log.contains("SSSS"), "secret fragment crossed the cut");
-        assert!(log.ends_with("earlier output discarded"));
+        assert!(at("HEAD_LINE") < at("bytes of stdout omitted here"));
+        assert!(at("bytes of stdout omitted here") < at("STDOUT_LAST"));
+        assert!(at("STDOUT_LAST") < at("fatal: build failed"));
+        assert!(log.ends_with("fatal: build failed\n"));
+    }
+
+    /// The masker only recognises a secret whole, so neither the end of the
+    /// head nor the start of the tail may hand it a fragment.
+    #[test]
+    fn neither_side_of_the_cut_exposes_a_split_secret() {
+        let limit = MAX_JOB_LOG_BYTES / 2;
+        let mut stream = CapturedStream::new(limit);
+        let head_limit = stream.head_limit;
+        let tail_limit = stream.tail_limit;
+        let secret = vec![b'S'; 64 * 1024];
+
+        let mut head = b"HEAD_START".to_vec();
+        head.resize(head_limit - secret.len(), b'x');
+        head.extend_from_slice(&secret);
+        stream.push(&head);
+        stream.push(&vec![b'x'; 3 * limit]);
+        let mut tail = secret.clone();
+        tail.resize(tail_limit - b"FINAL_ERROR".len(), b'x');
+        tail.extend_from_slice(b"FINAL_ERROR");
+        // In small writes, the way a pipe delivers it.
+        for chunk in tail.chunks(8192) {
+            stream.push(chunk);
+        }
+
+        assert_eq!(stream.head.len(), head_limit);
+        assert_eq!(stream.tail.len(), tail_limit);
+        let log = stream.visible("stdout");
+        assert!(log.starts_with("HEAD_START"));
+        assert!(log.ends_with("FINAL_ERROR"));
+        assert!(!log.contains("SSSS"), "a secret fragment crossed the cut");
+        let omitted = (3 * limit + 2 * TRUNCATED_LOG_BOUNDARY_BYTES) as u64;
+        assert!(
+            log.contains(&format!("{omitted} bytes of stdout omitted here")),
+            "the notice must count every byte the log does not show"
+        );
+    }
+
+    #[test]
+    fn a_stream_inside_its_budget_is_kept_whole() {
+        let mut stream = CapturedStream::new(MAX_JOB_LOG_BYTES / 2);
+        let whole: Vec<u8> = (0..MAX_JOB_LOG_BYTES / 2)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        for chunk in whole.chunks(8192) {
+            stream.push(chunk);
+        }
+        assert!(!stream.truncated());
+        assert_eq!(stream.bytes(), Some(whole));
+        stream.push(b"!");
+        assert!(stream.truncated());
+        assert_eq!(stream.bytes(), None);
     }
 
     /// Removing the capture ceiling makes this process's VmHWM grow with the
@@ -913,11 +1029,11 @@ mod ci_job_output_tests {
             "500 MiB job output raised runner VmHWM by {} MiB",
             growth / (1024 * 1024)
         );
-        assert!(output.output.status.success());
-        assert!(output.stdout_truncated);
+        assert!(output.status.success());
+        assert!(output.stdout.truncated());
         let log = output.log();
         assert!(log.contains("FINAL_ERROR"));
-        assert!(log.contains("stdout truncated"));
+        assert!(log.contains("bytes of stdout omitted here"));
     }
 }
 
@@ -948,8 +1064,8 @@ mod background_job_tests {
         .expect("the script finished but the run waited for its background job")
         .expect("run failed");
 
-        assert!(output.output.status.success(), "script exited non-zero");
-        assert_eq!(output.output.stdout, b"done\n");
+        assert!(output.status.success(), "script exited non-zero");
+        assert_eq!(output.stdout.bytes().as_deref(), Some(&b"done\n"[..]));
 
         // The background job is part of the tree the run owned, and it must
         // not outlive it either.
@@ -995,9 +1111,12 @@ mod background_job_tests {
 
         let output = output_ci_job_in_process_tree(&mut command).await.unwrap();
 
-        assert_eq!(output.output.status.code(), Some(3));
-        assert_eq!(output.output.stdout.len(), 200_000);
-        assert_eq!(output.output.stderr, b"err\n");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(
+            output.stdout.bytes().map(|bytes| bytes.len()),
+            Some(200_000)
+        );
+        assert_eq!(output.stderr.bytes().as_deref(), Some(&b"err\n"[..]));
     }
 }
 

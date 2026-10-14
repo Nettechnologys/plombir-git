@@ -284,9 +284,13 @@ Scheduler (rg-ci)
 
 Jobs run on the **embedded runner** by default, or on **external runners**
 (`--external-runners`) that authenticate with a runner token and poll for work.
-Jobs with an `image` can be executed in Docker (`--docker`). Job logs stream to
-the UI over a WebSocket (`/ws/job/:job_id`); artifacts are stored and served
-through the REST API.
+Jobs with an `image` can be executed in Docker (`--docker`). The image must be
+an image reference (`rg_process::image_reference`): it is checked when the
+pipeline is created and again by both runners, and `docker run` receives it
+after `--`. Each stream of a job's output is kept to a bounded beginning and a
+bounded end, with the omitted middle marked (`rg_process::CapturedStream`). Job
+logs stream to the UI over a WebSocket (`/ws/job/:job_id`); artifacts are stored
+and served through the REST API.
 
 ### 6.4 Wiki engine
 
