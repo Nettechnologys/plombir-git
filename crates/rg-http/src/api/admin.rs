@@ -175,11 +175,13 @@ pub async fn get_user(
     responses(
         (status = 200, description = "Updated", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Admin required, or a session outside its sudo window (`reason: sudo_required`)", body = serde_json::Value),
     ),
 )]
 pub async fn update_user(
     State(state): State<AppState>,
     InstanceAdmin(current_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Path(user_id): Path<i64>,
     Json(body): Json<UpdateUserRequest>,
@@ -262,13 +264,14 @@ pub struct CreateUserRequest {
     responses(
         (status = 201, description = "Created. `temporary_password` is shown only here", body = serde_json::Value),
         (status = 400, description = "Invalid username or email", body = serde_json::Value),
-        (status = 403, description = "Admin required", body = serde_json::Value),
+        (status = 403, description = "Admin required, or a session outside its sudo window (`reason: sudo_required`)", body = serde_json::Value),
         (status = 409, description = "The name or the address is taken", body = serde_json::Value),
     ),
 )]
 pub async fn create_user(
     State(state): State<AppState>,
     InstanceAdmin(current_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<CreateUserRequest>,
 ) -> impl IntoResponse {
@@ -331,13 +334,14 @@ pub async fn create_user(
     responses(
         (status = 200, description = "`temporary_password` is shown only here", body = serde_json::Value),
         (status = 400, description = "The account signs in through an identity provider, or is your own", body = serde_json::Value),
-        (status = 403, description = "Admin required", body = serde_json::Value),
+        (status = 403, description = "Admin required, or a session outside its sudo window (`reason: sudo_required`)", body = serde_json::Value),
         (status = 404, description = "User not found", body = serde_json::Value),
     ),
 )]
 pub async fn reset_user_password(
     State(state): State<AppState>,
     InstanceAdmin(current_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
@@ -1010,12 +1014,14 @@ fn validate_ldap_provider_request(
         (status = 201, description = "Created"),
         (status = 400, description = "Incomplete or unknown provider configuration"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required, or a session outside its sudo window (`reason: sudo_required`)", body = serde_json::Value),
         (status = 409, description = "A provider with that slug already exists"),
     ),
 )]
 pub async fn create_sso_provider(
     State(state): State<AppState>,
     InstanceAdmin(admin_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<UpsertSsoProviderRequest>,
 ) -> impl IntoResponse {
@@ -1168,6 +1174,7 @@ pub async fn create_sso_provider(
         (status = 200, description = "Updated"),
         (status = 400, description = "Incomplete or unknown provider configuration"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required, or a session outside its sudo window (`reason: sudo_required`)", body = serde_json::Value),
         (status = 409, description = "Another provider already holds that slug, identities \
                                       still linked under it stand in the way of the rename, or \
                                       the provider's own identities stand in the way of a change \
@@ -1177,6 +1184,7 @@ pub async fn create_sso_provider(
 pub async fn update_sso_provider(
     State(state): State<AppState>,
     InstanceAdmin(admin_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(body): Json<UpsertSsoProviderRequest>,

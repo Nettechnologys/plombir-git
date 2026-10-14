@@ -317,3 +317,112 @@ async fn the_second_factor_is_asked_for_and_a_pat_cannot_step_up() {
     .await;
     assert_eq!(status, 403, "a personal access token stepped up");
 }
+
+/// The instance-admin actions whose result outlives the session — another
+/// account's password, an admin flag, a new account, an identity provider that
+/// signs people in — are held to the same window as a key or a token: a
+/// stolen admin session must not turn itself into access that survives its
+/// revocation (card_6c299579b99e).
+#[tokio::test]
+async fn admin_routes_that_grant_lasting_access_refuse_a_session_outside_its_sudo_window() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (_, admin_id) = register_full(&base, "sudo_admin", "sudo_admin@example.com").await;
+    let (_, target_id) = register_full(&base, "sudo_target", "sudo_target@example.com").await;
+    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
+        .await
+        .unwrap()
+        .unwrap();
+    let stale = ordinary_session(&db, admin_id).await;
+
+    let routes: Vec<(&str, reqwest::Method, String, serde_json::Value)> = vec![
+        (
+            "account creation",
+            reqwest::Method::POST,
+            format!("{base}/api/v1/admin/users"),
+            serde_json::json!({
+                "username": "sudo_backdoor",
+                "email": "sudo_backdoor@example.com",
+                "is_admin": true,
+            }),
+        ),
+        (
+            "password reset",
+            reqwest::Method::POST,
+            format!("{base}/api/v1/admin/users/{target_id}/password-reset"),
+            serde_json::json!({}),
+        ),
+        (
+            "admin grant",
+            reqwest::Method::PATCH,
+            format!("{base}/api/v1/admin/users/{target_id}"),
+            serde_json::json!({ "is_admin": true }),
+        ),
+        (
+            "SSO provider creation",
+            reqwest::Method::POST,
+            format!("{base}/api/v1/admin/sso/providers"),
+            serde_json::json!({}),
+        ),
+        (
+            "SSO provider change",
+            reqwest::Method::PATCH,
+            format!("{base}/api/v1/admin/sso/providers/1"),
+            serde_json::json!({}),
+        ),
+    ];
+    let send = |method: reqwest::Method, url: String, token: String, body: serde_json::Value| {
+        let client = client.clone();
+        async move {
+            let response = client
+                .request(method, url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            (status, response.json().await.unwrap_or_default())
+        }
+    };
+    for (what, method, url, body) in &routes {
+        let answer = send(method.clone(), url.clone(), stale.clone(), body.clone()).await;
+        assert!(
+            sudo_refusal(&answer),
+            "a session outside its window got an admin {what}: {answer:?}"
+        );
+    }
+    // The refusal is the extractor's, before the handler: nothing changed.
+    let target = rg_db::ops::user_ops::find_by_id(&db, target_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !target.is_admin,
+        "a refused grant still made the target admin"
+    );
+    assert!(
+        rg_db::ops::user_ops::find_by_username(&db, "sudo_backdoor")
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused creation still made the account"
+    );
+
+    let (status, stepped) = post(
+        &client,
+        format!("{base}/api/v1/users/me/sudo"),
+        &stale,
+        serde_json::json!({ "password": PASSWORD }),
+    )
+    .await;
+    assert_eq!(status, 200, "{stepped}");
+    let elevated = stepped["token"].as_str().unwrap().to_string();
+    for (what, method, url, body) in &routes {
+        let answer = send(method.clone(), url.clone(), elevated.clone(), body.clone()).await;
+        assert!(
+            !sudo_refusal(&answer),
+            "a stepped-up admin session was still refused an admin {what}: {answer:?}"
+        );
+    }
+}
