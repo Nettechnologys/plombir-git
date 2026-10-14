@@ -200,6 +200,7 @@ async fn create_attachment_from_source(
         content_type,
         Some(sha256),
         &publication_id,
+        limits,
     )
     .await
 }
@@ -279,6 +280,7 @@ async fn persist_attachment(
     content_type: &str,
     sha256: Option<String>,
     publication_id: &str,
+    limits: &crate::storage_quota::StorageLimits,
 ) -> Result<Attachment> {
     let PreparedAttachment {
         filename,
@@ -312,6 +314,33 @@ async fn persist_attachment(
     };
     match rg_db::ops::attachment_ops::create(db, model).await {
         Ok(attachment) => {
+            if let Some(refusal) = over_quota_after_commit(db, &attachment, limits).await {
+                // Row first, blob second: a row that outlives its blob is an
+                // attachment that answers 404, a blob that outlives its row is
+                // an orphan the open journal entry still names. If the row
+                // cannot be removed the attachment stands, whole, past the
+                // line — the honest answer is then that it was stored.
+                match rg_db::ops::attachment_ops::delete_by_id(db, attachment.id).await {
+                    Ok(_) => {
+                        cleanup_uncommitted_attachment(
+                            storage,
+                            &key,
+                            publication_id,
+                            "post-commit quota recheck",
+                        )
+                        .await;
+                        return Err(refusal);
+                    }
+                    Err(error) => tracing::warn!(
+                        attachment_id = attachment.id,
+                        repo_id,
+                        error = %format!("{error:#}"),
+                        refusal = %format!("{refusal:#}"),
+                        "an attachment that committed past its repository's quota could not be \
+                         rolled back; it stays stored"
+                    ),
+                }
+            }
             if let Err(error) =
                 crate::deletion_recovery::mark_committed(storage, publication_id).await
             {
@@ -330,6 +359,58 @@ async fn persist_attachment(
         Err(error) => {
             cleanup_uncommitted_attachment(storage, &key, publication_id, "metadata insert").await;
             Err(error).context("failed to persist attachment metadata")
+        }
+    }
+}
+
+/// Whether `attachment`, now committed, put its repository past a quota that
+/// the check before the upload let it through: two uploads checked at the
+/// same moment both see room that only one of them fits in.
+///
+/// Only the attachments up to and including this one count against it, so
+/// of two that both committed past the line the earlier keeps its place and
+/// the later one is the one refused — never both. A recheck that cannot read
+/// the sums keeps the attachment: it passed the check that could, and the
+/// race this guards is the exception, not the rule.
+async fn over_quota_after_commit(
+    db: &DatabaseConnection,
+    attachment: &Attachment,
+    limits: &crate::storage_quota::StorageLimits,
+) -> Option<anyhow::Error> {
+    let recheck = async {
+        let through =
+            rg_db::ops::attachment_ops::repo_size_through(db, attachment.repo_id, attachment.id)
+                .await?;
+        if through > DEFAULT_REPO_ATTACHMENT_QUOTA {
+            return Ok(Some(invalid_request(
+                "repository attachment quota exceeded",
+            )));
+        }
+        let Some(limit) = limits.repo_quota_bytes else {
+            return Ok(None);
+        };
+        let usage = crate::storage_quota::usage(db, attachment.repo_id).await?;
+        let others = usage.total_bytes().saturating_sub(usage.attachment_bytes);
+        let mine = u64::try_from(through - attachment.size).unwrap_or(0);
+        Ok::<_, anyhow::Error>(
+            crate::storage_quota::exceeds(
+                others.saturating_add(mine),
+                u64::try_from(attachment.size).unwrap_or(0),
+                limit,
+            )
+            .map(|exceeded| crate::error::payload_too_large(exceeded.message)),
+        )
+    };
+    match recheck.await {
+        Ok(refusal) => refusal,
+        Err(error) => {
+            tracing::warn!(
+                attachment_id = attachment.id,
+                repo_id = attachment.repo_id,
+                error = %format!("{error:#}"),
+                "could not recheck the quota after an attachment committed; keeping it"
+            );
+            None
         }
     }
 }
@@ -527,11 +608,13 @@ fn normalize_content_type(value: &str) -> String {
 mod tests {
     use super::{
         create_attachment, create_attachment_from_file, delete_attachment, normalize_content_type,
-        validate_filename, AttachmentTarget,
+        over_quota_after_commit, validate_filename, AttachmentTarget,
+        DEFAULT_REPO_ATTACHMENT_QUOTA,
     };
     use crate::blob_storage::{
         BlobKey, BlobMetadata, BlobStorage, BlobStorageError, LocalBlobStorage,
     };
+    use crate::error::InvalidRequest;
     use crate::staging::SiblingSpool;
     use futures::future::BoxFuture;
     use sea_orm::{ActiveValue::Set, ConnectOptions, ConnectionTrait, Database};
@@ -918,6 +1001,187 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// A row as a concurrent upload would have left it, `size` bytes large.
+    async fn insert_competitor(
+        db: &sea_orm::DatabaseConnection,
+        beside: &rg_db::entities::attachment::Model,
+        name: &str,
+        size: i64,
+    ) -> rg_db::entities::attachment::Model {
+        rg_db::ops::attachment_ops::create(
+            db,
+            rg_db::entities::attachment::ActiveModel {
+                uuid: Set(uuid::Uuid::new_v4().to_string()),
+                repo_id: Set(beside.repo_id),
+                uploader_id: Set(beside.uploader_id),
+                issue_id: Set(beside.issue_id),
+                filename: Set(name.to_string()),
+                blob_key: Set(format!("attachments/{}/{name}", beside.repo_id)),
+                content_type: Set("text/plain".to_string()),
+                size: Set(size),
+                download_count: Set(0),
+                created_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Two uploads that both committed past the line: only the later one —
+    /// the one whose prefix holds the other — is over it. Before, a recheck
+    /// over the whole repository found both over and refused both.
+    #[tokio::test]
+    async fn of_two_attachments_past_the_quota_only_the_later_is_over() {
+        let db = setup_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::blob_storage::LocalBlobStorage::new(dir.path().to_path_buf());
+        let seeded = seed_issue_attachment(&db, &storage).await;
+        let unlimited = crate::storage_quota::StorageLimits::default();
+
+        let half = DEFAULT_REPO_ATTACHMENT_QUOTA / 2;
+        let earlier = insert_competitor(&db, &seeded, "earlier.bin", half).await;
+        let later = insert_competitor(&db, &seeded, "later.bin", half).await;
+        assert!(over_quota_after_commit(&db, &earlier, &unlimited)
+            .await
+            .is_none());
+        let refusal = over_quota_after_commit(&db, &later, &unlimited)
+            .await
+            .expect("the later upload is the one past the attachment quota");
+        assert!(
+            refusal.downcast_ref::<InvalidRequest>().is_some(),
+            "{refusal:#}"
+        );
+
+        // The same rule under the repository budget, which answers 413.
+        for row in [&earlier, &later] {
+            rg_db::ops::attachment_ops::delete_by_id(&db, row.id)
+                .await
+                .unwrap();
+        }
+        let budget = crate::storage_quota::StorageLimits {
+            repo_quota_bytes: Some(u64::try_from(seeded.size).unwrap() + 1000),
+            ..Default::default()
+        };
+        let earlier = insert_competitor(&db, &seeded, "earlier.bin", 600).await;
+        let later = insert_competitor(&db, &seeded, "later.bin", 600).await;
+        assert!(over_quota_after_commit(&db, &earlier, &budget)
+            .await
+            .is_none());
+        let refusal = over_quota_after_commit(&db, &later, &budget)
+            .await
+            .expect("the later upload is the one past the budget");
+        assert!(
+            refusal
+                .downcast_ref::<crate::error::PayloadTooLarge>()
+                .is_some(),
+            "{refusal:#}"
+        );
+    }
+
+    /// The race end to end: a competitor commits between this upload's check
+    /// and its row. The upload is refused, its row is gone, and so is its blob;
+    /// and when the row cannot be removed the attachment stands whole — the
+    /// blob is never deleted from under a row that still names it.
+    #[tokio::test]
+    async fn an_attachment_that_loses_the_quota_race_is_rolled_back_row_first() {
+        let db = setup_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::blob_storage::LocalBlobStorage::new(dir.path().to_path_buf());
+        let seeded = seed_issue_attachment(&db, &storage).await;
+        let room = DEFAULT_REPO_ATTACHMENT_QUOTA - seeded.size;
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER quota_race BEFORE INSERT ON attachments \
+             WHEN NEW.filename IN ('late.txt', 'kept.txt') BEGIN \
+             INSERT INTO attachments(uuid, repo_id, uploader_id, issue_id, filename, blob_key, \
+             content_type, size, download_count, created_at) VALUES (lower(hex(randomblob(16))), \
+             NEW.repo_id, NEW.uploader_id, NEW.issue_id, 'competitor.txt', \
+             'attachments/competitor', 'text/plain', {}, 0, NEW.created_at); END;",
+            room - 4
+        ))
+        .await
+        .unwrap();
+        let upload = |name: &'static str| {
+            create_attachment(
+                &db,
+                &storage,
+                seeded.repo_id,
+                seeded.uploader_id.unwrap(),
+                AttachmentTarget::Issue(seeded.issue_id.unwrap()),
+                name,
+                "text/plain",
+                b"ten bytes!",
+            )
+        };
+        let named = |name: &'static str| {
+            let db = db.clone();
+            async move {
+                rg_db::ops::attachment_ops::list_by_issue(
+                    &db,
+                    seeded.repo_id,
+                    seeded.issue_id.unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.filename == name)
+                .collect::<Vec<_>>()
+            }
+        };
+        fn count_named(root: &std::path::Path, name: &str) -> usize {
+            std::fs::read_dir(root)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                count_named(&path, name)
+                            } else {
+                                usize::from(entry.file_name() == name)
+                            }
+                        })
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+        let blobs_named = |name: &str| count_named(dir.path(), name);
+
+        let refusal = upload("late.txt").await.expect_err("the late upload loses");
+        assert!(
+            refusal.downcast_ref::<InvalidRequest>().is_some(),
+            "{refusal:#}"
+        );
+        assert!(
+            named("late.txt").await.is_empty(),
+            "the loser's row is gone"
+        );
+        assert_eq!(blobs_named("late.txt"), 0, "the loser's blob is gone");
+        assert_eq!(named("competitor.txt").await.len(), 1, "the winner stays");
+
+        // Row deletion broken: the attachment stays, blob and row together.
+        for winner in named("competitor.txt").await {
+            rg_db::ops::attachment_ops::delete_by_id(&db, winner.id)
+                .await
+                .unwrap();
+        }
+        db.execute_unprepared(
+            "CREATE TRIGGER no_delete BEFORE DELETE ON attachments BEGIN \
+             SELECT RAISE(ABORT, 'injected failure: DELETE on attachments'); END;",
+        )
+        .await
+        .unwrap();
+        let kept = upload("kept.txt")
+            .await
+            .expect("an attachment that cannot be rolled back is reported as stored");
+        assert_eq!(named("kept.txt").await.len(), 1);
+        assert_eq!(
+            blobs_named("kept.txt"),
+            1,
+            "the blob must not be deleted while its row stands: {kept:?}"
+        );
     }
 
     fn assert_journal_wraps_blob_write(

@@ -241,6 +241,64 @@ fn refuse_reserved_package_name(package_type: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The bytes of `info`'s files that the version it names does not hold yet:
+/// what publishing it would add to the repository.
+///
+/// A file the version already has is refused further down as a conflict, so it
+/// is not charged here: near the budget, re-sending a published file answered
+/// 413 for room it never needed instead of saying it was already published.
+/// Read-only on purpose — a request refused by the budget must not leave a
+/// registry or a package row behind.
+async fn bytes_the_publish_adds(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    info: &PublishInfo,
+    protocol_version_key: Option<&str>,
+) -> Result<u64> {
+    let held = async {
+        let Some(registry) = rg_db::ops::package_registry_ops::find_by_repo_and_type(
+            db,
+            repo_id,
+            &info.package_type,
+        )
+        .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(package) =
+            rg_db::ops::package_ops::find_by_registry_and_name(db, registry.id, &info.name).await?
+        else {
+            return Ok(Vec::new());
+        };
+        let version = match protocol_version_key {
+            Some(key) => {
+                rg_db::ops::package_version_ops::find_by_package_and_protocol_version_key(
+                    db, package.id, key,
+                )
+                .await?
+            }
+            None => {
+                rg_db::ops::package_version_ops::find_by_package_and_version(
+                    db,
+                    package.id,
+                    &info.version,
+                )
+                .await?
+            }
+        };
+        match version {
+            Some(version) => rg_db::ops::package_file_ops::list_by_version(db, version.id).await,
+            None => Ok(Vec::new()),
+        }
+    }
+    .await?;
+    Ok(info
+        .files
+        .iter()
+        .filter(|(filename, _)| !held.iter().any(|file| &file.filename == filename))
+        .fold(0_u64, |total, (_, file)| total.saturating_add(file.len())))
+}
+
 /// Publish a package version to the registry.
 ///
 /// `limits` is the repository budget, checked once the repository is known
@@ -289,13 +347,13 @@ pub async fn publish(
         .await?
         .ok_or_else(|| not_found("repository"))?;
 
-    let incoming = info
-        .files
-        .iter()
-        .fold(0_u64, |total, (_, file)| total.saturating_add(file.len()));
-    crate::storage_quota::check_room(db, repo.id, incoming, limits)
-        .await
-        .map_err(crate::storage_quota::QuotaError::into_service_error)?;
+    if limits.repo_quota_bytes.is_some() {
+        let incoming =
+            bytes_the_publish_adds(db, repo.id, &info, protocol_version_key.as_deref()).await?;
+        crate::storage_quota::check_room(db, repo.id, incoming, limits)
+            .await
+            .map_err(crate::storage_quota::QuotaError::into_service_error)?;
+    }
 
     let registry =
         rg_db::ops::package_registry_ops::find_or_create(db, repo.id, &info.package_type).await?;

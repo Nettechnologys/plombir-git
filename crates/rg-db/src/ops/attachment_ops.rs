@@ -118,6 +118,29 @@ pub async fn repo_size(db: &DatabaseConnection, repo_id: i64) -> Result<i64> {
     Ok(bytes)
 }
 
+/// The bytes of `repo_id`'s attachments up to and including `through_id`.
+///
+/// The post-commit quota recheck sums this rather than the whole repository,
+/// so that of two uploads that both committed past the line only the later one
+/// — the one whose prefix includes the other — finds itself over it.
+pub async fn repo_size_through(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    through_id: i64,
+) -> Result<i64> {
+    let (_, bytes) = super::aggregate::count_and_sum(
+        db,
+        AttachmentEntity::find()
+            .filter(attachment::Column::RepoId.eq(repo_id))
+            .filter(attachment::Column::Id.lte(through_id)),
+        attachment::Column::Id,
+        attachment::Column::Size,
+        "db: sum repository attachment sizes up to one attachment",
+    )
+    .await?;
+    Ok(bytes)
+}
+
 pub async fn increment_download_count(db: &DatabaseConnection, id: i64) -> Result<()> {
     AttachmentEntity::update_many()
         .col_expr(

@@ -148,6 +148,121 @@ async fn a_blob_row_that_was_not_written_fails_the_push() {
     assert_eq!(head.status(), 200, "the successful push must be readable");
 }
 
+/// Open an upload session, returning its `Location`.
+async fn open_session(base: &str, token: &str, owner: &str, repo: &str) -> String {
+    let start = reqwest::Client::new()
+        .post(format!("{base}/v2/{owner}/{repo}/blobs/uploads/"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 202, "start upload failed");
+    start
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .expect("start upload must return a Location")
+        .to_string()
+}
+
+async fn patch_range(base: &str, token: &str, location: &str, range: &str, body: &[u8]) -> u16 {
+    reqwest::Client::new()
+        .patch(format!("{base}{location}"))
+        .bearer_auth(token)
+        .header("content-range", range)
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// A chunk that reached staging but whose progress could not be recorded used
+/// to stay in the file: the next PATCH found staging longer than the row and
+/// answered 500 "staged upload does not match" for as long as the session
+/// lived. Staging is cut back to the acknowledged offset, and the same chunk
+/// goes in on the retry.
+#[tokio::test]
+async fn a_chunk_whose_progress_was_not_recorded_leaves_the_session_resumable() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _user_id) = register_full(&base, "oci_progress", "oci_progress@example.com").await;
+    create_repo(&base, &token, "progress").await;
+    let location = open_session(&base, &token, "oci_progress", "progress").await;
+    assert_eq!(
+        patch_range(&base, &token, &location, "0-4", b"aaaaa").await,
+        202
+    );
+
+    let fault = fail_db_writes(&db, "oci_upload", DbWrite::Update).await;
+    assert_eq!(
+        patch_range(&base, &token, &location, "5-9", b"bbbbb").await,
+        500,
+        "a progress write that failed fails the chunk"
+    );
+    fault.clear().await;
+
+    assert_eq!(
+        patch_range(&base, &token, &location, "5-9", b"bbbbb").await,
+        202,
+        "the retried chunk must find staging where the session left it"
+    );
+    let digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"aaaaabbbbb"))
+    );
+    let finish = reqwest::Client::new()
+        .put(format!("{base}{location}"))
+        .query(&[("digest", digest.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    crate::common::assert_blob_push_created(finish, 10).await;
+}
+
+/// A final chunk under the wrong digest is the client's mistake and answers
+/// 400, but its bytes stayed appended to staging, so the corrected `PUT` met a
+/// session that no longer matched its row. It now goes through.
+#[tokio::test]
+async fn a_final_chunk_under_the_wrong_digest_can_be_retried_with_the_right_one() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _user_id) = register_full(&base, "oci_redigest", "oci_redigest@example.com").await;
+    create_repo(&base, &token, "redigest").await;
+    let location = open_session(&base, &token, "oci_redigest", "redigest").await;
+    assert_eq!(
+        patch_range(&base, &token, &location, "0-4", b"aaaaa").await,
+        202
+    );
+
+    let finish = |digest: String| {
+        let (base, token, location) = (base.clone(), token.clone(), location.clone());
+        async move {
+            reqwest::Client::new()
+                .put(format!("{base}{location}"))
+                .query(&[("digest", digest.as_str())])
+                .bearer_auth(&token)
+                .header("content-range", "5-9")
+                .body(b"bbbbb".to_vec())
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let wrong = finish(format!("sha256:{}", "0".repeat(64))).await;
+    assert_eq!(
+        wrong.status(),
+        400,
+        "a digest the bytes do not match is the client's"
+    );
+
+    let right = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"aaaaabbbbb"))
+    );
+    crate::common::assert_blob_push_created(finish(right).await, 10).await;
+}
+
 /// A mount owns only the destination bytes it actually copied.
 ///
 /// Losing the first target row must roll its new copy back. Losing a later

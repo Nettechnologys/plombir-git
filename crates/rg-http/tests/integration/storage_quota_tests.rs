@@ -1028,6 +1028,26 @@ async fn package_publish_over_the_repository_budget_is_refused() {
         (1, 1500),
         "the refused version stored nothing"
     );
+
+    // Re-sending the file the version already holds is not charged a second
+    // time: it is refused for what it is — already published — rather than
+    // for room it would never take.
+    let republished = publish_generic(
+        &base,
+        &token,
+        "pkg-quota-owner",
+        "pkg-quota",
+        "widget",
+        "1.0.0",
+        vec![b'a'; 1500],
+    )
+    .await;
+    assert_eq!(
+        republished.status(),
+        409,
+        "an already published file is a conflict, not a budget refusal: {}",
+        republished.text().await.unwrap()
+    );
 }
 
 // ── CI artifacts ─────────────────────────────────────────────

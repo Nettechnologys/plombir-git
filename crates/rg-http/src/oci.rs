@@ -2670,9 +2670,14 @@ pub async fn chunk_upload(
     match stream_body_to_file(body, &file_path, state.storage_limits.oci_blob_max_bytes).await {
         Ok(staged) => {
             let total_size = staged.total;
+            // Every refusal from here on is answered after the append, so each
+            // one cuts staging back to the offset the row acknowledges first.
+            // Left longer than the row says, the file fails the next PATCH's
+            // accountability check with a 500 and the session is wedged for
+            // good — which is what an uncut append used to do.
             if let Some(range) = requested_range {
                 if staged.written != range.len() || total_size != range.end + 1 {
-                    return oci_err(
+                    let refusal = oci_err(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "UNKNOWN",
                         &format!(
@@ -2682,6 +2687,7 @@ pub async fn chunk_upload(
                             range.start, range.end, staged.written
                         ),
                     );
+                    return refuse_after_append(&file_path, recorded_size, refusal).await;
                 }
             }
 
@@ -2722,11 +2728,12 @@ pub async fn chunk_upload(
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    return oci_err(
+                    let refusal = oci_err(
                         oci_status_for(&e),
                         "UNKNOWN",
                         &format!("failed to record upload progress for session {uuid}: {e}"),
                     );
+                    return refuse_after_append(&file_path, recorded_size, refusal).await;
                 }
             }
 
@@ -3088,7 +3095,7 @@ pub async fn complete_upload(
                     staged
                 }
                 Ok(staged) => {
-                    return oci_err(
+                    let refusal = oci_err(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "UNKNOWN",
                         &format!(
@@ -3097,6 +3104,7 @@ pub async fn complete_upload(
                             range.start, range.end, staged.written, staged.total
                         ),
                     );
+                    return refuse_after_append(&file_path, recorded, refusal).await;
                 }
                 Err(error) => return oci_body_error(error),
             }
@@ -3266,11 +3274,24 @@ pub async fn complete_upload(
         // a 400 — it prints `digest invalid` and stops — so answering one for a
         // broken `repo_root` tells the operator to go inspect an image that was
         // never the problem. Ask the error which side is at fault.
-        Err(e) if is_client_digest_fault(&e) => oci_err(
-            StatusCode::BAD_REQUEST,
-            error_codes::DIGEST_INVALID,
-            &format!("{e:#}"),
-        ),
+        //
+        // A digest that does not match leaves the staging file intact, and
+        // with this request's final chunk appended to it. Cut back to the
+        // acknowledged offset like every other refusal after an append, or a
+        // client retrying with the right digest meets a session that no
+        // longer matches its row.
+        Err(e) if is_client_digest_fault(&e) => {
+            let refusal = oci_err(
+                StatusCode::BAD_REQUEST,
+                error_codes::DIGEST_INVALID,
+                &format!("{e:#}"),
+            );
+            if staged.written > 0 {
+                refuse_after_append(&file_path, recorded, refusal).await
+            } else {
+                refusal
+            }
+        }
         Err(e) => oci_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "UNKNOWN",
