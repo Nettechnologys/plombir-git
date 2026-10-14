@@ -44,6 +44,9 @@ pub struct UserInfo {
     pub is_admin: bool,
     pub is_active: bool,
     pub auth_provider: String,
+    /// Whether a TOTP factor is enrolled — what an administrator needs to see
+    /// before offering to reset it.
+    pub mfa_enabled: bool,
     pub last_login_at: Option<chrono::DateTime<Utc>>,
     pub login_attempts: i32,
     pub locked_until: Option<chrono::DateTime<Utc>>,
@@ -996,6 +999,7 @@ impl From<rg_db::entities::user::Model> for UserInfo {
             is_admin: u.is_admin,
             is_active: u.is_active,
             auth_provider: u.auth_provider,
+            mfa_enabled: u.mfa_enabled,
             last_login_at: u.last_login_at,
             login_attempts: u.login_attempts,
             locked_until: u.locked_until,

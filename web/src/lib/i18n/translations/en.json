@@ -1615,6 +1615,8 @@
       "login_ok": "OK",
       "working": "Working...",
       "unlock": "Unlock",
+      "reset_mfa": "Reset MFA",
+      "reset_mfa_confirm": "Remove every second factor of {username} — the authenticator, its backup codes and every passkey — and sign out all of their sessions? They will sign in with their password or provider alone until they enrol again.",
       "reset_password": "Reset password",
       "reset_password_confirm": "Give {username} a new password? Every session they have is signed out.",
       "display_name": "Display Name",

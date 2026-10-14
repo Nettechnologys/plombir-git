@@ -371,7 +371,7 @@ template). Model sections include `server`, `database`, `auth`, `ci`, `releases`
 `rg-cli/src/config.rs` and are shared by **every** subcommand, not just `serve`:
 `migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,
 `rotate-encryption-key`, `create-repo`, `import`, `index-repo`,
-`list-tombstones` and `package list` all take `--config` and read `[database].url` /
+`list-tombstones`, `reset-mfa` and `package list` all take `--config` and read `[database].url` /
 `[server].repo_root` through the same functions the server uses; `import` also
 reads `[imports].trusted_origins`, so an operator-only private-origin exception
 is identical in server and one-shot import modes. An admin command therefore

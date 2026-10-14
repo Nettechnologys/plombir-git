@@ -374,6 +374,76 @@ pub async fn reset_user_password(
     }
 }
 
+/// POST /api/v1/admin/users/:id/mfa/reset
+///
+/// Take every second factor off an account whose owner can no longer pass it:
+/// an authenticator that is gone, or one a stolen session armed and the owner
+/// never held. A password reset ends at the second factor, so without this an
+/// administrator's only tool was a database edit. Every session is revoked
+/// first, then the TOTP factor with its unused backup codes, then every
+/// passkey — which signs in without TOTP and so is what a thief would rather
+/// leave behind.
+///
+/// In sudo mode: taking another account's factors off is the first half of
+/// taking that account over, and a stolen administrator session must not be
+/// enough for it.
+#[utoipa::path(
+    post,
+    path = "/admin/users/{id}/mfa/reset",
+    tag = "Admin",
+    params(("id" = i64, Path, description = "User ID")),
+    responses(
+        (status = 200, description = "The account, its second factors removed and its sessions revoked", body = serde_json::Value),
+        (status = 400, description = "Your own account: change your factors from your settings", body = serde_json::Value),
+        (status = 403, description = "Admin required, or a session outside its sudo window (`reason: sudo_required`)", body = serde_json::Value),
+        (status = 404, description = "User not found", body = serde_json::Value),
+        (status = 409, description = "The account has no second factor to reset", body = serde_json::Value),
+    ),
+)]
+pub async fn reset_user_mfa(
+    State(state): State<AppState>,
+    InstanceAdmin(current_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
+    headers: HeaderMap,
+    Path(user_id): Path<i64>,
+) -> impl IntoResponse {
+    // An administrator's own factors come off from their settings, where the
+    // password (or sudo mode) is asked for them; here they would come off on
+    // the strength of a session alone.
+    if current_id == user_id {
+        return AppError::bad_request("change your own second factor from your account settings")
+            .into_response();
+    }
+    // Resolved before the mutation and with the failure propagated, for the
+    // reason `unlock_user` spells out.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, current_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    match rg_core::user::account::reset_mfa(&state.db, user_id).await {
+        Ok(reset) => {
+            rg_core::audit::record(
+                &state.db,
+                &audit_actor,
+                "admin.reset_mfa",
+                Some("user"),
+                Some(user_id),
+                Some(&reset.user.username),
+                Some(&headers),
+                Some(serde_json::json!({
+                    "totp_removed": reset.totp_removed,
+                    "passkeys_removed": reset.passkeys_removed,
+                    "sessions_revoked": true,
+                })),
+            )
+            .await;
+            let response: rg_core::user::service::UserInfo = reset.user.into();
+            (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+        }
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
 /// POST /api/v1/admin/users/:id/unlock
 #[utoipa::path(
     post,

@@ -199,6 +199,78 @@ pub(crate) async fn cmd_rotate_instance_key(
     Ok(())
 }
 
+/// `plombir-git reset-mfa <username>` — take every second factor off one
+/// account, from the shell.
+///
+/// The operator's door for what `POST /admin/users/{id}/mfa/reset` cannot
+/// reach: the instance whose only administrator is the account locked out.
+/// Same `rg_core::user::account::reset_mfa`, same `admin.reset_mfa` journal
+/// row — with no actor, the honest encoding for a shell, and `via: "cli"` so
+/// a review can tell the two doors apart.
+pub(crate) async fn cmd_reset_mfa(
+    username: String,
+    db_url: Option<String>,
+    cfg: Option<&config::ConfigFile>,
+) -> anyhow::Result<()> {
+    init_cli_logging();
+    let db_url = config::resolve_db_url(db_url, cfg);
+    // On the ordinary pool: this is the live handler's work, a few short row
+    // writes, and demanding a stopped server would keep the one administrator
+    // who needs it waiting on an outage.
+    let db = dbconn::connect_online(
+        &db_url,
+        "plombir-git reset-mfa",
+        dbconn::OnlineAccess::SameWorkAsALiveHandler,
+    )
+    .await?;
+    let reset = reset_mfa_of(&db, &username).await?;
+    println!(
+        "Second factors removed from `{}` (id {}): {}{} passkey(s). Every session is \
+         signed out; the account signs in with its password, or its provider, until its \
+         owner enrols again.",
+        reset.user.username,
+        reset.user.id,
+        if reset.totp_removed {
+            "the authenticator and its unused backup codes, "
+        } else {
+            ""
+        },
+        reset.passkeys_removed,
+    );
+    Ok(())
+}
+
+/// The work of [`cmd_reset_mfa`] on an open database.
+pub(crate) async fn reset_mfa_of(
+    db: &rg_db::DatabaseConnection,
+    username: &str,
+) -> anyhow::Result<rg_core::user::account::SecondFactorReset> {
+    let user = rg_db::ops::user_ops::find_by_username(db, username)
+        .await
+        .context("look the account up")?
+        .ok_or_else(|| anyhow::anyhow!("no account named `{username}`"))?;
+    let reset = rg_core::user::account::reset_mfa(db, user.id)
+        .await
+        .with_context(|| format!("reset the second factors of `{username}`"))?;
+    rg_core::audit::record(
+        db,
+        &rg_core::audit::AuditActor::none(),
+        "admin.reset_mfa",
+        Some("user"),
+        Some(reset.user.id),
+        Some(&reset.user.username),
+        None,
+        Some(serde_json::json!({
+            "totp_removed": reset.totp_removed,
+            "passkeys_removed": reset.passkeys_removed,
+            "sessions_revoked": true,
+            "via": "cli",
+        })),
+    )
+    .await;
+    Ok(reset)
+}
+
 /// `plombir-git rotate-encryption-key` — move every at-rest secret onto a new
 /// at-rest encryption key.
 ///
@@ -1079,6 +1151,103 @@ mod tests {
     use crate::cli::PackageCmd;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    /// `reset-mfa` does the work, not only the parsing: on a real database
+    /// the account loses its authenticator, its unused backup codes and its
+    /// passkeys, every session is revoked, and the journal says the shell did
+    /// it. An account with nothing to reset is refused and keeps its sessions.
+    #[tokio::test]
+    async fn reset_mfa_removes_every_second_factor_and_journals_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("reset.db").display()
+        );
+        let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+            .await
+            .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user =
+            rg_db::ops::user_ops::create_user(&db, "locked", "locked@example.com", "x", "Locked")
+                .await
+                .unwrap();
+        rg_db::ops::user_ops::stage_pending_totp_secret(&db, user.id, "sealed")
+            .await
+            .unwrap()
+            .unwrap();
+        rg_db::ops::user_ops::enable_mfa_with_backup_codes(
+            &db,
+            user.id,
+            &["AAAA-BBBB".to_string()],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        rg_db::ops::passkey_credential_ops::create(
+            &db,
+            user.id,
+            "cred",
+            "{}",
+            "thief",
+            "localhost",
+        )
+        .await
+        .unwrap();
+        let before = rg_db::ops::user_ops::find_by_id(&db, user.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let reset = super::reset_mfa_of(&db, "locked").await.unwrap();
+        assert!(reset.totp_removed);
+        assert_eq!(reset.passkeys_removed, 1);
+        let after = rg_db::ops::user_ops::find_by_id(&db, user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!after.mfa_enabled && after.totp_secret.is_none());
+        assert!(
+            after.session_version > before.session_version,
+            "sessions were not revoked"
+        );
+        assert!(
+            rg_db::ops::passkey_credential_ops::list_by_user(&db, user.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !rg_db::ops::mfa_backup_code_ops::verify_and_consume(&db, user.id, "AAAA-BBBB")
+                .await
+                .unwrap()
+        );
+        let (rows, _) =
+            rg_db::ops::audit_log_ops::list_paginated(&db, 0, 10, None, None, None, None, None)
+                .await
+                .unwrap();
+        let entry = rows
+            .iter()
+            .find(|row| row.action == "admin.reset_mfa")
+            .expect("the reset is journalled");
+        assert_eq!(entry.user_id, None, "a shell has no account to name");
+        assert!(entry
+            .details
+            .as_deref()
+            .unwrap_or_default()
+            .contains("\"via\":\"cli\""));
+
+        let error = super::reset_mfa_of(&db, "locked").await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no second factor"),
+            "{error:#}"
+        );
+        let untouched = rg_db::ops::user_ops::find_by_id(&db, user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.session_version, after.session_version);
+        assert!(super::reset_mfa_of(&db, "nobody").await.is_err());
+    }
 
     async fn read_headers(stream: &mut TcpStream) -> String {
         let mut bytes = Vec::new();

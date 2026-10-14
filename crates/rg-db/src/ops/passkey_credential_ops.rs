@@ -65,6 +65,15 @@ pub async fn delete(db: &DatabaseConnection, user_id: i64, id: i64) -> Result<bo
     Ok(res.rows_affected > 0)
 }
 
+/// Delete every passkey of an account, answering how many went.
+pub async fn delete_all_for_user(db: &DatabaseConnection, user_id: i64) -> Result<u64, DbErr> {
+    let res = Entity::delete_many()
+        .filter(passkey_credential::Column::UserId.eq(user_id))
+        .exec(db)
+        .await?;
+    Ok(res.rows_affected)
+}
+
 /// What became of an attempt to store an advanced credential.
 ///
 /// Three outcomes rather than a `bool`, because the login path has to answer

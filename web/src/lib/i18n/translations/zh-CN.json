@@ -1615,6 +1615,8 @@
       "login_ok": "正常",
       "working": "处理中...",
       "unlock": "解锁",
+      "reset_mfa": "重置多因素认证",
+      "reset_mfa_confirm": "移除 {username} 的所有第二因素（验证器、备用代码和所有通行密钥），并注销其所有会话？在重新注册之前，该用户只能使用密码或身份提供方登录。",
       "reset_password": "重置密码",
       "reset_password_confirm": "要为 {username} 生成新密码吗？该用户的所有会话都将被登出。",
       "display_name": "显示名称",

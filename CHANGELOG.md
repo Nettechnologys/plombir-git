@@ -9,6 +9,9 @@ This project records user-facing changes here. The format follows
 ### Added
 
 - Public security reporting and contributor guidance.
+- `POST /admin/users/{id}/mfa/reset` and `plombir-git reset-mfa <username>`
+  take every second factor (authenticator, backup codes, passkeys) off an
+  account whose owner is locked out and sign its sessions out.
 - CI secrets can be scoped to an environment. Only jobs that declare the
   environment read them, after its approval when it is protected, and an
   environment's value overrides a repository-wide secret of the same name.
@@ -24,6 +27,11 @@ This project records user-facing changes here. The format follows
   (`POST /api/v1/auth/sso/{slug}/reauthenticate`, which asks an OIDC provider
   for `max_age=600`) or with a passkey. Otherwise these routes answer `403`
   with `reason: "sudo_required"`; the web UI asks and retries on its own.
+- **Breaking:** `POST /users/mfa/enable` needs the account `password` on
+  every enrolment, the first one included, and `setup`, `enable`, `disable`
+  and `backup/regenerate` refuse personal access tokens. An account without a
+  password here (SSO, LDAP) sends none and needs sudo mode instead.
+- `DELETE /users/passkeys/{id}` refuses personal access tokens.
 - **Breaking:** the `sub` claim of CI OIDC tokens is now
   `repo:<owner>/<name>:ref:<ref>`, or `repo:<owner>/<name>:environment:<env>`
   for a job with an environment. Trust policies that match the old

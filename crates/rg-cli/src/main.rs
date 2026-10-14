@@ -131,6 +131,12 @@ async fn run() -> anyhow::Result<()> {
                 .await?
         }
 
+        Commands::ResetMfa {
+            username,
+            db_url,
+            config: _,
+        } => commands::cmd_reset_mfa(username, db_url, state_cfg()).await?,
+
         Commands::RotateEncryptionKey {
             db_url,
             config: _,

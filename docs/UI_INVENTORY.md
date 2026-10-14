@@ -19,15 +19,15 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 433 |
-| Reachable from the browser | 302 (70%) |
+| Router routes (with declared `Access`) | 434 |
+| Reachable from the browser | 303 (70%) |
 | Layout modules | 2 |
 | Pages | 72 |
-| Interactive controls | 1042 |
-| Controls calling an API | 366 |
+| Interactive controls | 1043 |
+| Controls calling an API | 367 |
 | Controls from shared components | 423 |
-| Browser sweep: scenarios / inventory entries / routes | 49 / 184 / 175 |
-| **UI routes without a web/smoke/browser test** | **26** |
+| Browser sweep: scenarios / inventory entries / routes | 50 / 186 / 176 |
+| **UI routes without a web/smoke/browser test** | **25** |
 | UI routes without corpus or browser coverage | 0 |
 
 ## By access level
@@ -36,9 +36,9 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 109 | 70 | 4 | 0 |
 | `RepoWrite` | 86 | 67 | 13 | 2 |
-| `User` | 57 | 44 | 6 | 0 |
+| `User` | 57 | 44 | 5 | 0 |
 | `RepoAdmin` | 39 | 39 | 0 | 0 |
-| `InstanceAdmin` | 32 | 27 | 0 | 1 |
+| `InstanceAdmin` | 33 | 28 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
 | `RepoAuthRead` | 18 | 18 | 1 | 0 |
 | `OrgAdmin` | 15 | 14 | 0 | 0 |
@@ -67,8 +67,8 @@
 | `/[owner]/[repo]` | 25 | 5 | 12 |
 | `/[owner]/[repo]/blob/[...path]` | 25 | 8 | 11 |
 | `/[owner]/[repo]/pipelines` | 25 | 11 | 14 |
+| `/admin/users` 🔒 | 25 | 8 | 4 |
 | `/[owner]/[repo]/wiki/[title]` | 24 | 9 | 13 |
-| `/admin/users` 🔒 | 24 | 7 | 4 |
 | `/[owner]/[repo]/packages` | 23 | 11 | 12 |
 | `/[owner]/[repo]/branches` | 22 | 6 | 12 |
 | `/[owner]/[repo]/milestones` | 22 | 8 | 13 |
@@ -1050,17 +1050,19 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| (showCreate = false)}> | :262 | `POST /api/v1/admin/users` | `InstanceAdmin` | rust+web+smoke+browser |
-| (showCreate = false)}> | :262 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
-| i18n:admin.users.working | :323 | `POST /api/v1/admin/users/{id}/unlock` | `InstanceAdmin` | rust+web+smoke+browser |
-| i18n:admin.users.working | :323 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
-| i18n:admin.users.reset_password | :329 | `POST /api/v1/admin/users/{id}/password-reset` | `InstanceAdmin` | rust+web+smoke+browser |
-| i18n:common.prev_arrow | :344 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web |
-| i18n:common.next_arrow | :346 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web |
-| i18n:common.loading | :384 | `PATCH /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :384 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
-| i18n:common.loading | :405 | `DELETE /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :405 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
+| (showCreate = false)}> | :281 | `POST /api/v1/admin/users` | `InstanceAdmin` | rust+web+smoke+browser |
+| (showCreate = false)}> | :281 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
+| i18n:admin.users.working | :342 | `POST /api/v1/admin/users/{id}/unlock` | `InstanceAdmin` | rust+web+smoke+browser |
+| i18n:admin.users.working | :342 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
+| i18n:admin.users.reset_password | :348 | `POST /api/v1/admin/users/{id}/password-reset` | `InstanceAdmin` | rust+web+smoke+browser |
+| i18n:admin.users.reset_mfa | :351 | `POST /api/v1/admin/users/{id}/mfa/reset` | `InstanceAdmin` | web+smoke+browser |
+| i18n:admin.users.reset_mfa | :351 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
+| i18n:common.prev_arrow | :366 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web |
+| i18n:common.next_arrow | :368 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web |
+| i18n:common.loading | :406 | `PATCH /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
+| i18n:common.loading | :406 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
+| i18n:common.loading | :427 | `DELETE /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
+| i18n:common.loading | :427 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+web+browser |
 
 ### `/dashboard`
 
@@ -1224,28 +1226,29 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:account_security.mfa.retry | :401 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
-| i18n:account_security.mfa.current_password | :416 | `POST /api/v1/users/mfa/backup/regenerate` | `User` | rust |
-| i18n:account_security.mfa.current_password | :416 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
-| i18n:account_security.mfa.current_password | :416 | `GET /api/v1/users/passkeys` | `User` | rust+web |
-| i18n:account_security.mfa.current_password | :416 | `GET /api/v1/users/me/sso` | `User` | rust+web |
-| i18n:account_security.mfa.current_password | :416 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
-| i18n:account_security.mfa.current_password | :434 | `POST /api/v1/users/mfa/disable` | `User` | rust |
-| i18n:account_security.mfa.current_password | :434 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
-| i18n:account_security.mfa.current_password | :434 | `GET /api/v1/users/passkeys` | `User` | rust+web |
-| i18n:account_security.mfa.current_password | :434 | `GET /api/v1/users/me/sso` | `User` | rust+web |
-| i18n:account_security.mfa.current_password | :434 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
-| i18n:account_security.mfa.starting | :445 | `POST /api/v1/users/mfa/setup` | `User` | rust+web |
-| i18n:account_security.passkeys.retry | :475 | `GET /api/v1/users/passkeys` | `User` | rust+web |
-| i18n:account_security.passkeys.remove | :489 | `DELETE /api/v1/users/passkeys/{id}` | `User` | rust |
-| i18n:account_security.sso.retry | :542 | `GET /api/v1/users/me/sso` | `User` | rust+web |
-| i18n:account_security.sso.unlink | :557 | `DELETE /api/v1/auth/sso/{slug}/unlink` | `User` | rust+web |
-| )} | :575 | `POST /api/v1/auth/sso/{slug}/link` | `User` | rust+web |
-| i18n:account_security.setup.code | :598 | `POST /api/v1/users/mfa/enable` | `User` | rust |
-| i18n:account_security.setup.code | :598 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
-| i18n:account_security.setup.code | :598 | `GET /api/v1/users/passkeys` | `User` | rust+web |
-| i18n:account_security.setup.code | :598 | `GET /api/v1/users/me/sso` | `User` | rust+web |
-| i18n:account_security.setup.code | :598 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
+| i18n:account_security.mfa.retry | :422 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
+| i18n:account_security.mfa.current_password | :437 | `POST /api/v1/users/mfa/backup/regenerate` | `User` | rust |
+| i18n:account_security.mfa.current_password | :437 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
+| i18n:account_security.mfa.current_password | :437 | `GET /api/v1/users/passkeys` | `User` | rust+web |
+| i18n:account_security.mfa.current_password | :437 | `GET /api/v1/users/me/sso` | `User` | rust+web |
+| i18n:account_security.mfa.current_password | :437 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
+| i18n:account_security.mfa.current_password | :457 | `POST /api/v1/users/mfa/disable` | `User` | rust |
+| i18n:account_security.mfa.current_password | :457 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
+| i18n:account_security.mfa.current_password | :457 | `GET /api/v1/users/passkeys` | `User` | rust+web |
+| i18n:account_security.mfa.current_password | :457 | `GET /api/v1/users/me/sso` | `User` | rust+web |
+| i18n:account_security.mfa.current_password | :457 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
+| i18n:account_security.mfa.starting | :470 | `POST /api/v1/users/mfa/setup` | `User` | rust+web+smoke |
+| i18n:account_security.passkeys.retry | :500 | `GET /api/v1/users/passkeys` | `User` | rust+web |
+| i18n:account_security.passkeys.remove | :514 | `DELETE /api/v1/users/passkeys/{id}` | `User` | rust |
+| i18n:account_security.sso.retry | :567 | `GET /api/v1/users/me/sso` | `User` | rust+web |
+| i18n:account_security.sso.unlink | :582 | `DELETE /api/v1/auth/sso/{slug}/unlink` | `User` | rust+web |
+| )} | :600 | `POST /api/v1/auth/sso/{slug}/link` | `User` | rust+web |
+| i18n:account_security.setup.code | :623 | `POST /api/v1/users/mfa/enable` | `User` | rust+smoke |
+| i18n:account_security.setup.code | :623 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
+| i18n:account_security.setup.code | :623 | `GET /api/v1/users/passkeys` | `User` | rust+web |
+| i18n:account_security.setup.code | :623 | `GET /api/v1/users/me/sso` | `User` | rust+web |
+| i18n:account_security.setup.code | :623 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
+| _(page load)_ | — | `GET /api/v1/users/me` | `User` | rust+web+smoke |
 
 ### `/settings/signing-keys`
 

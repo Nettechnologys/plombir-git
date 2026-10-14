@@ -233,6 +233,65 @@ pub async fn reset_password(
     })
 }
 
+/// What [`reset_mfa`] took off an account.
+#[derive(Debug)]
+pub struct SecondFactorReset {
+    pub user: User,
+    /// Whether a TOTP factor (and with it every unused backup code) was on.
+    pub totp_removed: bool,
+    pub passkeys_removed: u64,
+}
+
+/// Take every second factor off `target_user_id`'s account, as an operator.
+///
+/// The way back in for an owner whose authenticator is gone, and the only one
+/// once a stolen session armed a factor the owner never held: a password
+/// reset of an MFA account ends at the second factor. Shared by
+/// `POST /admin/users/{id}/mfa/reset` and `plombir-git reset-mfa` so the two
+/// doors cannot drift.
+///
+/// Every session goes first, because the one that armed the wrong factor must
+/// not outlive its removal; then the TOTP factor with its pending enrolment
+/// and unused backup codes; then every passkey, which signs in without TOTP
+/// and so is the factor a thief would rather leave behind. A failure part-way
+/// leaves the sessions revoked and the call repeatable. An account with no
+/// second factor is refused rather than quietly "reset": its problem is
+/// elsewhere, and its sessions need not be revoked for it.
+pub async fn reset_mfa(db: &DatabaseConnection, target_user_id: i64) -> Result<SecondFactorReset> {
+    let target = user_ops::find_by_id(db, target_user_id)
+        .await?
+        .ok_or_else(|| crate::error::not_found("user"))?;
+    let passkeys = rg_db::ops::passkey_credential_ops::list_by_user(db, target.id)
+        .await
+        .context("list the passkeys of an account whose MFA is being reset")?;
+    if !target.mfa_enabled && passkeys.is_empty() {
+        return Err(crate::error::conflict(
+            "this account has no second factor to reset",
+        ));
+    }
+    user_ops::invalidate_sessions(db, target.id)
+        .await
+        .context("revoke the sessions of an account whose MFA is being reset")?;
+    let mut user = target;
+    let totp_removed = user.mfa_enabled;
+    if totp_removed {
+        user = user_ops::disable_mfa(db, user.id)
+            .await?
+            .ok_or_else(|| crate::error::not_found("user"))?;
+    }
+    let passkeys_removed = rg_db::ops::passkey_credential_ops::delete_all_for_user(db, user.id)
+        .await
+        .context("remove the passkeys of an account whose MFA is being reset")?;
+    let user = user_ops::find_by_id(db, user.id)
+        .await?
+        .ok_or_else(|| crate::error::not_found("user"))?;
+    Ok(SecondFactorReset {
+        user,
+        totp_removed,
+        passkeys_removed,
+    })
+}
+
 // ── Profile ──────────────────────────────────────────────────────────────
 
 /// Trim a free-text profile field; blank is "unset", over `max` is refused.

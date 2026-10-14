@@ -597,6 +597,29 @@ pub(crate) enum Commands {
         config: Option<String>,
     },
 
+    /// Take every second factor off an account whose owner can no longer pass it
+    ///
+    /// For an authenticator that is gone, or one a stolen session armed and
+    /// the owner never held: a password reset ends at the second factor, so
+    /// this is the way back in. Every session is signed out, the TOTP factor
+    /// with its unused backup codes and every passkey are removed, and the
+    /// action is journalled. The same work as `POST /admin/users/{id}/mfa/reset`,
+    /// for the instance whose only administrator is the one locked out.
+    ResetMfa {
+        /// The account's username
+        username: String,
+
+        /// Database URL (sqlite://, postgres://, or mysql://)
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
+    },
+
     /// Manage package registry
     Package {
         #[command(subcommand)]
@@ -628,7 +651,8 @@ impl Commands {
             | Self::RestoreDb { config, .. }
             | Self::CreateRepo { config, .. }
             | Self::Import { config, .. }
-            | Self::IndexRepo { config, .. } => StateCreationContract::ServerOwned {
+            | Self::IndexRepo { config, .. }
+            | Self::ResetMfa { config, .. } => StateCreationContract::ServerOwned {
                 config: config.as_deref(),
             },
             Self::Package {
@@ -904,7 +928,8 @@ const AFTER: &str = "after";
             | Commands::BackupDb { db_url, config, .. }
             | Commands::RestoreDb { db_url, config, .. }
             | Commands::RotateInstanceKey { db_url, config, .. }
-            | Commands::RotateEncryptionKey { db_url, config, .. } => {
+            | Commands::RotateEncryptionKey { db_url, config, .. }
+            | Commands::ResetMfa { db_url, config, .. } => {
                 (db_url.as_deref(), None, config.as_deref())
             }
             Commands::CreateRepo {
@@ -965,6 +990,7 @@ const AFTER: &str = "after";
         ],
         &["plombir-git", "index-repo", "alice/site"],
         &["plombir-git", "list-tombstones"],
+        &["plombir-git", "reset-mfa", "alice"],
         &["plombir-git", "package", "list", "alice", "site", "cargo"],
     ];
 

@@ -138,6 +138,7 @@ mod merge_queue_enqueue_state_tests;
 mod merge_queue_handoff_atomicity_tests;
 mod mfa_account_delete_race_tests;
 mod mfa_backup_regenerate_tests;
+mod mfa_change_authorization_tests;
 mod mfa_disable_lockout_tests;
 mod mfa_enable_atomicity_tests;
 mod mfa_reenrolment_tests;

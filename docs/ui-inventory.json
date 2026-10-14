@@ -806,7 +806,8 @@
       "handler": "api::mfa::setup_mfa",
       "testedIn": [
         "rust",
-        "web"
+        "web",
+        "smoke"
       ],
       "reachedFromUi": true
     },
@@ -816,7 +817,8 @@
       "access": "User",
       "handler": "api::mfa::enable_mfa",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke"
       ],
       "reachedFromUi": true
     },
@@ -4866,6 +4868,7 @@
       "browserScenarios": [
         "admin-users-create",
         "admin-users-delete",
+        "admin-users-reset-mfa",
         "admin-users-unlock",
         "admin-users-update"
       ]
@@ -4958,6 +4961,21 @@
       "reachedFromUi": true,
       "browserScenarios": [
         "admin-users-unlock"
+      ]
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/admin/users/{id}/mfa/reset",
+      "access": "InstanceAdmin",
+      "handler": "api::admin::reset_user_mfa",
+      "testedIn": [
+        "web",
+        "smoke",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "admin-users-reset-mfa"
       ]
     },
     {
@@ -24266,7 +24284,7 @@
         {
           "tag": "a",
           "label": "←",
-          "line": 240,
+          "line": 259,
           "via": null,
           "href": "/admin",
           "handler": null,
@@ -24276,7 +24294,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.users.done",
-          "line": 256,
+          "line": 275,
           "via": null,
           "href": null,
           "handler": "() => (issuedPassword = null)",
@@ -24286,7 +24304,7 @@
         {
           "tag": "form",
           "label": "(showCreate = false)}>",
-          "line": 262,
+          "line": 281,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -24334,7 +24352,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 267,
+          "line": 286,
           "via": null,
           "href": null,
           "handler": null,
@@ -24344,7 +24362,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.users.creating",
-          "line": 270,
+          "line": 289,
           "via": null,
           "href": null,
           "handler": null,
@@ -24354,7 +24372,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 271,
+          "line": 290,
           "via": null,
           "href": null,
           "handler": "() => (showCreate = false)",
@@ -24364,7 +24382,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.users.new",
-          "line": 274,
+          "line": 293,
           "via": null,
           "href": null,
           "handler": "() => (showCreate = true)",
@@ -24374,7 +24392,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.users.working",
-          "line": 323,
+          "line": 342,
           "via": null,
           "href": null,
           "handler": "() => handleUnlock(u)",
@@ -24422,7 +24440,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 327,
+          "line": 346,
           "via": null,
           "href": null,
           "handler": "() => openEdit(u)",
@@ -24432,7 +24450,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.users.reset_password",
-          "line": 329,
+          "line": 348,
           "via": null,
           "href": null,
           "handler": "() => handleResetPassword(u)",
@@ -24461,8 +24479,55 @@
         },
         {
           "tag": "button",
+          "label": "i18n:admin.users.reset_mfa",
+          "line": 351,
+          "via": null,
+          "href": null,
+          "handler": "() => handleResetMfa(u)",
+          "calls": [
+            {
+              "symbol": "admin.resetUserMfa",
+              "method": "POST",
+              "url": "/api/v1/admin/users/{id}/mfa/reset",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/users/{id}/mfa/reset",
+              "access": "InstanceAdmin",
+              "handler": "api::admin::reset_user_mfa",
+              "matched": true,
+              "testedIn": [
+                "web",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "admin-users-reset-mfa"
+              ]
+            },
+            {
+              "symbol": "admin.listUsers",
+              "method": "GET",
+              "url": "/api/v1/admin/users",
+              "opaque": false,
+              "routeUrl": "/api/v1/admin/users",
+              "access": "InstanceAdmin",
+              "handler": "api::admin::list_users",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "admin-users-reset-mfa"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
           "label": "i18n:common.delete",
-          "line": 332,
+          "line": 354,
           "via": null,
           "href": null,
           "handler": "() => confirmDelete(u)",
@@ -24472,7 +24537,7 @@
         {
           "tag": "button",
           "label": "i18n:common.prev_arrow",
-          "line": 344,
+          "line": 366,
           "via": null,
           "href": null,
           "handler": "prevPage",
@@ -24497,7 +24562,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next_arrow",
-          "line": 346,
+          "line": 368,
           "via": null,
           "href": null,
           "handler": "nextPage",
@@ -24522,7 +24587,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 369,
+          "line": 391,
           "via": null,
           "href": null,
           "handler": null,
@@ -24532,7 +24597,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 374,
+          "line": 396,
           "via": null,
           "href": null,
           "handler": null,
@@ -24542,7 +24607,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 378,
+          "line": 400,
           "via": null,
           "href": null,
           "handler": null,
@@ -24552,7 +24617,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 384,
+          "line": 406,
           "via": null,
           "href": null,
           "handler": "handleSave",
@@ -24600,7 +24665,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 387,
+          "line": 409,
           "via": null,
           "href": null,
           "handler": "closeEdit",
@@ -24610,7 +24675,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 405,
+          "line": 427,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -24658,7 +24723,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 408,
+          "line": 430,
           "via": null,
           "href": null,
           "handler": "() => showDeleteConfirm = false",
@@ -27685,7 +27750,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.retry",
-          "line": 401,
+          "line": 422,
           "via": null,
           "href": null,
           "handler": "loadBackupStatus",
@@ -27710,7 +27775,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.mfa.current_password",
-          "line": 416,
+          "line": 437,
           "via": null,
           "href": null,
           "handler": "regenerateBackupCodes",
@@ -27790,7 +27855,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.working",
-          "line": 426,
+          "line": 449,
           "via": null,
           "href": null,
           "handler": null,
@@ -27800,7 +27865,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.mfa.current_password",
-          "line": 434,
+          "line": 457,
           "via": null,
           "href": null,
           "handler": "disableMfa",
@@ -27880,7 +27945,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.disabling",
-          "line": 439,
+          "line": 464,
           "via": null,
           "href": null,
           "handler": null,
@@ -27890,7 +27955,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.starting",
-          "line": 445,
+          "line": 470,
           "via": null,
           "href": null,
           "handler": "startSetup",
@@ -27906,7 +27971,8 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web"
+                "web",
+                "smoke"
               ]
             }
           ],
@@ -27915,7 +27981,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.retry",
-          "line": 475,
+          "line": 500,
           "via": null,
           "href": null,
           "handler": "loadPasskeyList",
@@ -27940,7 +28006,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.remove",
-          "line": 489,
+          "line": 514,
           "via": null,
           "href": null,
           "handler": "() => removePasskey(key.id)",
@@ -27964,7 +28030,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.passkeys.name",
-          "line": 504,
+          "line": 529,
           "via": null,
           "href": null,
           "handler": "addPasskey",
@@ -27974,7 +28040,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.waiting",
-          "line": 514,
+          "line": 539,
           "via": null,
           "href": null,
           "handler": null,
@@ -27984,7 +28050,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.retry",
-          "line": 542,
+          "line": 567,
           "via": null,
           "href": null,
           "handler": "loadSsoLinks",
@@ -28009,7 +28075,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.unlink",
-          "line": 557,
+          "line": 582,
           "via": null,
           "href": null,
           "handler": "() => unlinkSsoProvider(link)",
@@ -28034,7 +28100,7 @@
         {
           "tag": "button",
           "label": ")}",
-          "line": 575,
+          "line": 600,
           "via": null,
           "href": null,
           "handler": "() => linkSsoProvider(provider)",
@@ -28059,7 +28125,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.setup.code",
-          "line": 598,
+          "line": 623,
           "via": null,
           "href": null,
           "handler": "enableMfa",
@@ -28074,7 +28140,8 @@
               "handler": "api::mfa::enable_mfa",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             },
             {
@@ -28139,7 +28206,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.setup.verifying",
-          "line": 603,
+          "line": 634,
           "via": null,
           "href": null,
           "handler": null,
@@ -28149,7 +28216,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.backup.copy",
-          "line": 619,
+          "line": 650,
           "via": null,
           "href": null,
           "handler": "copyBackupCodes",
@@ -28177,7 +28244,23 @@
           "unresolved": true
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "auth.me",
+          "method": "GET",
+          "url": "/api/v1/users/me",
+          "opaque": false,
+          "routeUrl": "/api/v1/users/me",
+          "access": "User",
+          "handler": "api::users::me",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web",
+            "smoke"
+          ]
+        }
+      ]
     },
     {
       "route": "/settings/signing-keys",
@@ -28623,10 +28706,10 @@
       "owner",
       "outsider"
     ],
-    "scenarios": 49,
-    "inventoryEntries": 798,
-    "coveredEntries": 184,
-    "coveredRoutes": 175,
-    "maxUiRoutesWithoutFrontendTest": 26
+    "scenarios": 50,
+    "inventoryEntries": 801,
+    "coveredEntries": 186,
+    "coveredRoutes": 176,
+    "maxUiRoutesWithoutFrontendTest": 25
   }
 }

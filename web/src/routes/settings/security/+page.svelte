@@ -41,8 +41,14 @@
   type Unknown = typeof UNKNOWN;
 
   let backupStatus = $state<MfaBackupStatus | Unknown | null>(null);
+  // An account whose password lives with its SSO provider or its directory
+  // has no password field to fill here: the server asks for sudo mode
+  // instead, and the confirmation prompt handles that (decision #5). Until
+  // `/users/me` answers, the field is shown, which is the stricter guess.
+  let hasPassword = $state(true);
   let setup = $state<MfaSetupResponse | null>(null);
   let verificationCode = $state('');
+  let enablePassword = $state('');
   let disablePassword = $state('');
   let regeneratePassword = $state('');
   let newBackupCodes = $state<string[]>([]);
@@ -98,7 +104,17 @@
     }
     ssoError = readSsoError(window.location.search);
     loadSecurity();
+    void loadPasswordKind();
   });
+
+  async function loadPasswordKind() {
+    try {
+      const me = await auth.me();
+      hasPassword = me?.has_password !== false;
+    } catch {
+      // Unread: keep asking for the password, the stricter guess.
+    }
+  }
 
   async function loadSecurity() {
     const claim = securityRequests.begin('security-load');
@@ -271,15 +287,20 @@
       error = t('account_security.mfa.code_required');
       return;
     }
+    if (hasPassword && !enablePassword) {
+      error = t('account_security.password_required');
+      return;
+    }
 
     try {
       saving = true;
       error = '';
       success = '';
-      const result = await mfa.enable(verificationCode.trim());
+      const result = await mfa.enable(verificationCode.trim(), hasPassword ? enablePassword : undefined);
       newBackupCodes = result.backup_codes;
       setup = null;
       verificationCode = '';
+      enablePassword = '';
       success = t('account_security.mfa.enabled_notice');
       await loadSecurity();
     } catch (err: any) {
@@ -292,7 +313,7 @@
   async function disableMfa(event: SubmitEvent) {
     event.preventDefault();
     if (saving) return;
-    if (!disablePassword) {
+    if (hasPassword && !disablePassword) {
       error = t('account_security.password_required');
       return;
     }
@@ -306,7 +327,7 @@
       saving = true;
       error = '';
       success = '';
-      await mfa.disable(disablePassword);
+      await mfa.disable(hasPassword ? disablePassword : undefined);
       disablePassword = '';
       newBackupCodes = [];
       setup = null;
@@ -322,7 +343,7 @@
   async function regenerateBackupCodes(event: SubmitEvent) {
     event.preventDefault();
     if (saving) return;
-    if (!regeneratePassword) {
+    if (hasPassword && !regeneratePassword) {
       error = t('account_security.password_required');
       return;
     }
@@ -336,7 +357,7 @@
       saving = true;
       error = '';
       success = '';
-      const result = await mfa.regenerateBackup(regeneratePassword);
+      const result = await mfa.regenerateBackup(hasPassword ? regeneratePassword : undefined);
       regeneratePassword = '';
       newBackupCodes = result.backup_codes;
       success = t('account_security.mfa.regenerated_notice');
@@ -414,16 +435,18 @@
       </div>
 
       <form class="disable-form" onsubmit={regenerateBackupCodes}>
-        <label>
-          {t('account_security.mfa.current_password')}
-          <input
-            type="password"
-            bind:value={regeneratePassword}
-            autocomplete="current-password"
-            disabled={saving}
-          />
-        </label>
-        <button type="submit" class="btn btn-secondary" disabled={saving || !regeneratePassword}>
+        {#if hasPassword}
+          <label>
+            {t('account_security.mfa.current_password')}
+            <input
+              type="password"
+              bind:value={regeneratePassword}
+              autocomplete="current-password"
+              disabled={saving}
+            />
+          </label>
+        {/if}
+        <button type="submit" class="btn btn-secondary" disabled={saving || (hasPassword && !regeneratePassword)}>
           {saving ? t('account_security.mfa.working') : t('account_security.mfa.regenerate')}
         </button>
       </form>
@@ -432,11 +455,13 @@
       </p>
 
       <form class="disable-form" onsubmit={disableMfa}>
-        <label>
-          {t('account_security.mfa.current_password')}
-          <input type="password" bind:value={disablePassword} autocomplete="current-password" disabled={saving} />
-        </label>
-        <button type="submit" class="btn btn-danger" disabled={saving || !disablePassword}>
+        {#if hasPassword}
+          <label>
+            {t('account_security.mfa.current_password')}
+            <input type="password" bind:value={disablePassword} autocomplete="current-password" disabled={saving} />
+          </label>
+        {/if}
+        <button type="submit" class="btn btn-danger" disabled={saving || (hasPassword && !disablePassword)}>
           {saving ? t('account_security.mfa.disabling') : t('account_security.mfa.disable')}
         </button>
       </form>
@@ -600,7 +625,13 @@
               {t('account_security.setup.code')}
               <input inputmode="numeric" autocomplete="one-time-code" bind:value={verificationCode} disabled={saving} />
             </label>
-            <button type="submit" class="btn btn-primary" disabled={saving || !verificationCode.trim()}>
+            {#if hasPassword}
+              <label>
+                {t('account_security.mfa.current_password')}
+                <input type="password" bind:value={enablePassword} autocomplete="current-password" disabled={saving} />
+              </label>
+            {/if}
+            <button type="submit" class="btn btn-primary" disabled={saving || !verificationCode.trim() || (hasPassword && !enablePassword)}>
               {saving ? t('account_security.setup.verifying') : t('account_security.setup.enable')}
             </button>
           </form>

@@ -101,12 +101,22 @@ if (!clientImport) {
   }
 }
 expect(page, /mfa\.setup\(\)/, 'Security page must call mfa.setup() for QR enrollment');
-expect(page, /mfa\.enable\(verificationCode\.trim\(\)\)/, 'Security page must enable MFA with the entered code');
-expect(page, /mfa\.backup\(\)/, 'Security page must load backup code status');
-expect(page, /mfa\.disable\(disablePassword\)/, 'Security page must disable MFA with current password');
+// Every enrolment of an account with a password confirms it (decision #5);
+// one without a password here sends none and is asked for sudo mode instead.
 expect(
   page,
-  /mfa\.regenerateBackup\(regeneratePassword\)/,
+  /mfa\.enable\(verificationCode\.trim\(\), hasPassword \? enablePassword : undefined\)/,
+  'Security page must enable MFA with the entered code and, for an account with one, the password',
+);
+expect(page, /mfa\.backup\(\)/, 'Security page must load backup code status');
+expect(
+  page,
+  /mfa\.disable\(hasPassword \? disablePassword : undefined\)/,
+  'Security page must disable MFA with the current password of an account that has one',
+);
+expect(
+  page,
+  /mfa\.regenerateBackup\(hasPassword \? regeneratePassword : undefined\)/,
   'Security page must offer a backup-code re-issue confirmed by the current password',
 );
 expect(page, /{@html setup\.qr_svg}/, 'Security page must render backend QR SVG from setup response');

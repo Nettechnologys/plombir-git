@@ -30,7 +30,7 @@ use tracing;
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{AuthUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{require_sudo, AuthUser, LoginSession, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -250,19 +250,22 @@ const PENDING_ENROLMENT_TTL: chrono::Duration = chrono::Duration::minutes(30);
     responses(
         (status = 200, description = "TOTP secret and QR code generated", body = SetupMfaResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "A personal access token, or, for an account with no password here, a session outside its sudo window (`reason: sudo_required`)"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
     ),
 )]
 pub async fn setup_mfa(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    LoginSession { user_id, claims }: LoginSession,
+    headers: HeaderMap,
 ) -> Result<Json<SetupMfaResponse>, AppError> {
     // Get username to include in TOTP label
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("user not found"))?;
+    authorize_mfa_change(&state, &headers, &claims, &user, None, "mfa-setup").await?;
 
     let (secret, otpauth_url, _qr_text) =
         rg_core::auth::totp::generate_secret(&user.username, "Plombir Git").map_err(|e| {
@@ -303,15 +306,11 @@ pub async fn setup_mfa(
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct EnableMfaRequest {
     code: String,
-    /// The account password, required only when this call would *replace* a
-    /// second factor that is currently protecting the account.
-    ///
-    /// Optional on a first enrolment: there the caller is adding a protection,
-    /// not removing one, and the session they already hold is what authorises
-    /// it. On a rotation the same call retires the authenticator the account is
-    /// standing on, which is the event `POST /users/mfa/disable` asks for a
-    /// password before allowing — a stolen session must not be enough to move
-    /// the second factor onto the thief's own phone.
+    /// The account password, on every enrolment and rotation of an account
+    /// that has one. A first enrolment is not harmless: an authenticator the
+    /// owner never held locks them out at the next sign-in, so a stolen
+    /// session must not be enough to arm one. An account without a password
+    /// here sends none and must be in sudo mode instead.
     #[serde(default)]
     password: Option<String>,
 }
@@ -333,13 +332,14 @@ pub struct EnableMfaResponse {
         (status = 200, description = "MFA enabled successfully with backup codes", body = EnableMfaResponse),
         (status = 400, description = "Invalid TOTP code, no setup in flight, or a replacement without the account password"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "A personal access token, or, for an account with no password here, a session outside its sudo window (`reason: sudo_required`)"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
     ),
 )]
 pub async fn enable_mfa(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    LoginSession { user_id, claims }: LoginSession,
     headers: HeaderMap,
     Json(req): Json<EnableMfaRequest>,
 ) -> Result<Json<EnableMfaResponse>, AppError> {
@@ -363,18 +363,21 @@ pub async fn enable_mfa(
         ));
     }
 
-    // The step that retires the live factor, so it is the step that asks for a
-    // password — the same question `POST /users/mfa/disable` asks, for the same
-    // event. A first enrolment protects an account that has no second factor
-    // yet and answers no such question.
-    if user.mfa_enabled {
-        let Some(password) = req.password.as_deref().filter(|p| !p.is_empty()) else {
-            return Err(AppError::bad_request(
-                "replacing the current authenticator requires the account password",
-            ));
-        };
-        confirm_account_password(&state, &user, password, "mfa-rotate", &headers).await?;
-    }
+    // Asked on every enrolment, not only on the rotation that retires a live
+    // factor: arming one the owner never held is the lockout.
+    authorize_mfa_change(
+        &state,
+        &headers,
+        &claims,
+        &user,
+        Some(req.password.as_deref()),
+        if user.mfa_enabled {
+            "mfa-rotate"
+        } else {
+            "mfa-enable"
+        },
+    )
+    .await?;
 
     // Decrypt the staged TOTP secret
     let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
@@ -606,7 +609,10 @@ pub async fn get_backup_codes(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct DisableMfaRequest {
-    password: String,
+    /// The account password; an account without one here sends none and must
+    /// be in sudo mode instead.
+    #[serde(default)]
+    password: Option<String>,
 }
 
 /// Re-confirm the account password on a door that sits *behind* a session.
@@ -621,6 +627,39 @@ pub struct DisableMfaRequest {
 ///
 /// `channel` names the door in the attempt record; the strike itself is the
 /// account-wide one `POST /users/login`, SSH and `docker login` record.
+/// Authorise a change to the account's second factor, from a login session
+/// (never a PAT — the extractor already refused one).
+///
+/// An account with a password of its own re-proves it, through the
+/// lockout-aware door. One whose password lives with its SSO provider or its
+/// directory has nothing to send here, so it must be in sudo mode instead —
+/// fresh from a provider sign-in, a directory bind or a passkey (decision #5,
+/// on top of #10). Without either, a stolen session could enrol an
+/// authenticator the owner never held and lock them out.
+///
+/// `password` is `None` on a step that asks for no password of a local
+/// account (`setup` stages a secret nothing reads yet; `enable` is where the
+/// password is asked).
+async fn authorize_mfa_change(
+    state: &AppState,
+    headers: &HeaderMap,
+    claims: &rg_core::auth::jwt::Claims,
+    user: &rg_db::entities::user::Model,
+    password: Option<Option<&str>>,
+    channel: &'static str,
+) -> Result<(), AppError> {
+    if !has_local_password(user) {
+        return require_sudo(claims);
+    }
+    match password {
+        None => Ok(()),
+        Some(password) => {
+            let password = password.unwrap_or_default();
+            confirm_account_password(state, user, password, channel, headers).await
+        }
+    }
+}
+
 /// Whether the account has a password of its own here. An account created
 /// through an SSO provider or a directory has an empty hash: its password, if
 /// any, lives with the provider.
@@ -698,7 +737,9 @@ pub(crate) async fn confirm_account_password(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RegenerateBackupCodesRequest {
-    password: String,
+    /// As for [`DisableMfaRequest::password`].
+    #[serde(default)]
+    password: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -721,6 +762,7 @@ pub struct RegenerateBackupCodesResponse {
         (status = 200, description = "New backup codes, shown once", body = RegenerateBackupCodesResponse),
         (status = 400, description = "MFA is not enabled for this account"),
         (status = 401, description = "Unauthorized, invalid password, or account temporarily locked"),
+        (status = 403, description = "A personal access token, or, for an account with no password here, a session outside its sudo window (`reason: sudo_required`)"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Password verification is at capacity — retry shortly"),
@@ -728,7 +770,7 @@ pub struct RegenerateBackupCodesResponse {
 )]
 pub async fn regenerate_backup_codes(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    LoginSession { user_id, claims }: LoginSession,
     headers: HeaderMap,
     Json(req): Json<RegenerateBackupCodesRequest>,
 ) -> Result<Json<RegenerateBackupCodesResponse>, AppError> {
@@ -741,12 +783,13 @@ pub async fn regenerate_backup_codes(
         return Err(AppError::bad_request("MFA is not enabled for this account"));
     }
 
-    confirm_account_password(
+    authorize_mfa_change(
         &state,
-        &user,
-        &req.password,
-        "mfa-backup-regenerate",
         &headers,
+        &claims,
+        &user,
+        Some(req.password.as_deref()),
+        "mfa-backup-regenerate",
     )
     .await?;
 
@@ -792,6 +835,7 @@ pub async fn regenerate_backup_codes(
     responses(
         (status = 200, description = "MFA disabled successfully"),
         (status = 401, description = "Unauthorized, invalid password, or account temporarily locked"),
+        (status = 403, description = "A personal access token, or, for an account with no password here, a session outside its sudo window (`reason: sudo_required`)"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Password verification is at capacity — retry shortly"),
@@ -799,7 +843,7 @@ pub async fn regenerate_backup_codes(
 )]
 pub async fn disable_mfa(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    LoginSession { user_id, claims }: LoginSession,
     headers: HeaderMap,
     Json(req): Json<DisableMfaRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -819,7 +863,15 @@ pub async fn disable_mfa(
     // the same lock from the login form — and a door-local counter would not
     // stop the guessed password from being used everywhere else, which is the
     // point of guessing it.
-    confirm_account_password(&state, &user, &req.password, "mfa-disable", &headers).await?;
+    authorize_mfa_change(
+        &state,
+        &headers,
+        &claims,
+        &user,
+        Some(req.password.as_deref()),
+        "mfa-disable",
+    )
+    .await?;
 
     let audit_actor = grant_actor(&state, user_id).await?;
 

@@ -664,6 +664,7 @@ Beyond `serve`, the `plombir-git` binary offers:
 | `index-repo <owner/name>` | Index a repository for code search |
 | `package` | Manage the package registry (`package list` requires a stopped server on file-backed SQLite) |
 | `list-tombstones` | Report the bytes interrupted deletions left in the storage root (reports only — moves, removes and creates nothing) |
+| `reset-mfa <username>` | Take every second factor (authenticator, backup codes, passkeys) off an account whose owner is locked out, and sign its sessions out — for when no other administrator can use `POST /admin/users/{id}/mfa/reset` |
 
 `create-repo` creates only a bare Git directory, with **no database row**. Use
 it for filesystem-level testing, not to create a repository users can clone
@@ -677,7 +678,7 @@ start.
 Every subcommand that touches the database or the repository directory
 (`migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,
 `rotate-encryption-key`, `create-repo`, `import`, `index-repo`, `list-tombstones`,
-`package list`)
+`reset-mfa`, `package list`)
 takes the same `--config` as `serve` and resolves `--db-url` / `--repo-root` as
 **CLI arg > config file > built-in default**. On a config-file deployment, pass
 `--config` rather than repeating the URL: with neither,

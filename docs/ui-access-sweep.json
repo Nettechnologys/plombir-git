@@ -5,7 +5,7 @@
     "outsider"
   ],
   "ratchet": {
-    "maxUiRoutesWithoutFrontendTest": 26
+    "maxUiRoutesWithoutFrontendTest": 25
   },
   "scenarios": [
     {
@@ -1171,7 +1171,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "() => handleUnlock(u)",
-          "line": 323,
+          "line": 342,
           "symbol": "admin.unlockUser",
           "method": "POST",
           "routeUrl": "/api/v1/admin/users/{id}/unlock",
@@ -1181,7 +1181,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "() => handleUnlock(u)",
-          "line": 323,
+          "line": 342,
           "symbol": "admin.listUsers",
           "method": "GET",
           "routeUrl": "/api/v1/admin/users",
@@ -1200,7 +1200,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "handleSave",
-          "line": 384,
+          "line": 406,
           "symbol": "admin.updateUser",
           "method": "PATCH",
           "routeUrl": "/api/v1/admin/users/{id}",
@@ -1210,7 +1210,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "handleSave",
-          "line": 384,
+          "line": 406,
           "symbol": "admin.listUsers",
           "method": "GET",
           "routeUrl": "/api/v1/admin/users",
@@ -1229,7 +1229,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "handleCreate",
-          "line": 262,
+          "line": 281,
           "symbol": "admin.createUser",
           "method": "POST",
           "routeUrl": "/api/v1/admin/users",
@@ -1239,7 +1239,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "handleCreate",
-          "line": 262,
+          "line": 281,
           "symbol": "admin.listUsers",
           "method": "GET",
           "routeUrl": "/api/v1/admin/users",
@@ -1258,10 +1258,39 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "() => handleResetPassword(u)",
-          "line": 329,
+          "line": 348,
           "symbol": "admin.resetUserPassword",
           "method": "POST",
           "routeUrl": "/api/v1/admin/users/{id}/password-reset",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-users-reset-mfa",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/users",
+          "kind": "control",
+          "control": "() => handleResetMfa(u)",
+          "line": 351,
+          "symbol": "admin.resetUserMfa",
+          "method": "POST",
+          "routeUrl": "/api/v1/admin/users/{id}/mfa/reset",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/users",
+          "kind": "control",
+          "control": "() => handleResetMfa(u)",
+          "line": 351,
+          "symbol": "admin.listUsers",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/users",
           "access": "InstanceAdmin"
         }
       ]
@@ -1277,7 +1306,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "handleDelete",
-          "line": 405,
+          "line": 427,
           "symbol": "admin.deleteUser",
           "method": "DELETE",
           "routeUrl": "/api/v1/admin/users/{id}",
@@ -1287,7 +1316,7 @@
           "page": "/admin/users",
           "kind": "control",
           "control": "handleDelete",
-          "line": 405,
+          "line": 427,
           "symbol": "admin.listUsers",
           "method": "GET",
           "routeUrl": "/api/v1/admin/users",

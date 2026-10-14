@@ -11,6 +11,8 @@ export interface AdminUser {
   is_admin: boolean;
   is_active: boolean;
   auth_provider: string;
+  /** Whether a TOTP factor is enrolled — what the "Reset MFA" action needs. */
+  mfa_enabled?: boolean;
   last_login_at: string | null;
   login_attempts: number;
   locked_until: string | null;
@@ -177,6 +179,11 @@ export const admin = {
     }),
   unlockUser: (id: number) =>
     request<AdminUser>(`/admin/users/${id}/unlock`, { method: 'POST' }),
+  // Takes every second factor (authenticator, backup codes, passkeys) off an
+  // account whose owner is locked out and signs its sessions out. Needs sudo
+  // mode, which `request` asks for when the server says so.
+  resetUserMfa: (id: number) =>
+    request<AdminUser>(`/admin/users/${id}/mfa/reset`, { method: 'POST' }),
   deleteUser: (id: number) =>
     request<{ deleted: boolean }>(`/admin/users/${id}`, { method: 'DELETE' }),
   listOrgs: (page?: number, perPage?: number) =>

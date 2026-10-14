@@ -101,7 +101,13 @@ async fn enable(
 /// Enrol TOTP over the real endpoints and hand back the live secret.
 async fn enrol(base: &str, token: &str) -> String {
     let secret = setup(base, token).await;
-    let (status, body) = enable(base, token, &code_for_step(&secret, current_step()), None).await;
+    let (status, body) = enable(
+        base,
+        token,
+        &code_for_step(&secret, current_step()),
+        Some(PASSWORD),
+    )
+    .await;
     assert_eq!(status, 200, "first enrolment must succeed: {body}");
     secret
 }
@@ -387,6 +393,12 @@ async fn a_stale_setup_cannot_arm_a_factor() {
     // And starting again works: the window is a bound on one enrolment, not a
     // way to wedge the account out of ever getting a second factor.
     let fresh = setup(&base, &token).await;
-    let (retried, body) = enable(&base, &token, &code_for_step(&fresh, current_step()), None).await;
+    let (retried, body) = enable(
+        &base,
+        &token,
+        &code_for_step(&fresh, current_step()),
+        Some(PASSWORD),
+    )
+    .await;
     assert_eq!(retried, 200, "a restarted enrolment must succeed: {body}");
 }

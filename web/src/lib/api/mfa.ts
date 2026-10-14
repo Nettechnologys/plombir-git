@@ -24,19 +24,22 @@ export interface MfaBackupStatus {
 export const mfa = {
   setup: () =>
     request<MfaSetupResponse>('/users/mfa/setup', { method: 'POST' }),
-  enable: (code: string) =>
+  // `password` is the account's own; an account without one here sends none
+  // and the server asks for sudo mode instead, which `request` turns into the
+  // confirmation prompt.
+  enable: (code: string, password?: string) =>
     request<MfaEnableResponse>('/users/mfa/enable', {
       method: 'POST',
-      body: JSON.stringify({ code }),
+      body: JSON.stringify({ code, password }),
     }),
   backup: () =>
     request<MfaBackupStatus>('/users/mfa/backup'),
-  regenerateBackup: (password: string) =>
+  regenerateBackup: (password?: string) =>
     request<MfaRegenerateBackupResponse>('/users/mfa/backup/regenerate', {
       method: 'POST',
       body: JSON.stringify({ password }),
     }),
-  disable: (password: string) =>
+  disable: (password?: string) =>
     request<void>('/users/mfa/disable', {
       method: 'POST',
       body: JSON.stringify({ password }),

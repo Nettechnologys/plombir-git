@@ -596,7 +596,9 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// owner to the authenticated user and deletes with both id and user id.
 /// 141 since the bounded CI job-log route takes a pipeline id and a job id;
 /// `pipeline_in_repo` and `job_belongs_to_pipeline` anchor both before reply.
-const CENSUS_TOTAL: usize = 153;
+/// 154 since decision #5: `api::admin::reset_user_mfa` takes a user id behind
+/// `InstanceAdmin`, for the reason `reset_user_password` does.
+const CENSUS_TOTAL: usize = 154;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.
@@ -982,6 +984,9 @@ fn scoped_bindings(function: &Function) -> HashSet<String> {
         ("org:", 4),
         ("actor_id:", 9),
         ("AuthUser(", 9),
+        ("SessionUser(", 12),
+        ("SudoUser(", 9),
+        ("LoginSession { ", 15),
     ] {
         if let Some(at) = sig.find(marker) {
             let rest = sig[at + offset..].trim_start();

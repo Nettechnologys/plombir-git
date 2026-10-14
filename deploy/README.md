@@ -499,7 +499,7 @@ docker compose up -d plombir-git
 If you deploy with a config file, pass `--config /app/plombir-git.toml` instead of
 `--db-url`: every DB-touching subcommand (`migrate`, `rebuild-fts`, `backup-db`,
 `restore-db`, `rotate-instance-key`, `rotate-encryption-key`, `import`,
-`index-repo`, `package list`) reads `[database].url` from it, so the admin
+`index-repo`, `reset-mfa`, `package list`) reads `[database].url` from it, so the admin
 command and the server cannot end up pointed at two different databases.
 Passing **neither** falls back to `sqlite://./plombir-git.db?mode=rwc` relative to
 the current directory — the container's `WORKDIR /app` unless `docker exec -w`

@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{AuthUser, SudoUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{AuthUser, SessionUser, SudoUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 use rg_core::auth::webauthn as wa;
@@ -757,7 +757,7 @@ pub async fn list_passkeys(
 )]
 pub async fn delete_passkey(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    SessionUser(user_id): SessionUser,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {

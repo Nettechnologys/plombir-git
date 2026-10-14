@@ -62,9 +62,9 @@ const GATEWAY = 'crates/rg-cli/src/dbconn.rs';
 const ONLINE_POOL_COMMANDS = [
   {
     file: 'crates/rg-cli/src/commands.rs',
-    sites: 2,
-    commands: ['plombir-git rotate-instance-key', 'plombir-git index-repo'],
-    why: 'one writes a single row through one statement; the other runs exactly what `POST /repos/{owner}/{repo}/ai/index` runs on request',
+    sites: 3,
+    commands: ['plombir-git rotate-instance-key', 'plombir-git index-repo', 'plombir-git reset-mfa'],
+    why: 'one writes a single row through one statement; the others run exactly what `POST /repos/{owner}/{repo}/ai/index` and `POST /admin/users/{id}/mfa/reset` run on request',
   },
   {
     file: 'crates/rg-cli/src/admin.rs',

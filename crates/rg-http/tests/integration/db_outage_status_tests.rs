@@ -223,10 +223,30 @@ async fn db_outage_in_mfa_setup_returns_503_after_live_handler_probe() {
     std::fs::create_dir_all(&repo_root).expect("create test repo root");
     let state = build_test_app_state(db.clone(), repo_root);
 
-    let healthy =
-        rg_http::api::mfa::setup_mfa(State(state.clone()), rg_http::api::auth::AuthUser(user.id))
-            .await
-            .into_response();
+    // The fixture account has no password here, so a change to its second
+    // factor needs a session in sudo mode.
+    let session = || rg_http::api::auth::LoginSession {
+        user_id: user.id,
+        claims: rg_core::auth::jwt::validate_token(
+            &rg_core::auth::jwt::generate_authenticated_token(
+                user.id,
+                &user.username,
+                user.session_version,
+                "test-secret-key",
+                7,
+            )
+            .unwrap(),
+            "test-secret-key",
+        )
+        .unwrap(),
+    };
+    let healthy = rg_http::api::mfa::setup_mfa(
+        State(state.clone()),
+        session(),
+        axum::http::HeaderMap::new(),
+    )
+    .await
+    .into_response();
     assert_eq!(healthy.status(), StatusCode::OK);
     let healthy_body = axum::body::to_bytes(healthy.into_body(), usize::MAX)
         .await
@@ -242,9 +262,10 @@ async fn db_outage_in_mfa_setup_returns_503_after_live_handler_probe() {
 
     db.close().await.expect("close MFA fixture pool");
 
-    let outage = rg_http::api::mfa::setup_mfa(State(state), rg_http::api::auth::AuthUser(user.id))
-        .await
-        .into_response();
+    let outage =
+        rg_http::api::mfa::setup_mfa(State(state), session(), axum::http::HeaderMap::new())
+            .await
+            .into_response();
     assert_eq!(
         outage.status(),
         StatusCode::SERVICE_UNAVAILABLE,
