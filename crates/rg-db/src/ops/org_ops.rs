@@ -28,10 +28,26 @@ pub async fn create_org(
         updated_at: Set(now),
         ..Default::default()
     };
-    let result = model.insert(db).await.context("db: create org")?;
-
-    // Auto-add the owner as an org member with "owner" role
-    add_org_member(db, result.id, owner_id, "owner").await?;
+    // One transaction: the creator's `owner` membership is the only thing that
+    // makes the organization manageable — `organizations.owner_id` grants
+    // nothing — so a failure between the two inserts used to leave an
+    // organization nobody could administer, delete or hand over.
+    let transaction = db.begin().await.context("db: begin org creation")?;
+    let result = model.insert(&transaction).await.context("db: create org")?;
+    organization_member::ActiveModel {
+        org_id: Set(result.id),
+        user_id: Set(owner_id),
+        role: Set("owner".to_string()),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&transaction)
+    .await
+    .context("db: add the creator as the org's owner")?;
+    transaction
+        .commit()
+        .await
+        .context("db: commit org creation")?;
 
     Ok(result)
 }
@@ -360,15 +376,174 @@ pub async fn add_org_member(
     model.insert(db).await.context("db: add org member")
 }
 
-/// Remove a member from an organization. Returns whether a row was removed.
-pub async fn remove_org_member(db: &DatabaseConnection, org_id: i64, user_id: i64) -> Result<bool> {
-    let result = organization_member::Entity::delete_many()
+/// What [`remove_org_member`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOrgMemberOutcome {
+    Removed,
+    /// The account holds no membership in the organization.
+    NotMember,
+    /// The membership is the organization's last `owner` role and stays: an
+    /// organization without one can no longer be deleted or given an owner.
+    LastOwner,
+}
+
+/// Remove `user_id`'s membership of `org_id`, unless it is the last `owner`.
+///
+/// One transaction, serialized per organization: its first statement writes
+/// the organization row, which locks that row on PostgreSQL and MySQL and
+/// takes the single writer slot on SQLite. Two owners removing each other at
+/// once therefore cannot both see the other still there and leave nobody.
+///
+/// When the account leaving is the one `organizations.owner_id` names, the
+/// column moves to a remaining owner in the same transaction, together with
+/// every repository of the organization whose `owner_id` names the account:
+/// that column carries `ON DELETE CASCADE`, so a row left naming a departed
+/// member would be destroyed with that member's account later. Neither column
+/// grants anything; they are kept pointing at someone who still belongs.
+pub async fn remove_org_member(
+    db: &DatabaseConnection,
+    org_id: i64,
+    user_id: i64,
+) -> Result<RemoveOrgMemberOutcome> {
+    use crate::entities::repository;
+
+    let transaction = db.begin().await.context("db: begin org member removal")?;
+    let org_rows = organization::Entity::update_many()
+        .col_expr(
+            organization::Column::UpdatedAt,
+            Expr::col(organization::Column::UpdatedAt).into(),
+        )
+        .filter(organization::Column::Id.eq(org_id))
+        .exec(&transaction)
+        .await
+        .context("db: lock the org whose member is removed")?;
+    let member = organization_member::Entity::find()
         .filter(organization_member::Column::OrgId.eq(org_id))
         .filter(organization_member::Column::UserId.eq(user_id))
-        .exec(db)
+        .one(&transaction)
+        .await
+        .context("db: read the org member to remove")?;
+    let Some(member) = member.filter(|_| org_rows.rows_affected > 0) else {
+        transaction
+            .rollback()
+            .await
+            .context("db: roll back removing a non-member")?;
+        return Ok(RemoveOrgMemberOutcome::NotMember);
+    };
+
+    let successor = if member.role == "owner" {
+        let successor = organization_member::Entity::find()
+            .filter(organization_member::Column::OrgId.eq(org_id))
+            .filter(organization_member::Column::Role.eq("owner"))
+            .filter(organization_member::Column::UserId.ne(user_id))
+            .order_by_asc(organization_member::Column::Id)
+            .one(&transaction)
+            .await
+            .context("db: find the org's other owners")?;
+        let Some(successor) = successor else {
+            transaction
+                .rollback()
+                .await
+                .context("db: roll back removing the last owner")?;
+            return Ok(RemoveOrgMemberOutcome::LastOwner);
+        };
+        Some(successor.user_id)
+    } else {
+        None
+    };
+
+    organization_member::Entity::delete_by_id(member.id)
+        .exec(&transaction)
         .await
         .context("db: remove org member")?;
-    Ok(result.rows_affected > 0)
+
+    let mut recorded = organization::Entity::find_by_id(org_id)
+        .one(&transaction)
+        .await
+        .context("db: read the org's recorded owner")?
+        .map_or(user_id, |org| org.owner_id);
+    if recorded == user_id {
+        // `successor` is set when the leaving member held the `owner` role;
+        // a recorded owner holding another role (data from before the role
+        // was the rule) hands the column to any remaining owner.
+        let next = match successor {
+            Some(successor) => Some(successor),
+            None => organization_member::Entity::find()
+                .filter(organization_member::Column::OrgId.eq(org_id))
+                .filter(organization_member::Column::Role.eq("owner"))
+                .order_by_asc(organization_member::Column::Id)
+                .one(&transaction)
+                .await
+                .context("db: find an owner to record")?
+                .map(|owner| owner.user_id),
+        };
+        if let Some(next) = next {
+            organization::Entity::update_many()
+                .col_expr(organization::Column::OwnerId, Expr::value(next))
+                .filter(organization::Column::Id.eq(org_id))
+                .exec(&transaction)
+                .await
+                .context("db: record the org's new owner")?;
+            recorded = next;
+        }
+    }
+    if recorded != user_id {
+        repository::Entity::update_many()
+            .col_expr(repository::Column::OwnerId, Expr::value(recorded))
+            .filter(repository::Column::OrgId.eq(org_id))
+            .filter(repository::Column::OwnerId.eq(user_id))
+            .exec(&transaction)
+            .await
+            .context("db: move the org's repository rows off the departed member")?;
+    }
+
+    transaction
+        .commit()
+        .await
+        .context("db: commit org member removal")?;
+    Ok(RemoveOrgMemberOutcome::Removed)
+}
+
+/// The live organizations in which `user_id` is the only member holding the
+/// `owner` role.
+///
+/// Membership carries `ON DELETE CASCADE`, so deleting this account would
+/// remove that last role without anything asking: the last-owner rule
+/// [`remove_org_member`] keeps would be bypassed by deleting the account.
+pub async fn list_orgs_solely_owned_by(
+    db: &DatabaseConnection,
+    user_id: i64,
+) -> Result<Vec<organization::Model>> {
+    let held: Vec<i64> = organization_member::Entity::find()
+        .select_only()
+        .column(organization_member::Column::OrgId)
+        .filter(organization_member::Column::UserId.eq(user_id))
+        .filter(organization_member::Column::Role.eq("owner"))
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list orgs the account owns by role")?;
+    let mut sole = Vec::new();
+    for org_id in held {
+        let others = organization_member::Entity::find()
+            .filter(organization_member::Column::OrgId.eq(org_id))
+            .filter(organization_member::Column::Role.eq("owner"))
+            .filter(organization_member::Column::UserId.ne(user_id))
+            .count(db)
+            .await
+            .context("db: count the org's other owners")?;
+        if others > 0 {
+            continue;
+        }
+        if let Some(org) = get_org(db, org_id)
+            .await?
+            .filter(|org| org.deleted_at.is_none())
+        {
+            sole.push(org);
+        }
+    }
+    sole.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(sole)
 }
 
 /// List members of an organization.

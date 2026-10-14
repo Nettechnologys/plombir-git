@@ -59,26 +59,22 @@
   const teamMemberRequests = new LatestRequestFence<string>();
   let routeGeneration = 0;
 
-  const canManage = $derived(
-    org !== null &&
-      getUser() !== null &&
-      (org.owner_id === getUser()?.id ||
-        members.some(
-          (member) =>
-            member.user_id === getUser()?.id && (member.role === 'owner' || member.role === 'admin'),
-        )),
+  // The viewer's role here, from the membership roll. `org.owner_id` is not
+  // asked: the server grants nothing on it, so a creator who has left the
+  // organization would be shown controls that only answer 403.
+  const viewerRole = $derived(
+    members.find((member) => member.user_id === getUser()?.id)?.role ?? null,
   );
+  const canManage = $derived(org !== null && (viewerRole === 'owner' || viewerRole === 'admin'));
+  // Deleting the organization, and giving or taking away the owner role, are
+  // an owner's; an admin runs the organization without disposing of it.
+  const isOwner = $derived(org !== null && viewerRole === 'owner');
 
   // Creating a repository here is a *member's* right, not an admin's: the API
   // gate (`NamespaceCreate`) admits anyone on the membership roll. The form
   // used to be rendered for everybody, including a stranger reading a public
   // organization, whose only feedback was a 403 on submit.
-  const canCreateRepo = $derived(
-    org !== null &&
-      getUser() !== null &&
-      (org.owner_id === getUser()?.id ||
-        members.some((member) => member.user_id === getUser()?.id)),
-  );
+  const canCreateRepo = $derived(org !== null && viewerRole !== null);
 
   $effect(() => {
     const expectedName = name;
@@ -544,9 +540,11 @@
           <button type="button" class="btn-secondary" onclick={startEditingOrganization} disabled={busyAction !== null}>
             {t('common.edit')}
           </button>
-          <button type="button" class="btn-danger" onclick={deleteOrganization} disabled={busyAction !== null}>
-            {busyAction === 'delete-org' ? t('common.loading') : t('orgs.delete_organization')}
-          </button>
+          {#if isOwner}
+            <button type="button" class="btn-danger" onclick={deleteOrganization} disabled={busyAction !== null}>
+              {busyAction === 'delete-org' ? t('common.loading') : t('orgs.delete_organization')}
+            </button>
+          {/if}
           <a class="btn-secondary" href={`/orgs/${pathSegment(org.name)}/hooks`}>{t('settings.webhooks.title')}</a>
         </div>
       {/if}
@@ -741,7 +739,9 @@
             <select bind:value={newMemberRole} disabled={busyAction !== null}>
               <option value="member">{t('orgs.role_member')}</option>
               <option value="admin">{t('orgs.role_admin')}</option>
-              <option value="owner">{t('orgs.role_owner')}</option>
+              {#if isOwner}
+                <option value="owner">{t('orgs.role_owner')}</option>
+              {/if}
             </select>
             <button type="submit" class="btn-sm" disabled={busyAction !== null}>
               {busyAction === 'add-org-member' ? t('common.loading') : t('common.add')}
@@ -756,7 +756,7 @@
               <span class="item-name">{memberName(member)}</span>
               <div class="item-actions">
                 <span class="badge">{t(`orgs.role_${member.role}`, undefined, formatTranslationFallback(member.role))}</span>
-                {#if canManage}
+                {#if canManage && (member.role !== 'owner' || isOwner)}
                   <button
                     type="button"
                     class="btn-danger"

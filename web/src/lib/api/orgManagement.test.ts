@@ -142,4 +142,35 @@ describe('organization management', () => {
 		expect(await answerConfirm()).toContain('Delete organization');
 		expect(orgs.delete).toHaveBeenCalledWith('acme');
 	});
+
+	it('keys every control on the viewer\'s membership role, never on owner_id', async () => {
+		// The recorded owner who has left the organization: the server grants
+		// nothing on `owner_id`, so nothing is offered.
+		orgs.listMembers.mockResolvedValue([
+			{ id: 3, user_id: 3, username: 'carol', role: 'owner' },
+			{ id: 2, user_id: 2, username: 'bob', role: 'member' },
+		]);
+		rendered = await renderComponent(OrganizationPage);
+		expect(rendered.container.querySelector('.header-actions')).toBeNull();
+		expect(rendered.container.querySelector('.member-form')).toBeNull();
+		await rendered.destroy();
+
+		// An admin runs the organization but does not dispose of it: no delete,
+		// no owner role to hand out, no removing an owner.
+		orgs.listMembers.mockResolvedValue([
+			{ id: 1, user_id: 1, username: 'alice', role: 'admin' },
+			{ id: 3, user_id: 3, username: 'carol', role: 'owner' },
+		]);
+		rendered = await renderComponent(OrganizationPage);
+		const actions = element(rendered.container, '.header-actions');
+		expect(actions.querySelector('.btn-danger')).toBeNull();
+		const roles = Array.from(
+			rendered.container.querySelectorAll<HTMLOptionElement>('.member-form select option'),
+		).map((option) => option.value);
+		expect(roles).toEqual(['member', 'admin']);
+		const carolRow = Array.from(rendered.container.querySelectorAll('.item')).find((row) =>
+			row.textContent?.includes('carol'),
+		)!;
+		expect(carolRow.querySelector('.btn-danger')).toBeNull();
+	});
 });

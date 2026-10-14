@@ -1268,6 +1268,23 @@ async fn refuse_ownerships_this_deletion_may_not_cascade(
         )));
     }
 
+    // Membership cascades with the account, so the last `owner` role of an
+    // organization would go without the rule that keeps it asking.
+    let solely_owned = rg_db::ops::org_ops::list_orgs_solely_owned_by(db, user_id)
+        .await
+        .context("failed to inventory the organizations this account is the last owner of")?;
+    if !solely_owned.is_empty() {
+        let names = solely_owned
+            .iter()
+            .map(|org| org.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(crate::error::conflict(format!(
+            "account is the last owner of the organization(s) {names}; give the owner role to \
+             another member or delete them before deleting the account"
+        )));
+    }
+
     if !owned_orgs.is_empty() {
         let names = owned_orgs
             .iter()

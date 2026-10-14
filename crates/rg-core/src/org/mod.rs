@@ -274,9 +274,22 @@ pub async fn add_org_member(
 }
 
 /// Remove a member from an organization.
+///
+/// The last member holding the `owner` role stays, refused as a conflict: the
+/// organization would be left with nobody who may delete it or give the role
+/// to anyone else. See [`org_ops::remove_org_member`] for what else moves.
 pub async fn remove_org_member(db: &DatabaseConnection, org_id: i64, user_id: i64) -> Result<()> {
-    if !org_ops::remove_org_member(db, org_id, user_id).await? {
-        return Err(crate::error::not_found("organization member"));
+    match org_ops::remove_org_member(db, org_id, user_id).await? {
+        org_ops::RemoveOrgMemberOutcome::Removed => {}
+        org_ops::RemoveOrgMemberOutcome::NotMember => {
+            return Err(crate::error::not_found("organization member"));
+        }
+        org_ops::RemoveOrgMemberOutcome::LastOwner => {
+            return Err(crate::error::conflict(
+                "this is the organization's last owner; give the owner role to another member \
+                 before removing it",
+            ));
+        }
     }
     crate::repo::service::invalidate_perm_cache_all(db);
     Ok(())

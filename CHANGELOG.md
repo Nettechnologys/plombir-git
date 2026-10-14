@@ -103,6 +103,14 @@ This project records user-facing changes here. The format follows
   gives that role to the account in its `owner_id` — the right that column
   carried until now — and records it in the audit log
   (`org.owner_role_backfill`).
+- An organization keeps at least one `owner`. Removing the last one answers
+  `409`, and deleting the account of an organization's last owner is refused,
+  where membership used to cascade away with it. Only an owner may give the
+  `owner` role or remove a member who holds it; an admin gets `403`. When the
+  member `owner_id` names leaves, that column and the organization's
+  repository rows that named them move to a remaining owner, so a later
+  deletion of the departed account cannot cascade into them. An organization
+  is created together with its creator's `owner` membership, or not at all.
 
 ## [0.1.1] - 2026-10-11
 

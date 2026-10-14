@@ -455,6 +455,13 @@ pub async fn add_org_member(
         Ok(user) => user,
         Err(e) => return AppError::from(e).into_response(),
     };
+    // Admins run the organization; owners may dispose of it. Handing out the
+    // `owner` role is handing out that power, so only an owner may.
+    if role == "owner" {
+        if let Err(refusal) = require_owner_role(&state.db, &org, actor_id).await {
+            return refusal.into_response();
+        }
+    }
 
     match rg_core::org::add_org_member(&state.db, org.id, member_user.id, role).await {
         Ok(m) => {
@@ -510,6 +517,7 @@ pub async fn add_org_member(
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Forbidden", body = serde_json::Value),
         (status = 404, description = "Organization member not found", body = serde_json::Value),
+        (status = 409, description = "The member is the organization's last owner", body = serde_json::Value),
     ),
 )]
 pub async fn remove_org_member(
@@ -528,6 +536,17 @@ pub async fn remove_org_member(
         Ok(actor) => actor,
         Err(error) => return AppError::from(error).into_response(),
     };
+    // Removing an owner takes away the power to dispose of the organization,
+    // so it is an owner's to do, as handing it out is.
+    match member_role(&state.db, &org, user_id).await {
+        Ok(Some(role)) if role == "owner" => {
+            if let Err(refusal) = require_owner_role(&state.db, &org, actor_id).await {
+                return refusal.into_response();
+            }
+        }
+        Ok(_) => {}
+        Err(error) => return AppError::from(error).into_response(),
+    }
     match rg_core::org::remove_org_member(&state.db, org.id, user_id).await {
         Ok(()) => {
             let details = serde_json::json!({
@@ -1012,6 +1031,19 @@ async fn is_org_admin(
         .is_some_and(|role| role == "owner" || role == "admin"))
 }
 
+/// Refuse unless `user_id` holds the `owner` role of `org`.
+async fn require_owner_role(
+    db: &sea_orm::DatabaseConnection,
+    org: &rg_db::entities::organization::Model,
+    user_id: i64,
+) -> Result<(), AppError> {
+    match member_role(db, org, user_id).await {
+        Ok(Some(role)) if role == "owner" => Ok(()),
+        Ok(_) => Err(AppError::forbidden("only organization owners can do this")),
+        Err(error) => Err(AppError::from(error)),
+    }
+}
+
 /// Authorization gate for every org mutation — membership changes and the whole
 /// team surface, both of which hand out access to the organization's private
 /// repositories (`rg_core::org::add_team_member` flushes the permission cache
@@ -1185,11 +1217,8 @@ impl axum::extract::FromRequestParts<AppState> for OrgOwner {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let OrgAdmin { org, actor_id } = OrgAdmin::from_request_parts(parts, state).await?;
-        match member_role(&state.db, &org, actor_id).await {
-            Ok(Some(role)) if role == "owner" => Ok(Self { org, actor_id }),
-            Ok(_) => Err(AppError::forbidden("only organization owners can do this")),
-            Err(error) => Err(AppError::from(error)),
-        }
+        require_owner_role(&state.db, &org, actor_id).await?;
+        Ok(Self { org, actor_id })
     }
 }
 

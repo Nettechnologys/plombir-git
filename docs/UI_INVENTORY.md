@@ -1129,21 +1129,21 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:common.loading | :547 | `DELETE /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
-| editingOrg = false} disabled= > | :556 | `PATCH /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :605 | `POST /api/v1/repos` | `User` | rust+web+smoke |
-| i18n:common.loading | :605 | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web |
-| i18n:orgs.new_team | :641 | `POST /api/v1/orgs/{name}/teams` | `OrgAdmin` | rust+browser |
-| i18n:orgs.new_team | :641 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
-| i18n:orgs.hide_team_members | :666 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
-| ` ? t('common.loading') : t('common.delete')} | :670 | `DELETE /api/v1/orgs/{name}/teams/{team_id}` | `OrgAdmin` | rust+web+smoke+browser |
-| ` ? t('common.loading') : t('common.delete')} | :670 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
-| ` ? t('common.loading') : t('common.add')} | :681 | `POST /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgAdmin` | rust+web+browser |
-| ` ? t('common.loading') : t('common.add')} | :681 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
-| -$ ` ? t('common.loading') : t('common.delete')} | :709 | `DELETE /api/v1/orgs/{name}/teams/{team_id}/members/{user_id}` | `OrgAdmin` | rust+web+browser |
-| -$ ` ? t('common.loading') : t('common.delete')} | :709 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
-| i18n:orgs.member_placeholder | :734 | `POST /api/v1/orgs/{name}/members` | `OrgAdmin` | rust+web+smoke+browser |
-| i18n:orgs.member_placeholder | :734 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
+| i18n:common.loading | :544 | `DELETE /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
+| editingOrg = false} disabled= > | :554 | `PATCH /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
+| i18n:common.loading | :603 | `POST /api/v1/repos` | `User` | rust+web+smoke |
+| i18n:common.loading | :603 | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web |
+| i18n:orgs.new_team | :639 | `POST /api/v1/orgs/{name}/teams` | `OrgAdmin` | rust+browser |
+| i18n:orgs.new_team | :639 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
+| i18n:orgs.hide_team_members | :664 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
+| ` ? t('common.loading') : t('common.delete')} | :668 | `DELETE /api/v1/orgs/{name}/teams/{team_id}` | `OrgAdmin` | rust+web+smoke+browser |
+| ` ? t('common.loading') : t('common.delete')} | :668 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
+| ` ? t('common.loading') : t('common.add')} | :679 | `POST /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgAdmin` | rust+web+browser |
+| ` ? t('common.loading') : t('common.add')} | :679 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
+| -$ ` ? t('common.loading') : t('common.delete')} | :707 | `DELETE /api/v1/orgs/{name}/teams/{team_id}/members/{user_id}` | `OrgAdmin` | rust+web+browser |
+| -$ ` ? t('common.loading') : t('common.delete')} | :707 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
+| i18n:orgs.member_placeholder | :732 | `POST /api/v1/orgs/{name}/members` | `OrgAdmin` | rust+web+smoke+browser |
+| i18n:orgs.member_placeholder | :732 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
 | ` ? t('common.loading') : t('common.delete')} | :760 | `DELETE /api/v1/orgs/{name}/members/{user_id}` | `OrgAdmin` | rust+web+smoke+browser |
 | ` ? t('common.loading') : t('common.delete')} | :760 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
 | _(page load)_ | — | `GET /api/v1/orgs/{name}` | `OrgRead` | rust+web+smoke |
