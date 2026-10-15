@@ -341,7 +341,7 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "22"
+          node-version: "26"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -636,7 +636,7 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "22"
+          node-version: "26"
 
       # scripts/frontend-href-contract-check.mjs enumerates web/src through
       # ripgrep, and scripts/workflow-yaml-contract-check.mjs parses this file
@@ -681,7 +681,7 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "22"
+          node-version: "26"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -1055,7 +1055,7 @@ jobs:
         if: steps.scope.outputs.build == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "22"
+          node-version: "26"
 
       - name: Boot the built image and check it serves
         if: steps.scope.outputs.build == 'true'

@@ -16,6 +16,11 @@ export default defineConfig({
 	},
 	test: {
 		environment: 'jsdom',
+		// Node 25 and later define a global `localStorage` of their own, which
+		// shadows the one jsdom installs: every test touching storage then reads
+		// `undefined`. The image builds the frontend on Node 26, so the tests run
+		// with Node's Web Storage switched off and jsdom's in its place.
+		execArgv: ['--no-experimental-webstorage'],
 		include: ['src/**/*.test.ts'],
 		setupFiles: ['src/lib/test/setup.ts'],
 	}
