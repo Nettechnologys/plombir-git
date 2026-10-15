@@ -65,6 +65,8 @@ export const NOT_RUN_BY_CI = new Map([
     'needs registry.npmjs.org on the network in addition to npm'],
   ['rg-runner commands::shared_docker_daemon_tests::stopping_one_same_id_job_leaves_the_other_runner_container_alive',
     'needs a Docker daemon shared by two runners and the ubuntu:24.04 image pulled'],
+  ['rg-runner commands::shared_docker_daemon_tests::an_orphaned_grandchild_does_not_stay_a_zombie',
+    'needs a Docker daemon and the ubuntu:24.04 image pulled; the argv tests check --init on every run'],
 ]);
 
 const problems = [];

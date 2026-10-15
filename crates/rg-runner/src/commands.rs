@@ -106,6 +106,35 @@ mod shared_docker_daemon_tests {
             "stopping the first runner removed the second container"
         );
     }
+
+    /// A job whose script ends in `exec` leaves PID 1 to a program that
+    /// waits only for its own children. A process the job orphaned is then
+    /// reparented to it and, once it exits, stays a zombie — unless the
+    /// container runs an init that reaps it.
+    #[tokio::test]
+    #[ignore = "requires a shared Docker daemon with the ubuntu:24.04 image"]
+    async fn an_orphaned_grandchild_does_not_stay_a_zombie() {
+        let workspace = tempfile::tempdir().expect("runner workspace");
+        let name = job_container_name(43);
+        // The orphan exits after a second; a second later the survey counts
+        // zombies by the state field of every /proc/<pid>/stat.
+        let script = "(sleep 1 &); \
+            (sleep 2; for stat in /proc/[0-9]*/stat; do cut -d' ' -f3 \"$stat\"; done \
+                | grep -c '^Z$' | sed 's/^/zombies=/') & \
+            exec sleep 3";
+        let (code, log) = run_job_docker(
+            "ubuntu:24.04",
+            script,
+            &[],
+            workspace.path(),
+            &name,
+            &rg_process::docker_job::JobLimits::default(),
+        )
+        .await;
+        remove_job_container(&name).await;
+        assert_eq!(code, 0, "{log}");
+        assert!(log.contains("zombies=0"), "{log}");
+    }
 }
 
 /// Bounds of the job deadline the server may hand out, mirroring

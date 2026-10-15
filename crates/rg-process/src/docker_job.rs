@@ -262,6 +262,13 @@ pub struct JobContainer<'a> {
 /// - `--pids-limit` / `--memory` / `--cpus` bound resource exhaustion, at the
 ///   operator's [`JobLimits`].
 ///
+/// `--init` makes Docker's own init (tini) PID 1 instead of the job's `sh`. A
+/// shell does not wait for children it did not start, so every process a job
+/// backgrounds and leaves behind — a test server's worker, a `make -j` recipe's
+/// grandchild — would otherwise stay a zombie until the container exits, and a
+/// job that checks its process group is cleaned up would fail only in CI. The
+/// init binary comes with the Docker engine, so `--pull never` still holds.
+///
 /// The Docker socket is never mounted and `--privileged` is never passed, so the
 /// job has no path to the daemon or to host devices. Secret values never appear
 /// on the command line: only variable names do.
@@ -287,6 +294,7 @@ pub fn run_args(
     let mut args: Vec<String> = [
         "run",
         "--rm",
+        "--init",
         "--pull",
         "never",
         "--name",
@@ -615,6 +623,9 @@ mod tests {
             has_pair(&args, "--security-opt", "no-new-privileges"),
             "{args:?}"
         );
+        // PID 1 must reap what the job's processes orphan.
+        let options = &args[..args.iter().position(|arg| arg == "--").unwrap()];
+        assert!(options.iter().any(|arg| arg == "--init"), "{args:?}");
         assert!(
             has_pair(&args, "--pids-limit", &PIDS_LIMIT.to_string()),
             "{args:?}"
@@ -635,12 +646,13 @@ mod tests {
     fn without_operator_limits_the_argv_is_the_one_jobs_always_had() {
         let variables: [(String, String); 0] = [];
         let args = run_args(&job(Path::new("/srv/repo"), &variables), IMAGE_ID).unwrap();
-        let head: Vec<&str> = args.iter().take(18).map(String::as_str).collect();
+        let head: Vec<&str> = args.iter().take(19).map(String::as_str).collect();
         assert_eq!(
             head,
             [
                 "run",
                 "--rm",
+                "--init",
                 "--pull",
                 "never",
                 "--name",

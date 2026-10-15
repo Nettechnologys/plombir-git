@@ -355,6 +355,12 @@ mod tests {
             window("--security-opt", "no-new-privileges"),
             "missing no-new-privileges: {args:?}"
         );
+        // An init reaps the zombies a job's orphaned grandchildren leave.
+        let options = &args[..args.iter().position(|a| a == "--").unwrap()];
+        assert!(
+            options.iter().any(|a| a == "--init"),
+            "missing --init: {args:?}"
+        );
         assert!(
             window(
                 "--pids-limit",
