@@ -264,24 +264,21 @@ jobs:
       # cargo-audit/deny only see the RustSec DB; some advisories are GHSA/OSV-only
       # (e.g. jsonwebtoken CVE-2026-25537 / GHSA-h395-gr6q-cpjc, openssl 0.10.x
       # memory-safety fixes) and slip past the RustSec gate entirely. This step
-      # runs osv-scanner against Cargo.lock so those surface in CI.
+      # runs osv-scanner against Cargo.lock so those fail the job too.
       #
-      # Informational for now (continue-on-error): the live OSV DB may flag
-      # OSV-only advisories across the transitive tree that haven't been triaged
-      # yet, and a hard fail would block unrelated PRs. Once the full OSV finding
-      # set is triaged (ignore-list where justified, no-fix documented), drop
-      # continue-on-error to promote this to a blocking gate.
+      # It was informational (continue-on-error) for weeks and printed eight
+      # GHSA advisories against the public SSH server's russh 0.60.3 — a
+      # pre-auth panic among them — without stopping anything
+      # (card_95a9eb65f6d4). Accepted advisories live in osv-scanner.toml, which
+      # scripts/advisory-ignore-list-contract-check.mjs keeps equal to
+      # .cargo/audit.toml and deny.toml; everything else is red.
       - name: Install osv-scanner
-        continue-on-error: true
         uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: osv-scanner
 
-      - name: osv-scanner (OSV/GHSA advisories, informational)
-        continue-on-error: true
-        run: |
-          osv-scanner scan --lockfile=Cargo.lock \
-            || osv-scanner --lockfile=Cargo.lock
+      - name: osv-scanner (OSV/GHSA advisories)
+        run: osv-scanner scan --config=osv-scanner.toml --lockfile=Cargo.lock
 
       # The frontend's npm tree gets the same treatment as Cargo.lock. Nothing
       # else watches it: dependabot.yml has no npm ecosystem and the

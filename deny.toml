@@ -15,19 +15,20 @@ all-features = true
 # `version = 2` drops the deprecated per-severity thresholds; unignored
 # vulnerabilities and unmaintained crates fail the check.
 version = 2
+# An ignore whose crate has left the tree is a standing pre-approval: the day
+# the crate comes back, its advisory is waived without anyone looking. Fail on
+# it instead, so the list only ever holds what the tree really carries.
+unused-ignored-advisory = "deny"
 # Consciously accepted advisories with no fixed release. Keep in sync with
-# `.cargo/audit.toml`; each entry documents why the exposure is acceptable.
+# `.cargo/audit.toml` and `osv-scanner.toml`; each entry documents why the exposure is acceptable.
 ignore = [
     # rsa "Marvin Attack" timing side-channel (no patched release: `patched = []`).
     # Reaches us via two paths: `sqlx-mysql` RSA auth (server-to-DB) and `russh`
-    # SSH host/user RSA keys (rsa 0.10.0-rc.16). Both use RSA for signatures/auth;
+    # SSH host/user RSA keys (rsa 0.10.0-rc). Both use RSA for signatures/auth;
     # neither exposes an attacker-controlled RSA *decryption* oracle (SSH kex is
     # curve25519/ECDH, not RSA key transport) — the specific vector Marvin
     # exploits. Revisit when `rsa` ships a constant-time release.
     "RUSTSEC-2023-0071",
-    # proc-macro-error2 unmaintained — build-time proc-macro only (via sea-orm
-    # macros), no runtime code. No maintained drop-in yet.
-    "RUSTSEC-2026-0173",
     # rustls-pemfile unmaintained — a thin wrapper over rustls-pki-types, no
     # security defect. Our direct use (rg-http TLS cert/key parsing) has been
     # migrated to `rustls_pki_types::pem::PemObject`; it now reaches us ONLY

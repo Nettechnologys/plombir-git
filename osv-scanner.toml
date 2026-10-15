@@ -1,0 +1,23 @@
+# osv-scanner configuration — read by the `security-audit` job in
+# .github/workflows/regression.yml (`osv-scanner scan --config=osv-scanner.toml`).
+#
+# The same consciously accepted advisories as .cargo/audit.toml and deny.toml,
+# and no others: `scripts/advisory-ignore-list-contract-check.mjs` fails when the
+# three lists disagree. Each entry carries the reason it is accepted. Anything
+# osv-scanner reports that is not listed here fails the job — that is how the
+# GHSA-only russh advisories (a pre-auth panic among them) would have stopped
+# CI instead of scrolling past in an informational step.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+reason = """\
+rsa "Marvin Attack" timing side-channel, no patched release. Reaches us through \
+sqlx-mysql RSA auth (server-to-DB) and russh SSH host/user RSA keys. Both use RSA \
+for signatures/auth; neither exposes an attacker-controlled RSA decryption oracle, \
+the vector Marvin exploits."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0134"
+reason = """\
+rustls-pemfile unmaintained, no security defect. Reaches us only transitively via \
+axum-server v0.7; our own PEM parsing uses rustls_pki_types::pem::PemObject."""

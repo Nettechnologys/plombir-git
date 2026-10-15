@@ -2,20 +2,18 @@
 #
 # Every entry here is an ADVISORY WE HAVE CONSCIOUSLY ACCEPTED because no fixed
 # release exists yet and the exposure in Plombir Git is low. Each carries a reason
-# and, where relevant, the follow-up. Keep this list in sync with deny.toml.
+# and, where relevant, the follow-up. Keep this list in sync with deny.toml and
+# osv-scanner.toml (scripts/advisory-ignore-list-contract-check.mjs).
 [advisories]
 ignore = [
     # rsa "Marvin Attack" timing side-channel — NO patched release exists
     # (RustSec `patched: []`). Reaches us via TWO paths: `sqlx-mysql`'s RSA auth
     # (caching_sha2 public-key exchange, server-to-DB) and `russh` SSH host/user
-    # RSA keys (rsa 0.10.0-rc.16). Both use RSA for signatures/auth; neither
+    # RSA keys (rsa 0.10.0-rc). Both use RSA for signatures/auth; neither
     # exposes an attacker-controlled RSA *decryption* oracle (SSH kex is
     # curve25519/ECDH, not RSA key transport) — the exact vector Marvin exploits.
     # Revisit when the `rsa` crate ships a constant-time fix or both drop it.
     "RUSTSEC-2023-0071",
-    # proc-macro-error2 unmaintained — build-time proc-macro dependency only
-    # (via sea-orm macros), no runtime code. No maintained drop-in yet.
-    "RUSTSEC-2026-0173",
     # rustls-pemfile unmaintained — a thin wrapper over rustls-pki-types, no
     # security defect. Our direct use (rg-http TLS cert/key parsing) has been
     # migrated to `rustls_pki_types::pem::PemObject`; it now reaches us ONLY
