@@ -1,7 +1,10 @@
 {
   "title": "Plombir Git - Production Overview",
   "uid": "plombir-git-main",
-  "tags": ["plombir-git", "production"],
+  "tags": [
+    "plombir-git",
+    "production"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
@@ -32,9 +35,14 @@
     {
       "id": 1,
       "title": "📊 Request Rate (QPS)",
-      "type": "graph",
+      "type": "timeseries",
       "datasource": "${datasource}",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
       "targets": [
         {
           "expr": "sum(rate(http_requests_total[1m])) by (route)",
@@ -42,18 +50,35 @@
           "refId": "A"
         }
       ],
-      "yaxes": [
-        { "label": "req/s", "format": "short" },
-        { "format": "short" }
-      ],
-      "legend": { "showLegend": true, "displayMode": "table", "placement": "right" }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "req/s"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": []
+        }
+      }
     },
     {
       "id": 2,
       "title": "⏱️ P95 Request Latency",
-      "type": "graph",
+      "type": "timeseries",
       "datasource": "${datasource}",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket{route=~\"$route\"}[5m])))",
@@ -66,17 +91,27 @@
           "refId": "B"
         }
       ],
-      "yaxes": [
-        { "label": "seconds", "format": "s" },
-        { "format": "short" }
-      ]
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "axisLabel": "seconds"
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 3,
       "title": "❌ Error Rate (5xx)",
-      "type": "graph",
+      "type": "timeseries",
       "datasource": "${datasource}",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
       "targets": [
         {
           "expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) by (route)",
@@ -89,17 +124,27 @@
           "refId": "B"
         }
       ],
-      "yaxes": [
-        { "label": "errors/s", "format": "short" },
-        { "format": "short" }
-      ]
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "errors/s"
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 4,
       "title": "🚀 In-Flight Requests",
       "type": "stat",
       "datasource": "${datasource}",
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 8 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 8
+      },
       "targets": [
         {
           "expr": "http_requests_in_flight",
@@ -109,29 +154,49 @@
       "options": {
         "colorMode": "value",
         "graphMode": "area",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
       }
     },
     {
       "id": 5,
       "title": "💾 DB Query Rate",
-      "type": "graph",
+      "type": "timeseries",
       "datasource": "${datasource}",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 8
+      },
       "targets": [
         {
           "expr": "sum(rate(db_queries_total[1m])) by (operation)",
           "legendFormat": "{{operation}}",
           "refId": "A"
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
     },
     {
       "id": 6,
       "title": "🐢 P95 DB Latency",
-      "type": "graph",
+      "type": "timeseries",
       "datasource": "${datasource}",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(db_query_duration_seconds_bucket[5m])))",
@@ -139,31 +204,50 @@
           "refId": "A"
         }
       ],
-      "yaxes": [
-        { "label": "seconds", "format": "s" },
-        { "format": "short" }
-      ]
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "axisLabel": "seconds"
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 7,
       "title": "📦 Git Operations",
-      "type": "graph",
+      "type": "timeseries",
       "datasource": "${datasource}",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
       "targets": [
         {
           "expr": "sum(rate(git_operations_total[5m])) by (operation)",
           "legendFormat": "{{operation}}",
           "refId": "A"
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
     },
     {
       "id": 8,
       "title": "🔄 CI Pipeline Status",
       "type": "piechart",
       "datasource": "${datasource}",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
       "targets": [
         {
           "expr": "sum(ci_pipelines_total) by (status)",
@@ -177,7 +261,12 @@
       "title": "⚙️ Running CI Jobs",
       "type": "stat",
       "datasource": "${datasource}",
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 24 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 24
+      },
       "targets": [
         {
           "expr": "ci_jobs_running",
@@ -190,7 +279,12 @@
       "title": "💚 Health Status",
       "type": "stat",
       "datasource": "${datasource}",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 24 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 24
+      },
       "targets": [
         {
           "expr": "up{job=\"plombir-git\"}",
@@ -202,13 +296,33 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": 0 },
-              { "color": "green", "value": 1 }
+              {
+                "color": "red",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
             ]
           },
           "mappings": [
-            { "options": { "0": { "text": "DOWN" } }, "type": "value" },
-            { "options": { "1": { "text": "UP" } }, "type": "value" }
+            {
+              "options": {
+                "0": {
+                  "text": "DOWN"
+                }
+              },
+              "type": "value"
+            },
+            {
+              "options": {
+                "1": {
+                  "text": "UP"
+                }
+              },
+              "type": "value"
+            }
           ]
         }
       }
@@ -218,7 +332,12 @@
       "title": "🧠 Memory Usage",
       "type": "gauge",
       "datasource": "${datasource}",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      },
       "targets": [
         {
           "expr": "1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)",
@@ -233,9 +352,18 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": 0 },
-              { "color": "yellow", "value": 0.7 },
-              { "color": "red", "value": 0.9 }
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.7
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
             ]
           }
         }
@@ -246,7 +374,12 @@
       "title": "💽 Disk Usage",
       "type": "gauge",
       "datasource": "${datasource}",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 32
+      },
       "targets": [
         {
           "expr": "1 - (node_filesystem_avail_bytes{fstype!~\"tmpfs|overlay\"} / node_filesystem_size_bytes)",
@@ -261,9 +394,18 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": 0 },
-              { "color": "yellow", "value": 0.7 },
-              { "color": "red", "value": 0.85 }
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.7
+              },
+              {
+                "color": "red",
+                "value": 0.85
+              }
             ]
           }
         }
@@ -274,7 +416,12 @@
       "title": "🖥️ CPU Usage",
       "type": "gauge",
       "datasource": "${datasource}",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 32
+      },
       "targets": [
         {
           "expr": "1 - rate(node_cpu_seconds_total{mode=\"idle\"}[5m])",
@@ -289,9 +436,18 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": 0 },
-              { "color": "yellow", "value": 0.6 },
-              { "color": "red", "value": 0.85 }
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.6
+              },
+              {
+                "color": "red",
+                "value": 0.85
+              }
             ]
           }
         }

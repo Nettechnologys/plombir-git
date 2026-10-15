@@ -109,10 +109,10 @@ const green = (expected, forbidden) => (result) => {
 fixture(
   'a commented-out pin above the live one does not become the tag',
   (source) => source.replace(
-    '    image: prom/prometheus:v2.55.0',
-    '    # image: prom/prometheus:v1.0.0-stale\n    image: prom/prometheus:v2.55.0',
+    '    image: prom/prometheus:v3.15.0',
+    '    # image: prom/prometheus:v1.0.0-stale\n    image: prom/prometheus:v3.15.0',
   ),
-  green('prometheus=prom/prometheus:v2.55.0', 'v1.0.0-stale'),
+  green('prometheus=prom/prometheus:v3.15.0', 'v1.0.0-stale'),
 );
 
 // …and the same line commented out with nothing live behind it is not a tag
@@ -120,29 +120,29 @@ fixture(
 fixture(
   'a service whose only pin is commented out is red',
   (source) => source.replace(
-    '    image: prom/prometheus:v2.55.0',
-    '    # image: prom/prometheus:v2.55.0',
+    '    image: prom/prometheus:v3.15.0',
+    '    # image: prom/prometheus:v3.15.0',
   ),
   red('services.prometheus.image is absent'),
 );
 
 fixture(
   'a floating tag is red',
-  (source) => source.replace('image: prom/prometheus:v2.55.0', 'image: prom/prometheus:latest'),
+  (source) => source.replace('image: prom/prometheus:v3.15.0', 'image: prom/prometheus:latest'),
   red('pin an explicit tag'),
 );
 
 fixture(
   'an untagged image is red',
-  (source) => source.replace('image: prom/prometheus:v2.55.0', 'image: prom/prometheus'),
+  (source) => source.replace('image: prom/prometheus:v3.15.0', 'image: prom/prometheus'),
   red('pin an explicit tag'),
 );
 
 fixture(
   'another registry for the image this gate runs is red',
   (source) => source.replace(
-    'image: prom/alertmanager:v0.27.0',
-    'image: quay.io/prometheus/alertmanager:v0.27.0',
+    'image: prom/alertmanager:v0.34.1',
+    'image: quay.io/prometheus/alertmanager:v0.34.1',
   ),
   red('not a `prom/alertmanager` image'),
 );
@@ -170,7 +170,7 @@ fixture(
     '      - ./prometheus/alerts.yml:',
     '      # - ./prometheus/alerts-deleted.yml:/etc/prometheus/alerts.yml:ro\n      - ./prometheus/alerts.yml:',
   ),
-  green('prometheus=prom/prometheus:v2.55.0', null),
+  green('prometheus=prom/prometheus:v3.15.0', null),
 );
 
 // A long-syntax bind mount is a mount `sed -nE '…- (\./…)'` could not see at
@@ -200,12 +200,12 @@ fixture(
 );
 
 // The digest carries its own colon; it must not be read as the tag separator,
-// or the repository check reads `prom/prometheus:v2.55.0@sha256` as the name.
+// or the repository check reads `prom/prometheus:v3.15.0@sha256` as the name.
 fixture(
   'the image this gate runs keeps its digest on stdout',
   (source) => source.replace('  # ── Prometheus (Metrics Storage) ──\n', '  # ── Prometheus ──\n'),
   (result) => {
-    const reason = green('prometheus=prom/prometheus:v2.55.0@sha256:', null)(result);
+    const reason = green('prometheus=prom/prometheus:v3.15.0@sha256:', null)(result);
     if (reason) return reason;
     return /^alertmanager=prom\/alertmanager:v[^@\s]+@sha256:[0-9a-f]{64}$/m.test(result.stdout)
       ? null
