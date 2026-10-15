@@ -201,12 +201,29 @@ fn record_synced_tips(clone: &Path, tips: &[String]) -> Result<()> {
 /// `last_sync_error`. Names objects by oid and path — what the owner needs to
 /// find the file — and stops after a few, since a row is not a report.
 pub(crate) fn describe_shortfall(failed: &[LfsFetchFailure]) -> String {
+    format!(
+        "the refs are up to date, but {} LFS object(s) could not be fetched from the upstream: {}",
+        failed.len(),
+        name_objects(failed)
+    )
+}
+
+/// The push mirror's twin of [`describe_shortfall`]: the objects a pass could
+/// not send to the remote.
+pub(crate) fn describe_upload_shortfall(failed: &[LfsFetchFailure]) -> String {
+    format!(
+        "{} LFS object(s) did not reach the push mirror, which now holds pointer files for \
+         them: {}",
+        failed.len(),
+        name_objects(failed)
+    )
+}
+
+/// The first few objects of `failed` by oid, path and reason, and how many
+/// more there are.
+fn name_objects(failed: &[LfsFetchFailure]) -> String {
     const NAMED: usize = 5;
-    let mut message = format!(
-        "the refs are up to date, but {} LFS object(s) could not be fetched from the upstream: ",
-        failed.len()
-    );
-    let named = failed
+    let mut message = failed
         .iter()
         .take(NAMED)
         .map(|failure| {
@@ -219,7 +236,6 @@ pub(crate) fn describe_shortfall(failed: &[LfsFetchFailure]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ");
-    message.push_str(&named);
     if failed.len() > NAMED {
         message.push_str(&format!("; and {} more", failed.len() - NAMED));
     }

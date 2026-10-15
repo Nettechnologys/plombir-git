@@ -308,9 +308,101 @@ where
 /// that the push landed and which credential carried it. The remote's user is
 /// the login half of that header, which is what lets `http-backend` accept
 /// `git-receive-pack` at all.
+///
+/// It is an LFS server too, the way a forge is: `<repo>.git/info/lfs/objects/batch`
+/// answers `upload` with an `upload` and a `verify` action for each object it
+/// does not hold and with no action for one it does, and keeps what is
+/// uploaded in [`FakeLfs`].
 pub(crate) struct GitHttpBackend {
     pub(crate) url: String,
     pub(crate) authorizations: Arc<Mutex<Vec<String>>>,
+    pub(crate) lfs: Arc<Mutex<FakeLfs>>,
+}
+
+/// The LFS half of a [`GitHttpBackend`].
+#[derive(Default)]
+pub(crate) struct FakeLfs {
+    /// Objects the remote holds, by oid.
+    pub(crate) objects: std::collections::HashMap<String, Vec<u8>>,
+    /// The oids each `upload` batch asked about, in order.
+    pub(crate) upload_batches: Vec<Vec<String>>,
+    /// Every `PUT` of an object, by oid.
+    pub(crate) uploads: Vec<String>,
+    /// Every `verify` of an object, by oid.
+    pub(crate) verified: Vec<String>,
+}
+
+/// Answer an LFS request of a [`GitHttpBackend`], or `None` for a git one.
+fn fake_lfs_response(
+    lfs: &Mutex<FakeLfs>,
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Option<String> {
+    let respond = |status: &str, content_type: &str, body: String| {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let mut lfs = lfs.lock().expect("lfs");
+    if path.ends_with("/info/lfs/objects/batch") {
+        let request: serde_json::Value = serde_json::from_slice(body).expect("batch body");
+        assert_eq!(request["operation"], "upload", "the fake serves uploads");
+        let objects = request["objects"].as_array().expect("batch objects");
+        let oids = objects
+            .iter()
+            .map(|object| object["oid"].as_str().expect("oid").to_string())
+            .collect::<Vec<_>>();
+        lfs.upload_batches.push(oids);
+        let answer = objects
+            .iter()
+            .map(|object| {
+                let oid = object["oid"].as_str().expect("oid");
+                if lfs.objects.contains_key(oid) {
+                    serde_json::json!({"oid": oid, "size": object["size"]})
+                } else {
+                    serde_json::json!({
+                        "oid": oid,
+                        "size": object["size"],
+                        "actions": {
+                            "upload": {"href": format!("http://{address}/lfs-objects/{oid}")},
+                            "verify": {"href": format!("http://{address}/lfs-verify")},
+                        },
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+        let answer = serde_json::json!({"transfer": "basic", "objects": answer}).to_string();
+        return Some(respond("200 OK", "application/vnd.git-lfs+json", answer));
+    }
+    if let Some(oid) = path.strip_prefix("/lfs-objects/") {
+        assert_eq!(method, "PUT");
+        lfs.uploads.push(oid.to_string());
+        lfs.objects.insert(oid.to_string(), body.to_vec());
+        return Some(respond("200 OK", "text/plain", String::new()));
+    }
+    if path == "/lfs-verify" {
+        let request: serde_json::Value = serde_json::from_slice(body).expect("verify body");
+        let oid = request["oid"].as_str().expect("oid").to_string();
+        let held = lfs
+            .objects
+            .get(&oid)
+            .is_some_and(|bytes| Some(bytes.len() as u64) == request["size"].as_u64());
+        lfs.verified.push(oid);
+        return Some(if held {
+            respond("200 OK", "application/vnd.git-lfs+json", "{}".to_string())
+        } else {
+            respond(
+                "404 Not Found",
+                "application/vnd.git-lfs+json",
+                "{}".to_string(),
+            )
+        });
+    }
+    None
 }
 
 pub(crate) fn spawn_git_http_backend(root: &std::path::Path) -> GitHttpBackend {
@@ -321,6 +413,8 @@ pub(crate) fn spawn_git_http_backend(root: &std::path::Path) -> GitHttpBackend {
     let address = listener.local_addr().expect("addr");
     let authorizations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&authorizations);
+    let lfs: Arc<Mutex<FakeLfs>> = Arc::default();
+    let lfs_state = Arc::clone(&lfs);
     let root = root.to_path_buf();
 
     std::thread::spawn(move || {
@@ -401,6 +495,12 @@ pub(crate) fn spawn_git_http_backend(root: &std::path::Path) -> GitHttpBackend {
                 .unwrap_or_default();
 
             let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+            if let Some(response) = fake_lfs_response(&lfs_state, address, &method, path, &body) {
+                if stream.write_all(response.as_bytes()).is_ok() {
+                    drop(stream.flush());
+                }
+                continue;
+            }
             let content_type = header("content-type").unwrap_or_default();
             let content_length = body.len().to_string();
             let project_root = root.to_string_lossy().into_owned();
@@ -481,6 +581,7 @@ pub(crate) fn spawn_git_http_backend(root: &std::path::Path) -> GitHttpBackend {
     GitHttpBackend {
         url: format!("http://{address}"),
         authorizations,
+        lfs,
     }
 }
 

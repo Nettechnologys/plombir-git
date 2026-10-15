@@ -247,6 +247,15 @@ fn blob_paths(
 ///
 /// A tag of a tree or a blob names no history and is left out.
 fn ref_commit_tips(repo: &gix::Repository, repo_path: &Path) -> Result<Vec<gix::ObjectId>> {
+    commit_tips_of(repo, repo_path, |_| true)
+}
+
+/// [`ref_commit_tips`] for the refs whose full name `wanted` accepts.
+fn commit_tips_of(
+    repo: &gix::Repository,
+    repo_path: &Path,
+    wanted: impl Fn(&str) -> bool,
+) -> Result<Vec<gix::ObjectId>> {
     let mut tips = BTreeSet::new();
     let references = repo
         .references()
@@ -258,6 +267,9 @@ fn ref_commit_tips(repo: &gix::Repository, repo_path: &Path) -> Result<Vec<gix::
         let mut reference = reference
             .map_err(anyhow::Error::from_boxed)
             .with_context(|| format!("failed to read a reference in {repo_path:?}"))?;
+        if !wanted(&reference.name().as_bstr().to_string()) {
+            continue;
+        }
         let id = reference
             .peel_to_id()
             .with_context(|| format!("failed to resolve `{}`", reference.name().as_bstr()))?
@@ -282,6 +294,19 @@ pub fn commit_tips(repo_path: &Path) -> Result<Vec<String>> {
         .into_iter()
         .map(|id| id.to_string())
         .collect())
+}
+
+/// The commits `refs/heads/*` and `refs/tags/*` point at, as hex, sorted —
+/// the history a push mirror sends, without the server's own refs.
+pub fn branch_and_tag_tips(repo_path: &Path) -> Result<Vec<String>> {
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+    Ok(commit_tips_of(&repo, repo_path, |name| {
+        name.starts_with("refs/heads/") || name.starts_with("refs/tags/")
+    })?
+    .into_iter()
+    .map(|id| id.to_string())
+    .collect())
 }
 
 /// Every LFS object that the commits reachable from the refs of `repo_path`,
@@ -319,7 +344,58 @@ pub fn pointers_added_since(
         }
     }
     let tips = ref_commit_tips(&repo, repo_path)?;
+    pointers_in_walk(&repo, repo_path, tips, hidden).map(Some)
+}
 
+/// Every LFS object that the history reachable from `tips`, and from none of
+/// `known`, adds — one entry per oid, sorted by oid. An empty `known` reads
+/// the whole history behind `tips`.
+///
+/// What a push mirror asks before it pushes: `tips` are the branches and tags
+/// it sends, `known` what the remote's branches and tags already point at.
+/// Unlike [`pointers_added_since`], a `known` commit this repository does not
+/// have is skipped rather than fatal — it is the remote's history, which may
+/// hold commits this one never had, and skipping it only widens the walk.
+pub fn pointers_reachable(
+    repo_path: &Path,
+    tips: &[String],
+    known: &[String],
+) -> Result<Vec<PointerInHistory>> {
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+    let commits = |names: &[String]| -> Result<Vec<gix::ObjectId>> {
+        let mut commits = Vec::with_capacity(names.len());
+        for name in names {
+            let Ok(id) = gix::ObjectId::from_hex(name.as_bytes()) else {
+                continue;
+            };
+            match repo.try_find_header(id) {
+                Ok(Some(header)) if header.kind() == gix::object::Kind::Commit => commits.push(id),
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(anyhow::Error::from(error)
+                        .context(format!("failed to read the header of object {id}")))
+                }
+            }
+        }
+        Ok(commits)
+    };
+    let tips = commits(tips)?;
+    if tips.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hidden = commits(known)?;
+    pointers_in_walk(&repo, repo_path, tips, hidden)
+}
+
+/// The pointers the commits reachable from `tips` and not from `hidden` add,
+/// each commit compared with its first parent.
+fn pointers_in_walk(
+    repo: &gix::Repository,
+    repo_path: &Path,
+    tips: Vec<gix::ObjectId>,
+    hidden: Vec<gix::ObjectId>,
+) -> Result<Vec<PointerInHistory>> {
     let mut found: BTreeMap<String, PointerInHistory> = BTreeMap::new();
     let mut seen_blobs = HashSet::new();
     let walk = repo
@@ -385,7 +461,7 @@ pub fn pointers_added_since(
             }
         }
     }
-    Ok(Some(found.into_values().collect()))
+    Ok(found.into_values().collect())
 }
 
 /// Every LFS object that the history reachable from a repository's refs

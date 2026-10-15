@@ -28,7 +28,26 @@
 //! owner turns on, never the default, because it destroys whatever the remote
 //! held that this repository does not.
 //!
-//! LFS objects are not uploaded: the remote receives the pointer files.
+//! ## LFS objects
+//!
+//! The pointers in the pushed history name objects the remote has to serve
+//! too, and `git push` does not carry them (card_c5bd09ee37e9). Before the
+//! refs go out, a pass asks the remote's LFS batch API for every object the
+//! history it sends points at and uploads the ones it lacks
+//! ([`crate::lfs::upload`]) — objects first, the way the git-lfs client's
+//! pre-push hook orders it, so a client that sees the new refs finds what
+//! they point at. Which history: the commits the pushed branches and tags
+//! reach and the remote's branches and tags do not (`git ls-remote`), so a
+//! pass after one new commit reads one commit. That shortcut trusts the
+//! remote's refs to stand for objects it already has, which only a clean
+//! pass earns: the first pass, and every pass after a failed one, reads the
+//! whole history behind the pushed refs instead.
+//!
+//! An object that does not reach the remote — this server has no copy of it,
+//! the remote refused it — does not hold the refs back: the code is no less
+//! the repository's for one missing binary. The pass is recorded as failed,
+//! naming the objects by oid and path, and the retry reads the whole history
+//! again.
 //!
 //! ## The remote and its credential
 //!
@@ -450,10 +469,11 @@ async fn push_pass(
     transport_policy: MirrorTransportPolicy,
     credentials: Option<GitCredentials>,
 ) -> (Option<GitCredentials>, Result<()>) {
-    let served = match crate::repo::service::repository_identity(db, mirror.repo_id).await {
-        Ok((owner, name)) => repo_root.join(&owner).join(format!("{name}.git")),
+    let (owner, name) = match crate::repo::service::repository_identity(db, mirror.repo_id).await {
+        Ok(identity) => identity,
         Err(error) => return (credentials, Err(error)),
     };
+    let served = repo_root.join(&owner).join(format!("{name}.git"));
     // The full guard, with DNS, immediately before the subprocess — not only
     // when the URL was stored: the name may resolve somewhere else by now.
     let remote = match transport_policy.destination(&mirror.url).await {
@@ -465,7 +485,96 @@ async fn push_pass(
             )
         }
     };
-    let force = mirror.force;
+    let storage = crate::blob_storage::instance_blob_storage(repo_root);
+    let lfs = LfsSide {
+        storage: &storage,
+        repo_root,
+        repository: crate::lfs::service::LfsRepository {
+            id: mirror.repo_id,
+            owner: &owner,
+            name: &name,
+        },
+        guard: &transport_policy,
+        // The remote's refs stand for the objects it has only after a clean
+        // pass; see the module documentation.
+        whole_history: mirror.last_success_at.is_none() || mirror.last_sync_error.is_some(),
+    };
+    send_to_remote(
+        lfs,
+        served,
+        remote,
+        credentials,
+        mirror.force,
+        transport_policy,
+    )
+    .await
+}
+
+/// What a pass needs to send the LFS objects beside the refs.
+struct LfsSide<'a> {
+    storage: &'a dyn crate::blob_storage::BlobStorage,
+    repo_root: &'a Path,
+    repository: crate::lfs::service::LfsRepository<'a>,
+    guard: &'a dyn crate::lfs::fetch::LfsSourceGuard,
+    /// Read every pointer behind the pushed refs, not only the ones the
+    /// remote's refs do not reach.
+    whole_history: bool,
+}
+
+/// The LFS objects, then the refs. Hands the credential back so the caller
+/// can mask it out of whatever the failure says.
+async fn send_to_remote(
+    lfs: LfsSide<'_>,
+    served: std::path::PathBuf,
+    remote: crate::net::GuardedGitRemote,
+    credentials: Option<GitCredentials>,
+    force: bool,
+    transport_policy: MirrorTransportPolicy,
+) -> (Option<GitCredentials>, Result<()>) {
+    let whole_history = lfs.whole_history;
+    let scan = crate::blocking::run_blocking_git("push mirror LFS pointer scan", move || {
+        let pointers = pointers_to_send(
+            transport_policy,
+            &served,
+            &remote,
+            credentials.as_ref(),
+            whole_history,
+        );
+        Ok((served, remote, credentials, pointers))
+    })
+    .await;
+    let (served, remote, credentials, pointers) = match scan {
+        Ok(scanned) => scanned,
+        Err(error) => return (None, Err(error)),
+    };
+    let pointers = match pointers {
+        Ok(pointers) => pointers,
+        Err(error) => return (credentials, Err(error)),
+    };
+
+    let uploaded = if pointers.is_empty() {
+        Ok(crate::lfs::upload::LfsUploadOutcome::default())
+    } else {
+        upload_objects(&lfs, &remote, credentials.as_ref(), &pointers).await
+    };
+    let lfs_shortfall = match uploaded {
+        Ok(outcome) if outcome.failed.is_empty() => {
+            if outcome.uploaded > 0 {
+                tracing::info!(
+                    repo_id = lfs.repository.id,
+                    uploaded = outcome.uploaded,
+                    "sent the LFS objects a push mirror pass brought pointers for"
+                );
+            }
+            None
+        }
+        Ok(outcome) => Some(super::lfs::describe_upload_shortfall(&outcome.failed)),
+        Err(error) => Some(format!(
+            "the LFS objects the pushed history points at could not be sent to the push \
+             mirror: {error:#}"
+        )),
+    };
+
     let pass = crate::blocking::run_blocking_git("push mirror", move || {
         let result = run_git_push(
             transport_policy,
@@ -477,10 +586,88 @@ async fn push_pass(
         Ok((credentials, result))
     })
     .await;
-    match pass {
-        Ok((credentials, result)) => (credentials, result),
-        Err(error) => (None, Err(error)),
-    }
+    let (credentials, pushed) = match pass {
+        Ok(pass) => pass,
+        Err(error) => return (None, Err(error)),
+    };
+    let result = match (pushed, lfs_shortfall) {
+        (Ok(()), None) => Ok(()),
+        (Ok(()), Some(shortfall)) => Err(anyhow::anyhow!("the refs were pushed, but {shortfall}")),
+        (Err(error), None) => Err(error),
+        (Err(error), Some(shortfall)) => Err(error.context(shortfall)),
+    };
+    (credentials, result)
+}
+
+/// The pointers the history this pass pushes holds: all of it with
+/// `whole_history`, otherwise what the remote's branches and tags do not
+/// reach yet.
+fn pointers_to_send(
+    transport_policy: MirrorTransportPolicy,
+    served: &Path,
+    remote: &crate::net::GuardedGitRemote,
+    credentials: Option<&GitCredentials>,
+    whole_history: bool,
+) -> Result<Vec<crate::lfs::pointer::PointerInHistory>> {
+    let known = if whole_history {
+        Vec::new()
+    } else {
+        remote_tips(transport_policy, remote, credentials)?
+    };
+    let tips = crate::lfs::pointer::branch_and_tag_tips(served)
+        .context("failed to read the refs this pass pushes")?;
+    crate::lfs::pointer::pointers_reachable(served, &tips, &known)
+        .context("failed to read the LFS pointers the pushed history holds")
+}
+
+/// The commits (and tag objects) the remote's branches and tags point at.
+fn remote_tips(
+    transport_policy: MirrorTransportPolicy,
+    remote: &crate::net::GuardedGitRemote,
+    credentials: Option<&GitCredentials>,
+) -> Result<Vec<String>> {
+    transport_policy.require_confidential_transport(remote.url())?;
+    let git = global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let invocation = remote.bind_invocation(credential_invocation(credentials))?;
+    let output = invocation.run(
+        git,
+        &["ls-remote", remote.url(), "refs/heads/*", "refs/tags/*"],
+        None,
+    )?;
+    output
+        .ensure_success()
+        .context("git ls-remote on the push mirror")?;
+    Ok(output
+        .stdout_str()
+        .lines()
+        .filter_map(|line| line.split('\t').next())
+        .filter(|id| gix::ObjectId::from_hex(id.trim().as_bytes()).is_ok())
+        .map(|id| id.trim().to_string())
+        .collect())
+}
+
+async fn upload_objects(
+    lfs: &LfsSide<'_>,
+    remote: &crate::net::GuardedGitRemote,
+    credentials: Option<&GitCredentials>,
+    pointers: &[crate::lfs::pointer::PointerInHistory],
+) -> Result<crate::lfs::upload::LfsUploadOutcome> {
+    let mut uploader = crate::lfs::upload::LfsUploader::new(
+        lfs.storage,
+        lfs.repo_root,
+        lfs.repository,
+        remote.url(),
+        credentials.map(|credentials| {
+            GitCredentials::new(
+                credentials.username().map(str::to_string),
+                credentials.password().to_string(),
+            )
+        }),
+        lfs.guard,
+    )?;
+    uploader.upload(pointers).await
 }
 
 /// The refspecs a pass pushes: branches and tags only, never the server's own
@@ -741,6 +928,196 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("turn on force"), "{message}");
+    }
+
+    /// The loopback remote is this test's own; the production guards refuse
+    /// it, and have their own tests.
+    struct Loopback;
+
+    impl crate::lfs::fetch::LfsSourceGuard for Loopback {
+        fn client_for(&self, _url: &str) -> Result<reqwest::ClientBuilder> {
+            Ok(crate::net::outbound_client_builder())
+        }
+    }
+
+    fn lfs_oid(payload: &[u8]) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(payload))
+    }
+
+    /// Commit a pointer to `payload` as `path`.
+    fn commit_pointer(work: &Path, path: &str, payload: &[u8]) {
+        std::fs::write(
+            work.join(path),
+            format!(
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+                lfs_oid(payload),
+                payload.len()
+            ),
+        )
+        .unwrap();
+        git(work, &["add", path]);
+        git(work, &["commit", "-q", "-m", path]);
+    }
+
+    /// Put `payload` in this server's LFS store for the seeded repository.
+    async fn store_locally(
+        db: &DatabaseConnection,
+        repo_root: &Path,
+        repo_id: i64,
+        payload: &[u8],
+    ) {
+        let oid = lfs_oid(payload);
+        let lfs_root = crate::lfs::service::lfs_root(repo_root, "push-mirror-owner", "pushed");
+        std::fs::create_dir_all(&lfs_root).unwrap();
+        let spool = lfs_root.join(crate::staging::lfs_object_spool_name(
+            &oid,
+            uuid::Uuid::new_v4(),
+        ));
+        std::fs::write(&spool, payload).unwrap();
+        crate::lfs::service::store_object_from_file(
+            db,
+            repo_id,
+            &crate::blob_storage::instance_blob_storage(repo_root),
+            "push-mirror-owner",
+            "pushed",
+            &oid,
+            &spool,
+            payload.len() as i64,
+        )
+        .await
+        .expect("store the object locally");
+    }
+
+    /// card_c5bd09ee37e9: the LFS objects the pushed history points at reach
+    /// the remote before the refs do; an object this server does not have is
+    /// named in the pass's failure without holding the refs back; the retry,
+    /// which reads the whole history, sends it once it is here and leaves the
+    /// uploaded ones alone; and a clean pass after that asks the remote only
+    /// about what its refs do not reach yet.
+    #[tokio::test]
+    async fn a_pass_sends_the_lfs_objects_the_pushed_history_points_at() {
+        let db = migrated_memory_database().await;
+        let repo_id = seeded_repo(&db).await;
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("repos");
+        let backend_root = temp.path().join("remote");
+        std::fs::create_dir_all(&backend_root).unwrap();
+        git(&backend_root, &["init", "-q", "--bare", "target.git"]);
+        let target = backend_root.join("target.git");
+        let backend = spawn_git_http_backend(&backend_root);
+        let remote_url = format!("{}/target.git", backend.url);
+        let credentials = || {
+            Some(GitCredentials::new(
+                Some("mirror-bot".into()),
+                "s3cret".into(),
+            ))
+        };
+        let policy = MirrorTransportPolicy::new(true);
+        let storage = crate::blob_storage::instance_blob_storage(&repo_root);
+        let (served, work) = served_repository(temp.path());
+
+        let present: &[u8] = b"a binary this server holds";
+        let missing: &[u8] = b"a binary nobody uploaded here";
+        commit_pointer(&work, "present.bin", present);
+        commit_pointer(&work, "missing.bin", missing);
+        git(&work, &["push", "-q", served.to_str().unwrap(), "main"]);
+        store_locally(&db, &repo_root, repo_id, present).await;
+
+        let pass = |whole_history: bool| {
+            let (storage, repo_root, served, remote_url) =
+                (&storage, &repo_root, served.clone(), remote_url.clone());
+            async move {
+                let lfs = LfsSide {
+                    storage,
+                    repo_root,
+                    repository: crate::lfs::service::LfsRepository {
+                        id: repo_id,
+                        owner: "push-mirror-owner",
+                        name: "pushed",
+                    },
+                    guard: &Loopback,
+                    whole_history,
+                };
+                let remote = crate::net::GuardedGitRemote::unbound_for_test(&remote_url);
+                send_to_remote(lfs, served, remote, credentials(), false, policy)
+                    .await
+                    .1
+            }
+        };
+
+        // First pass: the whole history. One object arrives, one is named.
+        let error = pass(true)
+            .await
+            .expect_err("an object this server lacks fails the pass");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&lfs_oid(missing)) && message.contains("missing.bin"),
+            "the failure names the missing object: {message}"
+        );
+        assert!(
+            message.contains("this server does not have this object"),
+            "{message}"
+        );
+        assert_eq!(
+            rev(&target, "refs/heads/main"),
+            rev(&served, "refs/heads/main"),
+            "a missing binary held the refs back"
+        );
+        {
+            let lfs = backend.lfs.lock().unwrap();
+            assert_eq!(
+                lfs.objects.get(&lfs_oid(present)).map(Vec::as_slice),
+                Some(present),
+                "the object this server holds did not reach the remote intact"
+            );
+            assert_eq!(lfs.uploads, vec![lfs_oid(present)]);
+            assert_eq!(lfs.verified, vec![lfs_oid(present)]);
+        }
+
+        // The retry reads the whole history again: the object that arrived is
+        // not sent twice, the one that is here now goes out.
+        store_locally(&db, &repo_root, repo_id, missing).await;
+        pass(true).await.expect("every object is here now");
+        {
+            let lfs = backend.lfs.lock().unwrap();
+            assert_eq!(
+                lfs.objects.get(&lfs_oid(missing)).map(Vec::as_slice),
+                Some(missing)
+            );
+            assert_eq!(lfs.uploads, vec![lfs_oid(present), lfs_oid(missing)]);
+        }
+
+        // A clean pass after one more commit asks about that commit only.
+        let third: &[u8] = b"a third binary";
+        commit_pointer(&work, "third.bin", third);
+        git(&work, &["push", "-q", served.to_str().unwrap(), "main"]);
+        store_locally(&db, &repo_root, repo_id, third).await;
+        pass(false).await.expect("an incremental pass");
+        let lfs = backend.lfs.lock().unwrap();
+        assert_eq!(
+            lfs.upload_batches.last(),
+            Some(&vec![lfs_oid(third)]),
+            "the pass read history the remote's refs already reach"
+        );
+        assert_eq!(
+            lfs.objects.get(&lfs_oid(third)).map(Vec::as_slice),
+            Some(third)
+        );
+        assert_eq!(
+            rev(&target, "refs/heads/main"),
+            rev(&served, "refs/heads/main")
+        );
+        let expected = format!("Basic {}", STANDARD.encode("mirror-bot:s3cret"));
+        assert!(
+            backend
+                .authorizations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|authorization| authorization == &expected),
+            "an LFS request went out without the mirror's credential"
+        );
     }
 
     /// A credential is given for one remote: moving the mirror to another host

@@ -571,7 +571,13 @@ here stays there. **Overwrite the remote** (`force`) makes the mirror an exact
 copy — rewritten branches are force-pushed, deleted ones removed — and with it
 anything only the remote had is lost, which is why it is never the default.
 Only `refs/heads/*` and `refs/tags/*` are pushed, never the server's own refs.
-LFS objects are not uploaded yet: the remote receives the pointer files.
+
+LFS objects go along, before the refs: the remote's LFS batch API is asked
+which objects of the pushed history it lacks, and those are uploaded with the
+mirror's credential, so `git lfs pull` from the mirror gets files rather than
+pointers. An object this server does not have, or one the remote refuses,
+does not hold the branches back — they are pushed, and the mirror's last error
+names the object by oid and path until a later push gets it there.
 
 The remote is held to the pull mirror's rules: HTTPS (plain HTTP only with
 `[mirror].allow_insecure_http`), the private-address guard before every push,

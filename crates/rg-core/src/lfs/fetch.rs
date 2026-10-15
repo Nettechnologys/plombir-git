@@ -67,9 +67,9 @@ pub const BATCH_SIZE: usize = 100;
 /// Ceiling on one batch answer. A hundred download actions with signed
 /// `href`s and their headers come to well under a megabyte; anything near
 /// this is not a batch answer.
-const BATCH_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const BATCH_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
+pub(crate) const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
 
 /// How long one object may take to arrive in total. The size of an object is
 /// the source's to choose up to [`LFS_OBJECT_MAX_BYTES`], so the request-wide
@@ -82,8 +82,8 @@ const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Tries per request before a transient refusal — a connection that failed,
 /// `429`, `5xx` — counts as the object's failure.
-const ATTEMPTS: u32 = 3;
-const RETRY_BACKOFF: Duration = Duration::from_millis(500);
+pub(crate) const ATTEMPTS: u32 = 3;
+pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Where a fetch may connect, and the only client that may connect there.
 ///
@@ -140,14 +140,7 @@ pub struct LfsFetcher<'a> {
     storage: &'a dyn BlobStorage,
     repo_root: &'a std::path::Path,
     destination: LfsRepository<'a>,
-    guard: &'a dyn LfsSourceGuard,
-    credentials: Option<GitCredentials>,
-    endpoint: reqwest::Url,
-    endpoint_origin: HttpOrigin,
-    batch_client: reqwest::Client,
-    /// One client per download origin, each built through the guard for that
-    /// origin. A source typically serves every object from one or two hosts.
-    download_clients: HashMap<HttpOrigin, reqwest::Client>,
+    batch: LfsBatchClient<'a>,
     /// The destination's `[limits]` budget, checked for each object before it
     /// is downloaded.
     limits: crate::storage_quota::StorageLimits,
@@ -158,7 +151,7 @@ pub struct LfsFetcher<'a> {
 }
 
 /// The batch endpoint the git-lfs client derives from `remote_url`.
-fn batch_endpoint(remote_url: &str) -> Result<reqwest::Url> {
+pub(crate) fn batch_endpoint(remote_url: &str) -> Result<reqwest::Url> {
     let mut url = reqwest::Url::parse(remote_url.trim())
         .with_context(|| format!("the remote URL `{remote_url}` is not a URL"))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -203,26 +196,12 @@ impl<'a> LfsFetcher<'a> {
         guard: &'a dyn LfsSourceGuard,
         limits: crate::storage_quota::StorageLimits,
     ) -> Result<Self> {
-        let endpoint = batch_endpoint(remote_url)?;
-        let endpoint_origin = HttpOrigin::from_url(&endpoint)
-            .context("the LFS batch endpoint has no HTTP(S) origin")?;
-        let batch_client = guard
-            .client_for(endpoint.as_str())?
-            .redirect(crate::net::same_origin_redirect_policy())
-            .user_agent("PlombirGit/0.1")
-            .build()
-            .context("failed to build the LFS batch client")?;
         Ok(Self {
             db,
             storage,
             repo_root,
             destination,
-            guard,
-            credentials,
-            endpoint,
-            endpoint_origin,
-            batch_client,
-            download_clients: HashMap::new(),
+            batch: LfsBatchClient::new("the source", remote_url, credentials, guard)?,
             limits,
             pass_allowance: crate::clone_budget::PassAllowance::unlimited(),
         })
@@ -259,7 +238,7 @@ impl<'a> LfsFetcher<'a> {
         }
 
         for chunk in wanted.chunks(BATCH_SIZE) {
-            let answer = match self.request_batch(chunk).await {
+            let answer = match self.batch.request("download", chunk).await {
                 Ok(answer) => answer,
                 Err(reason) => {
                     outcome
@@ -288,94 +267,6 @@ impl<'a> LfsFetcher<'a> {
             }
         }
         Ok(outcome)
-    }
-
-    /// Ask the source for download actions for `chunk`. `Err` is the reason
-    /// the whole batch failed, for every object in it.
-    async fn request_batch(
-        &self,
-        chunk: &[&PointerInHistory],
-    ) -> std::result::Result<HashMap<String, BatchObject>, String> {
-        let body = serde_json::json!({
-            "operation": "download",
-            "transfers": ["basic"],
-            "objects": chunk
-                .iter()
-                .map(|entry| serde_json::json!({
-                    "oid": entry.pointer.oid,
-                    "size": entry.pointer.size,
-                }))
-                .collect::<Vec<_>>(),
-        })
-        .to_string();
-
-        let response = send_with_retry(|| {
-            let request = self
-                .batch_client
-                .post(self.endpoint.clone())
-                .header(reqwest::header::ACCEPT, LFS_MEDIA_TYPE)
-                .header(reqwest::header::CONTENT_TYPE, LFS_MEDIA_TYPE)
-                .body(body.clone());
-            match &self.credentials {
-                Some(credentials) => request.basic_auth(
-                    credentials.username().unwrap_or_default(),
-                    Some(credentials.password()),
-                ),
-                None => request,
-            }
-        })
-        .await
-        .map_err(|error| {
-            tracing::warn!(
-                endpoint = %self.endpoint_origin_label(),
-                error = %format!("{error:#}"),
-                "the source's LFS batch API could not be reached"
-            );
-            "the source's LFS batch API could not be reached".to_string()
-        })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(match status {
-                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                    format!(
-                        "the source refused this server's credential for its LFS API ({status})"
-                    )
-                }
-                reqwest::StatusCode::NOT_FOUND => {
-                    format!("the source has no LFS batch API for this repository ({status})")
-                }
-                reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                    format!("the source rate-limited the LFS batch request ({status})")
-                }
-                _ => format!("the source's LFS batch API answered {status}"),
-            });
-        }
-
-        let bytes = read_bounded(response, BATCH_RESPONSE_MAX_BYTES)
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "the source's LFS batch answer could not be read"
-                );
-                "the source's LFS batch answer could not be read".to_string()
-            })?;
-        let answer: BatchResponse = serde_json::from_slice(&bytes)
-            .map_err(|_| "the source's LFS batch answer is not a batch answer".to_string())?;
-        if let Some(transfer) = answer.transfer.as_deref() {
-            if transfer != "basic" {
-                return Err(format!(
-                    "the source answered with the `{transfer}` transfer adapter, which this server \
-                     does not speak"
-                ));
-            }
-        }
-        Ok(answer
-            .objects
-            .into_iter()
-            .map(|object| (object.oid.clone(), object))
-            .collect())
     }
 
     /// Download and publish one object. The outer `Err` is this server's; the
@@ -435,27 +326,26 @@ impl<'a> LfsFetcher<'a> {
             return Ok(Err(reason));
         }
 
-        let request = match self.download_request(action) {
+        let request = match self.batch.prepare(action, "download") {
             Ok(request) => request,
             Err(reason) => return Ok(Err(reason)),
         };
-        let credentials = self
-            .credentials
-            .as_ref()
-            .filter(|_| request.may_carry_credentials);
-        let response = match send_with_retry(|| request.build(credentials)).await {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(
-                    oid = %entry.pointer.oid,
-                    error = %format!("{error:#}"),
-                    "an LFS download from the source could not be started"
-                );
-                return Ok(Err(
-                    "the source's download address could not be reached".to_string()
-                ));
-            }
-        };
+        let response =
+            match send_with_retry(|| request.build(reqwest::Method::GET, self.batch.credentials()))
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(
+                        oid = %entry.pointer.oid,
+                        error = %format!("{error:#}"),
+                        "an LFS download from the source could not be started"
+                    );
+                    return Ok(Err(
+                        "the source's download address could not be reached".to_string()
+                    ));
+                }
+            };
         if response.status() != reqwest::StatusCode::OK {
             return Ok(Err(format!(
                 "the source answered {} to the download",
@@ -508,24 +398,184 @@ impl<'a> LfsFetcher<'a> {
         Ok(Ok(()))
     }
 
-    /// Prepare the download request for `action`, or say why it may not be
-    /// sent.
-    fn download_request(
-        &mut self,
-        action: &DownloadAction,
-    ) -> std::result::Result<DownloadRequest, String> {
-        let href = reqwest::Url::parse(&action.href)
-            .map_err(|_| "the source's download address is not a URL".to_string())?;
-        let origin = HttpOrigin::from_url(&href)
-            .ok_or_else(|| "the source's download address is not an HTTP(S) URL".to_string())?;
-        let same_origin = origin == self.endpoint_origin;
-        if !same_origin && href.scheme() != "https" {
-            return Err(
-                "the source sent a plaintext download address on another origin".to_string(),
+    fn spool_path(&self, oid: &str) -> std::path::PathBuf {
+        crate::lfs::service::lfs_root(
+            self.repo_root,
+            self.destination.owner,
+            self.destination.name,
+        )
+        .join(crate::staging::lfs_object_fetch_spool_name(
+            oid,
+            uuid::Uuid::new_v4(),
+        ))
+    }
+}
+
+/// One remote's LFS batch API and the clients its actions are sent through —
+/// what a fetch from a source and a push mirror's upload have in common.
+///
+/// `party` names the remote in every reason this writes ("the source", "the
+/// push mirror"): those reasons are stored in a row its owner reads, so they
+/// say who refused, never quote what the remote said.
+pub(crate) struct LfsBatchClient<'a> {
+    party: &'static str,
+    guard: &'a dyn LfsSourceGuard,
+    credentials: Option<GitCredentials>,
+    endpoint: reqwest::Url,
+    endpoint_origin: HttpOrigin,
+    batch_client: reqwest::Client,
+    /// One client per action origin, each built through the guard for that
+    /// origin. A remote typically serves every object from one or two hosts.
+    action_clients: HashMap<HttpOrigin, reqwest::Client>,
+}
+
+impl<'a> LfsBatchClient<'a> {
+    /// A client for the batch API of the repository at `remote_url`.
+    ///
+    /// Network-free: the endpoint's address is resolved by the client's guarded
+    /// connector when the first batch is sent, never ahead of it.
+    pub(crate) fn new(
+        party: &'static str,
+        remote_url: &str,
+        credentials: Option<GitCredentials>,
+        guard: &'a dyn LfsSourceGuard,
+    ) -> Result<Self> {
+        let endpoint = batch_endpoint(remote_url)?;
+        let endpoint_origin = HttpOrigin::from_url(&endpoint)
+            .context("the LFS batch endpoint has no HTTP(S) origin")?;
+        let batch_client = guard
+            .client_for(endpoint.as_str())?
+            .redirect(crate::net::same_origin_redirect_policy())
+            .user_agent("PlombirGit/0.1")
+            .build()
+            .context("failed to build the LFS batch client")?;
+        Ok(Self {
+            party,
+            guard,
+            credentials,
+            endpoint,
+            endpoint_origin,
+            batch_client,
+            action_clients: HashMap::new(),
+        })
+    }
+
+    /// The remote's credential — for the batch endpoint, and for an action
+    /// only through [`ActionRequest::build`], which knows whether it may go
+    /// there.
+    pub(crate) fn credentials(&self) -> Option<&GitCredentials> {
+        self.credentials.as_ref()
+    }
+
+    /// Ask the remote for `operation` (`download` or `upload`) actions for
+    /// `chunk`. `Err` is the reason the whole batch failed, for every object
+    /// in it.
+    pub(crate) async fn request(
+        &self,
+        operation: &str,
+        chunk: &[&PointerInHistory],
+    ) -> std::result::Result<HashMap<String, BatchObject>, String> {
+        let party = self.party;
+        let body = serde_json::json!({
+            "operation": operation,
+            "transfers": ["basic"],
+            "objects": chunk
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "oid": entry.pointer.oid,
+                    "size": entry.pointer.size,
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+
+        let response = send_with_retry(|| {
+            let request = self
+                .batch_client
+                .post(self.endpoint.clone())
+                .header(reqwest::header::ACCEPT, LFS_MEDIA_TYPE)
+                .header(reqwest::header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+                .body(body.clone());
+            match &self.credentials {
+                Some(credentials) => request.basic_auth(
+                    credentials.username().unwrap_or_default(),
+                    Some(credentials.password()),
+                ),
+                None => request,
+            }
+        })
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                endpoint = %self.endpoint_origin_label(),
+                error = %format!("{error:#}"),
+                "{party}'s LFS batch API could not be reached"
             );
+            format!("{party}'s LFS batch API could not be reached")
+        })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(match status {
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                    format!("{party} refused this server's credential for its LFS API ({status})")
+                }
+                reqwest::StatusCode::NOT_FOUND => {
+                    format!("{party} has no LFS batch API for this repository ({status})")
+                }
+                reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                    format!("{party} rate-limited the LFS batch request ({status})")
+                }
+                _ => format!("{party}'s LFS batch API answered {status}"),
+            });
         }
 
-        let client = match self.download_clients.get(&origin) {
+        let bytes = read_bounded(response, BATCH_RESPONSE_MAX_BYTES)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "{party}'s LFS batch answer could not be read"
+                );
+                format!("{party}'s LFS batch answer could not be read")
+            })?;
+        let answer: BatchResponse = serde_json::from_slice(&bytes)
+            .map_err(|_| format!("{party}'s LFS batch answer is not a batch answer"))?;
+        if let Some(transfer) = answer.transfer.as_deref() {
+            if transfer != "basic" {
+                return Err(format!(
+                    "{party} answered with the `{transfer}` transfer adapter, which this server \
+                     does not speak"
+                ));
+            }
+        }
+        Ok(answer
+            .objects
+            .into_iter()
+            .map(|object| (object.oid.clone(), object))
+            .collect())
+    }
+
+    /// Prepare the request for `action` — a `download`, `upload` or `verify`,
+    /// named by `what` in the reasons — or say why it may not be sent.
+    pub(crate) fn prepare(
+        &mut self,
+        action: &BatchAction,
+        what: &str,
+    ) -> std::result::Result<ActionRequest, String> {
+        let party = self.party;
+        let href = reqwest::Url::parse(&action.href)
+            .map_err(|_| format!("{party}'s {what} address is not a URL"))?;
+        let origin = HttpOrigin::from_url(&href)
+            .ok_or_else(|| format!("{party}'s {what} address is not an HTTP(S) URL"))?;
+        let same_origin = origin == self.endpoint_origin;
+        if !same_origin && href.scheme() != "https" {
+            return Err(format!(
+                "{party} sent a plaintext {what} address on another origin"
+            ));
+        }
+
+        let client = match self.action_clients.get(&origin) {
             Some(client) => client.clone(),
             None => {
                 let client = self
@@ -538,32 +588,31 @@ impl<'a> LfsFetcher<'a> {
                             .read_timeout(DOWNLOAD_IDLE_TIMEOUT)
                             .user_agent("PlombirGit/0.1")
                             .build()
-                            .context("failed to build the LFS download client")
+                            .context("failed to build the LFS transfer client")
                     })
                     .map_err(|error| {
                         tracing::warn!(
                             host = href.host_str().unwrap_or_default(),
                             error = %format!("{error:#}"),
-                            "refused an LFS download address the source chose"
+                            "refused an LFS {what} address {party} chose"
                         );
-                        "the source's download address points where this server may not connect"
-                            .to_string()
+                        format!("{party}'s {what} address points where this server may not connect")
                     })?;
-                self.download_clients.insert(origin, client.clone());
+                self.action_clients.insert(origin, client.clone());
                 client
             }
         };
 
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, value) in &action.header {
-            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| "the source attached an invalid header to the download".to_string())?;
-            let value = reqwest::header::HeaderValue::from_str(value)
-                .map_err(|_| "the source attached an invalid header to the download".to_string())?;
+            let invalid = || format!("{party} attached an invalid header to the {what}");
+            let name =
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid())?;
+            let value = reqwest::header::HeaderValue::from_str(value).map_err(|_| invalid())?;
             headers.insert(name, value);
         }
         let names_authorization = headers.contains_key(reqwest::header::AUTHORIZATION);
-        Ok(DownloadRequest {
+        Ok(ActionRequest {
             client,
             href,
             headers,
@@ -571,41 +620,36 @@ impl<'a> LfsFetcher<'a> {
         })
     }
 
-    fn spool_path(&self, oid: &str) -> std::path::PathBuf {
-        crate::lfs::service::lfs_root(
-            self.repo_root,
-            self.destination.owner,
-            self.destination.name,
-        )
-        .join(crate::staging::lfs_object_fetch_spool_name(
-            oid,
-            uuid::Uuid::new_v4(),
-        ))
-    }
-
     /// The endpoint's origin, for log lines — never the URL, whose path names
-    /// the source repository and whose query a source may sign.
+    /// the remote repository and whose query a remote may sign.
     fn endpoint_origin_label(&self) -> String {
         self.endpoint.origin().ascii_serialization()
     }
 }
 
-/// One download, rebuilt for every try.
-struct DownloadRequest {
+/// One action's request, rebuilt for every try.
+pub(crate) struct ActionRequest {
     client: reqwest::Client,
     href: reqwest::Url,
     headers: reqwest::header::HeaderMap,
-    /// Whether the source's credential may go to this `href`.
+    /// Whether the remote's credential may go to this `href`.
     may_carry_credentials: bool,
 }
 
-impl DownloadRequest {
-    fn build(&self, credentials: Option<&GitCredentials>) -> reqwest::RequestBuilder {
+impl ActionRequest {
+    /// The request, with the action's own headers, and with `credentials`
+    /// only when the `href` is on the batch endpoint's origin and the action
+    /// did not name an `Authorization` of its own.
+    pub(crate) fn build(
+        &self,
+        method: reqwest::Method,
+        credentials: Option<&GitCredentials>,
+    ) -> reqwest::RequestBuilder {
         let request = self
             .client
-            .get(self.href.clone())
+            .request(method, self.href.clone())
             .headers(self.headers.clone());
-        match credentials {
+        match credentials.filter(|_| self.may_carry_credentials) {
             Some(credentials) => request.basic_auth(
                 credentials.username().unwrap_or_default(),
                 Some(credentials.password()),
@@ -615,7 +659,7 @@ impl DownloadRequest {
     }
 }
 
-fn failure(entry: &PointerInHistory, reason: String) -> LfsFetchFailure {
+pub(crate) fn failure(entry: &PointerInHistory, reason: String) -> LfsFetchFailure {
     LfsFetchFailure {
         oid: entry.pointer.oid.clone(),
         path: entry.path.clone(),
@@ -625,7 +669,7 @@ fn failure(entry: &PointerInHistory, reason: String) -> LfsFetchFailure {
 
 /// Send what `build` makes, again after a pause when the answer is one a
 /// later try may not repeat.
-async fn send_with_retry(
+pub(crate) async fn send_with_retry(
     build: impl Fn() -> reqwest::RequestBuilder,
 ) -> reqwest::Result<reqwest::Response> {
     let mut backoff = RETRY_BACKOFF;
@@ -649,7 +693,10 @@ async fn send_with_retry(
 }
 
 /// Read a whole response body, refusing one larger than `max_bytes`.
-async fn read_bounded(mut response: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
+pub(crate) async fn read_bounded(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
     if response
         .content_length()
         .is_some_and(|length| length > max_bytes as u64)
@@ -787,33 +834,42 @@ struct BatchResponse {
     objects: Vec<BatchObject>,
 }
 
+/// One object of a batch answer.
 #[derive(Deserialize)]
-struct BatchObject {
-    oid: String,
+pub(crate) struct BatchObject {
+    pub(crate) oid: String,
     #[serde(default)]
-    size: Option<u64>,
+    pub(crate) size: Option<u64>,
     #[serde(default)]
-    actions: Option<BatchActions>,
+    pub(crate) actions: Option<BatchActions>,
     #[serde(default)]
-    error: Option<BatchObjectError>,
+    pub(crate) error: Option<BatchObjectError>,
+}
+
+/// What the remote asks the client to do with an object. A download answer
+/// carries `download`; an upload answer carries `upload` (and may add
+/// `verify`) for an object the remote does not have yet, and nothing for one
+/// it already has.
+#[derive(Deserialize)]
+pub(crate) struct BatchActions {
+    #[serde(default)]
+    pub(crate) download: Option<BatchAction>,
+    #[serde(default)]
+    pub(crate) upload: Option<BatchAction>,
+    #[serde(default)]
+    pub(crate) verify: Option<BatchAction>,
 }
 
 #[derive(Deserialize)]
-struct BatchActions {
-    #[serde(default)]
-    download: Option<DownloadAction>,
-}
-
-#[derive(Deserialize)]
-struct DownloadAction {
+pub(crate) struct BatchAction {
     href: String,
     #[serde(default)]
     header: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
-struct BatchObjectError {
-    code: i64,
+pub(crate) struct BatchObjectError {
+    pub(crate) code: i64,
 }
 
 #[cfg(test)]

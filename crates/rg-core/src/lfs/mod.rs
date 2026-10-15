@@ -4,3 +4,4 @@ pub mod gc;
 pub mod locks;
 pub mod pointer;
 pub mod service;
+pub mod upload;
