@@ -171,7 +171,7 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                     "number":      { "type": "number", "description": "Issue number" },
                     "title":       { "type": "string", "description": "New title" },
                     "body":        { "type": "string", "description": "New body" },
-                    "state":       { "type": "string", "description": "'open' or 'closed'" },
+                    "state":       { "type": "string", "enum": ["open", "closed"], "description": "New state" },
                     "labels":      { "type": "array", "items": { "type": "string" }, "description": "Replace label set" },
                     "assignee_id": { "type": ["number", "null"], "description": "Assignee user id (null to clear)" },
                     "milestone_id":{ "type": ["number", "null"], "description": "Milestone id (null to clear)" }
@@ -234,7 +234,7 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                     "owner":   { "type": "string", "description": "Repository owner" },
                     "repo":    { "type": "string", "description": "Repository name" },
                     "number":  { "type": "number", "description": "Pull request number" },
-                    "strategy":{ "type": "string", "description": "merge / squash / rebase" }
+                    "strategy":{ "type": "string", "enum": ["merge", "squash", "rebase"], "description": "How the head is merged into the base" }
                 },
                 "required": ["owner", "repo", "number", "strategy"]
             }
@@ -263,7 +263,7 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                     "owner":     { "type": "string", "description": "Repository owner" },
                     "repo":      { "type": "string", "description": "Repository name" },
                     "number":    { "type": "number", "description": "Pull request number" },
-                    "action":    { "type": "string", "description": "comment / approve / request_changes" },
+                    "action":    { "type": "string", "enum": ["comment", "approve", "request_changes"], "description": "What the review says" },
                     "body":      { "type": "string", "description": "Review body (Markdown)" },
                     "commit_id": { "type": "string", "description": "Commit SHA the review pins to (optional)" }
                 },
@@ -283,8 +283,8 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                     "body":       { "type": "string", "description": "Comment body (Markdown)" },
                     "line":       { "type": "number", "description": "Line number in the diff" },
                     "start_line": { "type": "number", "description": "Start line for a multi-line comment" },
-                    "side":       { "type": "string", "description": "'LEFT' or 'RIGHT'" },
-                    "start_side": { "type": "string", "description": "Side of the start line" },
+                    "side":       { "type": "string", "enum": ["LEFT", "RIGHT"], "description": "Side of the diff the line is on" },
+                    "start_side": { "type": "string", "enum": ["LEFT", "RIGHT"], "description": "Side of the start line" },
                     "review_id":  { "type": "number", "description": "Attach to an existing review (optional)" },
                     "suggestion": { "type": "string", "description": "Suggested replacement text (optional)" },
                     "reply_to_id":{ "type": "number", "description": "Id of the comment this one replies to (optional); `path` repeats that comment's path" },
@@ -396,7 +396,7 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                 "type": "object",
                 "properties": {
                     "q":       { "type": "string", "description": "Search query" },
-                    "type":    { "type": "string", "description": "all / repos / issues / wiki (default all)" },
+                    "type":    { "type": "string", "enum": ["all", "repos", "issues", "pulls", "users", "code", "wiki"], "description": "What to search (default all)" },
                     "page":    { "type": "number", "description": "Page number (optional)" },
                     "per_page":{ "type": "number", "description": "Page size (optional)" }
                 },
@@ -424,7 +424,7 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                 "properties": {
                     "owner": { "type": "string", "description": "Repository owner" },
                     "repo":  { "type": "string", "description": "Repository name" },
-                    "state": { "type": "string", "description": "open / closed / all (default open)" },
+                    "state": { "type": "string", "enum": ["open", "closed"], "description": "Issue state (default open)" },
                     "limit": { "type": "number", "description": "Max results (default 20)" }
                 },
                 "required": ["owner", "repo"]
@@ -438,7 +438,7 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                 "properties": {
                     "owner": { "type": "string", "description": "Repository owner" },
                     "repo":  { "type": "string", "description": "Repository name" },
-                    "state": { "type": "string", "description": "open / closed / all (default open)" },
+                    "state": { "type": "string", "enum": ["open", "closed", "merged"], "description": "Pull request state (default open)" },
                     "limit": { "type": "number", "description": "Max results (default 20)" }
                 },
                 "required": ["owner", "repo"]
@@ -475,6 +475,19 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
         }
     ]);
 
+    let mut tools = tools;
+    if let Some(tools) = tools.as_array_mut() {
+        for tool in tools {
+            let effect = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(tool_effect);
+            if let (Some(effect), Some(tool)) = (effect, tool.as_object_mut()) {
+                tool.insert("annotations".into(), effect.annotations());
+            }
+        }
+    }
+
     make_success(req.id.clone(), serde_json::json!({ "tools": tools }))
 }
 
@@ -482,6 +495,61 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
 
 /// Signature shared by every tool handler: arguments in, response text out.
 type ToolHandler = fn(&AppState, &Value) -> String;
+
+/// What a tool does to the forge, as the MCP tool annotations describe it.
+///
+/// Without `annotations` the specification tells a client to assume a tool is
+/// destructive and open-world, so an honest client asks the human before every
+/// `get_pr_diff` and a careless one learns to ask about nothing. The line
+/// between the two write kinds is whether the forge can put things back by
+/// itself: a comment can be deleted and a label set replaced, while a merge, a
+/// commit pushed onto a branch, an overwritten issue body or a cancelled job
+/// cannot be undone through this API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolEffect {
+    /// Reads only; calling it changes nothing.
+    Read,
+    /// Adds something new; a repeated call adds it again.
+    Additive,
+    /// Changes state reversibly; a repeated call with the same arguments
+    /// leaves the forge as the first one did.
+    AdditiveIdempotent,
+    /// Changes something the forge cannot restore by itself.
+    Destructive,
+    /// As [`ToolEffect::Destructive`], but a repeated call has no further effect.
+    DestructiveIdempotent,
+}
+
+impl ToolEffect {
+    /// The MCP `annotations` object for a tool with this effect.
+    ///
+    /// `openWorldHint` is false for every tool: each one talks to this forge's
+    /// own API and nothing beyond it.
+    pub fn annotations(self) -> Value {
+        let (read_only, destructive, idempotent) = match self {
+            ToolEffect::Read => (true, false, true),
+            ToolEffect::Additive => (false, false, false),
+            ToolEffect::AdditiveIdempotent => (false, false, true),
+            ToolEffect::Destructive => (false, true, false),
+            ToolEffect::DestructiveIdempotent => (false, true, true),
+        };
+        serde_json::json!({
+            "readOnlyHint": read_only,
+            "destructiveHint": destructive,
+            "idempotentHint": idempotent,
+            "openWorldHint": false,
+        })
+    }
+}
+
+/// What `tool` does to the forge. `None` for a tool this server does not
+/// implement.
+pub fn tool_effect(tool: &str) -> Option<ToolEffect> {
+    TOOL_DISPATCH
+        .iter()
+        .find(|(name, _, _, _)| *name == tool)
+        .map(|(_, _, _, effect)| *effect)
+}
 
 /// A route the API mounts, as a tool row declares it.
 const fn route(method: &'static str, path: &'static str) -> ApiRoute {
@@ -509,7 +577,13 @@ const fn route(method: &'static str, path: &'static str) -> ApiRoute {
 /// `rg-http`'s `every_mcp_tool_call_stays_on_the_routes_it_declares` drives
 /// every tool through that binding, so a row that forgets a route is a red
 /// test, not a tool that quietly stops working.
-const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
+///
+/// The fourth column is what the tool does to the forge, and [`list_tools`]
+/// turns it into the MCP `annotations` a client decides by whether to ask the
+/// human first (card_8fb6aef19d21). It sits in this row, not in the schema
+/// literal, so a new tool cannot be added without saying what it does — and
+/// `every_tool_effect_agrees_with_its_routes` holds it to the routes beside it.
+const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute], ToolEffect)] = &[
     // read
     (
         "list_repos",
@@ -518,26 +592,31 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             route("GET", "/api/v1/repos/explore"),
             route("GET", "/api/v1/repos/{owner}"),
         ],
+        ToolEffect::Read,
     ),
     (
         "read_file",
         tool_read_file,
         &[route("GET", "/api/v1/repos/{owner}/{name}/blob/{*path}")],
+        ToolEffect::Read,
     ),
     (
         "read_dir",
         tool_read_dir,
         &[route("GET", "/api/v1/repos/{owner}/{name}/tree")],
+        ToolEffect::Read,
     ),
     (
         "get_issue",
         tool_get_issue,
         &[route("GET", "/api/v1/repos/{owner}/{name}/issues/{number}")],
+        ToolEffect::Read,
     ),
     (
         "get_pr",
         tool_get_pr,
         &[route("GET", "/api/v1/repos/{owner}/{name}/pulls/{number}")],
+        ToolEffect::Read,
     ),
     (
         "get_pr_diff",
@@ -546,6 +625,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "GET",
             "/api/v1/repos/{owner}/{name}/pulls/{number}/diff",
         )],
+        ToolEffect::Read,
     ),
     (
         "list_reviews",
@@ -554,6 +634,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "GET",
             "/api/v1/repos/{owner}/{name}/pulls/{number}/reviews",
         )],
+        ToolEffect::Read,
     ),
     (
         "list_review_comments",
@@ -562,6 +643,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "GET",
             "/api/v1/repos/{owner}/{name}/pulls/{number}/comments",
         )],
+        ToolEffect::Read,
     ),
     // content write
     (
@@ -571,12 +653,14 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "POST",
             "/api/v1/repos/{owner}/{name}/contents/{*path}",
         )],
+        ToolEffect::Destructive,
     ),
     // issues write
     (
         "create_issue",
         tool_create_issue,
         &[route("POST", "/api/v1/repos/{owner}/{name}/issues")],
+        ToolEffect::Additive,
     ),
     (
         "update_issue",
@@ -585,6 +669,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "PATCH",
             "/api/v1/repos/{owner}/{name}/issues/{number}",
         )],
+        ToolEffect::DestructiveIdempotent,
     ),
     (
         "comment_issue",
@@ -593,6 +678,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "POST",
             "/api/v1/repos/{owner}/{name}/issues/{number}/comments",
         )],
+        ToolEffect::Additive,
     ),
     (
         "set_issue_labels",
@@ -601,12 +687,14 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "PATCH",
             "/api/v1/repos/{owner}/{name}/issues/{number}",
         )],
+        ToolEffect::AdditiveIdempotent,
     ),
     // pulls write
     (
         "create_pr",
         tool_create_pr,
         &[route("POST", "/api/v1/repos/{owner}/{name}/pulls")],
+        ToolEffect::Additive,
     ),
     (
         "merge_pr",
@@ -615,6 +703,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "POST",
             "/api/v1/repos/{owner}/{name}/pulls/{number}/merge",
         )],
+        ToolEffect::Destructive,
     ),
     (
         "request_reviewers",
@@ -623,6 +712,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "POST",
             "/api/v1/repos/{owner}/{name}/pulls/{number}/reviewers",
         )],
+        ToolEffect::AdditiveIdempotent,
     ),
     // reviews write
     (
@@ -632,6 +722,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "POST",
             "/api/v1/repos/{owner}/{name}/pulls/{number}/reviews",
         )],
+        ToolEffect::Additive,
     ),
     (
         "create_review_comment",
@@ -640,6 +731,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "POST",
             "/api/v1/repos/{owner}/{name}/pulls/{number}/comments",
         )],
+        ToolEffect::Additive,
     ),
     (
         "apply_suggestion",
@@ -648,17 +740,20 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "POST",
             "/api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}/suggestion/apply",
         )],
+        ToolEffect::Destructive,
     ),
     // CI
     (
         "list_pipelines",
         tool_list_pipelines,
         &[route("GET", "/api/v1/repos/{owner}/{name}/pipelines")],
+        ToolEffect::Read,
     ),
     (
         "get_pipeline",
         tool_get_pipeline,
         &[route("GET", "/api/v1/repos/{owner}/{name}/pipelines/{id}")],
+        ToolEffect::Read,
     ),
     (
         "retry_pipeline",
@@ -667,6 +762,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "POST",
             "/api/v1/repos/{owner}/{name}/pipelines/{id}/retry",
         )],
+        ToolEffect::Additive,
     ),
     (
         "cancel_pipeline",
@@ -675,6 +771,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "POST",
             "/api/v1/repos/{owner}/{name}/pipelines/{id}/cancel",
         )],
+        ToolEffect::DestructiveIdempotent,
     ),
     (
         "get_ci_job",
@@ -683,6 +780,7 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "GET",
             "/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}",
         )],
+        ToolEffect::Read,
     ),
     (
         "get_commit_status",
@@ -691,34 +789,45 @@ const TOOL_DISPATCH: &[(&str, ToolHandler, &[ApiRoute])] = &[
             "GET",
             "/api/v1/repos/{owner}/{name}/commits/{sha}/status",
         )],
+        ToolEffect::Read,
     ),
     // search
-    ("search", tool_search, &[route("GET", "/api/v1/search")]),
+    (
+        "search",
+        tool_search,
+        &[route("GET", "/api/v1/search")],
+        ToolEffect::Read,
+    ),
     // AI
     (
         "ai_repo_summary",
         tool_ai_repo_summary,
         &[route("GET", "/api/v1/ai/repos/{owner}/{name}/summary")],
+        ToolEffect::Read,
     ),
     (
         "ai_list_issues",
         tool_ai_list_issues,
         &[route("GET", "/api/v1/ai/repos/{owner}/{name}/issues")],
+        ToolEffect::Read,
     ),
     (
         "ai_list_prs",
         tool_ai_list_prs,
         &[route("GET", "/api/v1/ai/repos/{owner}/{name}/prs")],
+        ToolEffect::Read,
     ),
     (
         "ai_repo_tree",
         tool_ai_repo_tree,
         &[route("GET", "/api/v1/ai/repos/{owner}/{name}/tree")],
+        ToolEffect::Read,
     ),
     (
         "ai_search_code",
         tool_ai_search_code,
         &[route("GET", "/api/v1/ai/repos/{owner}/{name}/search/code")],
+        ToolEffect::Read,
     ),
 ];
 
@@ -743,8 +852,8 @@ pub fn call_tool(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
-    let result = match TOOL_DISPATCH.iter().find(|(tool, _, _)| *tool == name) {
-        Some((_, handler, _)) => handler(state, &args),
+    let result = match TOOL_DISPATCH.iter().find(|(tool, _, _, _)| *tool == name) {
+        Some((_, handler, _, _)) => handler(state, &args),
         None => {
             return make_error(req.id.clone(), -32601, &format!("unknown tool: {}", name));
         }
@@ -767,7 +876,7 @@ pub fn call_tool(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
 /// a token's allowed tools against this list, so a typo is refused when the
 /// token is minted rather than silently matching nothing.
 pub fn tool_names() -> impl Iterator<Item = &'static str> {
-    TOOL_DISPATCH.iter().map(|(name, _, _)| *name)
+    TOOL_DISPATCH.iter().map(|(name, _, _, _)| *name)
 }
 
 /// The API routes `tool` calls — all of them, and nothing else. `None` for a
@@ -775,8 +884,8 @@ pub fn tool_names() -> impl Iterator<Item = &'static str> {
 pub fn tool_routes(tool: &str) -> Option<&'static [ApiRoute]> {
     TOOL_DISPATCH
         .iter()
-        .find(|(name, _, _)| *name == tool)
-        .map(|(_, _, routes)| *routes)
+        .find(|(name, _, _, _)| *name == tool)
+        .map(|(_, _, routes, _)| *routes)
 }
 
 // ── helpers ───────────────────────────────────────────────
@@ -1484,7 +1593,7 @@ mod tests {
     #[test]
     fn advertised_tools_match_the_dispatch_table() {
         let advertised = advertised_tool_names();
-        let dispatched: Vec<&str> = TOOL_DISPATCH.iter().map(|(name, _, _)| *name).collect();
+        let dispatched: Vec<&str> = TOOL_DISPATCH.iter().map(|(name, _, _, _)| *name).collect();
 
         // Two empty sets compare equal; a vacuous pass would be worse than no gate.
         assert!(!dispatched.is_empty(), "dispatch table is empty");
@@ -1519,6 +1628,81 @@ mod tests {
             "dispatched by call_tool but never advertised — implemented and unreachable: \
              {unadvertised:?}"
         );
+    }
+
+    /// card_8fb6aef19d21: a tool without `annotations` is, by the MCP
+    /// specification, destructive and open-world — so every tool `tools/list`
+    /// advertises carries all four hints, and they are the ones its dispatch
+    /// row declares.
+    #[test]
+    fn every_advertised_tool_carries_its_annotations() {
+        let resp = list_tools(&state(), &req("tools/list", Value::Null));
+        let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+        assert_eq!(tools.len(), TOOL_DISPATCH.len());
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap();
+            let annotations = tool
+                .get("annotations")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{name} is advertised without annotations"));
+            for hint in [
+                "readOnlyHint",
+                "destructiveHint",
+                "idempotentHint",
+                "openWorldHint",
+            ] {
+                assert!(
+                    annotations.get(hint).is_some_and(Value::is_boolean),
+                    "{name} lacks a boolean {hint}: {annotations:?}"
+                );
+            }
+            assert_eq!(
+                tool["annotations"],
+                tool_effect(name).unwrap().annotations(),
+                "{name}"
+            );
+        }
+        let hints = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .map(|tool| tool["annotations"].clone())
+                .unwrap()
+        };
+        assert_eq!(hints("merge_pr")["destructiveHint"], true);
+        assert_eq!(hints("merge_pr")["readOnlyHint"], false);
+        assert_eq!(hints("get_pr_diff")["readOnlyHint"], true);
+        assert_eq!(hints("comment_issue")["destructiveHint"], false);
+        assert_eq!(hints("comment_issue")["readOnlyHint"], false);
+    }
+
+    /// The effect column cannot claim less than the routes beside it do: a tool
+    /// that reads only GETs, and a tool that only GETs is a read. A write tool
+    /// marked `Read` would let a client run it without asking anyone.
+    #[test]
+    fn every_tool_effect_agrees_with_its_routes() {
+        for (name, _, routes, effect) in TOOL_DISPATCH {
+            let only_gets = routes.iter().all(|route| route.method == "GET");
+            assert_eq!(
+                *effect == ToolEffect::Read,
+                only_gets,
+                "{name} is {effect:?} but calls {routes:?}"
+            );
+        }
+        for name in [
+            "merge_pr",
+            "write_file",
+            "apply_suggestion",
+            "cancel_pipeline",
+        ] {
+            assert!(
+                matches!(
+                    tool_effect(name),
+                    Some(ToolEffect::Destructive | ToolEffect::DestructiveIdempotent)
+                ),
+                "{name} changes what the forge cannot restore"
+            );
+        }
     }
 
     /// card_66aa21756448: the content-read tools addressed routes this server
@@ -1806,7 +1990,7 @@ mod tests {
             "..app",
         ];
         let mut probed = 0;
-        for (name, _, routes) in TOOL_DISPATCH {
+        for (name, _, routes, _) in TOOL_DISPATCH {
             for value in hostile {
                 for (owner, repo) in [("alice", value), (value, "app")] {
                     let (answer, sent) = call_recorded(name, probe_arguments(name, owner, repo));
@@ -1901,7 +2085,7 @@ mod tests {
     /// actually mounted is `rg-http`'s to prove, with the router in hand.
     #[test]
     fn every_tool_declares_its_routes_in_the_servers_spelling() {
-        for (name, _, routes) in TOOL_DISPATCH {
+        for (name, _, routes, _) in TOOL_DISPATCH {
             assert!(!routes.is_empty(), "{name} declares no route");
             for route in *routes {
                 assert!(

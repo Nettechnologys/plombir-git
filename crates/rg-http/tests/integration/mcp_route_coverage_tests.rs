@@ -551,3 +551,51 @@ async fn every_mcp_tool_call_stays_on_the_routes_it_declares() {
 
     server.abort();
 }
+
+/// The values a tool's schema offers as an `enum` for one argument.
+fn advertised_enum(tool: &str, argument: &str) -> Vec<String> {
+    let state = rg_mcp::AppState::new("http://127.0.0.1:1".into(), String::new());
+    let request = rg_mcp::protocol::JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: serde_json::Value::from(1),
+        method: "tools/list".into(),
+        params: None,
+    };
+    let tools = rg_mcp::tools::list_tools(&state, &request)
+        .result
+        .expect("tools/list answers");
+    let tool = tools["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|t| t["name"] == tool))
+        .unwrap_or_else(|| panic!("{tool} is not advertised"))
+        .clone();
+    tool["inputSchema"]["properties"][argument]["enum"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{tool}.{argument} offers no enum"))
+        .iter()
+        .map(|value| value.as_str().expect("a string enum").to_string())
+        .collect()
+}
+
+/// An `enum` in a tool's schema is a promise the client validates against
+/// before it calls: every value offered must be one the server's own parser
+/// accepts, or the agent is steered into a 400 the schema said could not happen.
+#[test]
+fn every_offered_mcp_enum_value_is_one_the_server_accepts() {
+    let strategies = advertised_enum("merge_pr", "strategy");
+    assert!(!strategies.is_empty());
+    for value in &strategies {
+        assert!(
+            rg_core::pull_request::MergeStrategy::parse(value).is_ok(),
+            "merge_pr offers strategy {value:?}, which the server refuses"
+        );
+    }
+    let actions = advertised_enum("create_review", "action");
+    assert!(!actions.is_empty());
+    for value in &actions {
+        assert!(
+            rg_core::review::service::ReviewAction::parse_action(value).is_ok(),
+            "create_review offers action {value:?}, which the server refuses"
+        );
+    }
+}
