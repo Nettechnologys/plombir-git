@@ -34,7 +34,16 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Model
 }
 
 /// Update a mirror record.
-pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
+///
+/// `last_sync_error` is cut to [`super::MAX_SYNC_ERROR_BYTES`] here, at the
+/// write, rather than by each caller: the pass that records a failure carries
+/// git's stderr, and a reason too long for MySQL's `TEXT` failed the whole
+/// statement — status, `last_sync_at` and `next_sync_at` with it — so the
+/// mirror kept its old state and stayed due on every tick (card_a3336549de13).
+pub async fn update(db: &DatabaseConnection, mut model: ActiveModel) -> Result<Model> {
+    if let ActiveValue::Set(Some(error)) = &model.last_sync_error {
+        model.last_sync_error = ActiveValue::Set(Some(super::bounded_sync_error(error)));
+    }
     model.update(db).await.context("db: update mirror")
 }
 

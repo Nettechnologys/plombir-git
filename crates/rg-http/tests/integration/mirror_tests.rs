@@ -1168,3 +1168,89 @@ async fn an_interval_that_would_make_a_mirror_permanently_due_is_refused() {
         );
     }
 }
+
+/// card_e4160f010bfb: the mirror routes are on `RepoWrite`, so a collaborator
+/// can repoint a mirror whose credential the owner stored. A move to another
+/// host without a credential of its own is the writer's 400, and the row keeps
+/// the owner's remote and token — the next pass dials what the row says.
+#[tokio::test]
+async fn a_writer_cannot_carry_the_stored_credential_to_another_host() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, _) = register_full(&base, "mirror-cred", "mirror-cred@example.com").await;
+    let (writer_token, _) =
+        register_full(&base, "mirror-writer", "mirror-writer@example.com").await;
+    create_repo(&base, &owner_token, "bound").await;
+
+    let client = reqwest::Client::new();
+    let repo_url = format!("{base}/api/v1/repos/mirror-cred/bound");
+    let added = client
+        .post(format!("{repo_url}/collaborators"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"username": "mirror-writer", "permission": "write"}))
+        .send()
+        .await
+        .expect("request");
+    assert!(
+        added.status().is_success(),
+        "{}",
+        added.text().await.unwrap()
+    );
+
+    let url = format!("{repo_url}/mirror");
+    let resp = client
+        .post(&url)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "url": REMOTE,
+            "username": "owner",
+            "password": "owner-pat",
+            "sync_interval_seconds": 3600,
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 201, "baseline create");
+    let repo_id = resp.json::<serde_json::Value>().await.expect("json")["repo_id"]
+        .as_i64()
+        .expect("repo_id");
+
+    let resp = client
+        .patch(&url)
+        .bearer_auth(&writer_token)
+        .json(&serde_json::json!({"url": "https://collector.example/x.git"}))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body = resp.text().await.expect("body");
+    assert_eq!(status, 400, "the owner's token followed the URL: {body}");
+    assert!(body.contains("another host"), "{body}");
+
+    let row = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+        .await
+        .expect("query")
+        .expect("the mirror row");
+    assert_eq!(
+        row.url, REMOTE,
+        "the refused request still moved the remote"
+    );
+    let key = rg_core::auth::encryption::derive_key(TEST_ENCRYPTION_KEY);
+    assert_eq!(
+        rg_core::auth::encryption::decrypt(row.password_encrypted.as_deref().unwrap(), &key)
+            .expect("decrypt"),
+        "owner-pat"
+    );
+
+    // Saying "no credential" is how the writer moves it, and the token stays behind.
+    let resp = client
+        .patch(&url)
+        .bearer_auth(&writer_token)
+        .json(&serde_json::json!({"url": "https://collector.example/x.git", "password": ""}))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["has_credentials"], false, "{body}");
+}

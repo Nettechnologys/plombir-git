@@ -106,3 +106,41 @@ mod last_used_tests {
         );
     }
 }
+
+/// The most of a failure's text a mirror's `last_sync_error` keeps — pull and
+/// push alike. MySQL's `TEXT` holds 64 KiB, and the text is git's stderr, whose
+/// `remote: …` lines the upstream writes at whatever length it likes; an
+/// `UPDATE` that does not fit fails, and the mirror would then show its previous
+/// state instead of the failure (and, for a pull mirror, stay due on every tick
+/// because `next_sync_at` rode in the same statement). The head of the message
+/// is where git names the cause.
+pub const MAX_SYNC_ERROR_BYTES: usize = 16 * 1024;
+
+/// `error` cut to [`MAX_SYNC_ERROR_BYTES`] on a character boundary, marked as
+/// cut.
+pub(crate) fn bounded_sync_error(error: &str) -> String {
+    if error.len() <= MAX_SYNC_ERROR_BYTES {
+        return error.to_string();
+    }
+    let mut end = MAX_SYNC_ERROR_BYTES;
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… (truncated)", &error[..end])
+}
+
+#[cfg(test)]
+mod sync_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_long_error_is_cut_on_a_character_boundary() {
+        let short = "refused";
+        assert_eq!(bounded_sync_error(short), short);
+        let long = "ё".repeat(MAX_SYNC_ERROR_BYTES);
+        let bounded = bounded_sync_error(&long);
+        assert!(bounded.len() <= MAX_SYNC_ERROR_BYTES + "… (truncated)".len());
+        assert!(bounded.ends_with("… (truncated)"));
+        assert!(long.starts_with(bounded.trim_end_matches("… (truncated)")));
+    }
+}

@@ -175,3 +175,44 @@ async fn the_sweep_takes_the_longest_waiting_mirrors_and_never_the_same_few() {
         "a batch smaller than the queue took something other than the front of it"
     );
 }
+
+/// card_a3336549de13, the half every backend runs: the write that records a
+/// failed pass bounds `last_sync_error` itself, so no caller has to remember
+/// to. SQLite would store the whole text, which is exactly why this asserts the
+/// length rather than relying on the insert to fail — the MySQL half lives in
+/// `multi_backend_smoke::a_pull_mirror_records_a_failure_longer_than_a_text_column`.
+#[tokio::test]
+async fn a_recorded_sync_failure_is_bounded_at_the_write() {
+    let (db, _temp) = setup().await;
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        "mirror-bound",
+        "mirror-bound@example.invalid",
+        "",
+        "Mirror Bound",
+    )
+    .await
+    .expect("create the owner")
+    .id;
+    let id = due_mirror(&db, owner, "bounded", None).await;
+
+    let row = rg_db::ops::mirror_ops::find_by_id(&db, id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut model: mirror::ActiveModel = row.into();
+    model.last_sync_error = Set(Some("remote: ".to_string() + &"x".repeat(100 * 1024)));
+    model.status = Set(mirror::STATUS_ERROR.to_string());
+    let stored = rg_db::ops::mirror_ops::update(&db, model)
+        .await
+        .expect("record the failure");
+
+    let error = stored.last_sync_error.expect("the failure is recorded");
+    assert!(
+        error.len() <= rg_db::ops::MAX_SYNC_ERROR_BYTES + "… (truncated)".len(),
+        "an unbounded failure reached the column: {} bytes",
+        error.len()
+    );
+    assert!(error.starts_with("remote: xxx"));
+    assert!(error.ends_with("… (truncated)"));
+}

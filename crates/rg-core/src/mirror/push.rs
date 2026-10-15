@@ -99,16 +99,6 @@ fn check_sync_interval(seconds: i64) -> Result<()> {
     Ok(())
 }
 
-/// Scheme, host and effective port: what a credential is given for.
-fn origin_of(url: &str) -> Option<(String, String, u16)> {
-    let url = reqwest::Url::parse(url).ok()?;
-    Some((
-        url.scheme().to_string(),
-        url.host_str()?.to_ascii_lowercase(),
-        url.port_or_known_default()?,
-    ))
-}
-
 fn next_scheduled(interval_seconds: i64) -> Option<chrono::DateTime<Utc>> {
     (interval_seconds > 0).then(|| Utc::now() + chrono::Duration::seconds(interval_seconds))
 }
@@ -224,7 +214,7 @@ pub async fn update_push_mirror(
         // editor picked, so a move to a new origin has to bring its own
         // credential — or say, with an empty `password`, that it needs none.
         if current.password_encrypted.is_some()
-            && origin_of(&remote.url) != origin_of(&current.url)
+            && !super::same_origin(&current.url, &remote.url)
             && remote.password.is_none()
             && changes.password.is_none()
         {

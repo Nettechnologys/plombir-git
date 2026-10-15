@@ -13,6 +13,7 @@ use sea_orm::{
     QueryOrder, QuerySelect,
 };
 
+use super::bounded_sync_error;
 use crate::entities::push_mirror::{ActiveModel, Column, Entity, Model};
 use crate::entities::repository;
 
@@ -29,23 +30,6 @@ pub const SYNC_LEASE_STALE_AFTER: chrono::Duration = chrono::Duration::hours(1);
 /// the push waits for the next tick.
 pub fn due_now() -> chrono::DateTime<Utc> {
     Utc::now() - chrono::Duration::seconds(1)
-}
-
-/// The most of a failure's text `last_sync_error` keeps. MySQL's `TEXT` holds
-/// 64 KiB, and a push refused ref by ref can say more than that; an `UPDATE`
-/// that does not fit fails, and the mirror would then show its previous state
-/// instead of the failure. The head of the message is where git names the cause.
-pub const MAX_SYNC_ERROR_BYTES: usize = 16 * 1024;
-
-fn bounded_error(error: &str) -> String {
-    if error.len() <= MAX_SYNC_ERROR_BYTES {
-        return error.to_string();
-    }
-    let mut end = MAX_SYNC_ERROR_BYTES;
-    while !error.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… (truncated)", &error[..end])
 }
 
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
@@ -238,7 +222,10 @@ pub async fn record_failure(
 ) -> Result<bool> {
     let recorded = Entity::update_many()
         .col_expr(Column::LastSyncAt, Expr::value(Utc::now()))
-        .col_expr(Column::LastSyncError, Expr::value(bounded_error(error)))
+        .col_expr(
+            Column::LastSyncError,
+            Expr::value(bounded_sync_error(error)),
+        )
         .col_expr(Column::NextSyncAt, Expr::value(retry_at))
         .col_expr(Column::LeaseToken, Expr::value(Option::<String>::None))
         .col_expr(
@@ -271,19 +258,4 @@ pub async fn health(db: &DatabaseConnection) -> Result<(u64, Option<chrono::Date
         .context("db: oldest pending push mirror")?
         .and_then(|mirror| mirror.pending_since);
     Ok((failing, oldest))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_long_error_is_cut_on_a_character_boundary() {
-        let short = "refused";
-        assert_eq!(bounded_error(short), short);
-        let long = "ё".repeat(MAX_SYNC_ERROR_BYTES);
-        let bounded = bounded_error(&long);
-        assert!(bounded.len() <= MAX_SYNC_ERROR_BYTES + "… (truncated)".len());
-        assert!(bounded.ends_with("… (truncated)"));
-    }
 }

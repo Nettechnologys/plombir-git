@@ -87,6 +87,9 @@ async fn plaintext_mirror_urls_are_refused_while_https_round_trips() {
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "url": "https://example.org/repointed.git",
+            // Another host: the stored credential was given for example.com,
+            // so the move brings its own (card_e4160f010bfb).
+            "password": "hunter3",
             "sync_interval_seconds": 7200,
         }))
         .send()

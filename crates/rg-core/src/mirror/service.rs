@@ -326,6 +326,23 @@ where
     if let Some(v) = password {
         updated_password_plain = Some(v);
     }
+    // The stored credential was given for one remote, and the next pass hands
+    // it to whatever `url` names. Changing the URL is a writer's right while
+    // the credential may be an admin's token, so a move to another origin has
+    // to bring its own credential — or say, with an empty `password`, that it
+    // needs none. The same rule push mirrors keep (`push::update_push_mirror`).
+    if let Some(new_url) = updated_url.as_deref() {
+        if existing.password_encrypted.is_some()
+            && updated_password_plain.is_none()
+            && !super::same_origin(&existing.url, new_url)
+        {
+            return Err(crate::error::invalid_request(
+                "the new URL points at another host, and the stored credential was given for \
+                 the old one; send `password` (and `username`) for the new remote, or an \
+                 empty `password` to sync without one",
+            ));
+        }
+    }
     crate::net::check_remote_username_length(updated_username.as_ref().and_then(Option::as_deref))?;
     let updated_password = updated_password_plain
         .as_deref()
@@ -1886,6 +1903,172 @@ mod tests {
             .downcast_ref::<crate::error::NotFound>()
             .expect("the lost race must stay classifiable as HTTP 404");
         assert_eq!(typed.resource, "mirror");
+    }
+
+    /// Point the fixture mirror at `url` with `password` stored, the way an
+    /// admin's earlier save would have left it.
+    async fn store_remote(db: &DatabaseConnection, mirror_id: i64, url: &str, password: &str) {
+        rg_db::ops::mirror_ops::update_settings(
+            db,
+            mirror_id,
+            Some(url.to_string()),
+            Some(Some("admin".to_string())),
+            Some(encrypt_password(Some(password), SECRET).unwrap()),
+            None,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("store the admin's remote")
+        .expect("the fixture mirror exists");
+    }
+
+    async fn update_url(
+        db: &DatabaseConnection,
+        repo_id: i64,
+        url: &str,
+        password: Option<&str>,
+    ) -> Result<Mirror> {
+        update_mirror(
+            db,
+            repo_id,
+            Some(url.to_string()),
+            None,
+            password.map(str::to_string),
+            None,
+            None,
+            MirrorTransportPolicy::new(true),
+            SECRET,
+        )
+        .await
+    }
+
+    fn stored_password(mirror: &Mirror) -> Option<String> {
+        load_credentials(mirror, SECRET)
+            .expect("decrypt")
+            .map(|credentials| credentials.password().to_string())
+    }
+
+    /// card_e4160f010bfb: the credential follows the origin it was given for.
+    /// A move to another host without one is refused and leaves the row as it
+    /// was; a new path on the same host keeps it; an explicit empty password,
+    /// or one typed into the new URL, moves the mirror with what it was given.
+    #[tokio::test]
+    async fn a_stored_credential_does_not_follow_the_url_to_another_host() {
+        let (db, repo_id, mirror_id) = update_fixture().await;
+        store_remote(
+            &db,
+            mirror_id,
+            "https://github.com/org/private.git",
+            "admin-pat",
+        )
+        .await;
+
+        let error = update_url(&db, repo_id, "https://collector.example/x.git", None)
+            .await
+            .expect_err("another host without a credential of its own must be refused");
+        let typed = error
+            .downcast_ref::<crate::error::InvalidRequest>()
+            .expect("the refusal is the caller's 400");
+        assert!(typed.message.contains("another host"), "{}", typed.message);
+        let row = get_mirror(&db, repo_id).await.unwrap().unwrap();
+        assert_eq!(row.url, "https://github.com/org/private.git");
+        assert_eq!(stored_password(&row).as_deref(), Some("admin-pat"));
+
+        // Another port is another origin too.
+        update_url(
+            &db,
+            repo_id,
+            "https://github.com:8443/org/private.git",
+            None,
+        )
+        .await
+        .expect_err("another port without a credential must be refused");
+
+        let moved = update_url(&db, repo_id, "https://github.com/org/renamed.git", None)
+            .await
+            .expect("a new path on the same host keeps its credential");
+        assert_eq!(moved.url, "https://github.com/org/renamed.git");
+        assert_eq!(stored_password(&moved).as_deref(), Some("admin-pat"));
+
+        let anonymous = update_url(&db, repo_id, "https://collector.example/x.git", Some(""))
+            .await
+            .expect("an empty password moves the mirror without a credential");
+        assert_eq!(anonymous.url, "https://collector.example/x.git");
+        assert_eq!(stored_password(&anonymous), None);
+
+        store_remote(
+            &db,
+            mirror_id,
+            "https://github.com/org/private.git",
+            "admin-pat",
+        )
+        .await;
+        let replaced = update_url(&db, repo_id, "https://other.example/x.git", Some("new-pat"))
+            .await
+            .expect("a credential for the new remote is accepted");
+        assert_eq!(stored_password(&replaced).as_deref(), Some("new-pat"));
+
+        store_remote(
+            &db,
+            mirror_id,
+            "https://github.com/org/private.git",
+            "admin-pat",
+        )
+        .await;
+        let lifted = update_url(
+            &db,
+            repo_id,
+            "https://bot:url-pat@third.example/x.git",
+            None,
+        )
+        .await
+        .expect("a credential typed into the new URL is the new remote's own");
+        assert_eq!(lifted.url, "https://third.example/x.git");
+        assert_eq!(stored_password(&lifted).as_deref(), Some("url-pat"));
+    }
+
+    /// The same rule, end to end: after a writer's attempt to repoint the
+    /// mirror, the next pass dials what the row holds with the row's
+    /// credential. The collector on another port must see no request with an
+    /// `Authorization` header — before the fix it received the admin's token.
+    #[tokio::test]
+    async fn the_next_pass_does_not_send_the_admins_token_to_a_writers_host() {
+        let (admin_remote, _, admin_seen) = spawn_authenticating_remote();
+        let (collector, _, collector_seen) = spawn_authenticating_remote();
+        let (db, repo_id, mirror_id) = update_fixture().await;
+        let admin_url = format!("http://localhost:{}/private.git", port_of(&admin_remote));
+        store_remote(&db, mirror_id, &admin_url, "admin-pat").await;
+
+        let collector_url = format!("http://localhost:{}/x.git", port_of(&collector));
+        update_url(&db, repo_id, &collector_url, None)
+            .await
+            .expect_err("repointing the mirror without a credential is refused");
+
+        let row = get_mirror(&db, repo_id).await.unwrap().unwrap();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let credentials = load_credentials(&row, SECRET).expect("decrypt");
+        run_git_clone_mirror(
+            MirrorTransportPolicy::new(true),
+            &crate::net::GuardedGitRemote::unbound_for_test(&row.url),
+            &directory.path().join("7.mirror"),
+            credentials.as_ref(),
+        )
+        .expect_err("the stub remote refuses everyone");
+
+        assert!(
+            collector_seen.lock().expect("lock").is_empty(),
+            "the writer's host received a credential"
+        );
+        let expected = format!("Basic {}", STANDARD.encode("admin:admin-pat"));
+        assert!(
+            admin_seen.lock().expect("lock").contains(&expected),
+            "the pass did not reach the admin's remote with its credential"
+        );
+    }
+
+    fn port_of(address: &str) -> &str {
+        address.rsplit_once(':').expect("host:port").1
     }
 
     /// The column is named `password_encrypted`; this is the test that keeps the

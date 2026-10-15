@@ -2769,11 +2769,9 @@ async fn push_mirror_state_transitions_are_portable() {
         .unwrap()
         .unwrap();
     assert!(
-        failed
-            .last_sync_error
-            .as_deref()
-            .is_some_and(|error| error.len()
-                <= push_mirror_ops::MAX_SYNC_ERROR_BYTES + "… (truncated)".len()),
+        failed.last_sync_error.as_deref().is_some_and(
+            |error| error.len() <= rg_db::ops::MAX_SYNC_ERROR_BYTES + "… (truncated)".len()
+        ),
         "a long failure was not bounded"
     );
     let (failing, _) = push_mirror_ops::health(&db).await.unwrap();
@@ -2781,6 +2779,115 @@ async fn push_mirror_state_transitions_are_portable() {
     assert!(push_mirror_ops::delete_for_repo(&db, repo.id, mirror.id)
         .await
         .unwrap());
+}
+
+/// card_a3336549de13: a pull mirror's pass records its failure in the same
+/// statement that moves `next_sync_at` on. git's stderr — whose `remote:` lines
+/// the upstream writes — can outgrow MySQL's 64 KiB `TEXT`, and an `UPDATE`
+/// that did not fit left the mirror in its old state and due on every tick.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn a_pull_mirror_records_a_failure_longer_than_a_text_column() {
+    use rg_db::ops::mirror_ops;
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("pullmirror{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Pull Mirror Smoke",
+    )
+    .await
+    .expect("create pull mirror owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("pullmirrorrepo{suffix}")),
+    )
+    .await
+    .expect("create pull mirror repository");
+
+    let now = chrono::Utc::now();
+    let mirror = mirror_ops::create(
+        &db,
+        rg_db::entities::mirror::ActiveModel {
+            repo_id: Set(repo.id),
+            url: Set("https://mirror.example.com/upstream.git".to_string()),
+            username: Set(None),
+            password_encrypted: Set(None),
+            sync_interval_seconds: Set(3600),
+            next_sync_at: Set(Some(now - chrono::Duration::seconds(5))),
+            last_sync_at: Set(None),
+            last_sync_error: Set(None),
+            status: Set(rg_db::entities::mirror::STATUS_ACTIVE.to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create pull mirror");
+    assert!(
+        mirror_ops::list_due_sync(&db, 1_000)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.id == mirror.id),
+        "baseline: the mirror is due"
+    );
+
+    // What `finish_pass` writes for a failed pass: 100 KiB of upstream text,
+    // two bytes per character so a byte cut would split one.
+    let next_sync = chrono::Utc::now() + chrono::Duration::seconds(3600);
+    let mut model: rg_db::entities::mirror::ActiveModel = mirror.clone().into();
+    model.last_sync_at = Set(Some(chrono::Utc::now()));
+    model.next_sync_at = Set(Some(next_sync));
+    model.last_sync_error = Set(Some(format!("remote: {}", "ё".repeat(50 * 1024))));
+    model.status = Set(rg_db::entities::mirror::STATUS_ERROR.to_string());
+    mirror_ops::update(&db, model)
+        .await
+        .expect("a long failure must still be recorded");
+
+    let failed = mirror_ops::find_by_id(&db, mirror.id)
+        .await
+        .unwrap()
+        .expect("the mirror row");
+    assert_eq!(failed.status, rg_db::entities::mirror::STATUS_ERROR);
+    let error = failed.last_sync_error.expect("the failure is recorded");
+    assert!(error.starts_with("remote: ёё"), "the head was lost");
+    assert!(error.ends_with("… (truncated)"), "the cut is not marked");
+    assert!(error.len() <= rg_db::ops::MAX_SYNC_ERROR_BYTES + "… (truncated)".len());
+    assert!(
+        failed
+            .next_sync_at
+            .is_some_and(|at| at > chrono::Utc::now()),
+        "the schedule did not move on"
+    );
+    assert!(
+        !mirror_ops::list_due_sync(&db, 1_000)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.id == mirror.id),
+        "the failed mirror is still due on the next tick"
+    );
+    mirror_ops::delete_by_id_unless_syncing(
+        &db,
+        mirror.id,
+        repo.id,
+        chrono::Utc::now() - mirror_ops::SYNC_LEASE_STALE_AFTER,
+    )
+    .await
+    .expect("clean up the pull mirror");
 }
 
 #[tokio::test]
