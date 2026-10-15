@@ -92,10 +92,7 @@ async fn test_list_boards() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!(
-            "{}/api/v1/repos/{}/{}/boards",
-            &base, &owner, &repo
-        ))
+        .get(format!("{}/api/v1/repos/{}/{}/boards", base, owner, repo))
         .send()
         .await
         .unwrap();
@@ -120,7 +117,7 @@ async fn test_add_card_to_column() {
     let resp = client
         .post(format!(
             "{}/api/v1/repos/{}/{}/boards/{}/columns/{}/cards",
-            &base, &owner, &repo, board_id, col_id
+            base, owner, repo, board_id, col_id
         ))
         .bearer_auth(&token)
         .json(&serde_json::json!({"note": "Fix the login bug"}))
@@ -154,7 +151,7 @@ async fn test_move_card_between_columns() {
     let resp = client
         .post(format!(
             "{}/api/v1/repos/{}/{}/boards/{}/columns/{}/cards",
-            &base, &owner, &repo, board_id, col0_id
+            base, owner, repo, board_id, col0_id
         ))
         .bearer_auth(&token)
         .json(&serde_json::json!({"note": "Move me"}))
@@ -169,7 +166,7 @@ async fn test_move_card_between_columns() {
     let resp = client
         .post(format!(
             "{}/api/v1/repos/{}/{}/boards/{}/cards/{}/move",
-            &base, &owner, &repo, board_id, card_id
+            base, owner, repo, board_id, card_id
         ))
         .bearer_auth(&token)
         .json(&serde_json::json!({"column_id": col1_id, "position": 0}))
@@ -191,7 +188,7 @@ async fn test_move_card_between_columns() {
     let response = client
         .post(format!(
             "{}/api/v1/repos/{}/{}/boards/{}/cards/reorder",
-            &base, &owner, &repo, board_id
+            base, owner, repo, board_id
         ))
         .bearer_auth(&token)
         .json(&serde_json::json!({
@@ -323,7 +320,7 @@ async fn test_delete_card() {
     let card_id = client
         .post(format!(
             "{}/api/v1/repos/{}/{}/boards/{}/columns/{}/cards",
-            &base, &owner, &repo, board_id, col_id
+            base, owner, repo, board_id, col_id
         ))
         .bearer_auth(&token)
         .json(&serde_json::json!({"note": "temp"}))
@@ -340,7 +337,7 @@ async fn test_delete_card() {
     let resp = client
         .delete(format!(
             "{}/api/v1/repos/{}/{}/boards/{}/cards/{}",
-            &base, &owner, &repo, board_id, card_id
+            base, owner, repo, board_id, card_id
         ))
         .bearer_auth(&token)
         .send()
@@ -365,7 +362,7 @@ async fn test_add_and_delete_column() {
     let resp = client
         .post(format!(
             "{}/api/v1/repos/{}/{}/boards/{}/columns",
-            &base, &owner, &repo, board_id
+            base, owner, repo, board_id
         ))
         .bearer_auth(&token)
         .json(&serde_json::json!({"name": "Review", "color": "#f59e0b"}))
@@ -390,7 +387,7 @@ async fn test_add_and_delete_column() {
     let resp = client
         .delete(format!(
             "{}/api/v1/repos/{}/{}/boards/{}/columns/{}",
-            &base, &owner, &repo, board_id, col_id
+            base, owner, repo, board_id, col_id
         ))
         .bearer_auth(&token)
         .send()
@@ -417,7 +414,7 @@ async fn test_delete_board() {
     let resp = client
         .delete(format!(
             "{}/api/v1/repos/{}/{}/boards/{}",
-            &base, &owner, &repo, board_id
+            base, owner, repo, board_id
         ))
         .bearer_auth(&token)
         .send()
@@ -427,10 +424,7 @@ async fn test_delete_board() {
 
     // Board list should now be empty
     let boards: serde_json::Value = client
-        .get(format!(
-            "{}/api/v1/repos/{}/{}/boards",
-            &base, &owner, &repo
-        ))
+        .get(format!("{}/api/v1/repos/{}/{}/boards", base, owner, repo))
         .send()
         .await
         .unwrap()

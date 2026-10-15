@@ -997,7 +997,7 @@ jobs:
           cache-to: type=gha,scope=plombir-git-image,mode=max
 
       # A built image is not yet a working one. The runtime stage is a different
-      # base (debian:bookworm-slim) from the builder (rust:1.96.1-slim-bookworm),
+      # base (debian:bookworm-slim) from the builder (rust:1.99.0-slim-bookworm),
       # so a shared library the build linked against and the runtime does not
       # install produces a binary that compiles, copies, and then refuses to
       # start — on the server, in a restart loop, with the failure a line in

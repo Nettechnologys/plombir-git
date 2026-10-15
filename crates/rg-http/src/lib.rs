@@ -13,6 +13,13 @@
 //!  - [`git_http`] — Git Smart HTTP endpoints + post-push hooks
 //!  - [`pat_auth`] — PAT ⇄ JWT bridging and git actor extraction
 
+// Handlers' helpers return `axum::response::Response` as their refusal: it is
+// what the handler hands back unchanged, and it is at least 128 bytes. Clippy
+// 1.99 started applying `result_large_err` to `async fn`, which turned twenty
+// of these helpers red at once. Boxing the refusal would add an allocation to
+// every refused request to move a value one frame up.
+#![allow(clippy::result_large_err)]
+
 pub mod api;
 pub mod build_info;
 pub mod client_ip;

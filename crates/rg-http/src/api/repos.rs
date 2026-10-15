@@ -287,11 +287,8 @@ pub async fn create_repo(
                 "readme": body.readme.as_deref(),
                 "issue_labels": body.issue_labels.as_deref(),
             });
-            let resource_name = format!(
-                "{}/{}",
-                body.org.as_deref().unwrap_or(&username),
-                &body.name
-            );
+            let resource_name =
+                format!("{}/{}", body.org.as_deref().unwrap_or(&username), body.name);
             rg_core::audit::record(
                 &state.db,
                 &audit_actor,

@@ -219,9 +219,8 @@ fn oci_reference_error(error: &ReferenceError) -> Response {
 /// round-trip on a request that is already malformed.
 ///
 /// An `Option` rather than the `Result<(), Response>` the access gate uses:
-/// that one is an `async fn`, whose return type is a future, so it escapes
-/// `clippy::result_large_err` — a synchronous one does not, and a lint allowance
-/// costs more than the word `Some` at three call sites.
+/// there is nothing to hand back on success, and `Some` reads as "here is the
+/// refusal" at its three call sites.
 fn blob_digest_refusal(digest: &str) -> Option<Response> {
     Reference::parse_blob_digest(digest)
         .err()

@@ -12,6 +12,6 @@
 # `rust-version` in Cargo.toml is a different thing: the oldest compiler the
 # crates promise to build with. This file is the compiler the gates run.
 [toolchain]
-channel = "1.96.1"
+channel = "1.99.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
