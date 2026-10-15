@@ -1740,6 +1740,65 @@
       ]
     },
     {
+      "id": "repo-push-mirrors",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/push-mirrors",
+          "kind": "control",
+          "control": "() => syncNow(mirror)",
+          "line": 216,
+          "symbol": "pushMirrors.sync",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors/{id}/sync",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/push-mirrors",
+          "kind": "control",
+          "control": "() => toggle(mirror)",
+          "line": 219,
+          "symbol": "pushMirrors.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors/{id}",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/push-mirrors",
+          "kind": "control",
+          "control": "() => remove(mirror)",
+          "line": 222,
+          "symbol": "pushMirrors.remove",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors/{id}",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/push-mirrors",
+          "kind": "control",
+          "control": "addMirror",
+          "line": 257,
+          "symbol": "pushMirrors.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/push-mirrors",
+          "kind": "control",
+          "control": "addMirror",
+          "line": 257,
+          "symbol": "pushMirrors.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors",
+          "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
       "id": "repo-lfs-storage",
       "personaOrder": [
         "outsider",

@@ -776,6 +776,9 @@ The server logs a warning at startup while `/metrics` is open to anyone.
 - **BackupTooOld**: No successful backup for 36+ hours (critical)
 - **BackupRunsFailing**: One or more scheduled backup failures in the last hour (warning)
 
+### Push Mirror Alerts
+- **PushMirrorBehind**: An enabled push mirror has not received a change for over an hour (warning). `plombir_git_push_mirror_max_lag_seconds` is the age of the oldest change still waiting; `plombir_git_push_mirrors_failing` counts the mirrors whose last push failed, and each one shows its error under the repository's **Settings → Push mirrors**.
+
 ## 🔭 Distributed Tracing (OpenTelemetry)
 
 Beyond Prometheus metrics, Plombir Git can export **distributed traces** over

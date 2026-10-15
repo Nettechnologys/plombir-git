@@ -237,6 +237,7 @@ const MAVEN_SEGMENTS: usize = 9;
 #[derive(Default, Clone)]
 struct Ids {
     deploy_key: i64,
+    push_mirror: i64,
     milestone: i64,
     label: i64,
     issue_comment: i64,
@@ -280,6 +281,7 @@ impl Ids {
     fn absent() -> Self {
         Self {
             deploy_key: ABSENT_ID,
+            push_mirror: ABSENT_ID,
             milestone: ABSENT_ID,
             label: ABSENT_ID,
             issue_comment: ABSENT_ID,
@@ -779,6 +781,18 @@ async fn seed_vault(
             "victim deploy key",
         )
         .await;
+    ids.push_mirror = fx
+        .create_id(
+            token,
+            fx.url(VICTIM, VAULT, "/push_mirrors"),
+            serde_json::json!({
+                "url": "https://scope-sweep.example.invalid/vault.git",
+                "sync_on_commit": false,
+                "sync_interval_seconds": 0,
+            }),
+            "victim push mirror",
+        )
+        .await;
 
     // ── Boards ─────────────────────────────────────────────────────────────
     let board = fx
@@ -917,6 +931,7 @@ fn coverage(tail: &str, ids: &Ids) -> Coverage {
     let probe = |pairs: &[(&'static str, i64)]| Coverage::Probe(pairs.iter().copied().collect());
     match tail {
         "/keys/{id}" => probe(&[("id", ids.deploy_key)]),
+        "/push_mirrors/{id}" | "/push_mirrors/{id}/sync" => probe(&[("id", ids.push_mirror)]),
         "/milestones/{id}" => probe(&[("id", ids.milestone)]),
         "/labels/{id}" => probe(&[("id", ids.label)]),
 

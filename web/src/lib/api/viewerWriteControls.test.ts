@@ -367,6 +367,9 @@ describe('repository settings sections', () => {
 		expect(container.querySelector('a[href="/alice/demo/settings/mirror"]')).not.toBeNull();
 		expect(container.querySelector('a[href="/alice/demo/settings/webhooks"]')).toBeNull();
 		expect(container.querySelector('a[href="/alice/demo/settings/ci-secrets"]')).toBeNull();
+		// A push mirror hands the repository and a credential to a remote the
+		// caller picks, so its routes are `RepoAdmin` and so is the section.
+		expect(container.querySelector('a[href="/alice/demo/settings/push-mirrors"]')).toBeNull();
 		expect(container.querySelector('.section-body')).not.toBeNull();
 	});
 
@@ -380,7 +383,8 @@ describe('repository settings sections', () => {
 	it('lists every section to an administrator', async () => {
 		const container = await openSettings('admin', '/alice/demo/settings/webhooks');
 
-		expect(container.querySelectorAll('.sidebar a.nav-item')).toHaveLength(14);
+		expect(container.querySelectorAll('.sidebar a.nav-item')).toHaveLength(15);
+		expect(container.querySelector('a[href="/alice/demo/settings/push-mirrors"]')).not.toBeNull();
 		expect(container.querySelector('.section-body')).not.toBeNull();
 	});
 });

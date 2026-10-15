@@ -655,6 +655,13 @@ pub async fn soft_delete_unless_mirror_syncing(
         .exec(&transaction)
         .await
         .context("db: retire repository mirror lease")?;
+    // A push mirror holds a sealed credential for another forge and would keep
+    // sending a deleted repository's history there.
+    crate::entities::push_mirror::Entity::delete_many()
+        .filter(crate::entities::push_mirror::Column::RepoId.eq(id))
+        .exec(&transaction)
+        .await
+        .context("db: retire repository push mirrors")?;
 
     // A soft delete cannot cascade to runners. Return any jobs still owned by
     // one before removing its credential; both writes must roll back with the

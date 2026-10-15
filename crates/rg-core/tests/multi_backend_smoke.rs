@@ -2619,6 +2619,170 @@ async fn ci_cache_eviction_upsert_is_portable() {
     exercise_ci_cache_eviction_contract(&db, repo.id).await;
 }
 
+/// Push mirrors write their state with single conditional `UPDATE`s —
+/// `COALESCE`, `CASE` and a lease predicate — and keep a remote address in a
+/// `TEXT` column. Each of those is a place where a backend can disagree.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn push_mirror_state_transitions_are_portable() {
+    use rg_db::ops::push_mirror_ops;
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("pushmirror{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Push Mirror Smoke",
+    )
+    .await
+    .expect("create push mirror owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("pushmirrorrepo{suffix}")),
+    )
+    .await
+    .expect("create push mirror repository");
+
+    // Longer than MySQL's default VARCHAR(255).
+    let url = format!("https://mirror.example.com/{}/repo.git", "a".repeat(300));
+    let now = chrono::Utc::now();
+    let mirror = push_mirror_ops::create(
+        &db,
+        rg_db::entities::push_mirror::ActiveModel {
+            repo_id: Set(repo.id),
+            url: Set(url.clone()),
+            username: Set(Some("b".repeat(300))),
+            password_encrypted: Set(None),
+            sync_on_commit: Set(true),
+            sync_interval_seconds: Set(0),
+            force: Set(false),
+            enabled: Set(true),
+            next_sync_at: Set(None),
+            pending_since: Set(None),
+            pending_revision: Set(0),
+            last_sync_at: Set(None),
+            last_success_at: Set(None),
+            last_sync_error: Set(None),
+            lease_token: Set(None),
+            lease_acquired_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a long remote address fits");
+    assert_eq!(mirror.url, url);
+
+    assert_eq!(
+        push_mirror_ops::mark_ref_moved(&db, repo.id).await.unwrap(),
+        1
+    );
+    let marked = push_mirror_ops::find_for_repo(&db, repo.id, mirror.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(marked.pending_revision, 1);
+    assert!(
+        marked.pending_since.is_some(),
+        "COALESCE did not stamp the lag"
+    );
+    assert!(
+        marked.next_sync_at.is_some(),
+        "CASE did not make a sync-on-commit mirror due"
+    );
+    let due = push_mirror_ops::list_due(&db, 10).await.unwrap();
+    assert!(
+        due.iter().any(|row| row.id == mirror.id),
+        "the due listing missed it"
+    );
+
+    assert!(push_mirror_ops::acquire_lease(&db, mirror.id, "first")
+        .await
+        .unwrap());
+    assert!(!push_mirror_ops::acquire_lease(&db, mirror.id, "second")
+        .await
+        .unwrap());
+    // A move during the pass: the pass started from revision 1, the row is at 2.
+    push_mirror_ops::mark_ref_moved(&db, repo.id).await.unwrap();
+    assert!(
+        push_mirror_ops::record_success(&db, mirror.id, "first", 1, None)
+            .await
+            .unwrap()
+    );
+    let behind = push_mirror_ops::find_for_repo(&db, repo.id, mirror.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        behind.pending_since.is_some(),
+        "a move during the pass was forgotten"
+    );
+    assert!(
+        behind.next_sync_at.is_some(),
+        "the missed move is not due again"
+    );
+    assert_eq!(behind.lease_token, None);
+
+    assert!(push_mirror_ops::acquire_lease(&db, mirror.id, "third")
+        .await
+        .unwrap());
+    assert!(
+        push_mirror_ops::record_success(&db, mirror.id, "third", 2, None)
+            .await
+            .unwrap()
+    );
+    let caught_up = push_mirror_ops::find_for_repo(&db, repo.id, mirror.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(caught_up.pending_since, None);
+    assert_eq!(
+        caught_up.next_sync_at, None,
+        "an interval of 0 schedules nothing"
+    );
+
+    assert!(push_mirror_ops::acquire_lease(&db, mirror.id, "fourth")
+        .await
+        .unwrap());
+    assert!(push_mirror_ops::record_failure(
+        &db,
+        mirror.id,
+        "fourth",
+        &"e".repeat(70_000),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap());
+    let failed = push_mirror_ops::find_for_repo(&db, repo.id, mirror.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        failed
+            .last_sync_error
+            .as_deref()
+            .is_some_and(|error| error.len()
+                <= push_mirror_ops::MAX_SYNC_ERROR_BYTES + "… (truncated)".len()),
+        "a long failure was not bounded"
+    );
+    let (failing, _) = push_mirror_ops::health(&db).await.unwrap();
+    assert!(failing >= 1);
+    assert!(push_mirror_ops::delete_for_repo(&db, repo.id, mirror.id)
+        .await
+        .unwrap());
+}
+
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn mfa_lifecycle_account_delete_is_portable() {

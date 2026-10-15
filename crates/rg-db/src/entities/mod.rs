@@ -66,6 +66,7 @@ pub mod protected_branch_push_grant;
 pub mod protected_tag;
 pub mod protected_tag_push_grant;
 pub mod pull_request;
+pub mod push_mirror;
 pub mod release;
 pub mod release_asset;
 pub mod repo_collaborator;

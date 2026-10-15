@@ -2222,6 +2222,33 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/mirror/sync",
             api::mirrors::trigger_mirror_sync,
         )
+        // Push mirrors are administration: they hand the repository and a
+        // credential for another forge to a remote the caller picks.
+        .get(
+            RepoAdmin,
+            "/repos/{owner}/{name}/push_mirrors",
+            api::push_mirrors::list_push_mirrors,
+        )
+        .post(
+            RepoAdmin,
+            "/repos/{owner}/{name}/push_mirrors",
+            api::push_mirrors::create_push_mirror,
+        )
+        .patch(
+            RepoAdmin,
+            "/repos/{owner}/{name}/push_mirrors/{id}",
+            api::push_mirrors::update_push_mirror,
+        )
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/push_mirrors/{id}",
+            api::push_mirrors::delete_push_mirror,
+        )
+        .post(
+            RepoAdmin,
+            "/repos/{owner}/{name}/push_mirrors/{id}/sync",
+            api::push_mirrors::sync_push_mirror,
+        )
         // Imports (GitHub/GitLab migration)
         .post(User, "/imports", api::imports::start_import)
         .get(User, "/imports", api::imports::list_imports)

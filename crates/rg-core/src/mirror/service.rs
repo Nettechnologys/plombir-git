@@ -1139,7 +1139,10 @@ pub async fn trigger_sync(
 ///
 /// `None` and `Some("")` both mean "no credential" — the empty string is how
 /// the API clears one.
-fn encrypt_password(password: Option<&str>, encryption_key: &str) -> Result<Option<String>> {
+pub(super) fn encrypt_password(
+    password: Option<&str>,
+    encryption_key: &str,
+) -> Result<Option<String>> {
     let Some(password) = password.filter(|p| !p.is_empty()) else {
         return Ok(None);
     };
@@ -1160,13 +1163,30 @@ fn encrypt_password(password: Option<&str>, encryption_key: &str) -> Result<Opti
 /// be handed half an answer, be refused, and (with prompting disabled) fail
 /// with a confusing error instead of the honest anonymous-access one.
 fn load_credentials(mirror: &Mirror, encryption_key: &str) -> Result<Option<GitCredentials>> {
-    let Some(ciphertext) = mirror.password_encrypted.as_deref() else {
+    decrypt_credentials(
+        mirror.username.as_deref(),
+        mirror.password_encrypted.as_deref(),
+        encryption_key,
+    )
+}
+
+/// [`load_credentials`] for any row that stores a remote's login and sealed
+/// secret the same way — the push mirror's too.
+pub(super) fn decrypt_credentials(
+    username: Option<&str>,
+    password_encrypted: Option<&str>,
+    encryption_key: &str,
+) -> Result<Option<GitCredentials>> {
+    let Some(ciphertext) = password_encrypted else {
         return Ok(None);
     };
     let key = crate::auth::encryption::derive_key(encryption_key);
     let password = crate::auth::encryption::decrypt(ciphertext, &key)
         .context("mirror credential could not be decrypted")?;
-    Ok(Some(GitCredentials::new(mirror.username.clone(), password)))
+    Ok(Some(GitCredentials::new(
+        username.map(str::to_string),
+        password,
+    )))
 }
 
 /// Replace the credential in a message that is about to be persisted or logged.
@@ -1175,7 +1195,10 @@ fn load_credentials(mirror: &Mirror, encryption_key: &str) -> Result<Option<GitC
 /// one this sync loaded out of `password_encrypted`, and one still written into
 /// a URL that the message quotes — git echoes the remote it failed to reach,
 /// and a row predating the create-time split still carries it.
-fn mask_credential(message: &str, credentials: Option<&Option<GitCredentials>>) -> String {
+pub(super) fn mask_credential(
+    message: &str,
+    credentials: Option<&Option<GitCredentials>>,
+) -> String {
     let message = crate::net::mask_url_credentials(message);
     match credentials.and_then(Option::as_ref) {
         Some(credentials) => {

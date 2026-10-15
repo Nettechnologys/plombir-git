@@ -300,6 +300,190 @@ where
     }
 }
 
+/// A git remote that accepts pushes: `git http-backend` behind a minimal
+/// HTTP/1.1 front, serving every bare repository under `root`.
+///
+/// HTTP Basic is required — 401 until an `Authorization` header shows up — and
+/// every header received is recorded, so a push mirror test can prove both
+/// that the push landed and which credential carried it. The remote's user is
+/// the login half of that header, which is what lets `http-backend` accept
+/// `git-receive-pack` at all.
+pub(crate) struct GitHttpBackend {
+    pub(crate) url: String,
+    pub(crate) authorizations: Arc<Mutex<Vec<String>>>,
+}
+
+pub(crate) fn spawn_git_http_backend(root: &std::path::Path) -> GitHttpBackend {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use std::io::Read;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("addr");
+    let authorizations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&authorizations);
+    let root = root.to_path_buf();
+
+    std::thread::spawn(move || {
+        // The gateway's streamed spawn is the one that takes stdin, and it is
+        // async; one small runtime serves every request this remote answers.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("backend runtime");
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_string();
+            let target = parts.next().unwrap_or_default().to_string();
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let line = line.trim_end().to_string();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+                }
+            }
+            let header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            };
+
+            let mut body = Vec::new();
+            if let Some(length) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+                body.resize(length, 0);
+                if reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+            } else if header("transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+                loop {
+                    let mut size = String::new();
+                    if reader.read_line(&mut size).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let size = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
+                    let mut chunk = vec![0; size + 2];
+                    if reader.read_exact(&mut chunk).is_err() {
+                        break;
+                    }
+                    if size == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..size]);
+                }
+            }
+
+            let Some(authorization) = header("authorization") else {
+                let response = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic \
+                                realm=\"plombir-git\"\r\nContent-Length: 0\r\nConnection: \
+                                close\r\n\r\n";
+                drop(stream.write_all(response.as_bytes()));
+                continue;
+            };
+            recorder.lock().expect("lock").push(authorization.clone());
+            let user = authorization
+                .strip_prefix("Basic ")
+                .and_then(|encoded| STANDARD.decode(encoded).ok())
+                .and_then(|decoded| String::from_utf8(decoded).ok())
+                .and_then(|pair| pair.split_once(':').map(|(user, _)| user.to_string()))
+                .unwrap_or_default();
+
+            let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+            let content_type = header("content-type").unwrap_or_default();
+            let content_length = body.len().to_string();
+            let project_root = root.to_string_lossy().into_owned();
+            let env = [
+                ("GIT_PROJECT_ROOT", project_root.as_str()),
+                ("GIT_HTTP_EXPORT_ALL", "1"),
+                ("REQUEST_METHOD", method.as_str()),
+                ("PATH_INFO", path),
+                ("QUERY_STRING", query),
+                ("CONTENT_TYPE", content_type.as_str()),
+                ("CONTENT_LENGTH", content_length.as_str()),
+                ("REMOTE_USER", user.as_str()),
+                ("REMOTE_ADDR", "127.0.0.1"),
+            ];
+            let output = runtime.block_on(async {
+                use tokio::io::AsyncWriteExt;
+                let mut child = rg_git::cli_gateway::global_gateway()
+                    .as_ref()
+                    .expect("git gateway")
+                    .spawn_async_with_env(&["http-backend"], None, &env)
+                    .await
+                    .expect("spawn git http-backend");
+                let mut stdin = child.stdin.take().expect("stdin");
+                let writer = tokio::spawn(async move {
+                    drop(stdin.write_all(&body).await);
+                });
+                let output = child.wait_with_output().await.expect("http-backend output");
+                drop(writer.await);
+                output
+            });
+
+            let split = output
+                .stdout
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|at| (at, 4))
+                .or_else(|| {
+                    output
+                        .stdout
+                        .windows(2)
+                        .position(|window| window == b"\n\n")
+                        .map(|at| (at, 2))
+                });
+            let (cgi_headers, cgi_body) = match split {
+                Some((at, skip)) => (
+                    String::from_utf8_lossy(&output.stdout[..at]).into_owned(),
+                    output.stdout[at + skip..].to_vec(),
+                ),
+                None => (String::new(), output.stdout.clone()),
+            };
+            let mut status = "200 OK".to_string();
+            let mut response_headers = String::new();
+            for line in cgi_headers.lines() {
+                let line = line.trim_end();
+                match line.split_once(':') {
+                    Some((name, value)) if name.eq_ignore_ascii_case("status") => {
+                        status = value.trim().to_string();
+                    }
+                    Some((name, _)) if name.eq_ignore_ascii_case("content-length") => {}
+                    Some(_) => {
+                        response_headers.push_str(line);
+                        response_headers.push_str("\r\n");
+                    }
+                    None => {}
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 {status}\r\n{response_headers}Content-Length: {}\r\nConnection: \
+                 close\r\n\r\n",
+                cgi_body.len()
+            );
+            if stream.write_all(head.as_bytes()).is_ok() && stream.write_all(&cgi_body).is_ok() {
+                drop(stream.flush());
+            }
+        }
+    });
+
+    GitHttpBackend {
+        url: format!("http://{address}"),
+        authorizations,
+    }
+}
+
 #[cfg(test)]
 mod parked_task_tests {
     use super::*;

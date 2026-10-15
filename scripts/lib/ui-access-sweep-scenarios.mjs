@@ -1196,6 +1196,35 @@ const repoDeployKeys = privileged(
   ]),
 );
 
+const repoPushMirrors = privileged(
+  async (context) => {
+    await context.navigate(settingsPage(context, 'push-mirrors'));
+    await context.fill('#push-mirror-url', context.fixture.browserPushMirrorUrl);
+    await context.click('form.mirror-form button[type="submit"]');
+    await context.waitForText('.mirror-url', context.fixture.browserPushMirrorUrl);
+    await context.clickWithin('li.mirror', context.fixture.pushMirrorUrl, 'button', 'Push now');
+    await context.waitForText('.success-box', 'Push queued.');
+    await context.clickWithin('li.mirror', context.fixture.pushMirrorUrl, 'button', 'Disable');
+    await context.waitForText('.success-box', 'Push mirror updated.');
+    await context.clickWithin('li.mirror', context.fixture.pushMirrorUrl, 'button', 'Delete');
+    await context.click('.confirm-modal-accept');
+    await context.waitForTextAbsent('.mirror-url', context.fixture.pushMirrorUrl);
+  },
+  (context) => requestSequence(context, [
+    [settingsApi(context, '/push_mirrors')],
+    [settingsApi(context, '/push_mirrors'), {
+      method: 'POST',
+      json: { url: 'https://outsider-sweep.example.invalid/mirror.git' },
+    }],
+    [settingsApi(context, `/push_mirrors/${context.fixture.pushMirrorId}/sync`), { method: 'POST' }],
+    [settingsApi(context, `/push_mirrors/${context.fixture.pushMirrorId}`), {
+      method: 'PATCH',
+      json: { force: true },
+    }],
+    [settingsApi(context, `/push_mirrors/${context.fixture.pushMirrorId}`), { method: 'DELETE' }],
+  ]),
+);
+
 const repoLfsStorage = privileged(
   async (context) => {
     await context.navigate(settingsPage(context, 'lfs-storage'));
@@ -1526,6 +1555,7 @@ export const UI_ACCESS_SWEEP_SCENARIOS = new Map([
   ['repo-ci-secrets', repoCiSecrets],
   ['repo-collaborators', repoCollaborators],
   ['repo-deploy-keys', repoDeployKeys],
+  ['repo-push-mirrors', repoPushMirrors],
   ['repo-lfs-storage', repoLfsStorage],
   ['repo-environments', repoEnvironments],
   ['repo-retention', repoRetention],

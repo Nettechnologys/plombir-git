@@ -662,10 +662,17 @@ async fn run_ref_move_hooks(
         None => None,
     };
 
+    // Repositories whose branches or tags moved in this run, for their push
+    // mirrors. Collected rather than marked per ref: a tag push carries dozens.
+    let mut moved_repositories = std::collections::BTreeSet::new();
+
     let mut cascade = RefUpdateCascade::new(Arc::new(seed), ref_updates);
     while let Some((target, update, depth)) = cascade.next() {
         if update.status != "ok" {
             continue;
+        }
+        if update.refname.starts_with("refs/heads/") || update.refname.starts_with("refs/tags/") {
+            moved_repositories.insert(target.repo_id);
         }
 
         tracing::info!(
@@ -745,6 +752,14 @@ async fn run_ref_move_hooks(
 
         // 5. Keep an existing code-search snapshot in step with the tree.
         refresh_code_index_for_push(params, &target, &update);
+    }
+
+    // 6. Push mirrors: whatever moved has not reached them yet. Every origin
+    // owes this — a pull mirror's pass, a merge and a push all change what the
+    // repository holds. The push itself runs in the background; this only
+    // marks the mirrors behind and wakes the loop that sends them.
+    for repo_id in moved_repositories {
+        crate::mirror::push::after_ref_move(params.write_pool.unwrap_or(params.db), repo_id).await;
     }
 }
 

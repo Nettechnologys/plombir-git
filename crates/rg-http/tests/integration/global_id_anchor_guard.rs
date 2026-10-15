@@ -597,8 +597,11 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// 141 since the bounded CI job-log route takes a pipeline id and a job id;
 /// `pipeline_in_repo` and `job_belongs_to_pipeline` anchor both before reply.
 /// 154 since decision #5: `api::admin::reset_user_mfa` takes a user id behind
-/// `InstanceAdmin`, for the reason `reset_user_password` does.
-const CENSUS_TOTAL: usize = 154;
+/// `InstanceAdmin`, for the reason `reset_user_password` does. 157 since
+/// card_5d25bc3276a3: `api::push_mirrors::{update,delete,sync}_push_mirror`
+/// take a push mirror id, each a scoped call — every service and `rg_db` call
+/// receives the gated repository's id beside it and finds the row only by both.
+const CENSUS_TOTAL: usize = 157;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

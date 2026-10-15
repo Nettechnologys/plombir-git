@@ -45,6 +45,7 @@ pub mod pr_reviewer_request_ops;
 pub mod protected_branch_ops;
 pub mod protected_tag_ops;
 pub mod pull_request_ops;
+pub mod push_mirror_ops;
 pub mod release_ops;
 pub mod repo_collaborator_ops;
 pub mod repo_number_floor_ops;

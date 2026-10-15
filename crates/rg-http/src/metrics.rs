@@ -374,6 +374,15 @@ pub mod business {
     /// "backed up long ago" are both alertable.
     pub static DB_BACKUP_LAST_SUCCESS: OnceLock<IntGauge> = OnceLock::new();
 
+    /// Gauge: enabled push mirrors whose last pass failed.
+    pub static PUSH_MIRRORS_FAILING: OnceLock<IntGauge> = OnceLock::new();
+
+    /// Gauge: seconds since the oldest ref move an enabled push mirror has not
+    /// received yet (0 = every mirror is up to date). A push mirror's failure
+    /// is invisible to the person pushing — the push here succeeds — so the
+    /// alert (`PushMirrorBehind` in `deploy/prometheus/alerts.yml`) reads this.
+    pub static PUSH_MIRROR_MAX_LAG: OnceLock<IntGauge> = OnceLock::new();
+
     /// Register all business metrics with the registry.
     pub fn register(registry: &Registry) -> Result<(), prometheus::Error> {
         macro_rules! register_counter {
@@ -484,6 +493,24 @@ pub mod business {
             .set(bt.clone())
             .map_err(|_| prometheus::Error::Msg("DB_BACKUP_LAST_SUCCESS already set".into()))?;
         registry.register(Box::new(bt))?;
+
+        let pf = IntGauge::with_opts(Opts::new(
+            "plombir_git_push_mirrors_failing",
+            "Enabled push mirrors whose last pass failed",
+        ))?;
+        PUSH_MIRRORS_FAILING
+            .set(pf.clone())
+            .map_err(|_| prometheus::Error::Msg("PUSH_MIRRORS_FAILING already set".into()))?;
+        registry.register(Box::new(pf))?;
+
+        let pl = IntGauge::with_opts(Opts::new(
+            "plombir_git_push_mirror_max_lag_seconds",
+            "Seconds since the oldest change an enabled push mirror has not received (0 = all up to date)",
+        ))?;
+        PUSH_MIRROR_MAX_LAG
+            .set(pl.clone())
+            .map_err(|_| prometheus::Error::Msg("PUSH_MIRROR_MAX_LAG already set".into()))?;
+        registry.register(Box::new(pl))?;
 
         Ok(())
     }
@@ -708,6 +735,16 @@ pub mod recorder {
     pub fn set_repos_total(count: i64) {
         if let Some(g) = business::REPOS_TOTAL.get() {
             g.set(count);
+        }
+    }
+
+    /// Publish the push mirrors' health, sampled from their rows.
+    pub fn set_push_mirror_health(failing: i64, max_lag_seconds: i64) {
+        if let Some(g) = business::PUSH_MIRRORS_FAILING.get() {
+            g.set(failing);
+        }
+        if let Some(g) = business::PUSH_MIRROR_MAX_LAG.get() {
+            g.set(max_lag_seconds);
         }
     }
 

@@ -48,6 +48,8 @@ const ADMIN_FIXTURE = Object.freeze({
   lfsPayload: 'seeded browser sweep LFS object',
   deployKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA seeded-sweep',
   browserDeployKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA browser-sweep',
+  pushMirrorUrl: 'https://seeded-sweep.example.invalid/mirror.git',
+  browserPushMirrorUrl: 'https://browser-sweep.example.invalid/mirror.git',
   environmentName: 'seeded-environment',
   tagPattern: 'seeded-*',
   webhookUrl: 'https://seeded-sweep.example.invalid/hook',
@@ -424,6 +426,13 @@ async function seedFixtures(backendUrl, tokens) {
       read_only: true,
     },
   });
+  // A push mirror to an address that never resolves: the owner's controls act
+  // on a real row, and the background pass that tries it only records a
+  // failure on that row.
+  const pushMirror = await ownerJson(`${repoPath}/push_mirrors`, {
+    method: 'POST',
+    json: { url: ADMIN_FIXTURE.pushMirrorUrl, sync_on_commit: false, sync_interval_seconds: 0 },
+  });
   // One LFS object in the settings repository, uploaded the way `git lfs push`
   // does, so the LFS storage page has a row whose Remove control the owner can
   // drive. It is minutes old, so the server keeps it and says why.
@@ -548,6 +557,7 @@ async function seedFixtures(backendUrl, tokens) {
     collaboratorId: collaborator.id,
     collaboratorUserId: collaborator.user_id,
     deployKeyId: deployKey.id,
+    pushMirrorId: pushMirror.id,
     lfsObjectOid: lfsOid,
     environmentId: environment.id,
     tagRuleId: tagRule.id,

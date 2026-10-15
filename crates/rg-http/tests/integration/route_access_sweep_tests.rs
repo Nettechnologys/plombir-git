@@ -1187,6 +1187,10 @@ struct RepoSeed {
     tag_protection_id: String,
     environment_id: String,
     deploy_key_id: String,
+    push_mirror_id: String,
+    /// The push mirror `DELETE` is pointed at, so a delete that lands first
+    /// leaves the `PATCH` and `sync` cells a row to answer about.
+    doomed_push_mirror_id: String,
     /// The account added as a collaborator, by `users.id`.
     ///
     /// `DELETE .../collaborators/{id}` takes a `users.id` while `PATCH` on the
@@ -1253,6 +1257,8 @@ impl RepoSeed {
             tag_protection_id: absent(),
             environment_id: absent(),
             deploy_key_id: absent(),
+            push_mirror_id: absent(),
+            doomed_push_mirror_id: absent(),
             collaborator_user_id: absent(),
             collaborator_name: OUTSIDER.to_string(),
             time_entry_id: absent(),
@@ -1731,6 +1737,33 @@ async fn seed_repo_rows(
             .unwrap(),
     ))
     .await;
+    // Push mirrors to an address that never resolves: the cells act on real
+    // rows, and nothing in this process pushes them anywhere.
+    let push_mirror_body = serde_json::json!({
+        "url": format!("https://access-sweep.example.invalid/{repo}.git"),
+        "sync_on_commit": false,
+        "sync_interval_seconds": 0,
+    });
+    let push_mirror = json_of(created("push mirror")(
+        fx.client
+            .post(format!("{prefix}/push_mirrors"))
+            .bearer_auth(&fx.owner_token)
+            .json(&push_mirror_body)
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
+    let doomed_push_mirror = json_of(created("doomed push mirror")(
+        fx.client
+            .post(format!("{prefix}/push_mirrors"))
+            .bearer_auth(&fx.owner_token)
+            .json(&push_mirror_body)
+            .send()
+            .await
+            .unwrap(),
+    ))
+    .await;
     let collaborator_added = fx
         .client
         .post(format!("{prefix}/collaborators"))
@@ -1935,6 +1968,8 @@ async fn seed_repo_rows(
         tag_protection_id: id_of(tag_protection),
         environment_id: id_of(environment),
         deploy_key_id: id_of(deploy_key),
+        push_mirror_id: id_of(push_mirror),
+        doomed_push_mirror_id: id_of(doomed_push_mirror),
         collaborator_user_id: collaborator.id.to_string(),
         collaborator_name: collaborator.name.clone(),
         time_entry_id: id_of(time_entry),
@@ -2107,6 +2142,8 @@ fn fill(fact: &RouteFact, repo: &RepoSeed, globals: &GlobalSeed, org: &str) -> S
             "id" if path.contains("/tags/protection/{id}") => &repo.tag_protection_id,
             "id" if path.contains("/actions/environments/{id}") => &repo.environment_id,
             "id" if path.contains("/keys/{id}") => &repo.deploy_key_id,
+            "id" if path.contains("/push_mirrors/{id}") && deletes => &repo.doomed_push_mirror_id,
+            "id" if path.contains("/push_mirrors/{id}") => &repo.push_mirror_id,
             // `DELETE` takes a `users.id` here and `PATCH` the collaborator row
             // id; only the delete needs a real value, because the patch answers
             // a body complaint before it looks anything up.

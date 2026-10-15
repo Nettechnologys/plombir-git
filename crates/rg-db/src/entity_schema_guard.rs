@@ -132,6 +132,7 @@ probed_entities!(
     protected_tag,
     protected_tag_push_grant,
     pull_request,
+    push_mirror,
     release,
     release_asset,
     repo_collaborator,

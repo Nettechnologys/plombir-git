@@ -77,6 +77,7 @@ export const packages = namespace();
 export const passkeys = namespace();
 export const pipelines = namespace();
 export const pulls = namespace();
+export const pushMirrors = namespace();
 export const releases = namespace();
 releases.attestation = namespace();
 export const repos = namespace();

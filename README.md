@@ -225,7 +225,7 @@ Three finds from the history:
 | Area | Capability | Implementation |
 |------|------------|----------------|
 | Git transport | Smart Protocol V1 & V2 over HTTPS and SSH (`russh`); pkt-line, sideband-64k, packfile encode/decode | [V2 transport](crates/rg-git/src/protocol/v2.rs) |
-| Repositories | Create / delete / transfer, fork, private & public, collaborators (read/write/admin), file & tree browsing, commit log, branches, tags | [Repository API](crates/rg-http/src/api/repos.rs) |
+| Repositories | Create / delete / transfer, fork, private & public, collaborators (read/write/admin), file & tree browsing, commit log, branches, tags, pull and push mirrors | [Repository API](crates/rg-http/src/api/repos.rs) |
 | Auth | User registration & login (argon2 + JWT), SSH public-key auth, Personal Access Tokens, MFA, SSO | [Auth API](crates/rg-http/src/api/auth.rs) |
 | Issues | Create, view, edit and delete issues and comments; close/reopen, labels, milestones, Gitea-compatible issue templates and chooser ([template reference](docs/issue-templates.md)) | [Issue API](crates/rg-http/src/api/issues.rs) |
 | Pull requests | Diff, three merge strategies (merge / squash / rebase), cross-repo (fork) PRs, code review (approve / request changes / inline comments), branch protection, repository pull-request template ([reference](docs/issue-templates.md#pull-request-templates)), CODEOWNERS auto-review ([reference](docs/codeowners.md)) | [PR API](crates/rg-http/src/api/pulls.rs) |
@@ -548,6 +548,37 @@ A pass that moves a branch updates the open pull requests on it — their head
 commit, auto-merge and the merge queue — but runs no CI pipeline and sends no
 `push` webhook: nobody pushed, and an upstream's workflows do not run on this
 instance's runners unasked.
+
+### Push mirrors
+
+The other direction: work here and keep a copy on another forge. A
+repository administrator adds one or more push mirrors under **Settings → Push
+mirrors** (or `POST /api/v1/repos/<owner>/<repo>/push_mirrors` with `url`,
+`username`, `password`), and after every change to the repository — a push over
+HTTPS or SSH, a web edit, a merge — its branches and tags are pushed to them.
+Mirrors that do not push on every change go out on their interval
+(`sync_interval_seconds`, `0` for none), and **Push now** sends one at once.
+
+The push runs in the background, never on the push that triggered it: a remote
+that is down or refuses the credential does not slow down or fail anything
+here. The settings page shows, per mirror, since when it is behind and why its
+last push failed; `plombir_git_push_mirror_max_lag_seconds` and the
+`PushMirrorBehind` alert say the same to an operator.
+
+By default the remote only moves forward. A branch rewritten here, or moved on
+the remote, is reported as refused and left as it is, and a branch deleted
+here stays there. **Overwrite the remote** (`force`) makes the mirror an exact
+copy — rewritten branches are force-pushed, deleted ones removed — and with it
+anything only the remote had is lost, which is why it is never the default.
+Only `refs/heads/*` and `refs/tags/*` are pushed, never the server's own refs.
+LFS objects are not uploaded yet: the remote receives the pointer files.
+
+The remote is held to the pull mirror's rules: HTTPS (plain HTTP only with
+`[mirror].allow_insecure_http`), the private-address guard before every push,
+the credential encrypted at rest and handed to `git` through the environment
+only. A credential typed into the URL is moved out of it. Neither the API, the
+audit log nor a recorded error ever shows it. SSH remotes are not supported:
+they need an identity of their own that this server does not manage yet.
 
 ### Git LFS
 

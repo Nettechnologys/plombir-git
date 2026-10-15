@@ -19,14 +19,14 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 434 |
-| Reachable from the browser | 303 (70%) |
+| Router routes (with declared `Access`) | 439 |
+| Reachable from the browser | 308 (70%) |
 | Layout modules | 2 |
-| Pages | 72 |
-| Interactive controls | 1043 |
-| Controls calling an API | 367 |
-| Controls from shared components | 423 |
-| Browser sweep: scenarios / inventory entries / routes | 50 / 186 / 176 |
+| Pages | 73 |
+| Interactive controls | 1052 |
+| Controls calling an API | 371 |
+| Controls from shared components | 425 |
+| Browser sweep: scenarios / inventory entries / routes | 51 / 191 / 181 |
 | **UI routes without a web/smoke/browser test** | **25** |
 | UI routes without corpus or browser coverage | 0 |
 
@@ -37,7 +37,7 @@
 | `RepoRead` | 109 | 70 | 4 | 0 |
 | `RepoWrite` | 86 | 67 | 13 | 2 |
 | `User` | 57 | 44 | 5 | 0 |
-| `RepoAdmin` | 39 | 39 | 0 | 0 |
+| `RepoAdmin` | 44 | 44 | 0 | 0 |
 | `InstanceAdmin` | 33 | 28 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
 | `RepoAuthRead` | 18 | 18 | 1 | 0 |
@@ -100,6 +100,7 @@
 | `/admin/runners` 🔒 | 11 | 4 | 1 |
 | `/search` | 11 | 0 | 0 |
 | `/[owner]/[repo]/settings/labels` | 10 | 2 | 2 |
+| `/[owner]/[repo]/settings/push-mirrors` | 9 | 4 | 2 |
 | `/admin/audit` 🔒 | 9 | 6 | 1 |
 | `/[owner]/[repo]/edit/[...path]` | 8 | 0 | 8 |
 | `/[owner]/[repo]/new` | 8 | 0 | 8 |
@@ -841,6 +842,19 @@ succeed and which must be denied.
 | i18n:common.loading | :252 | `POST /api/v1/repos/{owner}/{name}/mirror/sync` | `RepoWrite` | rust |
 | i18n:common.loading | :252 | `GET /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust+web |
 | i18n:common.loading | :255 | `DELETE /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust+web |
+
+### `/[owner]/[repo]/settings/push-mirrors`
+
+| Control | Source | Call | `Access` | test |
+|---|---|---|---|---|
+| i18n:common.loading | :216 | `POST /api/v1/repos/{owner}/{name}/push_mirrors/{id}/sync` | `RepoAdmin` | web+browser |
+| i18n:common.loading | :216 | `GET /api/v1/repos/{owner}/{name}/push_mirrors` | `RepoAdmin` | rust+web |
+| i18n:settings.push_mirrors.disable | :219 | `PATCH /api/v1/repos/{owner}/{name}/push_mirrors/{id}` | `RepoAdmin` | rust+web+browser |
+| i18n:settings.push_mirrors.disable | :219 | `GET /api/v1/repos/{owner}/{name}/push_mirrors` | `RepoAdmin` | rust+web |
+| i18n:settings.push_mirrors.delete | :222 | `DELETE /api/v1/repos/{owner}/{name}/push_mirrors/{id}` | `RepoAdmin` | web+browser |
+| i18n:settings.push_mirrors.delete | :222 | `GET /api/v1/repos/{owner}/{name}/push_mirrors` | `RepoAdmin` | rust+web |
+| i18n:settings.push_mirrors.url | :257 | `POST /api/v1/repos/{owner}/{name}/push_mirrors` | `RepoAdmin` | rust+web+browser |
+| i18n:settings.push_mirrors.url | :257 | `GET /api/v1/repos/{owner}/{name}/push_mirrors` | `RepoAdmin` | rust+web+browser |
 
 ### `/[owner]/[repo]/settings/retention`
 

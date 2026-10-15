@@ -35,6 +35,7 @@ pub mod orgs;
 pub mod packages;
 pub mod passkeys;
 pub mod pulls;
+pub mod push_mirrors;
 pub mod releases;
 pub mod repo_access;
 pub mod repo_content;

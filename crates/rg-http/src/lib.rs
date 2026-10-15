@@ -1175,6 +1175,22 @@ async fn refresh_entity_gauges(db: &DatabaseConnection) {
             tracing::warn!(error = %format!("{e:#}"), "metrics gauge sink: count_running_jobs failed")
         }
     }
+    match metrics::time_db(
+        "push_mirror.health",
+        rg_db::ops::push_mirror_ops::health(db),
+    )
+    .await
+    {
+        Ok((failing, oldest_pending)) => {
+            let lag = oldest_pending
+                .map(|since| (chrono::Utc::now() - since).num_seconds().max(0))
+                .unwrap_or(0);
+            metrics::recorder::set_push_mirror_health(failing as i64, lag)
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "metrics gauge sink: push mirror health failed")
+        }
+    }
 }
 
 /// Background task that periodically refreshes the entity-count gauges

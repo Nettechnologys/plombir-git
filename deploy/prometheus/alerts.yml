@@ -210,3 +210,20 @@ groups:
         annotations:
           summary: "Scheduled database backup run failed"
           description: "{{ $value }} failed run(s) in the last hour. The warning in the server log names the directory and the cause."
+
+  # Push mirrors fail where nobody looks: the push into Plombir Git succeeds and
+  # the copy on the other forge quietly falls behind.
+  - name: plombir_git_push_mirrors
+    interval: 60s
+    rules:
+      # The gauge is the age of the oldest change an enabled mirror has not
+      # received; 0 when every mirror is up to date.
+      - alert: PushMirrorBehind
+        expr: plombir_git_push_mirror_max_lag_seconds > 3600
+        for: 15m
+        labels:
+          severity: warning
+          service: plombir-git
+        annotations:
+          summary: "A push mirror has not received changes for over an hour"
+          description: "Open the repository's Settings → Push mirrors: the failing mirror shows its last error. `plombir_git_push_mirrors_failing` counts them."

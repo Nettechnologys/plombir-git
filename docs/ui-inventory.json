@@ -3275,6 +3275,79 @@
       "reachedFromUi": true
     },
     {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/push_mirrors",
+      "access": "RepoAdmin",
+      "handler": "api::push_mirrors::list_push_mirrors",
+      "testedIn": [
+        "rust",
+        "web",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-push-mirrors"
+      ]
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/repos/{owner}/{name}/push_mirrors",
+      "access": "RepoAdmin",
+      "handler": "api::push_mirrors::create_push_mirror",
+      "testedIn": [
+        "rust",
+        "web",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-push-mirrors"
+      ]
+    },
+    {
+      "method": "PATCH",
+      "url": "/api/v1/repos/{owner}/{name}/push_mirrors/{id}",
+      "access": "RepoAdmin",
+      "handler": "api::push_mirrors::update_push_mirror",
+      "testedIn": [
+        "rust",
+        "web",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-push-mirrors"
+      ]
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/repos/{owner}/{name}/push_mirrors/{id}",
+      "access": "RepoAdmin",
+      "handler": "api::push_mirrors::delete_push_mirror",
+      "testedIn": [
+        "web",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-push-mirrors"
+      ]
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/repos/{owner}/{name}/push_mirrors/{id}/sync",
+      "access": "RepoAdmin",
+      "handler": "api::push_mirrors::sync_push_mirror",
+      "testedIn": [
+        "web",
+        "browser"
+      ],
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-push-mirrors"
+      ]
+    },
+    {
       "method": "POST",
       "url": "/api/v1/imports",
       "access": "User",
@@ -20111,6 +20184,238 @@
       "passive": []
     },
     {
+      "route": "/[owner]/[repo]/settings/push-mirrors",
+      "file": "web/src/routes/[owner]/[repo]/settings/push-mirrors/+page.svelte",
+      "admin": false,
+      "controls": [
+        {
+          "tag": "button",
+          "label": "i18n:common.loading",
+          "line": 216,
+          "via": null,
+          "href": null,
+          "handler": "() => syncNow(mirror)",
+          "calls": [
+            {
+              "symbol": "pushMirrors.sync",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/push_mirrors/{id}/sync",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors/{id}/sync",
+              "access": "RepoAdmin",
+              "handler": "api::push_mirrors::sync_push_mirror",
+              "matched": true,
+              "testedIn": [
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-push-mirrors"
+              ]
+            },
+            {
+              "symbol": "pushMirrors.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/push_mirrors",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors",
+              "access": "RepoAdmin",
+              "handler": "api::push_mirrors::list_push_mirrors",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.push_mirrors.disable",
+          "line": 219,
+          "via": null,
+          "href": null,
+          "handler": "() => toggle(mirror)",
+          "calls": [
+            {
+              "symbol": "pushMirrors.update",
+              "method": "PATCH",
+              "url": "/api/v1/repos/{owner}/{repo}/push_mirrors/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors/{id}",
+              "access": "RepoAdmin",
+              "handler": "api::push_mirrors::update_push_mirror",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-push-mirrors"
+              ]
+            },
+            {
+              "symbol": "pushMirrors.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/push_mirrors",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors",
+              "access": "RepoAdmin",
+              "handler": "api::push_mirrors::list_push_mirrors",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.push_mirrors.delete",
+          "line": 222,
+          "via": null,
+          "href": null,
+          "handler": "() => remove(mirror)",
+          "calls": [
+            {
+              "symbol": "pushMirrors.remove",
+              "method": "DELETE",
+              "url": "/api/v1/repos/{owner}/{repo}/push_mirrors/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors/{id}",
+              "access": "RepoAdmin",
+              "handler": "api::push_mirrors::delete_push_mirror",
+              "matched": true,
+              "testedIn": [
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-push-mirrors"
+              ]
+            },
+            {
+              "symbol": "pushMirrors.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/push_mirrors",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors",
+              "access": "RepoAdmin",
+              "handler": "api::push_mirrors::list_push_mirrors",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "form",
+          "label": "i18n:settings.push_mirrors.url",
+          "line": 257,
+          "via": null,
+          "href": null,
+          "handler": "addMirror",
+          "calls": [
+            {
+              "symbol": "pushMirrors.create",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/push_mirrors",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors",
+              "access": "RepoAdmin",
+              "handler": "api::push_mirrors::create_push_mirror",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-push-mirrors"
+              ]
+            },
+            {
+              "symbol": "pushMirrors.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/push_mirrors",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/push_mirrors",
+              "access": "RepoAdmin",
+              "handler": "api::push_mirrors::list_push_mirrors",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-push-mirrors"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 274,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 285,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.loading",
+          "line": 291,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 32,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 39,
+          "via": "ConfirmModal",
+          "href": null,
+          "handler": "() => confirmer.answer(false)",
+          "calls": [],
+          "unresolved": true
+        }
+      ],
+      "passive": []
+    },
+    {
       "route": "/[owner]/[repo]/settings/retention",
       "file": "web/src/routes/[owner]/[repo]/settings/retention/+page.svelte",
       "admin": false,
@@ -28706,10 +29011,10 @@
       "owner",
       "outsider"
     ],
-    "scenarios": 50,
-    "inventoryEntries": 801,
-    "coveredEntries": 186,
-    "coveredRoutes": 176,
+    "scenarios": 51,
+    "inventoryEntries": 809,
+    "coveredEntries": 191,
+    "coveredRoutes": 181,
     "maxUiRoutesWithoutFrontendTest": 25
   }
 }

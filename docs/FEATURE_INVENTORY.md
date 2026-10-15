@@ -52,6 +52,7 @@ Paths below are relative to `crates/` unless stated otherwise.
 | HTTP timeouts and redirect refusal | ✅ 🔒 | `rg-core/src/net.rs`; 30-second request and 10-second connect timeouts |
 | Webhook DNS-rebinding defense | ✅ 🔒 | Checked addresses are passed to the connector; proxy use and redirects are disabled |
 | Mirror SSRF defense | ✅ 🔒 | URL checks at configuration and execution, plus checked address selection |
+| Push mirrors | ✅ 🔒 | `rg-core/src/mirror/push.rs`; pull-mirror transport rules, background push after every ref move, fast-forward only unless `force` |
 
 ## Runtime robustness
 

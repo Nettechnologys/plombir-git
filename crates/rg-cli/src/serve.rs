@@ -2119,6 +2119,15 @@ fn build_transports(
         )
     });
     let mirror_sync = spawn_mirror_sync(&settings, storage, &post_push_context, shutdown_rx)?;
+    // Push mirrors are not a schedule `[mirror].enabled` switches off: a push
+    // into a repository with one owes that remote the same push.
+    let push_mirrors = rg_core::mirror::push_scheduler::spawn_push_mirrors_with_shutdown(
+        storage.db.clone(),
+        storage.repo_root.clone(),
+        settings.auth_secrets.encryption_key.clone(),
+        settings.transports.mirror,
+        Some(shutdown_rx.clone()),
+    );
 
     // LFS for clones made from the SSH address: `git-lfs-authenticate` sends the
     // client to the HTTP side, and the only address it can honestly name is the
@@ -2206,7 +2215,11 @@ fn build_transports(
     Ok(Transports {
         http,
         ssh,
-        workers: notification_mail.into_iter().chain(mirror_sync).collect(),
+        workers: notification_mail
+            .into_iter()
+            .chain(mirror_sync)
+            .chain(Some(push_mirrors))
+            .collect(),
     })
 }
 
