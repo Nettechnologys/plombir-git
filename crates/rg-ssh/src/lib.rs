@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::{load_secret_key, Algorithm, PrivateKey};
-use russh::server::{Auth, Config, Handler, Msg, Session};
+use russh::server::{Auth, ChannelOpenHandle, Config, Handler, Msg, Session};
 use russh::{Channel, ChannelId, ChannelStream};
 use sea_orm::DatabaseConnection;
 use tokio::io::AsyncWriteExt;
@@ -1261,8 +1261,9 @@ impl Handler for SshHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         tracing::debug!(id = self.id, channel_id = ?channel.id(), "channel_open_session");
         let open = self.channels.len() + self.live_execs.load(std::sync::atomic::Ordering::SeqCst);
         if open >= self.limits.channels {
@@ -1272,10 +1273,14 @@ impl Handler for SshHandler {
                 max = self.limits.channels,
                 "SSH channel refused: this connection already holds as many as it may"
             );
-            return Ok(false);
+            reply
+                .reject(russh::ChannelOpenFailure::ResourceShortage)
+                .await;
+            return Ok(());
         }
         self.channels.insert(channel.id(), channel);
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn channel_close(
@@ -3023,7 +3028,7 @@ mod tests {
             type Error = russh::Error;
             async fn check_server_key(
                 &mut self,
-                _key: &russh::keys::ssh_key::PublicKey,
+                _key: &russh::keys::PublicKeyOrCertificate,
             ) -> Result<bool, Self::Error> {
                 Ok(true)
             }
