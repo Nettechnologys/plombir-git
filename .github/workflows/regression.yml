@@ -283,6 +283,27 @@ jobs:
           osv-scanner scan --lockfile=Cargo.lock \
             || osv-scanner --lockfile=Cargo.lock
 
+      # The frontend's npm tree gets the same treatment as Cargo.lock. Nothing
+      # else watches it: dependabot.yml has no npm ecosystem and the
+      # repository's Dependabot alerts are off, so six high advisories in
+      # web/package-lock.json once sat there until a manual clean-up
+      # (card_d31056dd93b1). `npm audit` reads the lockfile alone, no install.
+      #
+      # The whole tree, dev dependencies included: vite, vitest and svelte-check
+      # run on every contributor's machine and in this workflow. High and
+      # critical fail the job; low and moderate are printed and do not. The
+      # remedy for a transitive advisory is an `overrides` entry in
+      # web/package.json that pins the fixed version — npm has no ignore-list,
+      # and accepting an unfixed advisory is a decision, not a config line.
+      - name: Install Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+
+      - name: npm audit (web/package-lock.json)
+        working-directory: web
+        run: npm audit --audit-level=high
+
   git-protocol:
     name: Real Git client protocol matrix
     runs-on: ubuntu-latest

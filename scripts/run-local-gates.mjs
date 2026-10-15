@@ -95,8 +95,8 @@ export const CARGO_JOBS = new Map([
   [
     'security-audit',
     {
-      ciOnly: '`cargo audit`, `cargo deny` and osv-scanner need three tools installed and an '
-        + 'advisory-database fetch — a push must not depend on the network being up.',
+      ciOnly: '`cargo audit`, `cargo deny`, osv-scanner and `npm audit` each fetch an '
+        + 'advisory database — a push must not depend on the network being up.',
     },
   ],
   [
