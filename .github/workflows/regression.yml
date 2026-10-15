@@ -384,10 +384,10 @@ jobs:
     services:
       postgres:
         # PostgreSQL 17.11. Pinned by the multi-platform index digest so a rerun
-        # of the same commit migrates against the same server build. No
-        # Dependabot entry watches workflow service images, so a bump is a
-        # reviewed edit of this line; `docker buildx imagetools inspect
-        # postgres:17` names the current digest.
+        # of the same commit migrates against the same server build. The pin
+        # lives in .github/ci-images/Dockerfile, where Dependabot sees it; a
+        # service image cannot be read from a file, so it is repeated here and
+        # scripts/ci-image-pins-contract-check.mjs fails while the two differ.
         image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
         env:
           POSTGRES_USER: plombir_git
@@ -765,6 +765,11 @@ jobs:
             echo "No deploy/docker-compose*.yml found — the glob no longer matches anything." >&2
             exit 1
           fi
+          # docker-compose.release.yml refuses to interpolate without the
+          # uid/gid it runs the server as — it has no 1000 fallback on purpose.
+          PLOMBIR_GIT_UID="$(id -u)"
+          PLOMBIR_GIT_GID="$(id -g)"
+          export PLOMBIR_GIT_UID PLOMBIR_GIT_GID
           for compose in "${composes[@]}"; do
             echo "Validating ${compose}"
             docker compose -f "${compose}" config >/dev/null

@@ -1,11 +1,25 @@
 # Plombir Git Deployment Guide
 
-Two compose files, pick one:
+> **This page describes `main`.** Installing a published release? Read the
+> guide of that release instead —
+> `https://github.com/Nettechnologys/plombir-git/blob/<tag>/deploy/README.md`,
+> or the copy inside its `plombir-git-deploy-<tag>.tar.gz` asset. Whatever
+> [CHANGELOG.md](../CHANGELOG.md) lists under *Unreleased* is in no release yet:
+> today that includes the one-time setup token and the `create-admin`
+> subcommand described below. A v0.1.1 instance has neither — the first account
+> registered on an empty instance becomes its administrator, whoever registers
+> it, and the config template it ships sets `registration = "open"` (its
+> `.env.example` sets `PLOMBIR_GIT_REGISTRATION=closed`, which wins, but closed
+> still admits that first account). Keep its HTTP port where only you can reach
+> it until you have registered.
+
+Three compose files, pick one:
 
 | File | Data lives in | Settings come from | Use it when |
 |------|---------------|--------------------|-------------|
 | `docker-compose.yml` | Docker named volume `plombir-git-data` | env vars + the image's default flags | trying Plombir Git out |
-| `docker-compose.hostdir.yml` | host directory `deploy/data/` | `deploy/plombir-git.toml` | running it for real: you want to see, back up and restore the data yourself |
+| `docker-compose.hostdir.yml` | host directory `deploy/data/` | `deploy/plombir-git.toml` | running it for real from a checkout: you build the image and want to see, back up and restore the data yourself |
+| `docker-compose.release.yml` | host directory `./data` | `./plombir-git.toml` | running a published release without the source: the image from GHCR by digest, as your own uid ([below](#-published-release--no-source-tree)) |
 
 ## 🚀 Quick Start — Plombir Git Application
 
@@ -151,7 +165,57 @@ docker compose -f docker-compose.hostdir.yml run --rm --entrypoint id plombir-gi
 ```
 
 Note that `PLOMBIR_GIT_UID` is a **build** argument: after changing it you must
-`up --build`, not just `restart`.
+`up --build`, not just `restart`. Without a build at all, `docker-compose.release.yml`
+below sets the uid at `up` time instead.
+
+### 📦 Published release — no source tree
+
+`docker-compose.release.yml` is the layout above with two differences: the
+image is the one a release published to GHCR, pinned by digest, and the server
+runs as the uid/gid you give it in `.env` (compose `user:`) rather than the uid
+1000 the published image was built with. On a host where uid 1000 belongs to
+some other service, `chown 1000 ./data` would hand it the forge's data; here
+the data stays with whichever account runs `up`. The image needs no
+`/etc/passwd` entry for that uid: the server writes only below `/data` and
+`/tmp`, its git subprocesses read no global configuration, and `HOME` is set
+to `/data`.
+
+Take the files from the release you install, not from this branch. Every
+release carries `plombir-git-deploy-<tag>.tar.gz`: this compose file with the
+image set to that release's digest, plus the `plombir-git.docker.toml`,
+`.env.example`, reverse-proxy examples and guide of the same commit. A config
+template from `main` can carry keys an older binary refuses at startup
+(`unknown field …`), and the copy of the compose file on `main` names the newest
+published release — whichever Dependabot last proposed — not necessarily the
+one you meant.
+
+```bash
+# As the system account that should own the data, e.g. a dedicated `forge` user.
+tag=v0.1.1   # the release you install
+curl -fLO "https://github.com/Nettechnologys/plombir-git/releases/download/${tag}/plombir-git-deploy-${tag}.tar.gz"
+curl -fLO "https://github.com/Nettechnologys/plombir-git/releases/download/${tag}/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf "plombir-git-deploy-${tag}.tar.gz" && cd "plombir-git-deploy-${tag}"
+
+install -m 600 .env.example .env
+jwt_secret="$(openssl rand -hex 32)"
+sed -i.bak "s/^PLOMBIR_GIT_JWT_SECRET=.*/PLOMBIR_GIT_JWT_SECRET=${jwt_secret}/" .env
+rm -f .env.bak
+printf 'PLOMBIR_GIT_UID=%s\nPLOMBIR_GIT_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+install -m 600 plombir-git.docker.toml plombir-git.toml
+install -d -m 700 data
+docker compose -f docker-compose.release.yml up -d
+```
+
+`PLOMBIR_GIT_UID` and `PLOMBIR_GIT_GID` have no default in this file: a
+forgotten line fails `up` with `required variable PLOMBIR_GIT_UID is missing a
+value` instead of quietly running as uid 1000. Releases up to and including
+v0.1.1 predate the bundle; for those, take `docker-compose.release.yml` from
+`main` (it pins v0.1.1) and `plombir-git.docker.toml` / `.env.example` from the
+tag:
+`https://raw.githubusercontent.com/Nettechnologys/plombir-git/v0.1.1/deploy/plombir-git.docker.toml`.
+Upgrading is the same procedure with the next bundle, after the backup and
+migration steps under [SQLite Backup / Restore](#sqlite-backup--restore).
 
 ### Reverse proxy
 
@@ -418,16 +482,22 @@ the same write lock and only rolls back at the end.
 
 ```bash
 docker compose stop plombir-git
-docker compose run --rm plombir-git rotate-encryption-key \
+docker compose run --rm plombir-git plombir-git rotate-encryption-key \
     --db-url "sqlite:///data/plombir-git.db?mode=rwc" \
     --old "$OLD_KEY" --new "$NEW_KEY" --dry-run   # reports, changes nothing
-docker compose run --rm plombir-git rotate-encryption-key \
+docker compose run --rm plombir-git plombir-git rotate-encryption-key \
     --db-url "sqlite:///data/plombir-git.db?mode=rwc" \
     --old "$OLD_KEY" --new "$NEW_KEY" --yes
 # then replace /data/encryption_key with the new value (mode 0600),
 # or update PLOMBIR_GIT_ENCRYPTION_KEY in .env for an external key source
 docker compose up -d plombir-git
 ```
+
+`plombir-git` appears twice on purpose: the first names the compose service,
+the second the program. The image has no entrypoint, so whatever follows the
+service *is* the command: a subcommand written straight after the service name
+asks Docker to execute a program of that name, and it fails with `executable
+file not found in $PATH`.
 
 `docker compose run` replaces the image's own command, so the database has to be
 named here: without `--db-url` (or `--config /app/plombir-git.toml`, if you deploy
@@ -527,7 +597,7 @@ use:
 
 ```bash
 docker compose stop plombir-git
-docker compose run --rm plombir-git restore-db \
+docker compose run --rm plombir-git plombir-git restore-db \
   --db-url "sqlite:///data/plombir-git.db?mode=rwc" \
   --force \
   /data/backups/plombir-git-YYYYMMDD-HHMMSS.db
@@ -553,7 +623,7 @@ them. For example:
 
 ```bash
 docker compose stop plombir-git
-docker compose run --rm plombir-git migrate --config /app/plombir-git.toml
+docker compose run --rm plombir-git plombir-git migrate --config /app/plombir-git.toml
 docker compose up -d plombir-git
 ```
 

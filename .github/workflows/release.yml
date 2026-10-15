@@ -21,6 +21,7 @@ jobs:
     outputs:
       version: ${{ steps.tag.outputs.version }}
       commit: ${{ steps.tag.outputs.commit }}
+      subcommands: ${{ steps.pages.outputs.subcommands }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -49,6 +50,22 @@ jobs:
           PY
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+      # The subcommands README.md and deploy/README.md tell an operator to type,
+      # checked against the clap declarations of this commit here, and against
+      # the binaries this release ships in the build job. main's guide once
+      # named `create-admin` while the latest release had no such command
+      # (card_d670212c28bb); a release is held to its own pages instead.
+      - name: Subcommands the operator pages name
+        id: pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          subcommands="$(node scripts/operator-page-subcommands-contract-check.mjs | tr ' ' ':' | paste -sd ' ' -)"
+          test -n "$subcommands"
+          echo "subcommands=$subcommands" >> "$GITHUB_OUTPUT"
 
   build:
     needs: validate
@@ -94,6 +111,8 @@ jobs:
           cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
       - name: Extract and verify release binaries
         shell: bash
+        env:
+          SUBCOMMANDS: ${{ needs.validate.outputs.subcommands }}
         run: |
           set -euo pipefail
           image="${REGISTRY_IMAGE}:${GITHUB_REF_NAME}-${{ matrix.arch }}"
@@ -112,6 +131,16 @@ jobs:
           test "$(docker run --rm --entrypoint plombir-git "$image" --version)" = "plombir-git ${GITHUB_REF_NAME}"
           test "$(docker run --rm --entrypoint plombir-git-runner "$image" --version)" = "plombir-git-runner ${GITHUB_REF_NAME}"
           test "$(docker run --rm --entrypoint plombir-git-mcp "$image" --version)" = "plombir-git-mcp ${GITHUB_REF_NAME}"
+          # Every subcommand this tag's README.md and deploy/README.md name has to
+          # answer `--help` in the image being published.
+          for invocation in $SUBCOMMANDS; do
+            binary="${invocation%%:*}"
+            subcommand="${invocation#*:}"
+            if ! docker run --rm --entrypoint "$binary" "$image" "$subcommand" --help >/dev/null; then
+              echo "::error::The operator pages tell people to run \`$binary $subcommand\`, and the image built from this tag has no such command."
+              exit 1
+            fi
+          done
           tar -C dist -czf "dist/plombir-git-linux-${{ matrix.arch }}.tar.gz" "plombir-git-linux-${{ matrix.arch }}"
           rm -r "dist/plombir-git-linux-${{ matrix.arch }}"
       - name: Export SPDX SBOM
@@ -198,6 +227,32 @@ jobs:
             echo '::error::GHCR image is not public. A package admin must change its visibility to public, then rerun this job; see docs/releases/README.md.'
             exit 1
           fi
+      # The deploy files of this tag, with the compose file's image set to the
+      # digest just published: an operator installing this release takes the
+      # compose file, the config template and the env example from one commit.
+      # A template from main can carry keys this binary refuses at startup, and
+      # main's compose points at whichever release Dependabot last proposed
+      # (card_57527e3efac9).
+      - name: Bundle the deploy files with the published digest
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="plombir-git-deploy-${GITHUB_REF_NAME}"
+          image="${REGISTRY_IMAGE}:${GITHUB_REF_NAME}@${DIGEST}"
+          compose=deploy/docker-compose.release.yml
+          test "$(grep -cE "^    image: ${REGISTRY_IMAGE}[:@]" "$compose")" = 1
+          mkdir -p "dist/${bundle}"
+          sed -E "s|^(    image: )${REGISTRY_IMAGE}[:@].*$|\1${image}|" "$compose" > "dist/${bundle}/docker-compose.release.yml"
+          grep -qxF "    image: ${image}" "dist/${bundle}/docker-compose.release.yml"
+          install -m 600 deploy/plombir-git.docker.toml "dist/${bundle}/plombir-git.docker.toml"
+          install -m 600 deploy/.env.example "dist/${bundle}/.env.example"
+          cp deploy/README.md deploy/nginx.conf.example deploy/Caddyfile.example "dist/${bundle}/"
+          (cd "dist/${bundle}" && PLOMBIR_GIT_UID=1000 PLOMBIR_GIT_GID=1000 PLOMBIR_GIT_DEPLOY_ENV_FILE=.env.example \
+            docker compose -f docker-compose.release.yml config --quiet)
+          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
+          rm -r "dist/${bundle}"
       - name: Publish release assets and notes
         env:
           GH_TOKEN: ${{ github.token }}

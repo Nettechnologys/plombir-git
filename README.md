@@ -263,8 +263,15 @@ fresh instance, then register at least one signing key.
 
 Tagged builds are available under [GitHub Releases](https://github.com/Nettechnologys/plombir-git/releases).
 Each release includes Linux x86_64 and aarch64 archives, SHA-256 checksums,
-SPDX SBOMs and a multi-architecture image at
-`ghcr.io/nettechnologys/plombir-git:v0.1.1` (substitute the desired tag).
+SPDX SBOMs, a multi-architecture image at
+`ghcr.io/nettechnologys/plombir-git:v0.1.1` (substitute the desired tag), and
+from the release after v0.1.1 on a `plombir-git-deploy-<tag>.tar.gz` with a
+compose file pinned to that image's digest
+([how to run it](deploy/README.md#-published-release--no-source-tree)).
+This page and `deploy/README.md` describe `main`: for a release, read them at
+its tag (`https://github.com/Nettechnologys/plombir-git/blob/<tag>/README.md`).
+What [CHANGELOG.md](CHANGELOG.md) lists under *Unreleased* — among it the
+first-administrator setup token and `create-admin` — is in no release yet.
 Run an unpacked binary from its archive directory so its bundled `web/build`
 is found by the default configuration.
 `plombir-git --version`, `plombir-git-runner --version` and

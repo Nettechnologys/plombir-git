@@ -8,15 +8,19 @@
    is outside `main`, or whose release notes are missing.
 3. Wait for both architecture builds. The workflow publishes a multi-architecture
    GHCR image, Linux binary archives, SPDX SBOMs, checksums, and provenance
-   attestations. It verifies the binaries' `--version` output and public image
-   access before creating the GitHub release.
+   attestations. It verifies the binaries' `--version` output, that every
+   subcommand `README.md` and `deploy/README.md` tell an operator to type answers
+   `--help` in the image, and public image access before creating the GitHub
+   release.
 4. **First GHCR publication only:** GitHub creates a new container package as
    private, even when the repository is public. An organization package admin
    must open the package settings, change its visibility to public, then rerun
    the failed Release workflow job. Do not distribute the image or call the
    release complete until the anonymous-access check and release job pass.
 5. Confirm that the GitHub release contains both architecture archives, their
-   SPDX SBOMs, the source SBOM, and `SHA256SUMS`. Pull the versioned image
+   SPDX SBOMs, the source SBOM, the `plombir-git-deploy-<tag>.tar.gz` bundle
+   (its `docker-compose.release.yml` names the published digest), and
+   `SHA256SUMS`. Pull the versioned image
    without credentials and inspect its amd64 and arm64 manifests. Use its digest
    for deployments. Production deployment is a separate operation.
 

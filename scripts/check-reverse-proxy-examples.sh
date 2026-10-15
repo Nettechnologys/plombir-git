@@ -18,14 +18,30 @@
 # The images are pinned, not `latest`: a floating tag would turn this red on an
 # unrelated push the day a proxy release changes its grammar. A version tag is
 # not enough either — `1.27-alpine` is rebuilt under the same name — so each
-# carries the digest of its multi-platform index, and a bump is a reviewed edit
-# of these two lines (`docker buildx imagetools inspect <tag>` names the digest).
+# carries the digest of its multi-platform index. Both pins live in
+# .github/ci-images/Dockerfile, the file Dependabot watches for them, and are
+# read from there: a copy here would be the one no updater ever proposes to bump
+# (card_2d33ee054ad2). scripts/ci-image-pins-contract-check.mjs holds that file
+# to one `FROM <image>@sha256:<digest> AS <name>` per line, which is the only
+# shape the read below understands.
 set -euo pipefail
 
-NGINX_IMAGE=nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
-CADDY_IMAGE=caddy:2.8.4@sha256:226d1f059b75399fe19182893c7184591c07b97afc8dfcf44eeb80c9a77a530f
-
 cd "$(dirname "$0")/.."
+
+CI_IMAGES=.github/ci-images/Dockerfile
+
+ci_image() {
+  local image
+  image="$(awk -v stage="$1" '$1 == "FROM" && $3 == "AS" && $4 == stage { print $2 }' "${CI_IMAGES}")"
+  if [ -z "${image}" ] || [ "$(printf '%s\n' "${image}" | wc -l)" -ne 1 ]; then
+    echo "${CI_IMAGES} must pin exactly one \`FROM <image> AS $1\`." >&2
+    exit 1
+  fi
+  printf '%s\n' "${image}"
+}
+
+NGINX_IMAGE="$(ci_image nginx)"
+CADDY_IMAGE="$(ci_image caddy)"
 
 for example in deploy/nginx.conf.example deploy/Caddyfile.example; do
   if [ ! -f "${example}" ]; then

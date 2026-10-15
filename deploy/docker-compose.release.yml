@@ -1,0 +1,81 @@
+# Plombir Git — the published image, a config file and a host directory
+#
+# `docker-compose.hostdir.yml` without the build: the same layout (data in
+# ./data, settings in ./plombir-git.toml, read-only root filesystem), but the
+# image is the one the release workflow published, pinned by digest, and the
+# uid the server runs as is set at `up` time instead of baked in by a build.
+# Nothing here needs the source tree.
+#
+# Take this file from the release you install, not from `main`: every release
+# carries it as `plombir-git-deploy-<tag>.tar.gz`, next to the
+# `plombir-git.docker.toml` and `.env.example` of the same commit, with the
+# image line below set to the digest that release published. The copy on `main`
+# points at the newest published release and Dependabot proposes the next one,
+# so it never names an image nobody can pull — but a config template on `main`
+# may already carry keys that release does not know.
+#
+# Quick start (in the unpacked bundle — the full version is in deploy/README.md):
+#   install -m 600 .env.example .env   # it will hold a secret in plain text
+#   sed -i "s/^PLOMBIR_GIT_JWT_SECRET=.*/PLOMBIR_GIT_JWT_SECRET=$(openssl rand -hex 32)/" .env
+#   echo "PLOMBIR_GIT_UID=$(id -u)" >> .env
+#   echo "PLOMBIR_GIT_GID=$(id -g)" >> .env
+#   install -m 600 plombir-git.docker.toml plombir-git.toml  # MUST exist before `up`
+#   install -d -m 700 data   # private repos, the DB and its backups live here
+#   docker compose -f docker-compose.release.yml up -d
+#
+# Run it as the account that should own the data — a dedicated system user is
+# the point: the published image was built with uid 1000, and on a host where
+# uid 1000 is somebody else, `chown 1000 ./data` would hand the forge's data to
+# them. `user:` below runs the server as the uid/gid from `.env` instead, so
+# ./data stays with the account that created it.
+#
+# The image has no entry in /etc/passwd for that uid, and nothing it runs needs
+# one: the server writes only below /data (repositories, database, keys, logs)
+# and /tmp, its git subprocesses read no global or system git configuration,
+# and HOME points into /data so nothing falls back to a home directory that is
+# not there.
+
+services:
+  plombir-git:
+    image: ghcr.io/nettechnologys/plombir-git:v0.1.1@sha256:b32189ec1f12e71f0a95f64cac4c5641fa381b96bec2bf1805d595c417b3b5a9
+    # No default: a forgotten uid must fail `up` loudly, not quietly fall back
+    # to the image's 1000 and write the data as whoever that is on this host.
+    user: "${PLOMBIR_GIT_UID:?set PLOMBIR_GIT_UID in .env to the uid that owns ./data}:${PLOMBIR_GIT_GID:?set PLOMBIR_GIT_GID in .env to the gid that owns ./data}"
+    container_name: plombir-git
+    restart: unless-stopped
+    # The same hardening as docker-compose.hostdir.yml, for the same reasons:
+    # no capability, no setuid escalation, nothing writable outside ./data and
+    # /tmp. Keep [server].host_key under /data in plombir-git.toml (the bundled
+    # template does), or the server reaches for $HOME/.ssh.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      HOME: /data
+    ports:
+      # HTTP on loopback only: put a TLS-terminating reverse proxy in front.
+      - "127.0.0.1:${PLOMBIR_GIT_HTTP_PORT:-8080}:8080"
+      # Git-over-SSH has to be reachable by clients.
+      - "${PLOMBIR_GIT_SSH_PORT:-2222}:2222"
+    volumes:
+      - ./data:/data
+      - ./plombir-git.toml:/app/plombir-git.toml:ro
+    env_file:
+      # The override is used by the local config gate to validate against an
+      # isolated throwaway file; normal deployments keep reading this .env.
+      - ${PLOMBIR_GIT_DEPLOY_ENV_FILE:-.env}
+    # The image's default CMD passes --repo-root/--db-url flags, and a CLI flag
+    # always beats the config file. Override it so plombir-git.toml is the single
+    # source of truth.
+    command: ["plombir-git", "serve", "--config", "/app/plombir-git.toml"]
+    networks:
+      - plombir-git-net
+
+networks:
+  plombir-git-net:
+    name: plombir-git-net
+    driver: bridge

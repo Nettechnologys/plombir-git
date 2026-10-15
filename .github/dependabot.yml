@@ -12,6 +12,16 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+  # The third-party images CI runs: the PostgreSQL and MySQL services of the
+  # smoke jobs and the two reverse proxies the deploy examples are loaded by.
+  # They are pinned in a Dockerfile that is never built because no Dependabot
+  # ecosystem reads a workflow's service image or a shell variable — see the
+  # header of .github/ci-images/Dockerfile.
+  - package-ecosystem: docker
+    directory: /.github/ci-images
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
   # The observability stack pins its images by digest; this is what proposes
   # the next digest as a reviewable pull request.
   - package-ecosystem: docker-compose

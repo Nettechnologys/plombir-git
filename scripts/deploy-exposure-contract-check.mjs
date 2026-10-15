@@ -52,6 +52,12 @@ const PUBLIC_ON_PURPOSE = [
     target: '2222',
     why: 'git-over-SSH has to reach the clients that push and clone; it authenticates every exec',
   },
+  {
+    file: 'deploy/docker-compose.release.yml',
+    service: 'plombir-git',
+    target: '2222',
+    why: 'the same listener as docker-compose.hostdir.yml, from the published image',
+  },
 ];
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', '[::1]']);

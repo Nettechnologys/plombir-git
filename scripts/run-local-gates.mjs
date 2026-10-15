@@ -270,7 +270,15 @@ export function runDeployConfig({ cwd = root } = {}) {
     done
   `, {
     cwd: repoRoot,
-    env: { PLOMBIR_GIT_DEPLOY_ENV_FILE: envFile },
+    // `docker-compose.release.yml` refuses to interpolate without the uid/gid
+    // it runs the server as (no 1000 fallback, see its `user:`), and neither
+    // `.env.example` nor a developer's own `.env` has to carry them. The
+    // environment wins over the env file, the same as in the workflow step.
+    env: {
+      PLOMBIR_GIT_DEPLOY_ENV_FILE: envFile,
+      PLOMBIR_GIT_UID: String(process.getuid()),
+      PLOMBIR_GIT_GID: String(process.getgid()),
+    },
   }));
 
 

@@ -36,6 +36,14 @@ This project records user-facing changes here. The format follows
   ceiling, by default, so upgrading changes nothing until a value is set. A
   write that would pass a ceiling answers `413` (an LFS batch object `507`)
   with the used, incoming and limit numbers.
+- Every release carries `plombir-git-deploy-<tag>.tar.gz`:
+  `deploy/docker-compose.release.yml` with the image pinned to the digest that
+  release published, plus the config template, `.env.example`, reverse-proxy
+  examples and deployment guide of the same commit. The compose file runs the
+  published image as the uid/gid set in `.env` (`user:`), so the data
+  directory no longer has to belong to uid 1000.
+- The release workflow refuses a tag whose image lacks a subcommand that the
+  tag's `README.md` or `deploy/README.md` tells an operator to run.
 
 ### Changed
 
@@ -79,6 +87,13 @@ This project records user-facing changes here. The format follows
   key already in use is still only warned about, so it can be rotated away.
   `--jwt-secret` and `--encryption-key` warn that argv is readable by every
   local account.
+
+### Fixed
+
+- `deploy/README.md`'s restore, migrate and encryption-key rotation recipes
+  ran `docker compose run --rm plombir-git <subcommand>`, which the image —
+  it has no entrypoint — answers with `executable file not found`. They now
+  name the program after the service.
 
 ### Security
 
