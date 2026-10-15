@@ -459,7 +459,16 @@ struct CommandList {
     /// for bytes that never come — on SSH, until the stream budget runs out.
     pack_follows: bool,
     refusal: Option<String>,
+    /// Whether the client announced `shallow <oid>` lines: it pushes from a
+    /// shallow clone, whose history ends at commits it does not have the
+    /// parents of.
+    shallow: bool,
 }
+
+/// The prefix of the lines a shallow clone sends ahead of its commands, one
+/// per commit at its shallow boundary (`send-pack` writes them before the
+/// first command, whenever the pushing repository is shallow).
+const SHALLOW_LINE: &[u8] = b"shallow ";
 
 /// A command line split into its three fields and the capabilities, before
 /// anything is decided about it. Bytes, not `str`: the line is only decoded
@@ -477,6 +486,11 @@ fn split_command_line(bytes: &[u8]) -> (&[u8], &[u8]) {
 /// a non-null object id. Used where the line is not otherwise trusted — to
 /// know whether a pack follows the commands of a refused push.
 fn command_writes_an_object(command: &[u8]) -> bool {
+    // A shallow line names a commit too, but it is the client's history, not
+    // a value it writes — a deletion pushed from a shallow clone sends no pack.
+    if command.starts_with(SHALLOW_LINE) {
+        return false;
+    }
     command
         .split(|byte| byte.is_ascii_whitespace())
         .filter(|field| !field.is_empty())
@@ -499,7 +513,9 @@ where
     let mut updates = Vec::new();
     let mut negotiation_bytes = 0_usize;
     let mut pack_follows = false;
-    // Capabilities ride on the first command line only.
+    let mut shallow = false;
+    // Capabilities ride on the first command line only — the first line
+    // after any `shallow` lines, never the first pkt-line of the request.
     let mut report = None;
 
     loop {
@@ -517,6 +533,7 @@ where
                     report: report.unwrap_or_default(),
                     pack_follows: false,
                     refusal: Some(refusal.reason().to_string()),
+                    shallow,
                 });
             }
         };
@@ -528,7 +545,10 @@ where
             PktLine::Data(bytes) => bytes,
         };
         let (command, capabilities) = split_command_line(&bytes);
-        if report.is_none() {
+        let shallow_line = report.is_none() && command.starts_with(SHALLOW_LINE);
+        if shallow_line {
+            shallow = true;
+        } else if report.is_none() {
             report = Some(ReportRequest::from_capabilities(&String::from_utf8_lossy(
                 capabilities,
             )));
@@ -561,6 +581,7 @@ where
                 report: report.unwrap_or_default(),
                 pack_follows,
                 refusal: Some(refusal),
+                shallow,
             });
         }
 
@@ -575,8 +596,28 @@ where
                 report: report.unwrap_or_default(),
                 pack_follows,
                 refusal: Some("receive-pack update command must be valid UTF-8".to_string()),
+                shallow,
             });
         };
+        if shallow_line {
+            // Nothing here is decided by the boundary itself: the server keeps
+            // no `.git/shallow`, and a pushed commit whose parents it lacks is
+            // refused by the connectivity check, named as a shallow update.
+            if line
+                .strip_prefix("shallow ")
+                .is_none_or(|oid| validate_wire_object_id(oid.trim()).is_err())
+            {
+                pack_follows |= skip_update_commands(reader).await?;
+                return Ok(CommandList {
+                    updates,
+                    report: report.unwrap_or_default(),
+                    pack_follows,
+                    refusal: Some("receive-pack shallow line must name an object id".to_string()),
+                    shallow,
+                });
+            }
+            continue;
+        }
         if line.is_empty() {
             continue;
         }
@@ -605,6 +646,7 @@ where
         report: report.unwrap_or_default(),
         pack_follows,
         refusal: None,
+        shallow,
     })
 }
 
@@ -787,6 +829,7 @@ where
         report,
         pack_follows,
         refusal,
+        shallow,
     } = read_update_commands(reader).await?;
 
     if let Some(reason) = refusal {
@@ -856,6 +899,9 @@ where
         }
         updates =
             check_and_write_refs(repo_path, updates, policy, Some(incoming), Some(applied)).await?;
+        if shallow {
+            name_shallow_updates(&mut updates);
+        }
     }
 
     // Point of no return crossed: the refs above are written and the caller's
@@ -1401,6 +1447,26 @@ fn enforce_signed_commit_policies_with_env(
 /// this repository after the pack was indexed.
 const INCOMPLETE_PUSH: &str =
     "the pushed objects are incomplete: the new value or something it references is missing";
+
+/// The `ng` reason for a ref pushed from a shallow clone whose history stops
+/// at a boundary commit this repository has not got the parents of. Stock
+/// git's receive-pack refuses the same push as `shallow update not allowed`;
+/// the server keeps no `.git/shallow`, so the ref could never be cloned whole.
+const SHALLOW_UPDATE: &str = "shallow update not allowed: the history behind this shallow clone's boundary is not on the server; fetch it (git fetch --unshallow) and push again";
+
+/// Name the incomplete refs of a push from a shallow clone for what they are.
+///
+/// The connectivity check sees only that a parent is missing. When the client
+/// said its history is cut short, that missing parent is the boundary's, and
+/// "incomplete objects" would send the pusher hunting for a broken pack.
+fn name_shallow_updates(updates: &mut [RefUpdate]) {
+    for update in updates
+        .iter_mut()
+        .filter(|update| update.status == "error" && update.message == INCOMPLETE_PUSH)
+    {
+        update.message = SHALLOW_UPDATE.into();
+    }
+}
 
 /// The `ng` reason for a ref refused because the connectivity check itself
 /// could not run. Fixed text: the failure chain names server paths.
@@ -3211,6 +3277,80 @@ mod wire_tests {
             assert_eq!(received.updates.len(), 2);
             assert_eq!(received.report, expected, "first line `{first:?}`");
         }
+    }
+
+    /// card_3741851bba0b: a shallow clone writes one `shallow <oid>` line per
+    /// boundary commit ahead of its commands. The capabilities still ride on
+    /// the first *command*: reading them off the first pkt-line told the
+    /// server a stock client wanted no report, so the refs moved and the
+    /// client, waiting for its report, saw the connection drop.
+    #[tokio::test]
+    async fn shallow_lines_do_not_take_the_place_of_the_first_command() {
+        let mut stream = pkt(format!("shallow {}\n", "d".repeat(40)).as_bytes());
+        stream.extend_from_slice(&pkt(format!("shallow {}\n", "e".repeat(40)).as_bytes()));
+        stream.extend_from_slice(&pkt(format!(
+            "{} {} refs/heads/gone\0report-status side-band-64k\n",
+            "c".repeat(40),
+            NULL_SHA1
+        )
+        .as_bytes()));
+        stream.extend_from_slice(b"0000");
+        let commands = read_update_commands(&mut BufReader::new(Cursor::new(stream)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            commands.report,
+            ReportRequest {
+                report_status: true,
+                side_band_64k: true,
+            }
+        );
+        assert!(commands.shallow);
+        assert!(commands.refusal.is_none(), "{:?}", commands.refusal);
+        assert_eq!(commands.updates.len(), 1, "a shallow line is no command");
+        assert_eq!(commands.updates[0].refname, "refs/heads/gone");
+        // A deletion pushed from a shallow clone sends no pack; waiting for
+        // one would hold the request until the stream budget ran out.
+        assert!(!commands.pack_follows);
+    }
+
+    /// A shallow line that names no object id is the pusher's mistake, told in
+    /// the report like any other malformed command list.
+    #[tokio::test]
+    async fn a_malformed_shallow_line_is_refused_in_the_report() {
+        let mut stream = pkt(b"shallow not-an-object-id\n");
+        stream.extend_from_slice(&pkt(format!(
+            "{} {} refs/heads/gone\0report-status\n",
+            "c".repeat(40),
+            NULL_SHA1
+        )
+        .as_bytes()));
+        stream.extend_from_slice(b"0000");
+        let commands = read_update_commands(&mut BufReader::new(Cursor::new(stream)))
+            .await
+            .unwrap();
+        assert_eq!(
+            commands.refusal.as_deref(),
+            Some("receive-pack shallow line must name an object id")
+        );
+    }
+
+    /// Only an incomplete ref of a shallow push is renamed; every other
+    /// refusal keeps its own reason.
+    #[test]
+    fn a_shallow_push_names_its_incomplete_refs_as_a_shallow_update() {
+        let update = |message: &str| RefUpdate {
+            old_sha: NULL_SHA1.into(),
+            new_sha: "b".repeat(40),
+            refname: "refs/heads/x".into(),
+            status: "error".into(),
+            message: message.into(),
+        };
+        let mut updates = vec![update(INCOMPLETE_PUSH), update(SERVER_OWNED_NAMESPACE)];
+        name_shallow_updates(&mut updates);
+        assert_eq!(updates[0].message, SHALLOW_UPDATE);
+        assert_eq!(updates[1].message, SERVER_OWNED_NAMESPACE);
     }
 
     #[tokio::test]
