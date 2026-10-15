@@ -86,6 +86,9 @@ tracing-subscriber = { workspace = true }
 # reached without presenting a real second factor, so the enrolment-atomicity
 # test derives the current code from the secret `POST /users/mfa/setup` returns.
 totp-rs = { workspace = true }
+# The passkey lockout test signs a real WebAuthn assertion with a software
+# authenticator: a P-256 key, the curve and crate `jsonwebtoken` already builds.
+p256 = { version = "0.13", features = ["ecdsa"] }
 
 [lints]
 workspace = true

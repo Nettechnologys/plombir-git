@@ -5268,6 +5268,7 @@ dependencies = [
  "http-body-util",
  "jsonwebtoken",
  "md-5",
+ "p256 0.13.2",
  "prometheus",
  "rand 0.8.6",
  "reqwest 0.12.28",

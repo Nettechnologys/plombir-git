@@ -931,12 +931,9 @@ pub async fn login_finish(
     if user.username != sealed.username || !user.is_usable() {
         return Err(AppError::unauthorized("invalid credentials"));
     }
-    if user
-        .locked_until
-        .is_some_and(|locked_until| locked_until > chrono::Utc::now())
-    {
-        return Err(AppError::unauthorized("account is temporarily locked"));
-    }
+    // The brute-force lock is read only after the assertion verifies, below.
+    // Read here, it answered "account is temporarily locked" to anyone holding
+    // a challenge cookie — and `login_start` hands one out for a username alone.
 
     let current_rp = resolve_rp(&state, &headers)?;
     require_same_ceremony_rp("login", &sealed.rp, &current_rp)?;
@@ -957,6 +954,24 @@ pub async fn login_finish(
         tracing::warn!(
             user_id = user.id,
             "passkey login challenge had already been answered; refusing the replay"
+        );
+        return Err(AppError::unauthorized("passkey authentication failed"));
+    }
+
+    // The lock, read only now that the assertion has proved possession and its
+    // challenge is spent (card_05245ed87f97). Before the assertion it was an
+    // oracle: `login_start` needs nothing but a username, so the lock state of
+    // every account with a passkey was readable without a secret. Like the
+    // password door (`AccountLocked` after `verify_password_or_dummy`), a
+    // locked account answers exactly what a bad signature gets, and the
+    // counter is left alone: no session follows, so nothing advanced here.
+    if user
+        .locked_until
+        .is_some_and(|locked_until| locked_until > chrono::Utc::now())
+    {
+        tracing::warn!(
+            user_id = user.id,
+            "passkey assertion verified for a locked account; refusing the login"
         );
         return Err(AppError::unauthorized("passkey authentication failed"));
     }
