@@ -215,6 +215,11 @@ async fn run() -> anyhow::Result<()> {
                 token,
                 runner_id,
                 auth_token,
+                // The deprecated alias grows no new flags; its job limits come
+                // from `runner.toml`, which it reads like `plombir-git-runner run`.
+                job_memory: None,
+                job_cpus: None,
+                job_pids: None,
                 config,
             })
             .await?

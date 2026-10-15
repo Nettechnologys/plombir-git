@@ -213,6 +213,45 @@ pub(crate) struct CiConfig {
     /// carrying a label is refused.
     #[serde(default)]
     pub(crate) runner_labels: Option<Vec<String>>,
+    /// Memory ceiling of every job container the embedded runner starts, as
+    /// `docker run --memory` takes it. Absent keeps
+    /// [`rg_process::docker_job::MEMORY_LIMIT`].
+    #[serde(default)]
+    pub(crate) job_memory: Option<String>,
+    /// CPU quota of every job container, as `docker run --cpus` takes it.
+    /// Absent keeps [`rg_process::docker_job::CPU_LIMIT`].
+    #[serde(default)]
+    pub(crate) job_cpus: Option<String>,
+    /// Process limit of every job container. Absent keeps
+    /// [`rg_process::docker_job::PIDS_LIMIT`].
+    #[serde(default)]
+    pub(crate) job_pids: Option<u64>,
+}
+
+/// Resolve `[ci]` `job_memory` / `job_cpus` / `job_pids` into the ceiling the
+/// embedded runner starts job containers under. A value Docker would refuse
+/// fails startup naming the key, instead of failing every job later.
+pub(crate) fn resolve_job_limits(
+    cfg: Option<&ConfigFile>,
+) -> anyhow::Result<rg_process::docker_job::JobLimits> {
+    let ci = cfg.map(|config| &config.ci);
+    let mut limits = rg_process::docker_job::JobLimits::default();
+    if let Some(memory) = ci.and_then(|ci| ci.job_memory.as_deref()) {
+        limits = limits
+            .with_memory("ci.job_memory", memory)
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(cpus) = ci.and_then(|ci| ci.job_cpus.as_deref()) {
+        limits = limits
+            .with_cpus("ci.job_cpus", cpus)
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(pids) = ci.and_then(|ci| ci.job_pids) {
+        limits = limits
+            .with_pids("ci.job_pids", pids)
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(limits)
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -2030,6 +2069,24 @@ mod tests {
                 "runner_labels",
                 "rg_core::ci::default_runner_labels",
                 format!("{:?}", rg_core::ci::default_runner_labels()),
+            ),
+            row(
+                "ci",
+                "job_memory",
+                "rg_process::docker_job::MEMORY_LIMIT",
+                format!("{:?}", rg_process::docker_job::MEMORY_LIMIT),
+            ),
+            row(
+                "ci",
+                "job_cpus",
+                "rg_process::docker_job::CPU_LIMIT",
+                format!("{:?}", rg_process::docker_job::CPU_LIMIT),
+            ),
+            row(
+                "ci",
+                "job_pids",
+                "rg_process::docker_job::PIDS_LIMIT",
+                rg_process::docker_job::PIDS_LIMIT.to_string(),
             ),
             row(
                 "limits",

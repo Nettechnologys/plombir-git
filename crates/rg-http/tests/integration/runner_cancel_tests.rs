@@ -229,6 +229,7 @@ async fn spawn_runner(
         base.to_owned(),
         runner.id,
         runner_token,
+        rg_runner::JobLimits::default(),
         async {
             drop(stopped.await);
         },

@@ -33,3 +33,7 @@ pub use commands::{cmd_register, cmd_run, RegisterCommand, RunCommand};
 /// that. Driving it from a real signal would take the test binary down with the
 /// runner, so the signal is a parameter — `cmd_run` supplies the real one.
 pub use commands::{run_jobs_until_shutdown, run_jobs_until_shutdown_checking_every};
+
+/// The job container ceiling [`run_jobs_until_shutdown`] takes, re-exported so
+/// a caller of the loop does not need `rg-process` for its one argument.
+pub use rg_process::docker_job::JobLimits;

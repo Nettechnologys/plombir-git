@@ -45,12 +45,14 @@ fn configured_ci_engine(
     shutdown: tokio::sync::watch::Receiver<bool>,
     write_pool: rg_db::DatabaseConnection,
     storage_limits: rg_core::storage_quota::StorageLimits,
+    job_limits: rg_process::docker_job::JobLimits,
 ) -> rg_ci::CiEngine {
     rg_ci::CiEngine::with_notifications_and_job_timeout(notifications, job_timeout_secs)
         .with_runner_labels(runner_labels)
         .with_shutdown(shutdown)
         .with_write_pool(write_pool)
         .with_storage_limits(storage_limits)
+        .with_job_limits(job_limits)
 }
 
 fn publish_listen_addresses(
@@ -1102,6 +1104,7 @@ struct ServeSettings {
     external_runners: bool,
     allow_host_runner: bool,
     runner_labels: Vec<String>,
+    job_limits: rg_process::docker_job::JobLimits,
     registration: rg_core::user::registration::RegistrationMode,
     registration_source: RegistrationSource,
     attestation_enabled: bool,
@@ -1246,6 +1249,7 @@ impl ServeSettings {
                 .as_ref()
                 .and_then(|c| c.ci.runner_labels.clone())
                 .unwrap_or_else(rg_core::ci::default_runner_labels),
+            job_limits: crate::config::resolve_job_limits(cfg.as_ref())?,
             registration,
             registration_source,
             attestation_enabled: resolve_attestation_enabled(cfg.as_ref()),
@@ -2061,12 +2065,24 @@ fn build_transports(
         shutdown_rx.clone(),
         storage.db_write.clone(),
         settings.storage_limits,
+        settings.job_limits.clone(),
     );
     tracing::info!(
         job_timeout_secs = ci_engine.job_timeout_secs(),
         runner_labels = ci_engine.runner_labels().join(","),
+        job_limits = %ci_engine.job_limits(),
         "Embedded CI runner timeout configured"
     );
+    if settings.docker {
+        if let Some(host) = ci_engine.job_limits().cpus_beyond_this_host() {
+            tracing::warn!(
+                cpus = ci_engine.job_limits().cpus(),
+                host_cpus = host,
+                "ci.job_cpus is above the CPUs this machine has; a Docker daemon on this machine \
+                 refuses every job with it — lower it unless DOCKER_HOST points at a bigger one"
+            );
+        }
+    }
     let ci_engine: std::sync::Arc<dyn rg_core::ci::CiTrigger + Send + Sync> =
         std::sync::Arc::new(ci_engine);
     let instance_settings = rg_core::instance::InstanceSettingsCache::default();
@@ -2602,6 +2618,19 @@ mod serve_tests {
             !labelled.is_empty(),
             "the CI engine is built without ci.runner_labels, so the embedded runner answers to \
              labels the operator never declared"
+        );
+
+        // And `[ci]` job limits: an engine built without them starts every job
+        // under the defaults, whatever the operator configured.
+        let limited = rust_source::production_function_call_sites(
+            source,
+            "configured_ci_engine",
+            &["with_job_limits"],
+        );
+        assert!(
+            !limited.is_empty(),
+            "the CI engine is built without ci.job_memory / job_cpus / job_pids, so every job \
+             container starts under the default ceiling"
         );
     }
 
@@ -3421,6 +3450,7 @@ mod serve_tests {
             shutdown_rx,
             rg_db::DatabaseConnection::Disconnected,
             rg_core::storage_quota::StorageLimits::default(),
+            rg_process::docker_job::JobLimits::default(),
         );
 
         assert_eq!(engine.job_timeout_secs(), 731);
@@ -3443,9 +3473,48 @@ mod serve_tests {
             shutdown_rx,
             rg_db::DatabaseConnection::Disconnected,
             limits,
+            rg_process::docker_job::JobLimits::default(),
         );
 
         assert_eq!(engine.storage_limits(), limits);
+    }
+
+    /// `[ci]` job limits reach the engine the embedded runners are spawned
+    /// from; a missing key keeps the ceiling jobs always had, and a value
+    /// Docker would refuse stops startup naming the key.
+    #[test]
+    fn configured_job_limits_reach_the_ci_engine() {
+        let config: ConfigFile =
+            toml::from_str("[ci]\njob_memory = \"12g\"\njob_cpus = \"8\"\njob_pids = 4096\n")
+                .expect("job limits config");
+        let limits = crate::config::resolve_job_limits(Some(&config)).expect("resolve limits");
+        assert_eq!(
+            (limits.memory(), limits.cpus(), limits.pids()),
+            ("12g", "8", 4096)
+        );
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let engine = super::configured_ci_engine(
+            rg_ci::CiNotifications::default(),
+            rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
+            rg_core::ci::default_runner_labels(),
+            shutdown_rx,
+            rg_db::DatabaseConnection::Disconnected,
+            rg_core::storage_quota::StorageLimits::default(),
+            limits.clone(),
+        );
+        assert_eq!(engine.job_limits(), &limits);
+
+        let unset: ConfigFile = toml::from_str("[ci]\ndocker = true\n").unwrap();
+        assert_eq!(
+            crate::config::resolve_job_limits(Some(&unset)).unwrap(),
+            rg_process::docker_job::JobLimits::default()
+        );
+        let refused: ConfigFile = toml::from_str("[ci]\njob_cpus = \"0\"\n").unwrap();
+        let error = crate::config::resolve_job_limits(Some(&refused))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("ci.job_cpus = \"0\""), "{error}");
     }
 
     /// `serve` shares one resolution path with the one-shot subcommands, so the

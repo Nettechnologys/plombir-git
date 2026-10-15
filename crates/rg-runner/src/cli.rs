@@ -107,6 +107,20 @@ pub(crate) enum Commands {
         #[arg(long)]
         auth_token: Option<String>,
 
+        /// Memory ceiling of every job container, as `docker run --memory`
+        /// takes it [config: job_memory] [default: 2g]
+        #[arg(long)]
+        job_memory: Option<String>,
+
+        /// CPU quota of every job container, as `docker run --cpus` takes it
+        /// [config: job_cpus] [default: 2]
+        #[arg(long)]
+        job_cpus: Option<String>,
+
+        /// Process limit of every job container [config: job_pids] [default: 512]
+        #[arg(long)]
+        job_pids: Option<u64>,
+
         /// Path to config file
         #[arg(long, default_value = "~/.plombir-git/runner.toml")]
         config: String,

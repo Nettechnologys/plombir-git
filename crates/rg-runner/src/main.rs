@@ -76,6 +76,9 @@ async fn main() -> Result<()> {
             token,
             runner_id,
             auth_token,
+            job_memory,
+            job_cpus,
+            job_pids,
             config,
         } => {
             rg_runner::cmd_run(rg_runner::RunCommand {
@@ -88,6 +91,9 @@ async fn main() -> Result<()> {
                 token,
                 runner_id,
                 auth_token,
+                job_memory,
+                job_cpus,
+                job_pids,
                 config,
             })
             .await?;

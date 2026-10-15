@@ -159,6 +159,7 @@ async fn a_stopping_runner_deregisters_and_hands_its_job_straight_back() {
         base.clone(),
         runner.id,
         runner_token,
+        rg_runner::JobLimits::default(),
         async {
             // A dropped sender would mean the same thing; the test always sends.
             drop(stopped.await);

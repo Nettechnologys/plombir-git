@@ -21,6 +21,12 @@ pub(crate) struct RunnerConfig {
     pub(crate) repository: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) labels: Option<Vec<String>>,
+    /// Ceiling of every job container this runner starts — see
+    /// [`rg_process::docker_job::JobLimits`]. The operator's to set; nothing a
+    /// workflow writes reaches it.
+    pub(crate) job_memory: Option<String>,
+    pub(crate) job_cpus: Option<String>,
+    pub(crate) job_pids: Option<u64>,
 }
 
 /// Built-in default for `--server`.
@@ -32,6 +38,14 @@ pub(crate) struct RunnerConfig {
 /// localhost on its next start. Same reasoning (and same fix) as
 /// `rg-cli/src/serve.rs::DEFAULT_*`.
 pub(crate) const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
+
+/// Built-in defaults for `--job-memory` / `--job-cpus` / `--job-pids`: the
+/// ceiling every job container had before it was configurable, owned by
+/// [`rg_process::docker_job`] and named here so this binary's `--help` and
+/// README are held to them like every other default.
+pub(crate) const DEFAULT_JOB_MEMORY: &str = rg_process::docker_job::MEMORY_LIMIT;
+pub(crate) const DEFAULT_JOB_CPUS: &str = rg_process::docker_job::CPU_LIMIT;
+pub(crate) const DEFAULT_JOB_PIDS: u32 = rg_process::docker_job::PIDS_LIMIT;
 
 /// Last-resort runner name, used when neither the CLI, nor the config file, nor
 /// the system hostname yields one.
@@ -52,6 +66,9 @@ pub(crate) struct RunnerCliArgs {
     pub(crate) label: Vec<String>,
     pub(crate) token: Option<String>,
     pub(crate) runner_id: Option<i64>,
+    pub(crate) job_memory: Option<String>,
+    pub(crate) job_cpus: Option<String>,
+    pub(crate) job_pids: Option<u64>,
 }
 
 /// How the runner identifies itself to the server.
@@ -75,6 +92,7 @@ pub(crate) struct ResolvedRunner {
     pub(crate) repository: Option<String>,
     pub(crate) name: String,
     pub(crate) labels: Vec<String>,
+    pub(crate) job_limits: rg_process::docker_job::JobLimits,
 }
 
 /// Split a legacy `--labels` value: comma-separated, trimmed, empty entries dropped so
@@ -174,7 +192,55 @@ pub(crate) fn resolve_runner(
         labels: cli_labels
             .or_else(|| cfg.and_then(|c| c.labels.clone()))
             .unwrap_or_default(),
+        job_limits: resolve_job_limits(&cli.job_memory, &cli.job_cpus, cli.job_pids, cfg)?,
     })
+}
+
+/// The job container ceiling, knob by knob: a flag beats `runner.toml`, which
+/// beats the built-in default. A refused value names the spelling it came in,
+/// so the operator is pointed at the flag or at the file.
+fn resolve_job_limits(
+    memory: &Option<String>,
+    cpus: &Option<String>,
+    pids: Option<u64>,
+    cfg: Option<&RunnerConfig>,
+) -> Result<rg_process::docker_job::JobLimits> {
+    let pick = |flag: &'static str,
+                cli: Option<&str>,
+                key: &'static str,
+                file: Option<&str>,
+                default: &str|
+     -> (&'static str, String) {
+        match (cli, file) {
+            (Some(value), _) => (flag, value.to_string()),
+            (None, Some(value)) => (key, value.to_string()),
+            (None, None) => ("the built-in default", default.to_string()),
+        }
+    };
+    let (memory_from, memory) = pick(
+        "--job-memory",
+        memory.as_deref(),
+        "job_memory",
+        cfg.and_then(|c| c.job_memory.as_deref()),
+        DEFAULT_JOB_MEMORY,
+    );
+    let (cpus_from, cpus) = pick(
+        "--job-cpus",
+        cpus.as_deref(),
+        "job_cpus",
+        cfg.and_then(|c| c.job_cpus.as_deref()),
+        DEFAULT_JOB_CPUS,
+    );
+    let (pids_from, pids) = match (pids, cfg.and_then(|c| c.job_pids)) {
+        (Some(value), _) => ("--job-pids", value),
+        (None, Some(value)) => ("job_pids", value),
+        (None, None) => ("the built-in default", u64::from(DEFAULT_JOB_PIDS)),
+    };
+    rg_process::docker_job::JobLimits::default()
+        .with_memory(memory_from, &memory)
+        .and_then(|limits| limits.with_cpus(cpus_from, &cpus))
+        .and_then(|limits| limits.with_pids(pids_from, pids))
+        .map_err(anyhow::Error::msg)
 }
 
 /// Take the `(runner_id, token)` pair out of the config file, if it holds one.
@@ -499,7 +565,18 @@ mod tests {
             repository: Some("owner/project".to_string()),
             name: Some("builder-1".to_string()),
             labels: Some(vec!["linux".to_string()]),
+            job_memory: Some("8g".to_string()),
+            job_cpus: Some("4".to_string()),
+            job_pids: Some(2048),
         }
+    }
+
+    fn limits(memory: &str, cpus: &str, pids: u64) -> rg_process::docker_job::JobLimits {
+        rg_process::docker_job::JobLimits::default()
+            .with_memory("test", memory)
+            .and_then(|limits| limits.with_cpus("test", cpus))
+            .and_then(|limits| limits.with_pids("test", pids))
+            .unwrap()
     }
 
     /// Create a config file the loader will accept on its permissions, so a
@@ -950,6 +1027,7 @@ labels = ["linux", "docker"]
                 repository: Some("owner/project".to_string()),
                 name: "builder-1".to_string(),
                 labels: vec!["linux".to_string()],
+                job_limits: limits("8g", "4", 2048),
             }
         );
     }
@@ -993,6 +1071,48 @@ labels = ["linux", "docker"]
         assert_eq!(resolved.labels, vec!["linux".to_string()]);
     }
 
+    /// Each limit resolves on its own: a flag for one knob leaves the file's
+    /// value for the others, and nothing set anywhere is the old ceiling.
+    #[test]
+    fn job_limits_resolve_knob_by_knob() {
+        let cli = RunnerCliArgs {
+            job_cpus: Some("6".to_string()),
+            ..RunnerCliArgs::default()
+        };
+        let resolved = resolve_runner(cli, Some(&sample_config())).unwrap();
+        assert_eq!(resolved.job_limits, limits("8g", "6", 2048));
+
+        let bare = resolve_runner(RunnerCliArgs::default(), None).unwrap();
+        assert_eq!(
+            bare.job_limits,
+            rg_process::docker_job::JobLimits::default()
+        );
+    }
+
+    /// A refused limit names where it came from, so the operator edits the
+    /// right thing — and the start stops instead of failing every job later.
+    #[test]
+    fn a_bad_job_limit_names_the_flag_or_the_key_it_came_from() {
+        let mut cfg = sample_config();
+        cfg.job_memory = Some("lots".to_string());
+        let from_file = resolve_runner(RunnerCliArgs::default(), Some(&cfg))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            from_file.starts_with("job_memory = \"lots\""),
+            "{from_file}"
+        );
+
+        let cli = RunnerCliArgs {
+            job_pids: Some(0),
+            ..RunnerCliArgs::default()
+        };
+        let from_flag = resolve_runner(cli, Some(&sample_config()))
+            .unwrap_err()
+            .to_string();
+        assert!(from_flag.starts_with("--job-pids = 0"), "{from_flag}");
+    }
+
     #[test]
     fn cli_flags_beat_the_config_file() {
         let cli = RunnerCliArgs {
@@ -1004,6 +1124,9 @@ labels = ["linux", "docker"]
             label: Vec::new(),
             token: Some("cli-tok".to_string()),
             runner_id: Some(42),
+            job_memory: Some("12g".to_string()),
+            job_cpus: Some("8".to_string()),
+            job_pids: Some(4096),
         };
 
         let resolved = resolve_runner(cli, Some(&sample_config())).unwrap();
@@ -1021,6 +1144,7 @@ labels = ["linux", "docker"]
                 repository: Some("flag/project".to_string()),
                 name: "from-flag".to_string(),
                 labels: vec!["docker".to_string(), "amd64".to_string()],
+                job_limits: limits("12g", "8", 4096),
             }
         );
     }
@@ -1577,6 +1701,9 @@ pub(crate) struct RunnerConfig {
         constant: &'static str,
         /// Its value, read from the constant rather than copied beside it.
         value: String,
+        /// How many subcommands carry the flag: `server` is on `register` and
+        /// `run`, the job limits only on `run` — `register` executes nothing.
+        markers: usize,
     }
 
     /// The pairing table. The key spellings have to be written out — no rule
@@ -1585,16 +1712,22 @@ pub(crate) struct RunnerConfig {
     /// fails every check below.
     fn documented_defaults() -> Vec<DocumentedDefault> {
         macro_rules! defaults {
-            ($(($key:literal, $konst:ident)),+ $(,)?) => {
+            ($(($key:literal, $konst:ident, $markers:literal)),+ $(,)?) => {
                 vec![$(DocumentedDefault {
                     key: $key,
                     constant: stringify!($konst),
                     value: super::$konst.to_string(),
+                    markers: $markers,
                 }),+]
             };
         }
 
-        defaults![("server", DEFAULT_SERVER)]
+        defaults![
+            ("server", DEFAULT_SERVER, 2),
+            ("job_memory", DEFAULT_JOB_MEMORY, 1),
+            ("job_cpus", DEFAULT_JOB_CPUS, 1),
+            ("job_pids", DEFAULT_JOB_PIDS, 1),
+        ]
     }
 
     /// `[default: …]` notes that state a *behaviour* rather than a value, each
@@ -1746,14 +1879,15 @@ pub(crate) struct RunnerConfig {
                     entry.constant
                 );
             }
-            // A floor, not a count: `register` and `run` both name this key, so
-            // a marker scan that stopped matching would otherwise read as
-            // agreement.
+            // A floor, not a count: every subcommand the row names carries
+            // this key, so a marker scan that stopped matching would otherwise
+            // read as agreement.
             assert!(
-                seen >= 2,
-                "only {seen} `[config: {}]` markers left in cli.rs, so nothing pins \
-                 `config::{}` to the help of both subcommands — drop the row or restore the \
-                 marker",
+                seen >= entry.markers,
+                "only {seen} of {} `[config: {}]` markers left in cli.rs, so nothing pins \
+                 `config::{}` to the help of every subcommand that takes it — drop the row \
+                 or restore the marker",
+                entry.markers,
                 entry.key,
                 entry.constant
             );

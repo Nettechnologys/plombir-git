@@ -499,7 +499,7 @@ jobs:
 | step `continue-on-error` | Steps are one script; the failure boundary is the job. Use `continue-on-error` on the **job**. |
 | step `timeout-minutes` | Same reason — the timeout boundary is the job. |
 | step `working-directory` without `run` | It would apply to nothing. |
-| `container.options` | Raw `docker run` flags would let a committed workflow undo the sandbox the runner builds around the job — the dropped capabilities, `no-new-privileges`, the pid/memory/cpu limits. There is no honest partial support. |
+| `container.options` | Raw `docker run` flags would let a committed workflow undo the sandbox the runner builds around the job — the dropped capabilities, `no-new-privileges`, the pid/memory/cpu limits. There is no honest partial support. A job that needs more memory or CPUs gets them from the operator: `[ci]` `job_memory` / `job_cpus` / `job_pids` for the built-in runner, `--job-memory` / `--job-cpus` / `--job-pids` on an external runner the job selects with `runs-on:`. |
 
 ## Actions
 

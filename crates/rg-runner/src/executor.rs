@@ -182,6 +182,7 @@ pub(crate) async fn run_job_docker(
     variables: &[(String, String)],
     workspace: &std::path::Path,
     container_name: &str,
+    limits: &rg_process::docker_job::JobLimits,
 ) -> (i32, String) {
     // Check if Docker daemon is running
     let docker_ok = rg_process::docker_job::client("docker")
@@ -209,6 +210,7 @@ pub(crate) async fn run_job_docker(
             workspace,
             user: rg_process::container_user(),
             variables,
+            limits,
         },
     )
     .await
@@ -302,6 +304,7 @@ mod tests {
                 workspace,
                 user: rg_process::container_user(),
                 variables,
+                limits: &rg_process::docker_job::JobLimits::default(),
             },
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         )
@@ -353,7 +356,10 @@ mod tests {
             "missing no-new-privileges: {args:?}"
         );
         assert!(
-            window("--pids-limit", rg_process::docker_job::PIDS_LIMIT),
+            window(
+                "--pids-limit",
+                &rg_process::docker_job::PIDS_LIMIT.to_string()
+            ),
             "missing --pids-limit"
         );
         assert!(

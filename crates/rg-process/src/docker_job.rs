@@ -24,12 +24,188 @@
 
 use std::path::Path;
 
-/// Hard cap on the number of processes a job container may spawn (fork-bomb guard).
-pub const PIDS_LIMIT: &str = "512";
-/// Memory ceiling for a job container.
+/// Default cap on the number of processes a job container may spawn
+/// (fork-bomb guard), when the operator sets none.
+pub const PIDS_LIMIT: u32 = 512;
+/// Default memory ceiling for a job container, in `docker run --memory` spelling.
 pub const MEMORY_LIMIT: &str = "2g";
-/// CPU quota for a job container.
+/// Default CPU quota for a job container, in `docker run --cpus` spelling.
 pub const CPU_LIMIT: &str = "2";
+
+/// Docker refuses a memory limit under 6 MiB.
+const MEMORY_FLOOR_BYTES: u64 = 6 << 20;
+/// No runner host carries this much; past it the value is a typo.
+const MEMORY_CEILING_BYTES: u64 = 1 << 40;
+/// Docker's smallest quota is a hundredth of a CPU.
+const CPU_FLOOR_HUNDREDTHS: u64 = 1;
+const CPU_CEILING: u64 = 1024;
+/// `PID_MAX_LIMIT` on 64-bit Linux: a pids limit past it limits nothing.
+const PIDS_CEILING: u32 = 4_194_304;
+
+/// The resource ceiling of every job container a runner starts.
+///
+/// Set by the runner's operator — `[ci]` `job_memory` / `job_cpus` /
+/// `job_pids` for the embedded runner, `--job-memory` / `--job-cpus` /
+/// `--job-pids` or `runner.toml` for `plombir-git-runner` — and by nobody else.
+/// A workflow cannot reach it: the job hands [`run_args`] an image, a script
+/// and variables, and none of them is read as a flag. Letting a repository
+/// raise its own ceiling would be `container.options` by another door, which
+/// is refused on purpose (`docs/gitea-actions.md`).
+///
+/// The default is the ceiling every job had before the knob existed, so an
+/// upgrade that sets nothing produces the same `docker run` byte for byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobLimits {
+    memory: String,
+    cpus: String,
+    pids: u32,
+}
+
+impl Default for JobLimits {
+    fn default() -> Self {
+        Self {
+            memory: MEMORY_LIMIT.to_string(),
+            cpus: CPU_LIMIT.to_string(),
+            pids: PIDS_LIMIT,
+        }
+    }
+}
+
+impl JobLimits {
+    /// Replace the memory ceiling with an operator's value.
+    ///
+    /// Each knob is checked when the runner starts, so a typo is a startup
+    /// error naming the setting as the operator wrote it (`setting`:
+    /// `ci.job_memory`, `--job-memory`, …) rather than every job failing on a
+    /// `docker run` refusal.
+    pub fn with_memory(mut self, setting: &str, value: &str) -> Result<Self, String> {
+        self.memory = parse_memory(value)
+            .map_err(|why| format!("{setting} = {value:?} is not a memory limit: {why}"))?;
+        Ok(self)
+    }
+
+    /// Replace the CPU quota with an operator's value; see [`Self::with_memory`].
+    pub fn with_cpus(mut self, setting: &str, value: &str) -> Result<Self, String> {
+        self.cpus = parse_cpus(value)
+            .map_err(|why| format!("{setting} = {value:?} is not a CPU quota: {why}"))?;
+        Ok(self)
+    }
+
+    /// Replace the process limit with an operator's value; see
+    /// [`Self::with_memory`]. There is no "unlimited": the limit is the
+    /// fork-bomb guard, and a job container always runs with one.
+    pub fn with_pids(mut self, setting: &str, value: u64) -> Result<Self, String> {
+        self.pids = u32::try_from(value)
+            .ok()
+            .filter(|pids| (1..=PIDS_CEILING).contains(pids))
+            .ok_or_else(|| {
+                format!(
+                    "{setting} = {value} is not a process limit: it has to be between 1 and \
+                     {PIDS_CEILING}; a job container always runs with one"
+                )
+            })?;
+        Ok(self)
+    }
+
+    /// `--memory`, as `docker run` takes it.
+    pub fn memory(&self) -> &str {
+        &self.memory
+    }
+
+    /// `--cpus`, as `docker run` takes it.
+    pub fn cpus(&self) -> &str {
+        &self.cpus
+    }
+
+    /// `--pids-limit`.
+    pub fn pids(&self) -> u32 {
+        self.pids
+    }
+
+    /// The quota in hundredths of a CPU.
+    pub fn cpu_hundredths(&self) -> u64 {
+        cpu_hundredths(&self.cpus).unwrap_or(0)
+    }
+
+    /// The CPUs this machine has, when the quota asks for more.
+    ///
+    /// Docker refuses `--cpus` above what its host has, and it refuses per job,
+    /// so every job would fail on its `docker run`. The daemon may sit on
+    /// another machine (`DOCKER_HOST`), so the caller warns rather than refuses.
+    pub fn cpus_beyond_this_host(&self) -> Option<usize> {
+        let host = std::thread::available_parallelism().ok()?.get();
+        (self.cpu_hundredths() > (host as u64).saturating_mul(100)).then_some(host)
+    }
+}
+
+impl std::fmt::Display for JobLimits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "memory={} cpus={} pids={}",
+            self.memory, self.cpus, self.pids
+        )
+    }
+}
+
+/// `<digits>[b|k|m|g]`, the spelling `docker run --memory` accepts, lowercased.
+fn parse_memory(value: &str) -> Result<String, String> {
+    let value = value.trim().to_ascii_lowercase();
+    let (digits, unit) = match value.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((at, _)) => value.split_at(at),
+        None => (value.as_str(), ""),
+    };
+    let shift = match unit {
+        "" | "b" => 0,
+        "k" => 10,
+        "m" => 20,
+        "g" => 30,
+        _ => return Err("write a whole number with an optional b, k, m or g, like \"8g\"".into()),
+    };
+    let bytes = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|number| number.checked_mul(1 << shift))
+        .ok_or("write a whole number with an optional b, k, m or g, like \"8g\"")?;
+    if bytes < MEMORY_FLOOR_BYTES {
+        return Err("docker refuses less than 6m".into());
+    }
+    if bytes > MEMORY_CEILING_BYTES {
+        return Err("more than 1024g is not a runner host".into());
+    }
+    Ok(value)
+}
+
+/// A decimal with at most two places, as `docker run --cpus` accepts it.
+fn parse_cpus(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let hundredths = cpu_hundredths(value)
+        .ok_or("write a decimal number of CPUs with at most two places, like \"8\" or \"1.5\"")?;
+    if hundredths < CPU_FLOOR_HUNDREDTHS {
+        return Err("docker refuses less than 0.01".into());
+    }
+    if hundredths > CPU_CEILING * 100 {
+        return Err(format!("more than {CPU_CEILING} is not a runner host"));
+    }
+    Ok(value.to_string())
+}
+
+fn cpu_hundredths(value: &str) -> Option<u64> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if whole.is_empty() || !digits(whole) || !digits(fraction) || fraction.len() > 2 {
+        return None;
+    }
+    if value.ends_with('.') {
+        return None;
+    }
+    let fraction = format!("{fraction:0<2}").parse::<u64>().ok()?;
+    whole
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(100)?
+        .checked_add(fraction)
+}
 
 /// `HOME` a job sees inside its container: a directory every uid can write.
 ///
@@ -72,6 +248,8 @@ pub struct JobContainer<'a> {
     /// The job's variables. Only their names reach the argv; values are
     /// inherited from the Docker CLI's environment (see [`prepare`]).
     pub variables: &'a [(String, String)],
+    /// The runner operator's ceiling, see [`JobLimits`].
+    pub limits: &'a JobLimits,
 }
 
 /// The argument vector for `docker run` of one job container, started from
@@ -81,7 +259,8 @@ pub struct JobContainer<'a> {
 /// malicious job cannot break out onto the runner host.
 /// - `--cap-drop=ALL` strips every Linux capability (no raw sockets, no mount…).
 /// - `--security-opt=no-new-privileges` blocks setuid/gain-privilege via execve.
-/// - `--pids-limit` / `--memory` / `--cpus` bound resource exhaustion.
+/// - `--pids-limit` / `--memory` / `--cpus` bound resource exhaustion, at the
+///   operator's [`JobLimits`].
 ///
 /// The Docker socket is never mounted and `--privileged` is never passed, so the
 /// job has no path to the daemon or to host devices. Secret values never appear
@@ -116,17 +295,19 @@ pub fn run_args(
         "ALL",
         "--security-opt",
         "no-new-privileges",
-        "--pids-limit",
-        PIDS_LIMIT,
-        "--memory",
-        MEMORY_LIMIT,
-        "--cpus",
-        CPU_LIMIT,
-        "-v",
     ]
     .into_iter()
     .map(str::to_string)
     .collect();
+    args.extend([
+        "--pids-limit".to_string(),
+        job.limits.pids().to_string(),
+        "--memory".to_string(),
+        job.limits.memory().to_string(),
+        "--cpus".to_string(),
+        job.limits.cpus().to_string(),
+        "-v".to_string(),
+    ]);
     args.push(format!("{workspace}:/workspace"));
     args.extend(["-w".to_string(), "/workspace".to_string()]);
     // The workspace is created owner-only and container root holds no capability
@@ -401,6 +582,9 @@ pub fn client(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
 mod tests {
     use super::*;
 
+    static DEFAULT_LIMITS: std::sync::LazyLock<JobLimits> =
+        std::sync::LazyLock::new(JobLimits::default);
+
     fn job<'a>(workspace: &'a Path, variables: &'a [(String, String)]) -> JobContainer<'a> {
         JobContainer {
             name: "plombir-git-runner-job-7",
@@ -409,6 +593,7 @@ mod tests {
             workspace,
             user: Some("1000:1000".to_string()),
             variables,
+            limits: &DEFAULT_LIMITS,
         }
     }
 
@@ -430,7 +615,10 @@ mod tests {
             has_pair(&args, "--security-opt", "no-new-privileges"),
             "{args:?}"
         );
-        assert!(has_pair(&args, "--pids-limit", PIDS_LIMIT), "{args:?}");
+        assert!(
+            has_pair(&args, "--pids-limit", &PIDS_LIMIT.to_string()),
+            "{args:?}"
+        );
         assert!(has_pair(&args, "--memory", MEMORY_LIMIT), "{args:?}");
         assert!(has_pair(&args, "--cpus", CPU_LIMIT), "{args:?}");
         assert!(!args.iter().any(|arg| arg == "--privileged"), "{args:?}");
@@ -438,6 +626,118 @@ mod tests {
             !args.iter().any(|arg| arg.contains("docker.sock")),
             "{args:?}"
         );
+    }
+
+    /// An operator who sets no limit gets the `docker run` every job had
+    /// before the knob existed — spelled out here rather than read from the
+    /// constants, so changing a default is a visible edit to this list.
+    #[test]
+    fn without_operator_limits_the_argv_is_the_one_jobs_always_had() {
+        let variables: [(String, String); 0] = [];
+        let args = run_args(&job(Path::new("/srv/repo"), &variables), IMAGE_ID).unwrap();
+        let head: Vec<&str> = args.iter().take(18).map(String::as_str).collect();
+        assert_eq!(
+            head,
+            [
+                "run",
+                "--rm",
+                "--pull",
+                "never",
+                "--name",
+                "plombir-git-runner-job-7",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--pids-limit",
+                "512",
+                "--memory",
+                "2g",
+                "--cpus",
+                "2",
+                "-v",
+                "/srv/repo:/workspace",
+            ]
+        );
+    }
+
+    /// The operator's limits replace the defaults, once each. Nothing the job
+    /// writes — its script, its variables, its image — becomes a second
+    /// `--memory`: the repository cannot raise its own ceiling.
+    #[test]
+    fn operator_limits_reach_the_argv_and_the_job_cannot_add_its_own() {
+        let limits = JobLimits::default()
+            .with_memory("ci.job_memory", "12g")
+            .and_then(|limits| limits.with_cpus("ci.job_cpus", "8"))
+            .and_then(|limits| limits.with_pids("ci.job_pids", 4096))
+            .unwrap();
+        let variables = [
+            ("MEMORY".to_string(), "--memory=64g".to_string()),
+            ("--cpus".to_string(), "64".to_string()),
+        ];
+        let mut container = job(Path::new("/srv/repo"), &variables);
+        container.limits = &limits;
+        container.script = "docker run --memory 64g --cpus 64 --pids-limit -1 x";
+        let args = run_args(&container, IMAGE_ID).unwrap();
+        let options = &args[..args.iter().position(|arg| arg == "--").unwrap()];
+
+        for (flag, value) in [
+            ("--memory", "12g"),
+            ("--cpus", "8"),
+            ("--pids-limit", "4096"),
+        ] {
+            assert!(has_pair(options, flag, value), "{flag} {value}: {args:?}");
+            assert_eq!(
+                options.iter().filter(|arg| arg.as_str() == flag).count(),
+                1,
+                "{flag} appears more than once before `--`: {args:?}"
+            );
+        }
+        assert!(
+            !options.iter().any(|arg| arg.contains("64")),
+            "a job-supplied value reached docker's options: {args:?}"
+        );
+    }
+
+    #[test]
+    fn operator_limits_are_validated_and_name_the_setting() {
+        let accepted = JobLimits::default()
+            .with_memory("job_memory", " 16G ")
+            .and_then(|limits| limits.with_cpus("job_cpus", "1.5"))
+            .and_then(|limits| limits.with_pids("job_pids", 1))
+            .unwrap();
+        assert_eq!(
+            (accepted.memory(), accepted.cpus(), accepted.pids()),
+            ("16g", "1.5", 1)
+        );
+        assert_eq!(accepted.cpu_hundredths(), 150);
+        for memory in [
+            "",
+            "g",
+            "12x",
+            "1.5g",
+            "-1",
+            "5m",
+            "2048g",
+            "99999999999999999999",
+        ] {
+            let error = JobLimits::default()
+                .with_memory("ci.job_memory", memory)
+                .unwrap_err();
+            assert!(error.starts_with("ci.job_memory = "), "{memory:?}: {error}");
+        }
+        for cpus in ["", "0", "0.001", "1.", ".5", "1,5", "-2", "2048", "two"] {
+            let error = JobLimits::default()
+                .with_cpus("--job-cpus", cpus)
+                .unwrap_err();
+            assert!(error.starts_with("--job-cpus = "), "{cpus:?}: {error}");
+        }
+        for pids in [0, 4_194_305, u64::MAX] {
+            let error = JobLimits::default()
+                .with_pids("ci.job_pids", pids)
+                .unwrap_err();
+            assert!(error.starts_with("ci.job_pids = "), "{pids}: {error}");
+        }
     }
 
     #[test]

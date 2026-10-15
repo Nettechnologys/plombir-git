@@ -62,6 +62,7 @@ mod shared_docker_daemon_tests {
                 &[],
                 &first_path,
                 &first_container,
+                &rg_process::docker_job::JobLimits::default(),
             )
             .await
         });
@@ -74,6 +75,7 @@ mod shared_docker_daemon_tests {
                 &[],
                 &second_path,
                 &second_container,
+                &rg_process::docker_job::JobLimits::default(),
             )
             .await
         });
@@ -311,6 +313,7 @@ pub async fn cmd_register(command: RegisterCommand) -> Result<()> {
             label,
             token: None,
             runner_id: None,
+            ..RunnerCliArgs::default()
         },
         cfg.as_ref(),
     )?;
@@ -459,6 +462,11 @@ pub struct RunCommand {
     pub token: Option<String>,
     pub runner_id: Option<i64>,
     pub auth_token: Option<String>,
+    /// `--job-memory` / `--job-cpus` / `--job-pids`: the operator's ceiling for
+    /// every job container, over `runner.toml`'s `job_*` keys.
+    pub job_memory: Option<String>,
+    pub job_cpus: Option<String>,
+    pub job_pids: Option<u64>,
     pub config: String,
 }
 
@@ -473,6 +481,9 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
         token,
         runner_id,
         auth_token,
+        job_memory,
+        job_cpus,
+        job_pids,
         config,
     } = command;
     // Resolve config: CLI args > config file > defaults.
@@ -490,6 +501,7 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
         repository: resolved_repository,
         name: resolved_name,
         labels: resolved_labels,
+        job_limits,
     } = resolve_runner(
         RunnerCliArgs {
             server,
@@ -500,9 +512,22 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
             label,
             token,
             runner_id,
+            job_memory,
+            job_cpus,
+            job_pids,
         },
         cfg.as_ref(),
     )?;
+    tracing::info!(%job_limits, "Job containers start under these limits");
+    if let Some(host) = job_limits.cpus_beyond_this_host() {
+        tracing::warn!(
+            cpus = job_limits.cpus(),
+            host_cpus = host,
+            "the job CPU quota is above the CPUs this machine has; a Docker daemon on this \
+             machine refuses every job with it — lower --job-cpus / job_cpus unless DOCKER_HOST \
+             points at a bigger one"
+        );
+    }
     // Install before the startup sweep: cache archives, workspaces, artifact
     // spools and every child job process inherit this process-wide policy.
     state_permissions.install();
@@ -596,6 +621,7 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
         resolved_server.to_string(),
         resolved_id,
         resolved_token,
+        job_limits,
         shutdown_requested(),
     )
     .await;
@@ -768,6 +794,7 @@ pub async fn run_jobs_until_shutdown(
     server: String,
     runner_id: i64,
     token: String,
+    job_limits: rg_process::docker_job::JobLimits,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
     run_jobs_until_shutdown_checking_every(
@@ -775,6 +802,7 @@ pub async fn run_jobs_until_shutdown(
         server,
         runner_id,
         token,
+        job_limits,
         shutdown,
         JOB_LIVENESS_INTERVAL,
     )
@@ -789,6 +817,7 @@ pub async fn run_jobs_until_shutdown_checking_every(
     server: String,
     runner_id: i64,
     token: String,
+    job_limits: rg_process::docker_job::JobLimits,
     shutdown: impl std::future::Future<Output = ()>,
     liveness_interval: std::time::Duration,
 ) {
@@ -809,6 +838,7 @@ pub async fn run_jobs_until_shutdown_checking_every(
     let server = server.as_str();
     let token = token.as_str();
     let live_container = &live_container;
+    let job_limits = &job_limits;
     let mut shutdown = std::pin::pin!(shutdown);
 
     // Main job polling loop
@@ -910,6 +940,7 @@ pub async fn run_jobs_until_shutdown_checking_every(
                                 container_name
                                     .as_deref()
                                     .expect("docker job has a container name"),
+                                job_limits,
                             )
                             .await
                         } else {
@@ -1349,6 +1380,9 @@ mod redirect_tests {
                 token: Some("runner-token".to_string()),
                 runner_id: Some(7),
                 auth_token: None,
+                job_memory: None,
+                job_cpus: None,
+                job_pids: None,
                 config: config.to_string_lossy().into_owned(),
             }),
         )

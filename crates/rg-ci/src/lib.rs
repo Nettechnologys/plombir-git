@@ -107,6 +107,10 @@ pub struct CiEngine {
     /// publish are held to, the same one the runner routes check. Process
     /// configuration like the rest; unset by default.
     storage_limits: rg_core::storage_quota::StorageLimits,
+    /// `[ci]` `job_memory` / `job_cpus` / `job_pids` — the ceiling of every job
+    /// container its embedded runners start. Process configuration, set by the
+    /// operator; no pipeline can reach it.
+    job_limits: rg_process::docker_job::JobLimits,
 }
 
 impl Default for CiEngine {
@@ -118,6 +122,7 @@ impl Default for CiEngine {
             runner_labels: rg_core::ci::default_runner_labels(),
             write_pool: None,
             storage_limits: rg_core::storage_quota::StorageLimits::default(),
+            job_limits: rg_process::docker_job::JobLimits::default(),
         }
     }
 }
@@ -193,6 +198,13 @@ impl CiEngine {
         self
     }
 
+    /// Start every job container the embedded runners of this engine run under
+    /// `limits` — see [`crate::runner::PipelineRunner::set_job_limits`].
+    pub fn with_job_limits(mut self, limits: rg_process::docker_job::JobLimits) -> Self {
+        self.job_limits = limits;
+        self
+    }
+
     /// The instance-wide fallback handed to every embedded runner this engine
     /// creates. Exposed for startup diagnostics and contract tests.
     pub fn job_timeout_secs(&self) -> u64 {
@@ -203,6 +215,12 @@ impl CiEngine {
     /// [`Self::job_timeout_secs`] is.
     pub fn runner_labels(&self) -> &[String] {
         &self.runner_labels
+    }
+
+    /// The `[ci]` job container ceiling every embedded runner starts jobs
+    /// under. Exposed for the same reason [`Self::job_timeout_secs`] is.
+    pub fn job_limits(&self) -> &rg_process::docker_job::JobLimits {
+        &self.job_limits
     }
 
     /// The `[limits]` every embedded runner is held to. Exposed for the same
@@ -1425,6 +1443,7 @@ fn build_internal_runner(
     }
     runner.set_shutdown(engine.shutdown.clone());
     runner.set_storage_limits(engine.storage_limits);
+    runner.set_job_limits(engine.job_limits.clone());
     if let Some(write_pool) = &engine.write_pool {
         runner.set_write_pool(write_pool.clone());
     }

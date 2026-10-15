@@ -182,6 +182,8 @@ pub struct PipelineRunner {
     /// `[limits]` — what the caches and artifacts this runner publishes are
     /// held to. See [`PipelineRunner::set_storage_limits`].
     storage_limits: rg_core::storage_quota::StorageLimits,
+    /// `[ci]` job container ceiling. See [`PipelineRunner::set_job_limits`].
+    job_limits: rg_process::docker_job::JobLimits,
 }
 
 impl PipelineRunner {
@@ -227,6 +229,7 @@ impl PipelineRunner {
             docker_program: "docker".into(),
             job_heartbeat_interval: JOB_HEARTBEAT_INTERVAL,
             storage_limits: rg_core::storage_quota::StorageLimits::default(),
+            job_limits: rg_process::docker_job::JobLimits::default(),
         }
     }
 
@@ -273,6 +276,7 @@ impl PipelineRunner {
             docker_program: "docker".into(),
             job_heartbeat_interval: JOB_HEARTBEAT_INTERVAL,
             storage_limits: rg_core::storage_quota::StorageLimits::default(),
+            job_limits: rg_process::docker_job::JobLimits::default(),
         }
     }
 
@@ -285,6 +289,13 @@ impl PipelineRunner {
     /// or a job here stores what a job on an external runner could not.
     pub fn set_storage_limits(&mut self, limits: rg_core::storage_quota::StorageLimits) {
         self.storage_limits = limits;
+    }
+
+    /// `[ci]` `job_memory` / `job_cpus` / `job_pids`: the ceiling every job
+    /// container this runner starts runs under. The operator's setting; the
+    /// pipeline it runs has no say (see [`rg_process::docker_job::JobLimits`]).
+    pub fn set_job_limits(&mut self, limits: rg_process::docker_job::JobLimits) {
+        self.job_limits = limits;
     }
 
     /// Set the repository ID (for CI_JOB_TOKEN generation).
@@ -964,7 +975,8 @@ impl PipelineRunner {
         )
         .with_runner_labels(self.runner_labels.clone())
         .with_write_pool(self.db_write.clone())
-        .with_storage_limits(self.storage_limits);
+        .with_storage_limits(self.storage_limits)
+        .with_job_limits(self.job_limits.clone());
         match &self.shutdown {
             Some(shutdown) => engine.with_shutdown(shutdown.clone()),
             None => engine,
@@ -1418,6 +1430,7 @@ impl PipelineRunner {
                 workspace: &workspace_path,
                 user: rg_process::container_user(),
                 variables: job_environment,
+                limits: &self.job_limits,
             },
         )
         .await
@@ -2410,6 +2423,10 @@ mod tests {
             ..Default::default()
         };
         runner.set_storage_limits(limits);
+        let job_limits = rg_process::docker_job::JobLimits::default()
+            .with_memory("ci.job_memory", "12g")
+            .unwrap();
+        runner.set_job_limits(job_limits.clone());
 
         let engine = runner.engine_one_hop_down();
         let nested = crate::build_internal_runner(
@@ -2433,6 +2450,10 @@ mod tests {
         shutdown_tx.send(true).unwrap();
         assert!(nested.shutting_down());
         assert_eq!(nested.storage_limits, limits);
+        assert_eq!(
+            nested.job_limits, job_limits,
+            "the merge commit's jobs must start under the operator's job limits, not the defaults"
+        );
     }
 
     #[tokio::test]
@@ -3804,6 +3825,53 @@ esac
             "the job container does not run as the workspace owner {owner}: {run_args:?}"
         );
         assert_process_stops(fixture.pid("client.pid"), "successful docker client").await;
+    }
+
+    /// `[ci]` job limits are what the job's real `docker run` carries — read
+    /// back from the argv the Docker CLI received, not from `run_args`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_operator_job_limits_reach_the_docker_run_of_an_embedded_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = DockerFixture::new(&temp.path().join("fake-docker"));
+        let (mut runner, db, job) = runner_with_one_job(
+            temp.path(),
+            "docker-limits",
+            "echo accepted",
+            Some("fixture:success"),
+            30,
+        )
+        .await;
+        runner.set_docker_program(&fixture.program);
+        runner.set_job_limits(
+            rg_process::docker_job::JobLimits::default()
+                .with_memory("ci.job_memory", "12g")
+                .and_then(|limits| limits.with_cpus("ci.job_cpus", "8"))
+                .and_then(|limits| limits.with_pids("ci.job_pids", 4096))
+                .unwrap(),
+        );
+
+        runner.run().await.unwrap();
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "success", "{:?}", completed.log);
+        let run_args = std::fs::read_to_string(fixture.root.join("run.args")).unwrap();
+        let run_args: Vec<&str> = run_args.lines().collect();
+        for (flag, value) in [
+            ("--memory", "12g"),
+            ("--cpus", "8"),
+            ("--pids-limit", "4096"),
+        ] {
+            assert!(
+                run_args
+                    .windows(2)
+                    .any(|pair| pair[0] == flag && pair[1] == value),
+                "the job container did not start with {flag} {value}: {run_args:?}"
+            );
+        }
     }
 
     /// The embedded timeout owns the shell's whole process tree. Recording both

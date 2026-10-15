@@ -156,6 +156,14 @@ allow_host_runner = false
 # Add what this machine really is; an empty list answers to nothing, so every
 # job that declares a label is refused.
 # runner_labels = ["self-hosted", "ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-20.04"]
+# The ceiling of every job container this instance starts: `docker run`'s
+# --memory, --cpus and --pids-limit. Yours to set, never the workflow's — no
+# job can raise its own. Checked at startup; a value Docker would refuse stops
+# the server naming the key. Jobs that need more than one machine-wide ceiling
+# belong on an external runner with its own limits and label (see README).
+# job_memory = "2g"
+# job_cpus = "2"
+# job_pids = 512
 
 [releases]
 # Serve the release-asset attestation endpoints: a user with write access signs

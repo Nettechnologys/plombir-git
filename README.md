@@ -839,6 +839,9 @@ token = "9f1c…"
 repository = "owner/project"
 name = "builder-1"
 labels = ["docker", "linux", "amd64"]
+job_memory = "2g"
+job_cpus = "2"
+job_pids = 512
 ```
 
 | Key | Flag | Meaning |
@@ -851,6 +854,9 @@ labels = ["docker", "linux", "amd64"]
 | `repository` | `--repository` | Repository the token may serve, in `owner/name` form; required for registration |
 | `name` | `--name` | Display name (default: system hostname) |
 | `labels` | repeatable `--label` | What a job's `tags:` is matched against — one exact value per flag, a list in the file |
+| `job_memory` | `--job-memory` (`run`) | Memory ceiling of every job container, as `docker run --memory` takes it (default `2g`) |
+| `job_cpus` | `--job-cpus` (`run`) | CPU quota of every job container, as `docker run --cpus` takes it (default `2`) |
+| `job_pids` | `--job-pids` (`run`) | Process limit of every job container — the fork-bomb guard, never unlimited (default `512`) |
 
 Use `--label 'gpu,a100'` when a label contains a comma; repeated `--label`
 occurrences remain separate list elements. The old comma-separated `--labels`
@@ -860,6 +866,15 @@ label and cannot be combined with `--label`.
 `runner_id` and `token` are one credential — a token only authenticates the id it
 was issued for, so pass both or neither. Unknown keys are rejected outright: a
 typo fails the start naming the key rather than being silently ignored.
+
+The three `job_*` limits are the operator's ceiling for every job this runner
+executes in a container, checked when the runner starts. A workflow cannot raise
+them — nothing in a job reaches `docker run`'s options, and `container.options`
+is refused. To give heavy builds more room, run a second runner with bigger
+limits and its own label (`--label big --job-memory 16g --job-cpus 8`), and let
+the jobs that need it ask for that label in `runs-on:` / `tags:`. Without these
+keys every job runs under the same `2g` / `2` CPUs / `512` processes it always
+has.
 
 `state_permissions = "owner-only"` makes ordinary files start as `0600` and
 directories as `0700`, even when the service manager launched the runner with a
