@@ -330,6 +330,71 @@ mod release_import_tests {
         );
         assert!(stats.completion_stage().contains("1 release(s)"));
     }
+
+    fn lfs_failure(index: usize, path_len: usize) -> crate::lfs::fetch::LfsFetchFailure {
+        crate::lfs::fetch::LfsFetchFailure {
+            oid: format!("{index:064x}"),
+            path: format!("{index}/{}", "d".repeat(path_len)),
+            reason: "the source did not offer this object".to_string(),
+        }
+    }
+
+    #[test]
+    fn stored_stats_without_long_lists_are_the_stats_as_they_are() {
+        let mut stats = ImportStats {
+            repo_cloned: true,
+            lfs_objects_imported: 3,
+            ..Default::default()
+        };
+        stats.lfs_objects_failed.push(lfs_failure(1, 10));
+
+        let stored: serde_json::Value = serde_json::from_str(&stats.stored_json()).unwrap();
+        assert_eq!(stored, serde_json::to_value(&stats).unwrap());
+    }
+
+    /// A thousand missing LFS objects under long paths, plus a list of another
+    /// kind: the stored stats fit the column, stay JSON, keep entries of both
+    /// lists and count what they left out.
+    #[test]
+    fn stored_stats_fit_the_column_and_count_what_they_leave_out() {
+        let stats = ImportStats {
+            lfs_objects_failed: (0..1000).map(|index| lfs_failure(index, 900)).collect(),
+            comments_failed: (0..400)
+                .map(|index| ImportedObjectFailure {
+                    source: format!("issue #{index} comment {index}"),
+                    reason: "comment creation failed",
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let stored = stats.stored_json();
+        assert!(
+            stored.len() <= MAX_STORED_STATS_BYTES,
+            "{} bytes",
+            stored.len()
+        );
+        let value: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        let lfs = value["lfs_objects_failed"].as_array().unwrap();
+        let comments = value["comments_failed"].as_array().unwrap();
+        assert!(!lfs.is_empty() && !comments.is_empty(), "{value}");
+        assert_eq!(
+            lfs.len() as u64 + value["lfs_objects_failed_omitted"].as_u64().unwrap(),
+            1000
+        );
+        assert_eq!(
+            comments.len() as u64 + value["comments_failed_omitted"].as_u64().unwrap(),
+            400
+        );
+        assert!(value.get("labels_failed_omitted").is_none());
+        // The kept entries are the first ones, and a long path is cut.
+        assert_eq!(lfs[0]["oid"], format!("{:064x}", 0));
+        let path = lfs[0]["path"].as_str().unwrap();
+        assert!(path.ends_with('…'));
+        assert_eq!(path.chars().count(), MAX_STORED_FAILURE_FIELD_CHARS + 1);
+        // The stage line still counts every failure.
+        assert!(stats.completion_stage().contains("1000 LFS object(s)"));
+    }
 }
 
 impl ImportStats {
@@ -365,6 +430,130 @@ impl ImportStats {
             "Import completed, but {}; the task's stats name each one",
             missing.join(" and ")
         )
+    }
+
+    /// The JSON written to `import_tasks.stats`, never longer than
+    /// [`MAX_STORED_STATS_BYTES`].
+    ///
+    /// The failure lists are as long as the source makes them — a history
+    /// with a few hundred missing LFS objects under long paths is enough —
+    /// and the column is `TEXT`, 65 535 bytes on MySQL. Writing them whole
+    /// failed the `UPDATE`, so a finished import stayed `running` until the
+    /// stale sweep marked it failed. The lists are shortened here instead,
+    /// entry by entry and taking from each list in turn, and every list that
+    /// lost entries gets a `<list>_omitted` count next to it. Cutting the JSON
+    /// by bytes would leave the import page a document it cannot parse. The
+    /// counts in [`Self::completion_stage`] are computed from the full lists.
+    pub fn stored_json(&self) -> String {
+        let mut value = match serde_json::to_value(self) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(error = %error, "import stats could not be serialized");
+                return String::new();
+            }
+        };
+        let Some(object) = value.as_object_mut() else {
+            return String::new();
+        };
+        let mut lists: Vec<(&str, Vec<serde_json::Value>)> = STORED_FAILURE_LISTS
+            .iter()
+            .map(|key| {
+                let entries = match object.remove(*key) {
+                    Some(serde_json::Value::Array(entries)) => entries,
+                    _ => Vec::new(),
+                };
+                (*key, entries.into_iter().map(shorten_strings).collect())
+            })
+            .collect();
+        // Measure the document with every list empty and every omitted count
+        // at its largest, so that what is added below can only fit.
+        for (key, entries) in &lists {
+            object.insert((*key).to_string(), serde_json::Value::Array(Vec::new()));
+            object.insert(format!("{key}_omitted"), entries.len().into());
+        }
+        let mut used = serde_json::to_string(&value).map_or(0, |json| json.len());
+        let mut kept: Vec<Vec<serde_json::Value>> = vec![Vec::new(); lists.len()];
+        let mut open = vec![true; lists.len()];
+        for index in 0.. {
+            let mut took_any = false;
+            for (list, (_, entries)) in lists.iter_mut().enumerate() {
+                if !open[list] {
+                    continue;
+                }
+                let Some(entry) = entries.get_mut(index) else {
+                    open[list] = false;
+                    continue;
+                };
+                // One byte for the comma or the bracket the entry adds.
+                let size = serde_json::to_string(entry).map_or(usize::MAX, |json| json.len() + 1);
+                if used.saturating_add(size) > MAX_STORED_STATS_BYTES {
+                    open[list] = false;
+                    continue;
+                }
+                used += size;
+                kept[list].push(std::mem::take(entry));
+                took_any = true;
+            }
+            if !took_any {
+                break;
+            }
+        }
+        let Some(object) = value.as_object_mut() else {
+            return String::new();
+        };
+        for ((key, entries), kept) in lists.into_iter().zip(kept) {
+            let omitted = entries.len() - kept.len();
+            object.insert(key.to_string(), serde_json::Value::Array(kept));
+            if omitted == 0 {
+                object.remove(&format!("{key}_omitted"));
+            } else {
+                object.insert(format!("{key}_omitted"), omitted.into());
+            }
+        }
+        serde_json::to_string(&value).unwrap_or_default()
+    }
+}
+
+/// Room `import_tasks.stats` gives [`ImportStats::stored_json`]: under the
+/// 65 535 bytes of a MySQL `TEXT`, with margin for the rest of the row.
+pub const MAX_STORED_STATS_BYTES: usize = 48 * 1024;
+
+/// Characters a single text field of a stored failure keeps — a path or a
+/// source name longer than this would otherwise crowd out the entries after
+/// it.
+const MAX_STORED_FAILURE_FIELD_CHARS: usize = 512;
+
+/// The [`ImportStats`] fields whose length the source decides.
+const STORED_FAILURE_LISTS: [&str; 6] = [
+    "labels_failed",
+    "milestones_failed",
+    "comments_failed",
+    "pr_reviews_failed",
+    "releases_failed",
+    "lfs_objects_failed",
+];
+
+/// `value` with every string longer than [`MAX_STORED_FAILURE_FIELD_CHARS`]
+/// cut on a character boundary and marked with `…`.
+fn shorten_strings(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text)
+            if text.chars().count() > MAX_STORED_FAILURE_FIELD_CHARS =>
+        {
+            let mut short: String = text.chars().take(MAX_STORED_FAILURE_FIELD_CHARS).collect();
+            short.push('…');
+            serde_json::Value::String(short)
+        }
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, field)| (key, shorten_strings(field)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(shorten_strings).collect())
+        }
+        other => other,
     }
 }
 
@@ -3986,7 +4175,7 @@ pub async fn start_import(
         .await
         {
             Ok(stats) => {
-                let stats_json = serde_json::to_string(&stats).unwrap_or_default();
+                let stats_json = stats.stored_json();
                 if let Err(error) = import_task_ops::mark_completed(
                     &db_clone,
                     task_clone.id,

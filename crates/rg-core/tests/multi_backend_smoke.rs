@@ -2890,6 +2890,105 @@ async fn a_pull_mirror_records_a_failure_longer_than_a_text_column() {
     .expect("clean up the pull mirror");
 }
 
+/// card_8753fa2f5564: an import whose source withheld a thousand LFS objects
+/// under long paths still finishes as `completed`. Written whole, its stats
+/// outgrew MySQL's 64 KiB `TEXT`; the `UPDATE` failed and the task stayed
+/// `running` until the stale sweep marked a finished import failed.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn an_import_with_a_thousand_failures_is_recorded_as_completed() {
+    use rg_core::import::service::{ImportStats, MAX_STORED_STATS_BYTES};
+    use rg_db::ops::import_task_ops;
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("importer{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Import Smoke",
+    )
+    .await
+    .expect("create importer");
+    let now = chrono::Utc::now();
+    let task = import_task_ops::create(
+        &db,
+        rg_db::entities::import_task::ActiveModel {
+            user_id: Set(owner.id),
+            platform: Set("github".to_string()),
+            source_url: Set("https://github.com/example/source".to_string()),
+            target_owner: Set(username.clone()),
+            target_name: Set(format!("imported{suffix}")),
+            status: Set("importing".to_string()),
+            progress: Set(95),
+            import_repo: Set(true),
+            import_issues: Set(false),
+            import_pull_requests: Set(false),
+            import_wiki: Set(false),
+            import_releases: Set(false),
+            import_labels: Set(false),
+            import_milestones: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create import task");
+
+    let stats = ImportStats {
+        repo_cloned: true,
+        lfs_objects_failed: (0..1000)
+            .map(|index| rg_core::lfs::fetch::LfsFetchFailure {
+                oid: format!("{index:064x}"),
+                path: format!("assets/{index}/{}.bin", "deep/".repeat(40)),
+                reason: "the source did not offer this object".to_string(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    assert!(
+        serde_json::to_string(&stats).unwrap().len() > 64 * 1024,
+        "baseline: the stats written whole do not fit a MySQL TEXT"
+    );
+
+    import_task_ops::mark_completed(
+        &db,
+        task.id,
+        &stats.stored_json(),
+        &stats.completion_stage(),
+    )
+    .await
+    .expect("a finished import must be recorded as completed");
+
+    let row = import_task_ops::find_by_id(&db, task.id)
+        .await
+        .unwrap()
+        .expect("the import task row");
+    assert_eq!(row.status, "completed");
+    let stored = row.stats.expect("the stats are recorded");
+    assert!(stored.len() <= MAX_STORED_STATS_BYTES);
+    let value: serde_json::Value = serde_json::from_str(&stored).expect("stats stay JSON");
+    let kept = value["lfs_objects_failed"].as_array().unwrap().len() as u64;
+    assert!(kept > 0);
+    assert_eq!(
+        kept + value["lfs_objects_failed_omitted"].as_u64().unwrap(),
+        1000
+    );
+    assert!(row
+        .stage
+        .is_some_and(|stage| stage.contains("1000 LFS object(s)")));
+}
+
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn mfa_lifecycle_account_delete_is_portable() {
