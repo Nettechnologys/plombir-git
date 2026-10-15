@@ -4,7 +4,7 @@ use sea_orm::{
 use sea_orm_migration::MigratorTrait;
 
 use super::{backfill_owner_roles, NAME};
-use crate::entities::{audit_log, organization_member};
+use rg_db::entities::{audit_log, organization_member};
 
 struct TempDb {
     path: std::path::PathBuf,
@@ -38,7 +38,7 @@ impl Drop for TempDb {
 }
 
 async fn user(db: &DatabaseConnection, name: &str) -> i64 {
-    crate::ops::user_ops::create_user(db, name, &format!("{name}@example.invalid"), "", name)
+    rg_db::ops::user_ops::create_user(db, name, &format!("{name}@example.invalid"), "", name)
         .await
         .expect("create account")
         .id
@@ -48,7 +48,7 @@ async fn user(db: &DatabaseConnection, name: &str) -> i64 {
 /// `role` — or removed altogether, the state an admin could leave it in on an
 /// earlier release.
 async fn org(db: &DatabaseConnection, name: &str, owner: i64, role: Option<&str>) -> i64 {
-    let org = crate::ops::org_ops::create_org(db, name, None, None, owner, "private")
+    let org = rg_db::ops::org_ops::create_org(db, name, None, None, owner, "private")
         .await
         .expect("create organization");
     match role {
@@ -123,7 +123,7 @@ async fn created_at_shape(db: &DatabaseConnection, member_id: i64) -> String {
 #[tokio::test]
 async fn organizations_without_an_owner_get_their_owner_id_as_one() {
     let temp = TempDb::new();
-    let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
         .await
         .expect("connect to throwaway SQLite database");
     let before = crate::migrations::Migrator::migrations()
@@ -204,7 +204,7 @@ async fn the_backfill_converges_on_every_backend() {
         Ok(url) if !url.is_empty() => url,
         _ => temp.url(),
     };
-    let db = crate::connect_with_pool(&url, crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+    let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
         .await
         .expect("connect to the test database");
     crate::run_migrations(&db).await.expect("run migrations");

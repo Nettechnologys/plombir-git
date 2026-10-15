@@ -1,0 +1,37 @@
+[package]
+name = "rg-db-migration"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+rust-version.workspace = true
+
+# The schema history: every migration, the lock that serialises migrators, and
+# the pure helpers a data migration needs. It sits *below* rg-db and never
+# depends on it, so an edit to rg-db's ops or entities does not recompile the
+# 145 migrations (card_0cc0d53e25a0). rg-db re-exports what callers use, so
+# `rg_db::run_migrations` and `rg_db::migrations` keep their paths.
+
+[dependencies]
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+sha2 = { workspace = true }
+semver = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+# The migration tests run against the layer above: they open databases through
+# rg-db's connector and seed rows through its ops. A dev-dependency cycle is
+# allowed by cargo; the tests link a normally built rg-db.
+rg-db = { path = "../rg-db", features = ["test-support"] }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+rand = { workspace = true }
+
+[lints]
+workspace = true

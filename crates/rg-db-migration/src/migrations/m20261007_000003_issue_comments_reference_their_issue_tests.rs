@@ -40,7 +40,7 @@ impl Drop for TempDb {
 /// migration, holding the rows [`seed`] writes.
 async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
     let temp = TempDb::new(label);
-    let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
         .await
         .expect("connect to throwaway SQLite database");
     migrate_to_just_before(&db).await;
@@ -216,7 +216,7 @@ async fn down_removes_the_reference_again() {
 async fn the_reference_installs_over_orphans_on_a_server_database() {
     let url = std::env::var("PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL")
         .expect("PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL must be set");
-    let db = crate::connect_with_pool(&url, crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+    let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
         .await
         .expect("connect to the exclusive test database");
     migrate_to_just_before(&db).await;

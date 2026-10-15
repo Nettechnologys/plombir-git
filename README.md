@@ -1026,7 +1026,8 @@ plombir-git/
 │   ├── rg-git/     # Git protocol layer (pkt-line, upload/receive-pack, sideband)
 │   ├── rg-ssh/     # SSH server (russh)
 │   ├── rg-http/    # HTTP server + REST API + WebSocket (axum)
-│   ├── rg-db/      # database layer (SeaORM entities + migrations)
+│   ├── rg-db/      # database layer (SeaORM entities + ops)
+│   ├── rg-db-migration/ # schema migrations, below rg-db
 │   ├── rg-ci/      # CI/CD engine (YAML parsing + pipeline executor)
 │   ├── rg-runner/  # CI runner agent  → plombir-git-runner
 │   └── rg-mcp/     # MCP server  → plombir-git-mcp

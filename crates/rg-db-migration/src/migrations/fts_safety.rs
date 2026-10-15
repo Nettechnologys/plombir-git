@@ -204,7 +204,7 @@ mod tests {
         m20260511_000003_fix_fts5_triggers as fix_triggers,
         m20260804_000006_repo_fts_soft_delete as repo_soft_delete,
     };
-    use crate::test_support::{assert_writer_stays_blocked, write_while_the_lock_is_held};
+    use rg_db::test_support::{assert_writer_stays_blocked, write_while_the_lock_is_held};
 
     #[derive(Debug, Eq, PartialEq)]
     struct Snapshot {
@@ -246,7 +246,7 @@ mod tests {
 
     async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
         let temp = TempDb::new(label);
-        let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
             .await
             .expect("connect to throwaway SQLite database");
         db.execute_unprepared(
@@ -532,7 +532,7 @@ mod tests {
             database_url.starts_with("mysql://"),
             "this proof exercises MySQL table-lock and implicit-DDL-commit semantics"
         );
-        let db = crate::connect_with_pool(&database_url, crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
             .await
             .expect("connect to disposable MySQL database");
         let suffix = uuid::Uuid::new_v4().simple().to_string();

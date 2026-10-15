@@ -13,7 +13,7 @@ use sea_orm_migration::sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QuerySelect, Set,
 };
 
-use crate::entities::{
+use crate::grant_tables::{
     ci_environment, ci_environment_approver_grant, protected_branch, protected_branch_push_grant,
     protected_tag, protected_tag_push_grant, user,
 };

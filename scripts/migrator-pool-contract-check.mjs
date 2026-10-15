@@ -28,11 +28,11 @@ const MIN_MIGRATOR_TEST_FILES = 7;
 // readers and writers stay isolated while a rebuild holds SQLite's lock.
 const MULTI_CONNECTION_ALLOWLIST = new Map([
   [
-    'crates/rg-db/src/migrations/m20260805_000002_uploads_outlive_their_uploader_tests.rs',
+    'crates/rg-db-migration/src/migrations/m20260805_000002_uploads_outlive_their_uploader_tests.rs',
     'primes every pooled connection and proves each one refreshes after the rebuild',
   ],
   [
-    'crates/rg-db/src/migrations/m20260730_000001_repositories_namespace_unique_tests.rs',
+    'crates/rg-db-migration/src/migrations/m20260730_000001_repositories_namespace_unique_tests.rs',
     'needs distinct pooled connections to prove concurrent writers wait for the rebuild',
   ],
 ]);

@@ -280,7 +280,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sqlite_create_preserves_live_rows_and_recovers_after_every_stage() {
         let temp = TempDb::new();
-        let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
             .await
             .expect("connect to throwaway SQLite database");
 
@@ -296,7 +296,7 @@ mod tests {
             database_url.starts_with("postgres://") || database_url.starts_with("mysql://"),
             "this proof exercises PostgreSQL or MySQL create/index DDL"
         );
-        let db = crate::connect_with_pool(&database_url, crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
             .await
             .expect("connect to disposable server database");
 

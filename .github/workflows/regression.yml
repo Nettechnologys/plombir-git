@@ -427,10 +427,10 @@ jobs:
           webauthn_ceremony_single_use::
 
       - name: Prove PostgreSQL code FTS create/retry boundary
-        run: cargo test -p rg-db -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
+        run: cargo test -p rg-db-migration -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
 
       - name: Prove PostgreSQL CI secret scoping converges and reverses
-        run: cargo test -p rg-db -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
+        run: cargo test -p rg-db-migration -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
 
       - name: Prove PostgreSQL code index refresh boundary
         run: cargo test -p rg-core -j 6 server_code_index_rebuild_publishes_atomically_without_holding_writers -- --ignored --nocapture
@@ -459,7 +459,7 @@ jobs:
       - name: Prove the issue-comment reference installs over orphans on PostgreSQL
         env:
           PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: postgres://plombir_git:plombir_git@127.0.0.1:5432/plombir_git_exclusive
-        run: cargo test -p rg-db -j 6 --lib the_reference_installs_over_orphans_on_a_server_database -- --ignored --nocapture
+        run: cargo test -p rg-db-migration -j 6 --lib the_reference_installs_over_orphans_on_a_server_database -- --ignored --nocapture
 
       - name: Run PostgreSQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
@@ -483,7 +483,7 @@ jobs:
       - name: Prove package filename uniqueness on PostgreSQL
         env:
           PLOMBIR_GIT_PACKAGE_FILE_MIGRATION_TEST_DATABASE_URL: ${{ env.PLOMBIR_GIT_TEST_DATABASE_URL }}
-        run: cargo test -p rg-db -j 6 one_filename_per_version_is_owned_by_the_database -- --nocapture
+        run: cargo test -p rg-db-migration -j 6 one_filename_per_version_is_owned_by_the_database -- --nocapture
 
   mysql-smoke:
     name: MySQL migration, CRUD and FTS smoke
@@ -551,13 +551,13 @@ jobs:
           webauthn_ceremony_single_use::
 
       - name: Prove MySQL FTS migration maintenance boundary
-        run: cargo test -p rg-db -j 6 mysql_fts_maintenance_holds_an_offline_boundary -- --ignored --nocapture
+        run: cargo test -p rg-db-migration -j 6 mysql_fts_maintenance_holds_an_offline_boundary -- --ignored --nocapture
 
       - name: Prove MySQL code FTS create/retry boundary
-        run: cargo test -p rg-db -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
+        run: cargo test -p rg-db-migration -j 6 server_create_preserves_live_rows_and_recovers_after_every_stage -- --ignored --nocapture
 
       - name: Prove MySQL CI secret scoping converges and reverses
-        run: cargo test -p rg-db -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
+        run: cargo test -p rg-db-migration -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
 
       - name: Prove MySQL code index refresh boundary
         run: cargo test -p rg-core -j 6 server_code_index_rebuild_publishes_atomically_without_holding_writers -- --ignored --nocapture
@@ -587,7 +587,7 @@ jobs:
       - name: Prove the issue-comment reference installs over orphans on MySQL
         env:
           PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: mysql://plombir_git:plombir_git@127.0.0.1:3306/plombir_git_exclusive
-        run: cargo test -p rg-db -j 6 --lib the_reference_installs_over_orphans_on_a_server_database -- --ignored --nocapture
+        run: cargo test -p rg-db-migration -j 6 --lib the_reference_installs_over_orphans_on_a_server_database -- --ignored --nocapture
 
       - name: Run MySQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
@@ -617,7 +617,7 @@ jobs:
       - name: Prove package filename uniqueness on MySQL
         env:
           PLOMBIR_GIT_PACKAGE_FILE_MIGRATION_TEST_DATABASE_URL: ${{ env.PLOMBIR_GIT_TEST_DATABASE_URL }}
-        run: cargo test -p rg-db -j 6 one_filename_per_version_is_owned_by_the_database -- --nocapture
+        run: cargo test -p rg-db-migration -j 6 one_filename_per_version_is_owned_by_the_database -- --nocapture
 
   contract-checks:
     name: Frontend/backend contract checks

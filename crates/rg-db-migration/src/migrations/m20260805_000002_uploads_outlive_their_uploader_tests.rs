@@ -51,7 +51,7 @@ async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
 }
 
 async fn fixture_at(temp: &TempDb) -> DatabaseConnection {
-    let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
         .await
         .expect("connect to throwaway SQLite database");
     execute_on_every_pool_connection(&db, "SELECT name FROM sqlite_master").await;
@@ -355,7 +355,7 @@ async fn every_prepared_pool_connection_uses_the_rebuilt_schema_immediately() {
 #[tokio::test]
 async fn offline_process_lease_keeps_a_separate_migration_out_of_a_live_server_pool() {
     let temp = TempDb::new("offline-process-lease");
-    let server_guard = crate::sqlite_process_guard::acquire_server(&temp.url())
+    let server_guard = rg_db::sqlite_process_guard::acquire_server(&temp.url())
         .unwrap()
         .unwrap();
     let server_db = fixture_at(&temp).await;
@@ -372,7 +372,7 @@ async fn offline_process_lease_keeps_a_separate_migration_out_of_a_live_server_p
 
     let refusal = format!(
         "{:#}",
-        crate::sqlite_process_guard::acquire_migration(&temp.url())
+        rg_db::sqlite_process_guard::acquire_migration(&temp.url())
             .expect_err("a separate migration must not cross the live-server lease")
     );
     assert!(refusal.contains("server to be stopped"), "{refusal}");
@@ -380,11 +380,11 @@ async fn offline_process_lease_keeps_a_separate_migration_out_of_a_live_server_p
     server_db.close().await.expect("close the old server pool");
     drop(server_guard);
 
-    let migration_guard = crate::sqlite_process_guard::acquire_migration(&temp.url())
+    let migration_guard = rg_db::sqlite_process_guard::acquire_migration(&temp.url())
         .unwrap()
         .unwrap();
     let migration_db =
-        crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+        rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
             .await
             .expect("open the standalone migration pool");
     REBUILD
@@ -397,10 +397,10 @@ async fn offline_process_lease_keeps_a_separate_migration_out_of_a_live_server_p
         .expect("close the standalone migration pool");
     drop(migration_guard);
 
-    let _restarted_server_guard = crate::sqlite_process_guard::acquire_server(&temp.url())
+    let _restarted_server_guard = rg_db::sqlite_process_guard::acquire_server(&temp.url())
         .unwrap()
         .unwrap();
-    let restarted = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+    let restarted = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
         .await
         .expect("open a fresh server pool after the migration");
     execute_on_every_pool_connection(&restarted, "SELECT count(*) FROM releases").await;

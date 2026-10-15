@@ -17,20 +17,27 @@ pub mod entities;
 mod entity_schema_guard;
 #[cfg(test)]
 mod fts_rebuild_tests;
-pub mod migration_lock;
-pub mod migrations;
 pub mod ops;
-pub mod package_version_key;
 #[cfg(test)]
 mod query_plan_tests;
-mod serialized_user_grants;
 pub mod sqlite_process_guard;
-#[cfg(test)]
-mod test_support;
+/// Contention helpers for tests, here and in `rg-db-migration`'s, which reach
+/// them through the `test-support` feature of their dev-dependency on this
+/// crate. A binary never enables it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod token_digest;
 pub mod user_grants;
 
 pub use token_digest::token_digest;
+
+// The schema history lives in `rg-db-migration`, below this crate, so an edit
+// here does not recompile 145 migrations. Re-exported under the paths callers
+// have always used.
+use rg_db_migration::serialized_user_grants;
+pub use rg_db_migration::{
+    migration_lock, migrations, package_version_key, prepare_sql, run_migrations,
+};
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -45,7 +52,6 @@ use sea_orm::sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
 };
 use sea_orm::SqlxSqliteConnector;
-use sea_orm_migration::MigratorTrait;
 
 pub use sea_orm;
 pub use sea_orm::DatabaseConnection;
@@ -205,52 +211,6 @@ pub fn is_retryable_transaction_error_anyhow(error: &anyhow::Error) -> bool {
             .downcast_ref::<sea_orm::DbErr>()
             .is_some_and(is_retryable_transaction_error)
     })
-}
-
-/// Convert portable `?` bind markers in raw SQL to the backend's syntax.
-///
-/// SeaORM does not rewrite placeholders in `Statement::from_sql_and_values`:
-/// PostgreSQL requires `$1`, `$2`, ... while SQLite and MySQL use `?`. Keep
-/// raw SQL readable and portable by passing it through this helper first.
-/// Question marks inside quoted strings or identifiers are left untouched.
-pub fn prepare_sql(backend: sea_orm::DatabaseBackend, sql: &str) -> String {
-    if backend != sea_orm::DatabaseBackend::Postgres {
-        return sql.to_string();
-    }
-
-    let mut result = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    let mut quote = None;
-    let mut parameter = 1;
-
-    while let Some(ch) = chars.next() {
-        if let Some(active_quote) = quote {
-            result.push(ch);
-            if ch == active_quote {
-                if chars.peek() == Some(&active_quote) {
-                    result.push(chars.next().unwrap());
-                } else {
-                    quote = None;
-                }
-            }
-            continue;
-        }
-
-        match ch {
-            '\'' | '"' | '`' => {
-                quote = Some(ch);
-                result.push(ch);
-            }
-            '?' => {
-                result.push('$');
-                result.push_str(&parameter.to_string());
-                parameter += 1;
-            }
-            _ => result.push(ch),
-        }
-    }
-
-    result
 }
 
 // ── Identity of a live database instance ────────────────────────────────
@@ -587,41 +547,6 @@ async fn connect_mysql(
     Ok(SqlxMySqlConnector::from_sqlx_mysql_pool(pool))
 }
 
-/// Run all pending migrations.
-///
-/// Every caller is serialised against every other process migrating the same
-/// database, so the gate cannot be forgotten by the sixth call site the way it
-/// would be if each one took it separately. On file-backed SQLite that
-/// exclusion is the file lease the caller already holds
-/// ([`sqlite_process_guard`]); on PostgreSQL and MySQL it is a lock inside the
-/// database itself ([`migration_lock`]), because `Migrator::up` is not
-/// idempotent with respect to a concurrent copy of itself there.
-pub async fn run_migrations(db: &DatabaseConnection) -> Result<()> {
-    let lock = migration_lock::acquire(db, migration_lock::DEFAULT_WAIT).await?;
-    let outcome = run_migrations_locked(db).await;
-    // Released explicitly on both paths so the next migrator is not left waiting
-    // on a socket that has not been noticed yet.
-    lock.release().await;
-    outcome
-}
-
-/// [`run_migrations`] with the lock already held.
-async fn run_migrations_locked(db: &DatabaseConnection) -> Result<()> {
-    tracing::info!("Running database migrations");
-    migrations::Migrator::up(db, None)
-        .await
-        .context("migration failed")?;
-    if matches!(db, DatabaseConnection::SqlxSqlitePoolConnection(_)) {
-        migrations::refresh_sqlite_pool_after_schema_change(
-            db.get_sqlite_connection_pool(),
-            "database migrations",
-        )
-        .await
-        .context("failed to refresh SQLite connections after migrations")?;
-    }
-    Ok(())
-}
-
 /// Rebuild full-text search indexes from the main tables.
 ///
 /// * **SQLite** — the FTS5 tables are independent virtual tables, so we
@@ -910,21 +835,6 @@ mod tests {
             .to_string();
         assert!(!error.contains("top-secret"));
         assert!(error.contains("root:***@db"));
-    }
-
-    #[test]
-    fn postgres_raw_sql_placeholders_are_numbered() {
-        assert_eq!(
-            prepare_sql(
-                DatabaseBackend::Postgres,
-                "SELECT '?' AS literal, id FROM t WHERE a = ? AND b = ?"
-            ),
-            "SELECT '?' AS literal, id FROM t WHERE a = $1 AND b = $2"
-        );
-        assert_eq!(
-            prepare_sql(DatabaseBackend::MySql, "SELECT * FROM t WHERE id = ?"),
-            "SELECT * FROM t WHERE id = ?"
-        );
     }
 
     /// Regression guard: every connection handed out by the pool must have the

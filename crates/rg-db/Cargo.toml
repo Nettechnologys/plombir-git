@@ -6,8 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rg-db-migration = { path = "../rg-db-migration" }
 sea-orm = { workspace = true }
-sea-orm-migration = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
@@ -18,10 +18,14 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
-semver = { workspace = true }
-regex = { workspace = true }
+
+[features]
+# `test_support`'s contention helpers, for `rg-db-migration`'s tests (its
+# dev-dependency on this crate turns it on). No binary enables it.
+test-support = []
 
 [dev-dependencies]
+sea-orm-migration = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

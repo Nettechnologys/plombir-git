@@ -17,15 +17,15 @@ const check = join(root, 'scripts', 'migrator-pool-contract-check.mjs');
 const identityFixture =
   'crates/rg-db/tests/integration/identity_keys_not_blank.rs';
 const preparedPoolFixture =
-  'crates/rg-db/src/migrations/m20260805_000002_uploads_outlive_their_uploader_tests.rs';
+  'crates/rg-db-migration/src/migrations/m20260805_000002_uploads_outlive_their_uploader_tests.rs';
 const candidateFiles = [
   identityFixture,
   'crates/rg-db/tests/integration/repositories_namespace_rebuild.rs',
   'crates/rg-db/tests/integration/legacy_column_upgrade.rs',
-  'crates/rg-db/src/migrations/m20260805_000004_repo_config_outlives_its_author_tests.rs',
-  'crates/rg-db/src/migrations/m20260805_000005_account_owned_rows_follow_their_parent_tests.rs',
+  'crates/rg-db-migration/src/migrations/m20260805_000004_repo_config_outlives_its_author_tests.rs',
+  'crates/rg-db-migration/src/migrations/m20260805_000005_account_owned_rows_follow_their_parent_tests.rs',
   preparedPoolFixture,
-  'crates/rg-db/src/migrations/m20260730_000001_repositories_namespace_unique_tests.rs',
+  'crates/rg-db-migration/src/migrations/m20260730_000001_repositories_namespace_unique_tests.rs',
 ];
 
 function fixtureRoot() {
@@ -42,7 +42,7 @@ function fixtureRoot() {
     `#[cfg(test)]
 mod tests {
     async fn direct_migrator_fixture() {
-        let db = crate::connect_with_pool("sqlite::memory:", crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+        let db = rg_db::connect_with_pool("sqlite::memory:", rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
             .await
             .unwrap();
         crate::migrations::Migrator::up(&db, None).await.unwrap();
@@ -98,7 +98,7 @@ try {
   writeFileSync(identity, source);
   const preparedPool = join(fixture, preparedPoolFixture);
   const preparedSource = readFileSync(preparedPool, 'utf8');
-  const fourConnections = 'crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)';
+  const fourConnections = 'rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)';
   const preparedPoolConnections = preparedSource.split(fourConnections).length - 1;
   if (preparedPoolConnections === 0) {
     console.error(`❌ prepared-pool fixture anchor disappeared: ${fourConnections}`);
@@ -106,7 +106,7 @@ try {
   }
   writeFileSync(
     preparedPool,
-    preparedSource.replaceAll(fourConnections, 'crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)'),
+    preparedSource.replaceAll(fourConnections, 'rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)'),
   );
 
   const staleAllowance = run(fixture);

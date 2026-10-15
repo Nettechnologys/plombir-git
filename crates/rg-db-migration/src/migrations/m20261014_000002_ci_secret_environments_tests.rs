@@ -45,7 +45,7 @@ async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
     let temp = TempDb::new(label);
     // One pooled connection: a rebuild swaps the table out from under every
     // other connection of the pool (card_a28a7004b108).
-    let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
         .await
         .expect("connect to throwaway SQLite database");
 
@@ -378,7 +378,7 @@ async fn server_up_converges_after_an_interrupted_run_and_down_reverses_it() {
         !url.starts_with("sqlite"),
         "SQLite is covered by the rebuild tests above"
     );
-    let db = crate::connect_with_pool(&url, crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+    let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
         .await
         .expect("connect to the disposable server database");
     crate::run_migrations(&db).await.expect("run migrations");
@@ -392,7 +392,7 @@ async fn server_up_converges_after_an_interrupted_run_and_down_reverses_it() {
         }
     };
     let suffix = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
-    let user = crate::ops::user_ops::create_user(
+    let user = rg_db::ops::user_ops::create_user(
         &db,
         &format!("scope{suffix}"),
         &format!("scope{suffix}@example.invalid"),
@@ -402,9 +402,9 @@ async fn server_up_converges_after_an_interrupted_run_and_down_reverses_it() {
     .await
     .expect("create user");
     let now = chrono::Utc::now();
-    let repo = crate::ops::repo_ops::create(
+    let repo = rg_db::ops::repo_ops::create(
         &db,
-        crate::entities::repository::ActiveModel {
+        rg_db::entities::repository::ActiveModel {
             id: sea_orm::NotSet,
             owner_id: sea_orm::Set(user.id),
             name: sea_orm::Set(format!("scope{suffix}")),
@@ -424,7 +424,7 @@ async fn server_up_converges_after_an_interrupted_run_and_down_reverses_it() {
     .await
     .expect("create repository");
     let environment = sea_orm::ActiveModelTrait::insert(
-        crate::entities::ci_environment::ActiveModel {
+        rg_db::entities::ci_environment::ActiveModel {
             repo_id: sea_orm::Set(repo.id),
             name: sea_orm::Set("production".into()),
             protected: sea_orm::Set(true),
@@ -441,7 +441,7 @@ async fn server_up_converges_after_an_interrupted_run_and_down_reverses_it() {
     let store = |environment_id: Option<i64>, name: &'static str| {
         let db = &db;
         async move {
-            crate::ops::ci_secret_ops::upsert(db, repo.id, environment_id, name, "v", user.id).await
+            rg_db::ops::ci_secret_ops::upsert(db, repo.id, environment_id, name, "v", user.id).await
         }
     };
     let raw_insert = |environment: String, name: &'static str| {
@@ -507,7 +507,7 @@ async fn server_up_converges_after_an_interrupted_run_and_down_reverses_it() {
         raw_insert("999999999".into(), "ORPHAN").await.is_err(),
         "the converged run did not add the environment foreign key"
     );
-    let resolved = crate::ops::ci_secret_ops::list_for_job(&db, repo.id, Some(environment.id))
+    let resolved = rg_db::ops::ci_secret_ops::list_for_job(&db, repo.id, Some(environment.id))
         .await
         .expect("list for a production job");
     assert_eq!(

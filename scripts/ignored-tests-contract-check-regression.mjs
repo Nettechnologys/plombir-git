@@ -157,8 +157,8 @@ runFixture(
   'a test behind #[path] keeps its compiled module path',
   ({ workflow }) => replaceRequired(
     workflow,
-    'cargo test -p rg-db -j 6 --lib the_reference_installs_over_orphans_on_a_server_database -- --ignored --nocapture',
-    'cargo test -p rg-db -j 6 --lib -- --ignored --nocapture --exact migrations::m20261007_000003_issue_comments_reference_their_issue::tests::the_reference_installs_over_orphans_on_a_server_database',
+    'cargo test -p rg-db-migration -j 6 --lib the_reference_installs_over_orphans_on_a_server_database -- --ignored --nocapture',
+    'cargo test -p rg-db-migration -j 6 --lib -- --ignored --nocapture --exact migrations::m20261007_000003_issue_comments_reference_their_issue::tests::the_reference_installs_over_orphans_on_a_server_database',
   ),
   0,
   'ignored tests: 62 #[ignore] test(s) — 52 run by regression.yml',

@@ -104,7 +104,8 @@ plombir-git/
 │   ├── rg-ssh/                   # SSH server (russh)
 │   ├── rg-http/                  # HTTP server + REST API + WebSocket (axum)
 │   │   └── src/{api,git_v2,security,ws,oci,...}
-│   ├── rg-db/                    # SeaORM entities + migrations
+│   ├── rg-db/                    # SeaORM entities + ops (re-exports the migrations)
+│   ├── rg-db-migration/          # schema history: migrations + migration lock, below rg-db
 │   ├── rg-ci/                    # CI/CD engine (native + Gitea Actions)
 │   ├── rg-cli/                   # main binary  → plombir-git
 │   ├── rg-runner/                # CI runner agent  → plombir-git-runner
@@ -125,7 +126,8 @@ plombir-git/
 rg-ci ──> rg-core, rg-db, rg-git, rg-process
 rg-cli ──> rg-ci, rg-core, rg-db, rg-git, rg-http, rg-process, rg-runner, rg-ssh
 rg-core ──> rg-db, rg-git, rg-process
-rg-db ──> none
+rg-db ──> rg-db-migration
+rg-db-migration ──> none
 rg-git ──> rg-process
 rg-http ──> rg-core, rg-db, rg-git, rg-mcp
 rg-mcp ──> rg-process

@@ -118,9 +118,22 @@ logic (delegate to `rg-core`).
 
 #### `rg-db` — database layer
 
-**Allowed:** SeaORM entities; migrations; CRUD operations.
+**Allowed:** SeaORM entities; CRUD operations.
 
 **Forbidden:** business logic; HTTP/SSH layer code.
+
+#### `rg-db-migration` — schema history
+
+**Allowed:** migrations (`src/migrations/`), the migration lock, and the pure
+helpers a data migration needs. `rg-db` depends on it and re-exports
+`run_migrations`, `migrations`, `migration_lock`, `package_version_key` and
+`prepare_sql`, so callers keep the `rg_db::` paths.
+
+**Forbidden:** depending on `rg-db` outside `[dev-dependencies]`, and with it
+reaching for `rg-db`'s live entities from a migration. A migration describes the
+schema of its date; a data migration declares the columns it reads (see
+`grant_tables`). Keeping this crate below `rg-db` is what spares an edit to an
+op or an entity from recompiling every migration.
 
 **Migration rules (please read — these have bitten us):**
 - A `#[derive(Iden)] enum Foo { Table }` produces the **singular** name `foo`,

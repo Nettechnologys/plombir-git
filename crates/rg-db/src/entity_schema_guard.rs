@@ -313,3 +313,100 @@ mod tests {
         BTreeSet::from(["live_entity".to_string()])
     );
 }
+
+/// `rg-db-migration` cannot see these entities, so the grant code it owns
+/// declares the columns it touches itself (`rg_db_migration::grant_tables`).
+/// Each frozen table must name a live table, every frozen column must still be
+/// a column of that live entity, and a read through it must work against the
+/// schema the migrations build — otherwise account deletion, which prunes
+/// grants through them, fails at runtime instead of here.
+#[tokio::test]
+async fn grant_tables_match_live_entities() {
+    use rg_db_migration::grant_tables as frozen;
+    use sea_orm::{IdenStatic, Iterable};
+
+    fn columns<E: EntityTrait>() -> BTreeSet<String> {
+        E::Column::iter()
+            .map(|column| column.as_str().to_string())
+            .collect()
+    }
+
+    fn compare<Frozen: EntityTrait, Live: EntityTrait>(failures: &mut Vec<String>) {
+        let table = Frozen::default().table_name().to_string();
+        if table != Live::default().table_name() {
+            failures.push(format!(
+                "frozen `{table}` stands for live `{}`",
+                Live::default().table_name()
+            ));
+        }
+        let live = columns::<Live>();
+        for column in columns::<Frozen>().difference(&live) {
+            failures.push(format!(
+                "`{table}.{column}` is no longer a column of the live entity"
+            ));
+        }
+    }
+
+    let mut failures = Vec::new();
+    compare::<frozen::user::Entity, crate::entities::user::Entity>(&mut failures);
+    compare::<frozen::protected_branch::Entity, crate::entities::protected_branch::Entity>(
+        &mut failures,
+    );
+    compare::<frozen::protected_tag::Entity, crate::entities::protected_tag::Entity>(&mut failures);
+    compare::<frozen::ci_environment::Entity, crate::entities::ci_environment::Entity>(
+        &mut failures,
+    );
+    compare::<
+        frozen::protected_branch_push_grant::Entity,
+        crate::entities::protected_branch_push_grant::Entity,
+    >(&mut failures);
+    compare::<
+        frozen::protected_tag_push_grant::Entity,
+        crate::entities::protected_tag_push_grant::Entity,
+    >(&mut failures);
+    compare::<
+        frozen::ci_environment_approver_grant::Entity,
+        crate::entities::ci_environment_approver_grant::Entity,
+    >(&mut failures);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    let db = sea_orm::Database::connect("sqlite::memory:")
+        .await
+        .expect("open in-memory sqlite");
+    crate::run_migrations(&db).await.expect("run migrations");
+    frozen::user::Entity::find()
+        .limit(1)
+        .all(&db)
+        .await
+        .unwrap();
+    frozen::protected_branch::Entity::find()
+        .limit(1)
+        .all(&db)
+        .await
+        .unwrap();
+    frozen::protected_tag::Entity::find()
+        .limit(1)
+        .all(&db)
+        .await
+        .unwrap();
+    frozen::ci_environment::Entity::find()
+        .limit(1)
+        .all(&db)
+        .await
+        .unwrap();
+    frozen::protected_branch_push_grant::Entity::find()
+        .limit(1)
+        .all(&db)
+        .await
+        .unwrap();
+    frozen::protected_tag_push_grant::Entity::find()
+        .limit(1)
+        .all(&db)
+        .await
+        .unwrap();
+    frozen::ci_environment_approver_grant::Entity::find()
+        .limit(1)
+        .all(&db)
+        .await
+        .unwrap();
+}

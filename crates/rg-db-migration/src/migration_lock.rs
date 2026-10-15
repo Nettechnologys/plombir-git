@@ -1,6 +1,6 @@
 //! Cross-process exclusion for schema changes on a **server** database.
 //!
-//! [`crate::sqlite_process_guard`] is the same gate for file-backed SQLite, and
+//! `rg_db::sqlite_process_guard` is the same gate for file-backed SQLite, and
 //! it does two jobs at once: it serialises the processes that may apply
 //! migrations, and it enforces the offline contract that a live server's pool
 //! must not be left holding a schema it can no longer refresh. Only the second
@@ -117,7 +117,7 @@ impl std::fmt::Debug for MigrationLock {
 /// Take the migration lock for `db`, waiting up to `wait` for a current holder.
 ///
 /// A SQLite (or otherwise non-server) handle yields a lock that holds nothing:
-/// its exclusion lives in [`crate::sqlite_process_guard`], and an in-memory
+/// its exclusion lives in `rg_db::sqlite_process_guard`, and an in-memory
 /// database has no second process to exclude.
 pub async fn acquire(db: &DatabaseConnection, wait: Duration) -> Result<MigrationLock> {
     // Matched on the variant rather than `get_database_backend`, which panics on
@@ -385,11 +385,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_sqlite_handle_locks_nothing() {
-        let db = crate::connect_with_pool(
+        let db = rg_db::connect_with_pool(
             "sqlite::memory:",
-            crate::TEST_CONNECT_TIMEOUT_SECS,
-            crate::DEFAULT_IDLE_TIMEOUT_SECS,
-            crate::DEFAULT_MAX_CONNECTIONS,
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
         )
         .await
         .expect("connect to an in-memory SQLite database");

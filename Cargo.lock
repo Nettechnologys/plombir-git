@@ -5201,7 +5201,28 @@ dependencies = [
  "anyhow",
  "chrono",
  "rand 0.8.6",
+ "rg-db-migration",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rg-db-migration"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rand 0.8.6",
  "regex",
+ "rg-db",
  "sea-orm",
  "sea-orm-migration",
  "semver",
@@ -5209,7 +5230,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",

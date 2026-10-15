@@ -69,6 +69,7 @@ exceptions = [
     { name = "rg-cli", allow = ["AGPL-3.0-or-later"] },
     { name = "rg-core", allow = ["AGPL-3.0-or-later"] },
     { name = "rg-db", allow = ["AGPL-3.0-or-later"] },
+    { name = "rg-db-migration", allow = ["AGPL-3.0-or-later"] },
     { name = "rg-git", allow = ["AGPL-3.0-or-later"] },
     { name = "rg-http", allow = ["AGPL-3.0-or-later"] },
     { name = "rg-mcp", allow = ["AGPL-3.0-or-later"] },

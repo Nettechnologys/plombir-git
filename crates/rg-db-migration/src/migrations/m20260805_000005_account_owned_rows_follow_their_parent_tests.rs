@@ -42,7 +42,7 @@ impl Drop for TempDb {
 /// allowed an earlier account/repository deletion to leave behind.
 async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
     let temp = TempDb::new(label);
-    let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
         .await
         .expect("connect to throwaway SQLite database");
 
@@ -253,7 +253,7 @@ async fn account_and_repository_deletion_cascade_the_rows_they_own() {
     )
     .await
     .expect("seed a collaborator on the repository that will be deleted");
-    crate::ops::repo_ops::delete_by_id(&db, 2)
+    rg_db::ops::repo_ops::delete_by_id(&db, 2)
         .await
         .expect("delete the repository");
     assert_eq!(

@@ -8,7 +8,7 @@ use sea_orm_migration::{MigratorTrait, SchemaManager};
 use tokio::sync::{oneshot, Notify};
 
 use super::{sqlite_rebuild, sqlite_rebuild_with_hook, Shape, SqliteRebuildPoint};
-use crate::test_support::{assert_writer_stays_blocked, write_while_the_lock_is_held};
+use rg_db::test_support::{assert_writer_stays_blocked, write_while_the_lock_is_held};
 
 const SURVIVING_REPO_ID: i64 = 1;
 const DELETED_REPO_ID: i64 = 2;
@@ -47,7 +47,7 @@ impl Drop for TempDb {
 
 async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
     let temp = TempDb::new(label);
-    let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
         .await
         .expect("connect to throwaway SQLite database");
 

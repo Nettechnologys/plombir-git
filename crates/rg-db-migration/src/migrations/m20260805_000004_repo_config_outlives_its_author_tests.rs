@@ -52,7 +52,7 @@ async fn fixture(label: &str) -> (DatabaseConnection, TempDb) {
     // `no such table: users` before it reloads its schema (card_a28a7004b108) —
     // which would make these tests flaky for a reason that has nothing to do
     // with what they assert.
-    let db = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
         .await
         .expect("connect to throwaway SQLite database");
 

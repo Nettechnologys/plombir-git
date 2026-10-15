@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect};
 
-use crate::entities::{ci_environment, protected_branch, protected_tag, user};
+use crate::grant_tables::{ci_environment, protected_branch, protected_tag, user};
 
 /// Source-level inventory guarded by [`tests::every_serialized_user_grant_is_registered`].
 #[cfg(test)]
@@ -235,7 +235,7 @@ async fn rewrite(db: &impl ConnectionTrait, keep: KeepIds<'_>) -> Result<()> {
 }
 
 /// Remove one account from every serialized authorization grant.
-pub(crate) async fn remove_user(db: &impl ConnectionTrait, user_id: i64) -> Result<()> {
+pub async fn remove_user(db: &impl ConnectionTrait, user_id: i64) -> Result<()> {
     rewrite(db, KeepIds::Except(user_id)).await
 }
 
@@ -400,7 +400,10 @@ const DECOY: &str = r#"pub allowed_user_ids: String,"#;
 
     #[test]
     fn every_serialized_user_grant_is_registered() {
-        let entity_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/entities");
+        // The live entities stay in rg-db; this registry moved below it with the
+        // migrations that use it.
+        let entity_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rg-db/src/entities");
         let mut discovered = BTreeMap::new();
         for entry in std::fs::read_dir(&entity_dir).expect("read entity source directory") {
             let path = entry.expect("read entity source entry").path();

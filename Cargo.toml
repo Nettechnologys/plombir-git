@@ -6,6 +6,7 @@ members = [
     "crates/rg-ssh",
     "crates/rg-http",
     "crates/rg-db",
+    "crates/rg-db-migration",
     "crates/rg-ci",
     "crates/rg-runner",
     "crates/rg-process",

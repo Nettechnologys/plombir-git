@@ -53,7 +53,7 @@ use sea_orm::DbErr;
 use tokio::task::JoinHandle;
 
 /// How long a test watches a writer before concluding it is still parked.
-pub(crate) const HELD_WRITER_WINDOW: Duration = Duration::from_millis(200);
+pub const HELD_WRITER_WINDOW: Duration = Duration::from_millis(200);
 
 /// How long a parked writer keeps re-trying before it reports contention as a
 /// failure.
@@ -69,7 +69,7 @@ const PARKED_WRITER_DEADLINE: Duration = Duration::from_secs(120);
 /// re-run: a half-applied batch would come back to a second attempt as a
 /// duplicate row rather than as contention. See the module docs for why a
 /// refusal here says nothing about the boundary under test.
-pub(crate) async fn write_while_the_lock_is_held<F, Fut>(mut attempt: F) -> Result<(), DbErr>
+pub async fn write_while_the_lock_is_held<F, Fut>(mut attempt: F) -> Result<(), DbErr>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<(), DbErr>>,
@@ -98,7 +98,7 @@ where
 /// `crossed` names the boundary the writer would have crossed, so the contract
 /// still reads as the test's subject; the outcome or the panic is appended when
 /// the writer did something else entirely.
-pub(crate) async fn assert_writer_stays_blocked<T>(writer: &mut JoinHandle<T>, crossed: &str)
+pub async fn assert_writer_stays_blocked<T>(writer: &mut JoinHandle<T>, crossed: &str)
 where
     T: Debug,
 {
