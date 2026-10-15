@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { scratchDir } from './lib/scratch-dir.mjs';
+import { launchChromeCdp } from './lib/chrome-cdp.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,6 +21,51 @@ const fixtureExecutable = fileURLToPath(import.meta.url);
 function flagValue(name) {
   const prefix = `${name}=`;
   return process.argv.find((arg) => arg.startsWith(prefix))?.slice(prefix.length);
+}
+
+// A browser that cannot start: says why on stderr, then hangs without
+// publishing an endpoint or exits. 64 KiB of noise goes first, so the report
+// has to keep the tail, not the head. On the exit path the reason comes from a
+// helper that outlives the main process, the way Chrome's crashpad and zygote
+// do — it lands after `exit`, and a report written at `exit` would miss it.
+function runFailingChromeFixture(reason) {
+  process.stderr.write('chrome noise\n'.repeat(5_000), () => {
+    if (process.env.PLOMBIR_GIT_CDP_FIXTURE_FAIL_EXIT) {
+      spawn(process.execPath, ['-e', `setTimeout(() => process.stderr.write(${JSON.stringify(`${reason}\n`)}), 300)`], {
+        stdio: ['ignore', 'ignore', 'inherit'],
+      });
+      process.exit(1);
+    }
+    process.stderr.write(`${reason}\n`, () => setInterval(() => {}, 60_000));
+  });
+}
+
+async function stderrReachesTheFailure() {
+  for (const exits of [false, true]) {
+    const reason = `FATAL:zygote_host_impl_linux.cc no usable sandbox ${exits ? 'exit' : 'hang'}-${process.pid}`;
+    process.env.PLOMBIR_GIT_CDP_FIXTURE_FAIL = reason;
+    if (exits) process.env.PLOMBIR_GIT_CDP_FIXTURE_FAIL_EXIT = '1';
+    let failure = null;
+    try {
+      const launched = await launchChromeCdp({ chromePath: fixtureExecutable, startupTimeoutMs: 1_500 });
+      await launched.cleanup();
+    } catch (error) {
+      failure = error;
+    } finally {
+      delete process.env.PLOMBIR_GIT_CDP_FIXTURE_FAIL;
+      delete process.env.PLOMBIR_GIT_CDP_FIXTURE_FAIL_EXIT;
+    }
+    const expected = exits ? /ended before its debugger was ready \(exit 1\)/ : /did not publish .*DevToolsActivePort/;
+    if (!failure || !expected.test(failure.message)) {
+      throw new Error(`a Chrome that ${exits ? 'exits' : 'hangs'} at startup was not reported as such: ${failure?.message ?? 'it launched'}`);
+    }
+    if (!failure.message.includes(reason)) {
+      throw new Error(`the startup failure does not carry Chrome's stderr:\n${failure.message}`);
+    }
+    if (failure.message.length > 8_192) {
+      throw new Error(`the startup failure carries ${failure.message.length} characters of stderr, not its tail`);
+    }
+  }
 }
 
 async function runChromeFixture(marker) {
@@ -166,10 +212,14 @@ async function runContract() {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
 
-  console.log('✅ browser smoke CDP: both entrypoints isolate parallel endpoints, preserve overrides, and clean profiles');
+  await stderrReachesTheFailure();
+
+  console.log('✅ browser smoke CDP: both entrypoints isolate parallel endpoints, preserve overrides, clean profiles, and report Chrome\'s stderr when it cannot start');
 }
 
-if (process.env.PLOMBIR_GIT_CDP_FIXTURE_MARKER) {
+if (process.env.PLOMBIR_GIT_CDP_FIXTURE_FAIL) {
+  runFailingChromeFixture(process.env.PLOMBIR_GIT_CDP_FIXTURE_FAIL);
+} else if (process.env.PLOMBIR_GIT_CDP_FIXTURE_MARKER) {
   await runChromeFixture(process.env.PLOMBIR_GIT_CDP_FIXTURE_MARKER);
 } else {
   await runContract();

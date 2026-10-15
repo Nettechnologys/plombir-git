@@ -20,6 +20,48 @@ function requestedCdpPort(value) {
   return port;
 }
 
+// Chrome says why it could not start — no usable sandbox, a full /dev/shm, a
+// crashpad or library failure — on stderr and nowhere else. The launch used to
+// discard it, so a CI flake read "Chrome did not publish …/DevToolsActivePort"
+// and nothing more, indistinguishable from a regression (card_1f13e657a8a1).
+// The tail is kept and attached to every startup failure. The stream is read
+// for the browser's whole life, not just until startup: a pipe nobody drains
+// fills up and blocks Chrome on its next log line.
+const STDERR_TAIL_BYTES = 4096;
+const STDERR_SETTLE_MS = 1_000;
+
+function captureStderrTail(stream) {
+  let tail = Buffer.alloc(0);
+  const closed = new Promise((resolve) => {
+    if (!stream) return resolve();
+    stream.on('data', (chunk) => {
+      tail = Buffer.concat([tail, chunk]);
+      if (tail.length > STDERR_TAIL_BYTES) tail = Buffer.from(tail.subarray(tail.length - STDERR_TAIL_BYTES));
+    });
+    stream.once('close', resolve);
+    stream.once('error', resolve);
+  });
+  return {
+    // The last lines before a crash arrive after `exit` as often as before it;
+    // wait for the stream to close, briefly, so they are part of the report.
+    async settled() {
+      let timer;
+      await Promise.race([closed, new Promise((resolve) => { timer = setTimeout(resolve, STDERR_SETTLE_MS); })]);
+      clearTimeout(timer);
+    },
+    text: () => tail.toString('utf8').trim(),
+  };
+}
+
+function withStderrTail(error, stderr) {
+  if (!(error instanceof Error)) return error;
+  const text = stderr.text();
+  error.message += text
+    ? `\nChrome stderr (last ${STDERR_TAIL_BYTES} bytes):\n${text}`
+    : '\nChrome wrote nothing to stderr.';
+  return error;
+}
+
 function watchChild(child, chromePath) {
   const state = { ended: false, failure: null };
   child.once('error', (error) => {
@@ -152,6 +194,7 @@ export async function launchChromeCdp({
   const profileDir = scratchDir(join(tmpdir(), profilePrefix));
   let child = null;
   let state = null;
+  let stderr = null;
   let cleaned = false;
 
   const cleanup = async () => {
@@ -166,8 +209,9 @@ export async function launchChromeCdp({
       `--remote-debugging-port=${requestedPort}`,
       `--user-data-dir=${profileDir}`,
       ...chromeArgs,
-    ], { stdio: 'ignore', detached: true });
+    ], { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
     state = watchChild(child, chromePath);
+    stderr = captureStderrTail(child.stderr);
 
     const deadline = Date.now() + startupTimeoutMs;
     const actualPort = requestedPort === 0
@@ -179,7 +223,9 @@ export async function launchChromeCdp({
     return { child, cdpRoot, port: actualPort, profileDir, requestedPort, cleanup };
   } catch (error) {
     await cleanup();
-    throw error;
+    if (!stderr) throw error;
+    await stderr.settled();
+    throw withStderrTail(error, stderr);
   }
 }
 

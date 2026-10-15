@@ -249,7 +249,8 @@ function git(args, options = {}) {
     cwd: WORK_DIR,
     env: { ...process.env, ...(options.env || {}) },
     encoding: 'utf8',
-    stdio: options.quiet ? 'ignore' : ['ignore', 'pipe', 'pipe'],
+    // Quiet still keeps stderr: a failed push must say why, not just "Command failed".
+    stdio: options.quiet ? ['ignore', 'ignore', 'pipe'] : ['ignore', 'pipe', 'pipe'],
   });
 }
 
