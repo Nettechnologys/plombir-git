@@ -433,7 +433,33 @@ jobs:
         run: cargo test -p rg-db -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
 
       - name: Prove PostgreSQL code index refresh boundary
-        run: cargo test -p rg-core -j 6 server_code_index_refresh_is_failure_atomic_and_serialized -- --ignored --nocapture
+        run: cargo test -p rg-core -j 6 server_code_index_rebuild_publishes_atomically_without_holding_writers -- --ignored --nocapture
+
+      # Server-database tests that no step ran until the ignored-tests gate
+      # read this workflow (card_0c68a0dc41e8).
+      - name: Prove default-branch and import adoption serialize on PostgreSQL
+        run: cargo test -p rg-core -j 6 --lib adoption_and_settings_serialize_on_server_database -- --ignored --nocapture
+
+      - name: Prove hook, secret and provider storage limits on PostgreSQL
+        run: >-
+          cargo test -p rg-http --test integration -j 6 -- --ignored --nocapture
+          ci_secrets_tag_protection_tests::
+          organization_deletion_storage_tests::
+          sso_provider_storage_limit_tests::
+          webhook_lifecycle_storage_tests::
+          webhook_secret_at_rest_tests::
+
+      # This one migrates an empty database to the schema just before its
+      # migration, so it gets a database of its own beside the shared one.
+      - name: Create an exclusive PostgreSQL database
+        run: >-
+          docker exec "${{ job.services.postgres.id }}"
+          createdb -U plombir_git plombir_git_exclusive
+
+      - name: Prove the issue-comment reference installs over orphans on PostgreSQL
+        env:
+          PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: postgres://plombir_git:plombir_git@127.0.0.1:5432/plombir_git_exclusive
+        run: cargo test -p rg-db -j 6 --lib the_reference_installs_over_orphans_on_a_server_database -- --ignored --nocapture
 
       - name: Run PostgreSQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
@@ -534,7 +560,34 @@ jobs:
         run: cargo test -p rg-db -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
 
       - name: Prove MySQL code index refresh boundary
-        run: cargo test -p rg-core -j 6 server_code_index_refresh_is_failure_atomic_and_serialized -- --ignored --nocapture
+        run: cargo test -p rg-core -j 6 server_code_index_rebuild_publishes_atomically_without_holding_writers -- --ignored --nocapture
+
+      # Server-database tests that no step ran until the ignored-tests gate
+      # read this workflow (card_0c68a0dc41e8).
+      - name: Prove default-branch and import adoption serialize on MySQL
+        run: cargo test -p rg-core -j 6 --lib adoption_and_settings_serialize_on_server_database -- --ignored --nocapture
+
+      - name: Prove hook, secret and provider storage limits on MySQL
+        run: >-
+          cargo test -p rg-http --test integration -j 6 -- --ignored --nocapture
+          ci_secrets_tag_protection_tests::
+          organization_deletion_storage_tests::
+          sso_provider_storage_limit_tests::
+          webhook_lifecycle_storage_tests::
+          webhook_secret_at_rest_tests::
+
+      # This one migrates an empty database to the schema just before its
+      # migration, so it gets a database of its own beside the shared one.
+      - name: Create an exclusive MySQL database
+        run: >-
+          docker exec "${{ job.services.mysql.id }}"
+          mysql -uroot -proot
+          -e "CREATE DATABASE plombir_git_exclusive; GRANT ALL ON plombir_git_exclusive.* TO 'plombir_git'@'%'"
+
+      - name: Prove the issue-comment reference installs over orphans on MySQL
+        env:
+          PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: mysql://plombir_git:plombir_git@127.0.0.1:3306/plombir_git_exclusive
+        run: cargo test -p rg-db -j 6 --lib the_reference_installs_over_orphans_on_a_server_database -- --ignored --nocapture
 
       - name: Run MySQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
