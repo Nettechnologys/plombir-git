@@ -197,27 +197,41 @@ pub(crate) async fn run_job_docker(
         return (-1, msg);
     }
 
-    let args = match rg_process::docker_job::run_args(&rg_process::docker_job::JobContainer {
-        name: container_name,
-        image,
-        script,
-        workspace,
-        user: rg_process::container_user(),
-        variables,
-    }) {
-        Ok(args) => args,
-        Err(error) => return (-1, error.to_string()),
+    // The image is found or pulled with the operator's credentials, then
+    // `docker run` starts its ID with the job's variables; see
+    // `rg_process::docker_job`.
+    let prepared = match rg_process::docker_job::prepare(
+        "docker",
+        &rg_process::docker_job::JobContainer {
+            name: container_name,
+            image,
+            script,
+            workspace,
+            user: rg_process::container_user(),
+            variables,
+        },
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(rg_process::docker_job::PrepareFailed::Refused(refused)) => {
+            return (-1, refused.to_string())
+        }
+        Err(rg_process::docker_job::PrepareFailed::ImageUnavailable(unavailable)) => {
+            return (unavailable.exit_code, unavailable.log)
+        }
     };
 
-    let mut command = rg_process::docker_job::client("docker");
-    command.args(&args);
-    rg_process::docker_job::apply_environment(&mut command, variables);
+    let mut command = prepared.command;
     match rg_process::output_ci_job_in_process_tree(&mut command).await {
         Ok(o) => {
             let code = o.status.code().unwrap_or(-1);
             let mut log = o.log();
             if code != 0 && log.is_empty() {
                 log = format!("Docker exited with code {}", code);
+            }
+            if !prepared.pull_log.is_empty() {
+                log = format!("{}\n{log}", prepared.pull_log.trim_end());
             }
             if let Some(notice) = rg_process::docker_job::left_out_variables_notice(variables) {
                 if !log.is_empty() && !log.ends_with('\n') {
@@ -280,14 +294,17 @@ mod tests {
         workspace: &std::path::Path,
         name: &str,
     ) -> Vec<String> {
-        rg_process::docker_job::run_args(&rg_process::docker_job::JobContainer {
-            name,
-            image,
-            script,
-            workspace,
-            user: rg_process::container_user(),
-            variables,
-        })
+        rg_process::docker_job::run_args(
+            &rg_process::docker_job::JobContainer {
+                name,
+                image,
+                script,
+                workspace,
+                user: rg_process::container_user(),
+                variables,
+            },
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
         .expect("test workspace is UTF-8")
     }
 
@@ -365,11 +382,18 @@ mod tests {
             "secret value leaked into argv"
         );
 
-        // Image and script still terminate the invocation.
+        // The image's ID and the script still terminate the invocation, and
+        // the client that carries the job's variables cannot pull.
         assert_eq!(
             &args[args.len() - 4..],
-            &["alpine:3.20", "sh", "-c", "echo hi"]
+            &[
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "sh",
+                "-c",
+                "echo hi"
+            ]
         );
+        assert!(window("--pull", "never"), "missing --pull never: {args:?}");
     }
 
     /// Container root has no `CAP_DAC_OVERRIDE` under `--cap-drop ALL`, so an

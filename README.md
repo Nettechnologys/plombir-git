@@ -757,6 +757,13 @@ separate binary: it registers once, then polls the server for jobs whose `tags:`
 its own labels satisfy and executes them — natively, or in a container when the
 job names an image (see [docs/ci.md](docs/ci.md)).
 
+Either way, a job's image is pulled by the operator's own `docker` client —
+your registry logins and credential helpers, never the job's variables — and the
+container then starts from the image's ID with `--pull never` (Docker 20.10 or
+newer). An image already present is reused as `docker run` would; with
+`DOCKER_CONTENT_TRUST=1` in the runner's environment it is pulled again for
+every job, so its signature is checked each time.
+
 The server hands jobs to registered runners only with `external_runners = true`
 under `[ci]`. With the default `false` it keeps running every job in-process, and
 a registered runner polls without ever being given one.

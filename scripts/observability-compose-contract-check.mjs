@@ -68,9 +68,9 @@ const composePath = join(root, 'deploy', 'docker-compose.observability.yml');
 const composeDir = dirname(composePath);
 
 // The services whose image the job has to run itself — `promtool` and `amtool`
-// ship inside these images and nowhere else. Grafana is deliberately absent: it
-// has no offline linter, so nothing here launches its image and a tag for it
-// would be an unused value that silently rots.
+// ship inside these images and nowhere else, and Grafana has no offline linter
+// at all, so `scripts/check-grafana-dashboards.mjs` boots the image and asks it
+// which panel and data source plugins it has.
 //
 // The repository is pinned as well as the tag. Dropping that turns a switch to a
 // different registry into a silent pass, and the whole point of reading the tag
@@ -78,6 +78,7 @@ const composeDir = dirname(composePath);
 const IMAGE_SERVICES = [
   { service: 'prometheus', repository: 'prom/prometheus' },
   { service: 'alertmanager', repository: 'prom/alertmanager' },
+  { service: 'grafana', repository: 'grafana/grafana' },
 ];
 
 function display(path) {
@@ -207,6 +208,28 @@ for (const { service, repository } of IMAGE_SERVICES) {
 
   tags.push(`${service}=${reference}`);
   notes.push(`${service}: ${reference}`);
+}
+
+// ── Grafana runs the plugins its image ships ──
+//
+// Grafana 12+ treats its data source plugins as "preinstalled" and, unless told
+// not to, fetches newer versions of them from grafana.com at every start. That
+// is code the digest pin above never reviewed, arriving on a restart with no
+// diff — and in this job's live check it unregistered `prometheus` halfway
+// through, which is how it was noticed.
+{
+  const environment = services.grafana?.environment;
+  const entries = Array.isArray(environment)
+    ? environment.map(String)
+    : isObject(environment)
+      ? Object.entries(environment).map(([name, value]) => `${name}=${value ?? ''}`)
+      : [];
+  if (!entries.some((entry) => /^GF_PLUGINS_PREINSTALL_DISABLED=(true|1)$/i.test(entry.trim()))) {
+    problems.push(
+      `${display(composePath)}: services.grafana.environment does not set GF_PLUGINS_PREINSTALL_DISABLED=true — `
+        + 'Grafana would download plugin updates at start, outside the pinned image.',
+    );
+  }
 }
 
 // ── Every file the stack bind-mounts ──

@@ -306,7 +306,7 @@ export function runObservability({ cwd = root } = {}) {
   );
   if (!provisioning.ok) return provisioning;
 
-  const missing = requireTool('docker', 'promtool and amtool ship inside the official images and nowhere else');
+  const missing = requireTool('docker', 'promtool and amtool ship inside the official images, and Grafana is checked by booting its own');
   if (missing) return { ok: false, output: `${provisioning.output}\n${missing}`.trim() };
 
   // Image tags are read out of the compose file rather than pinned a second time
@@ -338,7 +338,7 @@ export function runObservability({ cwd = root } = {}) {
     }
     images[line.slice(0, separator)] = line.slice(separator + 1);
   }
-  for (const service of ['prometheus', 'alertmanager']) {
+  for (const service of ['prometheus', 'alertmanager', 'grafana']) {
     if (!images[service]) {
       return { ok: false, output: `observability-compose-contract-check.mjs printed no image for ${service}.` };
     }
@@ -372,18 +372,16 @@ export function runObservability({ cwd = root } = {}) {
         --entrypoint amtool "\${IMAGE_ALERTMANAGER}" check-config "/cfg/$(basename "\${config}")"
     done
 
-    dashboards=(deploy/grafana/dashboards/*.json)
-    if [ "\${#dashboards[@]}" -eq 0 ]; then
-      echo "deploy/grafana/dashboards/ no longer holds a *.json." >&2
-      exit 1
-    fi
-    for dashboard in "\${dashboards[@]}"; do
-      echo "Parsing \${dashboard}"
-      node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "\${dashboard}"
-    done
+    "\${NODE}" "\${CHECK_GRAFANA}" "\${PWD}"
   `, {
     cwd: repoRoot,
-    env: { IMAGE_PROMETHEUS: images.prometheus, IMAGE_ALERTMANAGER: images.alertmanager },
+    env: {
+      IMAGE_PROMETHEUS: images.prometheus,
+      IMAGE_ALERTMANAGER: images.alertmanager,
+      GRAFANA_IMAGE: images.grafana,
+      NODE: process.execPath,
+      CHECK_GRAFANA: join(scriptsDir, 'check-grafana-dashboards.mjs'),
+    },
   }));
   return {
     ...gate,

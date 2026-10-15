@@ -95,6 +95,10 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_SERVER_ROOT_URL=http://localhost:3000
       - GF_INSTALL_PLUGINS=
+      # Grafana 12+ otherwise downloads newer versions of its bundled plugins
+      # (prometheus, postgresql, ...) from grafana.com on every start, so the
+      # code drawing the dashboards is not the code the digest above pins.
+      - GF_PLUGINS_PREINSTALL_DISABLED=true
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro

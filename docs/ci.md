@@ -188,12 +188,20 @@ sets itself (`CI`, `CI_*`) is ignored, and the job log says which ones.
 
 A job that runs in a container gets its variables through the runner's own
 `docker` client, which runs on the host. Names that would reconfigure that
-client or a credential helper it starts — `PATH`, `HOME`, `LANG`, `LC_*`,
-`TMPDIR`, `LD_*`, `DOCKER_*`, `*_PROXY`, `SSL_CERT_*`, the Go runtime's
-`GOMAXPROCS`/`GOGC`/`GODEBUG`/…, `AWS_*` other than the access key, secret,
-session token and region, `GOOGLE_APPLICATION_CREDENTIALS`, `CLOUDSDK_*` — are
-not passed to the container, and the job log names each one. Set the value
-under another name and export it in the script if the job needs it.
+client — `PATH`, `HOME`, `LANG`, `LC_*`, `TMPDIR`, `XDG_RUNTIME_DIR`, `LD_*`,
+`DOCKER_*`, `*_PROXY`, `SSL_CERT_*`, the Go runtime's
+`GOMAXPROCS`/`GOGC`/`GODEBUG`/… — are not passed to the container, and the job
+log names each one. Set the value under another name and export it in the
+script if the job needs it.
+
+The image is found or pulled first, by a separate `docker` client that carries
+none of the job's variables; only that one can start a registry credential
+helper. The container then starts from the image's ID with `--pull never`. So
+the variables a credential helper reads — every `AWS_*` (`AWS_PROFILE`
+included), `GOOGLE_APPLICATION_CREDENTIALS`, `CLOUDSDK_*` — are ordinary job
+variables and reach the container, and a missing image is always pulled with
+the runner operator's credentials, never the job's. The pull's output opens the
+job log.
 
 The runner supplies these on its own: `CI_PIPELINE_ID`, `CI_COMMIT_SHA`,
 `CI_SHA`, `CI_REF`, `CI_EVENT`, `CI_REPOSITORY`, `CI_REPOSITORY_OWNER`, and —

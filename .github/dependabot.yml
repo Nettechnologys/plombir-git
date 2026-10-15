@@ -1,16 +1,33 @@
 version: 2
 updates:
+  # Every ecosystem sets `open-pull-requests-limit` on purpose. Dependabot's
+  # default is 5 open PRs per ecosystem, and an update over the limit is not
+  # queued or reported — it is simply not proposed. On 2026-10-15 the five slots
+  # for github-actions were taken, and `actions/download-artifact` (four majors
+  # behind) and `actions/setup-node` (still on the Node 20 runtime) were never
+  # offered. A limit above the number of things each ecosystem pins is what
+  # makes "no PR" mean "nothing to update".
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 10
   # The observability stack pins its images by digest; this is what proposes
   # the next digest as a reviewable pull request.
   - package-ecosystem: docker-compose
     directory: /deploy
     schedule:
       interval: weekly
+    open-pull-requests-limit: 10
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 20
+    # Minor and patch bumps of actions ride in one PR; a major keeps its own,
+    # because that is the one that can change behaviour and gets reverted alone.
+    groups:
+      github-actions-minor:
+        update-types:
+          - minor
+          - patch

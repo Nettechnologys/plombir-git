@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runObservability } from './run-local-gates.mjs';
+import { dashboardProblems } from './lib/grafana-dashboards.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const check = join(root, 'scripts', 'grafana-provisioning-contract-check.mjs');
@@ -170,4 +171,113 @@ runLocalGateFixture(
     'path: /var/lib/grafana/not-mounted',
   ),
   'options.path (/var/lib/grafana/not-mounted) is not the target',
+);
+
+// ── The dashboard judge behind scripts/check-grafana-dashboards.mjs ──
+//
+// The live check boots the pinned image; this half drives its judge with what
+// that image answered, so a mutation can be shown red without Docker. The lists
+// below are what grafana/grafana:13.2.3 returned from /api/plugins on
+// 2026-10-15. They are a fixture, not the gate's source of truth: the gate asks
+// the image every run, and the last case shows the answer is what decides.
+const GRAFANA_13_PANELS = new Set(
+  ('alertlist annolist barchart bargauge candlestick canvas dashlist flamegraph gauge geomap gettingstarted '
+    + 'heatmap histogram logs logstable news nodeGraph piechart stat state-timeline status-history table text '
+    + 'timeseries traces trend welcome xychart').split(' '),
+);
+const GRAFANA_13_DATASOURCES = new Set(
+  ('alertmanager cloudwatch grafana-azure-monitor-datasource grafana-postgresql-datasource '
+    + 'grafana-pyroscope-datasource grafana-testdata-datasource graphite influxdb jaeger loki mssql mysql '
+    + 'opentsdb prometheus stackdriver tempo zipkin').split(' '),
+);
+const PROVISIONED = [{ name: 'Prometheus', uid: 'PBFA97CFB590B2093', type: 'prometheus' }];
+const shippedDashboard = join(root, 'deploy', 'grafana', 'dashboards', 'plombir-git-main.json');
+
+function judge(name, mutate, expected, { panelPlugins = GRAFANA_13_PANELS, copy = false } = {}) {
+  const dashboard = JSON.parse(readFileSync(shippedDashboard, 'utf8'));
+  if (mutate) mutate(dashboard);
+  const dashboards = [{ file: 'plombir-git-main.json', dashboard }];
+  if (copy) {
+    dashboards.push({ file: 'plombir-git-copy.json', dashboard: { ...dashboard, title: 'Copy' } });
+  }
+  const problems = dashboardProblems({
+    dashboards,
+    panelPlugins,
+    datasourcePlugins: GRAFANA_13_DATASOURCES,
+    datasources: PROVISIONED,
+    provisionedUids: new Set(['plombir-git-main']),
+  });
+  const ok = expected === null
+    ? problems.length === 0
+    : problems.length > 0 && problems.every((problem) => problem.includes(expected));
+  if (!ok) {
+    throw new Error(
+      `${name}: expected ${expected === null ? 'no problems' : `problems mentioning ${JSON.stringify(expected)}`}, `
+        + `got ${JSON.stringify(problems, null, 2)}`,
+    );
+  }
+  console.log(`✅ ${name}`);
+}
+
+judge('the shipped dashboard resolves on Grafana 13', null, null);
+
+// The defect the live check was written for: Grafana 12 removed the Angular
+// `graph` panel, and every one of the overview's graphs was one.
+judge(
+  'a panel turned back into an Angular `graph` is red',
+  (dashboard) => { dashboard.panels[0].type = 'graph'; },
+  'is a `graph` panel, and this Grafana has no such panel plugin',
+);
+
+judge(
+  'a `graph` panel inside a collapsed row is red too',
+  (dashboard) => {
+    const [first, ...rest] = dashboard.panels;
+    dashboard.panels = [{ id: 99, type: 'row', title: 'Collapsed', collapsed: true, panels: [{ ...first, type: 'graph' }] }, ...rest];
+  },
+  'panels[0].panels[0] (id 1',
+);
+
+judge(
+  'a data source variable over a plugin with nothing provisioned is red',
+  (dashboard) => {
+    dashboard.templating.list.find((variable) => variable.type === 'datasource').query = 'influxdb';
+  },
+  'none is provisioned',
+);
+
+judge(
+  'a variable naming a data source Grafana does not provision is red',
+  (dashboard) => {
+    dashboard.templating.list.find((variable) => variable.name === 'route').datasource = 'Prometheus-old';
+  },
+  'which Grafana does not provision',
+);
+
+judge(
+  'a panel pointing at an undefined data source variable is red',
+  (dashboard) => { dashboard.panels[0].datasource = '${metrics}'; },
+  'no data source variable of that name exists',
+);
+
+judge(
+  'a dashboard without a uid is red',
+  (dashboard) => { delete dashboard.uid; },
+  'has no `uid`',
+);
+
+judge(
+  'two dashboard files under one uid are red',
+  null,
+  'share uid plombir-git-main',
+  { copy: true },
+);
+
+// The judge has no list of its own: the same `graph` panel is fine on an image
+// that still ships the plugin, which is what a Grafana 11 pin was.
+judge(
+  'what the image reports decides, not a list in the gate',
+  (dashboard) => { dashboard.panels[0].type = 'graph'; },
+  null,
+  { panelPlugins: new Set([...GRAFANA_13_PANELS, 'graph']) },
 );

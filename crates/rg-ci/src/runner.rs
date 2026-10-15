@@ -1405,19 +1405,32 @@ impl PipelineRunner {
         // Generate a unique container name
         let container_name = self.job_container_name(job_id);
 
-        // `docker run` for the job. The hardening, the mount and the environment
-        // rules are shared with the external runner, see `rg_process::docker_job`.
-        let args = rg_process::docker_job::run_args(&rg_process::docker_job::JobContainer {
-            name: &container_name,
-            image,
-            script,
-            workspace: &workspace_path,
-            user: rg_process::container_user(),
-            variables: job_environment,
-        })?;
-        let mut command = self.docker_command();
-        command.args(&args);
-        rg_process::docker_job::apply_environment(&mut command, job_environment);
+        // The image is found or pulled with the operator's credentials, then
+        // `docker run` starts its ID with the job's variables. The hardening,
+        // the mount and the environment rules are shared with the external
+        // runner, see `rg_process::docker_job`.
+        let prepared = match rg_process::docker_job::prepare(
+            &self.docker_program,
+            &rg_process::docker_job::JobContainer {
+                name: &container_name,
+                image,
+                script,
+                workspace: &workspace_path,
+                user: rg_process::container_user(),
+                variables: job_environment,
+            },
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(rg_process::docker_job::PrepareFailed::Refused(refused)) => {
+                return Err(refused.into())
+            }
+            Err(rg_process::docker_job::PrepareFailed::ImageUnavailable(unavailable)) => {
+                return Ok((unavailable.exit_code, unavailable.log));
+            }
+        };
+        let mut command = prepared.command;
         let output = rg_process::output_ci_job_in_process_tree(&mut command)
             .await
             .context("failed to spawn docker run")?;
@@ -1431,6 +1444,9 @@ impl PipelineRunner {
                 "Docker container exited with code {} (no output)",
                 exit_code
             );
+        }
+        if !prepared.pull_log.is_empty() {
+            log = format!("{}\n{log}", prepared.pull_log.trim_end());
         }
 
         Ok((exit_code, log))
@@ -3389,6 +3405,16 @@ case "$1" in
   info)
     exit 0
     ;;
+  image)
+    # `image inspect --format {{.Id}} -- <image>`: the ID names the image, so
+    # `run` below can tell which one it was handed.
+    for arg in "$@"; do image=$arg; done
+    case "$image" in
+      fixture:success) echo sha256:5555555555555555555555555555555555555555555555555555555555555555 ;;
+      *) echo sha256:7777777777777777777777777777777777777777777777777777777777777777 ;;
+    esac
+    exit 0
+    ;;
   rm)
     printf '%s\n' "$*" > "$state/rm.args"
     rm -f "$state/container.live"
@@ -3398,7 +3424,7 @@ case "$1" in
     printf '%s\n' "$$" > "$state/client.pid"
     printf '%s\n' "$@" > "$state/run.args"
     for arg in "$@"; do
-      if [ "$arg" = "fixture:success" ]; then
+      if [ "$arg" = "sha256:5555555555555555555555555555555555555555555555555555555555555555" ]; then
         printf 'docker success\n'
         exit 0
       fi

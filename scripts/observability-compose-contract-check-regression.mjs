@@ -147,6 +147,21 @@ fixture(
   red('not a `prom/alertmanager` image'),
 );
 
+// Grafana joined the images this job runs when the dashboards started being
+// resolved against the booted image; a fork of it would answer for plugins the
+// stack does not have.
+fixture(
+  'another repository for the Grafana image is red',
+  (source) => source.replace('image: grafana/grafana:13', 'image: grafana/grafana-oss:13'),
+  red('not a `grafana/grafana` image'),
+);
+
+fixture(
+  'a Grafana that may download plugin updates at start is red',
+  (source) => source.replace('      - GF_PLUGINS_PREINSTALL_DISABLED=true\n', ''),
+  red('does not set GF_PLUGINS_PREINSTALL_DISABLED=true'),
+);
+
 fixture(
   'a renamed service is red',
   (source) => source.replace('  alertmanager:\n', '  alerts:\n'),
@@ -185,8 +200,8 @@ fixture(
 );
 
 // The digest is what makes a redeploy of one commit pull the same bytes, and
-// it is checked on every service — Grafana and node-exporter run nothing in
-// this job, but they are just as mutable under their tags.
+// it is checked on every service — node-exporter runs nothing in this job,
+// but it is just as mutable under its tag.
 fixture(
   'a tag without a digest is red',
   (source) => source.replace(/(image: prom\/node-exporter:v[^@\n]+)@sha256:[0-9a-f]{64}/, '$1'),
@@ -207,9 +222,12 @@ fixture(
   (result) => {
     const reason = green('prometheus=prom/prometheus:v3.15.0@sha256:', null)(result);
     if (reason) return reason;
-    return /^alertmanager=prom\/alertmanager:v[^@\s]+@sha256:[0-9a-f]{64}$/m.test(result.stdout)
+    if (!/^alertmanager=prom\/alertmanager:v[^@\s]+@sha256:[0-9a-f]{64}$/m.test(result.stdout)) {
+      return 'stdout does not carry the alertmanager digest';
+    }
+    return /^grafana=grafana\/grafana:[^@\s]+@sha256:[0-9a-f]{64}$/m.test(result.stdout)
       ? null
-      : 'stdout does not carry the alertmanager digest';
+      : 'stdout does not carry the grafana image';
   },
 );
 
