@@ -193,10 +193,11 @@ async fn a_mirror_reply_never_carries_the_stored_password() {
 }
 
 /// The other half of the same card: the reply is administrative, so reading it
-/// takes push access. `require_read` let any visitor to a *public* repo pull the
-/// remote's username and credential state out of the settings.
+/// takes administration (card_b42563679dd3 raised it from push access).
+/// `require_read` let any visitor to a *public* repo pull the remote's username
+/// and credential state out of the settings.
 #[tokio::test]
-async fn reading_a_mirror_requires_write_access() {
+async fn reading_a_mirror_requires_admin_access() {
     let base = spawn_test_app().await;
     let (owner_token, _) = register_full(&base, "mirror-pub", "mirror-pub@example.com").await;
     let (outsider_token, _) = register_full(&base, "mirror-nosy", "mirror-nosy@example.com").await;
@@ -230,7 +231,7 @@ async fn reading_a_mirror_requires_write_access() {
     assert_eq!(
         resp.status(),
         403,
-        "a reader without push access reached the mirror settings"
+        "a reader without administration reached the mirror settings"
     );
 
     let resp = client
@@ -1169,16 +1170,17 @@ async fn an_interval_that_would_make_a_mirror_permanently_due_is_refused() {
     }
 }
 
-/// card_e4160f010bfb: the mirror routes are on `RepoWrite`, so a collaborator
-/// can repoint a mirror whose credential the owner stored. A move to another
-/// host without a credential of its own is the writer's 400, and the row keeps
-/// the owner's remote and token — the next pass dials what the row says.
+/// card_e4160f010bfb: a collaborator can repoint a mirror whose credential the
+/// owner stored — one with administration, since card_b42563679dd3 put the
+/// mirror routes behind `RepoAdmin`. A move to another host without a
+/// credential of its own is that collaborator's 400, and the row keeps the
+/// owner's remote and token — the next pass dials what the row says.
 #[tokio::test]
-async fn a_writer_cannot_carry_the_stored_credential_to_another_host() {
+async fn a_collaborator_cannot_carry_the_stored_credential_to_another_host() {
     let (base, db) = spawn_test_app_with_db().await;
     let (owner_token, _) = register_full(&base, "mirror-cred", "mirror-cred@example.com").await;
-    let (writer_token, _) =
-        register_full(&base, "mirror-writer", "mirror-writer@example.com").await;
+    let (collab_token, _) =
+        register_full(&base, "mirror-collab", "mirror-collab@example.com").await;
     create_repo(&base, &owner_token, "bound").await;
 
     let client = reqwest::Client::new();
@@ -1186,7 +1188,7 @@ async fn a_writer_cannot_carry_the_stored_credential_to_another_host() {
     let added = client
         .post(format!("{repo_url}/collaborators"))
         .bearer_auth(&owner_token)
-        .json(&serde_json::json!({"username": "mirror-writer", "permission": "write"}))
+        .json(&serde_json::json!({"username": "mirror-collab", "permission": "admin"}))
         .send()
         .await
         .expect("request");
@@ -1216,7 +1218,7 @@ async fn a_writer_cannot_carry_the_stored_credential_to_another_host() {
 
     let resp = client
         .patch(&url)
-        .bearer_auth(&writer_token)
+        .bearer_auth(&collab_token)
         .json(&serde_json::json!({"url": "https://collector.example/x.git"}))
         .send()
         .await
@@ -1241,10 +1243,10 @@ async fn a_writer_cannot_carry_the_stored_credential_to_another_host() {
         "owner-pat"
     );
 
-    // Saying "no credential" is how the writer moves it, and the token stays behind.
+    // Saying "no credential" is how the collaborator moves it, and the token stays behind.
     let resp = client
         .patch(&url)
-        .bearer_auth(&writer_token)
+        .bearer_auth(&collab_token)
         .json(&serde_json::json!({"url": "https://collector.example/x.git", "password": ""}))
         .send()
         .await
@@ -1253,4 +1255,128 @@ async fn a_writer_cannot_carry_the_stored_credential_to_another_host() {
     let body: serde_json::Value = resp.json().await.expect("json");
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["has_credentials"], false, "{body}");
+}
+
+/// card_b42563679dd3: a pull mirror's pass force-moves every branch to the
+/// upstream's history and prunes the rest, past branch protection, and the
+/// mirror then closes the repository to pushes. Under `RepoWrite` a
+/// collaborator could point the mirror at their own upstream, press "Sync now"
+/// and rewrite a protected `main`. All five verbs are administration: a writer
+/// gets 403 on each and changes nothing, a collaborator with administration
+/// gets through on each.
+#[tokio::test]
+async fn every_mirror_verb_is_administration_not_write() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, _) = register_full(&base, "mirror-adm", "mirror-adm@example.com").await;
+    let (writer_token, _) = register_full(&base, "mirror-wr", "mirror-wr@example.com").await;
+    let (admin_token, _) = register_full(&base, "mirror-ad2", "mirror-ad2@example.com").await;
+    create_repo(&base, &owner_token, "guarded").await;
+
+    let client = reqwest::Client::new();
+    let repo_url = format!("{base}/api/v1/repos/mirror-adm/guarded");
+    for (who, permission) in [("mirror-wr", "write"), ("mirror-ad2", "admin")] {
+        let added = client
+            .post(format!("{repo_url}/collaborators"))
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({"username": who, "permission": permission}))
+            .send()
+            .await
+            .expect("request");
+        assert!(
+            added.status().is_success(),
+            "{}",
+            added.text().await.unwrap()
+        );
+    }
+    let url = format!("{repo_url}/mirror");
+    let sync = format!("{url}/sync");
+    let create_body = serde_json::json!({"url": REMOTE, "sync_interval_seconds": 3600});
+
+    // A writer cannot create one.
+    let resp = client
+        .post(&url)
+        .bearer_auth(&writer_token)
+        .json(&create_body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 403, "a writer created a pull mirror");
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&admin_token)
+        .json(&create_body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 201, "an administrator could not create");
+    let repo_id = resp.json::<serde_json::Value>().await.expect("json")["repo_id"]
+        .as_i64()
+        .expect("repo_id");
+
+    // Nor read, repoint, sync or delete the one an administrator made.
+    let refused = [
+        ("GET", client.get(&url)),
+        (
+            "PATCH",
+            client.patch(&url).json(
+                &serde_json::json!({"url": "https://collector.example/x.git", "password": ""}),
+            ),
+        ),
+        ("POST sync", client.post(&sync)),
+        ("DELETE", client.delete(&url)),
+    ];
+    for (verb, request) in refused {
+        let resp = request
+            .bearer_auth(&writer_token)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), 403, "a writer reached `{verb} mirror`");
+    }
+    let row = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+        .await
+        .expect("query")
+        .expect("the refused DELETE still removed the mirror");
+    assert_eq!(row.url, REMOTE, "the refused PATCH still moved the remote");
+
+    // The administrator holds every verb. The mirror is switched off first so
+    // that "Sync now" answers from the row (409) instead of dialling a remote.
+    let resp = client
+        .get(&url)
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200, "GET as administrator");
+    let resp = client
+        .patch(&url)
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({"status": "inactive"}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200, "PATCH as administrator");
+    let resp = client
+        .post(&sync)
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        409,
+        "sync as administrator did not reach the handler"
+    );
+    let resp = client
+        .delete(&url)
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("request");
+    assert!(
+        resp.status().is_success(),
+        "DELETE as administrator answered {}",
+        resp.status()
+    );
 }

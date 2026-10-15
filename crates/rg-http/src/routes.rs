@@ -2197,33 +2197,36 @@ pub(crate) fn build_all_routes(
             api::repo_content::delete_file,
         )
         // ── Mirroring ──────────────────────────────────────────────────────
+        // Administration too: a pull mirror's pass force-updates and prunes
+        // every branch from the upstream the caller names, past branch
+        // protection, and closes the repository to pushes (card_b42563679dd3).
         .get(
-            RepoWrite,
+            RepoAdmin,
             "/repos/{owner}/{name}/mirror",
             api::mirrors::get_mirror,
         )
         .post(
-            RepoWrite,
+            RepoAdmin,
             "/repos/{owner}/{name}/mirror",
             api::mirrors::create_mirror,
         )
         .patch(
-            RepoWrite,
+            RepoAdmin,
             "/repos/{owner}/{name}/mirror",
             api::mirrors::update_mirror,
         )
         .delete(
-            RepoWrite,
+            RepoAdmin,
             "/repos/{owner}/{name}/mirror",
             api::mirrors::delete_mirror,
         )
         .post(
-            RepoWrite,
+            RepoAdmin,
             "/repos/{owner}/{name}/mirror/sync",
             api::mirrors::trigger_mirror_sync,
         )
-        // Push mirrors are administration: they hand the repository and a
-        // credential for another forge to a remote the caller picks.
+        // Push mirrors are administration as well: they hand the repository
+        // and a credential for another forge to a remote the caller picks.
         .get(
             RepoAdmin,
             "/repos/{owner}/{name}/push_mirrors",

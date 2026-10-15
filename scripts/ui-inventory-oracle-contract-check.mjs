@@ -861,6 +861,10 @@ for (const [method, url] of [
   // Also carries `web` since card_de4bdc55196c: the mirror settings component
   // tests really drive `mirrors.update`, so this row is no longer rust-only.
   ['PATCH', '/api/v1/repos/{owner}/{name}/mirror'],
+  // Rust-only until card_b42563679dd3 made the pull mirror administration and
+  // gave it a browser-sweep scenario; the live Rust request is still the one
+  // this oracle has to find.
+  ['POST', '/api/v1/repos/{owner}/{name}/mirror/sync'],
 ]) {
   const row = inventory.routes.find((candidate) => (
     candidate.method === method && candidate.url === url
@@ -887,7 +891,6 @@ for (const [method, url] of [
   ['PATCH', '/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}'],
   ['GET', '/api-docs'],
   ['GET', '/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}'],
-  ['POST', '/api/v1/repos/{owner}/{name}/mirror/sync'],
   ['HEAD', '/v2/{owner}/{repo}/manifests/{reference}'],
 ]) {
   const row = inventory.routes.find((candidate) => (

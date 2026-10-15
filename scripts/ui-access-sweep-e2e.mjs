@@ -50,6 +50,7 @@ const ADMIN_FIXTURE = Object.freeze({
   browserDeployKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA browser-sweep',
   pushMirrorUrl: 'https://seeded-sweep.example.invalid/mirror.git',
   browserPushMirrorUrl: 'https://browser-sweep.example.invalid/mirror.git',
+  browserPullMirrorUrl: 'https://browser-sweep.example.invalid/pull.git',
   environmentName: 'seeded-environment',
   tagPattern: 'seeded-*',
   webhookUrl: 'https://seeded-sweep.example.invalid/hook',

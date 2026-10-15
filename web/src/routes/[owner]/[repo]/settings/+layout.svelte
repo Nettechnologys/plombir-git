@@ -13,8 +13,8 @@
   const currentPath = $derived($page.url.pathname);
 
   // Each section names the level its server routes require (card_270a0a77fd79):
-  // labels, the mirror and LFS locks are `RepoWrite`, everything else here —
-  // push mirrors included — is `RepoAdmin`. A section the viewer may not use is neither listed nor
+  // labels and LFS locks are `RepoWrite`, everything else here — both
+  // mirrors included — is `RepoAdmin`. A section the viewer may not use is neither listed nor
   // rendered — rendering it only asked the server for a 403 on load.
   type Level = 'write' | 'admin';
   const navItems = $derived([
@@ -26,7 +26,7 @@
     { path: `/${owner}/${repo}/settings/environments`, label: t('settings.environments.title', 'Environments'), icon: '🚀', level: 'admin' as Level },
     { path: `/${owner}/${repo}/settings/retention`, label: t('settings.retention.title', 'CI retention'), icon: '🧹', level: 'admin' as Level },
     { path: `/${owner}/${repo}/settings/tags`, label: t('settings.tag_protection.title', 'Tag protection'), icon: '🏷️', level: 'admin' as Level },
-    { path: `/${owner}/${repo}/settings/mirror`, label: t('settings.mirror.title'), icon: '🔁', level: 'write' as Level },
+    { path: `/${owner}/${repo}/settings/mirror`, label: t('settings.mirror.title'), icon: '🔁', level: 'admin' as Level },
     { path: `/${owner}/${repo}/settings/push-mirrors`, label: t('settings.push_mirrors.title'), icon: '📤', level: 'admin' as Level },
     { path: `/${owner}/${repo}/settings/lfs-locks`, label: t('settings.lfs_locks.title'), icon: '🔐', level: 'write' as Level },
     { path: `/${owner}/${repo}/settings/lfs-storage`, label: t('settings.lfs_storage.title'), icon: '📦', level: 'admin' as Level },

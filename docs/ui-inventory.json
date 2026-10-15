@@ -3223,56 +3223,76 @@
     {
       "method": "GET",
       "url": "/api/v1/repos/{owner}/{name}/mirror",
-      "access": "RepoWrite",
+      "access": "RepoAdmin",
       "handler": "api::mirrors::get_mirror",
       "testedIn": [
         "rust",
-        "web"
+        "web",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-mirror"
+      ]
     },
     {
       "method": "POST",
       "url": "/api/v1/repos/{owner}/{name}/mirror",
-      "access": "RepoWrite",
+      "access": "RepoAdmin",
       "handler": "api::mirrors::create_mirror",
       "testedIn": [
         "rust",
-        "web"
+        "web",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-mirror"
+      ]
     },
     {
       "method": "PATCH",
       "url": "/api/v1/repos/{owner}/{name}/mirror",
-      "access": "RepoWrite",
+      "access": "RepoAdmin",
       "handler": "api::mirrors::update_mirror",
       "testedIn": [
         "rust",
-        "web"
+        "web",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-mirror"
+      ]
     },
     {
       "method": "DELETE",
       "url": "/api/v1/repos/{owner}/{name}/mirror",
-      "access": "RepoWrite",
+      "access": "RepoAdmin",
       "handler": "api::mirrors::delete_mirror",
       "testedIn": [
         "rust",
-        "web"
+        "web",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-mirror"
+      ]
     },
     {
       "method": "POST",
       "url": "/api/v1/repos/{owner}/{name}/mirror/sync",
-      "access": "RepoWrite",
+      "access": "RepoAdmin",
       "handler": "api::mirrors::trigger_mirror_sync",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-mirror"
+      ]
     },
     {
       "method": "GET",
@@ -20052,12 +20072,16 @@
               "url": "/api/v1/repos/{owner}/{repo}/mirror",
               "opaque": false,
               "routeUrl": "/api/v1/repos/{owner}/{name}/mirror",
-              "access": "RepoWrite",
+              "access": "RepoAdmin",
               "handler": "api::mirrors::update_mirror",
               "matched": true,
               "testedIn": [
                 "rust",
-                "web"
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-mirror"
               ]
             },
             {
@@ -20066,12 +20090,16 @@
               "url": "/api/v1/repos/{owner}/{repo}/mirror",
               "opaque": false,
               "routeUrl": "/api/v1/repos/{owner}/{name}/mirror",
-              "access": "RepoWrite",
+              "access": "RepoAdmin",
               "handler": "api::mirrors::create_mirror",
               "matched": true,
               "testedIn": [
                 "rust",
-                "web"
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-mirror"
               ]
             }
           ],
@@ -20111,11 +20139,15 @@
               "url": "/api/v1/repos/{owner}/{repo}/mirror/sync",
               "opaque": false,
               "routeUrl": "/api/v1/repos/{owner}/{name}/mirror/sync",
-              "access": "RepoWrite",
+              "access": "RepoAdmin",
               "handler": "api::mirrors::trigger_mirror_sync",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-mirror"
               ]
             },
             {
@@ -20124,12 +20156,16 @@
               "url": "/api/v1/repos/{owner}/{repo}/mirror",
               "opaque": false,
               "routeUrl": "/api/v1/repos/{owner}/{name}/mirror",
-              "access": "RepoWrite",
+              "access": "RepoAdmin",
               "handler": "api::mirrors::get_mirror",
               "matched": true,
               "testedIn": [
                 "rust",
-                "web"
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-mirror"
               ]
             }
           ],
@@ -20149,12 +20185,16 @@
               "url": "/api/v1/repos/{owner}/{repo}/mirror",
               "opaque": false,
               "routeUrl": "/api/v1/repos/{owner}/{name}/mirror",
-              "access": "RepoWrite",
+              "access": "RepoAdmin",
               "handler": "api::mirrors::delete_mirror",
               "matched": true,
               "testedIn": [
                 "rust",
-                "web"
+                "web",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-mirror"
               ]
             }
           ],
@@ -29011,10 +29051,10 @@
       "owner",
       "outsider"
     ],
-    "scenarios": 51,
+    "scenarios": 52,
     "inventoryEntries": 809,
-    "coveredEntries": 191,
-    "coveredRoutes": 181,
-    "maxUiRoutesWithoutFrontendTest": 25
+    "coveredEntries": 196,
+    "coveredRoutes": 186,
+    "maxUiRoutesWithoutFrontendTest": 24
   }
 }

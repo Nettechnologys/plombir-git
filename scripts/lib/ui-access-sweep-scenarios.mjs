@@ -1196,6 +1196,39 @@ const repoDeployKeys = privileged(
   ]),
 );
 
+// A pull mirror closes the repository to pushes while it exists, so the owner
+// takes it all the way round — configure, save, sync, delete — and leaves the
+// shared repository as it found it. The remote never resolves: the sync is
+// answered `200` with the failure recorded on the mirror, as a real one is.
+const repoPullMirror = privileged(
+  async (context) => {
+    await context.navigate(settingsPage(context, 'mirror'));
+    await context.fill('#mirror-url', context.fixture.browserPullMirrorUrl);
+    await context.click('form.mirror-form button[type="submit"]');
+    await context.waitForText('.success-box', 'Mirror configured.');
+    await context.click('form.mirror-form button[type="submit"]');
+    await context.waitForText('.success-box', 'Mirror settings saved.');
+    await context.clickByText('form.mirror-form button', 'Sync now');
+    await context.waitForText('.success-box', 'Mirror sync requested.');
+    await context.clickByText('form.mirror-form button', 'Delete mirror');
+    await context.click('.confirm-modal-accept');
+    await context.waitForText('.success-box', 'Mirror deleted.');
+  },
+  (context) => requestSequence(context, [
+    [settingsApi(context, '/mirror')],
+    [settingsApi(context, '/mirror'), {
+      method: 'POST',
+      json: { url: 'https://outsider-sweep.example.invalid/pull.git' },
+    }],
+    [settingsApi(context, '/mirror'), {
+      method: 'PATCH',
+      json: { url: 'https://outsider-sweep.example.invalid/pull.git' },
+    }],
+    [settingsApi(context, '/mirror/sync'), { method: 'POST' }],
+    [settingsApi(context, '/mirror'), { method: 'DELETE' }],
+  ]),
+);
+
 const repoPushMirrors = privileged(
   async (context) => {
     await context.navigate(settingsPage(context, 'push-mirrors'));
@@ -1555,6 +1588,7 @@ export const UI_ACCESS_SWEEP_SCENARIOS = new Map([
   ['repo-ci-secrets', repoCiSecrets],
   ['repo-collaborators', repoCollaborators],
   ['repo-deploy-keys', repoDeployKeys],
+  ['repo-pull-mirror', repoPullMirror],
   ['repo-push-mirrors', repoPushMirrors],
   ['repo-lfs-storage', repoLfsStorage],
   ['repo-environments', repoEnvironments],

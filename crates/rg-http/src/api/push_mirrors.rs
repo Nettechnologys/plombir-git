@@ -8,8 +8,8 @@
 //!
 //! Repository administration, so `RepoAdmin` on every verb: a push mirror
 //! hands this repository's whole history and a credential for another forge
-//! to a remote the caller chooses. The pull mirror's settings sit behind
-//! `RepoWrite` because a pull mirror only ever brings content in.
+//! to a remote the caller chooses. The pull mirror is administration too: its
+//! pass rewrites every branch past branch protection (card_b42563679dd3).
 
 use axum::{
     extract::{Path, State},

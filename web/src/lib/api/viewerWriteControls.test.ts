@@ -364,11 +364,12 @@ describe('repository settings sections', () => {
 		const container = await openSettings('write', '/alice/demo/settings/labels');
 
 		expect(container.querySelector('a[href="/alice/demo/settings/labels"]')).not.toBeNull();
-		expect(container.querySelector('a[href="/alice/demo/settings/mirror"]')).not.toBeNull();
 		expect(container.querySelector('a[href="/alice/demo/settings/webhooks"]')).toBeNull();
 		expect(container.querySelector('a[href="/alice/demo/settings/ci-secrets"]')).toBeNull();
 		// A push mirror hands the repository and a credential to a remote the
-		// caller picks, so its routes are `RepoAdmin` and so is the section.
+		// caller picks, and a pull mirror's pass rewrites every branch past
+		// branch protection, so both are `RepoAdmin` and so are their sections.
+		expect(container.querySelector('a[href="/alice/demo/settings/mirror"]')).toBeNull();
 		expect(container.querySelector('a[href="/alice/demo/settings/push-mirrors"]')).toBeNull();
 		expect(container.querySelector('.section-body')).not.toBeNull();
 	});

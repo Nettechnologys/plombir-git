@@ -5,7 +5,7 @@
     "outsider"
   ],
   "ratchet": {
-    "maxUiRoutesWithoutFrontendTest": 25
+    "maxUiRoutesWithoutFrontendTest": 24
   },
   "scenarios": [
     {
@@ -1735,6 +1735,65 @@
           "symbol": "deployKeys.delete",
           "method": "DELETE",
           "routeUrl": "/api/v1/repos/{owner}/{name}/keys/{id}",
+          "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
+      "id": "repo-pull-mirror",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/mirror",
+          "kind": "control",
+          "control": "saveMirror",
+          "line": 211,
+          "symbol": "mirrors.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/mirror",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/mirror",
+          "kind": "control",
+          "control": "saveMirror",
+          "line": 211,
+          "symbol": "mirrors.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/mirror",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/mirror",
+          "kind": "control",
+          "control": "syncMirror",
+          "line": 252,
+          "symbol": "mirrors.sync",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/mirror/sync",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/mirror",
+          "kind": "control",
+          "control": "syncMirror",
+          "line": 252,
+          "symbol": "mirrors.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/mirror",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/mirror",
+          "kind": "control",
+          "control": "removeMirror",
+          "line": 255,
+          "symbol": "mirrors.remove",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/mirror",
           "access": "RepoAdmin"
         }
       ]

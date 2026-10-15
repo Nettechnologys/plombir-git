@@ -26,8 +26,8 @@
 | Interactive controls | 1052 |
 | Controls calling an API | 371 |
 | Controls from shared components | 425 |
-| Browser sweep: scenarios / inventory entries / routes | 51 / 191 / 181 |
-| **UI routes without a web/smoke/browser test** | **25** |
+| Browser sweep: scenarios / inventory entries / routes | 52 / 196 / 186 |
+| **UI routes without a web/smoke/browser test** | **24** |
 | UI routes without corpus or browser coverage | 0 |
 
 ## By access level
@@ -35,9 +35,9 @@
 | `Access` | routes | reachable from UI | no frontend test | no corpus/browser coverage |
 |---|---:|---:|---:|---:|
 | `RepoRead` | 109 | 70 | 4 | 0 |
-| `RepoWrite` | 86 | 67 | 13 | 2 |
+| `RepoWrite` | 81 | 62 | 12 | 2 |
 | `User` | 57 | 44 | 5 | 0 |
-| `RepoAdmin` | 44 | 44 | 0 | 0 |
+| `RepoAdmin` | 49 | 49 | 0 | 0 |
 | `InstanceAdmin` | 33 | 28 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
 | `RepoAuthRead` | 18 | 18 | 1 | 0 |
@@ -837,11 +837,11 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:settings.mirror.url | :211 | `PATCH /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust+web |
-| i18n:settings.mirror.url | :211 | `POST /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust+web |
-| i18n:common.loading | :252 | `POST /api/v1/repos/{owner}/{name}/mirror/sync` | `RepoWrite` | rust |
-| i18n:common.loading | :252 | `GET /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust+web |
-| i18n:common.loading | :255 | `DELETE /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust+web |
+| i18n:settings.mirror.url | :211 | `PATCH /api/v1/repos/{owner}/{name}/mirror` | `RepoAdmin` | rust+web+browser |
+| i18n:settings.mirror.url | :211 | `POST /api/v1/repos/{owner}/{name}/mirror` | `RepoAdmin` | rust+web+browser |
+| i18n:common.loading | :252 | `POST /api/v1/repos/{owner}/{name}/mirror/sync` | `RepoAdmin` | rust+browser |
+| i18n:common.loading | :252 | `GET /api/v1/repos/{owner}/{name}/mirror` | `RepoAdmin` | rust+web+browser |
+| i18n:common.loading | :255 | `DELETE /api/v1/repos/{owner}/{name}/mirror` | `RepoAdmin` | rust+web+browser |
 
 ### `/[owner]/[repo]/settings/push-mirrors`
 

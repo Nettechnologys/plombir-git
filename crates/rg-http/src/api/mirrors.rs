@@ -5,6 +5,15 @@
 //! PATCH  /api/v1/repos/:owner/:name/mirror       — update mirror settings
 //! DELETE /api/v1/repos/:owner/:name/mirror       — delete mirror
 //! POST   /api/v1/repos/:owner/:name/mirror/sync  — manual sync trigger
+//!
+//! Repository administration, so `RepoAdmin` on every verb, like the push
+//! mirror's. A pass fetches `+refs/heads/*` with `--prune` into the served
+//! repository: every branch is force-moved to the upstream's history and the
+//! ones the upstream lacks are deleted, and none of that goes through branch
+//! protection, which guards receive-pack and the web edits. Once a mirror
+//! exists the repository refuses pushes from everyone. Under `RepoWrite` a
+//! collaborator could point the mirror at their own upstream and rewrite a
+//! protected `main` (card_b42563679dd3).
 
 use axum::{
     extract::{Path, State},
@@ -17,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_grant};
-use crate::api::repo_access::RepoWrite;
+use crate::api::repo_access::RepoAdmin;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -147,13 +156,14 @@ pub struct UpdateMirrorRequest {
         (status = 201, description = "Mirror created", body = MirrorResponse),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Administration access denied", body = serde_json::Value),
         (status = 409, description = "This repository already has a mirror", body = serde_json::Value),
     ),
 )]
 pub async fn create_mirror(
     State(state): State<AppState>,
     Path((owner, _)): Path<(String, String)>,
-    RepoWrite { repo, actor_id }: RepoWrite,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
     headers: HeaderMap,
     Json(body): Json<CreateMirrorRequest>,
 ) -> impl IntoResponse {
@@ -212,20 +222,19 @@ pub async fn create_mirror(
     responses(
         (status = 200, description = "Success", body = MirrorResponse),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
-        (status = 403, description = "Write access denied", body = serde_json::Value),
+        (status = 403, description = "Administration access denied", body = serde_json::Value),
         (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
 pub async fn get_mirror(
     State(state): State<AppState>,
-    // Write access, not read access: a mirror is repository *administration*,
-    // not repository content. The reply names the remote and its username and
-    // says whether a credential is stored — under `RepoRead` a public repo
-    // handed all of that to anonymous callers. The other four verbs on this
-    // resource already require write, and the settings UI that consumes this
-    // endpoint lives behind the same door, so read is the odd one out. (GitHub
-    // likewise shows mirror configuration only with push access.)
-    RepoWrite { repo, .. }: RepoWrite,
+    // Administration, not read access: a mirror is repository
+    // *administration*, not repository content. The reply names the remote and
+    // its username and says whether a credential is stored — under `RepoRead` a
+    // public repo handed all of that to anonymous callers. The other four verbs
+    // on this resource require the same, and the settings UI that consumes this
+    // endpoint lives behind the same door.
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
     match rg_core::mirror::service::get_mirror(&state.db, repo.id).await {
         Ok(Some(mirror)) => (StatusCode::OK, Json(MirrorResponse::from(mirror))).into_response(),
@@ -248,13 +257,14 @@ pub async fn get_mirror(
         (status = 200, description = "Updated", body = MirrorResponse),
         (status = 400, description = "Unknown `status` value", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Administration access denied", body = serde_json::Value),
         (status = 404, description = "No mirror configured", body = serde_json::Value),
     ),
 )]
 pub async fn update_mirror(
     State(state): State<AppState>,
     Path((owner, _)): Path<(String, String)>,
-    RepoWrite { repo, actor_id }: RepoWrite,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
     headers: HeaderMap,
     Json(body): Json<UpdateMirrorRequest>,
 ) -> impl IntoResponse {
@@ -314,6 +324,7 @@ pub async fn update_mirror(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Administration access denied", body = serde_json::Value),
         (status = 404, description = "No mirror configured", body = serde_json::Value),
         (status = 409, description = "A sync pass is in flight", body = serde_json::Value),
     ),
@@ -321,7 +332,7 @@ pub async fn update_mirror(
 pub async fn delete_mirror(
     State(state): State<AppState>,
     Path((owner, _)): Path<(String, String)>,
-    RepoWrite { repo, actor_id }: RepoWrite,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let audit_actor = match grant_actor(&state, actor_id).await {
@@ -373,6 +384,7 @@ pub async fn delete_mirror(
     responses(
         (status = 200, description = "Sync triggered", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Administration access denied", body = serde_json::Value),
         (status = 404, description = "No mirror configured", body = serde_json::Value),
         (status = 409, description = "The mirror is switched off", body = serde_json::Value),
     ),
@@ -380,7 +392,7 @@ pub async fn delete_mirror(
 pub async fn trigger_mirror_sync(
     State(state): State<AppState>,
     Path((_, _)): Path<(String, String)>,
-    RepoWrite { repo, .. }: RepoWrite,
+    RepoAdmin { repo, .. }: RepoAdmin,
 ) -> impl IntoResponse {
     match rg_core::mirror::service::trigger_sync(
         &state.db,
