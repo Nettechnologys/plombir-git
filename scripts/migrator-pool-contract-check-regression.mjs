@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Mutation stand for migrator-pool-contract-check.mjs. The clean-tree pass
-// proves the two multi-connection regression fixtures remain valid exceptions;
+// proves the three multi-connection regression fixtures remain valid exceptions;
 // changing the previously flaky identity migration fixture back to a pool of
 // two proves the rule still rejects the defect that motivated the gate.
 
@@ -26,6 +26,7 @@ const candidateFiles = [
   'crates/rg-db-migration/src/migrations/m20260805_000005_account_owned_rows_follow_their_parent_tests.rs',
   preparedPoolFixture,
   'crates/rg-db-migration/src/migrations/m20260730_000001_repositories_namespace_unique_tests.rs',
+  'crates/rg-db-migration/src/migrations/m20261014_000004_repositories_name_fold_case_tests.rs',
 ];
 
 function fixtureRoot() {
@@ -71,7 +72,7 @@ function run(fixture) {
 const fixture = fixtureRoot();
 try {
   const clean = run(fixture);
-  if (clean.status !== 0 || !clean.output.includes('8 direct-Migrator test files')) {
+  if (clean.status !== 0 || !clean.output.includes('9 direct-Migrator test files')) {
     console.error(`❌ unmutated Migrator pool fixture did not pass:\n${clean.output}`);
     process.exit(1);
   }
