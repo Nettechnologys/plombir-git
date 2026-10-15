@@ -1613,6 +1613,15 @@ pub(crate) async fn handle_git_receive_pack(
         Ok(outcome) => {
             let (ref_updates, response) =
                 finish_landed_receive_pack(outcome, buf_writer, reader_task).await;
+            record_token_push_denials(
+                credential.as_ref(),
+                &headers,
+                &owner,
+                &repo,
+                repo_model.id,
+                &ref_updates,
+            )
+            .await;
 
             // ── Post-push hooks: trigger CI + Webhook ───────────────
             //
@@ -1676,6 +1685,49 @@ pub(crate) async fn handle_git_receive_pack(
 
             response.into_response()
         }
+    }
+}
+
+/// Journal each ref a token kept off protected branches was refused, as
+/// `agent.scope_denied` — one row per refused ref (card_270b42fd0297).
+///
+/// The refusal itself happens inside `receive-pack`, which answers the client
+/// with an `ng` line and knows nothing of tokens. The REST and MCP doors write
+/// this row where they refuse; without it, the push — the most direct attempt
+/// on a protected branch an agent can make — was the one refusal its owner
+/// could not see in the audit log.
+async fn record_token_push_denials(
+    credential: Option<&GitCredential>,
+    headers: &axum::http::HeaderMap,
+    owner: &str,
+    repo: &str,
+    repo_id: i64,
+    ref_updates: &[rg_git::protocol::receive_pack::RefUpdate],
+) {
+    let Some(grant) = credential.and_then(|credential| credential.grant.as_ref()) else {
+        return;
+    };
+    for update in ref_updates {
+        let Some(rule) = rg_core::branch_protection::push_rules::token_narrowing_refusal(update)
+        else {
+            continue;
+        };
+        grant
+            .record_denial(
+                headers,
+                serde_json::json!({
+                    "reason": "protected_branch",
+                    "transport": "git",
+                    "repository": format!("{owner}/{repo}"),
+                    "repo_id": repo_id,
+                    "branch": update
+                        .refname
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(&update.refname),
+                    "rule": rule,
+                }),
+            )
+            .await;
     }
 }
 

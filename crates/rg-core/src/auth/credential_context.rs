@@ -103,9 +103,9 @@ pub async fn refuse_protected_write(
         })),
     )
     .await;
-    Err(crate::error::forbidden(format!(
-        "this token may not write to protected branch '{branch}'"
-    )))
+    Err(crate::error::forbidden(
+        crate::branch_protection::push_rules::token_protected_refusal(branch),
+    ))
 }
 
 /// The audit action of every refusal a token's narrowing produces.

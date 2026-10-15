@@ -16,9 +16,35 @@
 
 use anyhow::{Context, Result};
 use rg_db::ops::{protected_branch_ops, protected_tag_ops};
-use rg_git::protocol::receive_pack::{validate_tag_protection_pattern, PushPolicy};
+use rg_git::protocol::receive_pack::{validate_tag_protection_pattern, PushPolicy, RefUpdate};
 use rg_git::signatures::{RegisteredSigningKey, SigningKeyKind};
 use sea_orm::DatabaseConnection;
+
+const TOKEN_PROTECTED_REFUSAL: &str = "this token may not write to protected branch '";
+
+/// The refusal a token kept off protected branches reads for `branch` — in a
+/// push's `ng` line and in a server-side write's 403 alike.
+pub fn token_protected_refusal(branch: &str) -> String {
+    format!("{TOKEN_PROTECTED_REFUSAL}{branch}'")
+}
+
+/// The protection rule a token's narrowing refused `update` under, when that
+/// is why the update was refused.
+///
+/// The narrowing is enforced inside `receive-pack`, which knows refusals only
+/// as `(status, message)`. Reading the message back here, beside the one
+/// function that writes it, is what lets the transport journal the refusal as
+/// `agent.scope_denied` (card_270b42fd0297). A ref the pull mirror refused
+/// first carries the mirror's message and is not the token's refusal.
+pub fn token_narrowing_refusal(update: &RefUpdate) -> Option<&str> {
+    if update.status != "error" {
+        return None;
+    }
+    update
+        .message
+        .strip_prefix(TOKEN_PROTECTED_REFUSAL)?
+        .strip_suffix('\'')
+}
 
 /// Everything `receive-pack` must hold one push to in `repo_id`, for the
 /// account `actor_id` (`None` for a deploy key).
@@ -53,10 +79,7 @@ pub async fn load_receive_pack_policy(
         rejected_refs.extend(protection_rules.iter().map(|rule| {
             (
                 format!("refs/heads/{}", rule.protection.branch_name),
-                format!(
-                    "this token may not write to protected branch '{}'",
-                    rule.protection.branch_name
-                ),
+                token_protected_refusal(&rule.protection.branch_name),
             )
         }));
     }
@@ -268,6 +291,35 @@ fn tag_push_allowed_by_rule(
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    fn refused(message: &str, status: &str) -> RefUpdate {
+        RefUpdate {
+            old_sha: "0".repeat(40),
+            new_sha: "1".repeat(40),
+            refname: "refs/heads/release/1".to_string(),
+            status: status.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_token_refusal_reads_back_as_the_rule_that_wrote_it() {
+        let written = token_protected_refusal("release/*");
+        assert_eq!(
+            token_narrowing_refusal(&refused(&written, "error")),
+            Some("release/*")
+        );
+        // An accepted update carrying the text, and refusals of any other
+        // origin, are not the token's.
+        assert_eq!(token_narrowing_refusal(&refused(&written, "ok")), None);
+        assert_eq!(
+            token_narrowing_refusal(&refused(
+                "push to protected branch 'main' is not allowed",
+                "error"
+            )),
+            None
+        );
+    }
 
     fn branch_rule(allowed_push_user_ids: &[i64]) -> protected_branch_ops::Rule {
         protected_branch_ops::Rule {

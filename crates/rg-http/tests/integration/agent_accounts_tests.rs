@@ -605,8 +605,29 @@ async fn a_token_kept_off_protected_branches_cannot_write_there() {
         stderr.contains("this token may not write to protected branch 'main'"),
         "{stderr}"
     );
+    // And journalled like the other four (card_270b42fd0297): exactly one row
+    // for the one refused ref, naming the branch and the token. The REST rows
+    // carry the token in the request's credential stamp; it is the same token.
+    let denied = f.denials("protected_branch").await;
+    assert_eq!(
+        denied.len(),
+        5,
+        "the refused push is journalled: {denied:?}"
+    );
+    let pushed_denial = &denied[4];
+    assert_eq!(pushed_denial["transport"], "git", "{pushed_denial}");
+    assert_eq!(pushed_denial["branch"], "main", "{pushed_denial}");
+    let kept_off_id = &denied[0]["credential"]["token_id"];
+    assert!(kept_off_id.is_i64(), "{:?}", denied[0]);
+    assert_eq!(&pushed_denial["token_id"], kept_off_id, "{pushed_denial}");
+
     let (pushed, stderr) = git_outcome(&["push", &remote(&trusted), "HEAD:main"], Some(&checkout));
     assert!(pushed, "the unnarrowed token's push: {stderr}");
+    assert_eq!(
+        f.denials("protected_branch").await.len(),
+        5,
+        "an accepted push wrote a denial"
+    );
 }
 
 /// A token confined to repositories reaches only those over git, too — and a
