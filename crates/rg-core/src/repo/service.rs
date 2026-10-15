@@ -2296,7 +2296,7 @@ fn repository_filesystem_directories(
             hint: crate::platform::fs::REPO_ROOT_HINT,
         },
         RepositoryFilesystemDirectory {
-            live: repo_root.join("_ci_cache").join(repo.id.to_string()),
+            live: crate::ci_cache::archive_dir(repo_root, repo.id),
             kind: "CI cache directory",
             hint: crate::platform::fs::CI_CACHE_DIR_HINT,
         },

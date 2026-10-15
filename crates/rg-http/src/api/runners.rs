@@ -1239,7 +1239,6 @@ pub async fn download_cache(
         Ok(scope) => scope,
         Err(error) => return error.into_response(),
     };
-    let directory = cache_archive_dir(&state, repo_id);
     let mut expired_seen = false;
     let mut live = None;
     for key_hash in scope.restore_hashes(key) {
@@ -1251,7 +1250,11 @@ pub async fn download_cache(
             Ok(None) => continue,
             Err(error) => return error.into_response(),
         };
-        let path = match recorded_cache_archive(&directory, &entry.file_path) {
+        let path = match rg_core::ci_cache::recorded_archive(
+            &state.repo_root,
+            repo_id,
+            &entry.file_path,
+        ) {
             Some(path) => path,
             None => {
                 return AppError::internal(anyhow::anyhow!(
@@ -1516,7 +1519,7 @@ pub async fn upload_cache(
         Ok(scope) => scope.save_hash(key),
         Err(error) => return error.into_response(),
     };
-    let directory = cache_archive_dir(&state, repo_id);
+    let directory = rg_core::ci_cache::archive_dir(&state.repo_root, repo_id);
     if let Err(error) = tokio::fs::create_dir_all(&directory).await {
         return cache_path_error("CI cache directory", &directory, &error).into_response();
     }
@@ -1680,28 +1683,6 @@ fn cache_key_header(headers: &HeaderMap) -> Result<&str, AppError> {
         return Err(AppError::bad_request("cache key must contain 1-512 bytes"));
     }
     Ok(key)
-}
-
-/// Where one repository's cache archives live.
-fn cache_archive_dir(state: &AppState, repo_id: i64) -> std::path::PathBuf {
-    state.repo_root.join("_ci_cache").join(repo_id.to_string())
-}
-
-/// Resolve the archive a cache row names, inside `directory` and nowhere else.
-///
-/// A row records the full path it was written under, and both writers — this
-/// module and the in-process runner in `rg_ci` — spell that root differently
-/// (configured `repo_root` versus a path derived from the repository), so the
-/// prefix is not something either side can compare against. The file name is:
-/// every archive of a repository sits directly in this one directory, which is
-/// also what keeps a row from ever addressing a file outside it.
-fn recorded_cache_archive(
-    directory: &std::path::Path,
-    recorded: &str,
-) -> Option<std::path::PathBuf> {
-    std::path::Path::new(recorded)
-        .file_name()
-        .map(|name| directory.join(name))
 }
 
 /// One actionable error for a filesystem failure on the server side of the CI

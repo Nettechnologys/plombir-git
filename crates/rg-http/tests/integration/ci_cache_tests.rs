@@ -871,6 +871,82 @@ async fn http_cache_publication_refuses_an_unwritable_journal() {
     );
 }
 
+/// The embedded runner and the external runners' HTTP route are two writers
+/// and two readers of one directory. The embedded runner publishes through
+/// `rg_core::ci_cache::publish_from_spool` under a root it derives itself; the
+/// HTTP route must serve that archive, and both must have written it where
+/// `_ci_cache/<repo_id>/` says, however the root was spelled.
+#[tokio::test]
+async fn an_archive_the_embedded_runner_published_is_served_over_http() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let (owner_token, _owner_id) = register_full(
+        &app.base,
+        "cache_two_writers",
+        "cache_two_writers@example.com",
+    )
+    .await;
+    let repo_id = create_private_repo(&app.base, &owner_token, "two-writers").await;
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &app.db,
+        repo_id,
+        "cache-runner-two-writers",
+        "",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let cache_key = "deps-two-writers";
+    let job_id = create_cached_job(&app.db, repo_id, runner.id, cache_key).await;
+
+    // Another spelling of the same root, as a path derived from elsewhere.
+    let last = app.repo_root.file_name().expect("repo_root has a name");
+    let embedded_root = app.repo_root.join("..").join(last);
+    let directory = rg_core::ci_cache::archive_dir(&embedded_root, repo_id);
+    std::fs::create_dir_all(&directory).unwrap();
+    let bytes = b"archive the embedded runner packed".to_vec();
+    let mut spool = rg_core::ci_cache::spool_in(&directory).unwrap();
+    std::io::Write::write_all(&mut spool, &bytes).unwrap();
+    let sha = hex::encode(Sha256::digest(&bytes));
+    let entry = rg_core::ci_cache::publish_from_spool(
+        &app.db,
+        &embedded_root,
+        repo_id,
+        &key_hash(cache_key),
+        spool.into_temp_path(),
+        i64::try_from(bytes.len()).unwrap(),
+        &sha,
+        &rg_core::storage_quota::StorageLimits::default(),
+    )
+    .await
+    .expect("embedded publication");
+
+    let name = std::path::Path::new(&entry.file_path)
+        .file_name()
+        .expect("recorded archive name")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        leftover_cache_files(&cache_dir(&app.repo_root, repo_id)),
+        vec![name],
+        "the embedded runner wrote somewhere other than _ci_cache/<repo_id>/"
+    );
+
+    let download = reqwest::Client::new()
+        .get(format!(
+            "{}/api/v1/runners/{}/jobs/{}/cache",
+            app.base, runner.id, job_id
+        ))
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(download.status(), 200);
+    assert_eq!(download.bytes().await.unwrap().as_ref(), bytes.as_slice());
+}
+
 /// Publish one cache archive through the real upload route.
 ///
 /// Hands back the owner's token (the retention route is repo-admin only), the
@@ -1006,6 +1082,50 @@ async fn expired_cache_cleanup_restores_an_archive_refreshed_during_eviction() {
             .to_string_lossy()
             .into_owned()],
         "restoring the live archive left a retention tombstone or lost the publication"
+    );
+}
+
+/// Retention finds an archive the way the readers do: by the recorded file
+/// name in the repository's directory under the current `repo_root`. A row
+/// written before the data directory moved still spells the old root; taking
+/// that spelling literally made the sweep delete the row as if its archive
+/// were already gone and leave the archive on disk with nothing pointing at it.
+#[tokio::test]
+async fn expired_cache_cleanup_removes_an_archive_recorded_under_an_old_root() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let owner = "cache_retention_moved";
+    let repo = "retention-moved";
+    let cache_key = "deps-moved";
+    let (token, repo_id, archive) = published_cache(&app, owner, repo, cache_key).await;
+    let name = archive
+        .file_name()
+        .expect("published archive name")
+        .to_string_lossy()
+        .into_owned();
+    let old_spelling = format!("/srv/plombir-git-before-the-move/_ci_cache/{repo_id}/{name}");
+    let cache_id = expire_cache(&app.db, repo_id, cache_key).await;
+    let entry = cache_entry(&app.db, repo_id, cache_key)
+        .await
+        .expect("expired cache entry");
+    let mut moved: rg_db::entities::ci_cache_entry::ActiveModel = entry.into();
+    moved.file_path = Set(old_spelling);
+    moved.update(&app.db).await.expect("record the old root");
+
+    let summary = cleanup_expired(&app, &token, owner, repo).await;
+    assert_eq!(summary["failures"], 0, "{summary}");
+    assert_eq!(summary["caches_deleted"], 1, "{summary}");
+    assert!(
+        cache_entry(&app.db, repo_id, cache_key).await.is_none(),
+        "cache entry {cache_id} survived its retention window"
+    );
+    assert!(
+        !archive.exists(),
+        "the row is gone but its archive is still on disk"
+    );
+    assert_eq!(
+        leftover_cache_files(&cache_dir(&app.repo_root, repo_id)),
+        Vec::<String>::new(),
+        "retention left a tombstone or an orphaned archive behind"
     );
 }
 

@@ -234,7 +234,7 @@ pub async fn publish_from_spool(
 
     if let Some(previous) = replaced
         .as_deref()
-        .and_then(|recorded| recorded_archive(&directory, recorded))
+        .and_then(|recorded| recorded_archive(repo_root, repo_id, recorded))
     {
         if previous != archive {
             discard_replaced(&previous, repo_id, key_hash).await;
@@ -244,14 +244,34 @@ pub async fn publish_from_spool(
     Ok(recorded)
 }
 
-fn archive_dir(repo_root: &Path, repo_id: i64) -> PathBuf {
-    repo_root.join("_ci_cache").join(repo_id.to_string())
+/// The directory under `repo_root` that holds every repository's CI cache.
+///
+/// This and [`archive_dir`] / [`recorded_archive`] are the one spelling of the
+/// layout: the embedded runner, the external runners' HTTP route, retention
+/// and repository deletion all address archives through them, so no two of
+/// them can disagree about where an archive lives.
+pub fn archive_root(repo_root: &Path) -> PathBuf {
+    repo_root.join("_ci_cache")
 }
 
-fn recorded_archive(directory: &Path, recorded: &str) -> Option<PathBuf> {
+/// Where one repository's cache archives live.
+pub fn archive_dir(repo_root: &Path, repo_id: i64) -> PathBuf {
+    archive_root(repo_root).join(repo_id.to_string())
+}
+
+/// The archive a cache row of `repo_id` names, inside that repository's
+/// directory and nowhere else.
+///
+/// A row records the full path it was written under, but that prefix is a
+/// spelling of `repo_root` at write time: the embedded runner and the HTTP
+/// route spell it differently, and a moved data directory changes it for
+/// every row at once. The file name is what identifies the archive. Taking
+/// only the name also keeps a row from ever addressing a file outside its
+/// repository's directory.
+pub fn recorded_archive(repo_root: &Path, repo_id: i64, recorded: &str) -> Option<PathBuf> {
     Path::new(recorded)
         .file_name()
-        .map(|name| directory.join(name))
+        .map(|name| archive_dir(repo_root, repo_id).join(name))
 }
 
 async fn cleanup_uncommitted(

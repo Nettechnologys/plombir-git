@@ -106,7 +106,6 @@ pub async fn cleanup_expired_storage(
     state: &AppState,
     repo_filter: Option<i64>,
 ) -> anyhow::Result<CleanupResponse> {
-    let cache_root = state.repo_root.join("_ci_cache");
     let mut summary = CleanupResponse::default();
     for artifact in rg_db::ops::artifact_ops::list_expired(&state.db).await? {
         if let Some(repo_id) = repo_filter {
@@ -177,14 +176,7 @@ pub async fn cleanup_expired_storage(
         // tombstone last. Nothing here may be fatal to the sweep either — one
         // cache entry that cannot be cleaned is a `failures` line, not a reason
         // to abandon every entry behind it and drop the summary on the floor.
-        let staging = match CacheDeletionStaging::prepare(
-            state,
-            cache.id,
-            &cache.file_path,
-            &cache_root,
-        )
-        .await
-        {
+        let staging = match CacheDeletionStaging::prepare(state, &cache).await {
             Ok(staging) => staging,
             Err(error) => {
                 summary.failures += 1;
@@ -553,32 +545,45 @@ struct CacheDeletionStaging {
 impl CacheDeletionStaging {
     /// Move the archive out of the live namespace.
     ///
+    /// The archive is found the way every reader finds it, by the recorded file
+    /// name inside the repository's cache directory under the current
+    /// `repo_root` (`rg_core::ci_cache::recorded_archive`). Taking the recorded
+    /// path literally used to disagree with them: after the data directory
+    /// moved, the old spelling named nothing, the entry was deleted as if its
+    /// archive were already gone, and the archive stayed on disk with no row.
+    ///
     /// An archive that is already gone is the end state this call is asked for,
     /// so it stages nothing and succeeds — otherwise an entry whose file an
-    /// operator removed by hand could never be cleaned at all. A recorded path
-    /// outside the managed cache root, or a filesystem failure, fails here —
-    /// before the entry is touched.
+    /// operator removed by hand could never be cleaned at all. A path that
+    /// resolves outside the repository's cache directory (through a symlink),
+    /// or a filesystem failure, fails here — before the entry is touched.
     async fn prepare(
         state: &AppState,
-        cache_id: i64,
-        recorded: &str,
-        root: &FsPath,
+        cache: &rg_db::entities::ci_cache_entry::Model,
     ) -> anyhow::Result<Self> {
         let mut staging = Self {
-            cache_id,
+            cache_id: cache.id,
             archive: None,
             deletion_id: None,
         };
-        let live = PathBuf::from(recorded);
+        let root = rg_core::ci_cache::archive_dir(&state.repo_root, cache.repo_id);
+        let Some(live) =
+            rg_core::ci_cache::recorded_archive(&state.repo_root, cache.repo_id, &cache.file_path)
+        else {
+            anyhow::bail!(
+                "stored path {} does not name a CI cache archive",
+                cache.file_path
+            );
+        };
         if !live.exists() {
             return Ok(staging);
         }
         let canonical_path = tokio::fs::canonicalize(&live)
             .await
             .map_err(|error| cache_cleanup_error("CI cache archive", &live, &error))?;
-        let canonical_root = tokio::fs::canonicalize(root)
+        let canonical_root = tokio::fs::canonicalize(&root)
             .await
-            .map_err(|error| cache_cleanup_error("CI cache directory", root, &error))?;
+            .map_err(|error| cache_cleanup_error("CI cache directory", &root, &error))?;
         if !canonical_path.starts_with(&canonical_root) {
             anyhow::bail!(
                 "stored path {} is outside managed storage root {}",

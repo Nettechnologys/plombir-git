@@ -1606,9 +1606,7 @@ impl PipelineRunner {
 
     /// Where this repository's cache archives live.
     fn cache_archive_dir(&self) -> std::path::PathBuf {
-        self.storage_root()
-            .join("_ci_cache")
-            .join(self.repo_id.to_string())
+        rg_core::ci_cache::archive_dir(self.storage_root(), self.repo_id)
     }
 
     /// See the field: the root every repository lives under.
@@ -1641,8 +1639,11 @@ impl PipelineRunner {
         let Some(entry) = existing else {
             return Ok(false);
         };
-        let Some(archive) = recorded_cache_archive(&self.cache_archive_dir(), &entry.file_path)
-        else {
+        let Some(archive) = rg_core::ci_cache::recorded_archive(
+            self.storage_root(),
+            self.repo_id,
+            &entry.file_path,
+        ) else {
             anyhow::bail!("CI cache entry {} names no archive file", entry.id);
         };
         if entry.expires_at <= chrono::Utc::now() {
@@ -1933,23 +1934,6 @@ fn append_job_notices(mut log: String, notices: &[String]) -> String {
         }
     }
     log
-}
-
-/// Resolve the archive a cache row names, inside `directory` and nowhere else.
-///
-/// A row records the full path it was written under, and the two writers — this
-/// runner and `rg_http`'s cache endpoints — spell that root differently (a path
-/// derived from the repository versus the configured `repo_root`), so the prefix
-/// is not something either side can compare against. The file name is: every
-/// archive of a repository sits directly in this one directory, which is also
-/// what keeps a row from ever addressing a file outside it.
-fn recorded_cache_archive(
-    directory: &std::path::Path,
-    recorded: &str,
-) -> Option<std::path::PathBuf> {
-    std::path::Path::new(recorded)
-        .file_name()
-        .map(|name| directory.join(name))
 }
 
 /// Hex-encoded SHA-256 of a file's *contents*, streamed in bounded chunks so a
