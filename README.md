@@ -123,20 +123,22 @@ If your workflows lean on marketplace actions, services or step outputs, Gitea
 will run them and Plombir Git will not. Plombir Git also has its own pipeline format,
 [`.plombir-git-ci.yml`](docs/ci.md), for what the subset cannot express.
 
-## Memory: measured, and not good yet
+## Memory: measured
 
-We publish only numbers we measured, and this one is our weak spot:
+We publish only numbers we measured:
 
 | Build | Load | `VmRSS` at idle | `VmHWM` (peak) |
 |-------|------|-----------------|----------------|
 | `1e3679f`, before the fix below | Production instance: 40 days up, 4 users, 35 MB database, 14 MB of repositories | 1.21 GB | 2.56 GB |
+| Build of 2026-10-06, with `1068860` | The same production instance: 9.8 days up | 258 MB | 395 MB |
 
-1.14 GB of that idle figure was 31 glibc per-thread malloc arenas of about
+1.14 GB of the first idle figure was 31 glibc per-thread malloc arenas of about
 58 MB each, held fully resident by transparent huge pages. Since `1068860` the
 server caps glibc at two arenas before it starts its worker threads (an explicit
-`MALLOC_ARENA_MAX` still wins). The measurement after that fix has not been
-taken yet; it will replace this paragraph when it has. Until then, "lightweight"
-is a goal rather than a measured claim.
+`MALLOC_ARENA_MAX` still wins). On the same host, still with transparent huge
+pages set to `always`, that is 4.7 times less at idle and 6.5 times less at
+peak; 178 MiB of the idle figure is in huge pages (`AnonHugePages`). Both rows
+are read from `/proc/<pid>/status` of the running server.
 
 ## How it is built
 
