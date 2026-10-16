@@ -659,3 +659,145 @@ async fn a_shallow_clone_pushes_and_deletes_a_branch_over_ssh() {
 
     server.abort();
 }
+
+/// card_28f9a52fcd9a, the SSH half: stock git pinned to protocol v0 clones
+/// with `--depth` over a live SSH stream and deepens the clone. This is the
+/// stateful transport — the shallow update and the negotiation share one
+/// conversation, unlike HTTP's request per round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protocol_v0_client_clones_shallow_and_deepens_over_ssh() {
+    let app_dir = tempfile::tempdir().unwrap();
+    let db = rg_db::connect_with_pool(
+        &format!(
+            "sqlite://{}?mode=rwc",
+            app_dir.path().join("test.db").display()
+        ),
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
+        60,
+        2,
+    )
+    .await
+    .unwrap();
+    rg_db::run_migrations(&db).await.unwrap();
+    let user = rg_db::ops::user_ops::create_user(&db, "v0-ssh", "v0-ssh@example.com", "", "V0")
+        .await
+        .unwrap();
+    let repo_root = app_dir.path().join("repos");
+    rg_core::repo::service::create_repo(&db, user.id, "deep", None, true, &repo_root, None)
+        .await
+        .unwrap();
+    let bare_path = repo_root.join("v0-ssh/deep.git");
+
+    let client_key = app_dir.path().join("client_ed25519");
+    let keygen = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&client_key)
+        .status()
+        .expect("ssh-keygen must be installed for SSH integration tests");
+    assert!(keygen.success());
+    let public_key = std::fs::read_to_string(client_key.with_extension("pub")).unwrap();
+    let public_key = public_key.trim();
+    rg_db::ops::ssh_key_ops::create(
+        &db,
+        rg_db::entities::ssh_key::ActiveModel {
+            id: sea_orm::NotSet,
+            user_id: Set(user.id),
+            title: Set("v0 shallow".to_string()),
+            public_key: Set(public_key.to_string()),
+            fingerprint: Set(rg_core::auth::ssh_key::fingerprint_from_openssh(public_key).unwrap()),
+            created_at: Set(chrono::Utc::now()),
+            last_used_at: Set(None),
+        },
+    )
+    .await
+    .unwrap();
+
+    let server = common::spawn_ssh_server(rg_ssh::SshServerConfig {
+        host_key_path: app_dir.path().join("host_ed25519"),
+        listen_addr: "127.0.0.1:0".to_string(),
+        repo_root: repo_root.clone(),
+        db: db.clone(),
+        db_write: db.clone(),
+        instance_settings: Default::default(),
+        git_stream_timeout_secs: 300,
+        git_idle_timeout_secs: 30,
+        post_push: None,
+        lfs: None,
+        shutdown: None,
+        shutdown_grace_secs: 5,
+    })
+    .await;
+
+    let seed = tempfile::tempdir().unwrap();
+    let seed_arg = seed.path().to_string_lossy();
+    git(&["init", "--initial-branch=main", &seed_arg], None);
+    git(&["config", "user.name", "V0 SSH"], Some(seed.path()));
+    git(
+        &["config", "user.email", "v0-ssh@example.com"],
+        Some(seed.path()),
+    );
+    for index in 0..5 {
+        std::fs::write(seed.path().join("history.txt"), format!("{index}\n")).unwrap();
+        git(&["add", "."], Some(seed.path()));
+        git(&["commit", "-q", "-m", "history"], Some(seed.path()));
+    }
+    let bare_arg = bare_path.to_string_lossy();
+    git(&["push", "-q", &bare_arg, "main"], Some(seed.path()));
+    git(
+        &[
+            "--git-dir",
+            &bare_arg,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+        None,
+    );
+
+    let ssh_command = format!(
+        "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes",
+        client_key.display()
+    );
+    let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+    let v0 = |args: &[&str], cwd: Option<&Path>| {
+        let mut full = vec!["-c", "protocol.version=0"];
+        full.extend_from_slice(args);
+        let output = gateway
+            .run_with_env(&full, cwd, &[("GIT_SSH_COMMAND", ssh_command.as_str())])
+            .unwrap();
+        assert!(
+            output.success(),
+            "git {full:?} over SSH: {}",
+            output.stderr_str()
+        );
+    };
+
+    let parent = tempfile::tempdir().unwrap();
+    let clone = parent.path().join("clone");
+    let remote = format!("ssh://git@{}/v0-ssh/deep.git", server.addr());
+    v0(
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &remote,
+            &clone.to_string_lossy(),
+        ],
+        None,
+    );
+    assert!(
+        clone.join(".git/shallow").is_file(),
+        "the clone is not shallow"
+    );
+    assert_eq!(git(&["rev-list", "--count", "HEAD"], Some(&clone)), "1");
+
+    v0(&["fetch", "-q", "--deepen", "2"], Some(&clone));
+    assert_eq!(git(&["rev-list", "--count", "HEAD"], Some(&clone)), "3");
+
+    v0(&["fetch", "-q", "--unshallow"], Some(&clone));
+    assert!(!clone.join(".git/shallow").exists());
+    assert_eq!(git(&["rev-list", "--count", "HEAD"], Some(&clone)), "5");
+
+    server.abort();
+}

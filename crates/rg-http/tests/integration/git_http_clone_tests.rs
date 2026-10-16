@@ -291,6 +291,140 @@ async fn a_protocol_v0_fetch_gets_what_it_lacks_and_never_a_hidden_ref() {
     drop(dir);
 }
 
+/// card_28f9a52fcd9a: a client that speaks only protocol v0/v1 — git before
+/// 2.26, libgit2, JGit, go-git — clones with `--depth`, deepens, fetches into
+/// the shallow clone and unshallows it. The v0 advertisement carried no
+/// `shallow` capability and the `shallow` / `deepen` lines were skipped, so
+/// stock `fetch-pack` refused all of it with `Server does not support shallow
+/// clients`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_protocol_v0_client_clones_shallow_deepens_and_unshallows() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let user = rg_db::ops::user_ops::create_user(&db, "v0-shallow", "v0s@example.com", "", "V0")
+        .await
+        .unwrap();
+    rg_core::repo::service::create_repo(&db, user.id, "deep", None, false, &repo_root, None)
+        .await
+        .unwrap();
+    let bare = repo_root.join("v0-shallow/deep.git");
+    let bare_str = bare.to_string_lossy().to_string();
+
+    let scratch = tempfile::tempdir().unwrap();
+    let seed = scratch.path().join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    git(&["init", "-q", "--initial-branch=main"], Some(&seed));
+    git(&["config", "user.name", "V0 Seed"], Some(&seed));
+    git(&["config", "user.email", "v0s@example.com"], Some(&seed));
+    let commit = |work: &Path, name: &str| {
+        std::fs::write(work.join(name), format!("{name}\n")).unwrap();
+        git(&["add", name], Some(work));
+        git(&["commit", "-q", "-m", name], Some(work));
+        git(&["rev-parse", "HEAD"], Some(work))
+    };
+    for index in 0..6 {
+        commit(&seed, &format!("history-{index}.txt"));
+    }
+    git(&["push", "-q", &bare_str, "main"], Some(&seed));
+    git(
+        &[
+            "--git-dir",
+            &bare_str,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+        None,
+    );
+
+    let state = build_test_app_state(db.clone(), repo_root.clone());
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    wait_for_listener(&addr).await;
+
+    let url = format!("http://{addr}/v0-shallow/deep.git");
+    let clone = scratch.path().join("clone");
+    // Every command pins v0; a run against v2 would prove nothing here.
+    let v0 = move |args: Vec<String>, cwd: Option<std::path::PathBuf>| async move {
+        tokio::task::spawn_blocking(move || {
+            let mut full = vec!["-c".to_string(), "protocol.version=0".to_string()];
+            full.extend(args);
+            let refs = full.iter().map(String::as_str).collect::<Vec<_>>();
+            git(&refs, cwd.as_deref())
+        })
+        .await
+        .unwrap()
+    };
+    let depth = |clone: &Path| git(&["rev-list", "--count", "HEAD"], Some(clone));
+
+    v0(
+        vec![
+            "clone".into(),
+            "-q".into(),
+            "--depth".into(),
+            "1".into(),
+            url.clone(),
+            clone.to_string_lossy().into_owned(),
+        ],
+        None,
+    )
+    .await;
+    assert!(
+        clone.join(".git/shallow").is_file(),
+        "the clone is not shallow"
+    );
+    assert_eq!(depth(&clone), "1", "a depth-1 clone holds one commit");
+
+    v0(
+        vec!["fetch".into(), "-q".into(), "--deepen".into(), "2".into()],
+        Some(clone.clone()),
+    )
+    .await;
+    assert_eq!(
+        depth(&clone),
+        "3",
+        "--deepen 2 fetches two more generations"
+    );
+
+    // A plain fetch into the shallow clone: the client sends its `shallow`
+    // lines and no depth, and gets the new commit.
+    let upstream = commit(&seed, "upstream.txt");
+    git(&["push", "-q", &bare_str, "main"], Some(&seed));
+    v0(
+        vec!["fetch".into(), "-q".into(), "origin".into()],
+        Some(clone.clone()),
+    )
+    .await;
+    assert_eq!(git(&["rev-parse", "origin/main"], Some(&clone)), upstream);
+
+    v0(
+        vec!["fetch".into(), "-q".into(), "--unshallow".into()],
+        Some(clone.clone()),
+    )
+    .await;
+    assert!(
+        !clone.join(".git/shallow").exists(),
+        "--unshallow left the clone shallow"
+    );
+    assert_eq!(
+        git(&["rev-list", "--count", "origin/main"], Some(&clone)),
+        "7",
+        "the unshallowed clone holds the whole history"
+    );
+    let fsck = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .unwrap()
+        .run(&["fsck", "--connectivity-only"], Some(&clone))
+        .unwrap();
+    assert!(fsck.success(), "{}", fsck.stderr_str());
+
+    server.abort();
+    drop(dir);
+}
+
 /// Stock git sends every stateless upload-pack request over 1 KiB with
 /// `Content-Encoding: gzip`. The body used to reach the protocol parser still
 /// compressed, so a fetch with enough `have` lines died with `500 invalid utf-8

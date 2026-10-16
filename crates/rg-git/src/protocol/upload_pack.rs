@@ -5,9 +5,10 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing;
 
+use super::v2::{build_shallow_update, ShallowRequest, ShallowUpdate};
 use super::{pack_stream, ClientRefusal};
 use crate::pkt_line::{read_pkt_line, write_flush, write_pkt_line, PktLine};
 use crate::sideband;
@@ -110,7 +111,11 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let (wants, client_caps) = read_wants(reader).await?;
+    let Wants {
+        wants,
+        capabilities: client_caps,
+        mut shallow,
+    } = read_wants(reader).await?;
     if wants.is_empty() {
         match transport {
             Transport::Stateless => write_flush(writer).await?,
@@ -134,6 +139,33 @@ where
     }
 
     let has = |cap: &str| client_caps.iter().any(|offered| offered == cap);
+
+    // The shallow update comes before any acknowledgment, in every request
+    // that asks for a depth: a stateless client re-sends its `deepen` with each
+    // round and reads the update again ahead of the ACKs (card_28f9a52fcd9a).
+    // Over v0/v1 `deepen-relative` is a capability, not a line.
+    shallow.deepen_relative = has("deepen-relative");
+    shallow.validate()?;
+    let shallow_update = {
+        let (repo_path, wants, shallow) = (repo_path.to_path_buf(), wants.clone(), shallow);
+        tokio::task::spawn_blocking(move || build_shallow_update(&repo_path, &wants, &shallow))
+            .await
+            .context("upload-pack shallow computation did not complete")??
+    };
+    if let Some(update) = &shallow_update {
+        for line in &update.response_lines {
+            write_pkt_line(writer, &PktLine::text(line)).await?;
+        }
+        write_flush(writer).await?;
+    }
+    // A stateless client with a depth first sends its wants alone and reads
+    // only the shallow update back; git's upload-pack ends that request here,
+    // without a `NAK` the client would read as the next round's answer.
+    if transport == Transport::Stateless && reader.fill_buf().await?.is_empty() {
+        writer.flush().await?;
+        return Ok(());
+    }
+
     let mode = if has("multi_ack_detailed") {
         AckMode::Detailed
     } else {
@@ -150,14 +182,30 @@ where
         thin: has("thin-pack"),
         ofs_delta: has("ofs-delta"),
     };
-    send_packfile(repo_path, &wants, &common, writer, options).await
+    send_packfile(
+        repo_path,
+        &wants,
+        &common,
+        shallow_update.as_ref(),
+        writer,
+        options,
+    )
+    .await
 }
 
-/// Read the `want` lines up to the flush that ends them, with the client's
-/// capabilities from the first one.
-async fn read_wants<R: AsyncRead + Unpin>(
-    reader: &mut BufReader<R>,
-) -> Result<(Vec<String>, Vec<String>)> {
+/// The part of an upload-pack request that comes before negotiation.
+#[derive(Debug)]
+struct Wants {
+    wants: Vec<String>,
+    /// The client's capabilities, from the first `want`.
+    capabilities: Vec<String>,
+    /// Its `shallow` boundaries and the depth it asks for.
+    shallow: ShallowRequest,
+}
+
+/// Read the `want`, `shallow` and `deepen*` lines up to the flush that ends
+/// them, with the client's capabilities from the first `want`.
+async fn read_wants<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<Wants> {
     read_wants_with_limits(
         reader,
         super::MAX_NEGOTIATION_ENTRIES,
@@ -170,9 +218,11 @@ async fn read_wants_with_limits<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     max_entries: usize,
     max_bytes: usize,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<Wants> {
     let mut wants = Vec::new();
     let mut capabilities = Vec::new();
+    let mut shallow = ShallowRequest::default();
+    let mut entries = 0_usize;
     let mut input_bytes = 0_usize;
 
     loop {
@@ -213,13 +263,15 @@ async fn read_wants_with_limits<R: AsyncRead + Unpin>(
             tracing::debug!(caps = ?capabilities, "Parsed client capabilities");
         }
 
+        // A `shallow` line is one more object id the request makes the
+        // server look at, so it counts against the same ceiling as a want.
+        entries += 1;
+        if entries > max_entries {
+            return Err(ClientRefusal::new(ENTRY_LIMIT_REFUSAL).into());
+        }
         if let Some(sha) = command.strip_prefix("want ") {
-            if wants.len() >= max_entries {
-                return Err(ClientRefusal::new(ENTRY_LIMIT_REFUSAL).into());
-            }
             wants.push(validated_oid(sha.trim())?);
-        } else {
-            // `shallow` / `deepen` are not advertised and not honoured.
+        } else if !shallow.read_line(command)? {
             tracing::debug!(line = %command, "Unknown upload-pack request line, ignoring");
         }
     }
@@ -229,7 +281,11 @@ async fn read_wants_with_limits<R: AsyncRead + Unpin>(
         caps = capabilities.len(),
         "Upload-pack wants read"
     );
-    Ok((wants, capabilities))
+    Ok(Wants {
+        wants,
+        capabilities,
+        shallow,
+    })
 }
 
 /// How a round of `have` lines ended.
@@ -396,8 +452,20 @@ pub(super) fn validated_oid(sha: &str) -> Result<String> {
 }
 
 /// What the SSH advertisement offers a v0/v1 fetch.
-const UPLOAD_PACK_CAPABILITIES: &str =
-    "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=plombir-git/0.1";
+///
+/// `shallow` and the `deepen-*` family are what stock `git fetch-pack` checks
+/// for before it will send `--depth`, `--shallow-since` or
+/// `--shallow-exclude`, and what it requires of any server once the clone is
+/// shallow; without them every client that does not speak v2 — git before
+/// 2.26, libgit2, JGit, go-git — died with `Server does not support shallow
+/// clients` (card_28f9a52fcd9a).
+const UPLOAD_PACK_CAPABILITIES: &str = "multi_ack_detailed side-band-64k thin-pack ofs-delta \
+     shallow deepen-since deepen-not deepen-relative agent=plombir-git/0.1";
+
+/// What the HTTP `info/refs` advertisement offers a v0/v1 fetch: the SSH set
+/// plus `no-done`, which belongs to the stateless transport.
+pub const HTTP_UPLOAD_PACK_CAPABILITIES: &str = "multi_ack_detailed no-done side-band-64k \
+     thin-pack ofs-delta shallow deepen-since deepen-not deepen-relative agent=plombir-git/0.1";
 
 /// Build ref advertisement from ref list.
 fn build_ref_advertisement_vec(
@@ -481,20 +549,38 @@ async fn send_packfile<W: AsyncWrite + Unpin>(
     repo_path: &Path,
     wants: &[String],
     common: &[String],
+    shallow: Option<&ShallowUpdate>,
     writer: &mut W,
     options: PackOptions,
 ) -> Result<()> {
+    // A depth-changing request is packed the way v2 packs it: the new
+    // boundaries go to `pack-objects` as `--shallow` lines, and the common
+    // objects are not excluded — a shallow client's `have` stands for less
+    // history than the same commit does here, so excluding it would leave out
+    // ancestors the client never had.
     let mut revs = String::new();
+    if let Some(update) = shallow {
+        for boundary in &update.boundaries {
+            revs.push_str("--shallow ");
+            revs.push_str(boundary);
+            revs.push('\n');
+        }
+    }
     for want in wants {
         revs.push_str(want);
         revs.push('\n');
     }
-    for have in common {
-        revs.push('^');
-        revs.push_str(have);
-        revs.push('\n');
+    if shallow.is_none() {
+        for have in common {
+            revs.push('^');
+            revs.push_str(have);
+            revs.push('\n');
+        }
     }
     let mut args = vec!["pack-objects", "--revs", "--stdout"];
+    if shallow.is_some_and(|update| !update.boundaries.is_empty()) {
+        args.push("--shallow");
+    }
     if options.thin {
         args.push("--thin");
     }

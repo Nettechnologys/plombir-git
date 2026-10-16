@@ -1183,7 +1183,7 @@ fn build_info_refs(repo_path: &std::path::Path, service: &str) -> Result<String>
     }
 
     let caps = if service == "git-upload-pack" {
-        "multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=plombir-git/0.1"
+        rg_git::protocol::upload_pack::HTTP_UPLOAD_PACK_CAPABILITIES
     } else {
         rg_git::protocol::receive_pack::CAPABILITIES
     };

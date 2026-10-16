@@ -173,15 +173,42 @@ directly via `exec_request`.
 ### Capabilities (what we advertise)
 
 ```
-side-band-64k ofs-delta agent=plombir-git/0.1
+SSH:  multi_ack_detailed side-band-64k thin-pack ofs-delta shallow deepen-since deepen-not deepen-relative agent=plombir-git/0.1
+HTTP: multi_ack_detailed no-done side-band-64k thin-pack ofs-delta shallow deepen-since deepen-not deepen-relative agent=plombir-git/0.1
 ```
 
-> Note: we do **not** advertise `multi_ack` / `multi_ack_detailed` / `no-done`, because
-> our negotiation loop only implements the simple NAK -> packfile flow.
->
-> Built in `build_ref_advertisement()` in `crates/rg-git/src/protocol/upload_pack.rs`.
-> The HTTP `info/refs` path (`build_info_refs()` in `crates/rg-http/src/lib.rs`) advertises a
-> wider set — `multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=plombir-git/0.1`.
+> Both strings live in `crates/rg-git/src/protocol/upload_pack.rs`
+> (`UPLOAD_PACK_CAPABILITIES`, `HTTP_UPLOAD_PACK_CAPABILITIES`); the HTTP `info/refs`
+> answer (`build_info_refs()` in `crates/rg-http/src/git_http.rs`) takes the second.
+> `no-done` belongs to the stateless transport only.
+
+### Shallow fetches over v0/v1
+
+A v0/v1 request may carry `shallow <oid>` lines (the client's current boundaries) and one
+of `deepen <n>`, `deepen-since <timestamp>` or `deepen-not <ref>` after its wants;
+`deepen-relative` is a capability there, not a line. They are read into the same
+`ShallowRequest` the v2 `fetch` command uses and answered by the same
+`build_shallow_update`:
+
+```
+Client                                   Server
+  | want <sha1>\0... deepen-relative?     |
+  | shallow <oid>*                        |
+  | deepen 1                              |
+  | <flush>                               |
+  |-------------------------------------->|
+  |                    shallow <oid>*     |  <- new boundaries
+  |                  unshallow <oid>*     |  <- boundaries that moved
+  |                            <flush>    |
+  |<--------------------------------------|
+  | have ... / done                       |  <- negotiation as usual
+```
+
+Over HTTP every request repeats the wants and the depth, so every response starts with the
+shallow update again. A stateless client with a depth first sends its wants alone and reads
+only the update back; that request ends there, without a `NAK` — the client reads one there as
+`expected shallow list` and dies. A depth-changing pack is built with the boundaries as
+`--shallow` lines and without excluding the client's haves (card_28f9a52fcd9a).
 
 ### The two forms of want/have
 

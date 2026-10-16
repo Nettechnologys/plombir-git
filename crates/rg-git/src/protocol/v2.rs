@@ -326,13 +326,61 @@ pub enum CommandRequest {
     Unknown(String),
 }
 
+/// What a fetch says about the client's shallow boundaries and the depth it
+/// wants — the same lines in protocol v2's `fetch` arguments and in a v0/v1
+/// upload-pack request, so both read them here and answer them with
+/// [`build_shallow_update`].
 #[derive(Clone, Debug, Default)]
 pub struct ShallowRequest {
     shallows: Vec<String>,
     deepen: Option<u32>,
-    deepen_relative: bool,
+    pub(super) deepen_relative: bool,
     deepen_since: Option<i64>,
     deepen_not: Vec<String>,
+}
+
+impl ShallowRequest {
+    /// Take one `shallow` / `deepen` / `deepen-since` / `deepen-not` line.
+    /// `Ok(false)` when the line is none of them.
+    pub(super) fn read_line(&mut self, line: &str) -> Result<bool> {
+        if let Some(shallow) = line.strip_prefix("shallow ") {
+            self.shallows.push(validated_oid(shallow)?);
+        } else if let Some(depth) = line.strip_prefix("deepen ") {
+            self.deepen = Some(
+                depth
+                    .parse()
+                    .map_err(|_| ClientRefusal::new("invalid deepen value"))?,
+            );
+        } else if let Some(timestamp) = line.strip_prefix("deepen-since ") {
+            self.deepen_since = Some(
+                timestamp
+                    .parse()
+                    .map_err(|_| ClientRefusal::new("invalid deepen-since value"))?,
+            );
+        } else if let Some(revision) = line.strip_prefix("deepen-not ") {
+            self.deepen_not.push(validated_deepen_not(revision)?);
+        } else {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Refuse a combination no client sends and no answer can be computed for.
+    pub(super) fn validate(&self) -> Result<()> {
+        if self.deepen == Some(0) {
+            return Err(ClientRefusal::new("deepen depth must be greater than zero").into());
+        }
+        if self.deepen_relative && self.deepen.is_none() {
+            return Err(ClientRefusal::new("deepen-relative requires deepen").into());
+        }
+        if self.deepen.is_some() && (self.deepen_since.is_some() || !self.deepen_not.is_empty()) {
+            return Err(ClientRefusal::new(
+                "deepen cannot be combined with deepen-since or deepen-not",
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 /// Read a Protocol V2 command request.
@@ -494,11 +542,7 @@ fn parse_ls_refs_args(args: &[String]) -> CommandRequest {
 fn parse_fetch_args(args: &[String]) -> Result<CommandRequest> {
     let mut wants = Vec::new();
     let mut haves = Vec::new();
-    let mut shallows = Vec::new();
-    let mut deepen = None;
-    let mut deepen_relative = false;
-    let mut deepen_since = None;
-    let mut deepen_not = Vec::new();
+    let mut shallow = ShallowRequest::default();
     let mut filter = None;
     let mut done = false;
     let mut pack = FetchPackOptions::default();
@@ -508,23 +552,10 @@ fn parse_fetch_args(args: &[String]) -> Result<CommandRequest> {
             wants.push(want.to_string());
         } else if let Some(have) = arg.strip_prefix("have ") {
             haves.push(have.to_string());
-        } else if let Some(shallow) = arg.strip_prefix("shallow ") {
-            shallows.push(validated_oid(shallow)?);
-        } else if let Some(d) = arg.strip_prefix("deepen ") {
-            deepen = Some(
-                d.parse()
-                    .map_err(|_| ClientRefusal::new("invalid Protocol V2 deepen value"))?,
-            );
         } else if *arg == "deepen-relative" {
-            deepen_relative = true;
-        } else if let Some(timestamp) = arg.strip_prefix("deepen-since ") {
-            deepen_since = Some(
-                timestamp
-                    .parse()
-                    .map_err(|_| ClientRefusal::new("invalid Protocol V2 deepen-since value"))?,
-            );
-        } else if let Some(revision) = arg.strip_prefix("deepen-not ") {
-            deepen_not.push(validated_deepen_not(revision)?);
+            // An argument in v2; in v0/v1 the same request is a capability.
+            shallow.deepen_relative = true;
+        } else if shallow.read_line(arg)? {
         } else if let Some(f) = arg.strip_prefix("filter ") {
             filter = Some(f.to_string());
         } else if *arg == "done" {
@@ -539,13 +570,7 @@ fn parse_fetch_args(args: &[String]) -> Result<CommandRequest> {
     Ok(CommandRequest::Fetch {
         wants,
         haves,
-        shallow: ShallowRequest {
-            shallows,
-            deepen,
-            deepen_relative,
-            deepen_since,
-            deepen_not,
-        },
+        shallow,
         filter,
         done,
         pack,
@@ -575,7 +600,7 @@ fn validated_deepen_not(revision: &str) -> Result<String> {
     if acceptable {
         Ok(revision.to_string())
     } else {
-        Err(ClientRefusal::new("invalid Protocol V2 deepen-not value").into())
+        Err(ClientRefusal::new("invalid deepen-not value").into())
     }
 }
 
@@ -971,32 +996,18 @@ fn validate_fetch_features(shallow: &ShallowRequest, filter: &Option<String>) ->
             .into());
         }
     }
-    if shallow.deepen == Some(0) {
-        return Err(
-            ClientRefusal::new("Protocol V2 deepen depth must be greater than zero").into(),
-        );
-    }
-    if shallow.deepen_relative && shallow.deepen.is_none() {
-        return Err(ClientRefusal::new("Protocol V2 deepen-relative requires deepen").into());
-    }
-    if shallow.deepen.is_some()
-        && (shallow.deepen_since.is_some() || !shallow.deepen_not.is_empty())
-    {
-        return Err(ClientRefusal::new(
-            "Protocol V2 deepen cannot be combined with deepen-since or deepen-not",
-        )
-        .into());
-    }
-    Ok(())
+    shallow.validate()
 }
 
+/// The client's new shallow boundaries, and the `shallow` / `unshallow` lines
+/// that tell it so.
 #[derive(Debug)]
-struct ShallowUpdate {
-    boundaries: Vec<String>,
-    response_lines: Vec<String>,
+pub(super) struct ShallowUpdate {
+    pub(super) boundaries: Vec<String>,
+    pub(super) response_lines: Vec<String>,
 }
 
-fn build_shallow_update(
+pub(super) fn build_shallow_update(
     repo_path: &Path,
     wants: &[String],
     request: &ShallowRequest,
@@ -1012,7 +1023,7 @@ fn build_shallow_update(
         if request.deepen_relative {
             if request.shallows.is_empty() {
                 return Err(ClientRefusal::new(
-                    "Protocol V2 deepen-relative requires at least one shallow boundary",
+                    "deepen-relative requires at least one shallow boundary",
                 )
                 .into());
             }
