@@ -188,7 +188,7 @@ impl<W: Write> Sink<W> {
     fn directory(&mut self, path: &str, mode: u32, mtime: u64) -> io::Result<()> {
         match self {
             Self::Tar(builder) => {
-                let mut header = base_header(tar::EntryType::Directory, mode, mtime);
+                let mut header = base_header(tar::EntryType::Directory, mode, mtime)?;
                 header.set_size(0);
                 builder.append_data(&mut header, path, io::empty())
             }
@@ -199,7 +199,7 @@ impl<W: Write> Sink<W> {
     fn symlink(&mut self, path: &str, target: &str, mtime: u64) -> io::Result<()> {
         match self {
             Self::Tar(builder) => {
-                let mut header = base_header(tar::EntryType::Symlink, 0o777, mtime);
+                let mut header = base_header(tar::EntryType::Symlink, 0o777, mtime)?;
                 header.set_size(0);
                 builder.append_link(&mut header, path, target)
             }
@@ -223,7 +223,7 @@ impl<W: Write> Sink<W> {
     ) -> io::Result<()> {
         match self {
             Self::Tar(builder) => {
-                let mut header = base_header(tar::EntryType::Regular, mode, mtime);
+                let mut header = base_header(tar::EntryType::Regular, mode, mtime)?;
                 header.set_size(size);
                 builder.append_data(&mut header, path, data)
             }
@@ -241,17 +241,16 @@ impl<W: Write> Sink<W> {
 
 /// The header fields `git archive` writes for every entry: owned by root,
 /// stamped with the commit time.
-fn base_header(kind: tar::EntryType, mode: u32, mtime: u64) -> tar::Header {
+fn base_header(kind: tar::EntryType, mode: u32, mtime: u64) -> io::Result<tar::Header> {
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(kind);
     header.set_mode(mode);
     header.set_mtime(mtime);
     header.set_uid(0);
     header.set_gid(0);
-    // Infallible for these short ASCII names.
-    let _ = header.set_username("root");
-    let _ = header.set_groupname("root");
-    header
+    header.set_username("root")?;
+    header.set_groupname("root")?;
+    Ok(header)
 }
 
 /// The `comment` record of a pax global header, where `git archive` puts the
@@ -1005,8 +1004,7 @@ mod tests {
         for format in [ArchiveFormat::TarGz, ArchiveFormat::Zip] {
             let (tar, _, _) = fixture();
             let error = rewrite_archive(tar.as_slice(), Vec::new(), format, &mut Short)
-                .err()
-                .expect("a short object must fail the archive");
+                .expect_err("a short object must fail the archive");
             assert!(error.to_string().contains("short"), "{error}");
         }
     }
