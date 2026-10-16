@@ -445,6 +445,13 @@ fn apply_middleware(
         middleware::maintenance_middleware,
     ));
 
+    // Every git and LFS request leaves a line, refusals included — outside the
+    // two gates above so their 429 and 503 do too, inside the address resolver
+    // below so the line names the client (card_02520afde020).
+    let router = router.layer(axum::middleware::from_fn(
+        middleware::transport_access_log_middleware,
+    ));
+
     // The client address is resolved before any layer that keys on it — the
     // per-IP limiter just above, the per-route auth limiter, the audit log —
     // so they all read one answer (see `client_ip`). It needs no `ConnectInfo`

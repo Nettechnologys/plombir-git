@@ -81,6 +81,96 @@ pub async fn http_metrics_middleware(request: Request, next: Next) -> Response {
     response
 }
 
+/// The git transport a request path belongs to, if it belongs to one.
+///
+/// Smart HTTP is `…/info/refs`, `…/git-upload-pack` and `…/git-receive-pack`
+/// under the root or `/git`; Git LFS is the object and lock API, which the
+/// `<remote>.git/info/lfs/…` spelling a stock client derives has already been
+/// rewritten to by the time any layer sees the request
+/// (`crate::routes::lfs_discovery_api_path`).
+pub(crate) fn transport_of(path: &str) -> Option<&'static str> {
+    if ["/info/refs", "/git-upload-pack", "/git-receive-pack"]
+        .iter()
+        .any(|endpoint| path.ends_with(endpoint))
+    {
+        return Some("git");
+    }
+    match path.split('/').collect::<Vec<_>>().as_slice() {
+        ["", "api", "v1", "repos", _, _, "lfs", "objects" | "locks", ..] => Some("lfs"),
+        _ => None,
+    }
+}
+
+/// One line per git or Git LFS request, whatever it answered.
+///
+/// The request trace logs a response only when it is a 5xx, so on the default
+/// `info` filter a refused push, a `401` on the LFS batch for a password where
+/// a token was needed, a `404` or a `413` left nothing in `docker logs` at all.
+/// On 2026-10-15 an LFS push on a live instance failed over HTTPS and the log
+/// could not say how (card_02520afde020). Every transport request now leaves a
+/// line: `info` when it succeeded, `warn` when it was refused or failed.
+///
+/// It sits outside the rate limiter and the maintenance gate so their `429` and
+/// `503` are logged too, and inside the client-address resolver so the line
+/// names the client. Being outside the request trace it carries its own fields:
+/// the query only as [`crate::log_redaction::redact_query`] leaves it, and no
+/// header at all — `Authorization` included. `elapsed_ms` is the time to the
+/// response head; a pack stream goes on after it.
+pub async fn transport_access_log_middleware(request: Request, next: Next) -> Response {
+    let Some(transport) = transport_of(request.uri().path()) else {
+        return next.run(request).await;
+    };
+    let started = Instant::now();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let query = request
+        .uri()
+        .query()
+        .map(crate::log_redaction::redact_query)
+        .unwrap_or_default();
+    let client_ip = request
+        .extensions()
+        .get::<crate::client_ip::ClientIp>()
+        .map(|ip| ip.0.to_string())
+        .unwrap_or_default();
+
+    let response = next.run(request).await;
+
+    let status = response.status().as_u16();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let request_id = response
+        .headers()
+        .get(&X_REQUEST_ID)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+    if response.status().is_client_error() || response.status().is_server_error() {
+        tracing::warn!(
+            transport = %transport,
+            %method,
+            path = %path,
+            query = %query,
+            status,
+            elapsed_ms,
+            client_ip = %client_ip,
+            request_id = %request_id,
+            "{transport} request refused"
+        );
+    } else {
+        tracing::info!(
+            transport = %transport,
+            %method,
+            path = %path,
+            query = %query,
+            status,
+            elapsed_ms,
+            client_ip = %client_ip,
+            request_id = %request_id,
+            "{transport} request"
+        );
+    }
+    response
+}
+
 /// Middleware that generates (or propagates) a per-request unique ID.
 ///
 /// - If the client sends `X-Request-Id`, that value is reused.
