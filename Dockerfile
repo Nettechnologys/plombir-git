@@ -154,6 +154,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     libsqlite3-0 \
     openssh-client \
+    # The container's PID 1 — see the ENTRYPOINT below.
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user.
@@ -200,6 +202,21 @@ EXPOSE 8080 2222
 # (SMTP) that must not mark the container unhealthy.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8080/readyz || exit 1
+
+# PID 1 is an init, not the server. The kernel hands every orphan in the
+# container to PID 1, and the server orphans some by design: a git process it
+# kills on a timeout leaves its own children (`pack-objects` under
+# `upload-pack`, `git-remote-https` under a mirror fetch) to be reparented. The
+# server never waits for processes it did not spawn, so as PID 1 it collected
+# them as zombies for the life of the instance, up to the container's
+# `pids.max` (card_ca2b5f84cb69). `tini` reaps them and forwards signals, so
+# `docker stop` still reaches the server's graceful shutdown.
+#
+# `--` and nothing else: whatever `CMD` or `docker run <image> …` supplies is
+# still the program, so `docker compose run --rm plombir-git plombir-git
+# migrate` reads exactly as before. `scripts/server-image-init-contract-check.mjs`
+# holds both halves.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # Default command: serve with config via env vars.
 # Set PLOMBIR_GIT_JWT_SECRET env var before running.

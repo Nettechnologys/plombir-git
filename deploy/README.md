@@ -494,8 +494,9 @@ docker compose up -d plombir-git
 ```
 
 `plombir-git` appears twice on purpose: the first names the compose service,
-the second the program. The image has no entrypoint, so whatever follows the
-service *is* the command: a subcommand written straight after the service name
+the second the program. The image's entrypoint is only `tini --`, an init that
+runs whatever it is given, so whatever follows the service *is* the command: a
+subcommand written straight after the service name
 asks Docker to execute a program of that name, and it fails with `executable
 file not found in $PATH`.
 

@@ -6,8 +6,9 @@
 // naming a subcommand the binary does not have (main's guide handing a v0.1.1
 // operator `create-admin`, card_d670212c28bb), and a subcommand written right
 // after a compose service, which Docker runs as a program of that name because
-// the image has no ENTRYPOINT. Plus the premise and the reader: an ENTRYPOINT
-// appearing, and prose outside code not counting as a command.
+// the image's ENTRYPOINT is only a pass-through init. Plus the premise and the
+// reader: an ENTRYPOINT that is not that init appearing, and prose outside code
+// not counting as a command.
 //
 // Every fixture is a copied repository shape, never the checkout.
 
@@ -106,7 +107,7 @@ fixture(
     'docker compose run --rm plombir-git plombir-git migrate',
     'docker compose run --rm plombir-git migrate',
   ),
-  'the image has no ENTRYPOINT',
+  "the image's ENTRYPOINT only execs its arguments",
 );
 
 fixture(
@@ -124,10 +125,17 @@ fixture(
 );
 
 fixture(
-  'an ENTRYPOINT in the image is red until the rule is revisited',
+  'an ENTRYPOINT other than the pass-through init is red until the rule is revisited',
   'Dockerfile',
-  (source) => source.replace(/^CMD \[/m, 'ENTRYPOINT ["tini", "--"]\nCMD ['),
-  'now declares an ENTRYPOINT',
+  (source) => source.replace(/^ENTRYPOINT \[.*\]$/m, 'ENTRYPOINT ["/usr/bin/tini", "--", "plombir-git"]'),
+  'which is not the pass-through init',
+);
+
+fixture(
+  'a second ENTRYPOINT after the init is red',
+  'Dockerfile',
+  (source) => source.replace(/^CMD \[/m, 'ENTRYPOINT ["plombir-git"]\nCMD ['),
+  'which is not the pass-through init',
 );
 
 fixture(

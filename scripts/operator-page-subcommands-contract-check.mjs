@@ -19,8 +19,11 @@
 // answers `exec: "restore-db": executable file not found in $PATH` — on the
 // restore, migrate and key-rotation recipes, each run once, against a stopped
 // server. A subcommand written straight after a compose service or an image
-// reference is therefore a failure here, for as long as the Dockerfile has no
-// ENTRYPOINT (asserted below, so the premise cannot rot under the rule).
+// reference is therefore a failure here, for as long as the Dockerfile's
+// ENTRYPOINT is at most an init that execs its arguments (`tini --`, which
+// reaps orphans as PID 1 — card_ca2b5f84cb69) — asserted below, so the premise
+// cannot rot under the rule. Behind `tini --` the first word after the service
+// is still the program.
 //
 // What counts as an invocation: inside a fenced code block, or an inline code
 // span, the binary as a whole word (a `./target/release/` prefix allowed)
@@ -205,13 +208,20 @@ for (const { binary, source } of BINARIES) {
 const everySubcommand = new Set([...declared.values()].flatMap((names) => (names ? [...names] : [])));
 everySubcommand.delete('help');
 
+// The one ENTRYPOINT that keeps "the word after the service is the program":
+// an init that execs whatever follows `--`.
+const PASS_THROUGH_ENTRYPOINT = 'ENTRYPOINT ["/usr/bin/tini", "--"]';
 const dockerfile = read('Dockerfile');
-const hasEntrypoint = dockerfile !== null
-  && dockerfile.split('\n').some((line) => /^\s*ENTRYPOINT\b/i.test(line));
-if (hasEntrypoint) {
+const entrypoints = dockerfile === null
+  ? []
+  : dockerfile.split('\n').map((line) => line.trim()).filter((line) => /^ENTRYPOINT\b/i.test(line));
+const entrypointPassesThrough = entrypoints.every((entrypoint) => entrypoint === PASS_THROUGH_ENTRYPOINT);
+for (const entrypoint of entrypoints) {
+  if (entrypoint === PASS_THROUGH_ENTRYPOINT) continue;
   failures.push(
-    'Dockerfile now declares an ENTRYPOINT, so `docker compose run <service> <subcommand>` may be right and '
-      + '`<service> plombir-git <subcommand>` wrong — re-read the pages and this check\'s container-position rule',
+    `Dockerfile now declares \`${entrypoint}\`, which is not the pass-through init \`${PASS_THROUGH_ENTRYPOINT}\`, `
+      + 'so `docker compose run <service> <subcommand>` may be right and `<service> plombir-git <subcommand>` '
+      + 'wrong — re-read the pages and this check\'s container-position rule',
   );
 }
 
@@ -224,9 +234,9 @@ for (const page of PAGES) {
   for (const { line, words } of simpleCommands) {
     const { from, container } = programStart(words);
     const next = words[container + 1];
-    if (container !== -1 && !hasEntrypoint && next && everySubcommand.has(next)) {
+    if (container !== -1 && entrypointPassesThrough && next && everySubcommand.has(next)) {
       failures.push(
-        `${page}:${line}: \`${words[container]} ${next}\` — the image has no ENTRYPOINT, so Docker runs a program `
+        `${page}:${line}: \`${words[container]} ${next}\` — the image's ENTRYPOINT only execs its arguments, so Docker runs a program `
           + `called \`${next}\` and fails; write \`${words[container]} plombir-git ${next}\``,
       );
     }
