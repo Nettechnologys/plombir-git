@@ -512,3 +512,9 @@ To keep both options open, every contributor signs the
 [Contributor License Agreement](CLA.md) once, by commenting on their first pull
 request. You keep the copyright in your work. The CLA gives the project the
 right to ship it under both licenses.
+
+Submitting a contribution means you accept the CLA for it. The `CLA` check on
+every pull request asks each commit author who has not signed yet to comment
+the sentence from [§ 6](CLA.md#6-how-to-sign), and a pull request is not merged
+while that check is red. One signature also covers whatever you contributed
+before it.

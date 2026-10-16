@@ -76,5 +76,11 @@ On your first pull request, comment:
 
 > I have read the CLA Document and I hereby sign the CLA
 
-Your signature covers that pull request and all later Contributions You make
-to Plombir Git.
+The CLA check on the pull request records your signature and turns green. A
+pull request is not merged until every author of its commits has signed.
+
+Your signature covers that pull request, every Contribution You submitted to
+Plombir Git before signing, and all later Contributions You make to it.
+
+By submitting a Contribution to Plombir Git, You also accept this agreement
+for that Contribution, whether or not You have signed it yet.
