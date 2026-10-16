@@ -18,6 +18,7 @@
 
 mod common;
 mod deactivated_ssh_tests;
+mod ssh_auth_latency_tests;
 mod ssh_failure_semantics_tests;
 mod ssh_lfs_authenticate_tests;
 mod ssh_lockout_tests;

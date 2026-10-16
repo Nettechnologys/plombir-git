@@ -564,9 +564,17 @@ impl SshServer {
             )
         })?;
 
+        // No blanket delay on a rejected authentication request. russh applies
+        // `auth_rejection_time` to *every* `Auth::Reject`, and OpenSSH offers
+        // each key in the agent and `~/.ssh/id_*` in turn: a client whose own
+        // key came sixth waited six seconds before every connection — and an
+        // LFS push over SSH opens several (card_3bd390bcff70). An unknown key is
+        // not a guess anybody can improve on, so it costs nothing; the password
+        // door, where a delay does slow guessing, keeps its second explicitly
+        // (`PASSWORD_REJECTION_FLOOR`).
         let config = Config {
-            auth_rejection_time: std::time::Duration::from_secs(1),
-            auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
+            auth_rejection_time: std::time::Duration::ZERO,
+            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
             keys: vec![host_key],
             ..Default::default()
         };
@@ -792,6 +800,8 @@ impl russh::server::Server for SshServer {
             live_execs: Arc::default(),
             authenticated_identity: None,
             git_protocol_version: "1".to_string(),
+            auth_attempts: 0,
+            rejected_publickeys: 0,
         };
         self.id += 1;
         handler
@@ -830,6 +840,32 @@ struct SshHandler {
     /// Git protocol version requested by the client (default: "1").
     /// Set to "2" when the client sends GIT_PROTOCOL=version=2 via env_request.
     git_protocol_version: String,
+    /// Authentication requests this connection has made so far, of any method.
+    /// A rejected password costs [`PASSWORD_REJECTION_FLOOR`] unless it was the
+    /// connection's first request — the contract russh's own
+    /// `auth_rejection_time_initial` gave it before the delay moved here.
+    auth_attempts: u32,
+    /// Public keys this connection offered that no account or deploy key holds.
+    /// Logged once — on the accept, or when the connection ends without one —
+    /// rather than once per key, so a client with a full agent leaves one line.
+    rejected_publickeys: u32,
+}
+
+/// What a rejected SSH password costs from a connection's second
+/// authentication request on: the brute-force brake that used to be russh's
+/// `auth_rejection_time`, kept on the one door where guessing is possible.
+const PASSWORD_REJECTION_FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl Drop for SshHandler {
+    fn drop(&mut self) {
+        if self.rejected_publickeys > 0 && self.authenticated_identity.is_none() {
+            tracing::warn!(
+                peer = ?self.peer,
+                rejected_publickeys = self.rejected_publickeys,
+                "SSH connection ended before authenticating; none of the public keys it offered is registered"
+            );
+        }
+    }
 }
 
 /// Per-push state the `git-receive-pack` branch needs beyond the byte stream:
@@ -958,6 +994,49 @@ impl Handler for SshHandler {
     // The returned Fingerprint displays as "SHA256:<base64>" which is
     // the standard format for authorized_keys.
 
+    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+        // OpenSSH's opening probe for the method list.
+        self.auth_attempts += 1;
+        Ok(Auth::reject())
+    }
+
+    /// Refuse a key no account or deploy key holds before the client signs.
+    ///
+    /// The default accepts every offer, so the client went on to sign with each
+    /// key it holds before hearing "no": one agent confirmation, or one touch of
+    /// a FIDO key, per key that was never registered here. The verdict on a key
+    /// that *is* held — its owner's standing included — stays in
+    /// [`Handler::auth_publickey`], after the signature proves possession.
+    async fn auth_publickey_offered(
+        &mut self,
+        _user: &str,
+        public_key: &russh::keys::PublicKey,
+    ) -> Result<Auth, Self::Error> {
+        self.auth_attempts += 1;
+        use russh::keys::ssh_key;
+        let fingerprint = public_key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+        let db = &*self.shared.db;
+        let held = match rg_db::ops::ssh_key_ops::find_by_fingerprint(db, &fingerprint).await {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => rg_db::ops::deploy_key_ops::find_by_fingerprint(db, &fingerprint)
+                .await
+                .map(|key| key.is_some()),
+            Err(error) => Err(error),
+        };
+        match held {
+            Ok(true) => Ok(Auth::Accept),
+            Ok(false) => {
+                self.rejected_publickeys += 1;
+                tracing::debug!(%fingerprint, "SSH public key offered that nobody holds");
+                Ok(Auth::reject())
+            }
+            Err(error) => {
+                tracing::error!(error = %format!("{error:#}"), "DB error while checking an offered SSH key");
+                Ok(Auth::reject())
+            }
+        }
+    }
+
     async fn auth_publickey(
         &mut self,
         _user: &str,
@@ -1023,7 +1102,11 @@ impl Handler for SshHandler {
                         "failed to update SSH key usage time"
                     );
                 }
-                tracing::info!(user_id = key.user_id, "SSH pubkey auth accepted");
+                tracing::info!(
+                    user_id = key.user_id,
+                    rejected_publickeys = self.rejected_publickeys,
+                    "SSH pubkey auth accepted"
+                );
                 Ok(Auth::Accept)
             }
             Ok(None) => match rg_db::ops::deploy_key_ops::find_by_fingerprint(db, &fp_str).await {
@@ -1046,6 +1129,7 @@ impl Handler for SshHandler {
                     tracing::info!(
                         repo_id = key.repo_id,
                         read_only = key.read_only,
+                        rejected_publickeys = self.rejected_publickeys,
                         "SSH deploy key auth accepted"
                     );
                     Ok(Auth::Accept)
@@ -1076,151 +1160,14 @@ impl Handler for SshHandler {
     }
 
     async fn auth_password(&mut self, username: &str, password: &str) -> Result<Auth, Self::Error> {
-        let db = &*self.shared.db;
-
-        let found = match rg_db::ops::user_ops::find_by_username(db, username).await {
-            Ok(user) => user,
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "DB error during password auth");
-                None
-            }
-        };
-        // Verified even when there is no such user, so that a rejection always
-        // costs one Argon2 hash — an early return here would let an attacker
-        // enumerate accounts by how fast the server says no.
-        //
-        // The hash runs off this worker, under the process-wide password
-        // limiter, and the TCP peer is the source it is shared by: one address
-        // opening connection after connection cannot take every slot for
-        // itself. The peer is the one address no client can write for itself.
-        let peer_ip = self.peer.map(|peer| peer.ip());
-        let password_ok = match rg_core::auth::password::verify_password_or_dummy(
-            password,
-            found.as_ref().map(|user| user.password_hash.as_str()),
-            peer_ip,
-        )
-        .await
-        {
-            Ok(verdict) => verdict,
-            Err(error)
-                if error
-                    .downcast_ref::<rg_core::auth::password::PasswordWorkSaturated>()
-                    .is_some() =>
-            {
-                // Nothing was checked, so nothing is settled: no strike, no
-                // failed-login row. During a flood the owner's *correct*
-                // password lands here too, and a strike for it would let the
-                // flood lock them out.
-                tracing::warn!(
-                    username,
-                    peer = ?self.peer,
-                    error = %format!("{error:#}"),
-                    "SSH password auth shed: password verification is at capacity"
-                );
-                return Ok(Auth::Reject {
-                    proceed_with_methods: None,
-                    partial_success: false,
-                });
-            }
-            Err(error) => {
-                // SSH has no way to say "this is our fault, retry later" — the
-                // client only ever learns accept or reject. So the log line is
-                // the whole remedy, and it has to name the account: without it a
-                // hash broken by a migration is indistinguishable from a user
-                // who keeps mistyping their password.
-                tracing::error!(
-                    username,
-                    user_id = ?found.as_ref().map(|user| user.id),
-                    error = %format!("{error:#}"),
-                    "cannot verify SSH password"
-                );
-                false
-            }
-        };
-
-        // The lockout is applied after the hash, never before: an early exit
-        // for a locked account would answer "is this account locked?" — and so
-        // "does it exist?" — through the response time. The same helper runs on
-        // the registry's `docker login`, so the SSH port can no longer be used
-        // to walk past a threshold the web login enforces.
-        let peer_address = peer_ip.map(|ip| ip.to_string());
-        let attempt = rg_core::auth::lockout::settle_password_attempt(
-            db,
-            found.as_ref(),
-            password_ok,
-            rg_core::auth::lockout::AttemptOrigin {
-                login: username,
-                channel: "ssh",
-                ip_address: peer_address.as_deref(),
-                user_agent: None,
-            },
-        )
-        .await;
-
-        match attempt {
-            Ok(rg_core::auth::lockout::PasswordAttempt::Accepted(account)) => {
-                // The generation is read from the row this password was checked
-                // against by the lifecycle finalizer, so a reset racing the
-                // credential lookup cannot make this session stale at birth.
-                self.authenticated_identity = Some(AuthenticatedIdentity::User {
-                    user_id: account.id,
-                    credential: UserCredential::Password {
-                        session_version: account.session_version,
-                    },
-                });
-                tracing::info!(username, "SSH password auth accepted");
-                Ok(Auth::Accept)
-            }
-            Ok(rg_core::auth::lockout::PasswordAttempt::SecondFactorRequired) => {
-                // The password was right. SSH has no way to prompt for a TOTP
-                // code — `auth_password` may only accept or reject — so the
-                // account authenticates here with the credential that is a
-                // standing second factor already: its SSH key. The log line is
-                // the whole explanation the owner can be given, since the
-                // client is told nothing but "no".
-                tracing::warn!(
-                    username,
-                    "SSH password auth refused: the account requires a second factor, \
-                     which this door cannot ask for — authenticate with an SSH key"
-                );
-                Ok(Auth::Reject {
-                    proceed_with_methods: None,
-                    partial_success: false,
-                })
-            }
-            Ok(rg_core::auth::lockout::PasswordAttempt::PasswordChangeRequired) => {
-                // An administrator chose this password, and it opens nothing
-                // until its holder has replaced it — which only the web login
-                // can ask for.
-                tracing::warn!(
-                    username,
-                    "SSH password auth refused: the password was set by an administrator and \
-                     must be changed through the web login first"
-                );
-                Ok(Auth::Reject {
-                    proceed_with_methods: None,
-                    partial_success: false,
-                })
-            }
-            Ok(rg_core::auth::lockout::PasswordAttempt::Rejected { locked }) => {
-                tracing::warn!(username, locked, "SSH password auth rejected");
-                Ok(Auth::Reject {
-                    proceed_with_methods: None,
-                    partial_success: false,
-                })
-            }
-            Err(error) => {
-                tracing::error!(
-                    username,
-                    error = %format!("{error:#}"),
-                    "SSH password verified but its account lifecycle could not be finalized"
-                );
-                Ok(Auth::Reject {
-                    proceed_with_methods: None,
-                    partial_success: false,
-                })
-            }
+        let started = tokio::time::Instant::now();
+        let first_request = self.auth_attempts == 0;
+        self.auth_attempts += 1;
+        let verdict = self.password_verdict(username, password).await?;
+        if matches!(verdict, Auth::Reject { .. }) && !first_request {
+            tokio::time::sleep_until(started + PASSWORD_REJECTION_FLOOR).await;
         }
+        Ok(verdict)
     }
 
     async fn auth_keyboard_interactive(
@@ -1229,6 +1176,8 @@ impl Handler for SshHandler {
         _submethods: &str,
         _response: Option<russh::server::Response<'_>>,
     ) -> Result<Auth, Self::Error> {
+        // Never offered and never accepted, so nothing here can be guessed.
+        self.auth_attempts += 1;
         Ok(Auth::Reject {
             proceed_with_methods: None,
             partial_success: false,
@@ -1732,6 +1681,160 @@ impl Handler for SshHandler {
 }
 
 impl SshHandler {
+    /// The password door's verdict, before [`PASSWORD_REJECTION_FLOOR`] is
+    /// applied to a rejection.
+    async fn password_verdict(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<Auth, HandlerError> {
+        let db = &*self.shared.db;
+
+        let found = match rg_db::ops::user_ops::find_by_username(db, username).await {
+            Ok(user) => user,
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "DB error during password auth");
+                None
+            }
+        };
+        // Verified even when there is no such user, so that a rejection always
+        // costs one Argon2 hash — an early return here would let an attacker
+        // enumerate accounts by how fast the server says no.
+        //
+        // The hash runs off this worker, under the process-wide password
+        // limiter, and the TCP peer is the source it is shared by: one address
+        // opening connection after connection cannot take every slot for
+        // itself. The peer is the one address no client can write for itself.
+        let peer_ip = self.peer.map(|peer| peer.ip());
+        let password_ok = match rg_core::auth::password::verify_password_or_dummy(
+            password,
+            found.as_ref().map(|user| user.password_hash.as_str()),
+            peer_ip,
+        )
+        .await
+        {
+            Ok(verdict) => verdict,
+            Err(error)
+                if error
+                    .downcast_ref::<rg_core::auth::password::PasswordWorkSaturated>()
+                    .is_some() =>
+            {
+                // Nothing was checked, so nothing is settled: no strike, no
+                // failed-login row. During a flood the owner's *correct*
+                // password lands here too, and a strike for it would let the
+                // flood lock them out.
+                tracing::warn!(
+                    username,
+                    peer = ?self.peer,
+                    error = %format!("{error:#}"),
+                    "SSH password auth shed: password verification is at capacity"
+                );
+                return Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                });
+            }
+            Err(error) => {
+                // SSH has no way to say "this is our fault, retry later" — the
+                // client only ever learns accept or reject. So the log line is
+                // the whole remedy, and it has to name the account: without it a
+                // hash broken by a migration is indistinguishable from a user
+                // who keeps mistyping their password.
+                tracing::error!(
+                    username,
+                    user_id = ?found.as_ref().map(|user| user.id),
+                    error = %format!("{error:#}"),
+                    "cannot verify SSH password"
+                );
+                false
+            }
+        };
+
+        // The lockout is applied after the hash, never before: an early exit
+        // for a locked account would answer "is this account locked?" — and so
+        // "does it exist?" — through the response time. The same helper runs on
+        // the registry's `docker login`, so the SSH port can no longer be used
+        // to walk past a threshold the web login enforces.
+        let peer_address = peer_ip.map(|ip| ip.to_string());
+        let attempt = rg_core::auth::lockout::settle_password_attempt(
+            db,
+            found.as_ref(),
+            password_ok,
+            rg_core::auth::lockout::AttemptOrigin {
+                login: username,
+                channel: "ssh",
+                ip_address: peer_address.as_deref(),
+                user_agent: None,
+            },
+        )
+        .await;
+
+        match attempt {
+            Ok(rg_core::auth::lockout::PasswordAttempt::Accepted(account)) => {
+                // The generation is read from the row this password was checked
+                // against by the lifecycle finalizer, so a reset racing the
+                // credential lookup cannot make this session stale at birth.
+                self.authenticated_identity = Some(AuthenticatedIdentity::User {
+                    user_id: account.id,
+                    credential: UserCredential::Password {
+                        session_version: account.session_version,
+                    },
+                });
+                tracing::info!(username, "SSH password auth accepted");
+                Ok(Auth::Accept)
+            }
+            Ok(rg_core::auth::lockout::PasswordAttempt::SecondFactorRequired) => {
+                // The password was right. SSH has no way to prompt for a TOTP
+                // code — `auth_password` may only accept or reject — so the
+                // account authenticates here with the credential that is a
+                // standing second factor already: its SSH key. The log line is
+                // the whole explanation the owner can be given, since the
+                // client is told nothing but "no".
+                tracing::warn!(
+                    username,
+                    "SSH password auth refused: the account requires a second factor, \
+                     which this door cannot ask for — authenticate with an SSH key"
+                );
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
+            Ok(rg_core::auth::lockout::PasswordAttempt::PasswordChangeRequired) => {
+                // An administrator chose this password, and it opens nothing
+                // until its holder has replaced it — which only the web login
+                // can ask for.
+                tracing::warn!(
+                    username,
+                    "SSH password auth refused: the password was set by an administrator and \
+                     must be changed through the web login first"
+                );
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
+            Ok(rg_core::auth::lockout::PasswordAttempt::Rejected { locked }) => {
+                tracing::warn!(username, locked, "SSH password auth rejected");
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
+            Err(error) => {
+                tracing::error!(
+                    username,
+                    error = %format!("{error:#}"),
+                    "SSH password verified but its account lifecycle could not be finalized"
+                );
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
+        }
+    }
+
     /// Refuse a request on a channel whose git process is already running —
     /// a second exec, a shell, a subsystem. Declining the request is all it
     /// takes; answering it with stderr and an exit status would write into that
