@@ -628,6 +628,10 @@ The file view shows an LFS file as the file: an image inline, other content
 as a download, from `GET /api/v1/repos/<owner>/<repo>/raw/<path>`. The blob
 API marks a pointer file with `lfs: {oid, size, available}`; a pointer whose
 object was never uploaded is reported as such and the raw route answers `404`.
+**Download ZIP** and **tar.gz** (`GET /api/v1/repos/<owner>/<repo>/archive/<ref>.zip`)
+carry LFS files as their content too, streamed from the LFS store. A pointer
+whose object the server does not have stays a pointer, and the archive then
+ends with `LFS-OBJECTS-MISSING.txt` naming each such path and oid.
 
 File locking works with the stock client from either clone URL:
 `git lfs lock <path>`, `git lfs locks`, `git lfs unlock <path>`. The server

@@ -26,6 +26,18 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<LfsOb
     model.insert(db).await.context("db: create LFS object")
 }
 
+/// Whether `repo_id` stores the bytes of any LFS object at all — the cheap
+/// question an archive download asks before it decides to look for pointers.
+pub async fn has_uploaded(db: &DatabaseConnection, repo_id: i64) -> Result<bool> {
+    Ok(LfsEntity::find()
+        .filter(lfs_object::Column::RepoId.eq(repo_id))
+        .filter(lfs_object::Column::Uploaded.eq(true))
+        .one(db)
+        .await
+        .context("db: check for uploaded LFS objects of a repository")?
+        .is_some())
+}
+
 /// Every object of `repo_id` whose bytes have been stored, oldest first.
 pub async fn list_uploaded_by_repo(
     db: &DatabaseConnection,

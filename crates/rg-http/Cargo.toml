@@ -29,6 +29,9 @@ hmac = { workspace = true }
 hex = { workspace = true }
 # Stock git gzips stateless upload-pack request bodies over 1 KiB.
 flate2 = { workspace = true }
+# A repository archive that carries its LFS objects is git's tar, read and
+# rewritten on the way out (`archive_lfs`).
+tar = { workspace = true }
 tokio-rustls = { workspace = true }
 axum-server = { workspace = true }
 utoipa = { version = "5", features = ["chrono"] }
@@ -67,7 +70,6 @@ rg-runner = { path = "../rg-runner" }
 reqwest = { workspace = true, features = ["multipart"] }
 serde_urlencoded = "0.7"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
-tar = { workspace = true }
 flate2 = { workspace = true }
 zip = { workspace = true }
 socket2 = "0.5"

@@ -37,6 +37,7 @@ pub mod security;
 pub mod ws;
 
 mod agent_scope;
+mod archive_lfs;
 mod body_limit;
 mod content_disposition;
 mod git_http;

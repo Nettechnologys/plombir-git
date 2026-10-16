@@ -24,6 +24,7 @@
 mod access_grant_audit_guard;
 mod account_self_service_tests;
 mod agent_accounts_tests;
+mod archive_lfs_tests;
 mod client_address_tests;
 mod comment_moderation_tests;
 mod common;

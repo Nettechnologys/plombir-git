@@ -236,8 +236,10 @@ pub(crate) struct GitChildStream {
     /// The child itself, minus the pipes below.
     pub child: tokio::process::Child,
     /// git's stdout, taken out of the child so the caller may read a head chunk
-    /// from it before committing to a status code.
-    pub stdout: tokio::process::ChildStdout,
+    /// from it before committing to a status code — or a stream derived from
+    /// it, such as the LFS-carrying archive (`crate::archive_lfs`), whose read
+    /// error is then the body's.
+    pub stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
     /// The concurrent stderr drain. It must run from the moment git starts: the
     /// pipe is small, and an unread full one deadlocks git mid-write.
     pub stderr: tokio::task::JoinHandle<Vec<u8>>,
@@ -277,7 +279,7 @@ pub(crate) fn split_git_child(mut child: tokio::process::Child) -> std::io::Resu
 
     Ok(GitChildStream {
         child,
-        stdout,
+        stdout: Box::new(stdout),
         stderr,
         head: axum::body::Bytes::new(),
     })
@@ -384,6 +386,16 @@ pub(crate) fn git_child_body_with_idle(
     Body::new(http_body_util::StreamBody::new(frame_stream))
 }
 
+/// Yield an error into the body, so hyper aborts the transfer instead of
+/// ending it with a terminating chunk.
+///
+/// `try_send`: the channel may be full because the client stopped reading, and
+/// then nobody is left to tell — but a reader that is still there must not see
+/// a clean end of a payload that was cut short.
+fn break_body(tx: &tokio::sync::mpsc::Sender<std::io::Result<axum::body::Bytes>>, why: &str) {
+    drop(tx.try_send(Err(std::io::Error::other(why.to_string()))));
+}
+
 /// Forward `head`, then everything left on `stdout`, chunk by chunk under the
 /// idle bound — reporting whether git closed the stream or we tore it down.
 async fn pump_child_stdout<R>(
@@ -417,6 +429,10 @@ where
                         idle_secs,
                         "git read idle timeout — killing git"
                     );
+                    // The payload is cut short on our side, so the body must
+                    // break: ending it would hand over a truncated download
+                    // that reads as complete.
+                    break_body(tx, "git produced nothing within the idle window");
                     return PumpEnd::Aborted;
                 }
             },
@@ -433,6 +449,7 @@ where
                     what = source.what,
                     "git stdout read failed — the payload is truncated"
                 );
+                break_body(tx, "the payload could not be read to its end");
                 return PumpEnd::Aborted;
             }
         };
@@ -1179,6 +1196,12 @@ mod git_child_stream_tests {
             assert_eq!(
                 rx.recv().await.unwrap().unwrap(),
                 Bytes::from_static(b"partial tar")
+            );
+            // The body breaks rather than ends: a client must not read the
+            // partial tar as the whole of it.
+            assert!(
+                matches!(rx.recv().await, Some(Err(_))),
+                "a failed read must break the body, not end it"
             );
             assert!(rx.recv().await.is_none(), "the failed reader must stop");
         }

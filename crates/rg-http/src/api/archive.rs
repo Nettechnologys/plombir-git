@@ -64,7 +64,9 @@ pub async fn download_archive(
     // The gate now runs before the filename is parsed, so an unreadable
     // repository answers 401/403 rather than telling a stranger which archive
     // extensions it would have accepted.
-    CiRead::<RepoContents> { .. }: CiRead<RepoContents>,
+    CiRead::<RepoContents> {
+        repo: repo_model, ..
+    }: CiRead<RepoContents>,
 ) -> impl IntoResponse {
     // axum 0.8 allows only one parameter per path segment, so the filename
     // (`<sha>.<ext>`) arrives as a single `{archive}` segment that we split
@@ -113,6 +115,17 @@ pub async fn download_archive(
         return AppError::bad_request(BAD_TREE_ISH).into_response();
     }
 
+    // A repository that stores LFS objects gets its archive with those objects
+    // in place of their pointers (card_aeeb6fc892f2): git writes a tar, which
+    // `archive_lfs` rewrites into the requested format on the way out. Every
+    // other repository keeps git's own encoder, byte for byte.
+    let carries_lfs = match rg_db::ops::lfs_object_ops::has_uploaded(&state.db, repo_model.id).await
+    {
+        Ok(carries) => carries,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    let git_format = if carries_lfs { "tar" } else { format_flag };
+
     // Stream `git archive` instead of running it synchronously and collecting
     // the result. The old call was `GitCommandGateway::run`, which is both a
     // `Vec` the size of the repository's archive *and* a blocking `recv_timeout`
@@ -122,7 +135,7 @@ pub async fn download_archive(
     // by any configured limit; both were chosen by whoever clicked the button.
     let child = match git
         .spawn_async(
-            &["archive", &format!("--format={}", format_flag), &sha],
+            &["archive", &format!("--format={git_format}"), &sha],
             Some(&repo_path),
         )
         .await
@@ -207,7 +220,7 @@ pub async fn download_archive(
         // client was told to fix a ref that was fine, and the outage reached
         // neither its retry logic nor the alerts.
         let error = anyhow::anyhow!(
-            "git archive --format={format_flag} failed ({}): {}",
+            "git archive --format={git_format} failed ({}): {}",
             code.map_or_else(|| "signal".to_string(), |code| code.to_string()),
             stderr.trim()
         );
@@ -232,6 +245,26 @@ pub async fn download_archive(
     // as a complete download.
     head.truncate(first);
     stream.head = axum::body::Bytes::from(head);
+    if carries_lfs {
+        let format = if format_flag == "zip" {
+            crate::archive_lfs::ArchiveFormat::Zip
+        } else {
+            crate::archive_lfs::ArchiveFormat::TarGz
+        };
+        stream = crate::archive_lfs::rewrite_git_tar(
+            stream,
+            format,
+            crate::archive_lfs::StoredLfsObjects {
+                runtime: tokio::runtime::Handle::current(),
+                db: state.db.clone(),
+                storage: state.blob_storage.clone(),
+                legacy_root: rg_core::lfs::service::lfs_root(&state.repo_root, &owner, &name),
+                repo_id: repo_model.id,
+                owner: owner.clone(),
+                name: name.clone(),
+            },
+        );
+    }
     let body = crate::http_stream::git_child_body_with_idle(
         stream,
         idle_secs,
