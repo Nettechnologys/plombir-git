@@ -607,7 +607,46 @@ message saying so, and an SSH clone needs
 `git config lfs.url <external URL>/api/v1/repos/<owner>/<repo>/lfs`.
 Deploy keys work too, read-only ones for downloads only. The pure-SSH transfer
 protocol (`git-lfs-transfer`) is not implemented; git-lfs falls back to
-`git-lfs-authenticate` by itself.
+`git-lfs-authenticate` by itself — at the cost of extra SSH connections, see
+[LFS over SSH: a slow or stalled push](#lfs-over-ssh-a-slow-or-stalled-push).
+
+#### LFS over SSH: a slow or stalled push
+
+From an SSH remote, a stock `git lfs push` opens five SSH connections, each
+authenticated on its own: `git-receive-pack`, the pure-SSH `git-lfs-transfer`
+probe (refused), `git-upload-pack`, the probe again, then
+`git-lfs-authenticate`, after which the objects go over HTTPS (measured with
+git-lfs 3.4.1 and 3.6.1). Where every connection needs a person — a key with a
+passphrase and no agent, an agent that asks for confirmation, a FIDO key that
+wants a touch — that is five prompts per push, and a client that gives up
+halfway leaves a push without its objects. Any one of these fixes it, client
+side:
+
+```bash
+# Every git-lfs version: one authentication for all five connections.
+# In ~/.ssh/config:
+#   Host git.example.com
+#     ControlMaster auto
+#     ControlPath ~/.ssh/cm-%C
+#     ControlPersist 60
+
+# git-lfs 3.6.1 (3.4.1 does not know the setting): skip the two probes — three
+# connections instead of five. Inside the repository:
+git config lfs.sshtransfer never
+
+# Every git-lfs version: send LFS over HTTPS with a personal access token, so
+# only git itself uses SSH — two connections.
+git config lfs.url https://git.example.com/<owner>/<repo>.git/info/lfs
+```
+
+To see where a push stops, run it with
+`GIT_TRACE=1 GIT_TRANSFER_TRACE=1 GIT_SSH_COMMAND="ssh -v" git push`: each
+`exec git-lfs-…` and its authentication is in the output, with timings. The
+server logs every SSH key it accepts with the number of unregistered keys the
+client offered before it (`rejected_publickeys`), a connection that ends
+without authenticating, and every LFS request over HTTPS, refusals included
+(`lfs request refused … status=401`): a `401` on the batch means a password was
+given where a personal access token is needed.
 
 An import brings the LFS objects along with the history. After the
 clone the server asks the source's own batch endpoint
