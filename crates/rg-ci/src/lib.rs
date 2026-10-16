@@ -905,12 +905,17 @@ fn persisted_dispatch_inputs(
     if trigger_type != rg_core::ci::WORKFLOW_DISPATCH_EVENT {
         return Ok(None);
     }
-    inputs
-        .filter(|inputs| !inputs.is_empty())
-        // A `HashMap<String, String>` cannot fail to serialize, but a silent
-        // `unwrap_or(None)` here would be a retry that quietly loses its inputs.
-        .map(|inputs| serde_json::to_string(inputs).context("serialize workflow_dispatch inputs"))
-        .transpose()
+    let Some(inputs) = inputs.filter(|inputs| !inputs.is_empty()) else {
+        return Ok(None);
+    };
+    // A `HashMap<String, String>` cannot fail to serialize, but a silent
+    // `unwrap_or(None)` here would be a retry that quietly loses its inputs.
+    let stored = serde_json::to_string(inputs).context("serialize workflow_dispatch inputs")?;
+    // The HTTP boundary refuses an oversized map before any git work; this is
+    // the same check where the row is built, so no producer can hand MySQL a
+    // document its `TEXT` column rejects with a 500 (card_2a0f4ba3b59d).
+    rg_core::ci::ensure_dispatch_inputs_fit(inputs, stored.len())?;
+    Ok(Some(stored))
 }
 
 /// One value of a run's replay context as the pipeline row should carry it.
@@ -7661,6 +7666,30 @@ mod manual_trigger_tests {
     use super::*;
 
     const DISPATCH_WORKFLOW: &[u8] = b"name: Manual\non:\n  workflow_dispatch:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n";
+
+    /// card_2a0f4ba3b59d: the row is built only from a document its column can
+    /// keep. A producer that skipped the HTTP check still gets a request error
+    /// here, before the transaction, rather than MySQL's `1406` as a 500.
+    #[test]
+    fn dispatch_inputs_the_row_cannot_keep_are_refused_where_the_row_is_built() {
+        let fits = std::collections::HashMap::from([(
+            "payload".to_string(),
+            "x".repeat(rg_core::ci::MAX_DISPATCH_INPUTS_JSON_BYTES - 14),
+        )]);
+        let stored = persisted_dispatch_inputs(rg_core::ci::WORKFLOW_DISPATCH_EVENT, Some(&fits))
+            .expect("a map at the ceiling is stored")
+            .expect("a non-empty map is stored");
+        assert_eq!(stored.len(), rg_core::ci::MAX_DISPATCH_INPUTS_JSON_BYTES);
+
+        let mut over = fits;
+        over.get_mut("payload").unwrap().replace_range(0..1, "\n");
+        let error = persisted_dispatch_inputs(rg_core::ci::WORKFLOW_DISPATCH_EVENT, Some(&over))
+            .expect_err("an escaped byte past the ceiling must be refused");
+        assert!(error
+            .downcast_ref::<rg_core::error::InvalidRequest>()
+            .is_some());
+        assert!(format!("{error:#}").contains("'payload'"));
+    }
 
     #[test]
     fn a_bare_workflow_dispatch_trigger_is_read_as_present() {

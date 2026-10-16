@@ -952,6 +952,66 @@ async fn a_retry_replays_the_dispatch_inputs_of_the_run_it_repeats() {
     );
 }
 
+/// card_2a0f4ba3b59d: an input map the pipeline row cannot keep is the
+/// caller's to shrink, so it is a `400` naming the input — before the engine
+/// is asked for anything — and a map exactly at the ceiling still starts a run.
+///
+/// Without the ceiling the same request was a `201` on SQLite and PostgreSQL
+/// and a `500` on MySQL, whose `TEXT` column refuses the `INSERT`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dispatch_inputs_past_the_stored_ceiling_are_refused_by_name() {
+    let h = harness("bigdispatch").await;
+    let client = reqwest::Client::new();
+    write_default_branch(&h, "README.md").await;
+    h.settle().await;
+    let url = format!("{}/api/v1/repos/{}/trg-repo/pipelines", h.base, h.owner);
+
+    // `{"payload":"…"}` is the value plus 14 bytes of JSON around it.
+    let at_ceiling = "x".repeat(rg_core::ci::MAX_DISPATCH_INPUTS_JSON_BYTES - 14);
+    let fits = std::collections::HashMap::from([("payload".to_string(), at_ceiling.clone())]);
+    assert_eq!(
+        serde_json::to_string(&fits).unwrap().len(),
+        rg_core::ci::MAX_DISPATCH_INPUTS_JSON_BYTES,
+        "the fixture has to sit exactly on the ceiling"
+    );
+    let started = client
+        .post(&url)
+        .bearer_auth(&h.token)
+        .json(&serde_json::json!({ "inputs": fits }))
+        .send()
+        .await
+        .expect("start a run at the ceiling");
+    assert_eq!(started.status(), 201, "a map at the ceiling must still run");
+    assert_eq!(h.engine.dispatch_inputs.lock().unwrap().as_slice(), [fits]);
+    h.engine.dispatch_inputs.lock().unwrap().clear();
+
+    // One byte more, spent on escaping rather than length: a quote is two
+    // bytes once stored, which is what the ceiling has to count.
+    let mut over = at_ceiling;
+    over.replace_range(0..1, "\"");
+    let refused = client
+        .post(&url)
+        .bearer_auth(&h.token)
+        .json(&serde_json::json!({ "inputs": { "payload": over, "target": "staging" } }))
+        .send()
+        .await
+        .expect("start a run past the ceiling");
+    assert_eq!(
+        refused.status(),
+        400,
+        "an input map the pipeline row cannot keep must be refused as the caller's request"
+    );
+    let body = refused.text().await.expect("refusal body");
+    assert!(
+        body.contains("'payload'"),
+        "the refusal must name the input that takes the room: {body}"
+    );
+    assert!(
+        h.engine.dispatch_inputs.lock().unwrap().is_empty(),
+        "the engine was asked to start a run the row cannot record"
+    );
+}
+
 /// card_74d58ec3ac1e: the same run again means the same *filters* again.
 ///
 /// `base_branch` and `previous_sha` were hardcoded `None` here, which is not

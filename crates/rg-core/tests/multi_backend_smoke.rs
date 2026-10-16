@@ -2989,6 +2989,95 @@ async fn an_import_with_a_thousand_failures_is_recorded_as_completed() {
         .is_some_and(|stage| stage.contains("1000 LFS object(s)")));
 }
 
+/// card_2a0f4ba3b59d: the ceiling `rg_core::ci` holds `workflow_dispatch`
+/// inputs to is one `pipelines.dispatch_inputs` can keep on every backend —
+/// and the first byte past it is refused as the caller's request, not handed
+/// to MySQL to fail with `1406 Data too long`.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn dispatch_inputs_at_the_ceiling_fit_the_pipeline_row() {
+    use rg_core::ci::MAX_DISPATCH_INPUTS_JSON_BYTES;
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("dispatch{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Dispatch Inputs Smoke",
+    )
+    .await
+    .expect("create dispatch owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("dispatchrepo{suffix}")),
+    )
+    .await
+    .expect("create dispatch repository");
+
+    // Multi-byte values: the column counts bytes, and so must the ceiling.
+    let mut inputs = std::collections::HashMap::new();
+    inputs.insert("target".to_string(), "staging".to_string());
+    let overhead = serde_json::to_string(&std::collections::HashMap::from([
+        ("target".to_string(), "staging".to_string()),
+        ("notes".to_string(), String::new()),
+    ]))
+    .unwrap()
+    .len();
+    let room = MAX_DISPATCH_INPUTS_JSON_BYTES - overhead;
+    let mut notes = "ž".repeat(room / 2);
+    notes.push_str(&"x".repeat(room % 2));
+    inputs.insert("notes".to_string(), notes);
+    let stored = serde_json::to_string(&inputs).unwrap();
+    assert_eq!(stored.len(), MAX_DISPATCH_INPUTS_JSON_BYTES);
+    rg_core::ci::validate_dispatch_inputs_size(&inputs).expect("a map at the ceiling is accepted");
+
+    let row = rg_db::ops::pipeline_ops::create_pipeline_row(
+        &db,
+        rg_db::ops::pipeline_ops::NewPipeline {
+            repo_id: repo.id,
+            commit_sha: "0123456789abcdef0123456789abcdef01234567",
+            ref_name: "refs/heads/main",
+            trigger_type: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+            triggered_by: Some(owner.id),
+            concurrency_group: None,
+            dispatch_inputs: Some(&stored),
+            base_branch: None,
+            previous_sha: None,
+        },
+    )
+    .await
+    .expect("dispatch inputs at the ceiling must fit the pipeline row");
+    let read_back = rg_db::ops::pipeline_ops::get_pipeline(&db, row.id)
+        .await
+        .unwrap()
+        .expect("the pipeline row");
+    let replayed: std::collections::HashMap<String, String> =
+        serde_json::from_str(read_back.dispatch_inputs.as_deref().expect("inputs stored"))
+            .expect("stored inputs stay JSON");
+    assert_eq!(
+        replayed, inputs,
+        "a retry must replay the inputs byte for byte"
+    );
+
+    inputs.get_mut("notes").unwrap().push('x');
+    let refused = rg_core::ci::validate_dispatch_inputs_size(&inputs)
+        .expect_err("one byte past the ceiling must be refused");
+    assert!(refused
+        .downcast_ref::<rg_core::error::InvalidRequest>()
+        .is_some());
+    assert!(format!("{refused:#}").contains("'notes'"));
+}
+
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn mfa_lifecycle_account_delete_is_portable() {

@@ -85,6 +85,55 @@ const CI_JOB_TOKEN_MIN_LIFETIME_SECS: i64 = 60;
 /// `workflow_dispatch` is what that event is called everywhere else.
 pub const WORKFLOW_DISPATCH_EVENT: &str = "workflow_dispatch";
 
+/// Largest `workflow_dispatch` input map a manual run may carry, counted as the
+/// JSON document `pipelines.dispatch_inputs` stores.
+///
+/// The column is `TEXT`, which MySQL caps at 65 535 bytes; SQLite and
+/// PostgreSQL take more, so without a ceiling of our own one oversized value
+/// was a `201` on two backends and a `500` (`1406 Data too long`) on the third
+/// (card_2a0f4ba3b59d). The number is the column's, and it also matches the
+/// 65 535 characters GitHub allows a dispatch payload. It is counted after
+/// serialization because escaping is what grows: a quote or a control
+/// character takes two to six bytes in the stored document.
+pub const MAX_DISPATCH_INPUTS_JSON_BYTES: usize = 65_535;
+
+/// Refuse a `workflow_dispatch` input map that would not fit the column the
+/// pipeline row keeps it in, naming the input that takes the most room.
+///
+/// This is a request problem the caller can fix, so it is an
+/// [`crate::error::InvalidRequest`], never a storage failure.
+pub fn validate_dispatch_inputs_size(
+    inputs: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let stored = serde_json::to_string(inputs).map_err(anyhow::Error::from)?;
+    ensure_dispatch_inputs_fit(inputs, stored.len())
+}
+
+/// [`validate_dispatch_inputs_size`] for a caller that already holds the
+/// serialized document, so it is measured once and stored as measured.
+pub fn ensure_dispatch_inputs_fit(
+    inputs: &std::collections::HashMap<String, String>,
+    stored_bytes: usize,
+) -> anyhow::Result<()> {
+    if stored_bytes <= MAX_DISPATCH_INPUTS_JSON_BYTES {
+        return Ok(());
+    }
+    let largest = inputs
+        .iter()
+        .max_by(|(left_name, left), (right_name, right)| {
+            left.len()
+                .cmp(&right.len())
+                // Deterministic among equals, so the message is stable.
+                .then_with(|| right_name.cmp(left_name))
+        })
+        .map(|(name, value)| format!("; the largest is input '{name}' ({} bytes)", value.len()))
+        .unwrap_or_default();
+    Err(crate::error::invalid_request(format!(
+        "workflow_dispatch inputs take {stored_bytes} bytes as stored, more than the \
+         {MAX_DISPATCH_INPUTS_JSON_BYTES} a pipeline can keep{largest}"
+    )))
+}
+
 /// Every event a pipeline may be created under.
 ///
 /// The vocabulary is `Workflow::matches_event`'s, not this list's — the list

@@ -656,6 +656,12 @@ pub async fn trigger_pipeline(
     RepoWrite { repo, actor_id }: RepoWrite,
     Json(body): Json<TriggerPipelineRequest>,
 ) -> impl IntoResponse {
+    // A map the pipeline row cannot keep is the caller's to shrink; refuse it
+    // before resolving refs or reading workflows (card_2a0f4ba3b59d).
+    if let Err(e) = rg_core::ci::validate_dispatch_inputs_size(&body.inputs) {
+        return AppError::from(e).into_response();
+    }
+
     let owner_display = match resolve_repo_storage_owner(&state, &repo, &owner).await {
         Ok(owner) => owner,
         Err(e) => return e.into_response(),
