@@ -43,6 +43,8 @@ fn main() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn run() -> anyhow::Result<()> {
+    // Before anything sets up TLS: the HTTPS listener, LDAPS, outbound clients.
+    rg_core::platform::tls::install_crypto_provider();
     // Parse CLI args first (without initializing logging, to avoid early output)
     let cli = Cli::parse();
     rg_process::refuse_retired_environment()?;

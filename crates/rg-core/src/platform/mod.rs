@@ -38,6 +38,7 @@
 
 pub mod fs;
 pub mod path;
+pub mod tls;
 
 pub use fs::{discard_dir, discard_dir_async, discard_file, discard_file_async};
 pub use path::validate_repo_path;

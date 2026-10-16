@@ -1059,6 +1059,8 @@ async fn load_tls_config(
     let key = PrivateKeyDer::from_pem_reader(&mut key_reader)
         .with_context(|| format!("failed to parse TLS private key in {}", key_path.display()))?;
 
+    // Both rustls providers are in the tree; the builder below needs one chosen.
+    rg_core::platform::tls::install_crypto_provider();
     let server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)

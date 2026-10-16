@@ -220,6 +220,8 @@ impl<T> DirectoryCall<T> for std::result::Result<T, LdapError> {
 }
 
 fn connection_settings(config: &LdapConfig) -> LdapConnSettings {
+    // `ldap3` builds its rustls client config from the process default.
+    crate::platform::tls::install_crypto_provider();
     let settings = LdapConnSettings::new().set_conn_timeout(std::time::Duration::from_secs(10));
     if config.use_tls && config.insecure_skip_tls_verify {
         settings.set_no_tls_verify(true)
