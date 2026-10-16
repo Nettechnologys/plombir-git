@@ -478,11 +478,8 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
     let mut tools = tools;
     if let Some(tools) = tools.as_array_mut() {
         for tool in tools {
-            let effect = tool
-                .get("name")
-                .and_then(Value::as_str)
-                .and_then(tool_effect);
-            if let (Some(effect), Some(tool)) = (effect, tool.as_object_mut()) {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+            if let (Some(effect), Some(tool)) = (tool_effect(name), tool.as_object_mut()) {
                 tool.insert("annotations".into(), effect.annotations());
             }
         }
@@ -506,7 +503,7 @@ type ToolHandler = fn(&AppState, &Value) -> String;
 /// commit pushed onto a branch, an overwritten issue body or a cancelled job
 /// cannot be undone through this API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToolEffect {
+pub(crate) enum ToolEffect {
     /// Reads only; calling it changes nothing.
     Read,
     /// Adds something new; a repeated call adds it again.
@@ -525,7 +522,7 @@ impl ToolEffect {
     ///
     /// `openWorldHint` is false for every tool: each one talks to this forge's
     /// own API and nothing beyond it.
-    pub fn annotations(self) -> Value {
+    pub(crate) fn annotations(self) -> Value {
         let (read_only, destructive, idempotent) = match self {
             ToolEffect::Read => (true, false, true),
             ToolEffect::Additive => (false, false, false),
@@ -544,7 +541,7 @@ impl ToolEffect {
 
 /// What `tool` does to the forge. `None` for a tool this server does not
 /// implement.
-pub fn tool_effect(tool: &str) -> Option<ToolEffect> {
+fn tool_effect(tool: &str) -> Option<ToolEffect> {
     TOOL_DISPATCH
         .iter()
         .find(|(name, _, _, _)| *name == tool)
