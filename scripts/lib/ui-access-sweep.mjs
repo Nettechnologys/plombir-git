@@ -301,9 +301,17 @@ export function assertPersonaResults(scenario, observedByPersona, routeUrls) {
         throw new Error(`${scenario.id}: ${persona} never reached ${coverage.method} ${coverage.routeUrl}`);
       }
       const expected = expectedForAccess(coverage.access, persona);
-      const wrong = matches.find((response) => expected === 'allowed'
-        ? response.status < 200 || response.status >= 400
-        : !DENIED_STATUSES.has(response.status));
+      // An allowed persona has to be let through at least once. Beside that,
+      // a `404` is the resource not existing yet — the mirror settings page
+      // reads `GET /mirror` before the owner configures one, and the same
+      // route answers `200` once they have — not a refusal; a 401/403 or a
+      // 5xx next to a success still is one.
+      const isAllowed = (response) => response.status >= 200 && response.status < 400;
+      const wrong = expected === 'allowed'
+        ? (matches.some(isAllowed)
+          ? matches.find((response) => !isAllowed(response) && response.status !== 404)
+          : matches[0])
+        : matches.find((response) => !DENIED_STATUSES.has(response.status));
       if (wrong) {
         throw new Error(
           `${scenario.id}: ${persona} ${coverage.method} ${coverage.routeUrl} returned ${wrong.status}; `

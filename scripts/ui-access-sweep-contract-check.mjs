@@ -152,6 +152,29 @@ if (report) {
       failures.push(`the complete synthetic persona matrix is rejected: ${error.message}`);
     }
 
+    // An owner who reads a resource before creating it sees a 404 and then a
+    // 200 on the same route (the pull-mirror settings page does exactly that):
+    // allowed. A 404 alone, or a 403 beside the 200, is not.
+    const ownerCover = privileged.covers.find((coverage) => coverage.method === 'GET')
+      ?? privileged.covers[0];
+    const ownerPath = examplePathFor(ownerCover.routeUrl);
+    const withOwner = (statuses) => new Map([
+      ...complete,
+      ['owner', [
+        ...complete.get('owner').filter((response) => !(response.method === ownerCover.method
+          && response.url.endsWith(ownerPath))),
+        ...statuses.map((status) => ({ method: ownerCover.method, url: `http://127.0.0.1:1${ownerPath}`, status })),
+      ]],
+    ]);
+    try { assertPersonaResults(privileged, withOwner([404, 200]), routeUrls); } catch (error) {
+      failures.push(`the oracle refused an owner who read a resource before creating it: ${error.message}`);
+    }
+    for (const [statuses, what] of [[[404], 'only a 404'], [[200, 403], 'a 403 beside its 200']]) {
+      let refused = false;
+      try { assertPersonaResults(privileged, withOwner(statuses), routeUrls); } catch { refused = true; }
+      if (!refused) failures.push(`the oracle accepted an owner who got ${what}`);
+    }
+
     const ownerOnly = new Map([['owner', complete.get('owner')]]);
     let rejected = false;
     try { assertPersonaResults(privileged, ownerOnly, routeUrls); } catch (error) {
