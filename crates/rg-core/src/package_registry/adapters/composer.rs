@@ -176,7 +176,10 @@ fn extract_composer_json(artifact: &PackageArtifact) -> anyhow::Result<String> {
         let entry = archive
             .by_index(i)
             .map_err(|e| anyhow::anyhow!("failed to read ZIP entry: {e}"))?;
-        let name = entry.name().to_string();
+        // A name the archive cannot decode is not `composer.json`.
+        let Ok(name) = entry.name().map(|name| name.into_owned()) else {
+            continue;
+        };
 
         // Match: any path ending with /composer.json
         if name.ends_with("/composer.json") {

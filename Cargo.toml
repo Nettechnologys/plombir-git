@@ -213,7 +213,18 @@ gix = { version = "0.84", features = [
 # Archive / compression
 flate2 = "1"
 tar = "0.4"
-zip = "2"
+# The formats zip 2.x read by default, less bzip2: zip 9 links it through
+# `libbz2-rs-sys`, whose bzip2-1.0.6 license deny.toml does not list, and no
+# package client writes a bzip2 entry into a .nupkg, wheel or Composer zip.
+zip = { version = "9", default-features = false, features = [
+    "aes-crypto",
+    "deflate",
+    "deflate64",
+    "lzma",
+    "time",
+    "xz",
+    "zstd",
+] }
 zstd = "0.13"
 
 # HTTP plumbing below axum, and stream helpers

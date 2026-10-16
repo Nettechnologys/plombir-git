@@ -305,7 +305,10 @@ fn extract_from_nupkg(artifact: &PackageArtifact) -> Result<ExtractedMetadata, a
         let mut entry = archive
             .by_index(i)
             .map_err(|e| anyhow::anyhow!("failed to read .nupkg entry {}: {e}", i))?;
-        let name = entry.name().to_lowercase();
+        // A name the archive cannot decode is not the `.nuspec`.
+        let Ok(name) = entry.name().map(|name| name.to_lowercase()) else {
+            continue;
+        };
         if name.ends_with(".nuspec") {
             nuspec_content = Some(read_manifest_to_string(&mut entry, ".nuspec")?);
             break;

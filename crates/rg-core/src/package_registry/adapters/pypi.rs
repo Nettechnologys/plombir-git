@@ -240,7 +240,10 @@ fn extract_from_whl(artifact: &PackageArtifact) -> Result<ExtractedMetadata, any
         let mut entry = archive
             .by_index(i)
             .map_err(|e| anyhow::anyhow!("failed to read .whl entry {}: {e}", i))?;
-        let path = entry.name().to_lowercase();
+        // A name the archive cannot decode is not the `METADATA` file.
+        let Ok(path) = entry.name().map(|name| name.to_lowercase()) else {
+            continue;
+        };
 
         // Look for *.dist-info/METADATA
         if path.ends_with(".dist-info/metadata") || path.ends_with(".dist-info\\metadata") {
