@@ -41,7 +41,9 @@ Three things, each with something you can check.
   protected branch's required approvals, nor does its owner's approval on the
   bot's own pull request. A bot cannot approve a protected deployment
   environment, and CI for a pull request from a fork runs only after a person
-  approves its exact head commit.
+  approves its exact head commit. Working alone with your own bot, where no
+  second person exists to approve:
+  [one person and their agent](#one-person-and-their-agent).
 - **Every MCP tool call is in the audit log** (`agent.mcp_tool_call`), and so is
   every request a token's narrowing refused (`agent.scope_denied`).
 
@@ -1096,6 +1098,49 @@ treat an agent as a participant of its own rather than as its owner:
   request outside a token's narrowing answers `403` and is written as
   `agent.scope_denied`; and every audit row made through a token carries
   `credential.token_id` and, through MCP, `credential.mcp_tool`.
+
+#### One person and their agent
+
+Required approvals are written for a team: the approval that opens the merge
+comes from a *second* person with write access. When you are the only person
+on the repository and the pull requests come from your own bot, nobody can give
+that approval — yours on your bot's pull request is the author approving
+themselves — so `"require_approval": true` leaves every one of the bot's pull
+requests unmergeable. That is deliberate: the refused merge says which
+approvals did not count and why.
+
+What keeps `main` safe in that setup is who can write to it, not a count of
+approvals. Three calls, with your own token (`you`, `you-bot` and `you/app`
+stand for your account, your bot and the repository):
+
+```bash
+# 1. The bot works on the repository as a collaborator with write access.
+curl -X POST https://forge.example.com/api/v1/repos/you/app/collaborators \
+  -H "Authorization: Bearer $YOUR_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"username": "you-bot", "permission": "write"}'
+
+# 2. main takes changes only through a pull request. You alone may still push
+#    to it directly; no approval count.
+curl -X POST https://forge.example.com/api/v1/repos/you/app/branches/protection \
+  -H "Authorization: Bearer $YOUR_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"branch_name": "main", "require_pr": true, "allowed_push_users": ["you"]}'
+
+# 3. The bot's token stays off protected branches: no merge, push or
+#    server-side commit there. That is already the default for a bot's token;
+#    saying it keeps it from being switched off by accident.
+curl -X POST https://forge.example.com/api/v1/users/bots/you-bot/tokens \
+  -H "Authorization: Bearer $YOUR_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name": "agent", "repositories": ["you/app"], "deny_protected_merge": true}'
+```
+
+The bot then opens pull requests into `main` and cannot land them by any
+route: `require_pr` refuses its `git push` to `main` over HTTPS and SSH alike,
+and its token refuses the merge and a commit from the web editor. A bot has no
+password, so there is no browser session to use instead. You review and press
+*Merge*. Add `"require_status_check": true` to the rule when CI has to pass
+first — it binds your merges and the bot's pull requests the same way. In the
+web UI the same settings are the repository's *Settings → Collaborators* and
+*Settings → Branches*, and your account's *Settings → Agents*.
 
 ---
 

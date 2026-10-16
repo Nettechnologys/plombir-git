@@ -630,6 +630,136 @@ async fn a_token_kept_off_protected_branches_cannot_write_there() {
     );
 }
 
+/// The README's "One person and their agent" recipe, call for call
+/// (card_a68e722c5ed4): with no second person to approve, an approval count
+/// leaves the bot's pull request unmergeable for its owner too, and the recipe
+/// — `require_pr` with the owner on the push list, the bot's token kept off
+/// protected branches — lets the owner merge while the bot cannot land
+/// anything on `main`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_owner_merges_the_bots_pull_request_and_the_bot_cannot() {
+    let f = fixture(StateOverrides::default()).await;
+    let protect = |body: serde_json::Value| {
+        f.http
+            .post(format!(
+                "{}/api/v1/repos/alice/app/branches/protection",
+                f.base
+            ))
+            .bearer_auth(&f.alice)
+            .json(&body)
+            .send()
+    };
+    let response = protect(serde_json::json!({
+        "branch_name": "main", "require_pr": true, "allowed_push_users": ["alice"],
+        "require_approval": true, "required_approvals": 1,
+    }))
+    .await
+    .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let rule: serde_json::Value = response.json().await.unwrap();
+    let rule_id = rule["id"].as_i64().expect("rule id");
+
+    let agent = f
+        .bot_token(serde_json::json!({
+            "name": "agent", "repositories": ["alice/app"], "deny_protected_merge": true,
+        }))
+        .await;
+    let response = f
+        .http
+        .post(format!("{}/api/v1/repos/alice/app/pulls", f.base))
+        .bearer_auth(&agent)
+        .json(&serde_json::json!({ "title": "change", "head": "feature", "base": "main" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+    let number = response.json::<serde_json::Value>().await.unwrap()["number"]
+        .as_i64()
+        .unwrap();
+    let merge = |token: &str| {
+        f.http
+            .post(format!(
+                "{}/api/v1/repos/alice/app/pulls/{number}/merge",
+                f.base
+            ))
+            .bearer_auth(token.to_string())
+            .json(&serde_json::json!({ "strategy": "merge" }))
+            .send()
+    };
+
+    // The team setting: the owner's approval of their bot's pull request is
+    // recorded, does not count, and the refusal says so.
+    let response = f
+        .http
+        .post(format!(
+            "{}/api/v1/repos/alice/app/pulls/{number}/reviews",
+            f.base
+        ))
+        .bearer_auth(&f.alice)
+        .json(&serde_json::json!({ "action": "approve" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let refused = merge(&f.alice).await.unwrap();
+    assert_eq!(refused.status(), 403);
+    let text = refused.text().await.unwrap();
+    assert!(text.contains("do not count"), "{text}");
+
+    // The recipe: no approval count.
+    let response = f
+        .http
+        .patch(format!(
+            "{}/api/v1/repos/alice/app/branches/protection/{rule_id}",
+            f.base
+        ))
+        .bearer_auth(&f.alice)
+        .json(&serde_json::json!({ "require_approval": false }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+
+    // The bot can land nothing on main: not the merge, not a push.
+    assert_eq!(merge(&agent).await.unwrap().status(), 403);
+    let host = f.base.trim_start_matches("http://");
+    let remote = format!("http://alice-agent:{agent}@{host}/alice/app.git");
+    let worktree = tempfile::tempdir().unwrap();
+    let checkout = worktree.path().join("app");
+    git(&["clone", &remote, checkout.to_str().unwrap()], None);
+    git(&["config", "user.name", "Agent"], Some(&checkout));
+    git(
+        &["config", "user.email", "agent@example.test"],
+        Some(&checkout),
+    );
+    std::fs::write(checkout.join("pushed.txt"), "pushed\n").unwrap();
+    git(&["add", "."], Some(&checkout));
+    git(&["commit", "-m", "pushed by the agent"], Some(&checkout));
+    let (pushed, stderr) = git_outcome(&["push", &remote, "HEAD:main"], Some(&checkout));
+    assert!(!pushed, "the bot pushed to main: {stderr}");
+
+    // The owner merges.
+    let merged = merge(&f.alice).await.unwrap();
+    assert!(
+        merged.status().is_success(),
+        "{} {}",
+        merged.status(),
+        merged.text().await.unwrap()
+    );
+}
+
 /// A token confined to repositories reaches only those over git, too — and a
 /// person's own token can carry the same confinement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
