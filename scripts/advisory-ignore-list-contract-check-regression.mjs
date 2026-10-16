@@ -24,24 +24,24 @@ function replaceOnce(text, from, to, label) {
 }
 
 const OSV_STEP = '        run: osv-scanner scan --config=osv-scanner.toml --lockfile=Cargo.lock\n';
-const OSV_ENTRY = '[[IgnoredVulns]]\nid = "RUSTSEC-2025-0134"\n';
+const OSV_ENTRY = '[[IgnoredVulns]]\nid = "RUSTSEC-2023-0071"\n';
 
 const fixtures = [
   { label: 'unmutated', mutate: {}, expect: null },
   {
     label: 'osv-scanner.toml drops an accepted id',
     mutate: { 'osv-scanner.toml': (t) => t.slice(0, t.indexOf(OSV_ENTRY)) },
-    expect: 'RUSTSEC-2025-0134 is accepted in .cargo/audit.toml, deny.toml but not in osv-scanner.toml.',
+    expect: 'RUSTSEC-2023-0071 is accepted in .cargo/audit.toml, deny.toml but not in osv-scanner.toml.',
   },
   {
     label: 'deny.toml accepts one more id',
-    mutate: { 'deny.toml': (t, l) => replaceOnce(t, '    "RUSTSEC-2025-0134",\n', '    "RUSTSEC-2025-0134",\n    "RUSTSEC-2099-0001",\n', l) },
+    mutate: { 'deny.toml': (t, l) => replaceOnce(t, '    "RUSTSEC-2023-0071",\n', '    "RUSTSEC-2023-0071",\n    "RUSTSEC-2099-0001",\n', l) },
     expect: 'RUSTSEC-2099-0001 is accepted in deny.toml but not in .cargo/audit.toml, osv-scanner.toml.',
   },
   {
     label: 'osv entry without a reason',
     mutate: { 'osv-scanner.toml': (t, l) => replaceOnce(t, `${OSV_ENTRY}reason = """\\`, `${OSV_ENTRY}note = """\\`, l) },
-    expect: 'IgnoredVulns[1] (RUSTSEC-2025-0134) carries no reason',
+    expect: 'IgnoredVulns[0] (RUSTSEC-2023-0071) carries no reason',
   },
   {
     label: 'scan step continues on error',

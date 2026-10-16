@@ -29,11 +29,6 @@ ignore = [
     # curve25519/ECDH, not RSA key transport) — the specific vector Marvin
     # exploits. Revisit when `rsa` ships a constant-time release.
     "RUSTSEC-2023-0071",
-    # rustls-pemfile unmaintained — a thin wrapper over rustls-pki-types, no
-    # security defect. Our direct use (rg-http TLS cert/key parsing) has been
-    # migrated to `rustls_pki_types::pem::PemObject`; it now reaches us ONLY
-    # transitively via axum-server v0.7, so the ignore stays until that updates.
-    "RUSTSEC-2025-0134",
 ]
 
 # ──────────────────────────────── Licenses ────────────────────────────────

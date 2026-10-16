@@ -1024,7 +1024,7 @@ async fn shutdown_signal(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
 /// Bridge the `watch` shutdown signal to an `axum_server::Handle`: once the
 /// signal fires, ask the handle to shut down gracefully with the grace window.
 fn spawn_graceful_shutdown_trigger(
-    handle: axum_server::Handle,
+    handle: axum_server::Handle<std::net::SocketAddr>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     grace: std::time::Duration,
 ) {

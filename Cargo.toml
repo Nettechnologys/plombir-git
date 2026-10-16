@@ -174,7 +174,7 @@ ldap3 = { version = "0.12", default-features = false, features = ["sync", "tls-r
 
 # TLS
 tokio-rustls = "0.26"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 
 # Config
 toml = "0.8"

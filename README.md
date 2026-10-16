@@ -1149,7 +1149,7 @@ web UI the same settings are the repository's *Settings → Collaborators* and
 | Layer | Choice | Version |
 |-------|--------|---------|
 | Async runtime | tokio | 1.x |
-| HTTP | axum + axum-server | 0.8 / 0.7 |
+| HTTP | axum + axum-server | 0.8 / 0.8 |
 | SSH server | russh | 0.60 |
 | Git objects | gix (gitoxide) + `git` CLI gateway | 0.84 |
 | ORM | SeaORM (SQLite / PostgreSQL / MySQL) | 1.1 |
