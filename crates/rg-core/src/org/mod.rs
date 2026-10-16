@@ -5,6 +5,14 @@ use sea_orm::DatabaseConnection;
 
 use rg_db::ops::org_ops;
 
+/// An organization's display name and description are one-line fields,
+/// `VARCHAR(255)` on MySQL.
+fn check_org_lengths(display_name: Option<&str>, description: Option<&str>) -> Result<()> {
+    use crate::text_limits::{check_optional, MAX_LINE_CHARS};
+    check_optional("display_name", display_name, MAX_LINE_CHARS)?;
+    check_optional("description", description, MAX_LINE_CHARS)
+}
+
 /// Create a new organization.
 pub async fn create_org(
     db: &DatabaseConnection,
@@ -16,6 +24,7 @@ pub async fn create_org(
 ) -> Result<rg_db::entities::organization::Model> {
     // Validate org name (same rules as username)
     crate::validate_username(name)?;
+    check_org_lengths(display_name, description)?;
 
     // Check visibility
     if visibility != "public" && visibility != "private" {
@@ -76,6 +85,7 @@ pub async fn update_org(
     description: Option<&str>,
     visibility: Option<&str>,
 ) -> Result<rg_db::entities::organization::Model> {
+    check_org_lengths(display_name, description)?;
     org_ops::update_org(db, id, display_name, description, visibility)
         .await?
         .ok_or_else(|| crate::error::not_found("organization"))
@@ -331,6 +341,11 @@ pub async fn create_team(
         return Err(crate::error::invalid_request(
             "permission must be 'read', 'write', or 'admin'",
         ));
+    }
+    {
+        use crate::text_limits::{check, check_optional, MAX_LINE_CHARS};
+        check("name", name, MAX_LINE_CHARS)?;
+        check_optional("description", description, MAX_LINE_CHARS)?;
     }
     org_ops::create_team(db, org_id, name, description, permission).await
 }

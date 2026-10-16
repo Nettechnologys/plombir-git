@@ -16,6 +16,21 @@ use crate::blob_storage::{BlobKey, BlobStorage};
 use crate::db::DbPools;
 use crate::deletion_recovery;
 
+/// Refuse release fields the database would not hold the same way on every
+/// backend: the one-line ones are `VARCHAR(255)` on MySQL.
+fn check_release_lengths(
+    tag_name: &str,
+    title: &str,
+    body: Option<&str>,
+    target_commitish: &str,
+) -> Result<()> {
+    use crate::text_limits::{check, check_optional, MAX_BODY_CHARS, MAX_LINE_CHARS};
+    check("tag_name", tag_name, MAX_LINE_CHARS)?;
+    check("title", title, MAX_LINE_CHARS)?;
+    check("target_commitish", target_commitish, MAX_LINE_CHARS)?;
+    check_optional("body", body, MAX_BODY_CHARS)
+}
+
 /// Create a new release.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_release(
@@ -39,6 +54,7 @@ pub async fn create_release(
     if title.is_empty() {
         return Err(crate::error::invalid_request("title cannot be empty"));
     }
+    check_release_lengths(tag_name, title, body, target_commitish)?;
 
     // The one answer both the pre-read and a losing insert give, so a caller
     // cannot tell which of the two noticed — and so no constraint text leaks.
@@ -182,6 +198,7 @@ pub async fn publish_release(
     if title.is_empty() {
         return Err(crate::error::invalid_request("title cannot be empty"));
     }
+    check_release_lengths(tag_name, title, body, target_commitish)?;
     // A refused release must not have created a tag first.
     if rg_db::ops::release_ops::find_by_repo_and_tag(db, repo_id, tag_name)
         .await?
@@ -295,6 +312,8 @@ pub async fn update_release(
     is_draft: Option<bool>,
     is_prerelease: Option<bool>,
 ) -> Result<Release> {
+    crate::text_limits::check_optional("title", title, crate::text_limits::MAX_LINE_CHARS)?;
+    crate::text_limits::check_optional("body", body, crate::text_limits::MAX_BODY_CHARS)?;
     update_release_after_read(db, id, title, body, is_draft, is_prerelease, || {
         std::future::ready(Ok(()))
     })

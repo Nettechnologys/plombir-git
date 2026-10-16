@@ -3078,6 +3078,591 @@ async fn dispatch_inputs_at_the_ceiling_fit_the_pipeline_row() {
     assert!(format!("{refused:#}").contains("'notes'"));
 }
 
+/// Text a person writes fits its column on every backend at the ceiling the
+/// API enforces, and one character past it is refused as a bad request, not a
+/// database error (card_9ea48ee6a422). On MySQL these columns were
+/// `VARCHAR(255)`, and strict mode turned any longer body into a `500`.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn free_text_at_the_ceiling_round_trips() {
+    use rg_core::text_limits::{MAX_BODY_CHARS, MAX_LINE_CHARS, MAX_PATH_CHARS};
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    if db.get_database_backend() == DatabaseBackend::MySql {
+        assert_free_text_columns_are_wide(&db).await;
+    }
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("freetext{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Free Text Smoke",
+    )
+    .await
+    .expect("create free-text owner");
+    let repo_name = format!("freetext{suffix}");
+    let repo = rg_db::ops::repo_ops::create(&db, namespace_repo(owner.id, None, &repo_name))
+        .await
+        .expect("create free-text repository");
+
+    // Four-byte characters: the column has to hold the bytes, not the count.
+    let body = "😀".repeat(MAX_BODY_CHARS);
+    let title = "😀".repeat(MAX_LINE_CHARS);
+    let over_body = format!("{body}x");
+    let over_title = format!("{title}x");
+    let refused = |result: anyhow::Result<()>, what: &str| {
+        let error = result.expect_err(&format!("{what} past the ceiling must be refused"));
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "{what} past the ceiling must be a bad request, got: {error:#}"
+        );
+    };
+
+    // Issue and its comment.
+    let issue = rg_core::issue::service::create_issue(
+        &db,
+        repo.id,
+        owner.id,
+        title.clone(),
+        Some(body.clone()),
+        None,
+        None,
+    )
+    .await
+    .expect("an issue at the ceiling is created");
+    let stored = rg_db::entities::issue::Entity::find_by_id(issue.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the issue row");
+    assert_eq!(stored.title, title);
+    assert_eq!(stored.body.as_deref(), Some(body.as_str()));
+    refused(
+        rg_core::issue::service::create_issue(
+            &db,
+            repo.id,
+            owner.id,
+            over_title.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .map(drop),
+        "an issue title",
+    );
+    refused(
+        rg_core::issue::service::create_issue(
+            &db,
+            repo.id,
+            owner.id,
+            "t".into(),
+            Some(over_body.clone()),
+            None,
+            None,
+        )
+        .await
+        .map(drop),
+        "an issue body",
+    );
+
+    let comment = rg_core::issue::service::add_comment(
+        &db,
+        &username,
+        &repo_name,
+        issue.number,
+        owner.id,
+        body.clone(),
+    )
+    .await
+    .expect("a comment at the ceiling is created");
+    let stored = rg_db::entities::issue_comment::Entity::find_by_id(comment.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the comment row");
+    assert_eq!(stored.body, body);
+    refused(
+        rg_core::issue::service::add_comment(
+            &db,
+            &username,
+            &repo_name,
+            issue.number,
+            owner.id,
+            over_body.clone(),
+        )
+        .await
+        .map(drop),
+        "a comment",
+    );
+
+    // Pull request, its review and an inline comment with a suggestion. The
+    // row is written directly: opening one through the service needs branches.
+    let now = chrono::Utc::now();
+    let pr = rg_db::entities::pull_request::ActiveModel {
+        repo_id: Set(repo.id),
+        number: Set(issue.number + 1),
+        title: Set(title.clone()),
+        body: Set(Some(body.clone())),
+        state: Set("open".to_string()),
+        is_draft: Set(false),
+        auto_merge_enabled: Set(false),
+        author_id: Set(owner.id),
+        head_branch: Set("feature".to_string()),
+        base_branch: Set("main".to_string()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("a pull request at the ceiling is stored");
+    assert_eq!(pr.body.as_deref(), Some(body.as_str()));
+
+    let review = rg_core::review::service::submit_review(
+        &db,
+        repo.id,
+        pr.number,
+        owner.id,
+        rg_core::review::service::ReviewAction::Comment,
+        Some(body.clone()),
+        None,
+    )
+    .await
+    .expect("a review at the ceiling is submitted");
+    let stored = rg_db::entities::pr_review::Entity::find_by_id(review.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the review row");
+    assert_eq!(stored.body.as_deref(), Some(body.as_str()));
+    refused(
+        rg_core::review::service::submit_review(
+            &db,
+            repo.id,
+            pr.number,
+            owner.id,
+            rg_core::review::service::ReviewAction::Comment,
+            Some(over_body.clone()),
+            None,
+        )
+        .await
+        .map(drop),
+        "a review",
+    );
+
+    let path = format!("{}.rs", "😀".repeat(MAX_PATH_CHARS - 3));
+    let inline = rg_core::review::service::create_review_comment(
+        &db,
+        repo.id,
+        pr.number,
+        None,
+        owner.id,
+        path.clone(),
+        Some(1),
+        None,
+        Some("RIGHT".to_string()),
+        None,
+        body.clone(),
+        Some(body.clone()),
+        None,
+        None,
+    )
+    .await
+    .expect("an inline comment at the ceiling is created");
+    let stored = rg_db::entities::review_comment::Entity::find_by_id(inline.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the inline comment row");
+    assert_eq!(stored.path, path);
+    assert_eq!(stored.body, body);
+    assert_eq!(stored.suggestion.as_deref(), Some(body.as_str()));
+    refused(
+        rg_core::review::service::create_review_comment(
+            &db,
+            repo.id,
+            pr.number,
+            None,
+            owner.id,
+            "a.rs".to_string(),
+            Some(1),
+            None,
+            Some("RIGHT".to_string()),
+            None,
+            over_body.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .map(drop),
+        "an inline comment",
+    );
+
+    // Wiki page: the update copies the old content into a revision.
+    rg_core::wiki::service::create_page(&db, repo.id, "Home", &body, Some(&body), Some(owner.id))
+        .await
+        .expect("a wiki page at the ceiling is created");
+    let updated = format!("{}y", &body[..body.len() - "😀".len()]);
+    rg_core::wiki::service::update_page(
+        &db,
+        repo.id,
+        "Home",
+        &updated,
+        Some("edit"),
+        Some(owner.id),
+    )
+    .await
+    .expect("a wiki page at the ceiling is updated");
+    let page = rg_core::wiki::service::get_page(&db, repo.id, "Home")
+        .await
+        .expect("read the wiki page back")
+        .expect("the wiki page");
+    assert_eq!(page.content, updated);
+    let revisions = rg_core::wiki::service::list_revisions(&db, repo.id, "Home")
+        .await
+        .expect("list wiki revisions");
+    assert!(
+        revisions.iter().any(|revision| revision.content == body),
+        "the revision keeps the content it replaced"
+    );
+    refused(
+        rg_core::wiki::service::create_page(&db, repo.id, "Other", &over_body, None, None)
+            .await
+            .map(drop),
+        "a wiki page",
+    );
+
+    // Release, notification, CI job script and full log.
+    let release = rg_core::release::service::create_release(
+        &db,
+        repo.id,
+        owner.id,
+        "v1",
+        &title,
+        Some(&body),
+        "main",
+        false,
+        false,
+        std::path::Path::new("/nonexistent"),
+    )
+    .await
+    .expect("a release at the ceiling is created");
+    assert_eq!(release.body.as_deref(), Some(body.as_str()));
+
+    let notification_title = format!("{username}/{repo_name} #{}: {title}", issue.number);
+    let notification = rg_db::ops::notification_ops::create_notification(
+        &db,
+        owner.id,
+        "issue_comment",
+        &notification_title,
+        Some(&body),
+        Some(repo.id),
+    )
+    .await
+    .expect("a notification about a title at the ceiling is stored");
+    assert_eq!(notification.title, notification_title);
+
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline_row(
+        &db,
+        rg_db::ops::pipeline_ops::NewPipeline {
+            repo_id: repo.id,
+            commit_sha: "0123456789abcdef0123456789abcdef01234567",
+            ref_name: "refs/heads/main",
+            trigger_type: "push",
+            triggered_by: Some(owner.id),
+            concurrency_group: None,
+            dispatch_inputs: None,
+            base_branch: None,
+            previous_sha: None,
+        },
+    )
+    .await
+    .expect("create the free-text pipeline");
+    let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+        .await
+        .expect("create the free-text stage");
+    let script = "cargo test --workspace --locked\n".repeat(64);
+    let job = rg_db::ops::pipeline_ops::create_job(
+        &db, stage.id, "test", &script, None, None, None, None, None, None, false, None, None, None,
+    )
+    .await
+    .expect("a job with a long script is created");
+    assert_eq!(job.script, script);
+    // What a runner uploads in replace mode: the whole log, up to 8 MiB.
+    let log = "line of output ✓\n".repeat(64 * 1024);
+    rg_db::ops::pipeline_ops::update_job_log(&db, job.id, &log)
+        .await
+        .expect("a full job log is stored");
+    let stored = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+        .await
+        .unwrap()
+        .expect("the job row");
+    assert_eq!(stored.log.as_deref(), Some(log.as_str()));
+}
+
+/// The MySQL columns `m20261016_000001_free_text_columns_mysql` widens, read
+/// back from the schema rather than from the migration's own list.
+async fn assert_free_text_columns_are_wide(db: &DatabaseConnection) {
+    let expected = [
+        ("issues", "body", "mediumtext"),
+        ("issues_fts", "body", "mediumtext"),
+        ("issue_comments", "body", "mediumtext"),
+        ("pull_requests", "body", "mediumtext"),
+        ("pr_reviews", "body", "mediumtext"),
+        ("pr_events", "body", "mediumtext"),
+        ("review_comments", "body", "mediumtext"),
+        ("review_comments", "suggestion", "mediumtext"),
+        ("review_comments", "path", "text"),
+        ("notifications", "title", "text"),
+        ("notifications", "body", "mediumtext"),
+        ("wiki_pages", "content", "mediumtext"),
+        ("wiki_pages", "message", "mediumtext"),
+        ("wiki_pages_fts", "content", "mediumtext"),
+        ("wiki_revisions", "content", "mediumtext"),
+        ("wiki_revisions", "message", "mediumtext"),
+        ("releases", "body", "mediumtext"),
+        ("milestones", "description", "mediumtext"),
+        ("packages", "description", "text"),
+        ("packages", "homepage", "text"),
+        ("packages", "repository_url", "text"),
+        ("pipeline_jobs", "script", "mediumtext"),
+        ("pipeline_jobs", "log", "mediumtext"),
+        ("pipeline_jobs", "tags", "text"),
+        ("pipeline_jobs", "cache_key", "text"),
+        ("protected_branches", "allowed_push_user_ids", "text"),
+        ("protected_branches", "required_status_checks", "text"),
+        ("runners", "labels", "text"),
+    ];
+    for (table, column, data_type) in expected {
+        let row = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::MySql,
+                "SELECT DATA_TYPE FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+                [table.into(), column.into()],
+            ))
+            .await
+            .expect("read the column type")
+            .unwrap_or_else(|| panic!("{table}.{column} exists"));
+        let actual: String = row.try_get_by_index(0).expect("DATA_TYPE");
+        assert_eq!(actual, data_type, "{table}.{column}");
+    }
+
+    // The ratchet: every `VARCHAR(255)` left on MySQL is one somebody looked
+    // at. sea-query's `.string()` is unbounded on PostgreSQL and SQLite and
+    // 255 characters here, so a new column a person writes into would pass
+    // every other test and answer `500` on MySQL alone.
+    let rows = db
+        .query_all(Statement::from_string(
+            DatabaseBackend::MySql,
+            "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND DATA_TYPE = 'varchar' \
+             AND CHARACTER_MAXIMUM_LENGTH = 255",
+        ))
+        .await
+        .expect("list the VARCHAR(255) columns");
+    let actual: std::collections::BTreeSet<String> = rows
+        .iter()
+        .map(|row| {
+            let table: String = row.try_get_by_index(0).expect("TABLE_NAME");
+            let column: String = row.try_get_by_index(1).expect("COLUMN_NAME");
+            format!("{table}.{column}")
+        })
+        .collect();
+    let known: std::collections::BTreeSet<String> = NARROW_MYSQL_COLUMNS
+        .iter()
+        .flat_map(|(table, columns)| {
+            columns
+                .iter()
+                .map(move |column| format!("{table}.{column}"))
+        })
+        .collect();
+    let new: Vec<_> = actual.difference(&known).collect();
+    assert!(
+        new.is_empty(),
+        "new VARCHAR(255) columns on MySQL: {new:?}. Text a person writes needs TEXT or \
+         MEDIUMTEXT there (see m20261016_000001_free_text_columns_mysql) and a ceiling in \
+         rg_core::text_limits; a column the server fills with something short belongs in \
+         NARROW_MYSQL_COLUMNS"
+    );
+    let gone: Vec<_> = known.difference(&actual).collect();
+    assert!(
+        gone.is_empty(),
+        "NARROW_MYSQL_COLUMNS names columns that are no longer VARCHAR(255): {gone:?}"
+    );
+}
+
+/// The `VARCHAR(255)` columns MySQL holds after every migration, as of
+/// 2026-10-16 (card_9ea48ee6a422). Each is filled by the server with something
+/// bounded — an id, a digest, a state, a name validated at the door — or is
+/// tracked as open: the CI names from workflow files and the commit status
+/// context in card_51b860efc19c. A column joins this list only with the same
+/// answer.
+const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
+    ("access_tokens", &["name", "scopes", "token_hash"]),
+    ("artifacts", &["name", "sha256"]),
+    ("attachments", &["content_type", "filename", "sha256"]),
+    ("audit_log", &["resource_name", "username"]),
+    ("board_columns", &["color", "name"]),
+    ("boards", &["name"]),
+    ("ci_cache_entries", &["sha256"]),
+    ("ci_environments", &["name"]),
+    ("ci_secrets", &["name"]),
+    ("commit_signing_keys", &["fingerprint", "kind", "title"]),
+    ("commit_statuses", &["context"]),
+    ("deploy_keys", &["fingerprint", "title"]),
+    ("email_confirmations", &["email"]),
+    (
+        "import_tasks",
+        &["platform", "stage", "status", "target_name", "target_owner"],
+    ),
+    ("issues", &["state", "title"]),
+    ("labels", &["color", "description", "name"]),
+    ("lfs_objects", &["oid", "publisher_token"]),
+    ("login_logs", &["failure_reason", "username"]),
+    (
+        "merge_queue_entries",
+        &[
+            "merge_group_base_sha",
+            "merge_group_head_sha",
+            "merge_group_sha",
+            "status",
+            "strategy",
+        ],
+    ),
+    ("milestones", &["state", "title"]),
+    ("mirror_sync_lease", &["token"]),
+    ("mirrors", &["status"]),
+    ("notifications", &["event_type"]),
+    ("npm_dist_tag_sets", &["initialization_token"]),
+    ("npm_dist_tags", &["tag"]),
+    (
+        "oauth_accounts",
+        &["email", "provider", "provider_user_id", "provider_username"],
+    ),
+    ("oci_blob", &["digest", "media_type", "storage_path"]),
+    ("oci_manifest", &["digest", "media_type"]),
+    ("oci_publication_lease", &["token"]),
+    ("oci_repository", &["namespace"]),
+    ("oci_tag", &["tag"]),
+    ("oci_upload", &["digest", "upload_path", "uuid"]),
+    ("organization_members", &["role"]),
+    (
+        "organizations",
+        &["description", "display_name", "name", "visibility"],
+    ),
+    ("owner_names", &["name", "name_key"]),
+    (
+        "package_files",
+        &["filename", "sha1", "sha256", "sha512", "storage_path"],
+    ),
+    ("package_registry", &["package_type"]),
+    (
+        "package_versions",
+        &[
+            "protocol_variant_key",
+            "protocol_version_key",
+            "semver",
+            "sha256",
+            "version",
+        ],
+    ),
+    ("packages", &["name"]),
+    ("passkey_credentials", &["name"]),
+    ("pipeline_concurrency_locks", &["group_name"]),
+    (
+        "pipeline_jobs",
+        &[
+            "environment_name",
+            "image",
+            "name",
+            "status",
+            "when_condition",
+        ],
+    ),
+    ("pipeline_stages", &["name", "status"]),
+    (
+        "pipelines",
+        &[
+            "commit_sha",
+            "concurrency_group",
+            "ref_name",
+            "status",
+            "trigger_type",
+        ],
+    ),
+    ("pr_events", &["event_type"]),
+    ("pr_reviews", &["action", "commit_id"]),
+    ("protected_branches", &["branch_name"]),
+    ("protected_tags", &["pattern"]),
+    (
+        "pull_requests",
+        &[
+            "auto_merge_strategy",
+            "base_branch",
+            "head_branch",
+            "head_sha",
+            "labels",
+            "merge_commit_sha",
+            "merge_strategy",
+            "state",
+            "title",
+        ],
+    ),
+    ("release_assets", &["content_type", "filename", "sha256"]),
+    ("releases", &["tag_name", "target_commitish", "title"]),
+    ("repo_collaborators", &["permission"]),
+    ("repo_watches", &["watch_state"]),
+    ("repositories", &["default_branch", "name", "name_key"]),
+    ("repository_redirects", &["name"]),
+    (
+        "repository_transfer_lease",
+        &["destination_namespace", "source_namespace", "token"],
+    ),
+    (
+        "review_comments",
+        &["commit_id", "side", "start_side", "suggestion_commit_sha"],
+    ),
+    (
+        "runners",
+        &["arch", "name", "os", "status", "token_hash", "version"],
+    ),
+    ("seaql_migrations", &["version"]),
+    ("ssh_keys", &["fingerprint", "title"]),
+    ("sso_providers", &["ldap_host", "scopes"]),
+    ("team_members", &["role"]),
+    ("teams", &["description", "name", "permission"]),
+    (
+        "users",
+        &[
+            "avatar_url",
+            "display_name",
+            "email",
+            "ldap_uid",
+            "password_hash",
+            "username",
+        ],
+    ),
+    ("webauthn_ceremony_spend", &["ceremony_id"]),
+    ("webhook_deliveries", &["delivery_id", "event"]),
+    ("webhooks", &["content_type", "scope_kind"]),
+    ("wiki_pages", &["sha", "title"]),
+];
+
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn mfa_lifecycle_account_delete_is_portable() {

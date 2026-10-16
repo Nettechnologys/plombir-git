@@ -117,6 +117,11 @@ pub async fn submit_review(
     body: Option<String>,
     commit_id: Option<String>,
 ) -> Result<PrReview> {
+    crate::text_limits::check_optional(
+        "body",
+        body.as_deref(),
+        crate::text_limits::MAX_BODY_CHARS,
+    )?;
     let pools = db.owned();
     let db = pools.read();
     // Validate PR exists
@@ -341,6 +346,13 @@ pub async fn create_review_comment(
     commit_id: Option<String>,
     reply_to_id: Option<i64>,
 ) -> Result<ReviewComment> {
+    crate::text_limits::check("path", &path, crate::text_limits::MAX_PATH_CHARS)?;
+    crate::text_limits::check("body", &body, crate::text_limits::MAX_BODY_CHARS)?;
+    crate::text_limits::check_optional(
+        "suggestion",
+        suggestion.as_deref(),
+        crate::text_limits::MAX_BODY_CHARS,
+    )?;
     let pools = db.owned();
     let db = pools.read();
     // Validate PR

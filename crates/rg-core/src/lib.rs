@@ -63,6 +63,7 @@ pub mod search; // Cross-platform abstractions
 pub mod staging; // The `.tmp/` spools of in-flight uploads, and the startup sweep that retires them
 pub mod storage_quota; // Opt-in per-repository storage budget across every upload store
 pub mod task_tracker; // Drain-aware tracker for detached fire-and-forget delivery tasks
+pub mod text_limits; // How long a title or a body a person writes may be
 pub mod yaml; // The one parser entry point for untrusted YAML (budgets, alias limits)
 
 pub mod blocking; // Keep synchronous Git/IO phases off Tokio's worker threads

@@ -49,6 +49,12 @@ pub async fn create_pr(
     if title.trim().is_empty() {
         return Err(crate::error::invalid_request("PR title cannot be empty"));
     }
+    crate::text_limits::check("title", &title, crate::text_limits::MAX_LINE_CHARS)?;
+    crate::text_limits::check_optional(
+        "body",
+        body.as_deref(),
+        crate::text_limits::MAX_BODY_CHARS,
+    )?;
     if head_branch == base_branch {
         return Err(crate::error::invalid_request(
             "head and base branches cannot be the same",
@@ -551,6 +557,16 @@ pub async fn update_pr(
     actor_id: i64,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<PullRequest> {
+    crate::text_limits::check_optional(
+        "title",
+        title.as_deref(),
+        crate::text_limits::MAX_LINE_CHARS,
+    )?;
+    crate::text_limits::check_optional(
+        "body",
+        body.as_deref(),
+        crate::text_limits::MAX_BODY_CHARS,
+    )?;
     let pools = db.owned();
     let db = pools.read();
     let mut pr = get_pr(db, owner, repo_name, number).await?;

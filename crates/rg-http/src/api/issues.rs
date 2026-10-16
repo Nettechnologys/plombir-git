@@ -946,6 +946,14 @@ fn parse_milestone_due_date(
         .transpose()
 }
 
+/// A milestone's title is a one-line field (`VARCHAR(255)` on MySQL); its
+/// description is a body.
+fn check_milestone_lengths(title: Option<&str>, description: Option<&str>) -> anyhow::Result<()> {
+    use rg_core::text_limits::{check_optional, MAX_BODY_CHARS, MAX_LINE_CHARS};
+    check_optional("title", title, MAX_LINE_CHARS)?;
+    check_optional("description", description, MAX_BODY_CHARS)
+}
+
 #[utoipa::path(
     post,
     path = "/repos/{owner}/{name}/milestones",
@@ -982,6 +990,9 @@ pub async fn create_milestone(
         Ok(due_date) => due_date,
         Err(error) => return error.into_response(),
     };
+    if let Err(error) = check_milestone_lengths(Some(&body.title), body.description.as_deref()) {
+        return AppError::from(error).into_response();
+    }
     let model = rg_db::entities::milestone::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: sea_orm::Set(repo.id),
@@ -1109,6 +1120,11 @@ where
         .due_date
         .map(|date| parse_milestone_due_date(date.as_deref()))
         .transpose()?;
+    check_milestone_lengths(
+        body.title.as_deref(),
+        body.description.as_ref().and_then(Option::as_deref),
+    )
+    .map_err(AppError::from)?;
 
     after_read().await?;
 

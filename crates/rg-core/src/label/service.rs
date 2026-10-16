@@ -41,6 +41,13 @@ pub async fn get_label(
     Ok(label)
 }
 
+/// A label's name and description are one-line fields, `VARCHAR(255)` on MySQL.
+fn check_label_lengths(name: Option<&str>, description: Option<&str>) -> Result<()> {
+    use crate::text_limits::{check_optional, MAX_LINE_CHARS};
+    check_optional("name", name, MAX_LINE_CHARS)?;
+    check_optional("description", description, MAX_LINE_CHARS)
+}
+
 /// Create a new label.
 pub async fn create_label(
     db: &DatabaseConnection,
@@ -55,6 +62,7 @@ pub async fn create_label(
     if name.trim().is_empty() {
         return Err(crate::error::invalid_request("label name cannot be empty"));
     }
+    check_label_lengths(Some(&name), description.as_deref())?;
     // `#` plus seven characters was not the rule: `#0;x:1;` passed it and the
     // web client writes the stored colour into a `style` attribute under a CSP
     // that allows inline styles. The shared validator closes the declaration
@@ -121,6 +129,10 @@ pub async fn update_label(
     color: Option<String>,
     description: Option<Option<String>>,
 ) -> Result<Label> {
+    check_label_lengths(
+        name.as_deref(),
+        description.as_ref().and_then(Option::as_deref),
+    )?;
     update_label_after_read(
         db,
         owner,

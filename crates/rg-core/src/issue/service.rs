@@ -120,6 +120,12 @@ pub async fn create_issue(
     if title.trim().is_empty() {
         return Err(crate::error::invalid_request("issue title cannot be empty"));
     }
+    crate::text_limits::check("title", &title, crate::text_limits::MAX_LINE_CHARS)?;
+    crate::text_limits::check_optional(
+        "body",
+        body.as_deref(),
+        crate::text_limits::MAX_BODY_CHARS,
+    )?;
 
     // Resolved before anything is written: an unknown name is the caller's
     // mistake and must not leave a half-labelled issue behind. The junction is
@@ -524,6 +530,16 @@ pub async fn update_issue(
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
     actor_id: Option<i64>,
 ) -> Result<Issue> {
+    crate::text_limits::check_optional(
+        "title",
+        title.as_deref(),
+        crate::text_limits::MAX_LINE_CHARS,
+    )?;
+    crate::text_limits::check_optional(
+        "body",
+        body.as_deref(),
+        crate::text_limits::MAX_BODY_CHARS,
+    )?;
     let pools = db.owned();
     let db = pools.read();
     let existing = get_issue(db, owner, repo_name, number).await?;
@@ -735,6 +751,7 @@ pub async fn add_comment(
             "comment body cannot be empty",
         ));
     }
+    crate::text_limits::check("body", &body, crate::text_limits::MAX_BODY_CHARS)?;
 
     let issue = get_issue(db, owner, repo_name, issue_number).await?;
 

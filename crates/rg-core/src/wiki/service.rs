@@ -22,10 +22,19 @@ pub async fn create_page(
     message: Option<&str>,
     author_id: Option<i64>,
 ) -> Result<wiki_page::Model> {
+    check_page_lengths(title, content, message)?;
     create_page_with_post_commit(db, repo_id, title, content, message, author_id, || {
         std::future::ready(())
     })
     .await
+}
+
+/// Refuse a page the database would not hold the same way on every backend.
+fn check_page_lengths(title: &str, content: &str, message: Option<&str>) -> Result<()> {
+    use crate::text_limits::{check, check_optional, MAX_BODY_CHARS, MAX_LINE_CHARS};
+    check("title", title, MAX_LINE_CHARS)?;
+    check("content", content, MAX_BODY_CHARS)?;
+    check_optional("message", message, MAX_BODY_CHARS)
 }
 
 /// Create the source row, then expose the historical post-commit window to a
@@ -116,6 +125,7 @@ pub async fn update_page(
     message: Option<&str>,
     author_id: Option<i64>,
 ) -> Result<wiki_page::Model> {
+    check_page_lengths(title, content, message)?;
     update_page_with_post_commit(db, repo_id, title, content, message, author_id, || {
         std::future::ready(())
     })

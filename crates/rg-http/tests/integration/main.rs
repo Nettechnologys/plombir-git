@@ -96,6 +96,7 @@ mod fault_injection_tests;
 mod foreign_gate_guard;
 mod foreign_id_scope_sweep_tests;
 mod fork_tests;
+mod free_text_ceiling_tests;
 mod git_auth_tests;
 mod git_http_clone_tests;
 mod git_http_failure_status_tests;

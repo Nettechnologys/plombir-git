@@ -52,7 +52,7 @@ fn checked_body(body: &str) -> Result<()> {
             "comment body cannot be empty",
         ));
     }
-    Ok(())
+    crate::text_limits::check("body", body, crate::text_limits::MAX_BODY_CHARS)
 }
 
 /// The issue comment `comment_id`, if it lives in `repo_id`.
