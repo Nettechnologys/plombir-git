@@ -53,26 +53,27 @@ const INDEX: &str = "uq_repositories_namespace_name_key";
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let backend = manager.get_database_backend();
-        if !manager
-            .has_column("repositories", "name_case_exempt")
-            .await?
-        {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(Alias::new("repositories"))
-                        .add_column(
-                            ColumnDef::new(Alias::new("name_case_exempt"))
-                                .boolean()
-                                .not_null()
-                                .default(false),
-                        )
-                        .to_owned(),
-                )
-                .await?;
+        if backend == DatabaseBackend::Sqlite {
+            // The mark is added and then read back, and on SQLite that must be
+            // one connection: migrations run over the whole pool, and a
+            // connection whose cached schema predates another connection's
+            // `ALTER TABLE` compiles the double-quoted `"name_case_exempt"` of
+            // the read as a string literal — SQLite's fallback for a quoted
+            // name it cannot resolve. The statement is re-prepared once the
+            // stale schema is noticed, but SQLx keeps the column names of the
+            // first preparation, so the rows come back without the column and
+            // the upgrade of any database holding a repository fails. See
+            // `m20261014_000001_owner_names_fold_case` for the same reasoning
+            // applied to trigger DDL.
+            let transaction = manager.get_connection().begin().await?;
+            let one_connection = SchemaManager::new(&transaction);
+            add_exempt_column(&one_connection).await?;
+            exempt_younger_twins(&one_connection).await?;
+            transaction.commit().await?;
+        } else {
+            add_exempt_column(manager).await?;
+            exempt_younger_twins(manager).await?;
         }
-
-        exempt_younger_twins(manager).await?;
 
         if !has_name_key(manager).await? {
             manager
@@ -132,6 +133,29 @@ impl MigrationTrait for Migration {
         }
         Ok(())
     }
+}
+
+/// Add `repositories.name_case_exempt` unless an earlier, partial run did.
+async fn add_exempt_column(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    if manager
+        .has_column("repositories", "name_case_exempt")
+        .await?
+    {
+        return Ok(());
+    }
+    manager
+        .alter_table(
+            Table::alter()
+                .table(Alias::new("repositories"))
+                .add_column(
+                    ColumnDef::new(Alias::new("name_case_exempt"))
+                        .boolean()
+                        .not_null()
+                        .default(false),
+                )
+                .to_owned(),
+        )
+        .await
 }
 
 /// Whether `repositories.name_key` exists. Not `has_column` on SQLite: its
@@ -453,3 +477,7 @@ mod tests {
         .expect("case-sensitive again after down");
     }
 }
+
+#[cfg(test)]
+#[path = "m20261014_000004_repositories_name_fold_case_tests.rs"]
+mod pool_tests;

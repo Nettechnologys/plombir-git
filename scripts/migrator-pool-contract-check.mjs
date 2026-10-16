@@ -24,8 +24,10 @@ const cratesDir = path.join(root, 'crates');
 const MIN_MIGRATOR_TEST_FILES = 7;
 
 // These tests deliberately keep several connections alive. One primes every
-// pooled connection before rebuilding tables; the other proves concurrent
-// readers and writers stay isolated while a rebuild holds SQLite's lock.
+// pooled connection before rebuilding tables; another proves concurrent
+// readers and writers stay isolated while a rebuild holds SQLite's lock; the
+// last proves an upgrade that reads a column it just added does so on the
+// connection that added it.
 const MULTI_CONNECTION_ALLOWLIST = new Map([
   [
     'crates/rg-db-migration/src/migrations/m20260805_000002_uploads_outlive_their_uploader_tests.rs',
@@ -34,6 +36,10 @@ const MULTI_CONNECTION_ALLOWLIST = new Map([
   [
     'crates/rg-db-migration/src/migrations/m20260730_000001_repositories_namespace_unique_tests.rs',
     'needs distinct pooled connections to prove concurrent writers wait for the rebuild',
+  ],
+  [
+    'crates/rg-db-migration/src/migrations/m20261014_000004_repositories_name_fold_case_tests.rs',
+    'needs a pool of several connections: only a second connection can hold a schema older than the upgrade\'s ALTER TABLE',
   ],
 ]);
 
