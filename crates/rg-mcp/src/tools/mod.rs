@@ -424,7 +424,7 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                 "properties": {
                     "owner": { "type": "string", "description": "Repository owner" },
                     "repo":  { "type": "string", "description": "Repository name" },
-                    "state": { "type": "string", "enum": ["open", "closed"], "description": "Issue state (default open)" },
+                    "state": { "type": "string", "enum": ["open", "closed", "all"], "description": "Issue state (default open; all = every issue)" },
                     "limit": { "type": "number", "description": "Max results (default 20)" }
                 },
                 "required": ["owner", "repo"]
@@ -438,7 +438,7 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                 "properties": {
                     "owner": { "type": "string", "description": "Repository owner" },
                     "repo":  { "type": "string", "description": "Repository name" },
-                    "state": { "type": "string", "enum": ["open", "closed", "merged"], "description": "Pull request state (default open)" },
+                    "state": { "type": "string", "enum": ["open", "closed", "merged", "all"], "description": "Pull request state (default open; all = every pull request)" },
                     "limit": { "type": "number", "description": "Max results (default 20)" }
                 },
                 "required": ["owner", "repo"]

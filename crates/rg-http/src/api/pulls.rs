@@ -137,6 +137,9 @@ pub struct MergeQueueEntryResponse {
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListQuery {
+    /// `open`, `closed`, `merged`, or `all`. Absent lists every pull request;
+    /// anything else is a `400` (card_8d29eeb02ee1).
+    #[param(schema_with = crate::api::list_state::pull_request_states)]
     pub state: Option<String>,
     #[serde(flatten)]
     #[param(ignore)]
@@ -166,7 +169,14 @@ pub async fn list_prs(
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<ListQuery>,
 ) -> impl IntoResponse {
-    let state_filter = params.state.as_deref();
+    let state_filter = match rg_core::list_state::parse_or(
+        params.state.as_deref(),
+        rg_core::list_state::ALL,
+        &rg_core::list_state::PULL_REQUEST_STATES,
+    ) {
+        Ok(state) => state,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     let pagination = params.pagination.clamp();
     match rg_core::pull_request::list_prs_paginated(
         &state.db,

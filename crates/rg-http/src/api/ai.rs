@@ -54,18 +54,27 @@ pub struct PrSummary {
 
 // ── Query structs ────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct IssueListQuery {
+    /// `open`, `closed`, or `all` (default: open). Anything else is a `400`.
     #[serde(default)]
+    #[param(schema_with = crate::api::list_state::issue_states)]
     pub state: Option<String>,
+    /// Max results (1-100, default 20)
     #[serde(default)]
     pub limit: Option<i64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PrListQuery {
+    /// `open`, `closed`, `merged`, or `all` (default: open). Anything else is
+    /// a `400`.
     #[serde(default)]
+    #[param(schema_with = crate::api::list_state::pull_request_states)]
     pub state: Option<String>,
+    /// Max results (1-100, default 20)
     #[serde(default)]
     pub limit: Option<i64>,
 }
@@ -149,12 +158,11 @@ pub async fn ai_repo_summary(
     params(
         ("owner" = String, Path, description = "Repository owner"),
         ("name" = String, Path, description = "Repository name"),
-        ("state" = Option<String>, Query, description = "open | closed (default: open)"),
-        ("limit" = Option<i64>, Query, description = "Max results (1-100, default 20)"),
+        IssueListQuery,
     ),
     responses(
         (status = 200, description = "Issue list", body = Vec<IssueSummary>),
-        (status = 400, description = "Invalid limit"),
+        (status = 400, description = "Invalid limit or state"),
         (status = 404, description = "Repository not found"),
     ),
     tag = "ai",
@@ -166,7 +174,14 @@ pub async fn ai_list_issues(
     Query(params): Query<IssueListQuery>,
 ) -> Result<(StatusCode, Json<Vec<IssueSummary>>), AppError> {
     let limit = ai_limit(params.limit)?;
-    let state_filter = params.state.as_deref().unwrap_or("open");
+    // `all` is no filter; an unknown value is a `400`, not an empty page an
+    // agent reads as "nothing here" (card_8d29eeb02ee1).
+    let state_filter = rg_core::list_state::parse_or(
+        params.state.as_deref(),
+        "open",
+        &rg_core::list_state::ISSUE_STATES,
+    )
+    .map_err(AppError::from)?;
 
     // The page is cut by the database. Reading every open issue of the
     // repository and dropping all but `limit` of them in Rust honoured the
@@ -177,7 +192,7 @@ pub async fn ai_list_issues(
         &state.db,
         &owner,
         &name,
-        Some(state_filter),
+        state_filter,
         0,
         limit,
     )
@@ -205,12 +220,11 @@ pub async fn ai_list_issues(
     params(
         ("owner" = String, Path, description = "Repository owner"),
         ("name" = String, Path, description = "Repository name"),
-        ("state" = Option<String>, Query, description = "open | closed | merged (default: open)"),
-        ("limit" = Option<i64>, Query, description = "Max results (1-100, default 20)"),
+        PrListQuery,
     ),
     responses(
         (status = 200, description = "PR list", body = Vec<PrSummary>),
-        (status = 400, description = "Invalid limit"),
+        (status = 400, description = "Invalid limit or state"),
         (status = 404, description = "Repository not found"),
     ),
     tag = "ai",
@@ -222,7 +236,14 @@ pub async fn ai_list_prs(
     Query(params): Query<PrListQuery>,
 ) -> Result<(StatusCode, Json<Vec<PrSummary>>), AppError> {
     let limit = ai_limit(params.limit)?;
-    let state_filter = params.state.as_deref().unwrap_or("open");
+    // `all` is no filter; an unknown value is a `400`, not an empty page an
+    // agent reads as "nothing here" (card_8d29eeb02ee1).
+    let state_filter = rg_core::list_state::parse_or(
+        params.state.as_deref(),
+        "open",
+        &rg_core::list_state::PULL_REQUEST_STATES,
+    )
+    .map_err(AppError::from)?;
 
     // Same bound, same reason as `ai_list_issues`: the requested page is the
     // page the query builds, not what survives a `.take()` over the repository's
@@ -231,7 +252,7 @@ pub async fn ai_list_prs(
         &state.db,
         &owner,
         &name,
-        Some(state_filter),
+        state_filter,
         0,
         limit,
     )

@@ -54,6 +54,7 @@ pub mod deletion_recovery; // Deletions killed mid-flight, and the startup pass 
 pub mod email;
 pub mod instance;
 pub mod lfs;
+pub mod list_state; // The `?state=` filter every issue / PR / milestone listing parses
 pub mod namespace; // Which first path segments the application already answers for
 pub mod net; // SSRF-hardened outbound HTTP for user-supplied URLs
 pub mod platform;

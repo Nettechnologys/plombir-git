@@ -598,4 +598,23 @@ fn every_offered_mcp_enum_value_is_one_the_server_accepts() {
             "create_review offers action {value:?}, which the server refuses"
         );
     }
+    // card_8d29eeb02ee1: `all` came out of these enums while the listings
+    // answered it with an empty page; it is back now that they honour it, and
+    // every offered value has to parse the way the handler parses it.
+    for (tool, accepted) in [
+        ("ai_list_issues", &rg_core::list_state::ISSUE_STATES[..]),
+        ("ai_list_prs", &rg_core::list_state::PULL_REQUEST_STATES[..]),
+    ] {
+        let states = advertised_enum(tool, "state");
+        assert!(
+            states.iter().any(|state| state == rg_core::list_state::ALL),
+            "{tool} must offer `all`"
+        );
+        for value in &states {
+            assert!(
+                rg_core::list_state::parse(value, accepted).is_ok(),
+                "{tool} offers state {value:?}, which the server refuses"
+            );
+        }
+    }
 }

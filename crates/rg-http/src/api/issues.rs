@@ -61,6 +61,9 @@ pub struct CreateCommentRequest {
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListQuery {
+    /// `open`, `closed`, or `all`. Absent lists every issue; anything else is
+    /// a `400` (card_8d29eeb02ee1).
+    #[param(schema_with = crate::api::list_state::issue_states)]
     pub state: Option<String>,
     /// The legacy label filter: one string, split on commas.
     ///
@@ -324,7 +327,14 @@ pub async fn list_issues(
     Query(raw_query): Query<Vec<(String, String)>>,
     Query(params): Query<ListQuery>,
 ) -> impl IntoResponse {
-    let state_filter = params.state.as_deref();
+    let state_filter = match rg_core::list_state::parse_or(
+        params.state.as_deref(),
+        rg_core::list_state::ALL,
+        &rg_core::list_state::ISSUE_STATES,
+    ) {
+        Ok(state) => state,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     let pagination = params.pagination.clamp();
 
     let label_names = label_filter(&raw_query, params.labels.as_deref());
@@ -869,6 +879,9 @@ async fn comments_with_authors(
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListMilestonesQuery {
+    /// `open`, `closed`, or `all`. Absent lists every milestone; anything else
+    /// is a `400` (card_8d29eeb02ee1).
+    #[param(schema_with = crate::api::list_state::milestone_states)]
     pub state: Option<String>,
 }
 
@@ -892,8 +905,17 @@ pub async fn list_milestones(
     Path((_, _)): Path<(String, String)>,
     Query(params): Query<ListMilestonesQuery>,
 ) -> impl IntoResponse {
-    match rg_db::ops::milestone_ops::list_by_repo(&state.db, repo.id, params.state.as_deref()).await
-    {
+    // The write side already refuses a state the listing cannot filter on
+    // (card_09b2665584ed); the read side answered `200 []` to the same typo.
+    let state_filter = match rg_core::list_state::parse_or(
+        params.state.as_deref(),
+        rg_core::list_state::ALL,
+        &rg_core::list_state::MILESTONE_STATES,
+    ) {
+        Ok(state) => state,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    match rg_db::ops::milestone_ops::list_by_repo(&state.db, repo.id, state_filter).await {
         Ok(milestones) => (StatusCode::OK, Json(serde_json::json!(milestones))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }

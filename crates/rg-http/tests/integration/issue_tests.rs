@@ -195,6 +195,145 @@ async fn test_issue_state_filter() {
     );
 }
 
+/// card_8d29eeb02ee1: `?state=all` is every row — what GitHub and Gitea
+/// clients send, and what the web app's own "All" tab sends — and a state the
+/// listing does not know is a `400` naming the ones it does. Both used to be
+/// `200 []` with `total: 0`, which reads as "this repository has none".
+#[tokio::test]
+async fn every_listing_reads_state_all_as_everything_and_refuses_an_unknown_state() {
+    let (base, token, owner, repo) = setup("stateall").await;
+    let client = reqwest::Client::new();
+
+    let mut numbers = vec![];
+    for title in ["Stays open", "Gets closed"] {
+        let issue: serde_json::Value = client
+            .post(format!("{base}/api/v1/repos/{owner}/{repo}/issues"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "title": title }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        numbers.push(issue["number"].as_i64().unwrap());
+    }
+    let closed = client
+        .patch(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/{}",
+            numbers[1]
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "state": "closed" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(closed.status(), 200);
+    for (title, state) in [("Open milestone", "open"), ("Closed milestone", "closed")] {
+        let created = client
+            .post(format!("{base}/api/v1/repos/{owner}/{repo}/milestones"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "title": title, "state": state }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201);
+    }
+
+    let get = |path: String| {
+        let client = client.clone();
+        let token = token.clone();
+        let base = base.clone();
+        async move {
+            let response = client
+                .get(format!("{base}/api/v1/{path}"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            (status, response.json::<serde_json::Value>().await.unwrap())
+        }
+    };
+    let states = |rows: &serde_json::Value| {
+        let mut states = rows
+            .as_array()
+            .unwrap_or_else(|| panic!("a list: {rows}"))
+            .iter()
+            .map(|row| row["state"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        states.sort();
+        states
+    };
+
+    let (status, body) = get(format!("repos/{owner}/{repo}/issues?state=all")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(states(&body["data"]), ["closed", "open"]);
+    assert_eq!(
+        body["pagination"]["total"], 2,
+        "the total counts the same rows: {body}"
+    );
+    let (status, body) = get(format!("ai/repos/{owner}/{repo}/issues?state=all")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(states(&body), ["closed", "open"]);
+    let (status, body) = get(format!("ai/repos/{owner}/{repo}/issues")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        states(&body),
+        ["open"],
+        "the agent listing still defaults to open"
+    );
+    let (status, body) = get(format!("repos/{owner}/{repo}/milestones?state=all")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(states(&body), ["closed", "open"]);
+    for path in [
+        format!("repos/{owner}/{repo}/pulls?state=all"),
+        format!("repos/{owner}/{repo}/pulls?state=merged"),
+        format!("ai/repos/{owner}/{repo}/prs?state=all"),
+    ] {
+        let (status, body) = get(path.clone()).await;
+        assert_eq!(status, 200, "{path}: {body}");
+    }
+
+    for (path, accepted) in [
+        (
+            format!("repos/{owner}/{repo}/issues?state=opne"),
+            "open, closed, all",
+        ),
+        (
+            format!("repos/{owner}/{repo}/issues?state=merged"),
+            "open, closed, all",
+        ),
+        (
+            format!("repos/{owner}/{repo}/issues?state=bogus&labels=bug"),
+            "open, closed, all",
+        ),
+        (
+            format!("ai/repos/{owner}/{repo}/issues?state=bogus"),
+            "open, closed, all",
+        ),
+        (
+            format!("repos/{owner}/{repo}/milestones?state=bogus"),
+            "open, closed, all",
+        ),
+        (
+            format!("repos/{owner}/{repo}/pulls?state=bogus"),
+            "open, closed, merged, all",
+        ),
+        (
+            format!("ai/repos/{owner}/{repo}/prs?state=bogus"),
+            "open, closed, merged, all",
+        ),
+    ] {
+        let (status, body) = get(path.clone()).await;
+        assert_eq!(status, 400, "{path} must refuse an unknown state: {body}");
+        assert!(
+            body.to_string().contains(accepted),
+            "{path} must name the states it accepts: {body}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_issue_comments() {
     let (base, token, owner, repo) = setup("4").await;
