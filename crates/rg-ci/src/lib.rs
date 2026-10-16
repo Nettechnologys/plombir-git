@@ -568,6 +568,8 @@ fn resolved_concurrency_group(
              this repository."
         )));
     }
+    // Checked once resolved: `${{ github.ref }}` grows with the branch name.
+    check_stored_name("concurrency.group", &group)?;
     Ok(Some(group))
 }
 
@@ -1555,6 +1557,27 @@ fn validate_runner_routing(
     Ok(())
 }
 
+/// Refuse a name from the workflow file that its column cannot hold.
+///
+/// Job and stage names and the concurrency group are kept in `VARCHAR(255)`.
+/// PostgreSQL and SQLite stored any length, but on MySQL a longer one failed
+/// the insert, so the author of a long `concurrency.group` or matrix label got
+/// a server failure instead of the key to shorten (card_51b860efc19c). The
+/// ceiling is checked on every backend, so a file means the same thing on all
+/// three. `what` names the key; the value is quoted only by its start, since
+/// it is the part that is too long.
+fn check_stored_name(what: &str, name: &str) -> Result<()> {
+    let max = rg_core::text_limits::MAX_LINE_CHARS;
+    let count = name.chars().count();
+    if count <= max {
+        return Ok(());
+    }
+    let start: String = name.chars().take(40).collect();
+    Err(rg_core::error::invalid_request(format!(
+        "{what} '{start}…' is {count} characters long; it must be at most {max} characters"
+    )))
+}
+
 /// Reject a CI config whose jobs declare something this engine cannot run.
 ///
 /// Every rejection here is a rule the *user's own file* broke, so each one
@@ -1591,7 +1614,11 @@ fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
     }
 
     let runnable_stages = resolved_stage_order(config);
+    for stage in &runnable_stages {
+        check_stored_name("the stage name", stage)?;
+    }
     for (name, job) in &config.jobs {
+        check_stored_name("the job name", name)?;
         // The engine places a job by its stage name, and a name it cannot place
         // used to cost the job its run — `warn!` server-side, nothing anywhere
         // the author looks. `stage: biuld` is the author's typo to fix, so it
@@ -1976,7 +2003,7 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
         }
         variants = next;
     }
-    Ok(variants
+    let variants: Vec<MatrixVariant> = variants
         .into_iter()
         .map(|(labels, variables)| MatrixVariant {
             name: format!(
@@ -1989,7 +2016,13 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
             ),
             variables,
         })
-        .collect())
+        .collect();
+    // The label grows with the values, so a job whose own name fits can still
+    // have a variant whose name does not.
+    for variant in &variants {
+        check_stored_name("the matrix job name", &variant.name)?;
+    }
+    Ok(variants)
 }
 
 /// The `<owner>/<name>` a pipeline is running for.
@@ -6116,6 +6149,144 @@ mod matrix_tests {
                 "a refused workflow must not fall through to the native config: {message}"
             );
         }
+    }
+
+    /// A name the workflow file chooses is stored in `VARCHAR(255)`, which on
+    /// MySQL refused a longer one at insert time: the author was told the
+    /// server failed. The ceiling is now the file's rule on every backend, and
+    /// the refusal names the key (card_51b860efc19c).
+    #[tokio::test]
+    async fn a_name_too_long_for_its_column_is_refused_with_the_key() {
+        async fn trigger(file: String) -> anyhow::Error {
+            let (repo, sha) = commit_repo(&[(".plombir-git-ci.yml", file.as_bytes())]);
+            // Refused before the first query, like every other rule the file
+            // breaks, so a connection without tables is enough.
+            let db = rg_db::connect_with_pool(
+                "sqlite::memory:",
+                rg_db::TEST_CONNECT_TIMEOUT_SECS,
+                rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+                rg_db::DEFAULT_MAX_CONNECTIONS,
+            )
+            .await
+            .unwrap();
+            trigger_pipeline(
+                TriggerPipelineParams {
+                    db: &db,
+                    repo_root: repo.path(),
+                    repo_path: repo.path(),
+                    repo_id: 1,
+                    commit_sha: &sha,
+                    ref_name: "refs/heads/main",
+                    trigger_type: "manual",
+                    base_branch: None,
+                    previous_sha: None,
+                    inputs: None,
+                    triggered_by: Some(1),
+                    docker_enabled: false,
+                    external_runners: true,
+                    allow_host_runner: false,
+                    jwt_secret: Some("secret"),
+                    encryption_key: Some("secret"),
+                    external_url: None,
+                },
+                &CiNotifications::default(),
+            )
+            .await
+            .expect_err("a name past the column must not build a pipeline")
+        }
+        fn refusal(error: &anyhow::Error) -> String {
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .unwrap_or_else(|| panic!("a name past the column is a 400, got: {error:#}"))
+                .to_string()
+        }
+
+        let long_job = "j".repeat(300);
+        let message = refusal(&trigger(format!("{long_job}:\n  script: [echo ok]\n")).await);
+        assert!(
+            message.contains("the job name") && message.contains("300 characters"),
+            "{message}"
+        );
+        assert!(
+            !message.contains(&long_job),
+            "the refusal quotes the start of the name, not all of it: {message}"
+        );
+
+        let long_stage = "s".repeat(256);
+        let message = refusal(
+            &trigger(format!(
+                "stages: [{long_stage}]\nbuild:\n  stage: {long_stage}\n  script: [echo ok]\n"
+            ))
+            .await,
+        );
+        assert!(
+            message.contains("the stage name") && message.contains("256 characters"),
+            "{message}"
+        );
+
+        // At the ceiling the file is fine as far as names go: what stops it
+        // here is the table-less connection, not a refusal of the name.
+        let at_ceiling = "j".repeat(rg_core::text_limits::MAX_LINE_CHARS);
+        let error = trigger(format!("{at_ceiling}:\n  script: [echo ok]\n")).await;
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_none(),
+            "255 characters fit the column: {error:#}"
+        );
+    }
+
+    /// A matrix variant is named `job [key=value, …]`, so the values decide its
+    /// length; a job whose own name fits can still produce one that does not.
+    #[test]
+    fn a_matrix_variant_name_too_long_for_its_column_is_refused() {
+        let error = expand_matrix(
+            "build",
+            &config(BTreeMap::from([("target".into(), vec!["t".repeat(250)])])),
+        )
+        .expect_err("`build [target=t…]` is past 255 characters");
+        let message = error
+            .downcast_ref::<rg_core::error::InvalidRequest>()
+            .unwrap_or_else(|| panic!("the file is wrong, not the server: {error:#}"))
+            .to_string();
+        assert!(message.contains("the matrix job name"), "{message}");
+
+        let fits = 255 - "build [target=]".len();
+        let variants = expand_matrix(
+            "build",
+            &config(BTreeMap::from([("target".into(), vec!["t".repeat(fits)])])),
+        )
+        .expect("a variant name of exactly 255 characters fits");
+        assert_eq!(variants[0].name.chars().count(), 255);
+    }
+
+    /// The group is checked once resolved: `${{ github.ref }}` is short in the
+    /// file and as long as the branch in the row.
+    #[test]
+    fn a_concurrency_group_too_long_once_resolved_is_refused() {
+        let group = |template: &str, ref_name: &str| {
+            resolved_concurrency_group(
+                Some(&config::ConcurrencyConfig {
+                    group: template.to_string(),
+                    cancel_in_progress: false,
+                }),
+                ref_name,
+            )
+        };
+        let long_branch = format!("refs/heads/{}", "b".repeat(250));
+        let error = group("deploy-${{ github.ref }}", &long_branch)
+            .expect_err("deploy-refs/heads/bbb… is past 255 characters");
+        let message = error
+            .downcast_ref::<rg_core::error::InvalidRequest>()
+            .unwrap_or_else(|| panic!("the file is wrong, not the server: {error:#}"))
+            .to_string();
+        assert!(message.contains("concurrency.group"), "{message}");
+
+        let fits = format!("refs/heads/{}", "b".repeat(255 - "x-refs/heads/".len()));
+        let resolved = group("x-${{ github.ref }}", &fits)
+            .expect("a group of exactly 255 characters fits")
+            .expect("the block declares a group");
+        assert_eq!(resolved.chars().count(), 255);
     }
 
     /// card_e949057aaa0d, on the path a push actually takes: an input nothing

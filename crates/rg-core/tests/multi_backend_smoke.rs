@@ -3412,6 +3412,127 @@ async fn free_text_at_the_ceiling_round_trips() {
         .unwrap()
         .expect("the job row");
     assert_eq!(stored.log.as_deref(), Some(log.as_str()));
+
+    // The names a workflow file chooses, at the ceiling `rg-ci` refuses past
+    // (card_51b860efc19c), and an image reference longer than 255 that the
+    // engine's own grammar accepts.
+    let grouped = rg_db::ops::pipeline_ops::create_pipeline_row(
+        &db,
+        rg_db::ops::pipeline_ops::NewPipeline {
+            repo_id: repo.id,
+            commit_sha: "0123456789abcdef0123456789abcdef01234567",
+            ref_name: "refs/heads/main",
+            trigger_type: "push",
+            triggered_by: Some(owner.id),
+            concurrency_group: Some(title.as_str()),
+            dispatch_inputs: None,
+            base_branch: None,
+            previous_sha: None,
+        },
+    )
+    .await
+    .expect("a concurrency group at the ceiling is stored");
+    assert_eq!(grouped.concurrency_group.as_deref(), Some(title.as_str()));
+    let stage = rg_db::ops::pipeline_ops::create_stage(&db, grouped.id, &title, 0)
+        .await
+        .expect("a stage name at the ceiling is stored");
+    assert_eq!(stage.name, title);
+    let image = format!(
+        "registry.example.com/{}:{}@sha256:{}",
+        "a".repeat(200),
+        "t".repeat(128),
+        "0".repeat(64)
+    );
+    assert!(image.len() > 255);
+    rg_process::image_reference::validate_image_reference(&image)
+        .expect("the engine accepts this reference");
+    let job = rg_db::ops::pipeline_ops::create_job(
+        &db,
+        stage.id,
+        &title,
+        "true",
+        Some(image.as_str()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("a job name at the ceiling and a long image are stored");
+    assert_eq!(job.name, title);
+    assert_eq!(job.image.as_deref(), Some(image.as_str()));
+
+    // A commit status: `context` in `VARCHAR(255)`, `description` and
+    // `target_url` in `VARCHAR(500)` on every backend.
+    use rg_core::text_limits::MAX_STATUS_TEXT_CHARS;
+    let sha = "89abcdef0123456789abcdef0123456789abcdef";
+    let description = "😀".repeat(MAX_STATUS_TEXT_CHARS);
+    let target_url = format!(
+        "https://ci.example.com/{}",
+        "u".repeat(MAX_STATUS_TEXT_CHARS - "https://ci.example.com/".len())
+    );
+    let status = rg_core::repo::service::create_commit_status(
+        &db,
+        repo.id,
+        sha,
+        "success",
+        &title,
+        Some(description.as_str()),
+        Some(target_url.as_str()),
+        owner.id,
+    )
+    .await
+    .expect("a commit status at every ceiling is stored");
+    assert_eq!(status.context, title);
+    assert_eq!(status.description.as_deref(), Some(description.as_str()));
+    assert_eq!(status.target_url.as_deref(), Some(target_url.as_str()));
+    let over_description = format!("{description}x");
+    let over_target_url = format!("{target_url}x");
+    for (what, context, description, target_url, sha) in [
+        ("a status context", over_title.as_str(), None, None, sha),
+        (
+            "a status description",
+            "ci",
+            Some(over_description.as_str()),
+            None,
+            sha,
+        ),
+        (
+            "a status target_url",
+            "ci",
+            None,
+            Some(over_target_url.as_str()),
+            sha,
+        ),
+        (
+            "a status sha",
+            "ci",
+            None,
+            None,
+            "0123456789abcdef0123456789abcdef0123456789abcdef",
+        ),
+    ] {
+        refused(
+            rg_core::repo::service::create_commit_status(
+                &db,
+                repo.id,
+                sha,
+                "success",
+                context,
+                description,
+                target_url,
+                owner.id,
+            )
+            .await
+            .map(drop),
+            what,
+        );
+    }
 }
 
 /// The MySQL columns `m20261016_000001_free_text_columns_mysql` widens, read
@@ -3443,6 +3564,8 @@ async fn assert_free_text_columns_are_wide(db: &DatabaseConnection) {
         ("pipeline_jobs", "log", "mediumtext"),
         ("pipeline_jobs", "tags", "text"),
         ("pipeline_jobs", "cache_key", "text"),
+        // m20261016_000002_pipeline_job_image_mysql_text
+        ("pipeline_jobs", "image", "text"),
         ("protected_branches", "allowed_push_user_ids", "text"),
         ("protected_branches", "required_status_checks", "text"),
         ("runners", "labels", "text"),
@@ -3508,10 +3631,10 @@ async fn assert_free_text_columns_are_wide(db: &DatabaseConnection) {
 
 /// The `VARCHAR(255)` columns MySQL holds after every migration, as of
 /// 2026-10-16 (card_9ea48ee6a422). Each is filled by the server with something
-/// bounded — an id, a digest, a state, a name validated at the door — or is
-/// tracked as open: the CI names from workflow files and the commit status
-/// context in card_51b860efc19c. A column joins this list only with the same
-/// answer.
+/// bounded — an id, a digest, a state, a name validated at the door. The CI
+/// names a workflow file chooses (job, stage, concurrency group) and a commit
+/// status context are refused past 255 characters before the write
+/// (card_51b860efc19c). A column joins this list only with the same answer.
 const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
     ("access_tokens", &["name", "scopes", "token_hash"]),
     ("artifacts", &["name", "sha256"]),
@@ -3586,13 +3709,7 @@ const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
     ("pipeline_concurrency_locks", &["group_name"]),
     (
         "pipeline_jobs",
-        &[
-            "environment_name",
-            "image",
-            "name",
-            "status",
-            "when_condition",
-        ],
+        &["environment_name", "name", "status", "when_condition"],
     ),
     ("pipeline_stages", &["name", "status"]),
     (

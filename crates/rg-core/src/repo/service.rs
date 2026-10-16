@@ -4717,6 +4717,20 @@ pub async fn create_commit_status(
             "invalid commit status state: '{state}', must be one of: {valid_states:?}"
         )));
     }
+    // Every one of these lands in a bounded column — `sha` in `VARCHAR(40)`,
+    // `context` in `VARCHAR(255)`, the other two in `VARCHAR(500)` — and the
+    // bound holds on PostgreSQL and MySQL alike. Unchecked, a longer value was
+    // the database refusing the insert, so a CI integration posting a long
+    // description was told the server had failed (card_51b860efc19c).
+    if !sha.is_empty() && !(sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+        return Err(crate::error::invalid_request(
+            "sha must be a full 40-character commit id",
+        ));
+    }
+    use crate::text_limits::{check, check_optional, MAX_LINE_CHARS, MAX_STATUS_TEXT_CHARS};
+    check("context", context, MAX_LINE_CHARS)?;
+    check_optional("description", description, MAX_STATUS_TEXT_CHARS)?;
+    check_optional("target_url", target_url, MAX_STATUS_TEXT_CHARS)?;
     let target_url = commit_status_target_url(target_url)?;
 
     let now = Utc::now();

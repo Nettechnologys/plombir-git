@@ -22,6 +22,11 @@ pub const MAX_BODY_CHARS: usize = 65_536;
 /// A title or a short one-line field: the `VARCHAR(255)` it is stored in.
 pub const MAX_LINE_CHARS: usize = 255;
 
+/// A commit status `description` or `target_url`: the `VARCHAR(500)` they are
+/// stored in on every backend. GitHub cuts a description at 140 characters;
+/// this one keeps everything the column can hold and refuses the rest.
+pub const MAX_STATUS_TEXT_CHARS: usize = 500;
+
 /// A path inside a repository, as a review comment anchors to it: Linux's
 /// `PATH_MAX`. Stored as `TEXT`, which 4 096 four-byte characters fit.
 pub const MAX_PATH_CHARS: usize = 4096;

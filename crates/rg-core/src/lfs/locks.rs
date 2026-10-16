@@ -37,6 +37,11 @@ use rg_db::ops::lfs_lock_ops::{self, LockAttempt, LockQuery};
 /// to fit the unique index into every supported database.
 pub const MAX_LOCK_PATH_CHARS: usize = 512;
 
+/// The longest `ref.name` a lock records — the width of `lfs_locks.ref_name`
+/// on every backend. Unchecked, a longer one was PostgreSQL and MySQL refusing
+/// the insert, and the client was told the server failed (card_51b860efc19c).
+pub const MAX_LOCK_REF_CHARS: usize = 1024;
+
 /// The page size when a client names none, and the largest it may ask for.
 pub const DEFAULT_PAGE_SIZE: u64 = 100;
 pub const MAX_PAGE_SIZE: u64 = 1000;
@@ -103,6 +108,11 @@ pub fn normalize_path(path: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
+/// Refuse a `ref.name` longer than the column that records it.
+fn check_ref_name(ref_name: Option<&str>) -> Result<()> {
+    crate::text_limits::check_optional("`ref.name`", ref_name, MAX_LOCK_REF_CHARS)
+}
+
 /// The page size a client asked for, within bounds.
 pub fn page_size(requested: Option<u64>) -> Result<u64> {
     match requested {
@@ -130,6 +140,7 @@ pub async fn create_lock(
     ref_name: Option<&str>,
 ) -> Result<CreateOutcome> {
     let path = normalize_path(path)?;
+    check_ref_name(ref_name)?;
     let attempt = lfs_lock_ops::create(db, repo_id, &path, ref_name, owner_id, Utc::now()).await?;
     Ok(match attempt {
         LockAttempt::Created(lock) => CreateOutcome::Created(view_one(db, lock).await?),
@@ -323,6 +334,18 @@ mod tests {
         }
         assert!(normalize_path(&"a".repeat(MAX_LOCK_PATH_CHARS)).is_ok());
         assert!(normalize_path(&"a".repeat(MAX_LOCK_PATH_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn a_ref_name_past_its_column_is_refused() {
+        let at_ceiling = format!("refs/heads/{}", "b".repeat(MAX_LOCK_REF_CHARS - 11));
+        check_ref_name(Some(&at_ceiling)).expect("1024 characters fit");
+        check_ref_name(None).expect("a lock need not name a ref");
+        let refused = check_ref_name(Some(&format!("{at_ceiling}b"))).unwrap_err();
+        assert!(refused
+            .downcast_ref::<crate::error::InvalidRequest>()
+            .is_some());
+        assert!(refused.to_string().contains("`ref.name`"), "{refused}");
     }
 
     #[test]

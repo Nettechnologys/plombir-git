@@ -227,3 +227,82 @@ async fn a_status_link_must_be_an_http_url() {
     assert_eq!(link("blank"), Some(serde_json::Value::Null));
     assert_eq!(link("hostile"), None, "a refused status is not stored");
 }
+
+/// Every field of a status lands in a bounded column — `sha` in `VARCHAR(40)`,
+/// `context` in `VARCHAR(255)`, `description` and `target_url` in
+/// `VARCHAR(500)` on PostgreSQL and MySQL too. A longer value used to reach the
+/// insert and come back a `500` there; it is the caller's to shorten, and the
+/// answer names the field (card_51b860efc19c).
+#[tokio::test]
+async fn a_status_field_past_its_column_is_a_bad_request_naming_it() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (owner_token, _owner_id) =
+        register_full(&base, "signal-owner", "signal-owner@example.com").await;
+    create_repo(&base, &owner_token, "signal-repo").await;
+
+    let post = |sha: String, body: serde_json::Value| {
+        let base = base.clone();
+        let token = owner_token.clone();
+        async move {
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "{base}/api/v1/repos/signal-owner/signal-repo/statuses/{sha}"
+                ))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .expect("post commit status");
+            let status = response.status();
+            (status, response.text().await.unwrap_or_default())
+        }
+    };
+
+    let cases = [
+        (
+            "description",
+            SHA.to_string(),
+            serde_json::json!({"state": "success", "context": "ci", "description": "d".repeat(501)}),
+        ),
+        (
+            "target_url",
+            SHA.to_string(),
+            serde_json::json!({
+                "state": "success",
+                "context": "ci",
+                "target_url": format!("https://ci.example.com/{}", "u".repeat(500)),
+            }),
+        ),
+        (
+            "context",
+            SHA.to_string(),
+            serde_json::json!({"state": "success", "context": "c".repeat(256)}),
+        ),
+        (
+            "sha",
+            "0".repeat(41),
+            serde_json::json!({"state": "success", "context": "ci"}),
+        ),
+    ];
+    for (field, sha, body) in cases {
+        let (status, text) = post(sha, body).await;
+        assert_eq!(status, 400, "{field} past its column: {text}");
+        assert!(text.contains(field), "the answer names {field}: {text}");
+    }
+
+    // At every ceiling the status is stored.
+    let (status, text) = post(
+        SHA.to_string(),
+        serde_json::json!({
+            "state": "success",
+            "context": "c".repeat(255),
+            "description": "d".repeat(500),
+            "target_url": format!(
+                "https://ci.example.com/{}",
+                "u".repeat(500 - "https://ci.example.com/".len())
+            ),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "{text}");
+}
