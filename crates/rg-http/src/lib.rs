@@ -41,6 +41,7 @@ mod body_limit;
 mod content_disposition;
 mod git_http;
 mod handlers;
+mod html_url;
 mod http_stream;
 mod log_redaction;
 mod public_url;

@@ -26,6 +26,10 @@ struct PipelineResponse {
     started_at: Option<String>,
     finished_at: Option<String>,
     created_at: String,
+    /// The pipeline on the repository's CI page in the web app, when the
+    /// instance has an `external_url` to build it from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    html_url: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -213,7 +217,7 @@ pub struct ListPipelinesQuery {
 pub async fn list_pipelines(
     State(state): State<AppState>,
     RepoRead { repo }: RepoRead,
-    Path((_, _)): Path<(String, String)>,
+    Path((owner, name)): Path<(String, String)>,
     Query(params): Query<ListPipelinesQuery>,
 ) -> impl IntoResponse {
     let pagination = params.pagination.clamp();
@@ -226,9 +230,11 @@ pub async fn list_pipelines(
     .await
     {
         Ok((pipelines, total)) => {
+            let links = crate::html_url::Links::new(&state, &owner, &name);
             let resp: Vec<PipelineResponse> = pipelines
                 .into_iter()
                 .map(|p| PipelineResponse {
+                    html_url: links.pipeline(p.id),
                     id: p.id,
                     repo_id: p.repo_id,
                     commit_sha: p.commit_sha,
@@ -353,7 +359,7 @@ pub async fn get_workflow_dispatch_schema(
 )]
 pub async fn get_pipeline(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
+    Path((owner, name, id)): Path<(String, String, i64)>,
     RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     let pipeline = match pipeline_in_repo(&state, &repo, id).await {
@@ -402,6 +408,7 @@ pub async fn get_pipeline(
 
     let resp = PipelineDetailResponse {
         pipeline: PipelineResponse {
+            html_url: crate::html_url::Links::new(&state, &owner, &name).pipeline(pipeline.id),
             id: pipeline.id,
             repo_id: pipeline.repo_id,
             commit_sha: pipeline.commit_sha,
@@ -744,14 +751,18 @@ pub async fn trigger_pipeline(
                 return error.into_response();
             }
 
+            let html_url = crate::html_url::Links::new(&state, &owner, &name).pipeline(pipeline_id);
             (
                 StatusCode::CREATED,
-                Json(serde_json::json!({
-                    "id": pipeline_id,
-                    "status": "pending",
-                    "commit_sha": commit_sha,
-                    "ref_name": ref_name,
-                })),
+                Json(crate::html_url::with_html_url(
+                    serde_json::json!({
+                        "id": pipeline_id,
+                        "status": "pending",
+                        "commit_sha": commit_sha,
+                        "ref_name": ref_name,
+                    }),
+                    html_url,
+                )),
             )
                 .into_response()
         }

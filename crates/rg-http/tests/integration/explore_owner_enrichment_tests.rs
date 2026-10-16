@@ -20,7 +20,10 @@ use std::collections::BTreeSet;
 
 use sea_orm::ConnectionTrait;
 
-use crate::common::{create_repo, register_full, spawn_test_app_with_db};
+use crate::common::{
+    create_repo, register_full, spawn_test_app_with_db, spawn_test_app_with_overrides,
+    StateOverrides,
+};
 
 async fn explore(base: &str) -> (reqwest::StatusCode, serde_json::Value) {
     let resp = reqwest::Client::new()
@@ -57,7 +60,13 @@ fn object_keys(value: &serde_json::Value) -> BTreeSet<String> {
 
 #[tokio::test]
 async fn explore_runtime_body_matches_its_published_openapi_schema() {
-    let (base, _db) = spawn_test_app_with_db().await;
+    // With `external_url` set, so the row carries every field the schema
+    // publishes — `html_url` included, which an instance without one omits.
+    let (base, _db) = spawn_test_app_with_overrides(StateOverrides {
+        external_url: Some("https://forge.example.test".into()),
+        ..Default::default()
+    })
+    .await;
     let (token, _user_id) = register_full(&base, "explspec", "explspec@example.com").await;
     create_repo(&base, &token, "explspec-repo").await;
 

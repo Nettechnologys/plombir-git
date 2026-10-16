@@ -545,7 +545,17 @@ pub async fn list_review_comments(
     RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     match rg_core::review::service::list_review_comments(&state.db, &owner, &repo, number).await {
-        Ok(comments) => (StatusCode::OK, Json(comments)).into_response(),
+        Ok(comments) => {
+            let links = crate::html_url::Links::new(&state, &owner, &repo);
+            let comments: Vec<serde_json::Value> = comments
+                .into_iter()
+                .map(|comment| {
+                    let html_url = links.review_comment(number, comment.id);
+                    crate::html_url::with_html_url(comment, html_url)
+                })
+                .collect();
+            (StatusCode::OK, Json(comments)).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -979,7 +989,7 @@ impl TimelineBuilder {
 )]
 pub async fn create_review_comment(
     State(state): State<AppState>,
-    Path((_owner, _repo, number)): Path<(String, String, i64)>,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
     RepoAuthRead {
         repo: repo_model,
         actor_id: user_id,
@@ -1004,7 +1014,15 @@ pub async fn create_review_comment(
     )
     .await
     {
-        Ok(comment) => (StatusCode::CREATED, Json(comment)).into_response(),
+        Ok(comment) => {
+            let html_url = crate::html_url::Links::new(&state, &owner, &repo)
+                .review_comment(number, comment.id);
+            (
+                StatusCode::CREATED,
+                Json(crate::html_url::with_html_url(comment, html_url)),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

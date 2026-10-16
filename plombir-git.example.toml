@@ -29,7 +29,8 @@ ssh_addr = "0.0.0.0:2222"
 package_upload_max_mb = 512
 # Public URL of this instance: the base of every link the server hands a
 # client to follow — SSO callbacks, emails, webhook payloads, Git LFS actions,
-# the OCI token realm, the CI OIDC issuer, package indexes — and the Git LFS
+# the OCI token realm, the CI OIDC issuer, package indexes, the `html_url` of
+# API responses (omitted while this is unset) — and the Git LFS
 # endpoint for clones made from the SSH URL. Set it to whatever your reverse
 # proxy serves. Left unset, links name the request's `Host`, over `https` when
 # `[tls]` is configured or a proxy sends `X-Forwarded-Proto: https`, and

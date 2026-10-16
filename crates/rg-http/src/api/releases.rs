@@ -210,7 +210,7 @@ pub struct UpdateReleaseRequest {
 pub async fn list_releases(
     State(state): State<AppState>,
     RepoRead { repo }: RepoRead,
-    Path((_, _)): Path<(String, String)>,
+    Path((owner, name)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
     let pagination = params.clamp();
@@ -218,11 +218,21 @@ pub async fn list_releases(
     let limit = pagination.limit();
 
     match rg_core::release::service::list_releases(&state.db, repo.id, offset, limit).await {
-        Ok((releases, total)) => (
-            StatusCode::OK,
-            Json(PaginatedResponse::new(releases, &pagination, total as u64)),
-        )
-            .into_response(),
+        Ok((releases, total)) => {
+            let links = crate::html_url::Links::new(&state, &owner, &name);
+            let releases: Vec<serde_json::Value> = releases
+                .into_iter()
+                .map(|release| {
+                    let html_url = links.release(release.id);
+                    crate::html_url::with_html_url(release, html_url)
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(PaginatedResponse::new(releases, &pagination, total as u64)),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -274,6 +284,7 @@ pub async fn create_release(
         .clone()
         .filter(|target| !target.is_empty())
         .unwrap_or_else(|| repo.default_branch.clone());
+    let (link_owner, link_name) = (owner.clone(), name.clone());
     let owned_state = state.clone();
     let repo_id = repo.id;
     match state
@@ -298,7 +309,15 @@ pub async fn create_release(
         })
         .await
     {
-        Ok(release) => (StatusCode::CREATED, Json(serde_json::json!(release))).into_response(),
+        Ok(release) => {
+            let html_url =
+                crate::html_url::Links::new(&state, &link_owner, &link_name).release(release.id);
+            (
+                StatusCode::CREATED,
+                Json(crate::html_url::with_html_url(release, html_url)),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -320,14 +339,21 @@ pub async fn create_release(
 )]
 pub async fn get_release(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
+    Path((owner, name, id)): Path<(String, String, i64)>,
     RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
     // The service marks a genuine miss with `rg_core::error::NotFound`, so this
     // still answers 404 for a deleted release — but a database outage surfaces
     // as 503 instead of telling the client the release is gone.
     match release_in_repo(&state, &repo, id).await {
-        Ok(release) => (StatusCode::OK, Json(serde_json::json!(release))).into_response(),
+        Ok(release) => {
+            let html_url = crate::html_url::Links::new(&state, &owner, &name).release(release.id);
+            (
+                StatusCode::OK,
+                Json(crate::html_url::with_html_url(release, html_url)),
+            )
+                .into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -371,6 +397,7 @@ pub async fn update_release(
         }
     }
 
+    let (link_owner, link_name) = (owner.clone(), name.clone());
     let owned_state = state.clone();
     match state
         .tracked_ref_operation(async move {
@@ -407,7 +434,15 @@ pub async fn update_release(
         })
         .await
     {
-        Ok(release) => (StatusCode::OK, Json(serde_json::json!(release))).into_response(),
+        Ok(release) => {
+            let html_url =
+                crate::html_url::Links::new(&state, &link_owner, &link_name).release(release.id);
+            (
+                StatusCode::OK,
+                Json(crate::html_url::with_html_url(release, html_url)),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

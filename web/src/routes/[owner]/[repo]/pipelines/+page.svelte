@@ -13,6 +13,7 @@
     type RepositoryResourceRequestClaim,
   } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
+  import { linkedId } from '$lib/htmlUrlTargets';
   import { viewerPermission } from '$lib/viewerPermission.svelte';
   import { getUser } from '$lib/stores/auth.svelte';
   import ConfirmModal from '$lib/components/ConfirmModal.svelte';
@@ -199,6 +200,11 @@
     busyJobIds = next;
   }
 
+  /** The pipeline `?pipeline=<id>` names, when it names a valid id. */
+  function linkedPipelineId(): number | null {
+    return linkedId($page.url.searchParams.get('pipeline'));
+  }
+
   async function loadPipelines(expectedOwner: string, expectedRepo: string) {
     const claim = pipelineListRequests.begin(expectedOwner, expectedRepo);
     try {
@@ -206,8 +212,14 @@
       const pipeResult = await pipelines.list(expectedOwner, expectedRepo);
       if (!pipelineListRequests.owns(claim, owner, repo)) return;
       pipelineList = pipeResult.data;
-      if (pipelineList.length > 0 && selectedPipelineId === null) {
-        await selectPipeline(pipelineList[0].id, expectedOwner, expectedRepo, routeGeneration);
+      if (selectedPipelineId === null) {
+        // A link names its pipeline — the API's `html_url` is
+        // `…/pipelines?pipeline=<id>`, and that one may be older than the
+        // first page. Without one, the newest pipeline opens.
+        const target = linkedPipelineId() ?? pipelineList[0]?.id;
+        if (target !== undefined) {
+          await selectPipeline(target, expectedOwner, expectedRepo, routeGeneration);
+        }
       }
     } catch (e: any) {
       if (pipelineListRequests.owns(claim, owner, repo)) error = e.message;

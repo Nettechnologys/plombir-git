@@ -24,6 +24,7 @@
   import { canWriteRepo, isRepoAdmin } from '$lib/repoPermission';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
   import { renderMarkdown as renderMarkdownSafe } from '$lib/utils/markdown';
+  import { revealHash } from '$lib/htmlUrlTargets';
 
   const t = createT();
 
@@ -186,6 +187,8 @@
     } finally {
       if (issueRequests.owns(claim, owner, repo, number) && isCurrentRoute(route)) {
         loading = false;
+        // A comment's `html_url` ends in `#comment-<id>`.
+        void revealHash();
       }
     }
   }
@@ -415,7 +418,7 @@
 
       <!-- Comments -->
       {#each commentList as comment (comment.id)}
-        <div class="comment" data-comment={comment.id}>
+        <div class="comment" id="comment-{comment.id}" data-comment={comment.id}>
           <div class="comment-header">
             <span>
               {t('issues.commented', { author: comment.author || t('common.unknown'), date: formatDate(comment.created_at) })}<BotBadge owner={comment.author_bot_owner} />

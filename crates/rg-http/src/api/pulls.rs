@@ -44,10 +44,14 @@ pub struct PullRequestResponse {
     /// When the author is a bot, the person it acts for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author_bot_owner: Option<String>,
+    /// The pull request's page in the web app, when `external_url` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
 }
 
 async fn prs_with_authors(
     db: &sea_orm::DatabaseConnection,
+    links: &crate::html_url::Links<'_>,
     prs: Vec<rg_db::entities::pull_request::Model>,
 ) -> Result<Vec<PullRequestResponse>, AppError> {
     let mut names = super::author_names::AuthorNames::default();
@@ -58,6 +62,7 @@ async fn prs_with_authors(
     for pr in prs {
         let (author, author_bot_owner) = names.author(db, pr.author_id).await?;
         responses.push(PullRequestResponse {
+            html_url: links.pull(pr.number),
             pr,
             author,
             author_bot_owner,
@@ -68,9 +73,10 @@ async fn prs_with_authors(
 
 async fn pr_with_author(
     db: &sea_orm::DatabaseConnection,
+    links: &crate::html_url::Links<'_>,
     pr: rg_db::entities::pull_request::Model,
 ) -> Result<PullRequestResponse, AppError> {
-    let mut responses = prs_with_authors(db, vec![pr]).await?;
+    let mut responses = prs_with_authors(db, links, vec![pr]).await?;
     Ok(responses.remove(0))
 }
 
@@ -172,7 +178,13 @@ pub async fn list_prs(
     )
     .await
     {
-        Ok((data, total)) => match prs_with_authors(&state.db, data).await {
+        Ok((data, total)) => match prs_with_authors(
+            &state.db,
+            &crate::html_url::Links::new(&state, &owner, &repo),
+            data,
+        )
+        .await
+        {
             Ok(data) => (
                 StatusCode::OK,
                 Json(PaginatedResponse::new(data, &pagination, total as u64)),
@@ -204,7 +216,13 @@ pub async fn get_pr(
     RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
-        Ok(pr) => match pr_with_author(&state.db, pr).await {
+        Ok(pr) => match pr_with_author(
+            &state.db,
+            &crate::html_url::Links::new(&state, &owner, &repo),
+            pr,
+        )
+        .await
+        {
             Ok(pr) => (StatusCode::OK, Json(pr)).into_response(),
             Err(error) => error.into_response(),
         },
@@ -324,7 +342,13 @@ pub async fn create_pr(
                             tracing::warn!(pr_id = pr.id, error = %format!("{error:#}"), "CODEOWNERS diff unavailable");
                         }
                     }
-                    match pr_with_author(&state.db, pr).await {
+                    match pr_with_author(
+                        &state.db,
+                        &crate::html_url::Links::new(&state, &owner, &repo),
+                        pr,
+                    )
+                    .await
+                    {
                         Ok(pr) => (StatusCode::CREATED, Json(pr)).into_response(),
                         Err(error) => error.into_response(),
                     }

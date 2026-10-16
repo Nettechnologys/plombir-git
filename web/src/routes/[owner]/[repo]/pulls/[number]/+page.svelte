@@ -14,6 +14,7 @@
   import { optionalSection, sectionOr } from '$lib/optionalSection';
   import type { DiffLine, MergeQueueEntry, PrDiff } from '$lib/api/pulls';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
+  import { revealHash } from '$lib/htmlUrlTargets';
 
   const t = createT();
 
@@ -359,6 +360,8 @@
     } finally {
       if (pullRequests.owns(claim, owner, repo, number) && isCurrentRoute(route)) {
         loading = false;
+        // A review comment's `html_url` ends in `#review-comment-<id>`.
+        void revealHash();
       }
     }
   }
@@ -1102,7 +1105,7 @@
 </div>
 
 {#snippet reviewComment(comment: any, isReply: boolean)}
-  <div class="thread-comment" class:reply={isReply} data-review-comment={comment.id}>
+  <div class="thread-comment" class:reply={isReply} id="review-comment-{comment.id}" data-review-comment={comment.id}>
     {#if editingCommentId === comment.id}
       <textarea class="comment-edit-input" bind:value={editDraft} rows="3" disabled={editBusy} aria-label={t('comments.edit_label')}></textarea>
       {#if editError}

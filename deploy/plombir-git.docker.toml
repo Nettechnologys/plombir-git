@@ -24,8 +24,9 @@ ssh_addr = "0.0.0.0:2222"
 host_key = "/data/ssh_host_key"
 # Public URL of this instance: the base of every link the server hands a
 # client to follow — emails, webhook payloads, Git LFS actions, the OCI token
-# realm, the CI OIDC issuer, package indexes — and the Git LFS endpoint for
-# clones made from the SSH URL. Set it to whatever your reverse proxy serves.
+# realm, the CI OIDC issuer, package indexes, the `html_url` of API responses
+# (omitted while this is unset) — and the Git LFS endpoint for clones made
+# from the SSH URL. Set it to whatever your reverse proxy serves.
 # external_url = "https://git.example.com"
 
 [database]

@@ -111,6 +111,10 @@ pub struct RepoResponse {
     /// is how the web app learns the address to show (card_e83bf21a5e5b).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_name: Option<String>,
+    /// The repository's page in the web app — absent when the instance has no
+    /// `external_url` to build it from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
 }
 
 /// Public repository row as it appears in the explore listing.
@@ -128,6 +132,9 @@ pub struct ExploreRepoResponse {
     pub stars_count: i64,
     pub forks_count: i64,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// The repository's page in the web app, when `external_url` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
 }
 
 /// Public account identity rendered in a repository's stargazer list.
@@ -304,7 +311,13 @@ pub async fn create_repo(
             // `repo_created` is recorded inside
             // `rg_core::repo::service::create_repo_with_opts` so the REST path
             // and the import subsystem both count through one site.
-            (StatusCode::CREATED, Json(serde_json::json!(repo))).into_response()
+            let namespace = body.org.as_deref().unwrap_or(&username);
+            let html_url = crate::html_url::Links::new(&state, namespace, &repo.name).repo();
+            (
+                StatusCode::CREATED,
+                Json(crate::html_url::with_html_url(&repo, html_url)),
+            )
+                .into_response()
         }
         // A rejected name and a name already in use are typed `InvalidRequest`
         // and stay 400. The `gix init`, the `create_dir_all` under `repo_root`
@@ -366,11 +379,12 @@ pub async fn list_repos(
         .await
         {
             Ok((data, total)) => {
+                let data = repos_with_html_urls(&state, &owner, data);
                 return (
                     StatusCode::OK,
                     Json(PaginatedResponse::new(data, &pagination, total as u64)),
                 )
-                    .into_response()
+                    .into_response();
             }
             Err(e) => return AppError::from(e).into_response(),
         }
@@ -388,11 +402,12 @@ pub async fn list_repos(
         .await
         {
             Ok((data, total)) => {
+                let data = repos_with_html_urls(&state, &owner, data);
                 return (
                     StatusCode::OK,
                     Json(PaginatedResponse::new(data, &pagination, total as u64)),
                 )
-                    .into_response()
+                    .into_response();
             }
             Err(e) => return AppError::from(e).into_response(),
         }
@@ -435,11 +450,29 @@ pub async fn get_repo(
         if let Some(permission) = viewer_permission {
             fields.insert("viewer_permission".into(), permission.into());
         }
+        if let Some(url) = crate::html_url::Links::new(&state, &owner, &repo.name).repo() {
+            fields.insert("html_url".into(), url.into());
+        }
         // The path resolved to this repository, so its owner segment is the
         // namespace's current name.
         fields.insert("owner_name".into(), owner.into());
     }
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// An owner's repository rows, each with the page it lives on.
+fn repos_with_html_urls(
+    state: &AppState,
+    owner: &str,
+    repos: Vec<rg_db::entities::repository::Model>,
+) -> Vec<serde_json::Value> {
+    repos
+        .into_iter()
+        .map(|repo| {
+            let html_url = crate::html_url::Links::new(state, owner, &repo.name).repo();
+            crate::html_url::with_html_url(repo, html_url)
+        })
+        .collect()
 }
 
 /// The caller's level on `repo`, for [`RepoResponse::viewer_permission`]:
@@ -877,7 +910,12 @@ pub async fn fork_repo_handler(
             // this returns, and the body is the created repository. The route
             // has always *declared* `201` above — nothing could notice the
             // disagreement while every fork was a 500.
-            (StatusCode::CREATED, Json(serde_json::json!(repo))).into_response()
+            let html_url = crate::html_url::Links::new(&state, &owner_name, &repo.name).repo();
+            (
+                StatusCode::CREATED,
+                Json(crate::html_url::with_html_url(&repo, html_url)),
+            )
+                .into_response()
         }
         // Absent source → 404 and a private source the caller may not read →
         // 403, both from the extractor above; a name already taken in their
@@ -1392,7 +1430,11 @@ pub async fn explore(
             let mut enriched: Vec<ExploreRepoResponse> = Vec::with_capacity(data.len());
             for repo in &data {
                 let owner_name = owners.get(&repo.owner_id).map(|user| user.username.clone());
+                let html_url = owner_name.as_deref().and_then(|owner| {
+                    crate::html_url::Links::new(&state, owner, &repo.name).repo()
+                });
                 enriched.push(ExploreRepoResponse {
+                    html_url,
                     id: repo.id,
                     owner_id: repo.owner_id,
                     owner_name,

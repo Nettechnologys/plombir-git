@@ -127,6 +127,16 @@ pub struct IssueResponse {
     /// is unassigned and when the assigned account no longer resolves — the
     /// number stays in `assignee_id` either way.
     pub assignee: Option<String>,
+    /// The issue's page in the web app, when `external_url` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+}
+
+impl IssueResponse {
+    fn linked(mut self, links: &crate::html_url::Links<'_>) -> Self {
+        self.html_url = links.issue(self.issue.issue.number);
+        self
+    }
 }
 
 /// List valid Markdown issue templates from the repository default branch.
@@ -272,6 +282,17 @@ pub struct CommentResponse {
     /// When the author is a bot, the person it acts for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author_bot_owner: Option<String>,
+    /// The comment on its issue's page in the web app, when `external_url` is
+    /// set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+}
+
+impl CommentResponse {
+    fn linked(mut self, links: &crate::html_url::Links<'_>, issue_number: i64) -> Self {
+        self.html_url = links.issue_comment(issue_number, self.comment.id);
+        self
+    }
 }
 
 // ── Issue handlers ──────────────────────────────────────────────────────
@@ -320,8 +341,12 @@ pub async fn list_issues(
         .await
         {
             Ok((data, total)) => {
+                let links = crate::html_url::Links::new(&state, &owner, &repo);
                 let data = match issues_with_authors(&state.db, data).await {
-                    Ok(data) => data,
+                    Ok(data) => data
+                        .into_iter()
+                        .map(|issue| issue.linked(&links))
+                        .collect::<Vec<_>>(),
                     Err(error) => return error.into_response(),
                 };
                 (
@@ -345,8 +370,12 @@ pub async fn list_issues(
     .await
     {
         Ok((data, total)) => {
+            let links = crate::html_url::Links::new(&state, &owner, &repo);
             let data = match issues_with_authors(&state.db, data).await {
-                Ok(data) => data,
+                Ok(data) => data
+                    .into_iter()
+                    .map(|issue| issue.linked(&links))
+                    .collect::<Vec<_>>(),
                 Err(error) => return error.into_response(),
             };
             (
@@ -381,7 +410,7 @@ pub async fn get_issue(
     match rg_core::issue::get_issue(&state.db, &owner, &repo, number).await {
         Ok(issue) => {
             let issue = match issue_with_author(&state.db, issue).await {
-                Ok(issue) => issue,
+                Ok(issue) => issue.linked(&crate::html_url::Links::new(&state, &owner, &repo)),
                 Err(error) => return error.into_response(),
             };
             (StatusCode::OK, Json(issue)).into_response()
@@ -470,7 +499,7 @@ async fn require_assignee_in_repo(
 )]
 pub async fn create_issue(
     State(state): State<AppState>,
-    Path((_, _)): Path<(String, String)>,
+    Path((owner, repo)): Path<(String, String)>,
     RepoAuthRead {
         repo: repo_model,
         actor_id: user_id,
@@ -512,7 +541,7 @@ pub async fn create_issue(
             // has no handler of its own, so a producer sitting on this branch
             // saw only the ones a human typed.
             let issue = match issue_with_author(&state.db, issue).await {
-                Ok(issue) => issue,
+                Ok(issue) => issue.linked(&crate::html_url::Links::new(&state, &owner, &repo)),
                 Err(error) => return error.into_response(),
             };
             (StatusCode::CREATED, Json(issue)).into_response()
@@ -645,7 +674,7 @@ pub async fn update_issue(
                 crate::metrics::recorder::issue_closed();
             }
             let issue = match issue_with_author(&state.db, issue).await {
-                Ok(issue) => issue,
+                Ok(issue) => issue.linked(&crate::html_url::Links::new(&state, &owner, &repo)),
                 Err(error) => return error.into_response(),
             };
             (StatusCode::OK, Json(issue)).into_response()
@@ -679,8 +708,12 @@ pub async fn list_comments(
 ) -> impl IntoResponse {
     match rg_core::issue::list_comments(&state.db, &owner, &repo, number).await {
         Ok(comments) => {
+            let links = crate::html_url::Links::new(&state, &owner, &repo);
             let comments = match comments_with_authors(&state.db, comments).await {
-                Ok(comments) => comments,
+                Ok(comments) => comments
+                    .into_iter()
+                    .map(|comment| comment.linked(&links, number))
+                    .collect::<Vec<_>>(),
                 Err(error) => return error.into_response(),
             };
             (StatusCode::OK, Json(comments)).into_response()
@@ -718,7 +751,9 @@ pub async fn add_comment(
     {
         Ok(comment) => {
             let comment = match comment_with_author(&state.db, comment).await {
-                Ok(comment) => comment,
+                Ok(comment) => {
+                    comment.linked(&crate::html_url::Links::new(&state, &owner, &repo), number)
+                }
                 Err(error) => return error.into_response(),
             };
             (StatusCode::CREATED, Json(comment)).into_response()
@@ -759,6 +794,7 @@ async fn issue_with_author(
         author,
         author_bot_owner,
         assignee,
+        html_url: None,
     })
 }
 
@@ -787,6 +823,7 @@ async fn issues_with_authors(
             author,
             author_bot_owner,
             assignee,
+            html_url: None,
         });
     }
     Ok(responses)
@@ -802,6 +839,7 @@ async fn comment_with_author(
         comment,
         author,
         author_bot_owner,
+        html_url: None,
     })
 }
 
@@ -820,6 +858,7 @@ async fn comments_with_authors(
             comment,
             author,
             author_bot_owner,
+            html_url: None,
         });
     }
     Ok(responses)

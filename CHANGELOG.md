@@ -9,6 +9,13 @@ This project records user-facing changes here. The format follows
 ### Added
 
 - Public security reporting and contributor guidance.
+- With `[server].external_url` set, API responses for repositories, pull
+  requests, issues, issue comments, review comments, pipelines and releases
+  carry `html_url`, the page a person opens to see them. Without it the field
+  is absent.
+- MCP `tools/list` annotates every tool with `readOnlyHint`,
+  `destructiveHint`, `idempotentHint` and `openWorldHint`, and arguments that
+  take one of a few words list them in an `enum`.
 - `POST /admin/users/{id}/mfa/reset` and `plombir-git reset-mfa <username>`
   take every second factor (authenticator, backup codes, passkeys) off an
   account whose owner is locked out and sign its sessions out.

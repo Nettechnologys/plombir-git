@@ -14,11 +14,16 @@
     type RepositoryResourceRequestClaim,
   } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
+  import { linkedId } from '$lib/htmlUrlTargets';
 
   const t = createT();
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
+  // A link names one release — the API's `html_url` is `…/releases?release=<id>`,
+  // and that release may be older than the first page — so the page shows it
+  // alone.
+  let linkedReleaseId = $derived(linkedId($page.url.searchParams.get('release')));
 
   let releaseList = $state<any[]>([]);
   let loading = $state(true);
@@ -72,6 +77,8 @@
   $effect(() => {
     const expectedOwner = owner!;
     const expectedRepo = repo!;
+    // Leaving `?release=<id>` for the full listing is a visit of its own.
+    void linkedReleaseId;
     routeGeneration += 1;
     currentPage = 1;
     releaseList = [];
@@ -158,9 +165,15 @@
       // Awaited before the assets, because whether a 404 from the attestation
       // endpoints means "unsigned" depends on the answer. A failure leaves the
       // capability unknown rather than off — see `attestationEnabled`.
+      const linked = linkedReleaseId;
       const [info, res] = await Promise.all([
         instance.get().catch(() => null),
-        releases.list(expectedOwner, expectedRepo, expectedPage, 20),
+        linked === null
+          ? releases.list(expectedOwner, expectedRepo, expectedPage, 20)
+          : releases.get(expectedOwner, expectedRepo, linked).then((release) => ({
+              data: [release],
+              pagination: undefined,
+            })),
       ]);
       if (!ownsListClaim(claim)) return;
       if (info) attestationEnabled = info.attestation_enabled;
