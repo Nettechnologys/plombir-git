@@ -598,47 +598,43 @@ they need an identity of their own that this server does not manage yet.
 ### Git LFS
 
 `git lfs` needs no `lfs.url` with either clone URL. From the HTTPS URL the
-client finds the endpoint itself. From the SSH URL it asks the server over SSH
-(`git-lfs-authenticate`), which checks the same repository permission as a
-clone or push and sends the client to the instance's public URL with a
-short-lived credential for that one repository.
+client finds the endpoint itself. From the SSH URL it speaks Git LFS over the
+SSH connection (`git-lfs-transfer`, git-lfs 3.0 and later): the same
+repository permission as a clone (download) or a push (upload), the same
+checks on every uploaded object as over HTTPS — its digest against its oid, its
+size against the one the client declared, the repository's storage budget —
+and the locking commands (`git lfs lock`, `locks`, `unlock`) on the same
+channel. Deploy keys work too, read-only ones for downloads only, and hold no
+locks.
 
+Older clients ask instead with `git-lfs-authenticate`, which sends them to the
+instance's public URL with a short-lived credential for that one repository.
 That answer can only name the public URL if the server knows it: set
 `[server].external_url`. Without it, `git-lfs-authenticate` refuses with a
-message saying so, and an SSH clone needs
+message saying so, and such a clone needs
 `git config lfs.url <external URL>/api/v1/repos/<owner>/<repo>/lfs`.
-Deploy keys work too, read-only ones for downloads only. The pure-SSH transfer
-protocol (`git-lfs-transfer`) is not implemented; git-lfs falls back to
-`git-lfs-authenticate` by itself — at the cost of extra SSH connections, see
-[LFS over SSH: a slow or stalled push](#lfs-over-ssh-a-slow-or-stalled-push).
 
-#### LFS over SSH: a slow or stalled push
+#### LFS over SSH: how many connections
 
-From an SSH remote, a stock `git lfs push` opens five SSH connections, each
-authenticated on its own: `git-receive-pack`, the pure-SSH `git-lfs-transfer`
-probe (refused), `git-upload-pack`, the probe again, then
-`git-lfs-authenticate`, after which the objects go over HTTPS (measured with
-git-lfs 3.4.1 and 3.6.1). Where every connection needs a person — a key with a
-passphrase and no agent, an agent that asks for confirmation, a FIDO key that
-wants a touch — that is five prompts per push, and a client that gives up
-halfway leaves a push without its objects. Any one of these fixes it, client
-side:
+A stock `git lfs push` to an SSH remote opens four SSH connections, each
+authenticated on its own: `git-receive-pack`, `git-upload-pack` (git-lfs
+asking which commits the remote already has), and two `git-lfs-transfer` — one
+for the lock check, one for the objects (measured with git-lfs 3.4.1, see
+`crates/rg-ssh/tests/integration/ssh_lfs_transfer_stock_client_tests.rs`).
+Nothing goes over HTTPS. Where `ssh` can multiplex, git-lfs runs its transfer
+workers as extra channels on the second connection, without new
+authentications. `git lfs pull` takes one connection.
+
+Where every connection needs a person — a key with a passphrase and no agent,
+an agent that asks for confirmation, a FIDO key that wants a touch — make it
+one authentication for all of them, client side:
 
 ```bash
-# Every git-lfs version: one authentication for all five connections.
 # In ~/.ssh/config:
 #   Host git.example.com
 #     ControlMaster auto
 #     ControlPath ~/.ssh/cm-%C
 #     ControlPersist 60
-
-# git-lfs 3.6.1 (3.4.1 does not know the setting): skip the two probes — three
-# connections instead of five. Inside the repository:
-git config lfs.sshtransfer never
-
-# Every git-lfs version: send LFS over HTTPS with a personal access token, so
-# only git itself uses SSH — two connections.
-git config lfs.url https://git.example.com/<owner>/<repo>.git/info/lfs
 ```
 
 To see where a push stops, run it with
@@ -646,7 +642,8 @@ To see where a push stops, run it with
 `exec git-lfs-…` and its authentication is in the output, with timings. The
 server logs every SSH key it accepts with the number of unregistered keys the
 client offered before it (`rejected_publickeys`), a connection that ends
-without authenticating, and every LFS request over HTTPS, refusals included
+without authenticating, every `git-lfs-transfer` session it starts and ends,
+and every LFS request over HTTPS, refusals included
 (`lfs request refused … status=401`): a `401` on the batch means a password was
 given where a personal access token is needed.
 

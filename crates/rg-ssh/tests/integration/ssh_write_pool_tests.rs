@@ -102,6 +102,7 @@ async fn key_usage_stamps_are_written_through_the_write_pool() {
         git_idle_timeout_secs: 30,
         post_push: None,
         lfs: None,
+        storage_limits: Default::default(),
         shutdown: None,
         shutdown_grace_secs: 5,
     })

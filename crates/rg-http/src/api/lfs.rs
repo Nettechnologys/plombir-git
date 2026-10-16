@@ -9,8 +9,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 use crate::api::repo_access;
 use crate::error::AppError;
@@ -19,7 +17,7 @@ use crate::AppState;
 /// Where LFS objects live and what has to be true about that directory. Shared
 /// with the background compressor in `rg_core::lfs::service`, so a handler
 /// failure and a maintenance-pass failure name the same directory the same way.
-use rg_core::platform::fs::{discard_file_async, LFS_STORAGE_HINT};
+use rg_core::platform::fs::LFS_STORAGE_HINT;
 
 #[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -604,107 +602,45 @@ pub async fn upload_object(
     // with `let _ =`, so an unwritable LFS root surfaced later as a failure to
     // *open* the temp file — pointing the operator at the file instead of at
     // the directory that actually has to be fixed.
-    //
-    // One spool per request: concurrent uploads of the same object must not
-    // write — or delete — each other's file, because the digest checked below
-    // is of this request's stream and the file is what gets published.
-    let temp_path = lfs_root.join(rg_core::staging::lfs_object_spool_name(
-        &oid,
-        uuid::Uuid::new_v4(),
-    ));
+    let temp_path = rg_core::lfs::receive::spool_path(&lfs_root, &oid);
     if let Some(parent) = temp_path.parent() {
         if let Err(error) = tokio::fs::create_dir_all(parent).await {
             return lfs_path_error("LFS object directory", parent, &error).into_response();
         }
     }
 
-    match write_body_to_file(
+    let spooled = match write_body_to_file(
         body,
         &temp_path,
         rg_core::lfs::service::LFS_OBJECT_MAX_BYTES,
     )
     .await
     {
-        Ok(staged) => {
-            // An LFS object id is a SHA-256 of its uncompressed bytes, not just
-            // a well-formed name chosen by the client. Hashing happens in the
-            // streaming write above, before this path is handed to the
-            // compressor or can become visible through its stable blob key.
-            if staged.sha256 != oid {
-                discard_file_async("LFS staging file", &temp_path).await;
-                return AppError::bad_request(format!(
-                    "LFS object content digest does not match oid: expected {oid}, got {}",
-                    staged.sha256
-                ))
-                .into_response();
-            }
-
-            // `batch` registers the size the client promised before it gives
-            // out this upload URL. Do not turn a short/long body into a live
-            // object whose row says something else. Direct authenticated PUTs
-            // have no prior row and keep the historical behavior of recording
-            // the size that actually arrived.
-            let already_stored = match rg_db::ops::lfs_object_ops::find_by_repo_and_oid(
-                &state.db, repo_id, &oid,
-            )
-            .await
-            {
-                Ok(Some(object)) if object.size != staged.written as i64 => {
-                    discard_file_async("LFS staging file", &temp_path).await;
-                    return AppError::bad_request(format!(
-                        "LFS object size does not match batch declaration: expected {} bytes, got {}",
-                        object.size, staged.written
-                    ))
-                    .into_response();
-                }
-                Ok(object) => object.is_some_and(|object| object.uploaded),
-                Err(error) => {
-                    discard_file_async("LFS staging file", &temp_path).await;
-                    return AppError::from(error).into_response();
-                }
-            };
-
-            // The batch checked the budget before it handed out this URL; two
-            // PUTs that both passed a batch meet here, with the bytes already
-            // spooled, so this can only refuse. An object already stored adds
-            // nothing — a re-PUT at the limit is not charged twice.
-            let incoming = if already_stored {
-                0
-            } else {
-                staged.written as u64
-            };
-            if let Err(error) = rg_core::storage_quota::check_room(
-                &state.db,
-                repo_id,
-                incoming,
-                &state.storage_limits,
-            )
-            .await
-            {
-                discard_file_async("LFS staging file", &temp_path).await;
-                return AppError::from(error.into_service_error()).into_response();
-            }
-
-            match rg_core::lfs::service::store_object_from_file(
-                &state.db,
-                repo_id,
-                state.blob_storage.as_ref(),
-                &owner,
-                &repo,
-                &oid,
-                &temp_path,
-                staged.written as i64,
-            )
-            .await
-            {
-                Ok(()) => StatusCode::OK.into_response(),
-                Err(e) => AppError::from(e).into_response(),
-            }
-        }
+        Ok(spooled) => spooled,
         // `write_body_to_file` retires a partial spool before returning
         // this error; keep the typed cause until this HTTP boundary classifies
         // a declared ceiling separately from an ordinary transport failure.
-        Err(e) => lfs_body_error(e).into_response(),
+        Err(e) => return lfs_body_error(e).into_response(),
+    };
+
+    // The same acceptance a `git-lfs-transfer` `put-object` gets over SSH:
+    // digest, declared size, storage budget, publication.
+    match rg_core::lfs::receive::accept_spooled(
+        &state.db,
+        state.blob_storage.as_ref(),
+        &state.storage_limits,
+        rg_core::lfs::receive::UploadTarget {
+            repo_id,
+            owner: &owner,
+            repo: &repo,
+            oid: &oid,
+        },
+        spooled,
+    )
+    .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -1029,21 +965,10 @@ fn respond_with_lfs_bytes(
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// A verified staging upload, measured and hashed while it is written.
-#[derive(Debug)]
-struct StagedLfsUpload {
-    written: usize,
-    sha256: String,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("LFS upload exceeds the configured {max_bytes}-byte limit")]
-struct LfsUploadTooLarge {
-    max_bytes: usize,
-}
-
 fn lfs_body_error(error: anyhow::Error) -> AppError {
-    if error.downcast_ref::<LfsUploadTooLarge>().is_some()
+    if error
+        .downcast_ref::<rg_core::lfs::receive::LfsObjectTooLarge>()
+        .is_some()
         || crate::body_limit::is_length_limit_error(error.as_ref())
     {
         AppError::payload_too_large("LFS upload exceeds the configured request-body limit")
@@ -1052,79 +977,38 @@ fn lfs_body_error(error: anyhow::Error) -> AppError {
     }
 }
 
-/// Stream an Axum `Body` to a file, returning its size and SHA-256.
+/// Stream an Axum `Body` into a new spool at `path`, returning it complete.
 ///
-/// This is the write path of every `git lfs push`: the staging path is derived
-/// from `repo_root` plus the object id, so a bare `?` on the io error hands the
-/// client an errno and nothing else. Every failure names the file.
+/// This is the write path of every `git lfs push` over HTTP; the spool is
+/// [`rg_core::lfs::receive::ObjectSpool`], which names the file in every
+/// failure and is retired here when the body does not arrive whole.
 async fn write_body_to_file(
     body: Body,
     path: &std::path::Path,
     max_bytes: usize,
-) -> anyhow::Result<StagedLfsUpload> {
-    let staged = |error: &std::io::Error| {
-        rg_core::platform::fs::path_error("LFS staging file", path, error, LFS_STORAGE_HINT)
-    };
+) -> anyhow::Result<rg_core::lfs::receive::SpooledObject> {
+    use futures::StreamExt;
 
-    // `create_new`: the name is this request's own, so finding a file there
-    // means something else wrote it, and truncating it is not ours to do.
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .map_err(|error| staged(&error))?;
-
-    let result = async {
-        use futures::StreamExt;
-        let mut written: usize = 0;
-        let mut hasher = Sha256::new();
-        let mut stream = body.into_data_stream();
-        while let Some(chunk) = stream.next().await {
-            // Preserve the typed `axum::Error` as the source. Formatting it
-            // here loses the nested `LengthLimitError` before the handler can
-            // distinguish a declared ceiling from an ordinary I/O failure.
-            let data = chunk
-                .map_err(anyhow::Error::new)
-                .context("body stream error")?;
-            written = written
-                .checked_add(data.len())
-                .filter(|size| *size <= max_bytes)
-                .ok_or_else(|| anyhow::Error::new(LfsUploadTooLarge { max_bytes }))?;
-            file.write_all(&data)
-                .await
-                .map_err(|error| staged(&error))?;
-            hasher.update(&data);
+    let mut spool =
+        rg_core::lfs::receive::ObjectSpool::create(path.to_path_buf(), max_bytes).await?;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        // Preserve the typed `axum::Error` as the source. Formatting it here
+        // loses the nested `LengthLimitError` before the handler can
+        // distinguish a declared ceiling from an ordinary I/O failure.
+        let written = match chunk
+            .map_err(anyhow::Error::new)
+            .context("body stream error")
+        {
+            Ok(data) => spool.write(&data).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = written {
+            spool.discard().await;
+            return Err(error);
         }
-
-        // `tokio::fs::File` buffers: `write_all` returns once the bytes are queued
-        // for the blocking pool, not once they are in the file, and dropping the
-        // handle does not wait for that queue either. The caller hands this path
-        // straight to `store_object_from_file`, which opens it with `std::fs` and
-        // compresses whatever is there — so under load the object that reaches
-        // blob storage is the upload minus however much had not landed yet, while
-        // `written` (counted here, in memory) says the whole thing arrived.
-        //
-        // Nothing downstream would notice. The row records `written` as the
-        // object's size, the upload answers `200`, and LFS never hashes the bytes
-        // against the `oid` they are filed under, so a truncated object is
-        // indistinguishable from a good one until somebody clones. The same
-        // missing `flush` cost the OCI registry a three-day flake, where it was at
-        // least loud (`sol_07eb75f8fb62`).
-        file.flush().await.map_err(|error| staged(&error))?;
-
-        Ok(StagedLfsUpload {
-            written,
-            sha256: hex::encode(hasher.finalize()),
-        })
     }
-    .await;
-
-    drop(file);
-    if result.is_err() {
-        discard_file_async("LFS staging file", path).await;
-    }
-    result
+    spool.finish().await
 }
 
 #[cfg(test)]

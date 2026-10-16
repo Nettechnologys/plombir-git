@@ -72,6 +72,7 @@ async fn fixture() -> Fixture {
         git_idle_timeout_secs: 30,
         post_push: None,
         lfs: None,
+        storage_limits: Default::default(),
         shutdown: None,
         shutdown_grace_secs: 5,
     })

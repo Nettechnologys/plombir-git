@@ -12,9 +12,9 @@
 //! pinned: the answer names the instance's public URL and carries a grant the
 //! HTTP side accepts (`rg-http`'s `lfs_ssh_grant_tests` pins that half); the
 //! grant is minted only past the gate `git-upload-pack` / `git-receive-pack`
-//! would get; and every refusal — including the `git-lfs-transfer` probe the
-//! client sends first — is a clean non-zero exit on a connection that keeps
-//! working.
+//! would get; and every refusal is a clean non-zero exit on a connection that
+//! keeps working. `git-lfs-transfer`, which the client tries first, is served
+//! itself now — `ssh_lfs_transfer_tests` drives it.
 
 use std::sync::Arc;
 
@@ -144,6 +144,7 @@ async fn harness(lfs: bool) -> Harness {
             external_url: EXTERNAL_URL.to_string(),
             signing_secret: SECRET.to_string(),
         }),
+        storage_limits: Default::default(),
         shutdown: None,
         shutdown_grace_secs: 5,
     })
@@ -332,16 +333,16 @@ async fn the_grant_is_minted_only_past_the_git_gate() {
     h.server.abort();
 }
 
-/// git-lfs 3.x probes `git-lfs-transfer` first and moves on to
-/// `git-lfs-authenticate` only when the probe fails cleanly. The probe used to
-/// end in a handler error, which drops the whole connection.
+/// A command this port does not serve — or one it serves, malformed — ends
+/// in a clean refusal. It used to end in a handler error, which drops the
+/// whole connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unsupported_command_is_a_clean_refusal_on_a_connection_that_keeps_working() {
     let h = harness(true).await;
     let session = connect_as(&h.server, &h.owner_key).await;
 
     for command in [
-        format!("git-lfs-transfer /{OWNER}/{REPO}.git download"),
+        format!("git-lfs-transfer /{OWNER}/{REPO}.git verify"),
         format!("git-upload-archive '/{OWNER}/{REPO}.git'"),
         format!("git-lfs-authenticate /{OWNER}/{REPO}.git verify"),
         "git-upload-pack ''".to_string(),
@@ -351,17 +352,6 @@ async fn an_unsupported_command_is_a_clean_refusal_on_a_connection_that_keeps_wo
         assert!(!refused.stderr.is_empty(), "{command} must say why");
         assert_eq!(refused.stdout, "", "{command}");
     }
-    assert!(
-        exec(
-            &session,
-            &format!("git-lfs-transfer /{OWNER}/{REPO}.git download")
-        )
-        .await
-        .stderr
-        .contains("git-lfs-authenticate"),
-        "the transfer refusal names the command that works"
-    );
-
     // Same connection, after four refusals.
     granted(
         &exec(

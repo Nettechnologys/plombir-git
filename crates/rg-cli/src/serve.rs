@@ -2153,6 +2153,7 @@ fn build_transports(
         git_idle_timeout_secs: settings.timeouts.git_idle,
         post_push: Some(std::sync::Arc::new(post_push_context)),
         lfs: ssh_lfs,
+        storage_limits: settings.storage_limits,
         instance_settings: instance_settings.clone(),
         // The second consumer of the shutdown fan-out. It used to be the one
         // the channel never reached, so a `SIGTERM` cut an SSH push mid-objects

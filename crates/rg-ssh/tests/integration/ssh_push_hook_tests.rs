@@ -233,6 +233,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
             storage_limits: Default::default(),
         })),
         lfs: None,
+        storage_limits: Default::default(),
     };
     let server = common::spawn_ssh_server(server_config).await;
     let listen_addr = server.addr().to_string();

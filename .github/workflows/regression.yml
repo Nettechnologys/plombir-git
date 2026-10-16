@@ -221,6 +221,14 @@ jobs:
           -E 'test(/^oci_live_client_tests::/) | test(/^lfs_locks_stock_client_tests::/)
           | test(old_url_clone_with_lfs_checks_out_the_file_content)'
 
+      # The same client over an SSH remote, with no HTTP server at all:
+      # `git-lfs-transfer` carries the objects and the locks, and the test
+      # counts the SSH connections a push opens (card_f11136311b12).
+      - name: Run stock Git LFS over SSH client test
+        run: >-
+          cargo nextest run -p rg-ssh --test integration --run-ignored only
+          -E 'test(/^ssh_lfs_transfer_stock_client_tests::/)'
+
       # nextest does not run doc-tests (upstream limitation), so they need
       # their own step or they silently stop being checked.
       - name: Run doc-tests

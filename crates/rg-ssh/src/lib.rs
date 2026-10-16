@@ -237,6 +237,9 @@ pub struct SshServerConfig {
     /// the HTTP side. `None` turns the command into a refusal that says how to
     /// configure the instance; git itself is unaffected.
     pub lfs: Option<SshLfsConfig>,
+    /// The repository storage budget `git-lfs-transfer` uploads are held to —
+    /// the one the HTTP LFS API enforces, so the two doors refuse alike.
+    pub storage_limits: rg_core::storage_quota::StorageLimits,
 }
 
 /// Git LFS for clones made from the SSH address.
@@ -275,6 +278,11 @@ struct SharedState {
     post_push: Option<Arc<rg_core::push_hooks::PostPushContext>>,
     /// See [`SshServerConfig::lfs`].
     lfs: Option<SshLfsConfig>,
+    /// Where `git-lfs-transfer` reads and writes objects: the instance blob
+    /// store the HTTP LFS API uses, built from the same repository root.
+    blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage>,
+    /// See [`SshServerConfig::storage_limits`].
+    storage_limits: rg_core::storage_quota::StorageLimits,
     /// Every git session this server is currently streaming.
     ///
     /// The session runs detached — `exec_request` returns as soon as it is
@@ -579,7 +587,12 @@ impl SshServer {
             ..Default::default()
         };
 
+        let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> = Arc::new(
+            rg_core::blob_storage::instance_blob_storage(&ssh_config.repo_root),
+        );
         let shared = Arc::new(SharedState {
+            blob_storage,
+            storage_limits: ssh_config.storage_limits,
             repo_root: Arc::new(ssh_config.repo_root),
             db_write: Arc::new(ssh_config.db_write),
             db: Arc::new(ssh_config.db),
@@ -1322,6 +1335,14 @@ impl Handler for SshHandler {
                     .lfs_authenticate(channel_id, &repo_path, operation, session)
                     .await
             }
+            Ok(ExecCommand::LfsTransfer {
+                repo_path,
+                operation,
+            }) => {
+                return self
+                    .lfs_transfer(channel_id, repo_path, operation, session)
+                    .await
+            }
             Err(error) => {
                 reject_git_exec(
                     session,
@@ -1914,6 +1935,158 @@ impl SshHandler {
         }
     }
 
+    /// Serve `git-lfs-transfer <path> <operation>`: Git LFS over this session
+    /// itself (card_f11136311b12).
+    ///
+    /// Admitted exactly as `git-upload-pack` (download) or `git-receive-pack`
+    /// (upload) would be on the same connection — same gate, same refusals,
+    /// maintenance mode closing the upload half — and drained on shutdown and
+    /// guarded by the idle watchdog like a git session. No wall-clock bound: an object of
+    /// gigabytes is a legitimate long transfer, and the idle watchdog is what
+    /// catches a stalled one.
+    async fn lfs_transfer(
+        &mut self,
+        channel_id: ChannelId,
+        repo_path: String,
+        operation: rg_core::lfs::service::LfsActionKind,
+        session: &mut Session,
+    ) -> Result<(), HandlerError> {
+        use rg_core::lfs::service::LfsActionKind;
+        use rg_core::lfs::transfer::TransferActor;
+
+        const COMMAND: &str = "git-lfs-transfer";
+        let identity = self.authenticated_identity.clone();
+        let refuse = |session: &mut Session, error: &GitServiceError, path: &str| {
+            reject_git_exec(session, channel_id, error, identity.as_ref(), COMMAND, path)
+        };
+
+        if rg_core::platform::validate_repo_path(&repo_path).is_err() {
+            return refuse(session, &GitServiceError::RepositoryNotFound, &repo_path);
+        }
+        let db = &*self.shared.db;
+        let repo_path = follow_renamed_repo_path(db, repo_path).await;
+        let service = match operation {
+            LfsActionKind::Download => "git-upload-pack",
+            LfsActionKind::Upload => "git-receive-pack",
+        };
+        let repo = match authorize_git_service(db, service, &repo_path, identity.as_ref()).await {
+            Ok(repo) => repo,
+            Err(error) => return refuse(session, &error, &repo_path),
+        };
+        if operation == LfsActionKind::Upload
+            && self.shared.instance_settings.get(db).await.maintenance_mode
+        {
+            return refuse(
+                session,
+                &GitServiceError::NotOffered(
+                    "Instance is in maintenance mode. LFS uploads are disabled; read-only access only.",
+                ),
+                &repo_path,
+            );
+        }
+        let actor = match identity.as_ref() {
+            Some(AuthenticatedIdentity::User { user_id, .. }) => {
+                TransferActor::User { user_id: *user_id }
+            }
+            Some(AuthenticatedIdentity::DeployKey { .. }) => TransferActor::DeployKey,
+            None => {
+                return refuse(
+                    session,
+                    &GitServiceError::AuthenticationRequired,
+                    &repo_path,
+                )
+            }
+        };
+        let Ok((owner, repo_name)) = parse_repo_owner_name(&repo_path) else {
+            return refuse(session, &GitServiceError::RepositoryNotFound, &repo_path);
+        };
+        // `git lfs unlock --force` takes someone else's lock away, which the
+        // HTTP locking API reserves to an administrator; asked here, with the
+        // rest of the session's access.
+        let administers = match actor {
+            TransferActor::User { user_id } if operation == LfsActionKind::Upload => {
+                match rg_core::repo::service::can_admin_repo(db, &repo, Some(user_id)).await {
+                    Ok(administers) => administers,
+                    Err(error) => {
+                        return refuse(
+                            session,
+                            &GitServiceError::ServerUnavailable(error),
+                            &repo_path,
+                        )
+                    }
+                }
+            }
+            _ => false,
+        };
+
+        // No place in the git-session limiter: that one bounds `git` child
+        // processes, and this runs none — it is the HTTP LFS API's work on
+        // another socket, which that limiter does not count either. Charging
+        // it would break the stock client: with `ControlMaster` available,
+        // git-lfs opens one channel per transfer worker (eight by default) on
+        // top of the push's own `git-receive-pack`, more than one account's
+        // share on a small host, and a worker whose channel is refused fails
+        // the whole push ("could not get connection for transfer"). What
+        // bounds a client here is the per-connection channel ceiling and the
+        // per-source connection ceiling.
+        let live_exec = LiveExec::start(&self.live_execs);
+        let ch = self
+            .channels
+            .remove(&channel_id)
+            .context("exec channel vanished between its check and its use")?;
+        session.channel_success(channel_id)?;
+        tracing::info!(identity = ?identity, %repo_path, ?operation, "SSH git-lfs-transfer started");
+
+        let handle = session.handle();
+        let shared = self.shared.clone();
+        self.shared.git_sessions.spawn(async move {
+            let _live_exec = live_exec;
+            let mut stream: IdleTimeout<ChannelStream<Msg>> =
+                IdleTimeout::from_secs(ch.into_stream(), shared.git_idle_timeout_secs);
+            let context = rg_core::lfs::transfer::TransferContext {
+                db: &shared.db,
+                storage: shared.blob_storage.as_ref(),
+                repo_root: &shared.repo_root,
+                limits: &shared.storage_limits,
+                repo: &repo,
+                owner: &owner,
+                repo_name: &repo_name,
+                operation,
+                actor,
+                administers,
+            };
+            let result = rg_core::lfs::transfer::serve(&mut stream, &context).await;
+            match &result {
+                Ok(()) => tracing::info!(%repo_path, ?operation, "SSH git-lfs-transfer complete"),
+                Err(error) if is_idle_timeout(error) => tracing::warn!(
+                    %repo_path,
+                    idle_timeout_secs = shared.git_idle_timeout_secs,
+                    "SSH git-lfs-transfer idle — closing channel"
+                ),
+                Err(error) if rg_git::protocol::client_refusal(error).is_some() => tracing::warn!(
+                    refusal = %format!("{error:#}"),
+                    %repo_path,
+                    "SSH git-lfs-transfer request refused"
+                ),
+                Err(error) => tracing::error!(
+                    error = %format!("{error:#}"),
+                    %repo_path,
+                    "SSH git-lfs-transfer failed"
+                ),
+            }
+            // Exit status before the close, as for every git session here: a
+            // client that sees the channel close first reports exit 255.
+            let exit_code: u32 = if result.is_ok() { 0 } else { 1 };
+            if let Err(error) = handle.exit_status_request(channel_id, exit_code).await {
+                tracing::warn!(error = ?error, "failed to send exit_status to client");
+            }
+            if let Err(error) = stream.shutdown().await {
+                tracing::warn!(error = ?error, "failed to shutdown SSH stream");
+            }
+        });
+        Ok(())
+    }
+
     async fn lfs_grant(
         &self,
         repo_path: &str,
@@ -1990,7 +2163,8 @@ impl SshHandler {
 /// commands and nothing else. A client that got this far has authenticated, so
 /// `ssh -T` also learns that its key works.
 const NO_SHELL: &str = "authenticated, but this port serves only Git (git-upload-pack, \
-                        git-receive-pack, git-lfs-authenticate); there is no shell";
+                        git-receive-pack, git-lfs-transfer, git-lfs-authenticate); there is no \
+                        shell";
 
 /// What an SSH `exec` asked this server to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -2003,16 +2177,20 @@ enum ExecCommand {
         repo_path: String,
         operation: rg_core::lfs::service::LfsActionKind,
     },
+    /// `git-lfs-transfer <path> <operation>`: LFS over this session itself.
+    LfsTransfer {
+        repo_path: String,
+        operation: rg_core::lfs::service::LfsActionKind,
+    },
 }
 
 /// Parse an SSH exec command string like:
 ///   `git-upload-pack '/owner/repo'`
 ///   `git-receive-pack '/owner/repo.git'`
 ///   `git-lfs-authenticate /owner/repo.git download`
+///   `git-lfs-transfer /owner/repo.git upload`
 ///
-/// Anything else is [`GitServiceError::NotOffered`] — including
-/// `git-lfs-transfer`, the pure-SSH LFS protocol, which git-lfs tries first and
-/// abandons for `git-lfs-authenticate` when it fails cleanly.
+/// Anything else is [`GitServiceError::NotOffered`].
 fn parse_exec_command(command: &str) -> std::result::Result<ExecCommand, GitServiceError> {
     let (program, arguments) = command
         .trim()
@@ -2050,12 +2228,26 @@ fn parse_exec_command(command: &str) -> std::result::Result<ExecCommand, GitServ
                 operation,
             })
         }
-        "git-lfs-transfer" => Err(GitServiceError::NotOffered(
-            "git-lfs-transfer is not supported; Git LFS on this server is served over HTTP \
-             through git-lfs-authenticate",
-        )),
+        "git-lfs-transfer" => {
+            const USAGE: &str = "usage: git-lfs-transfer <owner>/<repo> <download|upload>";
+            let (path, operation) = arguments
+                .trim()
+                .rsplit_once(' ')
+                .ok_or(GitServiceError::NotOffered(USAGE))?;
+            let operation = rg_core::lfs::service::LfsActionKind::from_operation(operation)
+                .ok_or(GitServiceError::NotOffered(USAGE))?;
+            let repo_path = unquote_repo_path(path.trim());
+            if repo_path.is_empty() {
+                return Err(GitServiceError::NotOffered(USAGE));
+            }
+            Ok(ExecCommand::LfsTransfer {
+                repo_path,
+                operation,
+            })
+        }
         _ => Err(GitServiceError::NotOffered(
-            "this port serves only git-upload-pack, git-receive-pack and git-lfs-authenticate",
+            "this port serves only git-upload-pack, git-receive-pack, git-lfs-transfer and \
+             git-lfs-authenticate",
         )),
     }
 }
@@ -2667,12 +2859,41 @@ mod tests {
         }
     }
 
+    /// `git-lfs-transfer` takes the same `<path> <operation>` shape as
+    /// `git-lfs-authenticate`, the path bare or quoted.
+    #[test]
+    fn git_lfs_transfer_names_a_repository_and_an_operation() {
+        use rg_core::lfs::service::LfsActionKind;
+        for (command, repo_path, operation) in [
+            (
+                "git-lfs-transfer /alice/project.git upload",
+                "alice/project.git",
+                LfsActionKind::Upload,
+            ),
+            (
+                "git-lfs-transfer 'alice/project.git' download",
+                "alice/project.git",
+                LfsActionKind::Download,
+            ),
+        ] {
+            assert_eq!(
+                parse_exec_command(command).unwrap(),
+                ExecCommand::LfsTransfer {
+                    repo_path: repo_path.to_string(),
+                    operation,
+                },
+                "{command}"
+            );
+        }
+    }
+
     /// Everything this port does not serve is a clean refusal with a message,
     /// never a handler error — russh turns that into a dropped connection.
     #[test]
     fn unsupported_and_malformed_commands_are_refusals_not_errors() {
         for command in [
-            "git-lfs-transfer /alice/project.git download",
+            "git-lfs-transfer /alice/project.git verify",
+            "git-lfs-transfer /alice/project.git",
             "git-upload-archive '/alice/project.git'",
             "git-lfs-authenticate /alice/project.git verify",
             "git-lfs-authenticate /alice/project.git",
@@ -3019,6 +3240,7 @@ mod tests {
                 shutdown_grace_secs: 1,
                 post_push: None,
                 lfs: None,
+                storage_limits: Default::default(),
             }),
         )
         .await
@@ -3061,6 +3283,7 @@ mod tests {
             shutdown_grace_secs: 1,
             post_push: None,
             lfs: None,
+            storage_limits: Default::default(),
         })
         .expect("build SSH server");
         server.limits = limits;

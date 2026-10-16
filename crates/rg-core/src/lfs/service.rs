@@ -517,7 +517,7 @@ pub struct LfsAction {
     pub expires_in: Option<i64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LfsError {
     pub code: i32,
     pub message: String,
@@ -622,48 +622,8 @@ pub async fn batch(
             let oid = &obj_req.oid;
             let size = obj_req.size;
             async move {
-                if let Some(error) = lfs_request_error(operation, oid, size) {
+                let Some(kind) = LfsActionKind::from_operation(operation) else {
                     return Ok(LfsObjectResponse {
-                        oid: oid.to_string(),
-                        size,
-                        actions: None,
-                        error: Some(error),
-                    });
-                }
-                match operation {
-                    "upload" => {
-                        handle_upload(
-                            db,
-                            repo_id,
-                            storage,
-                            lfs_root,
-                            base_url,
-                            owner,
-                            repo,
-                            oid,
-                            size,
-                            signing_secret,
-                            actor,
-                            limits,
-                        )
-                        .await
-                    }
-                    "download" => {
-                        handle_download(
-                            db,
-                            repo_id,
-                            lfs_root,
-                            base_url,
-                            owner,
-                            repo,
-                            oid,
-                            size,
-                            signing_secret,
-                            actor,
-                        )
-                        .await
-                    }
-                    _ => Ok(LfsObjectResponse {
                         oid: oid.to_string(),
                         size,
                         actions: None,
@@ -671,8 +631,23 @@ pub async fn batch(
                             code: 422,
                             message: format!("unsupported operation: {}", operation),
                         }),
-                    }),
-                }
+                    });
+                };
+                let decision = decide_object(
+                    db, repo_id, storage, lfs_root, owner, repo, kind, oid, size, limits,
+                )
+                .await?;
+                http_object_response(
+                    decision,
+                    base_url,
+                    owner,
+                    repo,
+                    repo_id,
+                    oid,
+                    size,
+                    signing_secret,
+                    actor,
+                )
             }
         })
         .collect();
@@ -685,21 +660,65 @@ pub async fn batch(
     Ok(LfsBatchResponse { transfer, objects })
 }
 
+/// What the batch API decided for one object, before a transport spells it:
+/// an HTTP batch turns it into signed action URLs, `git-lfs-transfer` into one
+/// `<oid> <size> <action>` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectDecision {
+    /// Upload: the server has the object already; nothing to send.
+    Present,
+    /// Upload: send it. A pending row now records the size the client declared.
+    Upload,
+    /// Download: the object is here.
+    Download,
+    /// The object is refused, with the batch API's per-object error.
+    Refused(LfsError),
+}
+
+/// Decide what `kind` means for one object of a batch.
+///
+/// The checks every transport owes the same answer to: a malformed oid or size,
+/// an upload above [`LFS_OBJECT_MAX_BYTES`] or over the repository's storage
+/// budget, an object already stored, one never uploaded.
 #[allow(clippy::too_many_arguments)]
-async fn handle_upload(
+pub async fn decide_object(
     db: &DatabaseConnection,
     repo_id: i64,
     storage: &dyn BlobStorage,
     lfs_root: &std::path::Path,
-    base_url: &str,
+    owner: &str,
+    repo: &str,
+    kind: LfsActionKind,
+    oid: &str,
+    size: i64,
+    limits: &crate::storage_quota::StorageLimits,
+) -> Result<ObjectDecision> {
+    if let Some(error) = lfs_request_error(kind.as_str(), oid, size) {
+        return Ok(ObjectDecision::Refused(error));
+    }
+    match kind {
+        LfsActionKind::Upload => {
+            decide_upload(
+                db, repo_id, storage, lfs_root, owner, repo, oid, size, limits,
+            )
+            .await
+        }
+        LfsActionKind::Download => decide_download(db, repo_id, oid).await,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decide_upload(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    storage: &dyn BlobStorage,
+    lfs_root: &std::path::Path,
     owner: &str,
     repo: &str,
     oid: &str,
     size: i64,
-    signing_secret: &[u8],
-    actor: Option<LfsActor>,
     limits: &crate::storage_quota::StorageLimits,
-) -> Result<LfsObjectResponse> {
+) -> Result<ObjectDecision> {
     // Check if object already exists
     let existing = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await?;
 
@@ -715,13 +734,7 @@ async fn handle_upload(
                 || obj_path.exists()
                 || obj_path.with_extension("zst").exists()
             {
-                // Already uploaded — no action needed
-                return Ok(LfsObjectResponse {
-                    oid: oid.to_string(),
-                    size,
-                    actions: None,
-                    error: None,
-                });
+                return Ok(ObjectDecision::Present);
             }
         }
     }
@@ -736,15 +749,10 @@ async fn handle_upload(
     {
         Ok(()) => {}
         Err(crate::storage_quota::QuotaError::Exceeded(exceeded)) => {
-            return Ok(LfsObjectResponse {
-                oid: oid.to_string(),
-                size,
-                actions: None,
-                error: Some(LfsError {
-                    code: 507,
-                    message: exceeded.message,
-                }),
-            });
+            return Ok(ObjectDecision::Refused(LfsError {
+                code: 507,
+                message: exceeded.message,
+            }));
         }
         Err(crate::storage_quota::QuotaError::Db(error)) => return Err(error),
     }
@@ -755,111 +763,93 @@ async fn handle_upload(
     if existing.is_none() {
         find_or_register_object(db, repo_id, oid, size).await?;
     }
-
-    // Return upload URL
-    let expires_at = Utc::now().timestamp() + LfsActionKind::Upload.ttl_seconds();
-    let signature = sign_action_url(
-        signing_secret,
-        LfsActionKind::Upload,
-        repo_id,
-        oid,
-        expires_at,
-        actor,
-    )?;
-    let upload_href = format!(
-        "{}/api/v1/repos/{}/{}/lfs/objects/{}?expires={}&signature={}{}",
-        base_url,
-        owner,
-        repo,
-        oid,
-        expires_at,
-        signature,
-        action_url_actor_param(actor)
-    );
-
-    Ok(LfsObjectResponse {
-        oid: oid.to_string(),
-        size,
-        actions: Some(LfsActions {
-            download: None,
-            upload: Some(LfsAction {
-                href: upload_href,
-                header: None,
-                expires_in: Some(UPLOAD_URL_TTL_SECONDS),
-            }),
-        }),
-        error: None,
-    })
+    Ok(ObjectDecision::Upload)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_download(
+async fn decide_download(
     db: &DatabaseConnection,
     repo_id: i64,
-    _lfs_root: &std::path::Path,
+    oid: &str,
+) -> Result<ObjectDecision> {
+    let Some(existing) = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await? else {
+        return Ok(ObjectDecision::Refused(LfsError {
+            code: 404,
+            message: "object not found".to_string(),
+        }));
+    };
+    if !existing.uploaded {
+        return Ok(ObjectDecision::Refused(LfsError {
+            code: 404,
+            message: "object not uploaded yet".to_string(),
+        }));
+    }
+    Ok(ObjectDecision::Download)
+}
+
+/// An [`ObjectDecision`] as the HTTP batch API answers it: a signed action URL
+/// for the transfer, nothing for an object already stored, the error otherwise.
+#[allow(clippy::too_many_arguments)]
+fn http_object_response(
+    decision: ObjectDecision,
     base_url: &str,
     owner: &str,
     repo: &str,
+    repo_id: i64,
     oid: &str,
     size: i64,
     signing_secret: &[u8],
     actor: Option<LfsActor>,
 ) -> Result<LfsObjectResponse> {
-    let Some(existing) = lfs_object_ops::find_by_repo_and_oid(db, repo_id, oid).await? else {
-        return Ok(LfsObjectResponse {
-            oid: oid.to_string(),
-            size,
-            actions: None,
-            error: Some(LfsError {
-                code: 404,
-                message: "object not found".to_string(),
-            }),
-        });
+    let (kind, ttl) = match decision {
+        ObjectDecision::Present => {
+            return Ok(LfsObjectResponse {
+                oid: oid.to_string(),
+                size,
+                actions: None,
+                error: None,
+            })
+        }
+        ObjectDecision::Refused(error) => {
+            return Ok(LfsObjectResponse {
+                oid: oid.to_string(),
+                size,
+                actions: None,
+                error: Some(error),
+            })
+        }
+        ObjectDecision::Upload => (LfsActionKind::Upload, UPLOAD_URL_TTL_SECONDS),
+        ObjectDecision::Download => (LfsActionKind::Download, DOWNLOAD_URL_TTL_SECONDS),
     };
-
-    if !existing.uploaded {
-        return Ok(LfsObjectResponse {
-            oid: oid.to_string(),
-            size,
-            actions: None,
-            error: Some(LfsError {
-                code: 404,
-                message: "object not uploaded yet".to_string(),
-            }),
-        });
-    }
-
-    let expires_at = Utc::now().timestamp() + LfsActionKind::Download.ttl_seconds();
-    let signature = sign_action_url(
-        signing_secret,
-        LfsActionKind::Download,
-        repo_id,
-        oid,
-        expires_at,
-        actor,
-    )?;
-    let download_href = format!(
-        "{}/api/v1/repos/{}/{}/lfs/objects/{}?expires={}&signature={}{}",
-        base_url,
-        owner,
-        repo,
-        oid,
-        expires_at,
-        signature,
-        action_url_actor_param(actor)
-    );
-
+    let expires_at = Utc::now().timestamp() + kind.ttl_seconds();
+    let signature = sign_action_url(signing_secret, kind, repo_id, oid, expires_at, actor)?;
+    let action = LfsAction {
+        href: format!(
+            "{}/api/v1/repos/{}/{}/lfs/objects/{}?expires={}&signature={}{}",
+            base_url,
+            owner,
+            repo,
+            oid,
+            expires_at,
+            signature,
+            action_url_actor_param(actor)
+        ),
+        header: None,
+        expires_in: Some(ttl),
+    };
+    let actions = match kind {
+        LfsActionKind::Upload => LfsActions {
+            download: None,
+            upload: Some(action),
+        },
+        LfsActionKind::Download => LfsActions {
+            download: Some(action),
+            upload: None,
+        },
+    };
     Ok(LfsObjectResponse {
         oid: oid.to_string(),
         size,
-        actions: Some(LfsActions {
-            download: Some(LfsAction {
-                href: download_href,
-                header: None,
-                expires_in: Some(DOWNLOAD_URL_TTL_SECONDS),
-            }),
-            upload: None,
-        }),
+        actions: Some(actions),
         error: None,
     })
 }

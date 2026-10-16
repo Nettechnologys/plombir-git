@@ -83,6 +83,7 @@ async fn registered_key_can_push_and_clone_over_live_ssh() {
         git_idle_timeout_secs: 30,
         post_push: None,
         lfs: None,
+        storage_limits: Default::default(),
         shutdown: None,
         shutdown_grace_secs: 5,
     };
@@ -236,6 +237,7 @@ async fn an_unregistered_key_is_refused_while_the_registered_one_still_works() {
         git_idle_timeout_secs: 30,
         post_push: None,
         lfs: None,
+        storage_limits: Default::default(),
         shutdown: None,
         shutdown_grace_secs: 5,
     };
@@ -401,6 +403,7 @@ async fn maintenance_mode_rejects_push_but_allows_clone_and_fetch_over_ssh() {
         git_idle_timeout_secs: 30,
         post_push: None,
         lfs: None,
+        storage_limits: Default::default(),
         shutdown: None,
         shutdown_grace_secs: 5,
     };
@@ -557,6 +560,7 @@ async fn a_shallow_clone_pushes_and_deletes_a_branch_over_ssh() {
         git_idle_timeout_secs: 30,
         post_push: None,
         lfs: None,
+        storage_limits: Default::default(),
         shutdown: None,
         shutdown_grace_secs: 5,
     };
@@ -723,6 +727,7 @@ async fn a_protocol_v0_client_clones_shallow_and_deepens_over_ssh() {
         git_idle_timeout_secs: 30,
         post_push: None,
         lfs: None,
+        storage_limits: Default::default(),
         shutdown: None,
         shutdown_grace_secs: 5,
     })
