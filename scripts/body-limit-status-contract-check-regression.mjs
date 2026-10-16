@@ -222,8 +222,8 @@ expect(
   ({ lfs }) =>
     edit(
       lfs,
-      '        Err(e) => lfs_body_error(e).into_response(),',
-      '        Err(e) => AppError::bad_request(format!("{e}")).into_response(),',
+      '        Err(e) => return lfs_body_error(e).into_response(),',
+      '        Err(e) => return AppError::bad_request(format!("{e}")).into_response(),',
     ),
   {
     red: true,

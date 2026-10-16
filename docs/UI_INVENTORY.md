@@ -758,7 +758,7 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| )} removeRequiredStatusCheck(index)} disabled= aria-label= ) | :254 | `PATCH /api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoAdmin` | web+browser |
+| )} removeRequiredStatusCheck(index)} disabled= aria-label= ) | :254 | `PATCH /api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoAdmin` | rust+web+browser |
 | )} removeRequiredStatusCheck(index)} disabled= aria-label= ) | :254 | `POST /api/v1/repos/{owner}/{name}/branches/protection` | `RepoAdmin` | rust+web+browser |
 | )} removeRequiredStatusCheck(index)} disabled= aria-label= ) | :254 | `GET /api/v1/repos/{owner}/{name}/branches/protection` | `RepoRead` | rust+web+browser |
 | i18n:common.delete | :403 | `DELETE /api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoAdmin` | web+browser |

@@ -2892,6 +2892,7 @@
       "access": "RepoAdmin",
       "handler": "api::branch_protection::update_protection",
       "testedIn": [
+        "rust",
         "web",
         "browser"
       ],
@@ -18704,6 +18705,7 @@
               "handler": "api::branch_protection::update_protection",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web",
                 "browser"
               ],

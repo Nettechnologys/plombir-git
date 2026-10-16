@@ -69,7 +69,7 @@ runFixture(
   'the clean tree accounts for every ignored test',
   null,
   0,
-  'ignored tests: 67 #[ignore] test(s) — 56 run by regression.yml, 11 not run by CI with a reason',
+  'ignored tests: 69 #[ignore] test(s) — 58 run by regression.yml, 11 not run by CI with a reason',
 );
 
 // card_0c68a0dc41e8 acceptance: the stock-client step is the only thing that
@@ -161,7 +161,7 @@ runFixture(
     'cargo test -p rg-db-migration -j 6 --lib -- --ignored --nocapture --exact migrations::m20261007_000003_issue_comments_reference_their_issue::tests::the_reference_installs_over_orphans_on_a_server_database',
   ),
   0,
-  'ignored tests: 67 #[ignore] test(s) — 56 run by regression.yml',
+  'ignored tests: 69 #[ignore] test(s) — 58 run by regression.yml',
 );
 
 runFixture(
