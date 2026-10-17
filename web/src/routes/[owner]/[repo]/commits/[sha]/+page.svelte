@@ -6,6 +6,7 @@
   import { isUnavailable, optionalSection } from '$lib/optionalSection';
   import { createT, formatDate as formatCalendarDate } from '$lib/i18n';
   import { isHttpUrl } from '$lib/utils/url';
+  import { parseServerTime } from '$lib/serverTime';
 
   const t = createT();
 
@@ -111,7 +112,7 @@
   }
 
   function formatDate(dateStr: string): string {
-    const date = new Date(dateStr);
+    const date = parseServerTime(dateStr);
     const now = new Date();
     const diffMs = now.getTime() - date.getTime();
     const diffMins = Math.floor(diffMs / 60000);

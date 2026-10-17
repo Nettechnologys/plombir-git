@@ -18,6 +18,7 @@
   import { getUser } from '$lib/stores/auth.svelte';
   import ConfirmModal from '$lib/components/ConfirmModal.svelte';
   import { createConfirmer } from '$lib/confirm.svelte';
+  import { parseServerTime } from '$lib/serverTime';
 
   const t = createT();
   const confirmer = createConfirmer();
@@ -732,8 +733,8 @@
 
   function duration(start: string, end?: string) {
     if (!start) return '-';
-    const s = new Date(start).getTime();
-    const e = end ? new Date(end).getTime() : Date.now();
+    const s = parseServerTime(start).getTime();
+    const e = end ? parseServerTime(end).getTime() : Date.now();
     const sec = Math.floor((e - s) / 1000);
     if (sec < 60) return sec + 's';
     if (sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's';

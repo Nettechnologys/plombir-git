@@ -15,6 +15,7 @@
   } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
   import { linkedId } from '$lib/htmlUrlTargets';
+  import { parseServerTime } from '$lib/serverTime';
 
   const t = createT();
 
@@ -462,7 +463,7 @@
   }
 
   function relativeTime(dateStr: string): string {
-    const date = new Date(dateStr);
+    const date = parseServerTime(dateStr);
     const now = new Date();
     const diffMs = now.getTime() - date.getTime();
     const diffSecs = Math.floor(diffMs / 1000);

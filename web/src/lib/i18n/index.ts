@@ -2,6 +2,7 @@ import { writable, derived } from 'svelte/store';
 import en from './translations/en.json';
 import zhCN from './translations/zh-CN.json';
 import { activeLocale, setActiveLocale, type Locale } from './locale.svelte';
+import { parseServerTime } from '../serverTime';
 
 export type { Locale };
 export { activeLocale };
@@ -138,7 +139,7 @@ export function createT() {
 // Date formatting with locale
 export function formatDate(dateStr: string, options?: Intl.DateTimeFormatOptions): string {
   const $locale = activeLocale();
-  const date = new Date(dateStr);
+  const date = parseServerTime(dateStr);
   const defaultOptions: Intl.DateTimeFormatOptions = {
     year: 'numeric',
     month: 'short',
@@ -149,7 +150,7 @@ export function formatDate(dateStr: string, options?: Intl.DateTimeFormatOptions
 
 export function formatDateTime(dateStr: string): string {
   const $locale = activeLocale();
-  const date = new Date(dateStr);
+  const date = parseServerTime(dateStr);
   return date.toLocaleString($locale === 'zh-CN' ? 'zh-CN' : 'en-US', {
     year: 'numeric',
     month: 'short',
