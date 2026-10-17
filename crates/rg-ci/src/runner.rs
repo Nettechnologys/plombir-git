@@ -920,7 +920,11 @@ impl PipelineRunner {
             status,
             Some(exit_code),
             Some(&log),
-            None,
+            // The external runner's `finish` reports its own end time; the
+            // embedded runner is its own reporter and must stamp one too, or
+            // the job keeps `finished_at = NULL` and every view that measures
+            // it counts up from `started_at` to now, forever.
+            Some(chrono::Utc::now().naive_utc()),
         )
         .await
         .with_context(|| format!("failed to record the result of CI job {}", job.id))?;
@@ -5221,5 +5225,79 @@ esac
             "the pipeline succeeded but reported {:?}",
             &pipelines[pipelines_before..]
         );
+    }
+
+    /// The embedded runner settled its jobs with `finished_at = None`, so a job
+    /// that ran for a second kept no end time: the pipeline page measured it
+    /// from `started_at` to the viewer's clock and showed hours. Both outcomes,
+    /// because success and failure are separate arms of the settle.
+    #[tokio::test]
+    async fn an_embedded_job_records_when_it_finished() {
+        let temp = tempfile::tempdir().unwrap();
+        let (db, repo, repo_path, commit_sha, user_id) =
+            repo_with_one_commit(temp.path(), "finished-at").await;
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            &commit_sha,
+            "refs/heads/main",
+            "manual",
+            Some(user_id),
+        )
+        .await
+        .unwrap();
+        let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+            .await
+            .unwrap();
+        let mut jobs = Vec::new();
+        for (name, script, allow_failure) in [("passes", "true", false), ("fails", "false", true)] {
+            let job = rg_db::ops::pipeline_ops::create_job(
+                &db,
+                stage.id,
+                name,
+                script,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                allow_failure,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            jobs.push(job.id);
+        }
+
+        let before = chrono::Utc::now().naive_utc();
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            pipeline.id,
+        );
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+        let after = chrono::Utc::now().naive_utc();
+
+        for (job_id, expected) in jobs.into_iter().zip(["success", "failed"]) {
+            let job = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.status, expected, "{:?}", job.log);
+            let finished = job
+                .finished_at
+                .unwrap_or_else(|| panic!("{expected} job {} kept no finished_at", job.name));
+            let started = job.started_at.expect("a job that ran has a start time");
+            assert!(
+                started <= finished && before <= finished && finished <= after,
+                "{expected} job: started {started}, finished {finished}, run window {before}..{after}"
+            );
+        }
     }
 }
