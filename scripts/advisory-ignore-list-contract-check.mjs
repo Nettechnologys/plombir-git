@@ -32,11 +32,13 @@ const problems = [];
 
 // tomllib is in the Python standard library from 3.11; every CI image and the
 // workstation have it. No TOML-shaped regex: a list split over lines or a
-// trailing comment would read as a different set.
+// trailing comment would read as a different set. `default=str` because TOML
+// has dates JSON does not: osv-scanner's `ignoreUntil` is one, and without it
+// the check dies on the very field that makes a temporary waiver expire.
 const TOML_PROGRAM = `
 import json, sys, tomllib
 with open(sys.argv[1], "rb") as handle:
-    json.dump(tomllib.load(handle), sys.stdout)
+    json.dump(tomllib.load(handle), sys.stdout, default=str)
 `;
 
 function readToml(relative) {
