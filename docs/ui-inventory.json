@@ -5607,7 +5607,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.empty.copied",
-          "line": 284,
+          "line": 270,
           "via": null,
           "href": null,
           "handler": "copyUrl(httpCloneUrl)",
@@ -5617,7 +5617,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.empty.copied",
-          "line": 293,
+          "line": 279,
           "via": null,
           "href": null,
           "handler": "copyUrl(sshCloneUrl)",
@@ -5627,7 +5627,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.browser.default_branch",
-          "line": 339,
+          "line": 325,
           "via": null,
           "href": null,
           "handler": "() => selectBranch(b.name, close)",
@@ -5637,7 +5637,7 @@
         {
           "tag": "button",
           "label": "i18n:search.code",
-          "line": 361,
+          "line": 347,
           "via": null,
           "href": null,
           "handler": "searchCode",
@@ -5647,7 +5647,7 @@
         {
           "tag": "a",
           "label": "i18n:repo.branches.title",
-          "line": 362,
+          "line": 348,
           "via": null,
           "href": "`/${owner}/${repo}/branches`",
           "handler": null,
@@ -5657,7 +5657,7 @@
         {
           "tag": "a",
           "label": "i18n:repo.tags.title",
-          "line": 365,
+          "line": 351,
           "via": null,
           "href": "`/${owner}/${repo}/tags`",
           "handler": null,
@@ -5667,7 +5667,7 @@
         {
           "tag": "a",
           "label": "➕",
-          "line": 369,
+          "line": 355,
           "via": null,
           "href": "`/${owner}/${repo}/new`",
           "handler": null,
@@ -5677,7 +5677,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 376,
+          "line": 362,
           "via": null,
           "href": "buildTreeHref(ref, '')",
           "handler": null,
@@ -5687,7 +5687,7 @@
         {
           "tag": "a",
           "label": "📁 ..",
-          "line": 392,
+          "line": 378,
           "via": null,
           "href": "buildTreeHref(ref, parentPath(path))",
           "handler": null,
@@ -5697,7 +5697,7 @@
         {
           "tag": "a",
           "label": "📁",
-          "line": 399,
+          "line": 385,
           "via": null,
           "href": "buildTreeHref(ref, path ? `${path}/${entry.name}` : entry.name)",
           "handler": null,
@@ -5707,7 +5707,7 @@
         {
           "tag": "a",
           "label": "📄",
-          "line": 404,
+          "line": 390,
           "via": null,
           "href": "buildBlobHref(path ? path + '/' + entry.name : entry.name)",
           "handler": null,
@@ -5717,7 +5717,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 425,
+          "line": 411,
           "via": null,
           "href": "buildCommitHref(commit.sha)",
           "handler": null,
@@ -5727,7 +5727,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 441,
+          "line": 427,
           "via": null,
           "href": null,
           "handler": "() => loadReadme(owner, repo, queryRef, queryPath, entries)",

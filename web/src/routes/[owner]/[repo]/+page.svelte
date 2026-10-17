@@ -10,6 +10,7 @@
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
   import { canWriteRepo } from '$lib/repoPermission';
+  import { renderMarkdown } from '$lib/utils/markdown';
 
   const t = createT();
   const RECENT_COMMITS = 5;
@@ -25,6 +26,12 @@
   let commits = $state<any[]>([]);
   let repoInfo = $state<any>(null);
   let readmeContent = $state<string | null>(null);
+  let readmeName = $state<string | null>(null);
+  // The README is Markdown when its name says so, like any other blob; a bare
+  // `README` is plain text. Rendered through the shared sanitizer, the same
+  // path the file view and issues use.
+  let readmeIsMarkdown = $derived(/\.(md|markdown)$/i.test(readmeName ?? ''));
+  let renderedReadme = $derived(readmeContent && readmeIsMarkdown ? renderMarkdown(readmeContent) : '');
   let readmeLoading = $state(false);
   let readmeError = $state('');
   let codeQuery = $state('');
@@ -120,6 +127,7 @@
     commits = [];
     repoInfo = null;
     readmeContent = null;
+    readmeName = null;
     readmeLoading = false;
     readmeError = '';
     try {
@@ -180,7 +188,10 @@
         if (entry) {
           try {
             const data = await repos.blob(expectedOwner, expectedRepo, name, expectedRef || undefined);
-            if (ownsCurrentView()) readmeContent = data.content;
+            if (ownsCurrentView()) {
+              readmeContent = data.content;
+              readmeName = name;
+            }
             break;
           } catch (e) {
             // The tree and blob reads are separate snapshots. A 404 means this
@@ -195,6 +206,7 @@
     } catch (e: any) {
       if (ownsCurrentView()) {
         readmeContent = null;
+        readmeName = null;
         readmeError = e?.message || t('repo.browser.readme_unavailable');
       }
     } finally {
@@ -217,32 +229,6 @@
     if (size < 1024) return size + t('repo.file_size.b');
     if (size < 1024 * 1024) return (size / 1024).toFixed(1) + t('repo.file_size.kb');
     return (size / (1024 * 1024)).toFixed(1) + t('repo.file_size.mb');
-  }
-
-  function escapeHtml(value: string): string {
-    return value
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
-
-  function safeMarkdownHref(value: string): string {
-    const href = value.trim();
-    if (/^(https?:|mailto:|#|\/|\.\/|\.\.\/)/i.test(href)) {
-      return href;
-    }
-    return '#';
-  }
-
-  function renderInlineMarkdown(line: string): string {
-    return escapeHtml(line)
-      .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, href) => {
-        return `<a href='${safeMarkdownHref(href)}' target='_blank' rel='noopener'>${label}</a>`;
-      });
   }
 </script>
 
@@ -453,28 +439,11 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
           <span>📄 README.md</span>
         </div>
         <div class="readme-body">
-          <div class="markdown-body">
-            <!-- Simple markdown rendering -->
-            {#each readmeContent.split('\n') as line}
-              {#if line.startsWith('# ')}
-                <h1 class="md-h1">{line.slice(2)}</h1>
-              {:else if line.startsWith('## ')}
-                <h2 class="md-h2">{line.slice(3)}</h2>
-              {:else if line.startsWith('### ')}
-                <h3 class="md-h3">{line.slice(4)}</h3>
-              {:else if line.startsWith('```')}
-                <hr class="md-hr" />
-              {:else if line.startsWith('- ') || line.startsWith('* ')}
-                <li class="md-li">{line.slice(2)}</li>
-              {:else if line.trim() === ''}
-                <br />
-              {:else}
-                <p class="md-p">
-                  {@html renderInlineMarkdown(line)}
-                </p>
-              {/if}
-            {/each}
-          </div>
+          {#if readmeIsMarkdown}
+            <div class="markdown-body">{@html renderedReadme}</div>
+          {:else}
+            <pre class="readme-plain">{readmeContent}</pre>
+          {/if}
         </div>
       </div>
     {:else if !path && readmeLoading}
@@ -730,7 +699,7 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
     color: var(--text-primary);
   }
 
-  .md-h1 {
+  .markdown-body :global(h1) {
     font-size: 28px;
     font-weight: 700;
     margin: 0 0 16px;
@@ -738,7 +707,7 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
     border-bottom: 1px solid var(--border);
   }
 
-  .md-h2 {
+  .markdown-body :global(h2) {
     font-size: 22px;
     font-weight: 600;
     margin: 24px 0 12px;
@@ -746,26 +715,64 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
     border-bottom: 1px solid var(--border-light);
   }
 
-  .md-h3 {
+  .markdown-body :global(h3) {
     font-size: 18px;
     font-weight: 600;
     margin: 16px 0 8px;
   }
 
-  .md-p {
-    margin: 0 0 8px;
+  .markdown-body :global(p),
+  .markdown-body :global(li) {
     font-size: 14px;
   }
 
-  .md-li {
-    margin: 2px 0 2px 20px;
-    font-size: 14px;
+  .markdown-body :global(p) {
+    margin: 0 0 12px;
   }
 
-  .md-hr {
+  .markdown-body :global(ul),
+  .markdown-body :global(ol) {
+    margin: 0 0 12px;
+    padding-left: 24px;
+  }
+
+  .markdown-body :global(hr) {
     border: none;
     border-top: 1px solid var(--border);
     margin: 12px 0;
+  }
+
+  .markdown-body :global(pre) {
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 16px;
+    overflow-x: auto;
+    margin: 0 0 12px;
+  }
+
+  .markdown-body :global(pre code) {
+    background: none;
+    padding: 0;
+  }
+
+  .markdown-body :global(table) {
+    border-collapse: collapse;
+    margin: 0 0 12px;
+  }
+
+  .markdown-body :global(th),
+  .markdown-body :global(td) {
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    font-size: 14px;
+  }
+
+  .readme-plain {
+    margin: 0;
+    white-space: pre-wrap;
+    font-family: var(--font-mono);
+    font-size: 13px;
   }
 
   .markdown-body :global(code) {
