@@ -15,6 +15,7 @@
   import type { DiffLine, MergeQueueEntry, PrDiff } from '$lib/api/pulls';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
   import { revealHash } from '$lib/htmlUrlTargets';
+  import { renderMarkdown } from '$lib/utils/markdown';
 
   const t = createT();
 
@@ -704,7 +705,7 @@
           <div class="comment-header">
             {aroundAuthor(t('pulls.author_commented'))[0]}<strong>{pr.author || t('common.unknown')}</strong><BotBadge owner={pr.author_bot_owner} />{aroundAuthor(t('pulls.author_commented'))[1]}
           </div>
-          <div class="comment-body">{pr.body}</div>
+          <div class="comment-body markdown-body">{@html renderMarkdown(pr.body)}</div>
         </div>
       {/if}
 
@@ -875,7 +876,7 @@
                     {#if event.metadata?.path}
                       <code>{event.metadata.path}{event.metadata.line ? `:${event.metadata.start_line && event.metadata.start_line !== event.metadata.line ? `${event.metadata.start_line}-${event.metadata.line}` : event.metadata.line}` : ''}</code>
                     {/if}
-                    {#if event.body}<div class="timeline-body">{event.body}</div>{/if}
+                    {#if event.body}<div class="timeline-body markdown-body">{@html renderMarkdown(event.body)}</div>{/if}
                     {#if verdict && !verdict.dismissed_at && pr.state === 'open' && permission.canWrite}
                       {#if dismissTargetId === verdict.id}
                         <div class="dismiss-form">
@@ -1005,7 +1006,7 @@
                     </div>
                     {#each lineComments as comment (comment.id)}
                       <div class="inline-thread" class:resolved={Boolean(comment.resolved_at)}>
-                        <div>{comment.body}{#if isEdited(comment)} <span class="edited-marker">{t('comments.edited')}</span>{/if}</div>
+                        <div class="markdown-body">{@html renderMarkdown(comment.body)}</div>{#if isEdited(comment)}<span class="edited-marker">{t('comments.edited')}</span>{/if}
                         {#if comment.suggestion !== null && comment.suggestion !== undefined}
                           <div class="suggestion-block">
                             {#if comment.suggestion === ''}
@@ -1023,7 +1024,7 @@
                           </div>
                         {/if}
                         {#each repliesFor(comment.id) as reply (reply.id)}
-                          <div class="inline-reply">{reply.body}{#if isEdited(reply)} <span class="edited-marker">{t('comments.edited')}</span>{/if}</div>
+                          <div class="inline-reply"><div class="markdown-body">{@html renderMarkdown(reply.body)}</div>{#if isEdited(reply)}<span class="edited-marker">{t('comments.edited')}</span>{/if}</div>
                         {/each}
                         {#if permission.canWrite}
                           <button class="btn-link" disabled={mutationBusy || resolvingCommentId === comment.id} onclick={() => setThreadResolved(comment, !comment.resolved_at)}>
@@ -1118,7 +1119,7 @@
         <button class="btn-secondary cancel-comment-edit" onclick={cancelEdit} disabled={editBusy}>{t('common.cancel')}</button>
       </div>
     {:else}
-      <div class="thread-comment-body">{comment.body}</div>
+      <div class="thread-comment-body markdown-body">{@html renderMarkdown(comment.body)}</div>
       <div class="thread-comment-meta">
         {#if isEdited(comment)}
           <span class="edited-marker">{t('comments.edited')}</span>
@@ -1368,7 +1369,15 @@
   .timeline-summary { display: flex; flex-wrap: wrap; gap: 5px; align-items: baseline; }
   .timeline-summary time { margin-left: auto; color: var(--text-secondary); font-size: 12px; }
   .timeline-event code { display: inline-block; margin-top: 5px; }
-  .timeline-body { margin-top: 7px; white-space: pre-wrap; color: var(--text-secondary); }
+  .timeline-body { margin-top: 7px; color: var(--text-secondary); }
+  /* Bodies and comments are Markdown, rendered and sanitized by renderMarkdown —
+     the same treatment an issue gets, so a description written once reads alike in both. */
+  .markdown-body { white-space: normal; overflow-wrap: anywhere; }
+  .markdown-body :global(p) { margin: 0 0 12px; }
+  .markdown-body :global(p:last-child) { margin-bottom: 0; }
+  .markdown-body :global(ul), .markdown-body :global(ol) { padding-left: 24px; margin: 8px 0 12px; }
+  .markdown-body :global(pre) { overflow-x: auto; background: var(--bg-primary); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; }
+  .markdown-body :global(code) { font-family: var(--font-mono); font-size: 12px; }
   .withdrawn-badge { padding: 1px 7px; border: 1px solid var(--border); border-radius: 12px; color: var(--text-secondary); font-size: 11px; font-weight: 600; }
   .dismiss-review { margin-top: 6px; font-size: 13px; }
   .dismiss-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
