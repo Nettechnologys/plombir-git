@@ -58,9 +58,9 @@ jobs:
           path-to-document: https://github.com/${{ github.repository }}/blob/main/CLA.md
           path-to-signatures: signatures/cla.json
           branch: cla-signatures
-          # The Maintainer's own account and the bots that open dependency
-          # updates; neither contributes work under someone else's copyright.
-          allowlist: Yahook,dependabot[bot],github-actions[bot]
+          # The Maintainer's owners and the bots that open dependency updates;
+          # none of them contributes work under someone else's copyright.
+          allowlist: Yahook,vadiksext,dependabot[bot],github-actions[bot]
           custom-notsigned-prcomment: >-
             Thank you for the pull request. Plombir Git is also offered under a
             commercial license, so before it can be merged every author of its
