@@ -354,7 +354,7 @@ fn render_delivery_payload(format: &str, event: &str, payload: &str) -> Result<S
                     .pointer("/repository/full_name")
                     .and_then(Value::as_str)
             });
-            let mut message = format!("ForgeKeep {event}");
+            let mut message = format!("Plombir Git {event}");
             if let Some(repository) = repository {
                 message.push_str(&format!(" in {repository}"));
             }
@@ -978,7 +978,7 @@ mod tests {
         let slack: Value =
             serde_json::from_str(&render_delivery_payload("slack", event, payload).unwrap())
                 .unwrap();
-        assert_eq!(slack["text"], "ForgeKeep ci.status in team/app: failed");
+        assert_eq!(slack["text"], "Plombir Git ci.status in team/app: failed");
         let discord: Value =
             serde_json::from_str(&render_delivery_payload("discord", event, payload).unwrap())
                 .unwrap();
