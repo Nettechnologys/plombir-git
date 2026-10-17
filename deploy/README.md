@@ -4,9 +4,9 @@
 > guide of that release instead —
 > `https://github.com/Nettechnologys/plombir-git/blob/<tag>/deploy/README.md`,
 > or the copy inside its `plombir-git-deploy-<tag>.tar.gz` asset. Whatever
-> [CHANGELOG.md](../CHANGELOG.md) lists under *Unreleased* is in no release yet:
-> today that includes the one-time setup token and the `create-admin`
-> subcommand described below. A v0.1.1 instance has neither — the first account
+> [CHANGELOG.md](../CHANGELOG.md) lists under *Unreleased* is in no release yet.
+> The one-time setup token and the `create-admin` subcommand described below
+> arrived in v0.2.0. A v0.1.1 instance has neither — the first account
 > registered on an empty instance becomes its administrator, whoever registers
 > it, and the config template it ships sets `registration = "open"` (its
 > `.env.example` sets `PLOMBIR_GIT_REGISTRATION=closed`, which wins, but closed
@@ -191,7 +191,7 @@ one you meant.
 
 ```bash
 # As the system account that should own the data, e.g. a dedicated `forge` user.
-tag=v0.1.1   # the release you install
+tag=v0.2.0   # the release you install
 curl -fLO "https://github.com/Nettechnologys/plombir-git/releases/download/${tag}/plombir-git-deploy-${tag}.tar.gz"
 curl -fLO "https://github.com/Nettechnologys/plombir-git/releases/download/${tag}/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
