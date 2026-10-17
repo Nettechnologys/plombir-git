@@ -18,6 +18,13 @@ HTTPS and SSH and serves the REST API, MCP and the CI scheduler; the web UI is
 a static SvelteKit bundle served next to it. It sits in the same space as
 [Gitea](https://gitea.com/) and [Forgejo](https://forgejo.org/).
 
+<p align="center">
+  <img src="docs/screenshots/agent-pr-demo.webp" width="880"
+       alt="An AI agent's pull request in Plombir Git: the agent's bot account opened it and applied a reviewer's suggestion, and a second person approves and merges it">
+  <br>
+  <sub>An agent opens a pull request under its own bot account and applies a review suggestion over MCP; a second person approves and merges it.</sub>
+</p>
+
 > **Origin.** Plombir Git is a fork of [IronForge](https://github.com/lengyuqu/ironforge).
 > See [NOTICE](NOTICE) for provenance and licensing details.
 
@@ -88,6 +95,26 @@ protected `environment:` holds the job until a person approves it.
 
 The table below is the honest trade. Gitea runs much more of the Actions
 ecosystem; Plombir Git's promise is narrower and stricter.
+
+## A look around
+
+<table>
+  <tr>
+    <td width="50%"><a href="docs/screenshots/pull-request.webp"><img src="docs/screenshots/pull-request.webp" alt="A pull request opened by a bot account, marked BOT and on behalf of its owner, with its Markdown description rendered"></a><br><sub><b>Pull request from an agent.</b> The bot account is marked, and so is the person it works for.</sub></td>
+    <td width="50%"><a href="docs/screenshots/review-suggestion.webp"><img src="docs/screenshots/review-suggestion.webp" alt="An inline review suggestion on a diff line, applied by the agent, with its reply in the thread"></a><br><sub><b>Code review.</b> Inline comments and suggestions; the agent applies one and answers in the thread.</sub></td>
+  </tr>
+  <tr>
+    <td><a href="docs/screenshots/pipeline.webp"><img src="docs/screenshots/pipeline.webp" alt="A CI pipeline with lint and test stages, every job passed"></a><br><sub><b>CI.</b> Stages, jobs and logs from <code>.plombir-git-ci.yml</code> or <code>.gitea/workflows</code>.</sub></td>
+    <td><a href="docs/screenshots/audit-log.webp"><img src="docs/screenshots/audit-log.webp" alt="The audit log listing agent.mcp_tool_call entries for the bot account next to the people's actions"></a><br><sub><b>Audit log.</b> Every MCP tool call an agent makes is recorded.</sub></td>
+  </tr>
+  <tr>
+    <td><a href="docs/screenshots/repository.webp"><img src="docs/screenshots/repository.webp" alt="A repository page with its file tree, recent commits and rendered README"></a><br><sub><b>Repository.</b> Code, branches, releases, packages and a wiki.</sub></td>
+    <td><a href="docs/screenshots/issues.webp"><img src="docs/screenshots/issues.webp" alt="An issue list with labels and a milestone"></a><br><sub><b>Issues.</b> Labels, milestones, assignees and boards.</sub></td>
+  </tr>
+</table>
+
+The screenshots come from a local demo instance with made-up users and a
+made-up project.
 
 ## Actions compatibility
 
