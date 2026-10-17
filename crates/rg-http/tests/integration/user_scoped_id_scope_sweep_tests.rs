@@ -127,11 +127,6 @@ const NOT_A_ROW_ID: &[(&str, &str)] = &[
          owned by the caller, so there is no per-account id space to walk",
     ),
     (
-        "tail",
-        "the `/api-docs/{*tail}` wildcard — a path inside the bundled Swagger UI bundle, held to \
-         its gate by `openapi_docs_auth_tests`",
-    ),
-    (
         "bot",
         "a bot's username — an account the caller owns, addressed by name. `fill` points it at \
          the owner's seeded bot, so the token id under it is probed here; another person's bot \

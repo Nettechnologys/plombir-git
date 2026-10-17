@@ -3,7 +3,7 @@
 // Replay the published OpenAPI spec against a running server.
 //
 // The spec is the contract a generated client, Swagger UI's "Try it out" and a
-// human reading `/api-docs/` all go by, so the question this asks is the one
+// human reading the document all go by, so the question this asks is the one
 // they ask: does the URL the document advertises reach the endpoint it claims?
 //
 // For a long time it could not answer that. It built every request as
@@ -572,18 +572,6 @@ if (!response.ok || !response.response) {
 if (!response.response.ok) {
   console.log(`❌ OpenAPI spec returned an error: HTTP ${response.response.status}`);
   process.exit(1);
-}
-
-const uiUnauthResp = await requestWithTimeout(`${BACKEND_URL}/api-docs/`, { method: 'GET' });
-const uiUnauthStatus = uiUnauthResp.response?.status ?? 0;
-if (OPENAPI_REQUIRE_AUTH) {
-  if (!uiUnauthResp.ok || uiUnauthStatus !== 401) {
-    console.log(`❌ /api-docs/ authentication behaviour is abnormal: HTTP ${uiUnauthStatus || 'network error'}`);
-    process.exit(1);
-  }
-  checks.push('✅ /api-docs/ returned 401, matching the authentication expectation');
-} else if (uiUnauthResp.ok && uiUnauthResp.response) {
-  checks.push(`ℹ️ /api-docs/ is directly accessible (HTTP ${uiUnauthResp.response.status})`);
 }
 
 const openapi = await response.response.json().catch(() => ({}));

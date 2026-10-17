@@ -35,7 +35,6 @@ tar = { workspace = true }
 tokio-rustls = { workspace = true }
 axum-server = { workspace = true }
 utoipa = { version = "5", features = ["chrono"] }
-utoipa-swagger-ui = "8"
 uuid = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }

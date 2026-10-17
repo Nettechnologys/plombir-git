@@ -829,27 +829,23 @@ fn build_docs_routes(
     }
     let spec = axum::body::Bytes::from(spec);
 
-    // The gate itself is `AuthUser`, taken by each handler — so these rows
-    // declare `User` and are driven by the persona sweep like any other
-    // authenticated route. They used to declare `Foreign(Middleware)` over a
+    // The gate itself is `AuthUser`, taken by the handler — so this row
+    // declares `User` and is driven by the persona sweep like any other
+    // authenticated route. It used to declare `Foreign(Middleware)` over a
     // `docs_auth_middleware` that read `Authorization: Bearer` and nothing
     // else, which bought the sweep's exemption *and* locked every browser out
-    // of the one surface built for browsers (card_fb094ba6d323).
+    // (card_fb094ba6d323).
     //
-    // What is left here is the PAT translation, which is not a gate: it turns a
-    // Personal Access Token into the Bearer JWT `AuthUser` understands, exactly
-    // as the same layer does for `/api/v1`. A request with no credentials, or
-    // with a session cookie, passes through it untouched and is answered by the
-    // handler's own gate.
-    let pat_bridge = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
-        mr.layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            pat_auth::pat_auth_middleware,
-        ))
-    });
-
-    // The same PAT bridge, plus the document itself. Only this one route reads
-    // it, so only this one route carries it.
+    // What the layer adds is the document itself and the PAT translation,
+    // which is not a gate: it turns a Personal Access Token into the Bearer JWT
+    // `AuthUser` understands, exactly as the same layer does for `/api/v1`. A
+    // request with no credentials, or with a session cookie, passes through it
+    // untouched and is answered by the handler's own gate.
+    //
+    // The instance used to serve Swagger UI beside it under `/api-docs/`. That
+    // page came from `utoipa-swagger-ui`, whose build script downloaded the UI
+    // from GitHub and unpacked it with a `zip` 2 no fixed release of it ever
+    // left; the document is what clients use, so only the document is served.
     let spec_bridge = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
         mr.layer(axum::Extension(handlers::OpenApiSpec(spec.clone())))
             .layer(axum::middleware::from_fn_with_state(
@@ -864,24 +860,6 @@ fn build_docs_routes(
             "/api-docs/openapi.json",
             handlers::openapi_handler,
             &spec_bridge,
-        )
-        .get_with(
-            User,
-            "/api-docs",
-            handlers::swagger_ui_root_handler,
-            &pat_bridge,
-        )
-        .get_with(
-            User,
-            "/api-docs/",
-            handlers::swagger_ui_root_handler,
-            &pat_bridge,
-        )
-        .get_with(
-            User,
-            "/api-docs/{*tail}",
-            handlers::swagger_ui_handler,
-            &pat_bridge,
         )
         .finish();
 

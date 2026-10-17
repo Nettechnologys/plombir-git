@@ -726,8 +726,9 @@ curl -X POST "$BASE_URL/api/v1/repos/testuser/myrepo/pulls" \
   -d '{"title":"Add feature","body":"Description","head":"feature","base":"main"}'
 ```
 
-The full API is documented via OpenAPI. `/api-docs/*` (OpenAPI JSON + Swagger
-UI) is protected by default and requires a valid JWT or PAT:
+The full API is documented via OpenAPI. `/api-docs/openapi.json` is protected
+by default and requires a session, a JWT or a PAT; load it into Swagger UI,
+Redoc or a client generator:
 
 ```bash
 TOKEN="$(curl -fsS "$BASE_URL/api/v1/users/login" \

@@ -49,8 +49,8 @@ async fn an_unmatched_path_is_not_an_authorization_problem() {
 }
 
 /// The docs gate must still be a gate — moving it off the sub-router, first
-/// onto its four routes and then into the handlers' signatures, is only correct
-/// if those routes are still shut.
+/// onto its routes and then into the handler's signature, is only correct if
+/// the document is still shut. (The Swagger UI routes beside it are gone.)
 ///
 /// The rest of that contract (a cookie session, a JWT and a PAT all open it) is
 /// `openapi_docs_auth_tests`; this asserts the one thing that would break if
@@ -59,10 +59,14 @@ async fn an_unmatched_path_is_not_an_authorization_problem() {
 async fn the_api_docs_gate_survived_moving_onto_its_routes() {
     let base = spawn_test_app().await;
 
-    for path in ["/api-docs/openapi.json", "/api-docs/"] {
-        let response = reqwest::get(format!("{base}{path}")).await.unwrap();
-        assert_eq!(response.status(), 401, "{path} must require a session");
-    }
+    let response = reqwest::get(format!("{base}/api-docs/openapi.json"))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        401,
+        "/api-docs/openapi.json must require a session"
+    );
 }
 
 /// A server with a real bundle behind it, which is the only configuration in

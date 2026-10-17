@@ -92,17 +92,14 @@ async fn commit_log_openapi_documents_client_and_storage_outcomes() {
 }
 
 /// card_fb094ba6d323: the docs gate used to read `Authorization: Bearer` and
-/// nothing else. card_d2e0ccf28b76: the fixed gate was then exercised only
-/// through the trailing-slash UI route.
-///
-/// Swagger UI is a browser surface, and a browser cannot put a header on a
-/// plain navigation — it sends the HttpOnly `plombir_git_token` cookie. Both UI
-/// spellings are independent Axum registrations, so each one must accept that
-/// cookie, a JWT and a PAT, and each one must still refuse an anonymous caller.
-/// Redirects are disabled deliberately: one alias redirecting to (or otherwise
-/// borrowing the result of) the other is not evidence that both routes exist.
+/// nothing else, so a browser — which cannot put a header on a plain
+/// navigation and sends the HttpOnly `plombir_git_token` cookie — was refused.
+/// The Swagger UI routes that exercised this are gone; the document they read
+/// is still opened from a browser tab, so it must accept that cookie, a JWT and
+/// a PAT, and must still refuse an anonymous caller. Redirects are disabled
+/// deliberately: a redirect to a login page is not the document answering.
 #[tokio::test]
-async fn both_swagger_ui_aliases_share_the_live_auth_contract_without_redirects() {
+async fn the_openapi_document_shares_the_live_auth_contract_without_redirects() {
     let base = spawn_test_app().await;
     let jwt = register_user(&base, "docscookie", "docscookie@example.com", "Qz7$wRtm").await;
     let pat = create_pat(&base, &jwt).await;
@@ -111,44 +108,43 @@ async fn both_swagger_ui_aliases_share_the_live_auth_contract_without_redirects(
         .build()
         .unwrap();
 
-    for path in ["/api-docs", "/api-docs/"] {
-        let with_cookie = client
-            .get(format!("{}{}", base, path))
-            .header("cookie", format!("plombir_git_token={jwt}"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            with_cookie.status(),
-            200,
-            "{path} refused a browser carrying the session cookie"
-        );
+    let path = "/api-docs/openapi.json";
+    let with_cookie = client
+        .get(format!("{}{}", base, path))
+        .header("cookie", format!("plombir_git_token={jwt}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        with_cookie.status(),
+        200,
+        "{path} refused a browser carrying the session cookie"
+    );
 
-        let with_jwt = client
-            .get(format!("{}{}", base, path))
-            .bearer_auth(&jwt)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(with_jwt.status(), 200, "{path} refused a valid JWT");
+    let with_jwt = client
+        .get(format!("{}{}", base, path))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(with_jwt.status(), 200, "{path} refused a valid JWT");
 
-        let with_pat = client
-            .get(format!("{}{}", base, path))
-            .bearer_auth(&pat)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(with_pat.status(), 200, "{path} refused a valid PAT");
+    let with_pat = client
+        .get(format!("{}{}", base, path))
+        .bearer_auth(&pat)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(with_pat.status(), 200, "{path} refused a valid PAT");
 
-        let anonymous = client
-            .get(format!("{}{}", base, path))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            anonymous.status(),
-            401,
-            "{path} let an anonymous caller in — the baseline above proves the fixture works"
-        );
-    }
+    let anonymous = client
+        .get(format!("{}{}", base, path))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        anonymous.status(),
+        401,
+        "{path} let an anonymous caller in — the baseline above proves the fixture works"
+    );
 }

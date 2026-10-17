@@ -95,6 +95,17 @@ This project records user-facing changes here. The format follows
   `--jwt-secret` and `--encryption-key` warn that argv is readable by every
   local account.
 
+### Removed
+
+- **Breaking:** the instance no longer serves Swagger UI at `/api-docs`,
+  `/api-docs/` and `/api-docs/{path}`. The OpenAPI document stays at
+  `/api-docs/openapi.json` under the same sign-in; open it in Swagger UI,
+  Redoc or a client generator. The page came from `utoipa-swagger-ui`, whose
+  build script downloaded the UI from GitHub at compile time and unpacked it
+  with `zip` 2.4.2 (RUSTSEC-2026-0367, -0368, -0369). No release of it
+  depends on a fixed `zip`. Building the server no longer needs network
+  access for it.
+
 ### Fixed
 
 - `deploy/README.md`'s restore, migrate and encryption-key rotation recipes

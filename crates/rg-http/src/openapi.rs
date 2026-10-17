@@ -3,10 +3,11 @@
 //! Provides auto-generated OpenAPI 3.0 spec via utoipa.
 //! Access at:
 //!   - OpenAPI JSON: GET /api-docs/openapi.json
-//!   - Swagger UI:    GET /api-docs/
+//!
+//! The instance serves no documentation page of its own: load the document
+//! into Swagger UI, Redoc or a client generator.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use utoipa::openapi::path::{Operation, PathItem};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme};
@@ -865,9 +866,4 @@ pub(crate) fn spec_json(facts: &[RouteFact]) -> (String, SecurityStamp) {
         .to_pretty_json()
         .expect("the OpenAPI document must serialize");
     (json, stamp)
-}
-
-/// Lazy-initialized Swagger UI config (avoids re-computing on every request).
-pub fn swagger_config() -> Arc<utoipa_swagger_ui::Config<'static>> {
-    Arc::new(utoipa_swagger_ui::Config::from("/api-docs/openapi.json"))
 }

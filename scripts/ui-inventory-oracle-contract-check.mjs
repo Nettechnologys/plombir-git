@@ -236,9 +236,9 @@ expect(
   'a catch-all route must not be covered by its prefix with no tail',
 );
 
-// A trailing slash is part of a path, not decoration. Six registrations carry
-// one on purpose — `/v2/`, the OCI upload start, `/api-docs/` and the two pypi
-// indexes — because that is what docker, pip and a browser send, and each is
+// A trailing slash is part of a path, not decoration. Five registrations carry
+// one on purpose — `/v2/`, the OCI upload start and the three pypi routes —
+// because that is what docker and pip send, and each is
 // mounted beside a slashless alias. Folding the pair into one row hid every
 // test that writes the real client URL.
 const slashSpelling = testSourceView('fixture.rs', String.raw`
@@ -828,7 +828,6 @@ expect(
 for (const [method, url] of [
   ['GET', '/v2/'],
   ['POST', '/v2/{owner}/{repo}/blobs/uploads/'],
-  ['GET', '/api-docs/'],
   ['POST', '/api/v1/repos/{owner}/{name}/packages/pypi/legacy/'],
   ['GET', '/api/v1/repos/{owner}/{name}/packages/pypi/simple/'],
   ['GET', '/api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}/'],
@@ -889,7 +888,6 @@ for (const [method, url] of [
   ['DELETE', '/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}'],
   ['DELETE', '/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}'],
   ['PATCH', '/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}'],
-  ['GET', '/api-docs'],
   ['GET', '/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}'],
   ['HEAD', '/v2/{owner}/{repo}/manifests/{reference}'],
 ]) {
@@ -938,7 +936,6 @@ for (const [method, url] of [
 // about the placeholder route mounted beside it.
 for (const [method, url, expected] of [
   ['GET', '/v2/{owner}/{repo}/blobs/{digest}', ['rust']],
-  ['GET', '/api-docs/{*tail}', ['rust']],
   ['GET', '/api/v1/repos/{owner}', ['rust', 'web', 'browser']],
   ['GET', '/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}', ['rust', 'web', 'browser']],
   // `web` is the production `packages.downloadUrl` assertion added with the

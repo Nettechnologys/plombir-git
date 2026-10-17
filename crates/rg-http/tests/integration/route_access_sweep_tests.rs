@@ -2178,10 +2178,6 @@ fn fill(fact: &RouteFact, repo: &RepoSeed, globals: &GlobalSeed, org: &str) -> S
             // repository-content routes want and is not what a registry holds.
             "file" if path.contains("/packages/") => PACKAGE_FILE,
             "path" | "file" => "README.md",
-            // The Swagger UI's own index, which `utoipa_swagger_ui::serve`
-            // really does hold — the wildcard used to fall through to `1` and
-            // the route answered `404` to everybody.
-            "tail" => "index.html",
             "title" => WIKI_TITLE,
             "slug" => "sweep-provider",
             "archive" => "main.zip",

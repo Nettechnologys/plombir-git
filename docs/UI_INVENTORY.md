@@ -19,8 +19,8 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 439 |
-| Reachable from the browser | 308 (70%) |
+| Router routes (with declared `Access`) | 436 |
+| Reachable from the browser | 308 (71%) |
 | Layout modules | 2 |
 | Pages | 73 |
 | Interactive controls | 1052 |
@@ -36,7 +36,7 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 109 | 70 | 4 | 0 |
 | `RepoWrite` | 81 | 62 | 12 | 2 |
-| `User` | 57 | 44 | 5 | 0 |
+| `User` | 54 | 44 | 5 | 0 |
 | `RepoAdmin` | 49 | 49 | 0 | 0 |
 | `InstanceAdmin` | 33 | 28 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
@@ -1323,9 +1323,6 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | GET | `/v2/{owner}/{repo}/blobs/uploads/{uuid}` | `Foreign:oci.rs` | rust+smoke |
 | PUT | `/v2/{owner}/{repo}/blobs/uploads/{uuid}` | `Foreign:oci.rs` | rust |
 | GET | `/api-docs/openapi.json` | `User` | rust+smoke |
-| GET | `/api-docs` | `User` | rust |
-| GET | `/api-docs/` | `User` | rust+smoke |
-| GET | `/api-docs/{*tail}` | `User` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/cargo/index/config.json` | `RepoRead` | rust |
 | PUT | `/api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/new` | `RepoWrite` | rust |
 | DELETE | `/api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/yank` | `RepoWrite` | rust |

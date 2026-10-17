@@ -8,7 +8,7 @@ use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 
 use crate::api::auth::AuthUser;
-use crate::{openapi, security, AppState};
+use crate::{security, AppState};
 
 /// Directory holding the built SvelteKit bundle, **relative to the working
 /// directory of the server process** — the docker image copies it to
@@ -589,46 +589,6 @@ pub(crate) async fn openapi_handler(
         [(header::CONTENT_TYPE, "application/json")],
         spec.0,
     )
-}
-
-/// GET /api-docs/{*tail} — serve Swagger UI static files.
-///
-/// `AuthUser` comes first deliberately: ahead of `Path<_>`, so the access
-/// question is answered before any extractor can answer something else.
-pub(crate) async fn swagger_ui_handler(
-    _: AuthUser,
-    axum::extract::Path(tail): axum::extract::Path<String>,
-) -> Response {
-    let path = if tail.is_empty() { "/" } else { &tail };
-    swagger_ui_response(path)
-}
-
-/// GET /api-docs[/] — serve Swagger UI index.
-pub(crate) async fn swagger_ui_root_handler(_: AuthUser) -> Response {
-    swagger_ui_response("/")
-}
-
-fn swagger_ui_response(path: &str) -> Response {
-    let config = openapi::swagger_config();
-
-    match utoipa_swagger_ui::serve(path, config) {
-        Ok(Some(file)) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, file.content_type)],
-            file.bytes.to_vec(),
-        ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "text/plain".to_string())],
-            "Not Found".as_bytes().to_vec(),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [(header::CONTENT_TYPE, "text/plain".to_string())],
-            format!("Swagger UI error: {e}").into_bytes(),
-        ),
-    }
-    .into_response()
 }
 
 #[cfg(test)]

@@ -171,37 +171,6 @@
     },
     {
       "method": "GET",
-      "url": "/api-docs",
-      "access": "User",
-      "handler": "handlers::swagger_ui_root_handler",
-      "testedIn": [
-        "rust"
-      ],
-      "reachedFromUi": false
-    },
-    {
-      "method": "GET",
-      "url": "/api-docs/",
-      "access": "User",
-      "handler": "handlers::swagger_ui_root_handler",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
-      "reachedFromUi": false
-    },
-    {
-      "method": "GET",
-      "url": "/api-docs/{*tail}",
-      "access": "User",
-      "handler": "handlers::swagger_ui_handler",
-      "testedIn": [
-        "rust"
-      ],
-      "reachedFromUi": false
-    },
-    {
-      "method": "GET",
       "url": "/api/v1/repos/{owner}/{name}/packages/cargo/index/config.json",
       "access": "RepoRead",
       "handler": "api::packages::cargo_index_config",
