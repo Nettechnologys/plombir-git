@@ -155,13 +155,93 @@ async fn asset_in_repo(
     repo: &rg_db::entities::repository::Model,
     asset_id: i64,
 ) -> Result<rg_db::entities::release_asset::Model, AppError> {
+    asset_and_release_in_repo(state, repo, asset_id)
+        .await
+        .map(|(asset, _)| asset)
+}
+
+/// [`asset_in_repo`], keeping the release it was anchored through — the
+/// journal names an asset by its release's tag.
+async fn asset_and_release_in_repo(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    asset_id: i64,
+) -> Result<
+    (
+        rg_db::entities::release_asset::Model,
+        rg_db::entities::release::Model,
+    ),
+    AppError,
+> {
     let asset = rg_core::release::service::get_asset(&state.db, asset_id).await?;
     let release = rg_core::release::service::get_release(&state.db, asset.release_id).await?;
     if release.repo_id != repo.id {
         return Err(AppError::not_found("asset not found"));
     }
 
-    Ok(asset)
+    Ok((asset, release))
+}
+
+/// One journal row for a release mutation that changes what a download gets.
+///
+/// Creating a release and uploading an asset are attributed by their rows
+/// (`author_id`, `uploader_id` with the asset's `sha256`). Everything else that
+/// changes what somebody downloads under a tag — an asset or release removed,
+/// a draft published or pulled back, the prerelease mark moved (both decide
+/// what `releases/latest` answers), an attestation signed — used to leave no
+/// trace: whoever deleted `app-1.0.tar.gz` before somebody uploaded a new one
+/// under that name was nowhere on record (card_215e51dcb498). The package
+/// registries journal the same class of change; see `supply_chain_journal_census`.
+///
+/// Written after the change and never turned into an error, like the registry
+/// rows: the mutation is done, and a retry prompted by a journal failure would
+/// only hit a release or asset that is no longer there.
+#[allow(clippy::too_many_arguments)]
+async fn record_release_event(
+    state: &AppState,
+    actor_id: i64,
+    headers: &HeaderMap,
+    action: &str,
+    (owner, name): (&str, &str),
+    release: &rg_db::entities::release::Model,
+    asset: Option<&rg_db::entities::release_asset::Model>,
+    extra: serde_json::Value,
+) {
+    let actor = rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, actor_id).await;
+    let mut details = serde_json::json!({
+        "repo": format!("{owner}/{name}"),
+        "tag": release.tag_name,
+    });
+    let (resource_type, resource_id, resource_name) = match asset {
+        Some(asset) => {
+            details["filename"] = serde_json::Value::from(asset.filename.as_str());
+            details["sha256"] = serde_json::Value::from(asset.sha256.as_deref());
+            (
+                "release_asset",
+                asset.id,
+                format!("{owner}/{name}@{}/{}", release.tag_name, asset.filename),
+            )
+        }
+        None => (
+            "release",
+            release.id,
+            format!("{owner}/{name}@{}", release.tag_name),
+        ),
+    };
+    if let (Some(details), serde_json::Value::Object(extra)) = (details.as_object_mut(), extra) {
+        details.extend(extra);
+    }
+    rg_core::audit::record(
+        &state.db,
+        &actor,
+        action,
+        Some(resource_type),
+        Some(resource_id),
+        Some(&resource_name),
+        Some(headers),
+        Some(details),
+    )
+    .await;
 }
 
 /// Request body for creating a release.
@@ -378,6 +458,7 @@ pub async fn update_release(
     State(state): State<AppState>,
     Path((owner, name, id)): Path<(String, String, i64)>,
     RepoWrite { repo, actor_id }: RepoWrite,
+    headers: HeaderMap,
     Json(body): Json<UpdateReleaseRequest>,
 ) -> impl IntoResponse {
     // Write access to `owner/name` says nothing about where `id` points: the
@@ -398,6 +479,7 @@ pub async fn update_release(
     }
 
     let (link_owner, link_name) = (owner.clone(), name.clone());
+    let (was_draft, was_prerelease) = (release.is_draft, release.is_prerelease);
     let owned_state = state.clone();
     match state
         .tracked_ref_operation(async move {
@@ -435,6 +517,37 @@ pub async fn update_release(
         .await
     {
         Ok(release) => {
+            let coordinates = (link_owner.as_str(), link_name.as_str());
+            if release.is_draft != was_draft {
+                record_release_event(
+                    &state,
+                    actor_id,
+                    &headers,
+                    if release.is_draft {
+                        "release.unpublish"
+                    } else {
+                        "release.publish"
+                    },
+                    coordinates,
+                    &release,
+                    None,
+                    serde_json::json!({}),
+                )
+                .await;
+            }
+            if release.is_prerelease != was_prerelease {
+                record_release_event(
+                    &state,
+                    actor_id,
+                    &headers,
+                    "release.prerelease.set",
+                    coordinates,
+                    &release,
+                    None,
+                    serde_json::json!({ "prerelease": release.is_prerelease }),
+                )
+                .await;
+            }
             let html_url =
                 crate::html_url::Links::new(&state, &link_owner, &link_name).release(release.id);
             (
@@ -466,11 +579,18 @@ pub async fn update_release(
 pub async fn delete_release(
     State(state): State<AppState>,
     Path((owner, name, id)): Path<(String, String, i64)>,
-    RepoWrite { repo, .. }: RepoWrite,
+    RepoWrite { repo, actor_id }: RepoWrite,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let release = match release_in_repo(&state, &repo, id).await {
         Ok(release) => release,
         Err(e) => return e.into_response(),
+    };
+    // Read before the delete takes them: the rows are what says which files
+    // the tag stopped serving.
+    let assets = match rg_core::release::service::list_assets(&state.db, release.id).await {
+        Ok(assets) => assets,
+        Err(e) => return AppError::from(e).into_response(),
     };
 
     match rg_core::release::service::delete_release(
@@ -483,11 +603,28 @@ pub async fn delete_release(
     )
     .await
     {
-        Ok(()) => (
-            StatusCode::NO_CONTENT,
-            Json(serde_json::json!({ "deleted": true })),
-        )
-            .into_response(),
+        Ok(()) => {
+            let assets: Vec<_> = assets
+                .iter()
+                .map(|asset| serde_json::json!({ "filename": asset.filename, "sha256": asset.sha256 }))
+                .collect();
+            record_release_event(
+                &state,
+                actor_id,
+                &headers,
+                "release.delete",
+                (&owner, &name),
+                &release,
+                None,
+                serde_json::json!({ "assets": assets }),
+            )
+            .await;
+            (
+                StatusCode::NO_CONTENT,
+                Json(serde_json::json!({ "deleted": true })),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -877,15 +1014,16 @@ fn attestation_builder_id(state: &AppState) -> String {
 )]
 pub async fn sign_asset_attestation(
     State(state): State<AppState>,
-    Path((_, _, asset_id)): Path<(String, String, i64)>,
-    RepoWrite { repo, .. }: RepoWrite,
+    Path((owner, name, asset_id)): Path<(String, String, i64)>,
+    RepoWrite { repo, actor_id }: RepoWrite,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     if !state.attestation_enabled {
         return AppError::not_found("attestation is not enabled").into_response();
     }
 
-    let asset = match asset_in_repo(&state, &repo, asset_id).await {
-        Ok(asset) => asset,
+    let (asset, release) = match asset_and_release_in_repo(&state, &repo, asset_id).await {
+        Ok(anchored) => anchored,
         Err(e) => return e.into_response(),
     };
 
@@ -898,7 +1036,18 @@ pub async fn sign_asset_attestation(
     )
     .await
     {
-        Ok((_asset, envelope)) => {
+        Ok((asset, envelope)) => {
+            record_release_event(
+                &state,
+                actor_id,
+                &headers,
+                "release.asset.attest",
+                (&owner, &name),
+                &release,
+                Some(&asset),
+                serde_json::json!({ "builder_id": builder_id }),
+            )
+            .await;
             (StatusCode::CREATED, Json(serde_json::json!(envelope))).into_response()
         }
         // A legacy asset with no recorded digest is the only client-fixable
@@ -1021,12 +1170,13 @@ pub async fn verify_asset_attestation(
 pub async fn delete_asset(
     State(state): State<AppState>,
     Path((owner, name, asset_id)): Path<(String, String, i64)>,
-    RepoWrite { repo, .. }: RepoWrite,
+    RepoWrite { repo, actor_id }: RepoWrite,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     // `owner`/`name` below only build the storage path — on their own they never
     // constrain which asset row is deleted, so the id has to be anchored first.
-    let asset = match asset_in_repo(&state, &repo, asset_id).await {
-        Ok(asset) => asset,
+    let (asset, release) = match asset_and_release_in_repo(&state, &repo, asset_id).await {
+        Ok(anchored) => anchored,
         Err(e) => return e.into_response(),
     };
 
@@ -1040,11 +1190,24 @@ pub async fn delete_asset(
     )
     .await
     {
-        Ok(()) => (
-            StatusCode::NO_CONTENT,
-            Json(serde_json::json!({ "deleted": true })),
-        )
-            .into_response(),
+        Ok(()) => {
+            record_release_event(
+                &state,
+                actor_id,
+                &headers,
+                "release.asset.delete",
+                (&owner, &name),
+                &release,
+                Some(&asset),
+                serde_json::json!({}),
+            )
+            .await;
+            (
+                StatusCode::NO_CONTENT,
+                Json(serde_json::json!({ "deleted": true })),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

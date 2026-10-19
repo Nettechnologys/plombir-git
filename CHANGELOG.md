@@ -20,6 +20,13 @@ This project records user-facing changes here. The format follows
 - The navigation bar shows the unread notification count.
 - Issue labels are drawn in their own colour in the issue list and on the
   issue page.
+- The audit log names who changed what a download resolves to without a new
+  version: `package.dist_tag.set` / `package.dist_tag.remove` for npm
+  dist-tags, `package.file.add` for a file added to an already-published
+  package version (through any protocol), and for releases
+  `release.publish` / `release.unpublish`, `release.prerelease.set`,
+  `release.delete`, `release.asset.delete` and `release.asset.attest`, each
+  with the file name and SHA-256 where there is a file.
 
 ### Changed
 

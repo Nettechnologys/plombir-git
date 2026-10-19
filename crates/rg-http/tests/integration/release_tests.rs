@@ -698,3 +698,211 @@ async fn a_release_creates_the_tag_it_names() {
         "a refused release left its row: {listed}"
     );
 }
+
+/// What a tag serves changes without a new upload when an asset or the release
+/// is removed, a draft is published, the prerelease mark moves (both decide
+/// `releases/latest`) or an attestation is signed — and none of it was on
+/// record: whoever deleted `app-1.0.tar.gz` before somebody uploaded a new one
+/// under that name could not be found (card_215e51dcb498).
+///
+/// Every mutation here is made by a write collaborator, so each row has to
+/// name the account that acted, not the one the repository belongs to.
+#[tokio::test]
+async fn release_mutations_record_who_made_them() {
+    let (base, db) = crate::common::spawn_test_app_with_db().await;
+    let (owner_token, owner_id) = crate::common::register_full(
+        &base,
+        "release-journal-owner",
+        "release-journal-owner@example.com",
+    )
+    .await;
+    rg_db::ops::user_ops::update_by_id(&db, owner_id, None, None, Some(true), None)
+        .await
+        .expect("promote the owner to admin")
+        .expect("the owner exists");
+    let (writer_token, writer_id) = crate::common::register_full(
+        &base,
+        "release-journal-writer",
+        "release-journal-writer@example.com",
+    )
+    .await;
+    create_initialised_repo(&base, &owner_token, "release-journal-repo").await;
+    let client = reqwest::Client::new();
+    let repo = format!("{base}/api/v1/repos/release-journal-owner/release-journal-repo");
+    let granted = client
+        .post(format!("{repo}/collaborators"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"username": "release-journal-writer", "permission": "write"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(granted.status(), 201, "{}", granted.text().await.unwrap());
+
+    let journal = |action: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        let owner_token = owner_token.clone();
+        async move {
+            let response = client
+                .get(format!("{base}/api/v1/admin/audit/logs"))
+                .query(&[("action", action), ("per_page", "100")])
+                .bearer_auth(&owner_token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            response.json::<serde_json::Value>().await.unwrap()["logs"]
+                .as_array()
+                .expect("`logs` array")
+                .clone()
+        }
+    };
+    let detail = |entry: &serde_json::Value| -> serde_json::Value {
+        serde_json::from_str(entry["details"].as_str().expect("details are recorded"))
+            .expect("details are JSON")
+    };
+    let only_row = |rows: Vec<serde_json::Value>, action: &str| -> serde_json::Value {
+        assert_eq!(rows.len(), 1, "{action}: {rows:?}");
+        let entry = rows.into_iter().next().unwrap();
+        assert_eq!(entry["user_id"], writer_id, "{action}: {entry}");
+        assert_eq!(
+            entry["username"], "release-journal-writer",
+            "{action}: {entry}"
+        );
+        entry
+    };
+
+    let created = client
+        .post(format!("{repo}/releases"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "tag_name": "v1.0.0",
+            "title": "First",
+            "is_draft": true,
+            "is_prerelease": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let release_id = created.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let patch = |body: serde_json::Value| {
+        let client = client.clone();
+        let url = format!("{repo}/releases/{release_id}");
+        let writer_token = writer_token.clone();
+        async move {
+            let response = client
+                .patch(url)
+                .bearer_auth(&writer_token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+        }
+    };
+    patch(serde_json::json!({"is_draft": false})).await;
+    // Saying it again changes nothing, so it must not claim another publish.
+    patch(serde_json::json!({"is_draft": false, "title": "First, renamed"})).await;
+    patch(serde_json::json!({"is_prerelease": true})).await;
+
+    let published = only_row(journal("release.publish").await, "release.publish");
+    assert_eq!(published["resource_type"], "release", "{published}");
+    assert_eq!(
+        published["resource_name"], "release-journal-owner/release-journal-repo@v1.0.0",
+        "{published}"
+    );
+    let prerelease = only_row(
+        journal("release.prerelease.set").await,
+        "release.prerelease.set",
+    );
+    assert_eq!(detail(&prerelease)["prerelease"], true, "{prerelease}");
+    assert!(journal("release.unpublish").await.is_empty());
+
+    let upload = |filename: &'static str, body: &'static str| {
+        let client = client.clone();
+        let url = format!("{repo}/releases/{release_id}/assets");
+        let owner_token = owner_token.clone();
+        async move {
+            let response = client
+                .post(url)
+                .bearer_auth(&owner_token)
+                .header("content-type", "application/octet-stream")
+                .header(
+                    "content-disposition",
+                    format!("attachment; filename={filename}"),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+            response.json::<serde_json::Value>().await.unwrap()
+        }
+    };
+    let replaced = upload("app-1.0.tar.gz", "original bytes").await;
+    let kept = upload("app-1.0.zip", "kept bytes").await;
+
+    let deleted = client
+        .delete(format!(
+            "{repo}/releases/assets/{}",
+            replaced["id"].as_i64().unwrap()
+        ))
+        .bearer_auth(&writer_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(deleted.status().is_success(), "{}", deleted.status());
+    let asset_delete = only_row(
+        journal("release.asset.delete").await,
+        "release.asset.delete",
+    );
+    assert_eq!(
+        asset_delete["resource_type"], "release_asset",
+        "{asset_delete}"
+    );
+    assert_eq!(
+        asset_delete["resource_name"],
+        "release-journal-owner/release-journal-repo@v1.0.0/app-1.0.tar.gz",
+        "{asset_delete}"
+    );
+    assert_eq!(
+        detail(&asset_delete)["sha256"],
+        replaced["sha256"],
+        "the row names the bytes that stopped being served: {asset_delete}"
+    );
+
+    let signed = client
+        .post(format!(
+            "{repo}/releases/assets/{}/attestation",
+            kept["id"].as_i64().unwrap()
+        ))
+        .bearer_auth(&writer_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed.status(), 201, "{}", signed.text().await.unwrap());
+    let attest = only_row(
+        journal("release.asset.attest").await,
+        "release.asset.attest",
+    );
+    assert_eq!(detail(&attest)["filename"], "app-1.0.zip", "{attest}");
+    assert_eq!(detail(&attest)["sha256"], kept["sha256"], "{attest}");
+
+    let removed = client
+        .delete(format!("{repo}/releases/{release_id}"))
+        .bearer_auth(&writer_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(removed.status().is_success(), "{}", removed.status());
+    let release_delete = only_row(journal("release.delete").await, "release.delete");
+    assert_eq!(
+        detail(&release_delete)["assets"],
+        serde_json::json!([{ "filename": "app-1.0.zip", "sha256": kept["sha256"] }]),
+        "the row lists what the tag stopped serving: {release_delete}"
+    );
+}

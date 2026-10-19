@@ -1,19 +1,24 @@
-//! Census: every route that changes what a registry client gets is named here
-//! together with the journal row it writes (card_8bdfea8689fd).
+//! Census: every route that changes what a registry client or a release
+//! download gets is named here together with the journal row it writes
+//! (card_8bdfea8689fd, card_215e51dcb498).
 //!
 //! The phase this guards exists because two such operations wrote nothing: an
 //! npm dist-tag moved `latest` without a trace while re-tagging an OCI image
 //! journaled (card_44ce692c5b9b), and a file added to an already-published
 //! version — a new wheel pip prefers — left neither a row nor an author
 //! (card_8c4269a5f5cf). Both were found by reading the doors one by one, which
-//! is not a method. This file is that reading, mechanised.
+//! is not a method. This file is that reading, mechanised. Releases are the
+//! second channel the same artifacts go out through, and they had the same
+//! gap in full: removing an asset or a release, publishing a draft and signing
+//! an attestation wrote nothing (card_215e51dcb498).
 //!
 //! ## What is counted
 //!
 //! Every route the router really serves — [`RouteFact`]s recorded by the build
 //! that produced it, not a copy of `routes.rs` — whose method changes state
-//! (`POST` / `PUT` / `PATCH` / `DELETE`) and whose path is a registry path:
-//! under `/packages/` or the OCI distribution root `/v2/`. Each one's handler
+//! (`POST` / `PUT` / `PATCH` / `DELETE`) and whose path is a registry or
+//! release path: under `/packages/`, the OCI distribution root `/v2/`, or
+//! `/releases`. Each one's handler
 //! has to have an entry in [`CENSUS`]; a door added without one is red, and so
 //! is an entry whose door is gone.
 //!
@@ -21,14 +26,18 @@
 //!
 //! [`Journal::Writes`] names audit actions. Each one has to be spelled as a
 //! string literal somewhere the handler reaches, directly or through the
-//! helpers of the registry modules (`api/packages/*.rs`, `oci.rs`) — a table
+//! helpers of the modules that serve them (`api/packages/*.rs`, `oci.rs`,
+//! `api/releases.rs`) — a table
 //! that only *named* the action would go on claiming a row after the
 //! `audit::record` call was deleted. [`Journal::Publishes`] is the publish
 //! funnel: a new version is attributed by its row's `author_id` and writes no
 //! journal row on purpose, a file added to an existing version is not
 //! attributed by anything else and writes `package.file.add`, which is checked
-//! like a `Writes`. [`Journal::Inert`] is a door that accepts a request without
-//! changing what any client resolves, with the reason why.
+//! like a `Writes`. [`Journal::AttributedByRow`] is a creation the row it
+//! writes already attributes — a release's `author_id`, an asset's
+//! `uploader_id` beside its `sha256` — with the column named. [`Journal::Inert`]
+//! is a door that accepts a request without changing what any client
+//! resolves, with the reason why.
 //!
 //! The reach is followed by name across those files, which can over-approximate
 //! (two helpers of one name would both count); it cannot miss a call made
@@ -42,7 +51,7 @@ use rg_http::route_table::{Access, RouteFact};
 use crate::common::source_scan::{calls, functions, rust_files, src_root};
 use crate::common::spawn_test_app_with_routes;
 
-/// What a registry door leaves behind.
+/// What a supply-chain door leaves behind.
 #[derive(Debug, Clone, Copy)]
 enum Journal {
     /// One of these audit actions on every successful call.
@@ -50,6 +59,8 @@ enum Journal {
     /// The publish funnel: a new version is attributed by `author_id` on its
     /// row, a file added to an existing version writes `package.file.add`.
     Publishes,
+    /// Creates a row that names its author; the string says which column.
+    AttributedByRow(&'static str),
     /// Accepts the request without changing what any client resolves.
     Inert(&'static str),
 }
@@ -57,7 +68,8 @@ enum Journal {
 /// The action the publish funnel writes for a file added to an existing version.
 const FILE_ADD: &str = "package.file.add";
 
-/// Every state-changing registry handler, keyed by `RouteFact::handler`.
+/// Every state-changing registry and release handler, keyed by
+/// `RouteFact::handler`.
 const CENSUS: &[(&str, Journal)] = &[
     // ── The publish funnel: every door reaches `persist_package` ──────────
     ("rg_http::api::packages::publish", Journal::Publishes),
@@ -147,12 +159,50 @@ const CENSUS: &[(&str, Journal)] = &[
         "rg_http::oci::complete_upload",
         Journal::Inert("part of a blob upload; see `start_upload`"),
     ),
+    // ── Releases ──────────────────────────────────────────────────────────
+    (
+        "rg_http::api::releases::create_release",
+        Journal::AttributedByRow("`releases.author_id`"),
+    ),
+    (
+        "rg_http::api::releases::upload_asset",
+        Journal::AttributedByRow("`release_assets.uploader_id`, beside its `sha256`"),
+    ),
+    (
+        "rg_http::api::releases::update_release",
+        Journal::Writes(&[
+            "release.publish",
+            "release.unpublish",
+            "release.prerelease.set",
+        ]),
+    ),
+    (
+        "rg_http::api::releases::delete_release",
+        Journal::Writes(&["release.delete"]),
+    ),
+    (
+        "rg_http::api::releases::delete_asset",
+        Journal::Writes(&["release.asset.delete"]),
+    ),
+    (
+        "rg_http::api::releases::sign_asset_attestation",
+        Journal::Writes(&["release.asset.attest"]),
+    ),
+    (
+        "rg_http::api::releases::verify_asset_attestation",
+        Journal::Inert(
+            "a POST that only reads: checks the stored envelope against the \
+             asset's current bytes and stores nothing",
+        ),
+    ),
 ];
 
-/// Whether a route is a state-changing registry door.
+/// Whether a route is a state-changing registry or release door.
 fn is_registry_mutation(fact: &RouteFact) -> bool {
     matches!(fact.method, "POST" | "PUT" | "PATCH" | "DELETE")
-        && (fact.path.contains("/packages/") || fact.path.starts_with("/v2/"))
+        && (fact.path.contains("/packages/")
+            || fact.path.starts_with("/v2/")
+            || fact.path.contains("/releases"))
 }
 
 /// The registry doors the census does not account for, and the census entries
@@ -194,12 +244,14 @@ fn handler_source(handler: &str) -> (String, &str) {
     (file, name)
 }
 
-/// Every production function of the registry modules, as `(file, name) → body`.
+/// Every production function of the registry and release modules, as
+/// `(file, name) → body`.
 fn registry_functions() -> BTreeMap<(String, String), String> {
     let root = src_root();
     let mut files = Vec::new();
     rust_files(&root.join("api/packages"), &mut files);
     files.push(root.join("oci.rs"));
+    files.push(root.join("api/releases.rs"));
     let mut out = BTreeMap::new();
     for path in files {
         let text = fs::read_to_string(&path).expect("read a registry module");
@@ -286,10 +338,10 @@ async fn every_registry_door_is_named_with_the_journal_row_it_writes() {
         let actions: &[&str] = match journal {
             Journal::Writes(actions) => actions,
             Journal::Publishes => &[FILE_ADD],
-            Journal::Inert(reason) => {
+            Journal::AttributedByRow(reason) | Journal::Inert(reason) => {
                 assert!(
                     !reason.trim().is_empty(),
-                    "{handler} is declared inert without saying why"
+                    "{handler} is exempt from journalling without saying why"
                 );
                 continue;
             }

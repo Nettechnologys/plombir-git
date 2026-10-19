@@ -145,7 +145,10 @@ const ANCHORED: &[AnchoredFile] = &[
             // id `id`; the asset routes carry the release as `release_id`.
             ("id", &["release_in_repo"]),
             ("release_id", &["release_in_repo"]),
-            ("asset_id", &["asset_in_repo"]),
+            // `asset_in_repo` delegates to `asset_and_release_in_repo`, which
+            // also hands back the release — what the journal names an asset by
+            // on the routes that delete or attest one (card_215e51dcb498).
+            ("asset_id", &["asset_in_repo", "asset_and_release_in_repo"]),
         ],
     ),
     (
@@ -390,6 +393,18 @@ const LEAF_COMPARISONS: &[(&str, &str, &[&str])] = &[
         "oci.rs",
         "upload_in_repo",
         &["upload.oci_repository_id == oci_repo.id"],
+    ),
+    // Every release and asset route rests on these two, and `asset_in_repo`
+    // only delegates — the asset's comparison is the release's, one hop up.
+    (
+        "api/releases.rs",
+        "release_in_repo",
+        &["release.repo_id != repo.id"],
+    ),
+    (
+        "api/releases.rs",
+        "asset_and_release_in_repo",
+        &["release.repo_id != repo.id"],
     ),
 ];
 
