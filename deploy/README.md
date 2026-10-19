@@ -210,9 +210,11 @@ docker compose -f docker-compose.release.yml up -d
 `PLOMBIR_GIT_UID` and `PLOMBIR_GIT_GID` have no default in this file: a
 forgotten line fails `up` with `required variable PLOMBIR_GIT_UID is missing a
 value` instead of quietly running as uid 1000. Releases up to and including
-v0.1.1 predate the bundle; for those, take `docker-compose.release.yml` from
-`main` (it pins v0.1.1) and `plombir-git.docker.toml` / `.env.example` from the
-tag:
+v0.1.1 predate the bundle; for those, take `docker-compose.release.yml` as the
+`v0.2.0` tag's source tree has it — that copy still pins v0.1.1, while `main`
+names the newest release —
+`https://raw.githubusercontent.com/Nettechnologys/plombir-git/v0.2.0/deploy/docker-compose.release.yml`,
+and `plombir-git.docker.toml` / `.env.example` from the v0.1.1 tag:
 `https://raw.githubusercontent.com/Nettechnologys/plombir-git/v0.1.1/deploy/plombir-git.docker.toml`.
 Upgrading is the same procedure with the next bundle, after the backup and
 migration steps under [SQLite Backup / Restore](#sqlite-backup--restore).

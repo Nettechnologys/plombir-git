@@ -37,7 +37,7 @@
 
 services:
   plombir-git:
-    image: ghcr.io/nettechnologys/plombir-git:v0.1.1@sha256:b32189ec1f12e71f0a95f64cac4c5641fa381b96bec2bf1805d595c417b3b5a9
+    image: ghcr.io/nettechnologys/plombir-git:v0.2.0@sha256:1444dccab08e219f9321594d4dccf804b99b297a7d14be07e71a23159e58eb99
     # No default: a forgotten uid must fail `up` loudly, not quietly fall back
     # to the image's 1000 and write the data as whoever that is on this host.
     user: "${PLOMBIR_GIT_UID:?set PLOMBIR_GIT_UID in .env to the uid that owns ./data}:${PLOMBIR_GIT_GID:?set PLOMBIR_GIT_GID in .env to the gid that owns ./data}"
