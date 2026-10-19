@@ -1242,6 +1242,10 @@ fn comparison_cache() -> &'static Mutex<BoundedGitReadCache<Comparison>> {
 /// repository itself when `None`, or a fork of it, as [`resolve_head_ref`]
 /// resolves a pull request's `<owner>:<branch>` head.
 ///
+/// Within one repository either side may also be a tag or a commit id, full or
+/// abbreviated: a branch of that name wins, then a tag, then a commit
+/// (card_d2812a16f34e). A fork head stays a branch: it is fetched by refname.
+///
 /// The caller has already decided the head repository is readable: a fork is
 /// a repository of its own, and read access to the base says nothing about
 /// it. Nothing here re-checks that.
@@ -1257,7 +1261,9 @@ pub async fn compare_branches(
     let base_path = repo_root.join(format!("{base_namespace}/{}.git", base_repo.name));
     let head_branch = head_branch.to_string();
     let missing_branch = |side: &str, branch: &str| {
-        crate::error::invalid_request(format!("{side} branch '{branch}' does not exist"))
+        crate::error::invalid_request(format!(
+            "{side} branch, tag or commit '{branch}' does not exist"
+        ))
     };
     for (side, branch) in [("base", base), ("head", head_branch.as_str())] {
         if rg_git::refname::validate_refname(&format!("refs/heads/{branch}")).is_err() {
@@ -1272,11 +1278,19 @@ pub async fn compare_branches(
             base_path.clone()
         };
     let base = base.to_string();
+    let same_repo = head_path == base_path;
     crate::blocking::run_blocking_git("comparing branches", move || {
-        let base_sha = crate::repo::service::try_get_branch_sha(&base_path, &base)?
+        let resolve_head = |name: &str| {
+            if same_repo {
+                resolve_compared_rev(&head_path, name)
+            } else {
+                crate::repo::service::try_get_branch_sha(&head_path, name)
+            }
+        };
+        let base_sha = resolve_compared_rev(&base_path, &base)?
             .ok_or_else(|| missing_branch("base", &base))?;
-        let head_sha = crate::repo::service::try_get_branch_sha(&head_path, &head_branch)?
-            .ok_or_else(|| missing_branch("head", &head_branch))?;
+        let head_sha =
+            resolve_head(&head_branch)?.ok_or_else(|| missing_branch("head", &head_branch))?;
         let key = DiffCacheKey {
             base_repo: base_path.clone(),
             head_repo: head_path.clone(),
@@ -1294,9 +1308,16 @@ pub async fn compare_branches(
             return Ok(comparison);
         }
 
-        let comparison = if head_path == base_path {
-            let head_rev = format!("refs/heads/{head_branch}");
-            compare_in(&base_path, &base, &head_branch, &head_rev)?
+        // Both sides are read at the ids resolved above, so the answer is the
+        // one the cache key names even if a branch moves in between.
+        let comparison = if same_repo {
+            compare_in(
+                &base_path,
+                &base,
+                &key.base_sha,
+                &head_branch,
+                &key.head_sha,
+            )?
         } else {
             let local_ref = scratch_fork_ref();
             let compared = (|| {
@@ -1312,22 +1333,18 @@ pub async fn compare_branches(
                 )?
                 .ensure_success()
                 .context("failed to fetch the head branch to compare")?;
-                compare_in(&base_path, &base, &head_branch, &local_ref)
+                compare_in(&base_path, &base, &key.base_sha, &head_branch, &local_ref)
             })();
             // In the same phase as the fetch, however the comparison went.
             discard_fork_ref(&base_path, &local_ref);
             compared?
         };
-        if crate::repo::service::try_get_branch_sha(&base_path, &base)
+        if resolve_compared_rev(&base_path, &base)
             .ok()
             .flatten()
             .as_ref()
             == Some(&key.base_sha)
-            && crate::repo::service::try_get_branch_sha(&head_path, &head_branch)
-                .ok()
-                .flatten()
-                .as_ref()
-                == Some(&key.head_sha)
+            && resolve_head(&head_branch).ok().flatten().as_ref() == Some(&key.head_sha)
         {
             comparison_cache()
                 .lock()
@@ -1339,17 +1356,66 @@ pub async fn compare_branches(
     .await
 }
 
-/// The comparison of `refs/heads/<base>` with `head_rev`, both in
-/// `repo_path`: the same merge base, numstat and patch a pull request's diff
-/// reads, plus the commits between.
+/// The commit id `name` stands for on one side of a comparison: the branch of
+/// that name, else the tag, else a commit whose id starts with it. `None` when
+/// none of them exists.
+///
+/// A branch is looked up first so that a hex-looking branch name keeps meaning
+/// the branch, as it did when only branches were accepted.
+fn resolve_compared_rev(repo_path: &std::path::Path, name: &str) -> Result<Option<String>> {
+    if let Some(sha) = crate::repo::service::try_get_branch_sha(repo_path, name)? {
+        return Ok(Some(sha));
+    }
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+    let tag_ref = format!("refs/tags/{name}");
+    if let Some(mut reference) = repo
+        .try_find_reference(tag_ref.as_str())
+        .with_context(|| format!("failed to look up {tag_ref} in {repo_path:?}"))?
+    {
+        let commit = reference
+            .peel_to_commit()
+            .with_context(|| format!("tag '{name}' does not point at a commit"))?;
+        return Ok(Some(commit.id.to_string()));
+    }
+    // Shorter than four characters is not an id `git` would accept either.
+    if name.len() < 4 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    let Ok(prefix) = gix::hash::Prefix::from_hex(name) else {
+        return Ok(None);
+    };
+    let object_id = match repo
+        .objects
+        .lookup_prefix(prefix, None)
+        .with_context(|| format!("looking up commit '{name}' in {repo_path:?}"))?
+    {
+        None => return Ok(None),
+        Some(Err(())) => {
+            return Err(crate::error::invalid_request(format!(
+                "commit SHA '{name}' is ambiguous"
+            )))
+        }
+        Some(Ok(id)) => id,
+    };
+    let object = repo
+        .find_object(object_id)
+        .with_context(|| format!("reading object {object_id}"))?;
+    Ok((object.kind == gix::object::Kind::Commit).then(|| object_id.to_string()))
+}
+
+/// The comparison of `base_rev` with `head_rev`, both in `repo_path`: the
+/// same merge base, numstat and patch a pull request's diff reads, plus the
+/// commits between. `base` and `head_branch` are the names the caller asked
+/// for, echoed back.
 fn compare_in(
     repo_path: &std::path::Path,
     base: &str,
+    base_rev: &str,
     head_branch: &str,
     head_rev: &str,
 ) -> Result<Comparison> {
-    let (old_rev, new_rev) =
-        plombir_git_diff_revs(repo_path, &format!("refs/heads/{base}"), head_rev)?;
+    let (old_rev, new_rev) = plombir_git_diff_revs(repo_path, base_rev, head_rev)?;
     let (mut files, stats) = gix_diff_numstat(repo_path, old_rev.clone(), new_rev.clone())?;
     let patch_text = plombir_git_patch_text(repo_path, &old_rev, &new_rev)?;
     attach_patches(&mut files, &patch_text);

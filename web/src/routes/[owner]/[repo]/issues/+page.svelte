@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
+  import LabelChip from '$lib/components/LabelChip.svelte';
   import { issues, labels } from '$lib/api/client.svelte';
   import {
     LatestRepositoryRequestFence,
@@ -24,6 +25,9 @@
   let issueTemplates = $state<any[]>([]);
   let templateConfig = $state<any>({ blank_issues_enabled: true, contact_links: [] });
   let labelOptions = $state<Array<{ id: number; name: string; color: string }>>([]);
+  // Issues carry label names only; the colours come from the label list this
+  // page loads for the create form anyway.
+  let labelColors = $derived(new Map(labelOptions.map((label) => [label.name, label.color])));
   let labelsLoading = $state(true);
   let labelsError = $state('');
   let newTitle = $state('');
@@ -346,7 +350,7 @@
               {t('issues.meta', { number: issue.number, date: formatDate(issue.created_at), author: issue.author || t('common.unknown') })}<BotBadge owner={issue.author_bot_owner} link={false} />
               {#if issue.labels?.length}
                 {#each issue.labels as label}
-                  <span class="label-badge">{label}</span>
+                  <LabelChip name={label} color={labelColors.get(label)} />
                 {/each}
               {/if}
             </div>
@@ -465,15 +469,5 @@
     font-size: 12px;
     color: var(--text-muted);
     margin-top: 2px;
-  }
-
-  .label-badge {
-    display: inline-block;
-    padding: 0 6px;
-    border: 1px solid var(--purple);
-    color: var(--purple);
-    border-radius: 10px;
-    font-size: 11px;
-    margin-left: 4px;
   }
 </style>

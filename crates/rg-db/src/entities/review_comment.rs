@@ -40,6 +40,9 @@ pub struct Model {
     pub resolved_at: Option<DateTimeUtc>,
     pub resolved_by_id: Option<i64>,
     pub created_at: DateTimeUtc,
+    /// When the body was last edited — `created_at` until then. Applying the
+    /// suggestion and resolving the thread have their own columns and leave it
+    /// alone, because clients read it as "the author changed this text".
     pub updated_at: DateTimeUtc,
 }
 

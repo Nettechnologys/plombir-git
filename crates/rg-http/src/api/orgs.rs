@@ -485,6 +485,16 @@ pub async fn add_org_member(
                 Some(details),
             )
             .await;
+            announce_membership_change(
+                &state,
+                org.clone(),
+                MembershipNotice::Org {
+                    role: m.role.clone(),
+                },
+                member_user.id,
+                actor_id,
+                rg_core::collaborator::service::AccessChange::Granted,
+            );
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
@@ -564,6 +574,16 @@ pub async fn remove_org_member(
                 Some(details),
             )
             .await;
+            announce_membership_change(
+                &state,
+                org.clone(),
+                MembershipNotice::Org {
+                    role: String::new(),
+                },
+                user_id,
+                actor_id,
+                rg_core::collaborator::service::AccessChange::Revoked,
+            );
             Json(serde_json::json!({"removed": true})).into_response()
         }
         Err(e) => AppError::from(e).into_response(),
@@ -754,8 +774,25 @@ pub async fn delete_team(
         Err(error) => return AppError::from(error).into_response(),
     };
 
+    // Read before the rows go: deleting the team takes its repository access
+    // from every member, and each of them is told, as a single removal is.
+    let members = match rg_core::org::list_team_members(&state.db, team.id).await {
+        Ok(members) => members,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+
     match rg_core::org::delete_team(&state.db, team.id).await {
         Ok(()) => {
+            for member in &members {
+                announce_membership_change(
+                    &state,
+                    org.clone(),
+                    MembershipNotice::Team(team.clone()),
+                    member.user_id,
+                    actor_id,
+                    rg_core::collaborator::service::AccessChange::Revoked,
+                );
+            }
             rg_core::audit::record(
                 &state.db,
                 &audit_actor,
@@ -898,6 +935,14 @@ pub async fn add_team_member(
                 })),
             )
             .await;
+            announce_membership_change(
+                &state,
+                org.clone(),
+                MembershipNotice::Team(team.clone()),
+                member_user.id,
+                actor_id,
+                rg_core::collaborator::service::AccessChange::Granted,
+            );
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
@@ -971,6 +1016,14 @@ pub async fn remove_team_member(
                 })),
             )
             .await;
+            announce_membership_change(
+                &state,
+                org.clone(),
+                MembershipNotice::Team(team.clone()),
+                user_id,
+                actor_id,
+                rg_core::collaborator::service::AccessChange::Revoked,
+            );
             Json(serde_json::json!({"removed": true})).into_response()
         }
         Err(e) => AppError::from(e).into_response(),
@@ -978,6 +1031,58 @@ pub async fn remove_team_member(
 }
 
 // ── Helpers ──────────────────────────────────────────────────
+
+/// Which membership [`announce_membership_change`] reports, owned so it can
+/// cross into the delivery task.
+enum MembershipNotice {
+    Org { role: String },
+    Team(rg_db::entities::team::Model),
+}
+
+/// Tell the member, in their inbox and live over the notification socket, that
+/// an organization or team membership was given or taken away.
+///
+/// Detached like the collaborator notice in `collaborators.rs`: the change has
+/// committed and answered, and a failed notice is logged, not returned.
+fn announce_membership_change(
+    state: &AppState,
+    org: rg_db::entities::organization::Model,
+    membership: MembershipNotice,
+    user_id: i64,
+    actor_id: i64,
+    change: rg_core::collaborator::service::AccessChange,
+) {
+    let db = state.db_pools();
+    let hub = state.notification_hub.clone();
+    rg_core::task_tracker::delivery_tracker().spawn(async move {
+        let membership = match &membership {
+            MembershipNotice::Org { role } => rg_core::org::Membership::Org { role },
+            MembershipNotice::Team(team) => rg_core::org::Membership::Team { team },
+        };
+        match rg_core::org::notify_membership_change(
+            &db, &org, membership, user_id, actor_id, change,
+        )
+        .await
+        {
+            Ok(Some(row)) => {
+                hub.push_notification(
+                    user_id,
+                    rg_core::collaborator::service::ACCESS_NOTIFICATION_TYPE,
+                    serde_json::json!(row),
+                )
+                .await
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                org_id = org.id,
+                user_id,
+                ?change,
+                error = %format!("{error:#}"),
+                "membership change notification was not delivered"
+            ),
+        }
+    });
+}
 
 /// Authentication gate for the handlers below.
 ///

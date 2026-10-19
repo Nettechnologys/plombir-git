@@ -43,6 +43,7 @@
   "nav": {
     "dashboard": "仪表板",
     "notifications": "通知",
+    "notifications_unread": "{count} 条未读通知",
     "organizations": "组织",
     "imports": "导入",
     "settings": "设置",

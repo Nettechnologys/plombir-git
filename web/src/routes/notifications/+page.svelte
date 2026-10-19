@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { notifications, connectNotificationWebSocket, type NotificationRow } from '$lib/api/client.svelte';
+  import { setUnreadCount } from '$lib/stores/unreadNotifications.svelte';
   import { getUser, isLoggedIn } from '$lib/stores/auth.svelte';
   import { createT, formatDateTime, formatTranslationFallback } from '$lib/i18n';
 
@@ -43,6 +44,7 @@
       if (!ownsLoad(claim)) return;
       notifs = listData.data;
       unreadCount = countData.unread_count || 0;
+      setUnreadCount(unreadCount);
     } catch (e) {
       if (!ownsLoad(claim)) return;
       loadError = e instanceof Error ? e.message : t('errors.load_failed');
@@ -100,6 +102,7 @@
     if (!notif.is_read) {
       try {
         await notifications.markRead(notif.id);
+        setUnreadCount(unreadCount - 1);
       } catch (e) {
         console.error('Failed to mark as read:', e);
       }

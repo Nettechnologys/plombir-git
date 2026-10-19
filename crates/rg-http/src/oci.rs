@@ -1282,56 +1282,18 @@ pub async fn delete_manifest(
         Ok(reference) => reference,
         Err(error) => return oci_reference_error(&error),
     };
-    let metadata_key = format!("oci/metadata/{}", oci_repo.id);
-    let lease = match acquire_publication_lease(&state.db, &metadata_key).await {
-        Ok(lease) => lease,
-        Err(error) => return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
-    };
-    if !lease.exclusive() {
-        release_publication_lease(&state.db, &lease).await;
-        return oci_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "UNKNOWN",
-            "OCI metadata lease was recovered; retry deletion",
-        );
-    }
-    let result = match &reference {
-        Reference::Tag(tag) => rg_db::ops::oci_ops::delete_tag(&state.db, oci_repo.id, tag)
-            .await
-            .map(|deleted| {
-                if deleted {
-                    rg_db::ops::oci_ops::ManifestDeleteOutcome::Deleted
-                } else {
-                    rg_db::ops::oci_ops::ManifestDeleteOutcome::Missing
-                }
-            }),
-        Reference::Digest(digest) => {
-            rg_db::ops::oci_ops::delete_manifest_by_digest(&state.db, oci_repo.id, digest).await
-        }
-    };
-    release_publication_lease(&state.db, &lease).await;
-    match result {
+    match retire_manifest(
+        &state,
+        oci_repo.id,
+        &owner,
+        &repo,
+        &reference,
+        user_id,
+        &headers,
+    )
+    .await
+    {
         Ok(rg_db::ops::oci_ops::ManifestDeleteOutcome::Deleted) => {
-            let actor = match user_id {
-                Some(user_id) => {
-                    rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, user_id).await
-                }
-                None => rg_core::audit::AuditActor::none(),
-            };
-            rg_core::audit::record(
-                &state.db,
-                &actor,
-                "oci.manifest.delete",
-                Some("oci_manifest"),
-                None,
-                Some(&match &reference {
-                    Reference::Tag(tag) => format!("{owner}/{repo}:{tag}"),
-                    Reference::Digest(digest) => format!("{owner}/{repo}@{digest}"),
-                }),
-                Some(&headers),
-                Some(serde_json::json!({"reference": reference.as_str()})),
-            )
-            .await;
             StatusCode::ACCEPTED.into_response()
         }
         Ok(rg_db::ops::oci_ops::ManifestDeleteOutcome::Missing) => {
@@ -1342,8 +1304,94 @@ pub async fn delete_manifest(
             error_codes::DENIED,
             "manifest is referenced by an image index",
         ),
-        Err(error) => oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
+        Err(ManifestRetireError::Lease(error)) => {
+            oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}"))
+        }
+        Err(ManifestRetireError::LeaseRecovered) => oci_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNKNOWN",
+            "OCI metadata lease was recovered; retry deletion",
+        ),
+        Err(ManifestRetireError::Store(error)) => {
+            oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}"))
+        }
     }
+}
+
+/// Why [`retire_manifest`] did not reach a deletion outcome.
+pub(crate) enum ManifestRetireError {
+    /// The repository metadata lease could not be taken.
+    Lease(anyhow::Error),
+    /// The lease was taken over from a publisher that never released it, so
+    /// this request cannot prove the metadata is quiescent.
+    LeaseRecovered,
+    /// The deletion itself failed.
+    Store(sea_orm::DbErr),
+}
+
+/// The one manifest retirement both doors use: the Docker `/v2` endpoint and
+/// the browser's `DELETE /repos/{owner}/{name}/packages/oci/images/{digest}`.
+///
+/// Lease, deletion and the `oci.manifest.delete` audit row live here so the
+/// two handlers differ only in their error envelopes. They used to carry their
+/// own copies, and the copy behind the browser button never wrote the audit
+/// row (card_e1e06a8e8dc3).
+pub(crate) async fn retire_manifest(
+    state: &AppState,
+    oci_repo_id: i64,
+    owner: &str,
+    repo: &str,
+    reference: &Reference,
+    actor_id: Option<i64>,
+    headers: &HeaderMap,
+) -> Result<rg_db::ops::oci_ops::ManifestDeleteOutcome, ManifestRetireError> {
+    let metadata_key = format!("oci/metadata/{oci_repo_id}");
+    let lease = acquire_publication_lease(&state.db, &metadata_key)
+        .await
+        .map_err(ManifestRetireError::Lease)?;
+    if !lease.exclusive() {
+        release_publication_lease(&state.db, &lease).await;
+        return Err(ManifestRetireError::LeaseRecovered);
+    }
+    let result = match reference {
+        Reference::Tag(tag) => rg_db::ops::oci_ops::delete_tag(&state.db, oci_repo_id, tag)
+            .await
+            .map(|deleted| {
+                if deleted {
+                    rg_db::ops::oci_ops::ManifestDeleteOutcome::Deleted
+                } else {
+                    rg_db::ops::oci_ops::ManifestDeleteOutcome::Missing
+                }
+            }),
+        Reference::Digest(digest) => {
+            rg_db::ops::oci_ops::delete_manifest_by_digest(&state.db, oci_repo_id, digest).await
+        }
+    };
+    release_publication_lease(&state.db, &lease).await;
+    let outcome = result.map_err(ManifestRetireError::Store)?;
+    if outcome == rg_db::ops::oci_ops::ManifestDeleteOutcome::Deleted {
+        let actor = match actor_id {
+            Some(actor_id) => {
+                rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, actor_id).await
+            }
+            None => rg_core::audit::AuditActor::none(),
+        };
+        rg_core::audit::record(
+            &state.db,
+            &actor,
+            "oci.manifest.delete",
+            Some("oci_manifest"),
+            None,
+            Some(&match reference {
+                Reference::Tag(tag) => format!("{owner}/{repo}:{tag}"),
+                Reference::Digest(digest) => format!("{owner}/{repo}@{digest}"),
+            }),
+            Some(headers),
+            Some(serde_json::json!({"reference": reference.as_str()})),
+        )
+        .await;
+    }
+    Ok(outcome)
 }
 
 async fn get_manifest_impl(

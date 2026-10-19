@@ -1571,3 +1571,161 @@ async fn a_resource_read_is_held_to_the_tokens_tools_and_repositories() {
         .collect();
     assert_eq!(uris, ["file://{owner}/{name}/{path}"]);
 }
+
+/// An inline review thread names who wrote each comment, and says when that is
+/// a bot acting for someone (card_691280137be7). The bookkeeping writes around
+/// it — applying the suggestion, resolving the thread — do not mark the
+/// reviewer's comment as edited; only an edit of its text does
+/// (card_f58b8b128e57).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_review_thread_names_its_authors_and_only_an_edit_marks_one_edited() {
+    let f = fixture(StateOverrides::default()).await;
+    let agent = f.bot_token(serde_json::json!({ "name": "reviewer" })).await;
+    let pulls = format!("{}/api/v1/repos/alice/app/pulls", f.base);
+    let response = f
+        .http
+        .post(&pulls)
+        .bearer_auth(&f.alice)
+        .json(&serde_json::json!({ "title": "feature", "head": "feature", "base": "main" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+    let number = response.json::<serde_json::Value>().await.unwrap()["number"]
+        .as_i64()
+        .unwrap();
+    let pr = format!("{pulls}/{number}");
+    let send = |method: reqwest::Method, url: String, token: &str, body: serde_json::Value| {
+        f.http
+            .request(method, url)
+            .bearer_auth(token.to_string())
+            .json(&body)
+            .send()
+    };
+
+    let response = send(
+        reqwest::Method::POST,
+        format!("{pr}/comments"),
+        &f.alice,
+        serde_json::json!({
+            "path": "feature.txt", "line": 1, "side": "RIGHT",
+            "body": "Shout it", "suggestion": "FEATURE\n",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+    let root: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(root["author"], "alice", "{root}");
+    assert!(root.get("author_bot_owner").is_none(), "{root}");
+    let root_id = root["id"].as_i64().unwrap();
+
+    let response = send(
+        reqwest::Method::POST,
+        format!("{pr}/comments/{root_id}/suggestion/apply"),
+        &agent,
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let applied: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(applied["comment"]["author"], "alice", "{applied}");
+
+    let response = send(
+        reqwest::Method::POST,
+        format!("{pr}/comments"),
+        &agent,
+        serde_json::json!({
+            "path": "feature.txt", "line": 1, "side": "RIGHT",
+            "body": "Applied in the latest commit", "reply_to_id": root_id,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+    let reply: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(reply["author"], "alice-agent", "{reply}");
+    assert_eq!(reply["author_bot_owner"], "alice", "{reply}");
+
+    let response = send(
+        reqwest::Method::PATCH,
+        format!("{pr}/comments/{root_id}/resolution"),
+        &f.alice,
+        serde_json::json!({ "resolved": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let resolved: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(resolved["author"], "alice", "{resolved}");
+
+    let thread = |token: String| {
+        let url = format!("{pr}/comments");
+        let http = f.http.clone();
+        async move {
+            let response = http.get(url).bearer_auth(token).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            response.json::<Vec<serde_json::Value>>().await.unwrap()
+        }
+    };
+    let comments = thread(f.alice.clone()).await;
+    let by_id = |comments: &[serde_json::Value], id: i64| {
+        comments
+            .iter()
+            .find(|comment| comment["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("comment {id} missing: {comments:?}"))
+    };
+    let root = by_id(&comments, root_id);
+    assert_eq!(root["author"], "alice", "{root}");
+    assert!(root["suggestion_applied_at"].is_string(), "{root}");
+    assert!(root["resolved_at"].is_string(), "{root}");
+    assert_eq!(
+        root["updated_at"], root["created_at"],
+        "applying and resolving are not edits: {root}"
+    );
+    let reply = by_id(&comments, reply["id"].as_i64().unwrap());
+    assert_eq!(reply["author"], "alice-agent", "{reply}");
+    assert_eq!(reply["author_bot_owner"], "alice", "{reply}");
+
+    // The timeline says the same about who applied the suggestion.
+    let response = f
+        .http
+        .get(format!("{pr}/timeline"))
+        .bearer_auth(&f.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let timeline: Vec<serde_json::Value> = response.json().await.unwrap();
+    let applied = timeline
+        .iter()
+        .find(|event| event["kind"] == "suggestion_applied")
+        .unwrap_or_else(|| panic!("no suggestion_applied: {timeline:?}"));
+    assert_eq!(applied["actor"]["username"], "alice-agent", "{applied}");
+    assert_eq!(applied["actor"]["bot_owner"], "alice", "{applied}");
+    let opened = timeline
+        .iter()
+        .find(|event| event["kind"] == "pull_request_opened")
+        .unwrap();
+    assert!(opened["actor"].get("bot_owner").is_none(), "{opened}");
+
+    let response = send(
+        reqwest::Method::PATCH,
+        format!("{pr}/comments/{root_id}"),
+        &f.alice,
+        serde_json::json!({ "body": "Shout it, please" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let edited: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(edited["author"], "alice", "{edited}");
+    let created = chrono::DateTime::parse_from_rfc3339(edited["created_at"].as_str().unwrap());
+    let updated = chrono::DateTime::parse_from_rfc3339(edited["updated_at"].as_str().unwrap());
+    assert!(
+        updated.unwrap() > created.unwrap(),
+        "an edit is an edit: {edited}"
+    );
+}

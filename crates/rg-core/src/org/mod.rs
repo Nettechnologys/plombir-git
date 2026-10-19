@@ -407,6 +407,78 @@ pub async fn remove_team_member(db: &DatabaseConnection, team_id: i64, user_id: 
     Ok(())
 }
 
+/// Which membership changed: in the organization itself, or in one of its
+/// teams.
+#[derive(Debug, Clone, Copy)]
+pub enum Membership<'a> {
+    Org {
+        role: &'a str,
+    },
+    Team {
+        team: &'a rg_db::entities::team::Model,
+    },
+}
+
+/// Tell `user_id` that `actor_id` added them to, or removed them from, an
+/// organization or one of its teams.
+///
+/// Membership is access: an organization member reads its repositories, and a
+/// team carries a repository permission. Repository collaborators were told of
+/// a grant (card_9da74035521e), but these four doors gave and took the same
+/// kind of access in silence (card_1d938b4213e6). The row has the collaborator
+/// notice's type, so the inbox shows both the same way. Returns `None` when the
+/// actor changed their own membership.
+///
+/// Runs after the change has committed: a caller logs a failure, it does not
+/// undo the membership.
+pub async fn notify_membership_change(
+    db: &impl crate::db::DbPools,
+    org: &rg_db::entities::organization::Model,
+    membership: Membership<'_>,
+    user_id: i64,
+    actor_id: i64,
+    change: crate::collaborator::service::AccessChange,
+) -> Result<Option<rg_db::entities::notification::Model>> {
+    use crate::collaborator::service::AccessChange;
+
+    if user_id == actor_id {
+        return Ok(None);
+    }
+    let actor = rg_db::ops::user_ops::find_by_id(db.read(), actor_id)
+        .await?
+        .map(|user| user.username)
+        .unwrap_or_else(|| "Someone".to_string());
+    let org_name = &org.name;
+    let title = match (membership, change) {
+        (Membership::Org { role }, AccessChange::Granted | AccessChange::Changed) => {
+            format!("{actor} added you to {org_name} as {role}")
+        }
+        (Membership::Org { .. }, AccessChange::Revoked) => {
+            format!("{actor} removed you from {org_name}")
+        }
+        (Membership::Team { team }, AccessChange::Granted | AccessChange::Changed) => format!(
+            "{actor} added you to team {} in {org_name} ({} access to its repositories)",
+            team.name, team.permission
+        ),
+        (Membership::Team { team }, AccessChange::Revoked) => {
+            format!("{actor} removed you from team {} in {org_name}", team.name)
+        }
+    };
+    // As with a revoked collaborator: the row says which organization it was,
+    // without sending a former member to a page that may now refuse them.
+    let link = (change != AccessChange::Revoked).then(|| format!("/orgs/{org_name}"));
+    let row = rg_db::ops::notification_ops::create_linked_notification(
+        db.write(),
+        user_id,
+        crate::collaborator::service::ACCESS_NOTIFICATION_TYPE,
+        &title,
+        None,
+        link.as_deref(),
+    )
+    .await?;
+    Ok(Some(row))
+}
+
 /// List team members.
 pub async fn list_team_members(
     db: &DatabaseConnection,

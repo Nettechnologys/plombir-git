@@ -23,9 +23,9 @@
 | Reachable from the browser | 310 (71%) |
 | Layout modules | 2 |
 | Pages | 73 |
-| Interactive controls | 1055 |
+| Interactive controls | 1057 |
 | Controls calling an API | 373 |
-| Controls from shared components | 425 |
+| Controls from shared components | 427 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
 | **UI routes without a web/smoke/browser test** | **24** |
 | UI routes without corpus or browser coverage | 0 |
@@ -57,7 +57,7 @@
 
 | Page | controls | call an API | from components |
 |---|---:|---:|---:|
-| `/[owner]/[repo]/pulls/[number]` | 71 | 36 | 25 |
+| `/[owner]/[repo]/pulls/[number]` | 73 | 36 | 27 |
 | `/[owner]/[repo]/boards` | 42 | 14 | 15 |
 | `/[owner]/[repo]/issues/[number]` | 40 | 17 | 23 |
 | `/[owner]/[repo]/pulls` | 28 | 12 | 12 |
@@ -313,13 +313,13 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:issues.tabs.open | :210 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
-| i18n:issues.tabs.closed | :217 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
-| i18n:issues.tabs.all | :224 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
-| i18n:issues.new | :232 | `GET /api/v1/repos/{owner}/{name}/issue_templates` | `RepoRead` | rust+web+browser |
-| i18n:issues.new | :232 | `GET /api/v1/repos/{owner}/{name}/issue_config` | `RepoRead` | rust+web+browser |
-| toggleLabel(label.name, event.currentTarget.checked)} /> }> | :280 | `POST /api/v1/repos/{owner}/{name}/issues` | `RepoAuthRead` | rust+web+browser |
-| toggleLabel(label.name, event.currentTarget.checked)} /> }> | :280 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web+browser |
+| i18n:issues.tabs.open | :214 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
+| i18n:issues.tabs.closed | :221 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
+| i18n:issues.tabs.all | :228 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
+| i18n:issues.new | :236 | `GET /api/v1/repos/{owner}/{name}/issue_templates` | `RepoRead` | rust+web+browser |
+| i18n:issues.new | :236 | `GET /api/v1/repos/{owner}/{name}/issue_config` | `RepoRead` | rust+web+browser |
+| toggleLabel(label.name, event.currentTarget.checked)} /> }> | :284 | `POST /api/v1/repos/{owner}/{name}/issues` | `RepoAuthRead` | rust+web+browser |
+| toggleLabel(label.name, event.currentTarget.checked)} /> }> | :284 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web+browser |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -334,22 +334,24 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:common.loading | :401 | `PATCH /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoWrite` | rust+web |
-| i18n:common.saving | :443 | `PATCH /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}` | `RepoAdmin` | web+browser |
-| i18n:issues.comment_placeholder | :460 | `POST /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoAuthRead` | rust+browser |
-| i18n:issues.comment_placeholder | :460 | `GET /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoRead` | rust+web+browser |
-| i18n:issues.comment_placeholder | :460 | `GET /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoRead` | rust+web+browser |
-| i18n:issues.comment_placeholder | :460 | `GET /api/v1/repos/{owner}/{name}/milestones` | `RepoRead` | rust+web+browser |
-| i18n:issues.comment_placeholder | :460 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust+web+browser |
-| i18n:issues.comment_placeholder | :460 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
-| i18n:issues.close_issue | :465 | `PATCH /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoWrite` | rust+web+browser |
-| i18n:issues.close_issue | :465 | `GET /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoRead` | rust+web |
-| i18n:issues.close_issue | :465 | `GET /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoRead` | rust+web |
-| i18n:issues.close_issue | :465 | `GET /api/v1/repos/{owner}/{name}/milestones` | `RepoRead` | rust+web |
-| i18n:issues.close_issue | :465 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust+web |
-| i18n:issues.close_issue | :465 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
-| i18n:common.deleting | :494 | `DELETE /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}` | `RepoAdmin` | rust+web+browser |
-| i18n:common.deleting | :510 | `DELETE /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoAdmin` | web+browser |
+| i18n:common.loading | :420 | `PATCH /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoWrite` | rust+web |
+| i18n:common.saving | :462 | `PATCH /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}` | `RepoAdmin` | web+browser |
+| i18n:issues.comment_placeholder | :479 | `POST /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoAuthRead` | rust+browser |
+| i18n:issues.comment_placeholder | :479 | `GET /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoRead` | rust+web+browser |
+| i18n:issues.comment_placeholder | :479 | `GET /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoRead` | rust+web+browser |
+| i18n:issues.comment_placeholder | :479 | `GET /api/v1/repos/{owner}/{name}/milestones` | `RepoRead` | rust+web+browser |
+| i18n:issues.comment_placeholder | :479 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust+web+browser |
+| i18n:issues.comment_placeholder | :479 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| i18n:issues.comment_placeholder | :479 | `GET /api/v1/repos/{owner}/{name}/labels` | `RepoRead` | rust+web |
+| i18n:issues.close_issue | :484 | `PATCH /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoWrite` | rust+web+browser |
+| i18n:issues.close_issue | :484 | `GET /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoRead` | rust+web |
+| i18n:issues.close_issue | :484 | `GET /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoRead` | rust+web |
+| i18n:issues.close_issue | :484 | `GET /api/v1/repos/{owner}/{name}/milestones` | `RepoRead` | rust+web |
+| i18n:issues.close_issue | :484 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust+web |
+| i18n:issues.close_issue | :484 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| i18n:issues.close_issue | :484 | `GET /api/v1/repos/{owner}/{name}/labels` | `RepoRead` | rust+web |
+| i18n:common.deleting | :513 | `DELETE /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}` | `RepoAdmin` | rust+web+browser |
+| i18n:common.deleting | :529 | `DELETE /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoAdmin` | web+browser |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -628,36 +630,36 @@ succeed and which must be denied.
 | i18n:pulls.suggestion.apply | :950 | `GET /api/v1/repos/{owner}/{name}/merge-queue` | `RepoRead` | rust+web |
 | i18n:pulls.threads.reopen | :962 | `PATCH /api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}/resolution` | `RepoWrite` | **—** |
 | i18n:pulls.threads.reopen | :962 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoRead` | rust+web |
-| i18n:pulls.suggestion.apply | :1020 | `POST /api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}/suggestion/apply` | `RepoWrite` | rust |
-| i18n:pulls.suggestion.apply | :1020 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}` | `RepoRead` | rust+web |
-| i18n:pulls.suggestion.apply | :1020 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/diff` | `RepoRead` | rust+web |
-| i18n:pulls.suggestion.apply | :1020 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviews` | `RepoRead` | rust+web |
-| i18n:pulls.suggestion.apply | :1020 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoRead` | rust+web |
-| i18n:pulls.suggestion.apply | :1020 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/timeline` | `RepoRead` | rust+web |
-| i18n:pulls.suggestion.apply | :1020 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviewers` | `RepoRead` | rust+web |
-| i18n:pulls.suggestion.apply | :1020 | `GET /api/v1/repos/{owner}/{name}/merge-queue` | `RepoRead` | rust+web |
-| i18n:pulls.threads.reopen | :1030 | `PATCH /api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}/resolution` | `RepoWrite` | browser |
-| i18n:pulls.threads.reopen | :1030 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoRead` | rust+web |
-| i18n:pulls.diff.submit_comment | :1050 | `POST /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoAuthRead` | rust+browser |
-| i18n:pulls.diff.submit_comment | :1050 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoRead` | rust+web |
-| i18n:common.retry | :1062 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}` | `RepoRead` | rust+web |
-| i18n:common.retry | :1062 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/diff` | `RepoRead` | rust+web |
-| i18n:common.retry | :1062 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviews` | `RepoRead` | rust+web |
-| i18n:common.retry | :1062 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoRead` | rust+web |
-| i18n:common.retry | :1062 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/timeline` | `RepoRead` | rust+web |
-| i18n:common.retry | :1062 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviewers` | `RepoRead` | rust+web |
-| i18n:common.retry | :1062 | `GET /api/v1/repos/{owner}/{name}/merge-queue` | `RepoRead` | rust+web |
-| i18n:pulls.review.submit | :1089 | `POST /api/v1/repos/{owner}/{name}/pulls/{number}/reviews` | `RepoAuthRead` | rust+browser |
-| i18n:pulls.review.submit | :1089 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}` | `RepoRead` | rust+web+browser |
-| i18n:pulls.review.submit | :1089 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/diff` | `RepoRead` | rust+web+browser |
-| i18n:pulls.review.submit | :1089 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviews` | `RepoRead` | rust+web+browser |
-| i18n:pulls.review.submit | :1089 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoRead` | rust+web+browser |
-| i18n:pulls.review.submit | :1089 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/timeline` | `RepoRead` | rust+web+browser |
-| i18n:pulls.review.submit | :1089 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviewers` | `RepoRead` | rust+web+browser |
-| i18n:pulls.review.submit | :1089 | `GET /api/v1/repos/{owner}/{name}/merge-queue` | `RepoRead` | rust+web+browser |
-| i18n:common.saving | :1116 | `PATCH /api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}` | `RepoAdmin` | web+browser |
-| i18n:common.deleting | :1144 | `DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}` | `RepoAdmin` | web+browser |
-| i18n:common.deleting | :1160 | `DELETE /api/v1/repos/{owner}/{name}/pulls/{number}` | `RepoAdmin` | web+browser |
+| i18n:pulls.suggestion.apply | :1021 | `POST /api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}/suggestion/apply` | `RepoWrite` | rust |
+| i18n:pulls.suggestion.apply | :1021 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}` | `RepoRead` | rust+web |
+| i18n:pulls.suggestion.apply | :1021 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/diff` | `RepoRead` | rust+web |
+| i18n:pulls.suggestion.apply | :1021 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviews` | `RepoRead` | rust+web |
+| i18n:pulls.suggestion.apply | :1021 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoRead` | rust+web |
+| i18n:pulls.suggestion.apply | :1021 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/timeline` | `RepoRead` | rust+web |
+| i18n:pulls.suggestion.apply | :1021 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviewers` | `RepoRead` | rust+web |
+| i18n:pulls.suggestion.apply | :1021 | `GET /api/v1/repos/{owner}/{name}/merge-queue` | `RepoRead` | rust+web |
+| i18n:pulls.threads.reopen | :1031 | `PATCH /api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}/resolution` | `RepoWrite` | browser |
+| i18n:pulls.threads.reopen | :1031 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoRead` | rust+web |
+| i18n:pulls.diff.submit_comment | :1051 | `POST /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoAuthRead` | rust+browser |
+| i18n:pulls.diff.submit_comment | :1051 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoRead` | rust+web |
+| i18n:common.retry | :1063 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}` | `RepoRead` | rust+web |
+| i18n:common.retry | :1063 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/diff` | `RepoRead` | rust+web |
+| i18n:common.retry | :1063 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviews` | `RepoRead` | rust+web |
+| i18n:common.retry | :1063 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoRead` | rust+web |
+| i18n:common.retry | :1063 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/timeline` | `RepoRead` | rust+web |
+| i18n:common.retry | :1063 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviewers` | `RepoRead` | rust+web |
+| i18n:common.retry | :1063 | `GET /api/v1/repos/{owner}/{name}/merge-queue` | `RepoRead` | rust+web |
+| i18n:pulls.review.submit | :1090 | `POST /api/v1/repos/{owner}/{name}/pulls/{number}/reviews` | `RepoAuthRead` | rust+browser |
+| i18n:pulls.review.submit | :1090 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}` | `RepoRead` | rust+web+browser |
+| i18n:pulls.review.submit | :1090 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/diff` | `RepoRead` | rust+web+browser |
+| i18n:pulls.review.submit | :1090 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviews` | `RepoRead` | rust+web+browser |
+| i18n:pulls.review.submit | :1090 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/comments` | `RepoRead` | rust+web+browser |
+| i18n:pulls.review.submit | :1090 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/timeline` | `RepoRead` | rust+web+browser |
+| i18n:pulls.review.submit | :1090 | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/reviewers` | `RepoRead` | rust+web+browser |
+| i18n:pulls.review.submit | :1090 | `GET /api/v1/repos/{owner}/{name}/merge-queue` | `RepoRead` | rust+web+browser |
+| i18n:common.saving | :1123 | `PATCH /api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}` | `RepoAdmin` | web+browser |
+| i18n:common.deleting | :1152 | `DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}` | `RepoAdmin` | web+browser |
+| i18n:common.deleting | :1168 | `DELETE /api/v1/repos/{owner}/{name}/pulls/{number}` | `RepoAdmin` | web+browser |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -1133,15 +1135,15 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| load | :169 | `GET /api/v1/notifications` | `User` | rust+web |
-| load | :169 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
-| i18n:notifications.mark_all_read | :173 | `POST /api/v1/notifications/mark-all-read` | `User` | rust+web |
-| i18n:notifications.mark_all_read | :173 | `GET /api/v1/notifications` | `User` | rust+web |
-| i18n:notifications.mark_all_read | :173 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
-| → internalLink(notif) | :199 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
-| i18n:notifications.mark_read | :215 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
-| i18n:notifications.mark_read | :215 | `GET /api/v1/notifications` | `User` | rust+web |
-| i18n:notifications.mark_read | :215 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
+| load | :172 | `GET /api/v1/notifications` | `User` | rust+web |
+| load | :172 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
+| i18n:notifications.mark_all_read | :176 | `POST /api/v1/notifications/mark-all-read` | `User` | rust+web |
+| i18n:notifications.mark_all_read | :176 | `GET /api/v1/notifications` | `User` | rust+web |
+| i18n:notifications.mark_all_read | :176 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
+| → internalLink(notif) | :202 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
+| i18n:notifications.mark_read | :218 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
+| i18n:notifications.mark_read | :218 | `GET /api/v1/notifications` | `User` | rust+web |
+| i18n:notifications.mark_read | :218 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
 | _(page load)_ | — | `GET /api/v1/ws/notifications` | `Foreign:ws.rs` | rust+web |
 
 ### `/orgs`

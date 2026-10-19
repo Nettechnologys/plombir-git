@@ -43,6 +43,7 @@
   "nav": {
     "dashboard": "Dashboard",
     "notifications": "Notifications",
+    "notifications_unread": "{count} unread notifications",
     "organizations": "Organizations",
     "imports": "Imports",
     "settings": "Settings",

@@ -1474,9 +1474,12 @@ async fn trigger_push_webhooks(
         "ref": update.refname,
         "before": update.old_sha,
         "after": update.new_sha,
+        // `full_name` is what the chat formats print after "in"; without it a
+        // Slack push message named no repository at all.
         "repository": {
             "owner": target.owner,
             "name": target.name,
+            "full_name": format!("{}/{}", target.owner, target.name),
         },
     });
 

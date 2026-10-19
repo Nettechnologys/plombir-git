@@ -866,7 +866,7 @@
                   <span class="timeline-dot"></span>
                   <div>
                     <div class="timeline-summary">
-                      <strong>{event.actor?.username || t('pulls.timeline.system')}</strong>
+                      <strong>{event.actor?.username || t('pulls.timeline.system')}</strong><BotBadge owner={event.actor?.bot_owner} />
                       <span>{t(`pulls.timeline.${event.kind}`, event.metadata || {}, formatTranslationFallback(event.kind))}</span>
                       {#if verdict?.dismissed_at}
                         <span class="withdrawn-badge">{t('pulls.review.withdrawn')}</span>
@@ -1005,7 +1005,8 @@
                       <code>{line.content || ' '}</code>
                     </div>
                     {#each lineComments as comment (comment.id)}
-                      <div class="inline-thread" class:resolved={Boolean(comment.resolved_at)}>
+                      <div class="inline-thread" class:resolved={Boolean(comment.resolved_at)} data-inline-comment={comment.id}>
+                        {@render commentAuthor(comment)}
                         <div class="markdown-body">{@html renderMarkdown(comment.body)}</div>{#if isEdited(comment)}<span class="edited-marker">{t('comments.edited')}</span>{/if}
                         {#if comment.suggestion !== null && comment.suggestion !== undefined}
                           <div class="suggestion-block">
@@ -1024,7 +1025,7 @@
                           </div>
                         {/if}
                         {#each repliesFor(comment.id) as reply (reply.id)}
-                          <div class="inline-reply"><div class="markdown-body">{@html renderMarkdown(reply.body)}</div>{#if isEdited(reply)}<span class="edited-marker">{t('comments.edited')}</span>{/if}</div>
+                          <div class="inline-reply" data-inline-comment={reply.id}>{@render commentAuthor(reply)}<div class="markdown-body">{@html renderMarkdown(reply.body)}</div>{#if isEdited(reply)}<span class="edited-marker">{t('comments.edited')}</span>{/if}</div>
                         {/each}
                         {#if permission.canWrite}
                           <button class="btn-link" disabled={mutationBusy || resolvingCommentId === comment.id} onclick={() => setThreadResolved(comment, !comment.resolved_at)}>
@@ -1105,6 +1106,12 @@
   {/if}
 </div>
 
+<!-- Who wrote a review comment, and for a bot on whose behalf: an agent's
+     reply in a thread must not read as its owner's own (card_691280137be7). -->
+{#snippet commentAuthor(comment: any)}
+  <div class="comment-author"><strong>{comment.author || t('common.unknown')}</strong><BotBadge owner={comment.author_bot_owner} /></div>
+{/snippet}
+
 {#snippet reviewComment(comment: any, isReply: boolean)}
   <div class="thread-comment" class:reply={isReply} id="review-comment-{comment.id}" data-review-comment={comment.id}>
     {#if editingCommentId === comment.id}
@@ -1119,6 +1126,7 @@
         <button class="btn-secondary cancel-comment-edit" onclick={cancelEdit} disabled={editBusy}>{t('common.cancel')}</button>
       </div>
     {:else}
+      {@render commentAuthor(comment)}
       <div class="thread-comment-body markdown-body">{@html renderMarkdown(comment.body)}</div>
       <div class="thread-comment-meta">
         {#if isEdited(comment)}
@@ -1433,6 +1441,7 @@
   .btn-primary:disabled { opacity: 0.5; }
   .thread-comment-meta { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 12px; }
   .edited-marker { color: var(--text-muted); font-size: 12px; }
+  .comment-author { margin-bottom: 4px; font-size: 13px; }
   .comment-edit-input { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-primary); color: var(--text-primary); font-family: inherit; }
   .comment-edit-actions { display: flex; gap: 8px; margin-top: 8px; }
   .btn-link.danger { color: var(--red); }

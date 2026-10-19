@@ -755,13 +755,16 @@ pub async fn add_comment(
 
     let issue = get_issue(db, owner, repo_name, issue_number).await?;
 
+    // One instant for both stamps: two clock reads straddling a millisecond
+    // made a brand-new comment read as edited (`updated_at > created_at`).
+    let now = Utc::now();
     let model = issue_comment::ActiveModel {
         id: sea_orm::NotSet,
         issue_id: Set(issue.id),
         author_id: Set(author_id),
         body: Set(body),
-        created_at: Set(Utc::now()),
-        updated_at: Set(Utc::now()),
+        created_at: Set(now),
+        updated_at: Set(now),
     };
 
     let comment = issue_comment_ops::create(db, model).await?;

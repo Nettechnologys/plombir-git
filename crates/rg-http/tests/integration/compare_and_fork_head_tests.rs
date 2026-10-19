@@ -152,6 +152,44 @@ async fn compare_previews_a_branch_and_a_fork_branch() {
         .as_str()
         .is_some_and(|sha| sha.len() == 40));
 
+    // Two commits, by full and by abbreviated id, and a tag against a branch
+    // (card_d2812a16f34e). The caller's spelling is echoed back.
+    let first = body["commits"][0]["sha"].as_str().unwrap().to_string();
+    let second = body["commits"][1]["sha"].as_str().unwrap().to_string();
+    let by_ids = |base_rev: &str, head_rev: &str| {
+        format!("{base}/api/v1/repos/cmp_alice/proj/compare?base={base_rev}&head={head_rev}")
+    };
+    for (base_rev, head_rev) in [
+        (first.as_str(), second.as_str()),
+        (&first[..7], &second[..9]),
+    ] {
+        let (status, body) =
+            api(reqwest::Method::GET, by_ids(base_rev, head_rev), &bob, None).await;
+        assert_eq!(status, 200, "{base_rev}...{head_rev}: {body}");
+        assert_eq!(body["total_commits"], 1, "{body}");
+        assert_eq!(body["commits"][0]["sha"], second.as_str(), "{body}");
+        assert_eq!(body["files_changed"][0]["path"], "b.txt", "{body}");
+        assert_eq!(body["merge_base_sha"], first.as_str(), "{body}");
+        assert_eq!(body["base_branch"], base_rev, "{body}");
+        assert_eq!(body["head_branch"], head_rev, "{body}");
+    }
+    let work = root.path().join("cmp_alice-cmp_alice-proj-feature");
+    git_ok(&work, "cmp_alice", &["tag", "v1", &first]);
+    git_ok(&work, "cmp_alice", &["push", "-q", "origin", "v1"]);
+    let (status, body) = api(reqwest::Method::GET, by_ids("v1", "feature"), &bob, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total_commits"], 1, "{body}");
+    assert_eq!(body["commits"][0]["sha"], second.as_str(), "{body}");
+    for (base_rev, head_rev) in [("deadbeef", "feature"), ("main", "0000000000")] {
+        let (status, body) =
+            api(reqwest::Method::GET, by_ids(base_rev, head_rev), &bob, None).await;
+        assert_eq!(status, 400, "{base_rev}...{head_rev}: {body}");
+        assert!(
+            body.to_string().contains("does not exist"),
+            "{base_rev}...{head_rev}: {body}"
+        );
+    }
+
     let (status, body) = api(
         reqwest::Method::POST,
         format!("{base}/api/v1/repos/cmp_alice/proj/fork"),

@@ -587,9 +587,11 @@ impl repo_access::HeadRefSource for Json<CreatePrRequest> {
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct CompareQuery {
-    /// The branch a pull request would merge into.
+    /// The branch a pull request would merge into, or a tag or commit id of
+    /// this repository.
     pub base: String,
-    /// The branch it would bring: `branch`, or `owner:branch` of a fork.
+    /// The branch it would bring: `branch`, or `owner:branch` of a fork. A tag
+    /// or commit id of this repository is accepted too; a fork head is a branch.
     pub head: String,
 }
 
@@ -611,7 +613,7 @@ pub struct CompareQuery {
     ),
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
-        (status = 400, description = "A branch does not exist, or the head is not a readable fork", body = serde_json::Value),
+        (status = 400, description = "A branch, tag or commit does not exist, or the head is not a readable fork", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "The token may not read the head repository", body = serde_json::Value),
         (status = 404, description = "Repository not found", body = serde_json::Value),

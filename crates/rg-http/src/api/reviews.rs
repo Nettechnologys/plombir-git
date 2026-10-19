@@ -4,7 +4,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{Extension, Json};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
+use sea_orm::{EntityTrait, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use utoipa::ToSchema;
@@ -79,6 +79,10 @@ pub struct ApplySuggestionsRequest {
 pub struct TimelineActor {
     pub id: i64,
     pub username: String,
+    /// When the actor is a bot, the person it acts for — so an agent's approval
+    /// or applied suggestion does not read as its owner's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_owner: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -154,6 +158,88 @@ async fn review_in_pr(
         Ok(review) if review.repo_id == repo_id && review.pr_id == pr_id => Ok(review),
         Ok(_) => Err(AppError::not_found("review not found")),
         Err(e) => Err(AppError::from(e)),
+    }
+}
+
+/// A review comment as a reader is shown it: the row, who wrote it and — for a
+/// bot — on whose behalf.
+///
+/// The rows used to go out bare, with only `author_id`, so an inline thread
+/// could not say that the reply "Applied in the latest commit" came from an
+/// agent rather than from the person it acts for (card_691280137be7).
+#[derive(Serialize)]
+pub struct ReviewCommentResponse {
+    #[serde(flatten)]
+    pub comment: review_comment::Model,
+    pub author: Option<String>,
+    /// When the author is a bot, the person it acts for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_bot_owner: Option<String>,
+    /// The comment on its pull request's page, when `external_url` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+}
+
+/// `comments` with their authors, resolved in at most two queries.
+async fn review_comments_with_authors(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    number: i64,
+    comments: Vec<review_comment::Model>,
+) -> Result<Vec<ReviewCommentResponse>, AppError> {
+    let links = crate::html_url::Links::new(state, owner, repo);
+    let mut names = super::author_names::AuthorNames::default();
+    names
+        .prefetch(&state.db, comments.iter().map(|comment| comment.author_id))
+        .await?;
+    let mut responses = Vec::with_capacity(comments.len());
+    for comment in comments {
+        let (author, author_bot_owner) = names.author(&state.db, comment.author_id).await?;
+        responses.push(ReviewCommentResponse {
+            html_url: links.review_comment(number, comment.id),
+            comment,
+            author,
+            author_bot_owner,
+        });
+    }
+    Ok(responses)
+}
+
+/// One comment with its author; see [`review_comments_with_authors`].
+async fn review_comment_with_author(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    number: i64,
+    comment: review_comment::Model,
+) -> axum::response::Response {
+    match review_comments_with_authors(state, owner, repo, number, vec![comment]).await {
+        Ok(mut responses) => Json(responses.remove(0)).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// The applied suggestions with their authors, in the shape
+/// [`rg_core::review::service::AppliedSuggestions`] has.
+async fn applied_suggestions_response(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    number: i64,
+    applied: rg_core::review::service::AppliedSuggestions,
+) -> axum::response::Response {
+    let rg_core::review::service::AppliedSuggestions {
+        comments,
+        commit_sha,
+    } = applied;
+    match review_comments_with_authors(state, owner, repo, number, comments).await {
+        Ok(comments) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "comments": comments, "commit_sha": commit_sha })),
+        )
+            .into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
@@ -546,15 +632,10 @@ pub async fn list_review_comments(
 ) -> impl IntoResponse {
     match rg_core::review::service::list_review_comments(&state.db, &owner, &repo, number).await {
         Ok(comments) => {
-            let links = crate::html_url::Links::new(&state, &owner, &repo);
-            let comments: Vec<serde_json::Value> = comments
-                .into_iter()
-                .map(|comment| {
-                    let html_url = links.review_comment(number, comment.id);
-                    crate::html_url::with_html_url(comment, html_url)
-                })
-                .collect();
-            (StatusCode::OK, Json(comments)).into_response()
+            match review_comments_with_authors(&state, &owner, &repo, number, comments).await {
+                Ok(comments) => (StatusCode::OK, Json(comments)).into_response(),
+                Err(error) => error.into_response(),
+            }
         }
         Err(e) => AppError::from(e).into_response(),
     }
@@ -596,7 +677,7 @@ struct TimelineData {
     comments: Vec<review_comment::Model>,
     reviewer_requests: Vec<pr_reviewer_request::Model>,
     queue_entry: Option<merge_queue_entry::Model>,
-    users: HashMap<i64, String>,
+    users: HashMap<i64, (String, Option<String>)>,
 }
 
 /// Load every source the timeline draws from for one PR. Any DB error is mapped
@@ -654,14 +735,21 @@ async fn load_timeline_data(
         &reviewer_requests,
         &queue_entry,
     );
-    let users = rg_db::entities::user::Entity::find()
-        .filter(rg_db::entities::user::Column::Id.is_in(actor_ids))
-        .all(db)
+    let mut names = super::author_names::AuthorNames::default();
+    names
+        .prefetch(db, actor_ids.iter().copied())
         .await
-        .map_err(|error| AppError::from(error).into_response())?
-        .into_iter()
-        .map(|user| (user.id, user.username))
-        .collect::<HashMap<_, _>>();
+        .map_err(IntoResponse::into_response)?;
+    let mut users = HashMap::with_capacity(actor_ids.len());
+    for id in actor_ids {
+        if let (Some(username), bot_owner) = names
+            .author(db, id)
+            .await
+            .map_err(IntoResponse::into_response)?
+        {
+            users.insert(id, (username, bot_owner));
+        }
+    }
 
     Ok(TimelineData {
         pr,
@@ -735,16 +823,19 @@ fn build_review_timeline(data: TimelineData) -> Vec<ReviewTimelineEvent> {
 /// and "was this already persisted?" checks across all event sources.
 struct TimelineBuilder {
     persisted_events: Vec<(pr_event::Model, serde_json::Value)>,
-    users: HashMap<i64, String>,
+    users: HashMap<i64, (String, Option<String>)>,
     timeline: Vec<ReviewTimelineEvent>,
 }
 
 impl TimelineBuilder {
     fn actor(&self, id: i64) -> Option<TimelineActor> {
-        self.users.get(&id).map(|username| TimelineActor {
-            id,
-            username: username.clone(),
-        })
+        self.users
+            .get(&id)
+            .map(|(username, bot_owner)| TimelineActor {
+                id,
+                username: username.clone(),
+                bot_owner: bot_owner.clone(),
+            })
     }
 
     fn has_event(&self, kind: &str) -> bool {
@@ -1015,13 +1106,12 @@ pub async fn create_review_comment(
     .await
     {
         Ok(comment) => {
-            let html_url = crate::html_url::Links::new(&state, &owner, &repo)
-                .review_comment(number, comment.id);
-            (
-                StatusCode::CREATED,
-                Json(crate::html_url::with_html_url(comment, html_url)),
-            )
-                .into_response()
+            let mut response =
+                review_comment_with_author(&state, &owner, &repo, number, comment).await;
+            if response.status() == StatusCode::OK {
+                *response.status_mut() = StatusCode::CREATED;
+            }
+            response
         }
         Err(e) => AppError::from(e).into_response(),
     }
@@ -1084,7 +1174,21 @@ pub async fn apply_review_suggestion(
                 &source_namespace,
                 &applied.commit_sha,
             );
-            (StatusCode::OK, Json(applied)).into_response()
+            let rg_core::review::service::AppliedSuggestion {
+                comment,
+                commit_sha,
+            } = applied;
+            match review_comments_with_authors(&state, &owner, &repo, number, vec![comment]).await {
+                Ok(mut comments) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "comment": comments.remove(0),
+                        "commit_sha": commit_sha,
+                    })),
+                )
+                    .into_response(),
+                Err(error) => error.into_response(),
+            }
         }
         // "Outdated suggestion" and "branch head changed" carry
         // `rg_core::error::Conflict` and still answer 409; the shape checks carry
@@ -1152,7 +1256,7 @@ pub async fn apply_review_suggestions(
                 &source_namespace,
                 &applied.commit_sha,
             );
-            (StatusCode::OK, Json(applied)).into_response()
+            applied_suggestions_response(&state, &owner, &repo, number, applied).await
         }
         // "Outdated suggestion" and "branch head changed" carry
         // `rg_core::error::Conflict` and still answer 409; the shape checks carry
@@ -1451,7 +1555,7 @@ pub async fn set_thread_resolution(
     )
     .await
     {
-        Ok(comment) => (StatusCode::OK, Json(comment)).into_response(),
+        Ok(comment) => review_comment_with_author(&state, &owner, &repo, number, comment).await,
         Err(error) => AppError::from(error).into_response(),
     }
 }
@@ -1485,7 +1589,7 @@ pub struct DismissReviewRequest {
 )]
 pub async fn edit_review_comment(
     State(state): State<AppState>,
-    Path((_, _, number, id)): Path<(String, String, i64, i64)>,
+    Path((owner, repo_name, number, id)): Path<(String, String, i64, i64)>,
     RepoAuthRead { repo, actor_id }: RepoAuthRead,
     Json(req): Json<crate::api::issues::EditCommentRequest>,
 ) -> impl IntoResponse {
@@ -1502,7 +1606,9 @@ pub async fn edit_review_comment(
     )
     .await
     {
-        Ok(comment) => (StatusCode::OK, Json(serde_json::json!(comment))).into_response(),
+        Ok(comment) => {
+            review_comment_with_author(&state, &owner, &repo_name, number, comment).await
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

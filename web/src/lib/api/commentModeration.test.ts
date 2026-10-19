@@ -39,6 +39,7 @@ import {
 	attachments as routeAttachments,
 	collaborators as routeCollaborators,
 	issues as routeIssues,
+	labels as routeLabels,
 	milestones as routeMilestones,
 	notifications as routeNotifications,
 	pulls as routePulls,
@@ -149,6 +150,19 @@ describe('issue page', () => {
 
 		expect(routeNotifications.subscription).toHaveBeenCalledWith('alice', 'demo', 'issues', 5);
 		expect(element(rendered.container, '.thread-subscription .btn-subscription').textContent?.trim()).toBe('Unsubscribe');
+	});
+
+	// card_c899d7177f65: the issue's own page paints its labels too.
+	it('paints the issue labels in their own colours', async () => {
+		routeIssues.get.mockResolvedValue({ ...(await routeIssues.get()), labels: ['bug', 'gone'] });
+		routeLabels.list.mockResolvedValue([{ id: 1, name: 'bug', color: '#b60205', description: null }]);
+		rendered = await renderComponent(IssuePage);
+
+		const bug = element<HTMLElement>(rendered.container, '[data-label="bug"]');
+		expect(bug.style.backgroundColor).toBe('rgb(182, 2, 5)');
+		expect(bug.style.color).toBe('rgb(255, 255, 255)');
+		expect(element(rendered.container, '[data-label="gone"]').classList.contains('outline')).toBe(true);
+		expect(routeLabels.list).toHaveBeenCalledWith('alice', 'demo');
 	});
 
 	it('marks an edited comment and only that one', async () => {
@@ -355,6 +369,63 @@ describe('pull request review comments', () => {
 		expect(reply.querySelector('.edit-comment')).toBeNull();
 		expect(reply.querySelector('.delete-comment')).toBeNull();
 		expect(reply.querySelector('.edited-marker')?.textContent).toContain('edited');
+	});
+
+	// card_691280137be7: the agent's reply in a thread says it is the agent, on
+	// whose behalf, and the human's comment says who wrote it.
+	it('names each author in the threads, with the bot badge on an agent reply', async () => {
+		routeReviews.comments.mockResolvedValue([
+			reviewComment({ author: 'alice' }),
+			reviewComment({
+				id: 32,
+				author_id: 9,
+				author: 'alice-agent',
+				author_bot_owner: 'alice',
+				body: 'Applied in the latest commit',
+				reply_to_id: 31,
+			}),
+		]);
+		routePulls.diff.mockResolvedValue({
+			base_branch: 'main',
+			head_branch: 'feature',
+			stats: { total_additions: 1, total_deletions: 0, files_changed: 1 },
+			files_changed: [
+				{
+					path: 'src/lib.rs',
+					status: 'modified',
+					additions: 1,
+					deletions: 0,
+					patch: '@@ -2,0 +3 @@\n+fn renamed() {}',
+					lines: [
+						{ kind: 'meta', content: '@@ -2,0 +3 @@', old_line: null, new_line: null },
+						{ kind: 'addition', content: 'fn renamed() {}', old_line: null, new_line: 3 },
+					],
+				},
+			],
+		});
+		rendered = await renderComponent(PullRequestPage);
+
+		// `:scope >`: an inline thread holds its replies, and their badge is not
+		// the root's.
+		const authorOf = (box: HTMLElement) => ({
+			name: box.querySelector(':scope > .comment-author strong')?.textContent,
+			bot: box.querySelector(':scope > .comment-author .bot-badge') !== null,
+			behalf: box.querySelector(':scope > .comment-author .on-behalf')?.textContent?.trim() ?? null,
+		});
+		expect(authorOf(commentBox(rendered.container, 'reviewComment', 31))).toEqual({ name: 'alice', bot: false, behalf: null });
+		expect(authorOf(commentBox(rendered.container, 'reviewComment', 32))).toEqual({
+			name: 'alice-agent',
+			bot: true,
+			behalf: 'on behalf of @alice',
+		});
+
+		const diffTab = Array.from(rendered.container.querySelectorAll<HTMLButtonElement>('.tab')).find((tab) =>
+			tab.textContent?.includes('Changes') || tab.textContent?.includes('Files'),
+		);
+		await click(diffTab!);
+		const inline = (id: number) => element<HTMLElement>(rendered!.container, `[data-inline-comment="${id}"]`);
+		expect(authorOf(inline(31))).toEqual({ name: 'alice', bot: false, behalf: null });
+		expect(authorOf(inline(32))).toEqual({ name: 'alice-agent', bot: true, behalf: 'on behalf of @alice' });
 	});
 
 	it('offers nothing to a non-author who is not an admin, and everything to an admin', async () => {

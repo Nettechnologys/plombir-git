@@ -577,9 +577,11 @@ pub async fn trigger_ci_status(
     pipeline_id: i64,
     status: &str,
 ) -> Result<()> {
+    // `repository` is filled in by `trigger_event_with_tracker` from the row it
+    // already loads. This used to say `repo#<id>`, which chat formats printed
+    // verbatim: "ci.status in repo#12: failed" (card_6096102c5bd7).
     let payload = serde_json::json!({
         "event": "ci.status",
-        "repository": format!("repo#{repo_id}"),
         "repository_id": repo_id,
         "pipeline_id": pipeline_id,
         "status": status,
@@ -598,7 +600,11 @@ pub(crate) async fn trigger_event_with_tracker(
         return Ok(());
     };
     let hooks = webhook_ops::list_active_for_event(db.read(), repo_id, repo.org_id, event).await?;
-    let payload = serde_json::to_string(payload).context("serialize webhook payload")?;
+    if hooks.is_empty() {
+        return Ok(());
+    }
+    let payload = with_repository_name(db.read(), &repo, payload).await;
+    let payload = serde_json::to_string(&payload).context("serialize webhook payload")?;
 
     // The query narrowed by substring; membership is decided here.
     for hook in hooks
@@ -616,6 +622,41 @@ pub(crate) async fn trigger_event_with_tracker(
     }
 
     Ok(())
+}
+
+/// `payload` with `repository: "<owner>/<name>"` when it names no repository.
+///
+/// The chat formats print that string ("Plombir Git issue.opened in team/app"),
+/// and most event payloads never carried it, so a channel subscribed to several
+/// repositories could not tell them apart. A payload that already has a
+/// `repository` (push sends an object) is left as it is. An owner that cannot be
+/// read costs the name, not the delivery.
+async fn with_repository_name(
+    db: &DatabaseConnection,
+    repo: &rg_db::entities::repository::Model,
+    payload: &Value,
+) -> Value {
+    let mut payload = payload.clone();
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    if object.contains_key("repository") {
+        return payload;
+    }
+    match crate::notification::thread::repository_owner_name(db, repo).await {
+        Ok(owner) => {
+            object.insert(
+                "repository".to_string(),
+                Value::String(format!("{owner}/{}", repo.name)),
+            );
+        }
+        Err(error) => tracing::warn!(
+            repo_id = repo.id,
+            error = %format!("{error:#}"),
+            "webhook payload goes out without its repository name"
+        ),
+    }
+    payload
 }
 
 /// Spawn one concrete hook delivery.
@@ -991,6 +1032,95 @@ mod tests {
         assert!(delivery_format("arbitrary").is_err());
     }
 
+    /// The chat line must come out of the real `trigger_ci_status`, not out of a
+    /// payload the test wrote: the renderer was always right, the payload was
+    /// what said `repo#<id>` (card_6096102c5bd7).
+    #[tokio::test]
+    async fn ci_status_names_the_repository_by_its_address() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options).await.expect("connect test db");
+        rg_db::run_migrations(&db).await.expect("migrate test db");
+        let user =
+            rg_db::ops::user_ops::create_user(&db, "team", "team@example.invalid", "", "Team")
+                .await
+                .expect("create owner");
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(user.id),
+                name: Set("app".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create repository");
+        for format in ["slack", "json"] {
+            webhook_ops::create_webhook(
+                &db,
+                webhook::ActiveModel {
+                    repo_id: Set(repo.id),
+                    // Nothing listens there: the rendered body is recorded on
+                    // the delivery row whether or not the POST lands.
+                    url: Set(format!("http://127.0.0.1:9/{format}")),
+                    content_type: Set(format.to_string()),
+                    secret_encrypted: Set(None),
+                    active: Set(true),
+                    events: Set("ci.status".to_string()),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create webhook");
+        }
+
+        trigger_ci_status(&db, repo.id, 7, "failed")
+            .await
+            .expect("trigger ci.status");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deliveries = loop {
+            let rows = webhook_delivery::Entity::find()
+                .order_by_asc(webhook_delivery::Column::WebhookId)
+                .all(&db)
+                .await
+                .expect("list deliveries");
+            if rows.len() == 2 {
+                break rows;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deliveries never recorded: {rows:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let bodies: Vec<Value> = deliveries
+            .iter()
+            .map(|row| serde_json::from_str(row.request_payload.as_deref().unwrap()).unwrap())
+            .collect();
+        assert_eq!(
+            bodies[0]["text"],
+            "Plombir Git ci.status in team/app: failed"
+        );
+        assert_eq!(bodies[1]["repository"], "team/app");
+        assert_eq!(bodies[1]["repository_id"], repo.id);
+        assert_eq!(bodies[1]["pipeline_id"], 7);
+    }
+
     async fn update_fixture() -> (DatabaseConnection, webhook::Model) {
         let mut options = ConnectOptions::new("sqlite::memory:");
         options.max_connections(1);
@@ -1322,7 +1452,10 @@ mod tests {
         .expect("create delivery hook");
 
         let event = serde_json::json!({"ref": "refs/heads/main", "message": "x".repeat(512)});
-        let expected = serde_json::to_string(&event).unwrap();
+        // The fan-out names the repository on a payload that does not.
+        let mut journaled = event.clone();
+        journaled["repository"] = serde_json::json!(format!("{username}/payload"));
+        let expected = serde_json::to_string(&journaled).unwrap();
         assert!(expected.len() > 255);
         let tracker = crate::task_tracker::TaskTracker::new();
         trigger_event_with_tracker(&db, repo.id, "push", &event, &tracker)

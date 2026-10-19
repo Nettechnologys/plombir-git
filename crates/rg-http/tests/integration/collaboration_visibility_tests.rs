@@ -220,3 +220,130 @@ async fn a_collaborator_is_told_when_their_access_changes() {
         inbox(&base, &owner).await
     );
 }
+
+/// Organization and team membership is access too, and was given and taken
+/// away in silence (card_1d938b4213e6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_is_told_when_added_to_or_removed_from_an_org_or_team() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (admin, _) = register_full(&base, "org_admin", "org_admin@example.com").await;
+    let (bob, bob_id) = register_full(&base, "org_bob", "org_bob@example.com").await;
+    let (status, body) = send(
+        reqwest::Method::POST,
+        format!("{base}/api/v1/orgs"),
+        Some(&admin),
+        Some(serde_json::json!({ "name": "acme" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+
+    let (status, body) = send(
+        reqwest::Method::POST,
+        format!("{base}/api/v1/orgs/acme/members"),
+        Some(&admin),
+        Some(serde_json::json!({ "user_id": bob_id, "role": "member" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let joined = eventually(&base, &bob, "org_admin added you to acme as member").await;
+    assert_eq!(joined["event_type"], "access");
+    assert_eq!(joined["link"], "/orgs/acme");
+    assert_eq!(joined["is_read"], false);
+
+    let (status, team) = send(
+        reqwest::Method::POST,
+        format!("{base}/api/v1/orgs/acme/teams"),
+        Some(&admin),
+        Some(serde_json::json!({ "name": "reviewers", "permission": "write" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{team}");
+    let team_id = team["id"].as_i64().unwrap();
+    let (status, body) = send(
+        reqwest::Method::POST,
+        format!("{base}/api/v1/orgs/acme/teams/{team_id}/members"),
+        Some(&admin),
+        Some(serde_json::json!({ "user_id": bob_id })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let teamed = eventually(
+        &base,
+        &bob,
+        "org_admin added you to team reviewers in acme (write access to its repositories)",
+    )
+    .await;
+    assert_eq!(teamed["event_type"], "access");
+    assert_eq!(teamed["link"], "/orgs/acme");
+
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        format!("{base}/api/v1/orgs/acme/teams/{team_id}/members/{bob_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let left_team = eventually(
+        &base,
+        &bob,
+        "org_admin removed you from team reviewers in acme",
+    )
+    .await;
+    assert_eq!(left_team["link"], serde_json::Value::Null);
+
+    // Deleting a team takes the access from every member at once.
+    let (status, team) = send(
+        reqwest::Method::POST,
+        format!("{base}/api/v1/orgs/acme/teams"),
+        Some(&admin),
+        Some(serde_json::json!({ "name": "triage", "permission": "read" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{team}");
+    let triage_id = team["id"].as_i64().unwrap();
+    let (status, body) = send(
+        reqwest::Method::POST,
+        format!("{base}/api/v1/orgs/acme/teams/{triage_id}/members"),
+        Some(&admin),
+        Some(serde_json::json!({ "user_id": bob_id })),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        format!("{base}/api/v1/orgs/acme/teams/{triage_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    eventually(
+        &base,
+        &bob,
+        "org_admin removed you from team triage in acme",
+    )
+    .await;
+
+    let (status, body) = send(
+        reqwest::Method::DELETE,
+        format!("{base}/api/v1/orgs/acme/members/{bob_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let left_org = eventually(&base, &bob, "org_admin removed you from acme").await;
+    assert_eq!(left_org["link"], serde_json::Value::Null);
+
+    // The admin who did all of it was not told about it, including about
+    // joining the organization they created.
+    assert!(
+        inbox(&base, &admin)
+            .await
+            .iter()
+            .all(|row| row["event_type"] != "access"),
+        "{:?}",
+        inbox(&base, &admin).await
+    );
+}

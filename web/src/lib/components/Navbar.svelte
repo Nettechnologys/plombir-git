@@ -5,6 +5,7 @@
   import Dropdown from './Dropdown.svelte';
   import Logo from './Logo.svelte';
   import { getRegistrationOpen } from '$lib/stores/instance.svelte';
+  import { getUnreadCount, watchUnreadNotifications } from '$lib/stores/unreadNotifications.svelte';
 
   // Below 900px the links, the search and the account menu fold behind one
   // button instead of stacking into three rows (card_c30077df5603).
@@ -14,6 +15,15 @@
   });
 
   const t = createT();
+
+  // The unread badge follows whoever is signed in, and stops with them.
+  let viewerId = $derived(isLoggedIn() ? (getUser()?.id ?? null) : null);
+  $effect(() => {
+    const userId = viewerId;
+    if (userId === null) return;
+    return watchUnreadNotifications(userId);
+  });
+  let unread = $derived(getUnreadCount());
 
   let search = $state('');
   let logoutPending = $state(false);
@@ -107,7 +117,9 @@
       {#if !isAuthReady()}
         <span class="nav-link" aria-live="polite">{t('nav.checking_session')}</span>
       {:else if isLoggedIn()}
-        <a href="/notifications" class="nav-link">{t('nav.notifications')}</a>
+        <a href="/notifications" class="nav-link notifications-link">
+          {t('nav.notifications')}{#if unread > 0}<span class="unread-badge" aria-label={t('nav.notifications_unread', { count: unread })}>{unread > 99 ? '99+' : unread}</span>{/if}
+        </a>
         <a href="/orgs" class="nav-link">{t('nav.organizations')}</a>
         <a href="/imports" class="nav-link">{t('nav.imports', 'Imports')}</a>
 
@@ -447,5 +459,19 @@
     border-radius: var(--radius);
     color: var(--text-primary);
     cursor: pointer;
+  }
+
+  .unread-badge {
+    display: inline-block;
+    min-width: 18px;
+    margin-left: 6px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: var(--accent);
+    color: var(--bg-primary);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 18px;
+    text-align: center;
   }
 </style>

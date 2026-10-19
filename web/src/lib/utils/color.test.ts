@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { safeHexColor } from './color';
+import { readableTextOn, safeHexColor } from './color';
 
 describe('safeHexColor', () => {
 	it('normalises a valid six-digit hex colour', () => {
@@ -26,5 +26,15 @@ describe('safeHexColor', () => {
 
 	it('passes the caller fallback through unchanged', () => {
 		expect(safeHexColor('', 'var(--text-muted)')).toBe('var(--text-muted)');
+	});
+});
+
+describe('readableTextOn', () => {
+	it('puts dark text on light colours and light text on dark ones', () => {
+		expect(readableTextOn('#ffffff')).toBe('#000000');
+		expect(readableTextOn('#fbca04')).toBe('#000000');
+		expect(readableTextOn('#000000')).toBe('#ffffff');
+		expect(readableTextOn('#b60205')).toBe('#ffffff');
+		expect(readableTextOn('#0075ca')).toBe('#ffffff');
 	});
 });

@@ -6,6 +6,38 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `GET /repos/{owner}/{name}/compare` takes a tag or a commit id (full or
+  abbreviated) on either side, besides a branch. A branch of the same name
+  still wins; a fork head is still a branch.
+- Review comment responses (list, create, edit, resolve, apply suggestion)
+  carry `author` and, for a bot, `author_bot_owner`; review timeline actors
+  carry `bot_owner`. Inline threads name each author and mark an agent's reply
+  as a bot acting for its owner.
+- Adding someone to an organization or team, removing them, or deleting a team
+  they are in leaves them an `access` notification.
+- The navigation bar shows the unread notification count.
+- Issue labels are drawn in their own colour in the issue list and on the
+  issue page.
+
+### Changed
+
+- Webhook payloads that name no repository now carry
+  `repository: "<owner>/<name>"`, so chat formats say which repository an
+  event is about. `ci.status` used to send `repository: "repo#<id>"`; JSON
+  subscribers reading that field get the address instead (`repository_id` is
+  unchanged). Push payloads add `repository.full_name`.
+
+### Fixed
+
+- Deleting an OCI image from the web UI leaves an `oci.manifest.delete` audit
+  entry, as deleting it through the registry API already did.
+- The hourly storage cleanup logs passes that only collected OCI blobs or
+  orphaned objects, with both counters.
+- Applying a suggestion or resolving a thread no longer marks the review
+  comment as edited, and a new comment is never marked edited.
+
 ## [0.2.0] - 2026-10-17
 
 This release has breaking changes. Read the

@@ -4,12 +4,14 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
+  import LabelChip from '$lib/components/LabelChip.svelte';
   import Modal from '$lib/components/Modal.svelte';
   import ThreadSubscription from '$lib/components/ThreadSubscription.svelte';
   import {
     buildIssueLinksPayload,
     collaborators,
     issues,
+    labels,
     milestones,
     repos,
     type Issue,
@@ -72,6 +74,7 @@
     issue = null;
     commentList = [];
     milestoneList = [];
+    labelColors = new Map();
     assigneeOptions = [];
     newComment = '';
     linkForm = { assigneeId: '', milestoneId: '' };
@@ -121,6 +124,21 @@
     return route;
   }
 
+  // The issue names its labels; their colours are the repository's label
+  // list. A failure here costs the colours, not the page.
+  let labelColors = $state(new Map<string, string>());
+
+  async function loadLabelColors(route: IssueRoute) {
+    try {
+      const list = await labels.list(route.owner, route.repo);
+      if (isCurrentRoute(route) && Array.isArray(list)) {
+        labelColors = new Map(list.map((label) => [label.name, label.color]));
+      }
+    } catch {
+      if (isCurrentRoute(route)) labelColors = new Map();
+    }
+  }
+
   async function loadIssue(
     expectedOwner = owner,
     expectedRepo = repo,
@@ -134,6 +152,7 @@
       generation: expectedRoute,
     };
     if (!isCurrentRoute(route)) return;
+    void loadLabelColors(route);
     const claim = issueRequests.begin(expectedOwner, expectedRepo, expectedNumber);
     try {
       loading = true;
@@ -368,7 +387,7 @@
           </span>
           {#if issue.labels?.length}
             {#each issue.labels as label}
-              <span class="label-badge">{label}</span>
+              <LabelChip name={label} color={labelColors.get(label)} />
             {/each}
           {/if}
         </div>
@@ -544,15 +563,6 @@
   }
   .state-badge.open { background: rgba(63, 185, 80, 0.15); color: var(--green); }
   .state-badge.closed { background: rgba(248, 81, 73, 0.15); color: var(--red); }
-
-  .label-badge {
-    display: inline-block;
-    padding: 0 6px;
-    border: 1px solid var(--purple);
-    color: var(--purple);
-    border-radius: 10px;
-    font-size: 11px;
-  }
 
   .issue-links {
     border: 1px solid var(--border);

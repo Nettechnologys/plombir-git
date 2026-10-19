@@ -120,6 +120,36 @@ async fn image_inventory_delete_and_gc_preserve_shared_layers() {
         .await
         .unwrap();
     assert_eq!(deleted.status(), 202, "{}", deleted.text().await.unwrap());
+
+    // Both doors are one irreversible operation and must leave the same trace:
+    // the browser button used to retire the image without an audit row while
+    // `docker`/`crane` deletion wrote one (card_e1e06a8e8dc3).
+    let user = rg_db::ops::user_ops::find_by_username(&db, "oci_gc")
+        .await
+        .unwrap()
+        .unwrap();
+    let trail: Vec<(Option<i64>, Option<String>)> = {
+        use sea_orm::{ColumnTrait as _, EntityTrait as _, QueryFilter as _, QueryOrder as _};
+        rg_db::entities::audit_log::Entity::find()
+            .filter(rg_db::entities::audit_log::Column::Action.eq("oci.manifest.delete"))
+            .order_by_asc(rg_db::entities::audit_log::Column::Id)
+            .all(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.user_id, row.resource_name))
+            .collect()
+    };
+    assert_eq!(
+        trail,
+        vec![
+            (Some(user.id), Some("oci_gc/images:first".to_string())),
+            (Some(user.id), Some(format!("oci_gc/images@{}", digests[0]))),
+            (Some(user.id), Some(format!("oci_gc/images@{}", digests[1]))),
+        ],
+        "the /v2 tag, /v2 digest and REST digest deletions each leave one row"
+    );
+
     let sweep = rg_http::api::ci_retention::cleanup_expired_storage(&state, Some(repo.id))
         .await
         .unwrap();

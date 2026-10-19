@@ -728,27 +728,52 @@ impl CacheDeletionStaging {
     }
 }
 
+/// One info line per pass that changed anything, carrying every counter.
+///
+/// The counters are destructured rather than read by name, so a new one cannot
+/// be left out of the line or out of the "did anything happen" test. The OCI
+/// blob collector shipped that way: it deleted blobs hourly and the line only
+/// appeared when CI artifacts happened to expire in the same pass
+/// (card_84a0006d0520).
+fn log_cleanup_summary(summary: &CleanupResponse) {
+    let &CleanupResponse {
+        artifacts_deleted,
+        caches_deleted,
+        oci_uploads_deleted,
+        oci_blobs_deleted,
+        oci_orphan_objects_deleted,
+        failures,
+    } = summary;
+    let changed = [
+        artifacts_deleted,
+        caches_deleted,
+        oci_uploads_deleted,
+        oci_blobs_deleted,
+        oci_orphan_objects_deleted,
+        failures,
+    ]
+    .iter()
+    .any(|count| *count > 0);
+    if changed {
+        tracing::info!(
+            artifacts = artifacts_deleted,
+            caches = caches_deleted,
+            oci_uploads = oci_uploads_deleted,
+            oci_blobs = oci_blobs_deleted,
+            oci_orphan_objects = oci_orphan_objects_deleted,
+            failures,
+            "CI retention cleanup completed"
+        )
+    }
+}
+
 pub async fn run_cleanup_loop(
     state: AppState,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
         match cleanup_expired_storage(&state, None).await {
-            Ok(summary)
-                if summary.artifacts_deleted > 0
-                    || summary.caches_deleted > 0
-                    || summary.oci_uploads_deleted > 0
-                    || summary.failures > 0 =>
-            {
-                tracing::info!(
-                    artifacts = summary.artifacts_deleted,
-                    caches = summary.caches_deleted,
-                    oci_uploads = summary.oci_uploads_deleted,
-                    failures = summary.failures,
-                    "CI retention cleanup completed"
-                )
-            }
-            Ok(_) => {}
+            Ok(summary) => log_cleanup_summary(&summary),
             Err(error) => {
                 tracing::error!(error = %format!("{error:#}"), "CI retention cleanup failed")
             }
@@ -760,5 +785,70 @@ pub async fn run_cleanup_loop(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{log_cleanup_summary, CleanupResponse};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn logged(summary: &CleanupResponse) -> String {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || log_cleanup_summary(summary));
+        let bytes = logs.0.lock().expect("log lock").clone();
+        String::from_utf8(bytes).expect("logs are UTF-8")
+    }
+
+    #[test]
+    fn a_pass_that_only_collected_oci_blobs_is_logged_with_both_counters() {
+        let line = logged(&CleanupResponse {
+            oci_blobs_deleted: 3,
+            oci_orphan_objects_deleted: 2,
+            ..CleanupResponse::default()
+        });
+        assert!(line.contains("CI retention cleanup completed"), "{line}");
+        assert!(line.contains("oci_blobs=3"), "{line}");
+        assert!(line.contains("oci_orphan_objects=2"), "{line}");
+
+        let orphans_only = logged(&CleanupResponse {
+            oci_orphan_objects_deleted: 1,
+            ..CleanupResponse::default()
+        });
+        assert!(
+            orphans_only.contains("oci_orphan_objects=1"),
+            "{orphans_only}"
+        );
+    }
+
+    #[test]
+    fn an_idle_pass_stays_silent() {
+        assert_eq!(logged(&CleanupResponse::default()), "");
     }
 }

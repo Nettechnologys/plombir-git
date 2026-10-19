@@ -431,6 +431,9 @@ pub async fn create_review_comment(
             .await?
         }
     };
+    // One instant for both stamps: two clock reads straddling a millisecond
+    // made a brand-new comment read as edited (`updated_at > created_at`).
+    let now = Utc::now();
     let model = review_comment::ActiveModel {
         id: sea_orm::NotSet,
         review_id: Set(review.id),
@@ -451,8 +454,8 @@ pub async fn create_review_comment(
         reply_to_id: Set(reply_to_id),
         resolved_at: Set(None),
         resolved_by_id: Set(None),
-        created_at: Set(Utc::now()),
-        updated_at: Set(Utc::now()),
+        created_at: Set(now),
+        updated_at: Set(now),
     };
 
     let comment = review_comment_ops::create(&transaction, model).await?;
@@ -787,19 +790,20 @@ pub async fn apply_suggestions(
     for suggestions in suggestions_by_path.values() {
         for suggestion in suggestions {
             // Built from the *stored* model, whose columns are `Unchanged`, so
-            // the statement carries exactly the four columns set here.
+            // the statement carries exactly the three columns set here.
+            // `updated_at` is not one of them: it dates the author's last edit
+            // of the text, and an applied suggestion used to show the reviewer's
+            // untouched comment as "edited" (card_f58b8b128e57).
             let mut active: review_comment::ActiveModel = suggestion.comment.clone().into();
             active.suggestion_applied_at = Set(Some(now));
             active.suggestion_applied_by_id = Set(Some(actor.id));
             active.suggestion_commit_sha = Set(Some(commit_sha.clone()));
-            active.updated_at = Set(now);
             updates.push(active);
 
             let mut applied = suggestion.comment.clone();
             applied.suggestion_applied_at = Some(now);
             applied.suggestion_applied_by_id = Some(actor.id);
             applied.suggestion_commit_sha = Some(commit_sha.clone());
-            applied.updated_at = now;
             comments.push(applied);
         }
     }
@@ -883,7 +887,8 @@ pub async fn set_thread_resolved(
     let mut active: review_comment::ActiveModel = comment.into();
     active.resolved_at = Set(resolved.then(Utc::now));
     active.resolved_by_id = Set(resolved.then_some(actor_id));
-    active.updated_at = Set(Utc::now());
+    // Not `updated_at`: resolving a thread does not edit its first comment
+    // (card_f58b8b128e57). `resolved_at` is the record of this change.
     let transaction = db
         .begin()
         .await

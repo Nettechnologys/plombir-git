@@ -95,3 +95,27 @@ describe('issue create label selection', () => {
 		);
 	});
 });
+
+// card_c899d7177f65: every chip used to be the same purple outline.
+describe('issue list label chips', () => {
+	it('paint each label in its own colour with readable text', async () => {
+		issues.list.mockResolvedValue({
+			data: [{ ...createdIssue, labels: ['bug', 'release, urgent', 'gone'] }],
+			pagination: { ...pagination, total: 1, total_pages: 1 },
+		});
+		labels.list.mockResolvedValue([
+			{ id: 1, name: 'release, urgent', color: '#FBCA04', description: null },
+			{ id: 2, name: 'bug', color: '#0075ca', description: null },
+		]);
+		rendered = await renderComponent(IssueListPage);
+
+		const chip = (name: string) => element<HTMLElement>(rendered!.container, `.issue-meta [data-label="${name}"]`);
+		expect(chip('bug').style.backgroundColor).toBe('rgb(0, 117, 202)');
+		expect(chip('bug').style.color).toBe('rgb(255, 255, 255)');
+		expect(chip('release, urgent').style.backgroundColor).toBe('rgb(251, 202, 4)');
+		expect(chip('release, urgent').style.color).toBe('rgb(0, 0, 0)');
+		// A name the label list does not know keeps the neutral outline.
+		expect(chip('gone').classList.contains('outline')).toBe(true);
+		expect(chip('gone').getAttribute('style')).toBeNull();
+	});
+});
