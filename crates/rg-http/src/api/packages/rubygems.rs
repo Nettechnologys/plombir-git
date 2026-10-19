@@ -467,6 +467,7 @@ pub async fn rubygems_push(
         actor_id: user_id, ..
     }: RepoWrite,
     Path((owner, name)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     body: Body,
 ) -> axum::response::Response {
     let body = match stage_request_artifact(&state, body, state.package_upload_max_bytes).await {
@@ -519,6 +520,7 @@ pub async fn rubygems_push(
     let published = persist_package(
         state,
         user_id,
+        &headers,
         owner,
         name,
         "rubygems".to_string(),

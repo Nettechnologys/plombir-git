@@ -3430,6 +3430,150 @@ async fn moving_and_removing_an_npm_dist_tag_records_who_did_it() {
     assert_names_the_writer(&removes[0], "stable");
 }
 
+/// A file added to an already-published version changes what a client gets
+/// while the version stays the same: a new platform wheel in `pkg==1.0.0` is
+/// what pip on that platform installs from then on. The version row's
+/// `author_id` names whoever published first and the file row names nobody,
+/// so this was a change no journal could attribute (card_8c4269a5f5cf).
+///
+/// The version is created by the owner over REST and the file added by a
+/// write collaborator through the Maven layout — the door `mvn deploy` uses —
+/// so the row has to name the account that added the file, whichever door it
+/// came through.
+#[tokio::test]
+async fn a_file_added_to_a_published_version_records_who_added_it() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, owner_id) = register_full(
+        &base,
+        "file-journal-owner",
+        "file-journal-owner@example.com",
+    )
+    .await;
+    rg_db::ops::user_ops::update_by_id(&db, owner_id, None, None, Some(true), None)
+        .await
+        .expect("promote the owner to admin")
+        .expect("the owner exists");
+    let (writer_token, writer_id) = register_full(
+        &base,
+        "file-journal-writer",
+        "file-journal-writer@example.com",
+    )
+    .await;
+    create_repo(&base, &owner_token, "file-journal-repo").await;
+    let client = reqwest::Client::new();
+    let repo = format!("{base}/api/v1/repos/file-journal-owner/file-journal-repo");
+    let granted = client
+        .post(format!("{repo}/collaborators"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"username": "file-journal-writer", "permission": "write"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        granted.status(),
+        StatusCode::CREATED,
+        "{}",
+        granted.text().await.unwrap()
+    );
+
+    let journal = || {
+        let client = client.clone();
+        let base = base.clone();
+        let owner_token = owner_token.clone();
+        async move {
+            let response = client
+                .get(format!("{base}/api/v1/admin/audit/logs"))
+                .query(&[("action", "package.file.add"), ("per_page", "100")])
+                .bearer_auth(&owner_token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.json::<serde_json::Value>().await.unwrap()["logs"]
+                .as_array()
+                .expect("`logs` array")
+                .clone()
+        }
+    };
+
+    let pom = br#"<?xml version="1.0"?>
+<project><groupId>com.example</groupId><artifactId>journal-file</artifactId><version>1.0.0</version></project>"#
+        .to_vec();
+    let mut url = reqwest::Url::parse(&format!("{repo}/packages/maven/publish")).unwrap();
+    url.query_pairs_mut()
+        .append_pair("name", "com.example:journal-file")
+        .append_pair("version", "1.0.0");
+    let created = client
+        .post(url)
+        .bearer_auth(&owner_token)
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"journal-file-1.0.0.pom\"",
+        )
+        .body(pom)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        created.status(),
+        StatusCode::CREATED,
+        "{}",
+        created.text().await.unwrap()
+    );
+    // Creating the version is attributed by its row; the journal rows below
+    // have to be earned by adding to it.
+    assert!(journal().await.is_empty());
+
+    let jar = zip_archive(&[("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n")]);
+    let layout =
+        format!("{repo}/packages/maven/com/example/journal-file/1.0.0/journal-file-1.0.0.jar");
+    let added = client
+        .put(&layout)
+        .bearer_auth(&writer_token)
+        .body(jar.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        added.status().is_success(),
+        "PUT the jar answered {}: {}",
+        added.status(),
+        added.text().await.unwrap()
+    );
+
+    // A refused repeat adds nothing, so it must not claim it did.
+    let repeated = client
+        .put(&layout)
+        .bearer_auth(&writer_token)
+        .body(jar.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repeated.status(), StatusCode::CONFLICT);
+
+    let rows = journal().await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let entry = &rows[0];
+    assert_eq!(entry["user_id"], writer_id, "{entry}");
+    assert_eq!(entry["username"], "file-journal-writer", "{entry}");
+    assert_eq!(entry["resource_type"], "package_version", "{entry}");
+    assert_eq!(
+        entry["resource_name"],
+        "file-journal-owner/file-journal-repo/com.example:journal-file@1.0.0",
+        "{entry}"
+    );
+    let details: serde_json::Value =
+        serde_json::from_str(entry["details"].as_str().expect("details are recorded"))
+            .expect("details are JSON");
+    assert_eq!(details["pkg_type"], "maven", "{details}");
+    assert_eq!(details["filename"], "journal-file-1.0.0.jar", "{details}");
+    assert_eq!(
+        details["sha256"],
+        hex::encode(sha2::Sha256::digest(&jar)),
+        "the row names the bytes a resolver will verify: {details}"
+    );
+}
+
 /// A scoped name (`@scope/name`) carries a literal slash, and `dist.tarball` is
 /// the *only* address npm ever downloads from — it never rebuilds the path from
 /// the package name itself. Pasted raw into the URL, that slash turns the

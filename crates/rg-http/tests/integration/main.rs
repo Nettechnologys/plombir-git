@@ -182,6 +182,7 @@ mod package_deletion_storage_tests;
 mod package_download_integrity_tests;
 mod package_failure_status_tests;
 mod package_format_e2e_tests;
+mod package_journal_census;
 mod package_manifest_publish_tests;
 mod package_permission_tests;
 mod package_upload_memory_tests;

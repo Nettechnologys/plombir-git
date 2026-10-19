@@ -251,6 +251,7 @@ pub async fn maven_upload(
         actor_id: user_id, ..
     }: RepoWrite,
     params: axum::extract::RawPathParams,
+    headers: axum::http::HeaderMap,
     body: Body,
 ) -> axum::response::Response {
     let body = match stage_request_artifact(&state, body, state.package_upload_max_bytes).await {
@@ -343,6 +344,7 @@ pub async fn maven_upload(
     publish_package(
         state,
         user_id,
+        &headers,
         request.owner,
         request.repo,
         "maven".to_string(),

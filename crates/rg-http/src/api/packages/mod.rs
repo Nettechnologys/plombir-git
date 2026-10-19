@@ -583,7 +583,10 @@ pub async fn publish(
         Ok(body) => body,
         Err(response) => return response,
     };
-    publish_package(state, user_id, owner, name, pkg_type, query, filename, body).await
+    publish_package(
+        state, user_id, &headers, owner, name, pkg_type, query, filename, body,
+    )
+    .await
 }
 
 /// The upload's filename as the `Content-Disposition` header spells it.
@@ -645,6 +648,7 @@ pub async fn pypi_legacy_upload(
         actor_id: user_id, ..
     }: RepoWrite,
     Path((owner, name)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     multipart: Multipart,
 ) -> axum::response::Response {
     let upload = match decode_twine_upload(
@@ -744,6 +748,7 @@ pub async fn pypi_legacy_upload(
     let mut response = publish_package_with_extra_files(
         state,
         user_id,
+        &headers,
         owner,
         name,
         "pypi".to_string(),
@@ -765,6 +770,7 @@ pub async fn pypi_legacy_upload(
 async fn publish_package(
     state: AppState,
     user_id: i64,
+    headers: &axum::http::HeaderMap,
     owner: String,
     name: String,
     pkg_type: String,
@@ -775,6 +781,7 @@ async fn publish_package(
     publish_package_with_extra_files(
         state,
         user_id,
+        headers,
         owner,
         name,
         pkg_type,
@@ -799,6 +806,7 @@ async fn publish_package(
 async fn publish_package_with_extra_files(
     state: AppState,
     user_id: i64,
+    headers: &axum::http::HeaderMap,
     owner: String,
     name: String,
     pkg_type: String,
@@ -893,6 +901,7 @@ async fn publish_package_with_extra_files(
     persist_package(
         state,
         user_id,
+        headers,
         owner,
         name,
         pkg_type,
@@ -908,6 +917,7 @@ async fn publish_package_with_extra_files(
 async fn persist_package(
     state: AppState,
     user_id: i64,
+    headers: &axum::http::HeaderMap,
     owner: String,
     name: String,
     pkg_type: String,
@@ -930,6 +940,13 @@ async fn persist_package(
     let storage =
         rg_core::package_registry::PackageStorage::from_backend(state.blob_storage.clone());
 
+    // Kept for the journal: `info` moves into the publish below.
+    let coordinates = PublishedCoordinates {
+        repo: format!("{owner}/{name}"),
+        pkg_type: pkg_type.clone(),
+        pkg_name: resolved.name.clone(),
+        version: resolved.version.clone(),
+    };
     let info = rg_core::package_registry::PublishInfo {
         owner,
         repo: name,
@@ -955,6 +972,17 @@ async fn persist_package(
     .await
     {
         Ok(result) => {
+            if !result.added_files.is_empty() {
+                record_added_package_files(
+                    &state,
+                    user_id,
+                    headers,
+                    &coordinates,
+                    result.version_id,
+                    &result.added_files,
+                )
+                .await;
+            }
             let status = if result.existing {
                 StatusCode::OK
             } else {
@@ -971,6 +999,66 @@ async fn persist_package(
                 .into_response()
         }
         Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+/// Where a publish landed, named the way the package journal names it.
+struct PublishedCoordinates {
+    repo: String,
+    pkg_type: String,
+    pkg_name: String,
+    version: String,
+}
+
+/// One `package.file.add` row per file a publish put into a version that was
+/// already there.
+///
+/// A new version is attributed by its row's `author_id`; a file added to an
+/// existing one is not — that column names whoever published first, and the
+/// file row records no uploader. Yet the file changes what a client gets
+/// without the version changing: a `cp312-manylinux` wheel added to
+/// `pkg==1.0.0` is what pip on that platform installs from then on
+/// (card_8c4269a5f5cf). Every protocol door — REST, twine, npm, Maven,
+/// RubyGems, cargo, NuGet — reaches the registry through `persist_package`,
+/// which is why the row is written here and not in each of them.
+///
+/// Written after the files are committed and never turned into an error, as
+/// with the dist-tag rows: the upload is done, and a retry the client made
+/// because the journal failed would only be refused as a duplicate file.
+async fn record_added_package_files(
+    state: &AppState,
+    user_id: i64,
+    headers: &axum::http::HeaderMap,
+    coordinates: &PublishedCoordinates,
+    version_id: i64,
+    files: &[rg_core::package_registry::service::AddedFile],
+) {
+    let actor = rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, user_id).await;
+    let PublishedCoordinates {
+        repo,
+        pkg_type,
+        pkg_name,
+        version,
+    } = coordinates;
+    for file in files {
+        rg_core::audit::record(
+            &state.db,
+            &actor,
+            "package.file.add",
+            Some("package_version"),
+            Some(version_id),
+            Some(&format!("{repo}/{pkg_name}@{version}")),
+            Some(headers),
+            Some(serde_json::json!({
+                "repo": repo,
+                "pkg_type": pkg_type,
+                "pkg_name": pkg_name,
+                "version": version,
+                "filename": file.filename,
+                "sha256": file.sha256,
+            })),
+        )
+        .await;
     }
 }
 
@@ -1017,6 +1105,7 @@ pub async fn publish_npm(
     publish_package(
         state,
         user_id,
+        &headers,
         owner,
         name,
         "npm".to_string(),
@@ -1058,6 +1147,7 @@ pub async fn publish_npm_packument(
         repo: repository,
     }: RepoWrite,
     Path((owner, repo, pkg_name)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
     body: Body,
 ) -> axum::response::Response {
     let body = match stage_request_artifact(
@@ -1192,6 +1282,7 @@ pub async fn publish_npm_packument(
     persist_package(
         state,
         user_id,
+        &headers,
         owner,
         repo,
         "npm".to_string(),

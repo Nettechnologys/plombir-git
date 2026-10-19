@@ -78,6 +78,20 @@ pub struct PublishResult {
     pub package_id: i64,
     pub version_id: i64,
     pub existing: bool,
+    /// The files this request put into a version that was already published;
+    /// empty when it created the version. The version row's `author_id` names
+    /// whoever published first, so these are the files nobody else answers
+    /// for — the caller journals them.
+    #[serde(default)]
+    pub added_files: Vec<AddedFile>,
+}
+
+/// A file a publish added to an already-published version.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AddedFile {
+    pub filename: String,
+    /// Lowercase hex — what the client that resolves this file will verify.
+    pub sha256: String,
 }
 
 /// Summary of a package for listing.
@@ -388,6 +402,7 @@ pub async fn publish(
         }
     };
     let existing_version = existing.is_some();
+    let mut added_files = Vec::new();
 
     let version = if let Some(v) = existing {
         if protocol_version_key.is_some() && v.version != info.version {
@@ -404,7 +419,7 @@ pub async fn publish(
         // beside a wheel; NuGet pushes a symbols package next to the main one),
         // and every request after the first left no trace in storage or the
         // database.
-        add_files_to_version(db, storage, &mut info, &v).await?;
+        added_files = add_files_to_version(db, storage, &mut info, &v).await?;
         v
     } else {
         // 4. Store files
@@ -607,6 +622,7 @@ pub async fn publish(
         package_id: pkg.id,
         version_id: version.id,
         existing: existing_version,
+        added_files,
     })
 }
 
@@ -748,12 +764,15 @@ async fn discard_stored_files(
 /// `UNIQUE(version_id, filename)` index is the concurrency boundary: file rows
 /// and the corresponding size increase commit together, while the losing
 /// request deletes only its request-private blobs.
+///
+/// Answers with the files it committed, so the caller can journal who put
+/// them there: nothing in the version or file rows says.
 async fn add_files_to_version(
     db: &DatabaseConnection,
     storage: &PackageStorage,
     info: &mut PublishInfo,
     version: &rg_db::entities::package_version::Model,
-) -> Result<()> {
+) -> Result<Vec<AddedFile>> {
     let published = rg_db::ops::package_file_ops::list_by_version(db, version.id).await?;
     for (filename, _) in &info.files {
         if published.iter().any(|f| &f.filename == filename) {
@@ -878,7 +897,13 @@ async fn add_files_to_version(
 
     storage.finish_publication(&stored_files).await;
 
-    Ok(())
+    Ok(stored_files
+        .into_iter()
+        .map(|stored| AddedFile {
+            filename: stored.filename,
+            sha256: stored.digests.sha256,
+        })
+        .collect())
 }
 
 /// List all packages for a repository and package type.

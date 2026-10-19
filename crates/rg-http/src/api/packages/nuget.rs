@@ -92,6 +92,7 @@ pub async fn nuget_publish(
     publish_package(
         state,
         user_id,
+        &headers,
         owner,
         name,
         "nuget".to_string(),
