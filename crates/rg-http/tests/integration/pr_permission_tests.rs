@@ -1518,3 +1518,92 @@ async fn creating_a_pr_that_adds_a_submodule_still_requests_the_codeowner() {
 
     server.abort();
 }
+
+/// card_6abf2e3c4287: a requested review wrote its inbox row deep inside
+/// `review::service`, which knew nothing of the WebSocket hub, so the reviewer's
+/// open tab heard about it only on the next periodic re-read. The socket is
+/// opened the way a browser opens it — by the session cookie — before the
+/// request is made, and the event has to arrive on it without any polling.
+#[tokio::test]
+async fn a_requested_reviewer_hears_about_it_on_their_open_notification_socket() {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, owner_id) =
+        register_full(&base, "ws-rr-owner", "ws-rr-owner@example.com").await;
+    let (reviewer_token, reviewer_id) =
+        register_full(&base, "ws-rr-reviewer", "ws-rr-reviewer@example.com").await;
+    let repo_id = create_repo_with_visibility(&base, &owner_token, "ws-review", false).await;
+    insert_pr(&db, repo_id, owner_id, 1).await;
+
+    let mut request = format!(
+        "{}/api/v1/ws/notifications",
+        base.replacen("http://", "ws://", 1)
+    )
+    .into_client_request()
+    .unwrap();
+    request.headers_mut().insert(
+        "cookie",
+        format!("plombir_git_token={reviewer_token}")
+            .parse()
+            .unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("the reviewer opens their notification socket");
+    async fn next_text<S>(socket: &mut S) -> serde_json::Value
+    where
+        S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), socket.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str(&text).unwrap(),
+            other => panic!("no notification frame on the reviewer's socket: {other:?}"),
+        }
+    }
+    let welcome = next_text(&mut socket).await;
+    assert_eq!(welcome["type"], "connected", "{welcome}");
+
+    let requested = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/repos/ws-rr-owner/ws-review/pulls/1/reviewers"
+        ))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"username": "ws-rr-reviewer"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(requested.status(), 201);
+
+    let event = next_text(&mut socket).await;
+    assert_eq!(event["event_type"], "review_requested", "{event}");
+    assert_eq!(event["data"]["user_id"], reviewer_id, "{event}");
+    let payload = &event["data"]["payload"];
+    assert_eq!(payload["subject_type"], "pull_request", "{payload}");
+    assert_eq!(
+        payload["link"], "/ws-rr-owner/ws-review/pulls/1",
+        "{payload}"
+    );
+
+    // The row the event announces is already readable when the event arrives.
+    let inbox: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/notifications"))
+        .bearer_auth(&reviewer_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        inbox["data"]
+            .as_array()
+            .expect("notification list")
+            .iter()
+            .any(|row| row["reason"] == "review_requested"),
+        "{inbox}"
+    );
+    if socket.close(None).await.is_err() {
+        // The server may have closed first — the frames above are the assertion.
+    }
+}

@@ -54,7 +54,35 @@ describe('the navigation bar', () => {
 		expect(badge(bar.container)?.getAttribute('aria-label')).toBe('1 unread notifications');
 	});
 
-	it('re-reads the count periodically for notifications that arrive without a push', async () => {
+	it('a requested review reaches the open notifications page without a reload', async () => {
+		notifications.unreadCount.mockResolvedValue({ unread_count: 0 });
+		notifications.list.mockResolvedValue({ data: [], pagination: { page: 1, per_page: 20, total: 0, total_pages: 0 } });
+		const page = await renderComponent(NotificationsPage);
+		rendered.push(page);
+		await settle();
+		expect(page.container.textContent).not.toContain('please review');
+
+		// card_6abf2e3c4287: thread notifications are announced by their reason.
+		notifications.unreadCount.mockResolvedValue({ unread_count: 1 });
+		notifications.list.mockResolvedValue({
+			data: [
+				{
+					id: 9,
+					event_type: 'pull_request',
+					reason: 'review_requested',
+					title: 'alice/app #3: please review',
+					is_read: false,
+					created_at: '2026-10-19T00:00:00Z',
+				},
+			],
+			pagination: { page: 1, per_page: 20, total: 1, total_pages: 1 },
+		});
+		for (const push of pushes) push({ event_type: 'review_requested', data: { payload: { reason: 'review_requested' } } });
+		await settle();
+		expect(page.container.textContent).toContain('please review');
+	});
+
+	it('re-reads the count periodically for notifications whose push was missed', async () => {
 		vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
 		notifications.unreadCount.mockResolvedValue({ unread_count: 0 });
 		const bar = await renderComponent(Navbar);

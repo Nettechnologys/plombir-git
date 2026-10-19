@@ -95,7 +95,7 @@ impl rg_core::notification::mail::Outbox for RecordingOutbox {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notifications_reach_the_people_an_event_is_about() {
     let (base, db, _repo_root) = spawn_test_app_with_db_and_repo_root().await;
-    let (owner, _) = register_full(&base, "nr_owner", "nr_owner@example.com").await;
+    let (owner, owner_id) = register_full(&base, "nr_owner", "nr_owner@example.com").await;
     let (reviewer, _) = register_full(&base, "nr_rev", "nr_rev@example.com").await;
     let (member, _) = register_full(&base, "nr_member", "nr_member@example.com").await;
     let (outsider, _) = register_full(&base, "nr_out", "nr_out@example.com").await;
@@ -255,11 +255,29 @@ async fn notifications_reach_the_people_an_event_is_about() {
     rg_db::ops::pipeline_ops::update_pipeline_status(&db, pipeline.id, "failed", None, None)
         .await
         .unwrap();
+    // Through pools that carry a hub, as the runners' do: the author's open
+    // tab is told, not only their inbox (card_6abf2e3c4287).
+    #[derive(Default)]
+    struct Heard(Mutex<Vec<(i64, String)>>);
+    impl rg_core::push_hooks::PushNotifier for Heard {
+        fn notify(&self, user_id: i64, event_type: &str, _data: serde_json::Value) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((user_id, event_type.to_string()));
+        }
+    }
+    let heard = std::sync::Arc::new(Heard::default());
+    let pools = rg_core::db::Db::new(db.clone(), db.clone()).with_notifier(Some(heard.clone()));
     assert_eq!(
-        rg_core::notification::thread::deliver_ci_failed(&db, pipeline.id)
+        rg_core::notification::thread::deliver_ci_failed(&pools, pipeline.id)
             .await
             .unwrap(),
         1
+    );
+    assert_eq!(
+        *heard.0.lock().unwrap(),
+        vec![(owner_id, "ci_failed".to_string())]
     );
     let failed = eventually(&base, &owner, "for the failed CI", |n| {
         n["reason"] == "ci_failed"

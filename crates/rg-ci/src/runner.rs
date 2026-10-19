@@ -532,7 +532,7 @@ impl PipelineRunner {
                         tracing::warn!(pipeline_id = self.pipeline_id, error = %hook_error, "failed to trigger CI webhook");
                     }
                     rg_core::notification::thread::notify_ci_failed(
-                        &rg_core::db::Db::new(self.db.clone(), self.db_write.clone()),
+                        &self.notification_pools(),
                         self.pipeline_id,
                     );
                 }
@@ -661,7 +661,7 @@ impl PipelineRunner {
         }
         if pipeline_failed {
             rg_core::notification::thread::notify_ci_failed(
-                &rg_core::db::Db::new(self.db.clone(), self.db_write.clone()),
+                &self.notification_pools(),
                 self.pipeline_id,
             );
         }
@@ -985,6 +985,15 @@ impl PipelineRunner {
             Some(shutdown) => engine.with_shutdown(shutdown.clone()),
             None => engine,
         }
+    }
+
+    /// The pools a failed pipeline's `ci_failed` notification is written
+    /// through, announced on the hub handed over in
+    /// [`set_notifications`](Self::set_notifications) — without it the PR
+    /// author's open tab never heard that CI failed (card_6abf2e3c4287).
+    fn notification_pools(&self) -> rg_core::db::Db {
+        rg_core::db::Db::new(self.db.clone(), self.db_write.clone())
+            .with_notifier(self.notifications.notifier.clone())
     }
 
     /// This runner's post-push wiring, for the base-branch moves the merges it
@@ -2367,6 +2376,38 @@ mod tests {
         notifier.notify(9, "push", serde_json::json!({}));
         assert_eq!(recorder.events(), vec![(9, "push".to_string())]);
         assert!(context.smtp_config.is_some());
+    }
+
+    /// A pipeline that fails under the embedded runner tells the PR author
+    /// through pools that carry the same hub (card_6abf2e3c4287).
+    #[tokio::test]
+    async fn a_wired_runner_announces_ci_failures_on_the_hub() {
+        use rg_core::db::DbPools as _;
+
+        let (recorder, notifications) = crate::test_notifier::wiring();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        let mut runner = PipelineRunner::new_local_only(
+            db,
+            std::path::Path::new("/srv/repos"),
+            std::path::Path::new("/srv/repos/o/r.git"),
+            1,
+        );
+        assert!(runner.notification_pools().notifier().is_none());
+        runner.set_notifications(notifications);
+
+        let pools = runner.notification_pools();
+        let notifier = pools
+            .notifier()
+            .expect("a failed pipeline owes its author a live event");
+        notifier.notify(4, "ci_failed", serde_json::json!({}));
+        assert_eq!(recorder.events(), vec![(4, "ci_failed".to_string())]);
     }
 
     /// A merge the embedded runner unblocks — auto-merge, the merge queue —

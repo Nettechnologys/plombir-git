@@ -1084,6 +1084,7 @@ async fn settle_refused_merge_group_config(
         crate::ci::ConfigurationFailureParams {
             db,
             write_pool: Some(pools.write()),
+            notifier: pools.notifier(),
             repo_id: entry.repo_id,
             commit_sha: group_sha,
             ref_name: group_ref,
@@ -2635,6 +2636,7 @@ mod merge_group_config_refusal_tests {
         PipelineCi {
             trigger,
             write_pool: None,
+            notifier: None,
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,
@@ -3044,6 +3046,7 @@ mod merge_group_conflict_reason_tests {
         PipelineCi {
             trigger,
             write_pool: None,
+            notifier: None,
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,
@@ -4168,6 +4171,7 @@ mod merge_group_strategy_fidelity_tests {
         PipelineCi {
             trigger,
             write_pool: None,
+            notifier: None,
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,

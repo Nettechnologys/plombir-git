@@ -324,9 +324,17 @@ mod tracked_ref_operation_tests {
 }
 
 impl AppState {
-    /// Carry both pools into services that enqueue writes after the request.
+    /// Carry both pools into services that enqueue writes after the request,
+    /// together with this server's hub: the notification rows those services
+    /// write are announced on it (card_6abf2e3c4287).
     pub fn db_pools(&self) -> rg_core::db::Db {
         rg_core::db::Db::new(self.db.clone(), self.db_write.clone())
+            .with_notifier(Some(self.notifier()))
+    }
+
+    /// This server's WebSocket hub, in the form `rg-core` announces through.
+    pub(crate) fn notifier(&self) -> Arc<dyn rg_core::push_hooks::PushNotifier> {
+        Arc::new(self.notification_hub.clone())
     }
 
     /// Run every post-push hook for refs this process just moved, detached
@@ -419,7 +427,7 @@ impl AppState {
             smtp_config: self.smtp_config.clone(),
             ci_engine: self.ci_engine.clone(),
             external_url: self.external_url.clone(),
-            notifier: Some(Arc::new(self.notification_hub.clone())),
+            notifier: Some(self.notifier()),
             delivery_tracker: self.delivery_tracker.clone(),
             write_pool: Some(self.db_write.clone()),
             storage_limits: self.storage_limits,
@@ -490,6 +498,7 @@ impl AppState {
             jwt_secret: Some(&self.jwt_secret),
             encryption_key: Some(&self.encryption_key),
             external_url: self.external_url.as_deref(),
+            notifier: Some(self.notifier()),
             storage_limits: self.storage_limits,
         }
     }

@@ -277,9 +277,9 @@ pub struct Delivered {
 }
 
 /// Deliver `event` now. See the module note for the order of things.
-pub async fn deliver(db: &impl crate::db::DbPools, event: &ThreadEvent) -> Result<Delivered> {
-    let write = db.write();
-    let db = db.read();
+pub async fn deliver(pools: &impl crate::db::DbPools, event: &ThreadEvent) -> Result<Delivered> {
+    let write = pools.write();
+    let db = pools.read();
     let subject = &event.subject;
     let subject_type = subject.kind.as_str();
     let Some(repo) = rg_db::ops::repo_ops::find_by_id(db, subject.repo_id).await? else {
@@ -371,8 +371,19 @@ pub async fn deliver(db: &impl crate::db::DbPools, event: &ThreadEvent) -> Resul
         actor: actor_name.as_deref(),
     };
     let mut delivered = Delivered::default();
+    let notifier = pools.notifier().map(|notifier| &**notifier);
     for page in recipients.chunks(THREAD_FANOUT_PAGE) {
-        deliver_page(db, write, &repo, event, page, &text, &mut delivered).await?;
+        deliver_page(
+            db,
+            write,
+            notifier,
+            &repo,
+            event,
+            page,
+            &text,
+            &mut delivered,
+        )
+        .await?;
     }
     if !delivered.mailed.is_empty() {
         super::mail::wake();
@@ -408,10 +419,13 @@ struct FoldGroup {
     email: bool,
 }
 
-/// Deliver `event` to one page of its recipients, in recipient order.
+/// Deliver `event` to one page of its recipients, in recipient order, and
+/// announce each row on `notifier` once the page has committed.
+#[allow(clippy::too_many_arguments)]
 async fn deliver_page(
     db: &DatabaseConnection,
     write: &DatabaseConnection,
+    notifier: Option<&dyn crate::push_hooks::PushNotifier>,
     repo: &rg_db::entities::repository::Model,
     event: &ThreadEvent,
     page: &[(i64, Reason)],
@@ -551,6 +565,23 @@ async fn deliver_page(
     transaction.commit().await?;
 
     for (user_id, reason, email) in outcome {
+        // After the commit, so a client that re-reads on the event finds the
+        // row. A folded row is announced too, since its text changed; the
+        // event type is why this event reached the reader.
+        if let Some(notifier) = notifier {
+            notifier.notify(
+                user_id,
+                reason.as_str(),
+                serde_json::json!({
+                    "reason": reason.as_str(),
+                    "repo_id": subject.repo_id,
+                    "subject_type": subject_type,
+                    "subject_id": subject.id,
+                    "title": text.title,
+                    "link": text.link,
+                }),
+            );
+        }
         delivered.notified.push((user_id, reason));
         if email {
             delivered.mailed.push(user_id);

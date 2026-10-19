@@ -198,9 +198,9 @@ pub fn spawn_notify_watchers(
 /// failed check or insert costs that page — logged with its size — and the
 /// walk continues; only a failed *page query* aborts it, and the count reached
 /// by then is logged rather than lost.
-pub async fn notify_watchers(db: &impl crate::db::DbPools, event: &WatchEvent) -> Result<()> {
-    let write = db.write();
-    let db = db.read();
+pub async fn notify_watchers(pools: &impl crate::db::DbPools, event: &WatchEvent) -> Result<()> {
+    let write = pools.write();
+    let db = pools.read();
     let repo_id = event.repo_id;
     let mut page = watch_page(db, repo_id, 0).await?;
     if page.is_empty() {
@@ -277,7 +277,25 @@ pub async fn notify_watchers(db: &impl crate::db::DbPools, event: &WatchEvent) -
         )
         .await
         {
-            Ok(written) => delivered += written as usize,
+            Ok(written) => {
+                delivered += written as usize;
+                // The page is one insert, so every recipient now has a row to
+                // re-read. Without this the watchers' open tabs heard of a new
+                // issue or pull request only on the next periodic re-read, as
+                // thread notifications did before card_6abf2e3c4287.
+                if let Some(notifier) = pools.notifier() {
+                    for &user_id in &recipients {
+                        notifier.notify(
+                            user_id,
+                            notification_type,
+                            serde_json::json!({
+                                "repo_id": repo_id,
+                                "title": event.title,
+                            }),
+                        );
+                    }
+                }
+            }
             Err(e) => tracing::warn!(
                 repo_id,
                 notification_type,

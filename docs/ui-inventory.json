@@ -23359,7 +23359,7 @@
         {
           "tag": "a",
           "label": "←",
-          "line": 166,
+          "line": 168,
           "via": null,
           "href": "/admin",
           "handler": null,
@@ -23369,7 +23369,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 173,
+          "line": 175,
           "via": null,
           "href": null,
           "handler": "applyFilter",
@@ -23399,7 +23399,7 @@
         {
           "tag": "select",
           "label": ")}",
-          "line": 178,
+          "line": 180,
           "via": null,
           "href": null,
           "handler": "applyFilter",
@@ -23425,7 +23425,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.audit.clear_filters",
-          "line": 185,
+          "line": 187,
           "via": null,
           "href": null,
           "handler": "clearFilters",
@@ -23451,7 +23451,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.audit.fields.details",
-          "line": 241,
+          "line": 243,
           "via": null,
           "href": null,
           "handler": "() => openDetail(log)",
@@ -23481,7 +23481,7 @@
         {
           "tag": "button",
           "label": "i18n:common.prev_arrow",
-          "line": 254,
+          "line": 256,
           "via": null,
           "href": null,
           "handler": "prevPage",
@@ -23507,7 +23507,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next_arrow",
-          "line": 256,
+          "line": 258,
           "via": null,
           "href": null,
           "handler": "nextPage",
@@ -23533,7 +23533,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 314,
+          "line": 316,
           "via": null,
           "href": null,
           "handler": "closeDetail",
@@ -26171,7 +26171,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 172,
+          "line": 174,
           "via": null,
           "href": null,
           "handler": "load",
@@ -26210,7 +26210,7 @@
         {
           "tag": "button",
           "label": "i18n:notifications.mark_all_read",
-          "line": 176,
+          "line": 178,
           "via": null,
           "href": null,
           "handler": "markAllRead",
@@ -26263,7 +26263,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 202,
+          "line": 204,
           "via": null,
           "href": "internalLink(notif)",
           "handler": "(event) => openNotification(event, notif)",
@@ -26288,7 +26288,7 @@
         {
           "tag": "button",
           "label": "i18n:notifications.mark_read",
-          "line": 218,
+          "line": 220,
           "via": null,
           "href": null,
           "handler": "() => markRead(notif.id)",

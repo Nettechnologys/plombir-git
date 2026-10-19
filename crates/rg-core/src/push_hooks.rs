@@ -65,7 +65,12 @@ pub struct PostPushParams<'a> {
     /// `jwt_secret`: this caller has no key, so no secrets are injected.
     pub encryption_key: Option<&'a str>,
     /// Real-time notification sink. `None` = no WebSocket hub in this process.
-    pub notifier: Option<&'a dyn PushNotifier>,
+    ///
+    /// Shared rather than borrowed: the thread notifications the hooks cause
+    /// (a CODEOWNERS review request, a pipeline that failed on its config) are
+    /// delivered on detached tasks that outlive this borrow, through the
+    /// pools [`Self::pools`] builds.
+    pub notifier: Option<&'a Arc<dyn PushNotifier>>,
     pub smtp_config: &'a Option<SmtpConfig>,
     pub ci_engine: &'a dyn CiTrigger,
     pub external_url: Option<&'a str>,
@@ -92,8 +97,16 @@ impl PostPushParams<'_> {
             jwt_secret: self.jwt_secret,
             encryption_key: self.encryption_key,
             external_url: self.external_url,
+            notifier: self.notifier.cloned(),
             storage_limits: self.storage_limits,
         }
+    }
+
+    /// The read and write pools this run writes through, announcing the
+    /// notification rows they write on this run's hub.
+    fn pools(&self) -> crate::db::Db {
+        crate::db::Db::new(self.db.clone(), self.write_pool.unwrap_or(self.db).clone())
+            .with_notifier(self.notifier.cloned())
     }
 
     /// Fan a real-time event out to `user_id`, or drop it when the caller has
@@ -165,7 +178,7 @@ impl PostPushContext {
                 allow_host_runner: self.allow_host_runner,
                 jwt_secret: self.jwt_secret.as_deref(),
                 encryption_key: self.encryption_key.as_deref(),
-                notifier: self.notifier.as_deref(),
+                notifier: self.notifier.as_ref(),
                 smtp_config: &self.smtp_config,
                 ci_engine: &*self.ci_engine,
                 external_url: self.external_url.as_deref(),
@@ -208,7 +221,7 @@ impl PostPushContext {
                     allow_host_runner: context.allow_host_runner,
                     jwt_secret: context.jwt_secret.as_deref(),
                     encryption_key: context.encryption_key.as_deref(),
-                    notifier: context.notifier.as_deref(),
+                    notifier: context.notifier.as_ref(),
                     smtp_config: &context.smtp_config,
                     ci_engine: &*context.ci_engine,
                     external_url: context.external_url.as_deref(),
@@ -234,6 +247,7 @@ impl PostPushContext {
             jwt_secret: self.jwt_secret.as_deref(),
             encryption_key: self.encryption_key.as_deref(),
             external_url: self.external_url.as_deref(),
+            notifier: self.notifier.clone(),
             storage_limits: self.storage_limits,
         }
     }
@@ -352,7 +366,8 @@ pub async fn evaluate_merges_for_head_commit(
 ) -> Vec<crate::pull_request::MergedRef> {
     let mut merged_refs = Vec::new();
     match crate::pull_request::try_auto_merges_for_head_commit(
-        &crate::db::Db::new(db.clone(), ci.write_pool.unwrap_or(db).clone()),
+        &crate::db::Db::new(db.clone(), ci.write_pool.unwrap_or(db).clone())
+            .with_notifier(ci.notifier.clone()),
         repo_root,
         source_repo_id,
         commit_sha,
@@ -739,10 +754,7 @@ async fn run_ref_move_hooks(
         // pair per subscriber, and a repository with thousands of them would
         // otherwise hold up every later ref in this same push.
         crate::repo::service::notify_watchers_push(
-            &crate::db::Db::new(
-                params.db.clone(),
-                params.write_pool.unwrap_or(params.db).clone(),
-            ),
+            &params.pools(),
             params.delivery_tracker,
             target.repo_id,
             &target.name,
@@ -1068,10 +1080,7 @@ async fn post_push_branch_maintenance(
 
             if let Some(head_sha) = synchronized.head_sha.as_deref() {
                 if update.old_sha != update.new_sha && protocol_head == Some(head_sha) {
-                    let pools = crate::db::Db::new(
-                        params.db.clone(),
-                        params.write_pool.unwrap_or(params.db).clone(),
-                    );
+                    let pools = params.pools();
                     for pr in &synchronized.open_prs {
                         let payload = serde_json::json!({
                             "event": "pull_request.synchronize",
@@ -1220,6 +1229,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
                 crate::ci::ConfigurationFailureParams {
                     db: params.db,
                     write_pool: params.write_pool,
+                    notifier: params.notifier,
                     repo_id: target.repo_id,
                     commit_sha: &update.new_sha,
                     ref_name: &update.refname,
@@ -1465,10 +1475,7 @@ async fn trigger_push_webhooks(
     update: &RefUpdate,
 ) {
     let repo_id = target.repo_id;
-    let webhook_db = crate::db::Db::new(
-        params.db.clone(),
-        params.write_pool.unwrap_or(params.db).clone(),
-    );
+    let webhook_db = params.pools();
     // 2. Trigger push webhook
     let payload = serde_json::json!({
         "ref": update.refname,
@@ -1980,7 +1987,8 @@ mod tests {
                 Vec::new(),
             ),
         ] {
-            let recording = Recording::default();
+            let recording = Arc::new(Recording::default());
+            let notifier: Arc<dyn PushNotifier> = recording.clone();
             let ci = RecordingPrCi::new();
             let smtp = None;
             let tracker = crate::task_tracker::TaskTracker::new();
@@ -1997,7 +2005,7 @@ mod tests {
                 allow_host_runner: false,
                 jwt_secret: None,
                 encryption_key: None,
-                notifier: Some(&recording),
+                notifier: Some(&notifier),
                 smtp_config: &smtp,
                 ci_engine: &ci,
                 external_url: None,

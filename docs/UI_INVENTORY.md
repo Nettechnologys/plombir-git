@@ -999,12 +999,12 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| applyFilter | :173 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke+browser |
-| )} | :178 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke |
-| i18n:admin.audit.clear_filters | :185 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke |
-| i18n:admin.audit.fields.details | :241 | `GET /api/v1/admin/audit/logs/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
-| i18n:common.prev_arrow | :254 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke |
-| i18n:common.next_arrow | :256 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke |
+| applyFilter | :175 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke+browser |
+| )} | :180 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke |
+| i18n:admin.audit.clear_filters | :187 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke |
+| i18n:admin.audit.fields.details | :243 | `GET /api/v1/admin/audit/logs/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
+| i18n:common.prev_arrow | :256 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke |
+| i18n:common.next_arrow | :258 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+web+smoke |
 
 ### `/admin/hooks` 🔒
 
@@ -1135,15 +1135,15 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| load | :172 | `GET /api/v1/notifications` | `User` | rust+web |
-| load | :172 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
-| i18n:notifications.mark_all_read | :176 | `POST /api/v1/notifications/mark-all-read` | `User` | rust+web |
-| i18n:notifications.mark_all_read | :176 | `GET /api/v1/notifications` | `User` | rust+web |
-| i18n:notifications.mark_all_read | :176 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
-| → internalLink(notif) | :202 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
-| i18n:notifications.mark_read | :218 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
-| i18n:notifications.mark_read | :218 | `GET /api/v1/notifications` | `User` | rust+web |
-| i18n:notifications.mark_read | :218 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
+| load | :174 | `GET /api/v1/notifications` | `User` | rust+web |
+| load | :174 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
+| i18n:notifications.mark_all_read | :178 | `POST /api/v1/notifications/mark-all-read` | `User` | rust+web |
+| i18n:notifications.mark_all_read | :178 | `GET /api/v1/notifications` | `User` | rust+web |
+| i18n:notifications.mark_all_read | :178 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
+| → internalLink(notif) | :204 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
+| i18n:notifications.mark_read | :220 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
+| i18n:notifications.mark_read | :220 | `GET /api/v1/notifications` | `User` | rust+web |
+| i18n:notifications.mark_read | :220 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
 | _(page load)_ | — | `GET /api/v1/ws/notifications` | `Foreign:ws.rs` | rust+web |
 
 ### `/orgs`

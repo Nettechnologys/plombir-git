@@ -126,10 +126,12 @@
   function setupWebSocket() {
     return connectNotificationWebSocket(
       (event) => {
-        if (event.event_type === 'push' || event.event_type === 'ci_triggered' || event.event_type === 'access') {
-          unreadCount++;
-          void load();
-        }
+        // Every event on this socket is a row written for the reader — a push,
+        // CI, an access change, or a thread notification named by its reason
+        // (`review_requested`, `mention`, …; card_6abf2e3c4287). The count comes
+        // back with the reload rather than being bumped here: a thread event
+        // can fold into a row that was already unread.
+        if (event?.event_type) void load();
       },
       () => {
         wsConnected = false;

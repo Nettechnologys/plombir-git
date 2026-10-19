@@ -23,6 +23,9 @@ pub struct PipelineCi<'a> {
     pub trigger: &'a dyn crate::ci::CiTrigger,
     /// The pool for notification fan-out after a failed configuration run.
     pub write_pool: Option<&'a DatabaseConnection>,
+    /// The hub the CI-failure notification of a failed configuration run is
+    /// announced on. `None` = no WebSocket hub in this process.
+    pub notifier: Option<std::sync::Arc<dyn crate::push_hooks::PushNotifier>>,
     pub docker_enabled: bool,
     pub external_runners: bool,
     /// See [`crate::ci::TriggerPipelineParams::allow_host_runner`].
@@ -316,6 +319,7 @@ pub async fn trigger_pull_request_ci_best_effort(
                     crate::ci::ConfigurationFailureParams {
                         db,
                         write_pool: ci.write_pool,
+                        notifier: ci.notifier.as_ref(),
                         repo_id: pr.repo_id,
                         commit_sha: head_sha,
                         ref_name: &ref_name,
@@ -590,6 +594,7 @@ mod configuration_failure_tests {
             &PipelineCi {
                 trigger: &trigger,
                 write_pool: None,
+                notifier: None,
                 docker_enabled: false,
                 external_runners: false,
                 allow_host_runner: false,

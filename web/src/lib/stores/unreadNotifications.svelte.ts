@@ -10,9 +10,10 @@
 
 import { connectNotificationWebSocket, notifications } from '$lib/api/client.svelte';
 
-/// Live pushes cover pushes, CI and access changes; issue and pull-request
-/// notifications reach the inbox without one, so the count is also re-read on
-/// this period while the tab is visible.
+/// Every notification row is pushed live (thread notifications too, since
+/// card_6abf2e3c4287), but the hub drops a push for a reader whose socket is
+/// reconnecting, so the count is also re-read on this period while the tab is
+/// visible.
 export const UNREAD_REFRESH_MS = 60_000;
 
 let unread = $state(0);

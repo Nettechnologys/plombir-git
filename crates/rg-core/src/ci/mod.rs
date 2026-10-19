@@ -510,6 +510,9 @@ pub struct WorkflowDispatchInput {
 pub struct ConfigurationFailureParams<'a> {
     pub db: &'a DatabaseConnection,
     pub write_pool: Option<&'a DatabaseConnection>,
+    /// Where the CI-failure notification this row causes is announced in real
+    /// time. `None` = no WebSocket hub in this process.
+    pub notifier: Option<&'a std::sync::Arc<dyn crate::push_hooks::PushNotifier>>,
     pub repo_id: i64,
     pub commit_sha: &'a str,
     pub ref_name: &'a str,
@@ -569,6 +572,7 @@ pub async fn publish_configuration_failure(
     let ConfigurationFailureParams {
         db,
         write_pool,
+        notifier,
         repo_id,
         commit_sha,
         ref_name,
@@ -665,7 +669,8 @@ pub async fn publish_configuration_failure(
         .await
         .context("db: commit CI configuration failure graph")?;
     crate::notification::thread::notify_ci_failed(
-        &crate::db::Db::new(db.clone(), write_pool.unwrap_or(db).clone()),
+        &crate::db::Db::new(db.clone(), write_pool.unwrap_or(db).clone())
+            .with_notifier(notifier.cloned()),
         pipeline_id,
     );
     Ok(Some(pipeline_id))
@@ -904,6 +909,7 @@ mod configuration_failure_tests {
         let params = || ConfigurationFailureParams {
             db: &db,
             write_pool: None,
+            notifier: None,
             repo_id: repo.id,
             commit_sha: "0123456789012345678901234567890123456789",
             ref_name: "refs/pull/7/head",

@@ -3263,6 +3263,173 @@ async fn npm_named_dist_tags_survive_publish_and_protocol_mutation() {
     assert_eq!(tags["latest"], "1.0.0", "{tags}");
 }
 
+/// Moving a dist-tag changes what `npm install <pkg>` resolves to while no
+/// version changes, so the version row's `author_id` cannot say who did it.
+/// The OCI twin — re-tagging an image — journals as `oci.manifest.push`; the
+/// npm doors wrote nothing, and a write token could point `latest` back at a
+/// vulnerable release without a trace (card_44ce692c5b9b).
+///
+/// The tag is moved by a write collaborator, not by the owner, so the journal
+/// has to name the account that acted rather than the one the package belongs to.
+#[tokio::test]
+async fn moving_and_removing_an_npm_dist_tag_records_who_did_it() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, owner_id) =
+        register_full(&base, "npm-journal-owner", "npm-journal-owner@example.com").await;
+    rg_db::ops::user_ops::update_by_id(&db, owner_id, None, None, Some(true), None)
+        .await
+        .expect("promote the owner to admin")
+        .expect("the owner exists");
+    let (writer_token, writer_id) = register_full(
+        &base,
+        "npm-journal-writer",
+        "npm-journal-writer@example.com",
+    )
+    .await;
+    create_repo(&base, &owner_token, "npm-journal-repo").await;
+    let client = reqwest::Client::new();
+    let repo = format!("{base}/api/v1/repos/npm-journal-owner/npm-journal-repo");
+    let granted = client
+        .post(format!("{repo}/collaborators"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"username": "npm-journal-writer", "permission": "write"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        granted.status(),
+        StatusCode::CREATED,
+        "{}",
+        granted.text().await.unwrap()
+    );
+
+    let name = "journal-tag-npm";
+    for version in ["1.0.0", "2.0.0"] {
+        let package_json = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let tarball = tar_gz(&[("package/package.json", package_json.as_bytes())]);
+        let packument = serde_json::json!({
+            "_id": name,
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": { version: { "name": name, "version": version } },
+            "_attachments": {
+                format!("{name}-{version}.tgz"): {
+                    "data": base64::engine::general_purpose::STANDARD.encode(&tarball),
+                    "length": tarball.len()
+                }
+            }
+        });
+        let published = client
+            .put(format!("{repo}/packages/npm/{name}"))
+            .bearer_auth(&owner_token)
+            .json(&packument)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            published.status(),
+            StatusCode::CREATED,
+            "publish {version}: {}",
+            published.text().await.unwrap()
+        );
+    }
+
+    let journal = |action: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        let owner_token = owner_token.clone();
+        async move {
+            let response = client
+                .get(format!("{base}/api/v1/admin/audit/logs"))
+                .query(&[("action", action), ("per_page", "100")])
+                .bearer_auth(&owner_token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.json::<serde_json::Value>().await.unwrap()["logs"]
+                .as_array()
+                .expect("`logs` array")
+                .clone()
+        }
+    };
+    // Publishing moves `latest` too, but through the version it creates; the
+    // rows below have to be earned by the dist-tag doors.
+    assert!(journal("package.dist_tag.set").await.is_empty());
+
+    let tag_url = |tag: &str| format!("{repo}/packages/npm/-/package/{name}/dist-tags/{tag}");
+    // A refused move must not leave a row claiming the tag moved.
+    let refused = client
+        .put(tag_url("latest"))
+        .bearer_auth(&writer_token)
+        .json("9.9.9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    assert!(journal("package.dist_tag.set").await.is_empty());
+
+    for (tag, version) in [("stable", "2.0.0"), ("latest", "1.0.0")] {
+        let set = client
+            .put(tag_url(tag))
+            .bearer_auth(&writer_token)
+            .json(version)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            set.status(),
+            StatusCode::OK,
+            "{}",
+            set.text().await.unwrap()
+        );
+    }
+    let removed = client
+        .delete(tag_url("stable"))
+        .bearer_auth(&writer_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        removed.status(),
+        StatusCode::OK,
+        "{}",
+        removed.text().await.unwrap()
+    );
+
+    let detail = |entry: &serde_json::Value| -> serde_json::Value {
+        serde_json::from_str(entry["details"].as_str().expect("details are recorded"))
+            .expect("details are JSON")
+    };
+    let assert_names_the_writer = |entry: &serde_json::Value, tag: &str| {
+        assert_eq!(entry["user_id"], writer_id, "{entry}");
+        assert_eq!(entry["username"], "npm-journal-writer", "{entry}");
+        assert_eq!(entry["resource_type"], "npm_dist_tag", "{entry}");
+        assert_eq!(
+            entry["resource_name"],
+            format!("npm-journal-owner/npm-journal-repo/{name}:{tag}"),
+            "{entry}"
+        );
+        assert_eq!(detail(entry)["pkg_name"], name, "{entry}");
+        assert_eq!(detail(entry)["tag"], tag, "{entry}");
+    };
+
+    let sets = journal("package.dist_tag.set").await;
+    assert_eq!(sets.len(), 2, "{sets:?}");
+    for (tag, version) in [("stable", "2.0.0"), ("latest", "1.0.0")] {
+        let entry = sets
+            .iter()
+            .find(|entry| detail(entry)["tag"] == tag)
+            .unwrap_or_else(|| panic!("no `package.dist_tag.set` row for {tag}: {sets:?}"));
+        assert_names_the_writer(entry, tag);
+        assert_eq!(detail(entry)["version"], version, "{entry}");
+    }
+
+    let removes = journal("package.dist_tag.remove").await;
+    assert_eq!(removes.len(), 1, "{removes:?}");
+    assert_names_the_writer(&removes[0], "stable");
+}
+
 /// A scoped name (`@scope/name`) carries a literal slash, and `dist.tarball` is
 /// the *only* address npm ever downloads from — it never rebuilds the path from
 /// the package name itself. Pasted raw into the URL, that slash turns the

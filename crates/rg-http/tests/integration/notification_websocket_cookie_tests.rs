@@ -121,3 +121,66 @@ async fn a_cookie_under_another_name_does_not_authenticate_the_notification_sock
         other => panic!("a valid JWT under the wrong cookie name was accepted: {other:?}"),
     }
 }
+
+/// card_6abf2e3c4287, the watch half: a new issue wrote an inbox row for every
+/// watcher of the repository and pushed nothing, so a watcher's open tab heard
+/// of it only on the next periodic re-read. The socket is the cookie one, the
+/// way the navigation bar opens it, and it is open before the issue exists.
+#[tokio::test]
+async fn a_watcher_hears_about_a_new_issue_on_their_open_notification_socket() {
+    let base = spawn_test_app().await;
+    let (owner, _) = register_full(&base, "wswatch-owner", "wswatch-owner@example.com").await;
+    let (watcher, watcher_id) =
+        register_full(&base, "wswatch-reader", "wswatch-reader@example.com").await;
+    crate::common::create_repo(&base, &owner, "watched").await;
+    let client = reqwest::Client::new();
+    let watched = client
+        .put(format!("{base}/api/v1/repos/wswatch-owner/watched/watch"))
+        .bearer_auth(&watcher)
+        .json(&serde_json::json!({ "state": "watching" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(watched.status(), 200);
+
+    let mut request = format!(
+        "{}/api/v1/ws/notifications",
+        base.replacen("http://", "ws://", 1)
+    )
+    .into_client_request()
+    .unwrap();
+    request.headers_mut().insert(
+        "cookie",
+        format!("plombir_git_token={watcher}").parse().unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("the watcher opens their notification socket");
+    async fn next_frame<S>(socket: &mut S) -> serde_json::Value
+    where
+        S: futures::Stream<Item = Result<Message, Error>> + Unpin,
+    {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), socket.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str(&text).unwrap(),
+            other => panic!("no notification frame on the watcher's socket: {other:?}"),
+        }
+    }
+    assert_eq!(next_frame(&mut socket).await["type"], "connected");
+
+    let opened = client
+        .post(format!("{base}/api/v1/repos/wswatch-owner/watched/issues"))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({ "title": "Watched thread" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), 201);
+
+    let event = next_frame(&mut socket).await;
+    assert_eq!(event["event_type"], "issue", "{event}");
+    assert_eq!(event["data"]["user_id"], watcher_id, "{event}");
+    assert_eq!(
+        event["data"]["payload"]["title"], "Issue #1 opened",
+        "{event}"
+    );
+}

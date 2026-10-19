@@ -49,6 +49,8 @@
     { value: 'package.delete', label: 'package.delete' },
     { value: 'package.yank', label: 'package.yank' },
     { value: 'package.unyank', label: 'package.unyank' },
+    { value: 'package.dist_tag.set', label: 'package.dist_tag.set' },
+    { value: 'package.dist_tag.remove', label: 'package.dist_tag.remove' },
     { value: 'admin.update_user', label: 'admin.update_user' },
     { value: 'admin.unlock_user', label: 'admin.unlock_user' },
     { value: 'admin.delete_user', label: 'admin.delete_user' },

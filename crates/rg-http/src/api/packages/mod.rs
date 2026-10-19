@@ -1979,16 +1979,37 @@ pub async fn npm_dist_tags(
 )]
 pub async fn set_npm_dist_tag(
     State(state): State<AppState>,
-    RepoWrite { .. }: RepoWrite,
+    RepoWrite { actor_id, .. }: RepoWrite,
     Path((owner, repo, pkg_name, tag)): Path<(String, String, String, String)>,
+    headers: axum::http::HeaderMap,
     Json(version): Json<String>,
 ) -> axum::response::Response {
+    // A dist-tag decides what `npm install <pkg>` resolves to without any
+    // version changing, so the version row's `author_id` cannot answer who
+    // pointed `latest` at an old release. The OCI twin — re-tagging an image —
+    // journals as `oci.manifest.push`; this one wrote nothing (card_44ce692c5b9b).
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+
     match rg_core::package_registry::service::set_npm_dist_tag(
         &state.db, &owner, &repo, &pkg_name, &tag, &version,
     )
     .await
     {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({}))).into_response(),
+        Ok(()) => {
+            record_npm_dist_tag_event(
+                &state,
+                &audit_actor,
+                "package.dist_tag.set",
+                (&owner, &repo, &pkg_name, &tag),
+                Some(&version),
+                &headers,
+            )
+            .await;
+            (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+        }
         Err(error) => AppError::from(error).into_response(),
     }
 }
@@ -2013,17 +2034,69 @@ pub async fn set_npm_dist_tag(
 )]
 pub async fn delete_npm_dist_tag(
     State(state): State<AppState>,
-    RepoWrite { .. }: RepoWrite,
+    RepoWrite { actor_id, .. }: RepoWrite,
     Path((owner, repo, pkg_name, tag)): Path<(String, String, String, String)>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+
     match rg_core::package_registry::service::remove_npm_dist_tag(
         &state.db, &owner, &repo, &pkg_name, &tag,
     )
     .await
     {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({}))).into_response(),
+        Ok(()) => {
+            record_npm_dist_tag_event(
+                &state,
+                &audit_actor,
+                "package.dist_tag.remove",
+                (&owner, &repo, &pkg_name, &tag),
+                None,
+                &headers,
+            )
+            .await;
+            (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+        }
         Err(error) => AppError::from(error).into_response(),
     }
+}
+
+/// The journal row for a dist-tag that was set or removed.
+///
+/// Written after the tag already moved and never turned into an error: the
+/// client sees the tag it asked for either way, and an audit failure that made
+/// it retry would only move the tag again.
+async fn record_npm_dist_tag_event(
+    state: &AppState,
+    actor: &rg_core::audit::AuditActor,
+    action: &str,
+    (owner, repo, pkg_name, tag): (&str, &str, &str, &str),
+    version: Option<&str>,
+    headers: &axum::http::HeaderMap,
+) {
+    let mut details = serde_json::json!({
+        "repo": format!("{owner}/{repo}"),
+        "pkg_type": "npm",
+        "pkg_name": pkg_name,
+        "tag": tag,
+    });
+    if let Some(version) = version {
+        details["version"] = serde_json::Value::from(version);
+    }
+    rg_core::audit::record(
+        &state.db,
+        actor,
+        action,
+        Some("npm_dist_tag"),
+        None,
+        Some(&format!("{owner}/{repo}/{pkg_name}:{tag}")),
+        Some(headers),
+        Some(details),
+    )
+    .await;
 }
 
 /// A Maven digest of one stored file, without collecting a local artifact.

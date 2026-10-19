@@ -954,6 +954,7 @@ impl Fixture {
         let ci = rg_core::pull_request::PipelineCi {
             trigger: self.ci_engine.as_ref(),
             write_pool: None,
+            notifier: None,
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,
