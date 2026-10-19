@@ -39,6 +39,59 @@ pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<R
         .context("db: list collaborators by repo")
 }
 
+/// The grants `user_id` holds on repositories that still exist, newest grant
+/// first, a page at a time, each with its repository; plus how many there are.
+///
+/// A soft-deleted repository keeps its collaborator rows until it is purged,
+/// so the join filters on the repository, in SQL, before the page is cut —
+/// a page filtered afterwards would come back short and `total` would count
+/// rows nobody can open.
+pub async fn list_live_grants_of_user(
+    db: &DatabaseConnection,
+    user_id: i64,
+    offset: u64,
+    limit: u64,
+) -> Result<(
+    Vec<(RepoCollaborator, crate::entities::repository::Model)>,
+    i64,
+)> {
+    use crate::entities::repository;
+
+    let base = CollabEntity::find()
+        .inner_join(repository::Entity)
+        .filter(repo_collaborator::Column::UserId.eq(user_id))
+        .filter(repository::Column::DeletedAt.is_null());
+    let total = base
+        .clone()
+        .count(db)
+        .await
+        .context("db: count a user's collaborator grants")? as i64;
+    let grants = base
+        .order_by_desc(repo_collaborator::Column::Id)
+        .offset(offset)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("db: list a user's collaborator grants")?;
+
+    let repo_ids: Vec<i64> = grants.iter().map(|grant| grant.repo_id).collect();
+    let mut repos: std::collections::HashMap<i64, repository::Model> = repository::Entity::find()
+        .filter(repository::Column::Id.is_in(repo_ids))
+        .all(db)
+        .await
+        .context("db: load the repositories of a user's collaborator grants")?
+        .into_iter()
+        .map(|repo| (repo.id, repo))
+        .collect();
+    // A repository deleted between the two statements drops out of this page
+    // rather than failing it; `total` was counted a moment earlier.
+    let page = grants
+        .into_iter()
+        .filter_map(|grant| repos.remove(&grant.repo_id).map(|repo| (grant, repo)))
+        .collect();
+    Ok((page, total))
+}
+
 /// Which of `user_ids` hold any collaborator grant on `repo_id`.
 ///
 /// The batch form of [`get_permission`]`.is_some()` for a caller that has to

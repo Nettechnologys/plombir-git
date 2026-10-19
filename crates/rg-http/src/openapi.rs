@@ -564,6 +564,7 @@ pub(crate) fn stamp_security(
         crate::api::ci_secrets::delete,
         // Collaborators
         crate::api::collaborators::list_collaborators,
+        crate::api::collaborators::list_my_collaborations,
         crate::api::collaborators::add_collaborator,
         crate::api::collaborators::update_permission,
         crate::api::collaborators::remove_collaborator,
@@ -579,6 +580,7 @@ pub(crate) fn stamp_security(
         crate::api::repo_content::delete_branch,
         crate::api::repo_content::delete_tag,
         crate::api::repo_content::get_commit_signature,
+        crate::api::repo_content::get_commit_diff,
         crate::api::repo_content::create_or_update_file,
         crate::api::repo_content::delete_file,
         // Package registry

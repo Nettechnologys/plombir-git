@@ -338,6 +338,17 @@
     },
     "repo": {
       "private": "Private"
+    },
+    "collaborations": {
+      "title": "Shared with you",
+      "hint": "Repositories other people gave you access to.",
+      "unavailable": "The repositories shared with you could not be loaded.",
+      "more": "Showing {shown} of {total}.",
+      "permission": {
+        "admin": "admin",
+        "write": "write",
+        "read": "read"
+      }
     }
   },
   "notifications": {
@@ -690,7 +701,13 @@
     "login_to_fork": "Login to fork",
     "login_to_star": "Login to star",
     "login_to_watch": "Login to watch",
-    "write_required": "You need write access to this repository to do this."
+    "write_required": "You need write access to this repository to do this.",
+    "access": {
+      "title": "Your access to this repository",
+      "admin": "You: admin",
+      "write": "You: write",
+      "read": "You: read"
+    }
   },
   "issues": {
     "title": "Issues",
@@ -824,7 +841,13 @@
       "files_changed": "Files changed: {count}",
       "nothing_to_compare": "{head} has no commits that {base} does not.",
       "invalid_spec": "This compare address must name branches as base...head.",
-      "unavailable": "The comparison could not be loaded."
+      "unavailable": "The comparison could not be loaded.",
+      "file_status": {
+        "added": "added",
+        "modified": "modified",
+        "deleted": "deleted"
+      },
+      "no_text_diff": "Binary file — no line diff to show."
     },
     "empty": "No {state} pull requests.",
     "meta": "#{number} opened {date} by {author}",
@@ -2215,7 +2238,10 @@
     "not_found_hint": "The commit log did not contain the requested commit.",
     "checks_count": "{count} checks",
     "status_checks": "Status Checks",
-    "view_details": "View Details →"
+    "view_details": "View Details →",
+    "diff_unavailable": "The changed files could not be loaded.",
+    "diff_unavailable_hint": "The commit details and status checks on this page are still current.",
+    "no_file_changes": "This commit changes no files."
   },
   "issue_board": {
     "page_title": "Board",

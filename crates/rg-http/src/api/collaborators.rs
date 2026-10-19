@@ -1,15 +1,17 @@
 //! REST API handlers for repository collaborators.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::api::access_audit::{grant_actor, record_grant};
+use crate::api::auth::AuthUser;
 use crate::api::repo_access::{RepoAdmin, RepoRead};
 use crate::api::user_ref::{accounts_by_id, UserRef};
 use crate::error::AppError;
+use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
 
 // ── Request / Response types ──────────────────────────────────────────
@@ -80,7 +82,117 @@ impl CollaboratorResponse {
     }
 }
 
+/// Tell the person whose access changed, off the request path: a row in
+/// their notifications, and the live push to an open notifications page.
+///
+/// The grant has committed and been journalled by the time this is called, so
+/// a failure is logged rather than turned into an error the granting admin
+/// can do nothing about (card_9da74035521e).
+fn announce_access_change(
+    state: &AppState,
+    repo: rg_db::entities::repository::Model,
+    user_id: i64,
+    actor_id: i64,
+    change: rg_core::collaborator::service::AccessChange,
+    permission: String,
+) {
+    let db = state.db_pools();
+    let hub = state.notification_hub.clone();
+    rg_core::task_tracker::delivery_tracker().spawn(async move {
+        match rg_core::collaborator::service::notify_access_change(
+            &db,
+            &repo,
+            user_id,
+            actor_id,
+            change,
+            &permission,
+        )
+        .await
+        {
+            Ok(Some(row)) => {
+                hub.push_notification(
+                    user_id,
+                    rg_core::collaborator::service::ACCESS_NOTIFICATION_TYPE,
+                    serde_json::json!(row),
+                )
+                .await
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                repo_id = repo.id,
+                user_id,
+                ?change,
+                error = %format!("{error:#}"),
+                "access change notification was not delivered"
+            ),
+        }
+    });
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────
+
+/// The repositories the caller was given access to.
+/// GET /api/v1/users/me/collaborations
+///
+/// Each entry is the repository row as `GET /repos/{owner}` lists it, plus
+/// `owner` and the caller's `permission`. Without it a grant was visible only
+/// from the granting side, and the person given access found the repository
+/// nowhere (card_d96c59297b09).
+#[utoipa::path(
+    get,
+    path = "/users/me/collaborations",
+    tag = "Collaborators",
+    params(
+        ("page" = Option<u64>, Query, description = "Page number (1-based)"),
+        ("per_page" = Option<u64>, Query, description = "Items per page (1-100)"),
+    ),
+    responses(
+        (status = 200, description = "The caller's collaborator grants", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+    ),
+)]
+pub async fn list_my_collaborations(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let pagination = params.clamp();
+    match rg_core::collaborator::service::list_collaborations(
+        &state.db,
+        user_id,
+        pagination.offset(),
+        pagination.limit(),
+    )
+    .await
+    {
+        Ok((page, total)) => {
+            let data: Vec<serde_json::Value> = page
+                .into_iter()
+                .map(|collaboration| {
+                    let html_url = crate::html_url::Links::new(
+                        &state,
+                        &collaboration.owner,
+                        &collaboration.repository.name,
+                    )
+                    .repo();
+                    let mut body =
+                        crate::html_url::with_html_url(collaboration.repository, html_url);
+                    if let Some(fields) = body.as_object_mut() {
+                        fields.insert("owner".into(), collaboration.owner.into());
+                        fields.insert("permission".into(), collaboration.permission.into());
+                    }
+                    body
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(PaginatedResponse::new(data, &pagination, total as u64)),
+            )
+                .into_response()
+        }
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
 
 /// List collaborators for a repo.
 /// GET /api/v1/repos/:owner/:name/collaborators
@@ -197,6 +309,14 @@ pub async fn add_collaborator(
                 }),
             )
             .await;
+            announce_access_change(
+                &state,
+                repository,
+                user.id,
+                actor_id,
+                rg_core::collaborator::service::AccessChange::Granted,
+                collab.permission.clone(),
+            );
             (
                 StatusCode::CREATED,
                 Json(CollaboratorResponse::new(collab, Some(&user))),
@@ -275,6 +395,14 @@ pub async fn update_permission(
                 }),
             )
             .await;
+            announce_access_change(
+                &state,
+                repo,
+                collab.user_id,
+                actor_id,
+                rg_core::collaborator::service::AccessChange::Changed,
+                collab.permission.clone(),
+            );
             (
                 StatusCode::OK,
                 Json(CollaboratorResponse::new(collab, user)),
@@ -342,6 +470,14 @@ pub async fn remove_collaborator(
                 }),
             )
             .await;
+            announce_access_change(
+                &state,
+                repo,
+                user_id,
+                actor_id,
+                rg_core::collaborator::service::AccessChange::Revoked,
+                String::new(),
+            );
             StatusCode::NO_CONTENT.into_response()
         }
         // A delete that matched nothing is a 404, not a 204: this path takes a

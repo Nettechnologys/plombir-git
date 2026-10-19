@@ -19,14 +19,14 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 436 |
-| Reachable from the browser | 308 (71%) |
+| Router routes (with declared `Access`) | 438 |
+| Reachable from the browser | 310 (71%) |
 | Layout modules | 2 |
 | Pages | 73 |
-| Interactive controls | 1052 |
-| Controls calling an API | 371 |
+| Interactive controls | 1055 |
+| Controls calling an API | 373 |
 | Controls from shared components | 425 |
-| Browser sweep: scenarios / inventory entries / routes | 52 / 196 / 186 |
+| Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
 | **UI routes without a web/smoke/browser test** | **24** |
 | UI routes without corpus or browser coverage | 0 |
 
@@ -34,9 +34,9 @@
 
 | `Access` | routes | reachable from UI | no frontend test | no corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 109 | 70 | 4 | 0 |
+| `RepoRead` | 110 | 71 | 4 | 0 |
 | `RepoWrite` | 81 | 62 | 12 | 2 |
-| `User` | 54 | 44 | 5 | 0 |
+| `User` | 55 | 45 | 5 | 0 |
 | `RepoAdmin` | 49 | 49 | 0 | 0 |
 | `InstanceAdmin` | 33 | 28 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
@@ -84,12 +84,12 @@
 | `/[owner]/[repo]/packages/upload` | 17 | 5 | 11 |
 | `/[owner]/[repo]/wiki` | 17 | 5 | 11 |
 | `/[owner]/[repo]/commits` | 16 | 6 | 12 |
+| `/dashboard` | 16 | 4 | 0 |
 | `/imports` | 16 | 3 | 2 |
+| `/[owner]/[repo]/commits/[sha]` | 15 | 7 | 11 |
 | `/[owner]/[repo]/settings/branches` | 15 | 2 | 2 |
 | `/[owner]/[repo]/wiki/[title]/history` | 15 | 5 | 11 |
 | `/settings/profile` | 15 | 8 | 2 |
-| `/[owner]/[repo]/commits/[sha]` | 14 | 6 | 11 |
-| `/dashboard` | 14 | 3 | 0 |
 | `/[owner]/[repo]/compare/[...spec]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/settings/webhooks` | 13 | 6 | 2 |
@@ -263,14 +263,21 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:common.retry | :177 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/status` | `RepoRead` | rust+web+browser |
-| i18n:common.retry | :177 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/statuses` | `RepoRead` | rust+web+browser |
-| i18n:common.retry | :177 | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
-| i18n:common.retry | :177 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/signature` | `RepoRead` | rust+web+browser |
-| i18n:common.retry | :231 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/status` | `RepoRead` | rust+web |
-| i18n:common.retry | :231 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/statuses` | `RepoRead` | rust+web |
-| i18n:common.retry | :231 | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
-| i18n:common.retry | :231 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/signature` | `RepoRead` | rust+web |
+| i18n:common.retry | :196 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/status` | `RepoRead` | rust+web+browser |
+| i18n:common.retry | :196 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/statuses` | `RepoRead` | rust+web+browser |
+| i18n:common.retry | :196 | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
+| i18n:common.retry | :196 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/signature` | `RepoRead` | rust+web+browser |
+| i18n:common.retry | :196 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/diff` | `RepoRead` | rust+web+browser |
+| i18n:common.retry | :250 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/status` | `RepoRead` | rust+web |
+| i18n:common.retry | :250 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/statuses` | `RepoRead` | rust+web |
+| i18n:common.retry | :250 | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
+| i18n:common.retry | :250 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/signature` | `RepoRead` | rust+web |
+| i18n:common.retry | :250 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/diff` | `RepoRead` | rust+web |
+| i18n:common.retry | :265 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/status` | `RepoRead` | rust+web |
+| i18n:common.retry | :265 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/statuses` | `RepoRead` | rust+web |
+| i18n:common.retry | :265 | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
+| i18n:common.retry | :265 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/signature` | `RepoRead` | rust+web |
+| i18n:common.retry | :265 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/diff` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -1085,12 +1092,13 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| )} * / | :245 | `POST /api/v1/repos` | `User` | rust+web+smoke+browser |
-| i18n:common.loading | :253 | `GET /api/v1/orgs` | `User` | rust+web+smoke+browser |
-| i18n:common.loading | :310 | `GET /api/v1/repos/templates/gitignores` | `Public` | web |
-| i18n:common.loading | :310 | `GET /api/v1/repos/templates/licenses` | `Public` | web |
-| i18n:common.loading | :310 | `GET /api/v1/repos/templates/readmes` | `Public` | web |
-| i18n:common.loading | :310 | `GET /api/v1/repos/templates/labels` | `Public` | web |
+| )} * / | :282 | `POST /api/v1/repos` | `User` | rust+web+smoke+browser |
+| i18n:common.loading | :290 | `GET /api/v1/orgs` | `User` | rust+web+smoke+browser |
+| i18n:common.loading | :347 | `GET /api/v1/repos/templates/gitignores` | `Public` | web |
+| i18n:common.loading | :347 | `GET /api/v1/repos/templates/licenses` | `Public` | web |
+| i18n:common.loading | :347 | `GET /api/v1/repos/templates/readmes` | `Public` | web |
+| i18n:common.loading | :347 | `GET /api/v1/repos/templates/labels` | `Public` | web |
+| i18n:common.retry | :452 | `GET /api/v1/users/me/collaborations` | `User` | rust+web |
 | _(page load)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+browser |
 
 ### `/explore`
@@ -1125,15 +1133,15 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| load | :168 | `GET /api/v1/notifications` | `User` | rust+web |
-| load | :168 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
-| i18n:notifications.mark_all_read | :172 | `POST /api/v1/notifications/mark-all-read` | `User` | rust+web |
-| i18n:notifications.mark_all_read | :172 | `GET /api/v1/notifications` | `User` | rust+web |
-| i18n:notifications.mark_all_read | :172 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
-| → internalLink(notif) | :198 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
-| i18n:notifications.mark_read | :214 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
-| i18n:notifications.mark_read | :214 | `GET /api/v1/notifications` | `User` | rust+web |
-| i18n:notifications.mark_read | :214 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
+| load | :169 | `GET /api/v1/notifications` | `User` | rust+web |
+| load | :169 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
+| i18n:notifications.mark_all_read | :173 | `POST /api/v1/notifications/mark-all-read` | `User` | rust+web |
+| i18n:notifications.mark_all_read | :173 | `GET /api/v1/notifications` | `User` | rust+web |
+| i18n:notifications.mark_all_read | :173 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
+| → internalLink(notif) | :199 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
+| i18n:notifications.mark_read | :215 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
+| i18n:notifications.mark_read | :215 | `GET /api/v1/notifications` | `User` | rust+web |
+| i18n:notifications.mark_read | :215 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
 | _(page load)_ | — | `GET /api/v1/ws/notifications` | `Foreign:ws.rs` | rust+web |
 
 ### `/orgs`

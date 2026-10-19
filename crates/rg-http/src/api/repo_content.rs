@@ -1998,6 +1998,37 @@ pub async fn get_commit_signature(
     }
 }
 
+/// GET /api/v1/repos/:owner/:name/commits/:sha/diff
+/// What one commit changed, read against its first parent — the empty tree
+/// for a root commit. The files carry the same numstat and patch lines a pull
+/// request's diff does (card_8c46bad6d61e).
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/commits/{sha}/diff",
+    tag = "Repository Content",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("sha" = String, Path, description = "Full or abbreviated commit id"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 400, description = "The SHA is not hex, or is ambiguous", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "Repository or commit not found", body = serde_json::Value),
+    ),
+)]
+pub async fn get_commit_diff(
+    State(state): State<AppState>,
+    Path((_owner, _repo, sha)): Path<(String, String, String)>,
+    CiRead::<RepoContents> { repo, .. }: CiRead<RepoContents>,
+) -> impl IntoResponse {
+    match rg_core::pull_request::commit_diff(&state.db, &state.repo_root, &repo, &sha).await {
+        Ok(diff) => (StatusCode::OK, Json(diff)).into_response(),
+        Err(e) => AppError::from(e).into_response(),
+    }
+}
+
 /// Verify a commit with the instance's registered keys.
 fn verify_commit_signature(
     repo_path: &std::path::Path,

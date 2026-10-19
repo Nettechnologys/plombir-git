@@ -1,7 +1,8 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { repos, type CommitSignature } from '$lib/api/client.svelte';
+  import { repos, type CommitDiff, type CommitSignature } from '$lib/api/client.svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
+  import DiffFileList from '$lib/components/DiffFileList.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { isUnavailable, optionalSection } from '$lib/optionalSection';
   import { createT, formatDate as formatCalendarDate } from '$lib/i18n';
@@ -28,6 +29,11 @@
   // gateway was down exactly like a commit nobody ever signed — the badge
   // simply was not there (card_c84bb28a36e1).
   let signatureUnavailable = $state(false);
+  // What the commit changed. Kept apart from "the diff could not be read" for
+  // the same reason as the signature: an unreachable git layer drawn as an
+  // empty file list says the commit touched nothing (card_8c46bad6d61e).
+  let commitDiff = $state<CommitDiff | null>(null);
+  let diffUnavailable = $state(false);
   const commitRequests = new LatestRepositoryResourceRequestFence<string>();
 
   // Fetch data on mount and when params change
@@ -50,9 +56,11 @@
     statuses = [];
     gpgSignature = null;
     signatureUnavailable = false;
+    commitDiff = null;
+    diffUnavailable = false;
 
     try {
-      const [combinedResult, statusesResult, logResult, signatureResult] = await Promise.all([
+      const [combinedResult, statusesResult, logResult, signatureResult, diffResult] = await Promise.all([
         repos.getCombinedStatus(expectedOwner, expectedRepo, expectedSha),
         repos.listCommitStatuses(expectedOwner, expectedRepo, expectedSha),
         repos.log(expectedOwner, expectedRepo, expectedSha).then(
@@ -65,6 +73,10 @@
         optionalSection(
           repos.commitSignature(expectedOwner, expectedRepo, expectedSha),
           "this commit's signature",
+        ),
+        optionalSection(
+          repos.commitDiff(expectedOwner, expectedRepo, expectedSha),
+          'the files this commit changed',
         ),
       ]);
 
@@ -91,6 +103,13 @@
       } else {
         gpgSignature = signatureResult;
         signatureUnavailable = false;
+      }
+      if (isUnavailable(diffResult)) {
+        commitDiff = null;
+        diffUnavailable = true;
+      } else {
+        commitDiff = diffResult;
+        diffUnavailable = false;
       }
     } catch (err: any) {
       if (commitRequests.owns(claim, owner, repo, sha)) {
@@ -237,6 +256,25 @@
       </div>
     {/if}
 
+    <!-- Files the commit changed. A missing commit already says so above. -->
+    {#if commitInfoFailure !== 'not_found'}
+      {#if diffUnavailable}
+        <div class="commit-info-state commit-diff-state" role="alert">
+          <h2>{t('commit_detail.diff_unavailable')}</h2>
+          <p>{t('commit_detail.diff_unavailable_hint')}</p>
+          <button onclick={retryLoad}>{t('common.retry')}</button>
+        </div>
+      {:else if commitDiff}
+        <div class="commit-diff">
+          {#if commitDiff.files_changed.length === 0}
+            <p class="empty-state">{t('commit_detail.no_file_changes')}</p>
+          {:else}
+            <DiffFileList files={commitDiff.files_changed} stats={commitDiff.stats} />
+          {/if}
+        </div>
+      {/if}
+    {/if}
+
     <!-- Combined Status Badge -->
     {#if combinedStatus}
       <div class="combined-status" style="border-left-color: {getStatusColor(combinedStatus.state)}">
@@ -340,7 +378,12 @@
     margin-bottom: 1.5rem;
   }
 
-  .commit-info-state h1 {
+  .commit-diff {
+    margin-bottom: 1.5rem;
+  }
+
+  .commit-info-state h1,
+  .commit-info-state h2 {
     font-size: 1.25rem;
     margin: 0 0 0.5rem;
   }

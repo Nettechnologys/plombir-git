@@ -338,6 +338,17 @@
     },
     "repo": {
       "private": "私有"
+    },
+    "collaborations": {
+      "title": "与你共享",
+      "hint": "其他人授予你访问权限的仓库。",
+      "unavailable": "无法加载与你共享的仓库。",
+      "more": "显示 {shown} / {total}。",
+      "permission": {
+        "admin": "管理员",
+        "write": "可写",
+        "read": "只读"
+      }
     }
   },
   "notifications": {
@@ -690,7 +701,13 @@
     "login_to_fork": "登录后即可复刻",
     "login_to_star": "登录后即可收藏",
     "login_to_watch": "登录后即可关注",
-    "write_required": "你需要此仓库的写入权限才能执行此操作。"
+    "write_required": "你需要此仓库的写入权限才能执行此操作。",
+    "access": {
+      "title": "你对此仓库的权限",
+      "admin": "你：管理员",
+      "write": "你：可写",
+      "read": "你：只读"
+    }
   },
   "issues": {
     "title": "问题",
@@ -824,7 +841,13 @@
       "files_changed": "变更文件：{count}",
       "nothing_to_compare": "{head} 没有 {base} 中不存在的提交。",
       "invalid_spec": "比较地址必须以 base...head 的形式指定分支。",
-      "unavailable": "无法加载比较结果。"
+      "unavailable": "无法加载比较结果。",
+      "file_status": {
+        "added": "新增",
+        "modified": "修改",
+        "deleted": "删除"
+      },
+      "no_text_diff": "二进制文件，没有可显示的行差异。"
     },
     "empty": "暂无 {state} 拉取请求。",
     "meta": "#{number} 由 {author} 于 {date} 创建",
@@ -2215,7 +2238,10 @@
     "not_found_hint": "提交日志中不包含所请求的提交。",
     "checks_count": "{count} 项检查",
     "status_checks": "状态检查",
-    "view_details": "查看详情 →"
+    "view_details": "查看详情 →",
+    "diff_unavailable": "无法加载变更的文件。",
+    "diff_unavailable_hint": "本页的提交详情和状态检查仍然是最新的。",
+    "no_file_changes": "此提交未更改任何文件。"
   },
   "issue_board": {
     "page_title": "看板",

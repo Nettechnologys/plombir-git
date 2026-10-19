@@ -71,6 +71,7 @@ beforeEach(async () => {
 	setTestPage('/dashboard', {});
 	auth.me.mockResolvedValueOnce(user());
 	repos.list.mockResolvedValue(emptyRepositories());
+	repos.collaborations.mockResolvedValue(emptyRepositories());
 	prepareTemplates();
 	await fetchUser();
 });
@@ -86,6 +87,71 @@ async function openCreateForm(): Promise<void> {
 	rendered = await renderComponent(DashboardPage);
 	await click(element(rendered.container, '.dashboard-header .btn-primary'));
 }
+
+// card_d96c59297b09: a grant used to be visible only from the granting side.
+describe('repositories shared with the account', () => {
+	function shared(owner: string, name: string, permission: string, is_private = false) {
+		return { id: name.length, owner, name, permission, is_private, description: null, updated_at: timestamp };
+	}
+
+	it('lists another owner\'s repository with the access it grants', async () => {
+		orgs.list.mockResolvedValue([]);
+		repos.collaborations.mockResolvedValue({
+			...emptyRepositories(),
+			data: [shared('Rinat', 'raw_assets', 'admin', true)],
+			pagination: { ...emptyRepositories().pagination, total: 1 },
+		});
+
+		rendered = await renderComponent(DashboardPage);
+
+		const section = element(rendered.container, '.collaborations');
+		expect(section.textContent).toContain('Shared with you');
+		expect(section.textContent).toContain('Rinat/raw_assets');
+		expect(section.textContent).toContain('admin');
+		expect(section.querySelector('a[href="/Rinat/raw_assets"]')).not.toBeNull();
+	});
+
+	it('says how many more there are past the first page', async () => {
+		orgs.list.mockResolvedValue([]);
+		repos.collaborations.mockResolvedValue({
+			...emptyRepositories(),
+			data: [shared('Rinat', 'raw_assets', 'write')],
+			pagination: { ...emptyRepositories().pagination, total: 150 },
+		});
+
+		rendered = await renderComponent(DashboardPage);
+
+		expect(element(rendered.container, '.collaborations').textContent).toContain('Showing 1 of 150.');
+	});
+
+	it('stays out of the way when nothing is shared', async () => {
+		orgs.list.mockResolvedValue([]);
+
+		rendered = await renderComponent(DashboardPage);
+
+		expect(rendered.container.querySelector('.collaborations')).toBeNull();
+	});
+
+	it('reports and retries a failed read instead of claiming nothing is shared', async () => {
+		orgs.list.mockResolvedValue([]);
+		repos.collaborations
+			.mockRejectedValueOnce(new Error('HTTP 503'))
+			.mockResolvedValueOnce({
+				...emptyRepositories(),
+				data: [shared('Rinat', 'raw_assets', 'write')],
+				pagination: { ...emptyRepositories().pagination, total: 1 },
+			});
+
+		rendered = await renderComponent(DashboardPage);
+
+		const section = element(rendered.container, '.collaborations');
+		expect(section.textContent).toContain('The repositories shared with you could not be loaded.');
+		await click(element(section, 'button'));
+
+		expect(repos.collaborations).toHaveBeenCalledTimes(2);
+		expect(element(rendered.container, '.collaborations').textContent).toContain('Rinat/raw_assets');
+	});
+});
 
 describe('dashboard optional section availability', () => {
 	it('does not treat a failed organization read as a personal-only account', async () => {

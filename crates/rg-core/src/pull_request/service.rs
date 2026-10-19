@@ -1406,6 +1406,122 @@ fn compare_in(
     })
 }
 
+/// What one commit changed: the same per-file numstat and patch a pull
+/// request's diff carries, read between the commit and its first parent.
+///
+/// The commit page used to show a commit's message, author and checks, and
+/// nothing of its content — there was no route that answered "which files did
+/// this commit touch" at all, and `compare` only takes branch names
+/// (card_8c46bad6d61e).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CommitDiff {
+    /// The full id the requested (possibly abbreviated) SHA resolved to.
+    pub sha: String,
+    /// The commit the diff is read against: the first parent, as `git show`
+    /// does for a merge. `None` for a root commit, which is read against the
+    /// empty tree, so every file it holds is `added`.
+    pub parent_sha: Option<String>,
+    pub files_changed: Vec<FileDiff>,
+    pub stats: DiffStats,
+}
+
+// A commit's diff never changes — the key names both commits by id — so the
+// answer is shared under the same bounded eviction policy as the other two.
+fn commit_diff_cache() -> &'static Mutex<BoundedGitReadCache<CommitDiff>> {
+    static CACHE: OnceLock<Mutex<BoundedGitReadCache<CommitDiff>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BoundedGitReadCache::default()))
+}
+
+/// The diff of commit `sha` (a full or abbreviated hex id) of `repo`.
+///
+/// An id that is not hex, or a prefix shared by several objects, is the
+/// client's mistake; an id no object answers to, or one naming something other
+/// than a commit, is a missing commit.
+pub async fn commit_diff(
+    db: &DatabaseConnection,
+    repo_root: &std::path::Path,
+    repo: &repo_entity::Model,
+    sha: &str,
+) -> Result<CommitDiff> {
+    let namespace = repository_namespace(db, repo).await?;
+    let repo_path = repo_root.join(format!("{namespace}/{}.git", repo.name));
+    let sha = sha.to_string();
+    crate::blocking::run_blocking_git("diffing a commit", move || {
+        let prefix = gix::hash::Prefix::from_hex(&sha)
+            .map_err(|_| crate::error::invalid_request("invalid commit SHA format"))?;
+        let git_repo = rg_git::repository::open(&repo_path)
+            .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+        let object_id = match git_repo
+            .objects
+            .lookup_prefix(prefix, None)
+            .with_context(|| format!("looking up commit '{sha}' in {repo_path:?}"))?
+        {
+            None => return Err(anyhow::Error::new(NotFound::new("commit"))),
+            Some(Err(())) => return Err(crate::error::invalid_request("commit SHA is ambiguous")),
+            Some(Ok(id)) => id,
+        };
+        let object = git_repo
+            .find_object(object_id)
+            .with_context(|| format!("reading object {object_id}"))?;
+        if object.kind != gix::object::Kind::Commit {
+            return Err(anyhow::Error::new(NotFound::new("commit")));
+        }
+        let commit = object.into_commit();
+        let parent_id = commit.parent_ids().next().map(|id| id.detach());
+
+        let key = DiffCacheKey {
+            base_repo: repo_path.clone(),
+            head_repo: repo_path.clone(),
+            base_branch: String::new(),
+            head_branch: String::new(),
+            base_sha: parent_id.map(|id| id.to_string()).unwrap_or_default(),
+            head_sha: object_id.to_string(),
+            reviewed_head_sha: None,
+        };
+        if let Some(diff) = commit_diff_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(diff);
+        }
+
+        let new_tree = commit
+            .tree()
+            .with_context(|| format!("reading the tree of commit {object_id}"))?;
+        let old_tree = match parent_id {
+            Some(parent_id) => git_repo
+                .find_commit(parent_id)
+                .with_context(|| format!("reading parent commit {parent_id}"))?
+                .tree()
+                .with_context(|| format!("reading the tree of commit {parent_id}"))?,
+            None => git_repo.empty_tree(),
+        };
+        let (mut files, stats) = gix_tree_numstat(&git_repo, &old_tree, &new_tree)?;
+        // git knows the empty tree's id without it being stored, so the patch
+        // half reads a root commit against the same empty tree as the numstat
+        // half above.
+        let old_rev = parent_id
+            .unwrap_or_else(|| gix::ObjectId::empty_tree(git_repo.object_hash()))
+            .to_string();
+        let patch_text = plombir_git_patch_text(&repo_path, &old_rev, &object_id.to_string())?;
+        attach_patches(&mut files, &patch_text);
+
+        let diff = CommitDiff {
+            sha: object_id.to_string(),
+            parent_sha: parent_id.map(|id| id.to_string()),
+            files_changed: files,
+            stats,
+        };
+        commit_diff_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, diff.clone());
+        Ok(diff)
+    })
+    .await
+}
+
 /// Join the file list one half of the diff produced to the patches the other
 /// half printed, and say out loud when the two do not meet.
 ///
@@ -1866,8 +1982,6 @@ fn gix_diff_numstat(
     old_ref: String,
     new_ref: String,
 ) -> Result<(Vec<FileDiff>, DiffStats)> {
-    use gix::bstr::ByteSlice;
-
     let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
@@ -1899,6 +2013,19 @@ fn gix_diff_numstat(
         .peel_to_tree()
         .map_err(|_| anyhow::anyhow!("{} is not a tree-ish", new_ref))?;
 
+    gix_tree_numstat(&repo, &old_tree, &new_tree)
+}
+
+/// The numstat half of [`gix_diff_numstat`], between two trees already in
+/// hand — which is what lets a root commit be read against the empty tree,
+/// a tree no ref names.
+fn gix_tree_numstat(
+    repo: &gix::Repository,
+    old_tree: &gix::Tree<'_>,
+    new_tree: &gix::Tree<'_>,
+) -> Result<(Vec<FileDiff>, DiffStats)> {
+    use gix::bstr::ByteSlice;
+
     let mut platform = old_tree.changes()?;
     platform.options(|opts| {
         opts.track_rewrites(None);
@@ -1908,7 +2035,7 @@ fn gix_diff_numstat(
     let mut total_additions = 0i64;
     let mut total_deletions = 0i64;
 
-    let mut resource_cache = plombir_git_diff_resource_cache(&repo)?;
+    let mut resource_cache = plombir_git_diff_resource_cache(repo)?;
 
     let file_count;
     {
@@ -1918,7 +2045,7 @@ fn gix_diff_numstat(
 
         platform
             .for_each_to_obtain_tree(
-                &new_tree,
+                new_tree,
                 |change| -> Result<std::ops::ControlFlow<()>, anyhow::Error> {
                     // `Change::diff` handles blobs and symlinks only. Two other
                     // shapes reach this callback and gix rejects both with the
@@ -3764,16 +3891,53 @@ mod diff_configuration_ownership_tests {
             "`gix_diff_numstat` opens the repository with a bare `gix::open`, which reads the \
              host's /etc/gitconfig, ~/.gitconfig and GIT_* — see card_25afc5bcc044"
         );
+        // The tree-to-tree half builds the cache; the ref-taking wrapper and
+        // the commit diff both reach it rather than building their own
+        // (card_8c46bad6d61e).
         assert_eq!(
             rust_source::production_function_call_sites(
                 source,
-                "gix_diff_numstat",
+                "gix_tree_numstat",
                 &["plombir_git_diff_resource_cache"]
             )
             .len(),
             1,
-            "`gix_diff_numstat` no longer builds exactly one resource cache from Plombir Git's \
+            "`gix_tree_numstat` no longer builds exactly one resource cache from Plombir Git's \
              own policy"
+        );
+        for caller in ["gix_diff_numstat", "commit_diff"] {
+            assert!(
+                rust_source::production_function_call_sites(
+                    source,
+                    caller,
+                    &["plombir_git_diff_resource_cache", "diff_resource_cache"]
+                )
+                .is_empty(),
+                "`{caller}` builds a resource cache of its own instead of going through \
+                 `gix_tree_numstat`"
+            );
+            assert_eq!(
+                rust_source::production_function_call_sites(source, caller, &["gix_tree_numstat"])
+                    .len(),
+                1,
+                "`{caller}` no longer counts lines through `gix_tree_numstat`"
+            );
+        }
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "commit_diff",
+                &["rg_git::repository::open"]
+            )
+            .len(),
+            1,
+            "`commit_diff` no longer opens the repository through `rg_git::repository::open`"
+        );
+        assert!(
+            rust_source::production_function_call_sites(source, "commit_diff", &["gix::open"])
+                .is_empty(),
+            "`commit_diff` opens the repository with a bare `gix::open`, which reads the host's \
+             /etc/gitconfig, ~/.gitconfig and GIT_* — see card_25afc5bcc044"
         );
         assert_eq!(
             rust_source::production_function_call_sites(

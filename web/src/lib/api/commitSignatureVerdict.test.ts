@@ -13,6 +13,7 @@ beforeEach(() => {
 	resetTestClient();
 	repos.getCombinedStatus.mockResolvedValue({ state: 'success', total_count: 0 });
 	repos.listCommitStatuses.mockResolvedValue([]);
+	repos.commitDiff.mockResolvedValue({ sha, parent_sha: null, files_changed: [], stats: { total_additions: 0, total_deletions: 0, files_changed: 0 } });
 	repos.log.mockResolvedValue({
 		commits: [{ sha, message: 'a signed commit', author: 'alice', date: '2026-09-01T10:00:00Z' }],
 	});

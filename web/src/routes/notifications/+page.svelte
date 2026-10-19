@@ -115,6 +115,7 @@
       case 'pr': case 'pull_request': return '🔀';
       case 'review': return '👀';
       case 'pipeline': return '🔧';
+      case 'access': return '🔑';
       default: return '🔔';
     }
   }
@@ -122,7 +123,7 @@
   function setupWebSocket() {
     return connectNotificationWebSocket(
       (event) => {
-        if (event.event_type === 'push' || event.event_type === 'ci_triggered') {
+        if (event.event_type === 'push' || event.event_type === 'ci_triggered' || event.event_type === 'access') {
           unreadCount++;
           void load();
         }

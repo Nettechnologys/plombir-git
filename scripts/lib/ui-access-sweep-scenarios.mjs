@@ -924,6 +924,7 @@ const repoReadSurface = privileged(
     [`${surfaceApi(context)}/commits/${context.fixture.surfaceCommitSha}/status`],
     [`${surfaceApi(context)}/commits/${context.fixture.surfaceCommitSha}/statuses`],
     [`${surfaceApi(context)}/commits/${context.fixture.surfaceCommitSha}/signature`],
+    [`${surfaceApi(context)}/commits/${context.fixture.surfaceCommitSha}/diff`],
     [`${surfaceApi(context)}/packages/generic/list`],
     [`${surfaceApi(context)}/packages/generic/browser-sweep`],
     [`${surfaceApi(context)}/packages/generic/browser-sweep/versions`],

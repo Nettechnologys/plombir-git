@@ -14,6 +14,8 @@ export { ApiError } from './error';
 export { connectJobLogWebSocket, connectNotificationWebSocket } from './websockets';
 export {
   repos,
+  type Collaboration,
+  type CommitDiff,
   type CommitSignature,
   type RepoPermission,
   type RepoSettingsPatch,

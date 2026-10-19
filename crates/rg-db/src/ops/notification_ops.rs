@@ -28,6 +28,31 @@ pub async fn create_notification(
     model.insert(db).await.context("db: create notification")
 }
 
+/// Create a notification that opens `link`, a path inside the instance.
+pub async fn create_linked_notification(
+    db: &DatabaseConnection,
+    user_id: i64,
+    event_type: &str,
+    title: &str,
+    repo_id: Option<i64>,
+    link: Option<&str>,
+) -> Result<notification::Model> {
+    let model = notification::ActiveModel {
+        user_id: Set(user_id),
+        event_type: Set(event_type.to_string()),
+        title: Set(title.to_string()),
+        repo_id: Set(repo_id),
+        link: Set(link.map(str::to_string)),
+        is_read: Set(false),
+        created_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    };
+    model
+        .insert(db)
+        .await
+        .context("db: create linked notification")
+}
+
 /// Create the same notification for every user in `user_ids`, in one statement.
 ///
 /// The watch fan-out delivers one event to a page of up to 500 subscribers.

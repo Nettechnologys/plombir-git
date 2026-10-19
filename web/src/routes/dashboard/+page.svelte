@@ -1,6 +1,6 @@
 <script lang="ts">
   import { isLoggedIn, getUser } from '$lib/stores/auth.svelte';
-  import { orgs, repos, type Organization } from '$lib/api/client.svelte';
+  import { orgs, repos, type Collaboration, type Organization } from '$lib/api/client.svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
@@ -45,6 +45,12 @@
   let labelSetOptions = $state<{ key: string; name: string; description: string }[]>([]);
   let templatesLoading = $state(true);
   let templatesUnavailable = $state(false);
+  // Repositories other people gave this account access to. A grant used to be
+  // visible only from the granting side (card_d96c59297b09).
+  let collaborations = $state<Collaboration[]>([]);
+  let collaborationsTotal = $state(0);
+  let collaborationsUnavailable = $state(false);
+  const collaborationRequests = new LatestRequestFence<string>();
   const repoRequests = new LatestRequestFence<string>();
   const organizationRequests = new LatestRequestFence<string>();
   const templateRequests = new LatestRequestFence<string>();
@@ -65,6 +71,9 @@
     labelSetOptions = [];
     templatesLoading = true;
     templatesUnavailable = false;
+    collaborations = [];
+    collaborationsTotal = 0;
+    collaborationsUnavailable = false;
     loading = true;
     error = '';
     showCreate = false;
@@ -78,6 +87,7 @@
     void loadRepos(expectedOwner, expectedAccount);
     void loadTemplates(expectedOwner, expectedAccount);
     void loadOrgs(expectedOwner, expectedAccount);
+    void loadCollaborations(expectedOwner, expectedAccount);
   });
 
   // `?owner=<name>` is how the rest of the app hands this form a namespace —
@@ -161,6 +171,33 @@
       }
       organizationsLoading = false;
     }
+  }
+
+  async function loadCollaborations(expectedOwner = owner, expectedAccount = accountGeneration) {
+    if (!expectedOwner || !isCurrentAccount(expectedOwner, expectedAccount)) return;
+    const claim = collaborationRequests.begin(expectedOwner);
+    const result = await optionalSection(repos.collaborations(1, 100), 'the repositories shared with you');
+    if (collaborationRequests.owns(claim, owner) && isCurrentAccount(expectedOwner, expectedAccount)) {
+      if (isUnavailable(result)) {
+        collaborationsUnavailable = true;
+      } else {
+        collaborations = result.data;
+        collaborationsTotal = result.pagination?.total ?? result.data.length;
+        collaborationsUnavailable = false;
+      }
+    }
+  }
+
+  function permissionLabel(permission: Collaboration['permission']): string {
+    switch (permission) {
+      case 'admin': return t('dashboard.collaborations.permission.admin');
+      case 'write': return t('dashboard.collaborations.permission.write');
+      default: return t('dashboard.collaborations.permission.read');
+    }
+  }
+
+  function retryCollaborations(): void {
+    void loadCollaborations(owner, accountGeneration);
   }
 
   function retryOrganizations(): void {
@@ -405,6 +442,44 @@
       {/each}
     </div>
   {/if}
+
+  <!-- Hidden while there is nothing to show: most accounts own everything they see. -->
+  {#if collaborationsUnavailable}
+    <section class="collaborations">
+      <h2>{t('dashboard.collaborations.title')}</h2>
+      <div class="error-banner" role="alert">
+        {t('dashboard.collaborations.unavailable')}
+        <button class="btn btn-secondary btn-sm" onclick={retryCollaborations}>{t('common.retry')}</button>
+      </div>
+    </section>
+  {:else if collaborations.length > 0}
+    <section class="collaborations">
+      <h2>{t('dashboard.collaborations.title')}</h2>
+      <p class="text-secondary">{t('dashboard.collaborations.hint')}</p>
+      <div class="repo-list">
+        {#each collaborations as repo (repo.id)}
+          <a href={`/${repo.owner}/${repo.name}`} class="repo-item">
+            <div class="repo-icon">
+              {repo.is_private ? '🔒' : '📂'}
+            </div>
+            <div class="repo-info">
+              <div class="repo-name">
+                {repo.owner}/{repo.name}
+                {#if repo.is_private}
+                  <span class="badge-private">{t('dashboard.repo.private')}</span>
+                {/if}
+                <span class="badge-permission">{permissionLabel(repo.permission)}</span>
+              </div>
+              <div class="repo-desc">{repo.description || t('common.no_description')}</div>
+            </div>
+          </a>
+        {/each}
+      </div>
+      {#if collaborationsTotal > collaborations.length}
+        <p class="text-secondary">{t('dashboard.collaborations.more', { shown: collaborations.length, total: collaborationsTotal })}</p>
+      {/if}
+    </section>
+  {/if}
 </div>
 
 <style>
@@ -584,6 +659,20 @@
     font-weight: 600;
     font-size: 15px;
     color: var(--accent);
+  }
+
+  .collaborations { margin-top: 32px; }
+  .collaborations h2 { font-size: 18px; margin-bottom: 4px; }
+  .collaborations > .text-secondary { margin-bottom: 12px; }
+  .badge-permission {
+    font-size: 11px;
+    font-weight: 500;
+    padding: 1px 6px;
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    color: var(--accent);
+    margin-left: 8px;
+    vertical-align: middle;
   }
 
   .badge-private {

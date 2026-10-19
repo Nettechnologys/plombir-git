@@ -7,6 +7,7 @@ import {
   type PaginatedResponse,
 } from './_base.svelte';
 import { repoPath, repoOwnerPath } from './repoPath';
+import type { FileDiff, PrDiff } from './pulls';
 
 function encodeRepoPath(path: string): string {
   return path.split('/').map(encodeURIComponent).join('/');
@@ -102,6 +103,26 @@ export interface RepoTreeEntry {
  */
 export type SignatureVerdict = 'valid' | 'invalid' | 'undeterminable' | 'unsigned';
 
+/** `GET /users/me/collaborations`: a repository row plus whose it is and the caller's grant on it. */
+export interface Collaboration {
+  id: number;
+  owner: string;
+  name: string;
+  description: string | null;
+  is_private: boolean;
+  permission: RepoPermission;
+  updated_at: string;
+}
+
+/** `GET /commits/{sha}/diff`: the files one commit changed, in the pull-request diff's shape. */
+export interface CommitDiff {
+  sha: string;
+  /** The first parent the diff is read against; `null` for a root commit. */
+  parent_sha: string | null;
+  files_changed: FileDiff[];
+  stats: PrDiff['stats'];
+}
+
 export interface CommitSignature {
   verdict: SignatureVerdict;
   signer_key: string | null;
@@ -159,6 +180,9 @@ export const repos = {
     request<PaginatedResponse<{ id: number; name: string; description: string | null; is_private: boolean; created_at: string }>>(
       `${repoOwnerPath(owner)}${qs({ page, per_page: perPage })}`
     ),
+  /** Repositories someone else owns that the signed-in account was given access to. */
+  collaborations: (page?: number, perPage?: number) =>
+    request<PaginatedResponse<Collaboration>>(`/users/me/collaborations${qs({ page, per_page: perPage })}`),
   explore: (page?: number, perPage?: number) =>
     request<PaginatedResponse<{ id: number; owner_id: number; name: string; description: string | null; stars_count: number; updated_at: string }>>(
       `/repos/explore${qs({ page, per_page: perPage })}`
@@ -270,6 +294,9 @@ export const repos = {
     request<RefChange>(`${repoPath(owner, repo)}/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' }),
   commitSignature: (owner: string, repo: string, sha: string) =>
     request<CommitSignature>(`${repoPath(owner, repo)}/commits/${sha}/signature`),
+  /** What one commit changed, against its first parent (the empty tree for a root commit). */
+  commitDiff: (owner: string, repo: string, sha: string) =>
+    request<CommitDiff>(`${repoPath(owner, repo)}/commits/${encodeURIComponent(sha)}/diff`),
   star: (owner: string, repo: string) =>
     request<{ starred: boolean }>(`${repoPath(owner, repo)}/star`, { method: 'PUT' }),
   starred: (owner: string, repo: string) =>

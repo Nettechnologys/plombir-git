@@ -175,6 +175,12 @@ describe('repository read and create state ownership', () => {
 			.mockResolvedValueOnce({ commits: [commit('middle detail', 'bbbbbbbbbbbbbbbb')] })
 			.mockResolvedValueOnce({ commits: [commit('current detail')] });
 		repos.commitSignature.mockResolvedValue(null);
+		repos.commitDiff.mockResolvedValue({
+			sha: 'aaaaaaaa',
+			parent_sha: null,
+			files_changed: [],
+			stats: { total_additions: 0, total_deletions: 0, files_changed: 0 },
+		});
 		setTestPage('/alice/demo/commits/aaaaaaaa', {
 			owner: 'alice',
 			repo: 'demo',

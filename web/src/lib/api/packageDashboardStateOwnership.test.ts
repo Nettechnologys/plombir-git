@@ -148,6 +148,10 @@ beforeEach(async () => {
 	await logout();
 	resetTestClient();
 	packages.listOciImages.mockResolvedValue({ images: [], next: null });
+	repos.collaborations.mockResolvedValue({
+		data: [],
+		pagination: { page: 1, per_page: 100, total: 0, total_pages: 0, has_next: false, has_prev: false },
+	});
 	navigation.goto.mockReset();
 });
 

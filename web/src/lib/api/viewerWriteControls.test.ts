@@ -312,6 +312,47 @@ describe.each(LEVELS)('viewer_permission %s', (level, writes) => {
 	});
 });
 
+// card_d96c59297b09: a collaborator could not tell from the repository itself
+// that they had been given access to it.
+describe('the reader\'s access badge', () => {
+	async function badge(): Promise<string | null> {
+		setTestPage('/alice/demo', { owner: 'alice', repo: 'demo' });
+		rendered = await renderComponent(RepoHeader, { owner: 'alice', repo: 'demo' });
+		await settle();
+		return rendered.container.querySelector('.access-badge')?.textContent?.trim() ?? null;
+	}
+
+	it('names a collaborator\'s grant on someone else\'s repository', async () => {
+		viewerIs('write');
+		expect(await badge()).toBe('You: write');
+	});
+
+	it('names read access only where it is not everyone\'s', async () => {
+		viewerIs('read');
+		expect(await badge()).toBeNull();
+		await rendered?.destroy();
+		repos.get.mockResolvedValue({
+			id: 1,
+			name: 'demo',
+			default_branch: 'main',
+			stars_count: 0,
+			is_private: true,
+			created_at: '2026-10-07T00:00:00Z',
+			viewer_permission: 'read',
+		});
+		expect(await badge()).toBe('You: read');
+	});
+
+	it('is not shown to the owner, or to an anonymous reader', async () => {
+		viewerIs('admin');
+		viewer.user = { id: 1, username: 'alice' };
+		expect(await badge()).toBeNull();
+		await rendered?.destroy();
+		viewerIs(null, false);
+		expect(await badge()).toBeNull();
+	});
+});
+
 describe('pull request reviews', () => {
 	it('are not offered to an anonymous reader', async () => {
 		viewerIs(null, false);

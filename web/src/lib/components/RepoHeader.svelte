@@ -25,6 +25,16 @@
   // settles the archive ref — one request per visit, not two
   // (card_270a0a77fd79). `null` until it arrives and for an anonymous reader.
   let viewerLevel = $state<RepoPermission | null>(null);
+  let repoIsPrivate = $state(false);
+  // What the signed-in reader may do here, said out loud for someone who was
+  // given access to another account's repository — the grant used to be
+  // visible only from the granting side (card_d96c59297b09). The owner's own
+  // pages, and plain read access to a public repository, need no badge.
+  let accessBadge = $derived(
+    viewerLevel && getUser()?.username !== owner && (viewerLevel !== 'read' || repoIsPrivate)
+      ? viewerLevel
+      : null,
+  );
 
   // Action button states
   type WatchState = 'not_watching' | 'watching' | 'ignoring';
@@ -130,6 +140,7 @@
     const archiveOwner = ++archiveRefStateOwner;
     archiveRef = fallbackRef;
     viewerLevel = null;
+    repoIsPrivate = false;
     void loadArchiveRef(expectedOwner, expectedRepo, fallbackRef, archiveOwner);
   });
 
@@ -162,6 +173,7 @@
           return;
         }
         viewerLevel = repoInfo?.viewer_permission ?? null;
+        repoIsPrivate = repoInfo?.is_private === true;
         if (!defaultBranch && repoInfo?.default_branch) {
           archiveRef = repoInfo.default_branch;
         }
@@ -414,6 +426,11 @@
       <a href={`/${owner}`}>{owner}</a>
       <span class="separator">/</span>
       <a href={`/${owner}/${repo}`}>{repo}</a>
+      {#if accessBadge}
+        <span class="access-badge" title={t('repo.access.title')}>
+          {accessBadge === 'admin' ? t('repo.access.admin') : accessBadge === 'write' ? t('repo.access.write') : t('repo.access.read')}
+        </span>
+      {/if}
     </div>
 
     <div class="repo-actions">
@@ -600,6 +617,16 @@
   .repo-name a {
     color: var(--accent);
     font-weight: 600;
+  }
+  .access-badge {
+    font-size: 12px;
+    font-weight: 500;
+    padding: 1px 8px;
+    margin-left: 10px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text-secondary);
+    vertical-align: middle;
   }
   .separator {
     margin: 0 4px;

@@ -387,7 +387,11 @@ async fn the_three_legal_watch_states_are_still_accepted() {
     }
 }
 
-/// Count the notifications a user can see.
+/// Count the watch notifications about a push that a user can see.
+///
+/// Only `push` rows: the collaborator in the fixture is also told that they
+/// were given access (card_9da74035521e), and that row is not what this file
+/// is about.
 async fn notification_count(base: &str, token: &str) -> usize {
     let body: serde_json::Value = reqwest::Client::new()
         .get(format!("{base}/api/v1/notifications"))
@@ -400,9 +404,11 @@ async fn notification_count(base: &str, token: &str) -> usize {
         .expect("json");
     // The endpoint answers either a bare array or a paginated envelope.
     body.as_array()
-        .map(|a| a.len())
-        .or_else(|| body["data"].as_array().map(|a| a.len()))
+        .or_else(|| body["data"].as_array())
         .unwrap_or_else(|| panic!("unexpected notifications payload: {body}"))
+        .iter()
+        .filter(|row| row["event_type"] == "push")
+        .count()
 }
 
 #[tokio::test]

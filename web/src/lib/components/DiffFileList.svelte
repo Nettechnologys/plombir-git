@@ -9,6 +9,18 @@
   const t = createT();
 
   let { files, stats }: { files: FileDiff[]; stats: PrDiff['stats'] } = $props();
+
+  const statusLabel = (status: string) => {
+    switch (status) {
+      case 'added': return t('pulls.compare.file_status.added');
+      case 'deleted': return t('pulls.compare.file_status.deleted');
+      case 'modified': return t('pulls.compare.file_status.modified');
+      default: return status;
+    }
+  };
+
+  const isBinary = (file: FileDiff) =>
+    file.lines.some((line) => line.kind === 'meta' && /^Binary files .* differ$/.test(line.content));
 </script>
 
 <div class="diff-view">
@@ -18,21 +30,30 @@
     <span class="deletion-text">−{stats.total_deletions}</span>
   </div>
   {#each files as file (file.path)}
-    <section class="diff-file">
-      <header class="diff-file-header">
-        <code>{file.path}</code>
+    <details class="diff-file" open>
+      <summary class="diff-file-header">
+        <span class="diff-file-name">
+          <span class="file-status" data-status={file.status}>{statusLabel(file.status)}</span>
+          <code>{file.path}</code>
+        </span>
         <span><span class="addition-text">+{file.additions}</span> <span class="deletion-text">−{file.deletions}</span></span>
-      </header>
-      <div class="diff-lines">
-        {#each file.lines as line, index (`${file.path}:${index}`)}
-          <div class="diff-line" class:addition={line.kind === 'addition'} class:deletion={line.kind === 'deletion'} class:meta={line.kind === 'meta'}>
-            <span class="line-number">{line.old_line ?? ''}</span>
-            <span class="line-number">{line.new_line ?? ''}</span>
-            <code>{line.content || ' '}</code>
-          </div>
-        {/each}
-      </div>
-    </section>
+      </summary>
+      <!-- git prints a blob it cannot line-count as one `Binary files … differ`
+           line, which on its own reads as an empty diff. -->
+      {#if isBinary(file)}
+        <p class="no-text-diff">{t('pulls.compare.no_text_diff')}</p>
+      {:else}
+        <div class="diff-lines">
+          {#each file.lines as line, index (`${file.path}:${index}`)}
+            <div class="diff-line" class:addition={line.kind === 'addition'} class:deletion={line.kind === 'deletion'} class:meta={line.kind === 'meta'}>
+              <span class="line-number">{line.old_line ?? ''}</span>
+              <span class="line-number">{line.new_line ?? ''}</span>
+              <code>{line.content || ' '}</code>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </details>
   {/each}
 </div>
 
@@ -42,8 +63,15 @@
   .addition-text { color: var(--green); }
   .deletion-text { color: var(--red); }
   .diff-file { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-  .diff-file-header { display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px; background: var(--bg-tertiary); border-bottom: 1px solid var(--border); font-size: 13px; }
+  .diff-file-header { display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px; background: var(--bg-tertiary); border-bottom: 1px solid var(--border); font-size: 13px; cursor: pointer; list-style: none; }
+  .diff-file-header::-webkit-details-marker { display: none; }
+  .diff-file:not([open]) .diff-file-header { border-bottom: none; }
+  .diff-file-name { display: flex; gap: 8px; align-items: center; min-width: 0; }
   .diff-file-header code { overflow-wrap: anywhere; }
+  .file-status { flex: none; padding: 1px 6px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); color: var(--text-secondary); }
+  .file-status[data-status='added'] { color: var(--green); border-color: var(--green); }
+  .file-status[data-status='deleted'] { color: var(--red); border-color: var(--red); }
+  .no-text-diff { margin: 0; padding: 10px 12px; color: var(--text-secondary); font-size: 13px; }
   .diff-lines { overflow-x: auto; }
   .diff-line {
     display: grid;

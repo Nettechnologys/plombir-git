@@ -1340,6 +1340,11 @@ pub(crate) fn build_all_routes(
         // about a provider: it is the listing the settings page needs before it
         // can offer the unlink above.
         .get(User, "/users/me/sso", api::sso::list_my_links)
+        .get(
+            User,
+            "/users/me/collaborations",
+            api::collaborators::list_my_collaborations,
+        )
         // ── Repositories ───────────────────────────────────────────────────
         .post(User, "/repos", api::repos::create_repo)
         // Template listing & explore (must be before /repos/{owner} to avoid
@@ -2169,6 +2174,11 @@ pub(crate) fn build_all_routes(
             RepoRead,
             "/repos/{owner}/{name}/commits/{sha}/signature",
             api::repo_content::get_commit_signature,
+        )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/commits/{sha}/diff",
+            api::repo_content::get_commit_diff,
         )
         .post_with(
             RepoWrite,

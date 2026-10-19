@@ -107,6 +107,108 @@ pub async fn list_collaborators(
     repo_collaborator_ops::list_by_repo(db, repo.id).await
 }
 
+/// One repository someone else owns that a user was given access to.
+#[derive(Debug, Clone)]
+pub struct Collaboration {
+    /// The `<owner>` half of the repository's `<owner>/<name>`.
+    pub owner: String,
+    pub repository: rg_db::entities::repository::Model,
+    /// read / write / admin
+    pub permission: String,
+}
+
+/// The repositories `user_id` is a collaborator on, newest grant first, a page
+/// at a time, and how many there are.
+///
+/// Until this existed a grant was visible only from the granting side: the
+/// person given access found the repository nowhere — not on their dashboard,
+/// not under their name (card_d96c59297b09).
+pub async fn list_collaborations(
+    db: &DatabaseConnection,
+    user_id: i64,
+    offset: u64,
+    limit: u64,
+) -> Result<(Vec<Collaboration>, i64)> {
+    let (grants, total) =
+        repo_collaborator_ops::list_live_grants_of_user(db, user_id, offset, limit).await?;
+    let mut page = Vec::with_capacity(grants.len());
+    for (grant, repository) in grants {
+        let owner = crate::repo::service::repository_namespace_name(
+            db,
+            repository.owner_id,
+            repository.org_id,
+        )
+        .await?;
+        page.push(Collaboration {
+            owner,
+            repository,
+            permission: grant.permission,
+        });
+    }
+    Ok((page, total))
+}
+
+/// What happened to someone's access to a repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessChange {
+    Granted,
+    Changed,
+    Revoked,
+}
+
+/// `notifications.event_type` of the rows [`notify_access_change`] writes.
+pub const ACCESS_NOTIFICATION_TYPE: &str = "access";
+
+/// Tell `user_id` that `actor_id` changed their access to `repo`.
+///
+/// A grant used to be recorded in the audit journal and nowhere the person it
+/// was about would ever look: no notification, no mail, nothing on their side
+/// at all (card_9da74035521e). Returns the row written, or `None` when the
+/// actor changed their own access — they know.
+///
+/// The change itself has committed by the time this runs, so a caller logs a
+/// failure here rather than unwinding the grant.
+pub async fn notify_access_change(
+    db: &impl crate::db::DbPools,
+    repo: &rg_db::entities::repository::Model,
+    user_id: i64,
+    actor_id: i64,
+    change: AccessChange,
+    permission: &str,
+) -> Result<Option<rg_db::entities::notification::Model>> {
+    if user_id == actor_id {
+        return Ok(None);
+    }
+    let read = db.read();
+    let owner =
+        crate::repo::service::repository_namespace_name(read, repo.owner_id, repo.org_id).await?;
+    let full_name = format!("{owner}/{}", repo.name);
+    let actor = rg_db::ops::user_ops::find_by_id(read, actor_id)
+        .await?
+        .map(|user| user.username)
+        .unwrap_or_else(|| "Someone".to_string());
+    let title = match change {
+        AccessChange::Granted => format!("{actor} gave you {permission} access to {full_name}"),
+        AccessChange::Changed => {
+            format!("{actor} changed your access to {full_name} to {permission}")
+        }
+        AccessChange::Revoked => format!("{actor} removed your access to {full_name}"),
+    };
+    // A revoked reader may no longer open the repository; the row still says
+    // which one it was, but does not send them to a page that refuses them.
+    let link = (change != AccessChange::Revoked).then(|| format!("/{full_name}"));
+    let row = rg_db::ops::notification_ops::create_linked_notification(
+        db.write(),
+        user_id,
+        ACCESS_NOTIFICATION_TYPE,
+        &title,
+        Some(repo.id),
+        link.as_deref(),
+    )
+    .await?;
+    Ok(Some(row))
+}
+
 /// Update a collaborator's permission.
 ///
 /// `repo_id` is the repository the caller was authorized against. The
