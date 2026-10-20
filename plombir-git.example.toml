@@ -170,6 +170,24 @@ allow_host_runner = false
 # read from each repository's default branch and evaluated in UTC; ticks missed
 # while the server was down are not caught up, at most one of them runs.
 # schedule_min_interval_minutes = 5
+# Where a workflow's `uses: owner/repo[/path]@ref` may load a composite action
+# from: "instance" — a public repository of this instance, or the workflow's
+# own — and "upstream", the forge at actions_upstream_url, fetched over the
+# network into a cache under repo_root. Anything else is refused by the name of
+# the source it would have come from; an empty list leaves only `uses: ./path`
+# and the three built-in actions. `uses: ./path` always works: it reads the
+# workflow's own repository. An action's steps run as the job's own, with its
+# environment — CI secrets included — so allow "upstream" only for a forge whose
+# actions you would paste into a workflow yourself.
+# actions_sources = ["instance"]
+# The forge "upstream" means: https://, or a file:// directory of mirrors.
+# actions_upstream_url = "https://github.com"
+# Load `owner/repo@ref` actions only by a full 40-character commit SHA, never a
+# tag or a branch that can move under a workflow.
+# actions_require_full_sha = false
+# Ceiling of the upstream action cache, in MiB: one fetch may not write more,
+# and the actions used least recently are evicted past it. 0 removes it.
+# actions_cache_max_mb = 1024
 
 [releases]
 # Serve the release-asset attestation endpoints: a user with write access signs

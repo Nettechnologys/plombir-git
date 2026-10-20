@@ -11,7 +11,9 @@
 //! - `jobs.<id>.steps[].run` → script commands
 //! - workflow/job `defaults.run.working-directory` and per-step
 //!   `working-directory` → isolated step directories
-//! - `jobs.<id>.steps[].uses` → `actions/checkout` is implicit; other actions are rejected
+//! - `jobs.<id>.steps[].uses` → `actions/checkout` is implicit, `actions/cache` and
+//!   `actions/upload-artifact` are native; composite actions are written into the job
+//!   as steps by `crate::actions` before the workflow is checked
 //! - `jobs.<id>.container.image` → Docker image
 //! - `jobs.<id>.env` → environment variables
 //! - `jobs.<id>.needs` → stage ordering (implicit via dependency graph)
@@ -404,7 +406,7 @@ fn input_environment_name(name: &str) -> String {
     format!("INPUT_{}", name.to_ascii_uppercase().replace('-', "_"))
 }
 
-fn valid_input_name(name: &str) -> bool {
+pub(crate) fn valid_input_name(name: &str) -> bool {
     let mut bytes = name.bytes();
     matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic() || byte == b'_')
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
@@ -1069,6 +1071,14 @@ const SUPPORTED_ACTIONS: &[&str] = &[
     "actions/cache@",
     "actions/upload-artifact@",
 ];
+
+/// Whether `uses` is one of the [`SUPPORTED_ACTIONS`] this engine implements
+/// itself — never loaded from a repository (`crate::actions`).
+pub(crate) fn is_native_action(uses: &str) -> bool {
+    SUPPORTED_ACTIONS
+        .iter()
+        .any(|action| uses.starts_with(action))
+}
 
 /// `with:` keys on a natively-implemented action that nothing consumes.
 ///
@@ -4764,10 +4774,40 @@ mod tests {
 
     /// Run a documented example through exactly the chain `try_read_gitea_workflows`
     /// puts a committed file through, minus the event match.
-    fn judge_example(body: &str, sources: &HashMap<String, String>) -> Result<()> {
+    /// The `action.yml` blocks of the page, served to its workflows by label.
+    struct DocumentedActions<'a>(&'a HashMap<String, String>);
+
+    impl crate::actions::ActionLoader for DocumentedActions<'_> {
+        fn load(
+            &self,
+            reference: &crate::actions::ActionReference,
+        ) -> std::result::Result<crate::actions::LoadedAction, crate::actions::ActionLoadError>
+        {
+            self.0
+                .get(&reference.label())
+                .map(|manifest| crate::actions::LoadedAction {
+                    sha: "0".repeat(40),
+                    origin: "the documentation".into(),
+                    manifest: manifest.clone(),
+                })
+                .ok_or_else(|| {
+                    crate::actions::ActionLoadError::Refused(
+                        "no `<!-- example: action … -->` block on the page defines it".into(),
+                    )
+                })
+        }
+    }
+
+    fn judge_example(
+        body: &str,
+        sources: &HashMap<String, String>,
+        actions: &HashMap<String, String>,
+    ) -> Result<()> {
         let workflow = GiteaWorkflow::parse(body)?;
         workflow.validate_supported_triggers()?;
-        let workflow = workflow.expand_local_reusable_workflows(sources)?;
+        let mut workflow = workflow.expand_local_reusable_workflows(sources)?;
+        crate::actions::expand_actions(&mut workflow, &DocumentedActions(actions))?
+            .map_err(anyhow::Error::msg)?;
         workflow.validate_supported_actions()?;
         workflow.validate_job_dependencies()
     }
@@ -4796,19 +4836,33 @@ mod tests {
                     .map(|file| (file.trim().to_owned(), example.body.clone()))
             })
             .collect();
+        // An action is a file of its own too, named by the `uses:` that loads it.
+        let actions: HashMap<String, String> = examples
+            .iter()
+            .filter_map(|example| {
+                example
+                    .marker
+                    .as_deref()
+                    .and_then(|marker| marker.strip_prefix("action "))
+                    .map(|label| (label.trim().to_owned(), example.body.clone()))
+            })
+            .collect();
 
         let (mut accepted, mut refused, mut callers) = (0, 0, 0);
         for example in examples.iter().filter(|example| example.language == "yaml") {
             let DocExample { line, body, .. } = example;
             match example.marker.as_deref() {
+                Some(marker) if marker.starts_with("action ") => {}
                 Some("refused") => {
-                    let error = judge_example(body, &sources).err().unwrap_or_else(|| {
-                        panic!(
+                    let error = judge_example(body, &sources, &actions)
+                        .err()
+                        .unwrap_or_else(|| {
+                            panic!(
                             "{name}:{line}: this block is presented as refused, but the engine \
                              accepts it — the page is teaching an author to avoid something that \
                              works"
                         )
-                    });
+                        });
                     assert!(
                         !format!("{error:#}").is_empty(),
                         "{name}:{line}: refused with an empty message"
@@ -4816,13 +4870,13 @@ mod tests {
                     refused += 1;
                 }
                 Some("reusable-caller") => {
-                    judge_example(body, &sources).unwrap_or_else(|error| {
+                    judge_example(body, &sources, &actions).unwrap_or_else(|error| {
                         panic!("{name}:{line}: this caller does not expand: {error:#}")
                     });
                     callers += 1;
                 }
                 _ => {
-                    judge_example(body, &sources).unwrap_or_else(|error| {
+                    judge_example(body, &sources, &actions).unwrap_or_else(|error| {
                         panic!(
                             "{name}:{line}: this ```yaml block is what a reader commits to their \
                              own repository, and this engine refuses it: {error:#}"
@@ -4847,6 +4901,11 @@ mod tests {
         assert_eq!(
             callers, 1,
             "expected exactly one reusable-workflow caller example in {name}"
+        );
+        assert!(
+            !actions.is_empty(),
+            "no `<!-- example: action … -->` block in {name} — the composite action example is \
+             no longer judged"
         );
     }
 

@@ -38,6 +38,9 @@ use crate::telemetry;
 /// because the runner is created deep inside `rg-ci`, one call away from
 /// whichever push, merge or manual dispatch triggered it, and none of those
 /// producers should have to carry the signal (card_34368880dc20).
+// Wide by design: one argument per piece of process configuration the engine
+// carries, each of which the wiring census below holds to its own builder call.
+#[allow(clippy::too_many_arguments)]
 fn configured_ci_engine(
     notifications: rg_ci::CiNotifications,
     job_timeout_secs: u64,
@@ -46,6 +49,7 @@ fn configured_ci_engine(
     write_pool: rg_db::DatabaseConnection,
     storage_limits: rg_core::storage_quota::StorageLimits,
     job_limits: rg_process::docker_job::JobLimits,
+    actions_policy: rg_ci::actions::ActionsPolicy,
 ) -> rg_ci::CiEngine {
     rg_ci::CiEngine::with_notifications_and_job_timeout(notifications, job_timeout_secs)
         .with_runner_labels(runner_labels)
@@ -53,6 +57,7 @@ fn configured_ci_engine(
         .with_write_pool(write_pool)
         .with_storage_limits(storage_limits)
         .with_job_limits(job_limits)
+        .with_actions_policy(actions_policy)
 }
 
 fn publish_listen_addresses(
@@ -1105,6 +1110,7 @@ struct ServeSettings {
     allow_host_runner: bool,
     runner_labels: Vec<String>,
     job_limits: rg_process::docker_job::JobLimits,
+    actions_policy: rg_ci::actions::ActionsPolicy,
     registration: rg_core::user::registration::RegistrationMode,
     registration_source: RegistrationSource,
     attestation_enabled: bool,
@@ -1250,6 +1256,7 @@ impl ServeSettings {
                 .and_then(|c| c.ci.runner_labels.clone())
                 .unwrap_or_else(rg_core::ci::default_runner_labels),
             job_limits: crate::config::resolve_job_limits(cfg.as_ref())?,
+            actions_policy: crate::config::resolve_actions_policy(cfg.as_ref())?,
             registration,
             registration_source,
             attestation_enabled: resolve_attestation_enabled(cfg.as_ref()),
@@ -2066,6 +2073,7 @@ fn build_transports(
         storage.db_write.clone(),
         settings.storage_limits,
         settings.job_limits.clone(),
+        settings.actions_policy.clone(),
     );
     tracing::info!(
         job_timeout_secs = ci_engine.job_timeout_secs(),
@@ -2665,6 +2673,19 @@ mod serve_tests {
             !limited.is_empty(),
             "the CI engine is built without ci.job_memory / job_cpus / job_pids, so every job \
              container starts under the default ceiling"
+        );
+
+        // And `[ci]` actions policy: an engine built without it loads actions
+        // under the defaults, whatever sources the operator allowed or forbade.
+        let governed = rust_source::production_function_call_sites(
+            source,
+            "configured_ci_engine",
+            &["with_actions_policy"],
+        );
+        assert!(
+            !governed.is_empty(),
+            "the CI engine is built without ci.actions_*, so workflows load actions from sources \
+             the operator never chose"
         );
     }
 
@@ -3485,6 +3506,7 @@ mod serve_tests {
             rg_db::DatabaseConnection::Disconnected,
             rg_core::storage_quota::StorageLimits::default(),
             rg_process::docker_job::JobLimits::default(),
+            rg_ci::actions::ActionsPolicy::default(),
         );
 
         assert_eq!(engine.job_timeout_secs(), 731);
@@ -3508,6 +3530,7 @@ mod serve_tests {
             rg_db::DatabaseConnection::Disconnected,
             limits,
             rg_process::docker_job::JobLimits::default(),
+            rg_ci::actions::ActionsPolicy::default(),
         );
 
         assert_eq!(engine.storage_limits(), limits);
@@ -3536,6 +3559,7 @@ mod serve_tests {
             rg_db::DatabaseConnection::Disconnected,
             rg_core::storage_quota::StorageLimits::default(),
             limits.clone(),
+            rg_ci::actions::ActionsPolicy::default(),
         );
         assert_eq!(engine.job_limits(), &limits);
 
@@ -3549,6 +3573,58 @@ mod serve_tests {
             .unwrap_err()
             .to_string();
         assert!(error.starts_with("ci.job_cpus = \"0\""), "{error}");
+    }
+
+    /// `[ci]` `actions_*` reach the engine every trigger reads workflows
+    /// through; a source or an upstream it cannot honour stops startup naming
+    /// the key.
+    #[test]
+    fn configured_actions_policy_reaches_the_ci_engine() {
+        let config: ConfigFile = toml::from_str(
+            "[ci]\nactions_sources = [\"upstream\"]\nactions_upstream_url = \"https://gitea.example/\"\nactions_require_full_sha = true\nactions_cache_max_mb = 64\n",
+        )
+        .expect("actions config");
+        let policy = crate::config::resolve_actions_policy(Some(&config)).expect("resolve policy");
+        assert!(policy.allows(rg_ci::actions::ActionSource::Upstream));
+        assert!(!policy.allows(rg_ci::actions::ActionSource::Instance));
+        assert_eq!(policy.upstream_url(), "https://gitea.example");
+        assert!(policy.require_full_sha());
+        assert_eq!(policy.cache_max_mb(), 64);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let engine = super::configured_ci_engine(
+            rg_ci::CiNotifications::default(),
+            rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
+            rg_core::ci::default_runner_labels(),
+            shutdown_rx,
+            rg_db::DatabaseConnection::Disconnected,
+            rg_core::storage_quota::StorageLimits::default(),
+            rg_process::docker_job::JobLimits::default(),
+            policy.clone(),
+        );
+        assert_eq!(engine.actions_policy(), &policy);
+
+        let unset: ConfigFile = toml::from_str("[ci]\ndocker = true\n").unwrap();
+        assert_eq!(
+            crate::config::resolve_actions_policy(Some(&unset)).unwrap(),
+            rg_ci::actions::ActionsPolicy::default()
+        );
+        for (refused, key) in [
+            (
+                "[ci]\nactions_sources = [\"github\"]\n",
+                "ci.actions_sources",
+            ),
+            (
+                "[ci]\nactions_upstream_url = \"http://example.com\"\n",
+                "ci.actions_upstream_url",
+            ),
+        ] {
+            let refused: ConfigFile = toml::from_str(refused).unwrap();
+            let error = crate::config::resolve_actions_policy(Some(&refused))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(key), "{error}");
+        }
     }
 
     /// `serve` shares one resolution path with the one-shot subcommands, so the

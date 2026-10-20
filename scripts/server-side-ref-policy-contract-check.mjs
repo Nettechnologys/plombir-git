@@ -88,6 +88,10 @@ const CLASSIFIED_MOVERS = new Map(
     ['crates/rg-core/src/mirror/service.rs', 'run_git_clone_mirror', 'git:clone', 'mirror_private_clone'],
     ['crates/rg-core/src/mirror/service.rs', 'run_git_remote_update', 'git:remote', 'mirror_private_clone'],
     ['crates/rg-core/src/import/service.rs', 'clone_repo', 'git:clone', 'repository_creation'],
+    // The upstream action cache (`_ci_actions/`) is a private clone like a
+    // mirror's: no client is served from it, and the ref only keeps a fetched
+    // action's commit from being pruned.
+    ['crates/rg-ci/src/actions.rs', 'load_from_upstream', 'git:update-ref', 'mirror_private_clone'],
     ['crates/rg-core/src/import/service.rs', 'import_wiki_pages_from_destination', 'git:clone', 'scratch_clone'],
   ].map(([file, symbol, primitive, policy]) => [
     `${file}:${symbol}:${primitive}`,

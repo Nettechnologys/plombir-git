@@ -231,6 +231,50 @@ pub(crate) struct CiConfig {
     /// [`rg_core::ci::schedule::DEFAULT_MIN_INTERVAL_MINUTES`].
     #[serde(default)]
     pub(crate) schedule_min_interval_minutes: Option<u64>,
+    /// Where a workflow's `uses: owner/repo@ref` may load an action from:
+    /// `"instance"`, `"upstream"`, both or neither. Absent keeps
+    /// [`rg_ci::actions::DEFAULT_ACTIONS_SOURCES`].
+    #[serde(default)]
+    pub(crate) actions_sources: Option<Vec<String>>,
+    /// The forge `"upstream"` means. Absent keeps
+    /// [`rg_ci::actions::DEFAULT_ACTIONS_UPSTREAM_URL`].
+    #[serde(default)]
+    pub(crate) actions_upstream_url: Option<String>,
+    /// Load `owner/repo@ref` actions only by a full commit SHA. Absent keeps
+    /// [`rg_ci::actions::DEFAULT_ACTIONS_REQUIRE_FULL_SHA`].
+    #[serde(default)]
+    pub(crate) actions_require_full_sha: Option<bool>,
+    /// Ceiling of the upstream action cache, in MiB; `0` removes it. Absent
+    /// keeps [`rg_ci::actions::DEFAULT_ACTIONS_CACHE_MAX_MB`].
+    #[serde(default)]
+    pub(crate) actions_cache_max_mb: Option<u64>,
+}
+
+/// Resolve `[ci]` `actions_*` into the rules the CI engine loads a workflow's
+/// actions under. A source or an upstream it cannot honour fails startup
+/// naming the key.
+pub(crate) fn resolve_actions_policy(
+    cfg: Option<&ConfigFile>,
+) -> anyhow::Result<rg_ci::actions::ActionsPolicy> {
+    let ci = cfg.map(|config| &config.ci);
+    let mut policy = rg_ci::actions::ActionsPolicy::default();
+    if let Some(sources) = ci.and_then(|ci| ci.actions_sources.as_ref()) {
+        policy = policy
+            .with_sources("ci.actions_sources", sources)
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(url) = ci.and_then(|ci| ci.actions_upstream_url.as_deref()) {
+        policy = policy
+            .with_upstream_url("ci.actions_upstream_url", url)
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(require) = ci.and_then(|ci| ci.actions_require_full_sha) {
+        policy = policy.with_require_full_sha(require);
+    }
+    if let Some(max_mb) = ci.and_then(|ci| ci.actions_cache_max_mb) {
+        policy = policy.with_cache_max_mb(max_mb);
+    }
+    Ok(policy)
 }
 
 /// Resolve `[ci]` `job_memory` / `job_cpus` / `job_pids` into the ceiling the
@@ -2098,6 +2142,30 @@ mod tests {
                 "schedule_min_interval_minutes",
                 "rg_core::ci::schedule::DEFAULT_MIN_INTERVAL_MINUTES",
                 rg_core::ci::schedule::DEFAULT_MIN_INTERVAL_MINUTES.to_string(),
+            ),
+            row(
+                "ci",
+                "actions_sources",
+                "rg_ci::actions::DEFAULT_ACTIONS_SOURCES",
+                format!("{:?}", rg_ci::actions::DEFAULT_ACTIONS_SOURCES),
+            ),
+            row(
+                "ci",
+                "actions_upstream_url",
+                "rg_ci::actions::DEFAULT_ACTIONS_UPSTREAM_URL",
+                format!("{:?}", rg_ci::actions::DEFAULT_ACTIONS_UPSTREAM_URL),
+            ),
+            row(
+                "ci",
+                "actions_require_full_sha",
+                "rg_ci::actions::DEFAULT_ACTIONS_REQUIRE_FULL_SHA",
+                rg_ci::actions::DEFAULT_ACTIONS_REQUIRE_FULL_SHA.to_string(),
+            ),
+            row(
+                "ci",
+                "actions_cache_max_mb",
+                "rg_ci::actions::DEFAULT_ACTIONS_CACHE_MAX_MB",
+                rg_ci::actions::DEFAULT_ACTIONS_CACHE_MAX_MB.to_string(),
             ),
             row(
                 "limits",

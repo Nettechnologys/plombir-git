@@ -25,6 +25,7 @@ const sources = [
   'crates/rg-core/src/pull_request/merge_queue.rs',
   'crates/rg-core/src/mirror/service.rs',
   'crates/rg-core/src/import/service.rs',
+  'crates/rg-ci/src/actions.rs',
 ];
 
 for (const relative of sources) {

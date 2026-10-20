@@ -29,6 +29,7 @@
 //!       - run: cargo build
 //! ```
 
+pub mod actions;
 pub mod condition;
 pub mod config;
 pub mod gitea_actions;
@@ -112,6 +113,9 @@ pub struct CiEngine {
     /// container its embedded runners start. Process configuration, set by the
     /// operator; no pipeline can reach it.
     job_limits: rg_process::docker_job::JobLimits,
+    /// `[ci]` `actions_*` — where a workflow's `uses:` may load an action from.
+    /// Process configuration, set by the operator; see [`actions::ActionsPolicy`].
+    actions_policy: actions::ActionsPolicy,
 }
 
 impl Default for CiEngine {
@@ -124,6 +128,7 @@ impl Default for CiEngine {
             write_pool: None,
             storage_limits: rg_core::storage_quota::StorageLimits::default(),
             job_limits: rg_process::docker_job::JobLimits::default(),
+            actions_policy: actions::ActionsPolicy::default(),
         }
     }
 }
@@ -204,6 +209,20 @@ impl CiEngine {
     pub fn with_job_limits(mut self, limits: rg_process::docker_job::JobLimits) -> Self {
         self.job_limits = limits;
         self
+    }
+
+    /// Load the actions a workflow `uses:` under `policy` — `[ci]`
+    /// `actions_sources`, `actions_upstream_url`, `actions_require_full_sha`
+    /// and `actions_cache_max_mb`.
+    pub fn with_actions_policy(mut self, policy: actions::ActionsPolicy) -> Self {
+        self.actions_policy = policy;
+        self
+    }
+
+    /// The `[ci]` rules for loading actions. Exposed for the same reason
+    /// [`Self::job_timeout_secs`] is.
+    pub fn actions_policy(&self) -> &actions::ActionsPolicy {
+        &self.actions_policy
     }
 
     /// The instance-wide fallback handed to every embedded runner this engine
@@ -633,6 +652,30 @@ async fn trigger_pipeline_with_barrier(
     trigger_pipeline_with_barrier_and_engine(params, &engine, before_concurrency_lock).await
 }
 
+/// The repository of this instance `owner/repo` names, for
+/// [`actions::RepositoryActionLoader`]: where it lives on disk and whether it
+/// is private. A soft-deleted repository is not there.
+async fn instance_action_repository(
+    db: &sea_orm::DatabaseConnection,
+    repo_root: &std::path::Path,
+    owner: &str,
+    repo: &str,
+) -> Result<Option<actions::InstanceRepository>> {
+    let Some((repository, namespace)) =
+        rg_core::repo::service::find_repo_and_namespace_by_owner_name(db, owner, repo).await?
+    else {
+        return Ok(None);
+    };
+    if repository.deleted_at.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(actions::InstanceRepository {
+        path: repo_root.join(format!("{namespace}/{}.git", repository.name)),
+        is_private: repository.is_private,
+        id: repository.id,
+    }))
+}
+
 async fn trigger_pipeline_with_barrier_and_engine(
     params: TriggerPipelineParams<'_>,
     engine: &CiEngine,
@@ -691,7 +734,32 @@ async fn trigger_pipeline_with_barrier_and_engine(
         let previous_sha = previous_sha.map(str::to_string);
         let inputs = inputs.cloned();
         let scheduled = schedule.map(|run| (run.workflow.to_string(), run.cron.to_string()));
+        let policy = engine.actions_policy().clone();
+        let repo_root = repo_root.to_path_buf();
+        let lookup_db = db.clone();
+        let lookup_root = repo_root.clone();
+        let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
+            // The workflow is read on a blocking thread; the one database
+            // question loading an action asks — which repository of this
+            // instance is `owner/repo`, and may it be read — is answered by
+            // handing it back to the runtime this thread was spawned from.
+            let lookup = move |owner: &str, repo: &str| {
+                runtime.block_on(instance_action_repository(
+                    &lookup_db,
+                    &lookup_root,
+                    owner,
+                    repo,
+                ))
+            };
+            let loader = actions::RepositoryActionLoader {
+                policy: &policy,
+                workflow_repo: &repo_path,
+                workflow_repo_id: repo_id,
+                commit_sha: &commit_sha,
+                repo_root: &repo_root,
+                lookup: &lookup,
+            };
             read_ci_config_with_inputs(
                 &repo_path,
                 RepositoryName {
@@ -708,6 +776,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
                     schedule: scheduled
                         .as_ref()
                         .map(|(workflow, cron)| rg_core::ci::ScheduledRun { workflow, cron }),
+                    actions: Some(&loader),
                 },
             )
         })
@@ -2383,6 +2452,11 @@ struct WorkflowInvocation<'a> {
     /// The cron entry a `schedule` tick fired for; see
     /// [`rg_core::ci::TriggerPipelineParams::schedule`].
     schedule: Option<rg_core::ci::ScheduledRun<'a>>,
+    /// Where `uses: owner/repo@ref` and `uses: ./path` are loaded from. `None`
+    /// loads nothing: every such step stays a `uses:` the workflow check
+    /// refuses, which is what a reader with no trigger behind it — a test, a
+    /// schema probe — gets.
+    actions: Option<&'a dyn actions::ActionLoader>,
 }
 
 /// Read CI configuration from the repo at the given commit.
@@ -2430,6 +2504,7 @@ fn read_ci_config(
             previous_sha,
             inputs: None,
             schedule: None,
+            actions: None,
         },
     )
 }
@@ -2975,13 +3050,23 @@ fn try_read_gitea_workflows(
                 ))
             })?;
         }
-        let workflow = workflow
+        let mut workflow = workflow
             .expand_local_reusable_workflows(&workflow_sources)
             .map_err(|e| {
                 rg_core::error::invalid_request(format!(
                     "failed to expand {WORKFLOW_DIR}/{name}: {e:#}"
                 ))
             })?;
+        // After the reusable workflows, so the jobs they bring load their
+        // actions too; before the check, so what it judges is the steps that
+        // will run rather than the `uses:` that named them.
+        if let Some(loader) = invocation.actions {
+            actions::expand_actions(&mut workflow, loader)?.map_err(|reason| {
+                rg_core::error::invalid_request(format!(
+                    "cannot load the actions of {WORKFLOW_DIR}/{name}: {reason}"
+                ))
+            })?;
+        }
         workflow.validate_supported_actions().map_err(|e| {
             rg_core::error::invalid_request(format!(
                 "unsupported workflow {WORKFLOW_DIR}/{name}: {e:#}"
@@ -8606,6 +8691,7 @@ jobs:
                 previous_sha: None,
                 inputs: Some(&inputs),
                 schedule: None,
+                actions: None,
             },
         )
         .expect("typed dispatch inputs must reach the committed workflow");
@@ -8647,6 +8733,7 @@ jobs:
                     previous_sha: None,
                     inputs: Some(&inputs),
                     schedule: None,
+                    actions: None,
                 },
             )
             .expect_err("an invalid dispatch input must refuse the committed workflow");
@@ -8744,6 +8831,7 @@ jobs:
                 previous_sha: None,
                 inputs: Some(&inputs),
                 schedule: None,
+                actions: None,
             },
         )
         .expect("each workflow must receive its slice of the aggregate map");
@@ -8771,6 +8859,7 @@ jobs:
                 previous_sha: None,
                 inputs: Some(&unknown),
                 schedule: None,
+                actions: None,
             },
         )
         .expect_err("an input declared by no matching workflow must be refused");
@@ -8841,6 +8930,7 @@ jobs:
                 previous_sha: None,
                 inputs: Some(&inputs),
                 schedule: None,
+                actions: None,
             },
         )
         .expect("the compatible aggregate must run both workflows");
@@ -8916,6 +9006,7 @@ jobs:
                     previous_sha: None,
                     inputs: Some(&inputs),
                     schedule: None,
+                    actions: None,
                 },
             )
             .expect_err("the real trigger must reject the same aggregate contract");
@@ -10942,6 +11033,7 @@ jobs:
                     previous_sha: None,
                     inputs: None,
                     schedule,
+                    actions: None,
                 },
             )
         };
@@ -11521,5 +11613,354 @@ mod step_model_tests {
                 .contains("leaked=no shared=carried"),
             "only the file command crosses"
         );
+    }
+}
+
+#[cfg(test)]
+mod composite_action_tests {
+    //! card_4cf988c73fd1: `uses: owner/repo@ref` loads a composite action —
+    //! from a repository of this instance or from the configured upstream —
+    //! under the operator's policy, and the job runs its steps with the
+    //! caller's inputs and hands back its outputs.
+
+    use super::*;
+    use sea_orm::{NotSet, Set};
+
+    fn git(args: &[&str], cwd: &std::path::Path) -> String {
+        let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        let output = gateway.run(args, Some(cwd)).unwrap();
+        assert!(output.success(), "git {args:?}: {}", output.stderr_str());
+        output.stdout_str().trim().to_string()
+    }
+
+    /// A bare repository at `bare` holding `files` on `main`, tagged `v1`;
+    /// answers the commit.
+    fn bare_with(bare: &std::path::Path, files: &[(&str, &str)]) -> String {
+        let work = tempfile::tempdir().unwrap();
+        for (path, content) in files {
+            let path = work.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "CI"],
+            vec!["config", "user.email", "ci@example.com"],
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", "action"],
+            vec!["tag", "v1"],
+        ] {
+            git(&args, work.path());
+        }
+        std::fs::create_dir_all(bare).unwrap();
+        git(&["init", "-q", "--bare"], bare);
+        let bare_arg = bare.to_string_lossy();
+        git(&["push", "-q", &bare_arg, "main", "v1"], work.path());
+        git(&["rev-parse", "HEAD"], work.path())
+    }
+
+    const GREET: &str = "name: Greet\ninputs:\n  who:\n    required: true\n  greeting:\n    default: Hello\noutputs:\n  said:\n    value: ${{ steps.say.outputs.text }}\nruns:\n  using: composite\n  steps:\n    - id: say\n      shell: sh\n      run: |\n        echo \"composite says ${{ inputs.greeting }}, ${{ inputs.who }}\"\n        echo \"text=${{ inputs.greeting }} ${{ inputs.who }}\" >> \"$GITHUB_OUTPUT\"\n";
+
+    const CALLER: &str = "on: push\njobs:\n  build:\n    steps:\n      - id: hi\n        uses: USES\n        with:\n          who: world\n      - name: Read\n        run: echo \"caller read <${{ steps.hi.outputs.said }}>\"\n";
+
+    struct Fixture {
+        temp: tempfile::TempDir,
+        db: rg_db::DatabaseConnection,
+        repo_id: i64,
+        user_id: i64,
+        repo_path: std::path::PathBuf,
+        sha: String,
+    }
+
+    async fn repository(
+        db: &rg_db::DatabaseConnection,
+        owner_id: i64,
+        name: &str,
+        is_private: bool,
+    ) -> i64 {
+        let now = chrono::Utc::now();
+        rg_db::ops::repo_ops::create(
+            db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner_id),
+                name: Set(name.into()),
+                description: Set(None),
+                is_private: Set(is_private),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// The workflow repository `step-owner/steps` running `workflow`, and two
+    /// repositories of this instance holding the greet action: `tools/greet`
+    /// (public) and `tools/secret` (private).
+    async fn fixture(workflow: &str) -> Fixture {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("step-owner/steps.git");
+        let sha = bare_with(&repo_path, &[(".gitea/workflows/build.yml", workflow)]);
+        bare_with(
+            &temp.path().join("tools/greet.git"),
+            &[("action.yml", GREET)],
+        );
+        bare_with(
+            &temp.path().join("tools/secret.git"),
+            &[("action.yml", GREET)],
+        );
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("actions.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "step-owner",
+            "step-owner@example.com",
+            "unused",
+            "Step Owner",
+        )
+        .await
+        .unwrap();
+        let tools =
+            rg_db::ops::user_ops::create_user(&db, "tools", "tools@example.com", "unused", "Tools")
+                .await
+                .unwrap();
+        let repo_id = repository(&db, user.id, "steps", true).await;
+        repository(&db, tools.id, "greet", false).await;
+        repository(&db, tools.id, "secret", true).await;
+        Fixture {
+            temp,
+            db,
+            repo_id,
+            user_id: user.id,
+            repo_path,
+            sha,
+        }
+    }
+
+    async fn trigger(fixture: &Fixture, policy: actions::ActionsPolicy) -> Result<i64> {
+        let engine = CiEngine::new().with_actions_policy(policy);
+        trigger_pipeline_with_barrier_and_engine(
+            TriggerPipelineParams {
+                db: &fixture.db,
+                repo_root: fixture.temp.path(),
+                repo_path: &fixture.repo_path,
+                repo_id: fixture.repo_id,
+                commit_sha: &fixture.sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "push",
+                base_branch: None,
+                previous_sha: None,
+                inputs: None,
+                schedule: None,
+                triggered_by: Some(fixture.user_id),
+                docker_enabled: false,
+                // Published only: the runner below is driven and awaited.
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &engine,
+            None,
+        )
+        .await
+    }
+
+    /// Run the pipeline on the embedded runner; the log of its one job.
+    async fn run_log(fixture: &Fixture, pipeline_id: i64) -> (String, String) {
+        let mut runner = runner::PipelineRunner::new_local_only(
+            fixture.db.clone(),
+            fixture.temp.path(),
+            &fixture.repo_path,
+            pipeline_id,
+        );
+        runner.set_repo_id(fixture.repo_id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+        let stage = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&fixture.db, pipeline_id)
+            .await
+            .unwrap()
+            .remove(0);
+        let job = rg_db::ops::pipeline_ops::list_jobs_by_stage(&fixture.db, stage.id)
+            .await
+            .unwrap()
+            .remove(0);
+        (job.status, job.log.unwrap_or_default())
+    }
+
+    /// The card's acceptance: a composite action from a repository of this
+    /// instance runs with the caller's input and its declared default, and the
+    /// next step reads its output; the commit it resolved to is in the log.
+    #[tokio::test]
+    async fn an_instance_action_runs_with_its_inputs_and_hands_back_its_outputs() {
+        let fixture = fixture(&CALLER.replace("USES", "tools/greet@v1")).await;
+        let pipeline_id = trigger(&fixture, actions::ActionsPolicy::default())
+            .await
+            .expect("the default policy loads public actions of this instance");
+        let (status, log) = run_log(&fixture, pipeline_id).await;
+        assert_eq!(status, "success", "{log}");
+        assert!(log.contains("composite says Hello, world"), "{log}");
+        assert!(log.contains("caller read <Hello world>"), "{log}");
+        let action_sha = git(
+            &["rev-parse", "v1"],
+            &fixture.temp.path().join("tools/greet.git"),
+        );
+        assert!(
+            log.contains(&format!("Action tools/greet@v1 is commit {action_sha}")),
+            "the resolved commit must be in the job log: {log}"
+        );
+    }
+
+    /// `./path` reads the workflow's own repository at the commit being built,
+    /// whatever the policy allows for other repositories.
+    #[tokio::test]
+    async fn a_local_action_runs_from_the_commit_being_built() {
+        let temp_workflow = CALLER.replace("USES", "./.gitea/actions/greet");
+        let fixture = fixture(&temp_workflow).await;
+        // Rebuild the workflow repository with the action beside the workflow.
+        std::fs::remove_dir_all(&fixture.repo_path).unwrap();
+        let sha = bare_with(
+            &fixture.repo_path,
+            &[
+                (".gitea/workflows/build.yml", &temp_workflow),
+                (".gitea/actions/greet/action.yml", GREET),
+            ],
+        );
+        let fixture = Fixture { sha, ..fixture };
+        let none = actions::ActionsPolicy::default()
+            .with_sources("ci.actions_sources", &[])
+            .unwrap();
+        let pipeline_id = trigger(&fixture, none).await.expect("a local action loads");
+        let (status, log) = run_log(&fixture, pipeline_id).await;
+        assert_eq!(status, "success", "{log}");
+        assert!(log.contains("caller read <Hello world>"), "{log}");
+        assert!(log.contains("from this repository"), "{log}");
+    }
+
+    /// A source the policy does not allow is refused by its name, before any
+    /// pipeline exists; so is a private repository of somebody else, and a tag
+    /// where the operator asked for full SHAs.
+    #[tokio::test]
+    async fn what_the_policy_does_not_allow_is_refused_by_the_source_it_names() {
+        let fixture = fixture(&CALLER.replace("USES", "tools/greet@v1")).await;
+        let upstream_only = actions::ActionsPolicy::default()
+            .with_sources("ci.actions_sources", &["upstream".into()])
+            .unwrap();
+        let error = trigger(&fixture, upstream_only).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "a refused source is the workflow's to fix: {message}"
+        );
+        assert!(
+            message.contains("source \"instance\"") && message.contains("tools/greet"),
+            "the refusal names the source and the action: {message}"
+        );
+
+        let pinned = actions::ActionsPolicy::default().with_require_full_sha(true);
+        let message = format!("{:#}", trigger(&fixture, pinned).await.unwrap_err());
+        assert!(message.contains("ci.actions_require_full_sha"), "{message}");
+
+        let fixture = self::fixture(&CALLER.replace("USES", "tools/secret@v1")).await;
+        let message = format!(
+            "{:#}",
+            trigger(&fixture, actions::ActionsPolicy::default())
+                .await
+                .unwrap_err()
+        );
+        assert!(message.contains("private repository"), "{message}");
+
+        let (_, total) = rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(
+            &fixture.db,
+            fixture.repo_id,
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 0, "a refused action published a pipeline");
+    }
+
+    /// An action the instance does not hold comes from the upstream when the
+    /// policy allows it — here a `file://` directory of mirrors — and is
+    /// cached by its commit; when the policy does not, it is refused naming
+    /// the upstream.
+    #[tokio::test]
+    async fn an_upstream_action_is_fetched_cached_and_refused_when_not_allowed() {
+        let fixture = fixture(&CALLER.replace("USES", "acme/greet@v1")).await;
+        let mirrors = tempfile::tempdir().unwrap();
+        let upstream_sha = bare_with(&mirrors.path().join("acme/greet"), &[("action.yml", GREET)]);
+        let url = format!("file://{}", mirrors.path().display());
+
+        let refused = format!(
+            "{:#}",
+            trigger(&fixture, actions::ActionsPolicy::default())
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            refused.contains("source \"upstream\"") && refused.contains("no repository acme/greet"),
+            "{refused}"
+        );
+
+        let upstream = actions::ActionsPolicy::default()
+            .with_sources("ci.actions_sources", &["upstream".into()])
+            .unwrap()
+            .with_upstream_url("ci.actions_upstream_url", &url)
+            .unwrap();
+        let pipeline_id = trigger(&fixture, upstream.clone())
+            .await
+            .expect("the upstream serves the action");
+        let (status, log) = run_log(&fixture, pipeline_id).await;
+        assert_eq!(status, "success", "{log}");
+        assert!(log.contains("caller read <Hello world>"), "{log}");
+        assert!(
+            log.contains(&format!("is commit {upstream_sha} from {url}/acme/greet")),
+            "{log}"
+        );
+        let cached = fixture
+            .temp
+            .path()
+            .join(actions::ACTIONS_CACHE_DIR)
+            .read_dir()
+            .unwrap()
+            .count();
+        assert_eq!(cached, 1, "the fetch is cached under the repository root");
+
+        // Pinned by the SHA it resolved to, the action is served from the
+        // cache with the upstream gone.
+        drop(mirrors);
+        let pinned =
+            self::fixture(&CALLER.replace("USES", &format!("acme/greet@{upstream_sha}"))).await;
+        std::fs::rename(
+            fixture.temp.path().join(actions::ACTIONS_CACHE_DIR),
+            pinned.temp.path().join(actions::ACTIONS_CACHE_DIR),
+        )
+        .unwrap();
+        trigger(&pinned, upstream)
+            .await
+            .expect("a SHA the cache holds needs no upstream");
     }
 }

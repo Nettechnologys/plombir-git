@@ -5,12 +5,13 @@ implements a **subset** of it. This page is that subset's boundary.
 
 Reaching for GitHub's own documentation instead will mislead you, which is why
 this page exists rather than a link. There is no Actions runtime here: a job is
-a shell script the runner executes in a worktree of your repository, so the
-parts of Actions that are *the runtime* — the marketplace, `actions/*` beyond
-three special cases, composite actions — have nothing to map onto and are
-refused. Steps, their outputs, the outputs one job hands to the jobs that need
-it and service containers are implemented by the runner itself; see
-[Steps](#steps), [Outputs](#outputs) and [Services](#services).
+a list of steps the runner executes in a worktree of your repository, so the
+parts of Actions that are *the runtime* — JavaScript and Docker actions — have
+nothing to map onto and are refused. Composite actions are written into the job
+as steps when the workflow is read; see [Actions](#actions). Steps, their
+outputs, the outputs one job hands to the jobs that need it and service
+containers are implemented by the runner itself; see [Steps](#steps),
+[Outputs](#outputs) and [Services](#services).
 
 **Refusals are loud and whole-file.** Every block below carries a closed schema.
 An unknown key, an unrunnable trigger, an action this engine does not implement
@@ -529,7 +530,7 @@ reads `steps.*` and `needs.*` ([Outputs](#outputs)), which a job's `if:` cannot.
 | `id` | string | The step's id: a letter or `_`, then letters, digits, `-` and `_`. Unique in the job. Later steps read what it left as `steps.<id>.*` — see [Outputs](#outputs). |
 | `run` | string | The script. |
 | `shell` | string | `bash`, `sh`, `python`, `pwsh`, or a command line of your own with `{0}` where the script goes. Requires `run:`. |
-| `uses` | string | One of exactly three actions. See [Actions](#actions). |
+| `uses` | string | A composite action, or one of three built-in actions. See [Actions](#actions). |
 | `with` | map | Inputs for that action. |
 | `env` | map string→string | Variables for this step. |
 | `if` | string | Condition, read between steps. See below. |
@@ -710,7 +711,10 @@ jobs:
 
 ## Actions
 
-Three, and only three, `uses:` values are implemented:
+A `uses:` step runs a **composite action**, or one of three actions this engine
+implements itself.
+
+### Built-in actions
 
 | `uses:` | What happens |
 |---------|--------------|
@@ -718,10 +722,113 @@ Three, and only three, `uses:` values are implemented:
 | `actions/cache@…` | Translated into the native [cache](ci.md#cache). |
 | `actions/upload-artifact@…` | Translated into the native [artifacts](ci.md#artifacts) block. |
 
-Any other action fails the workflow — there is no runtime to execute it, and
-skipping it would be worse than refusing it.
+These three are never loaded from a repository, whatever the version after
+the `@`.
 
-An input these three do not implement fails the workflow too.
+### Composite actions
+
+An `action.yml` at the root of `acme/greet`, tagged `v1`:
+
+<!-- example: action acme/greet@v1 -->
+```yaml
+name: Greet
+inputs:
+  who:
+    required: true
+  greeting:
+    default: Hello
+outputs:
+  said:
+    value: ${{ steps.say.outputs.text }}
+runs:
+  using: composite
+  steps:
+    - id: say
+      shell: bash
+      run: echo "text=${{ inputs.greeting }}, ${{ inputs.who }}" >> "$GITHUB_OUTPUT"
+```
+
+and a workflow that uses it (`acme/tools/greet@<sha>` would name a directory
+of a repository, `./.gitea/actions/greet` one of the workflow's own):
+
+```yaml
+on: push
+jobs:
+  build:
+    steps:
+      - id: hi
+        uses: acme/greet@v1
+        with:
+          who: world
+      - run: echo "${{ steps.hi.outputs.said }}"
+```
+
+The action is loaded when the workflow is read, on the server, and its steps
+are written into the job in place of the `uses:` step; both runners then run
+plain steps. Where it comes from:
+
+| `uses:` | Read from |
+|---------|-----------|
+| `./path` | The workflow's own repository, at the commit being built. Always allowed. |
+| `owner/repo[/path]@ref` | First a repository of this instance: a **public** one, or the workflow's own — a private repository of somebody else is refused. When the instance has no such repository, the upstream forge (`https://github.com` unless the operator set another). |
+
+The operator decides which of those may be used, in `[ci]`:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `actions_sources` | `["instance"]` | `"instance"`, `"upstream"`, both, or `[]` for neither. A `uses:` from a source that is not listed fails the workflow, naming the source. |
+| `actions_upstream_url` | `"https://github.com"` | The forge `"upstream"` means: `https://`, or a `file://` directory of mirrors. |
+| `actions_require_full_sha` | `false` | Load `owner/repo@ref` only by a full 40-character commit SHA, never a tag or a branch that can move. |
+| `actions_cache_max_mb` | `1024` | Upstream actions are fetched (one commit deep) into a cache under the repository root and kept by commit; one fetch may not write more than this, and the actions used least recently are evicted past it. `0` removes the ceiling. |
+
+A tag or a branch is resolved to a commit every time the workflow is read; the
+job log's first step for the action says which commit, and from where.
+
+**An action's steps are your job's steps.** They run with every variable the
+job has — and the job's environment holds the repository's CI secrets — so an
+action can read what a `run:` step of yours can. Allow `"upstream"` only for
+forges whose actions you would paste into a workflow yourself, and pin them
+(`actions_require_full_sha`).
+
+What `action.yml` (or `action.yaml`) may say:
+
+- `name`, `description`, `author`, `branding` — read by people, not by the engine;
+- `inputs.<name>`: `description`, `required`, `default`, `deprecationMessage`. A
+  `with:` key the action does not declare, and a required input the step does
+  not give, fail the workflow;
+- `outputs.<name>`: `description`, `value`. The caller reads them as
+  `steps.<id>.outputs.<name>`;
+- `runs.using: composite` and `runs.steps`. Each step takes `name`, `id`,
+  `run` with its `shell` (required, as on GitHub), `uses` — another composite
+  action, at most 10 deep —, `with`, `env`, `if`, `working-directory` and
+  `continue-on-error`.
+
+Inside the action, `${{ inputs.<name> }}` is the value the step gave, and
+`github.action_repository` / `github.action_ref` name the action. The steps run
+in the caller's job, so every other expression means what it means there.
+
+One difference from GitHub to know before writing an `if:` on it: the calling
+step's id belongs to the step that hands the action's `outputs` back, which runs
+last. When a step inside the action fails, that step does not run, so
+`steps.<id>.outcome` reads `skipped` where GitHub says `failure`. Test
+`failure()` / `success()` — they see the inner step — rather than the outcome of
+the calling step.
+
+Refused, by name:
+
+| What | Why |
+|------|-----|
+| `runs.using: node*` | A JavaScript action needs a Node runtime on the runner; there is none. |
+| `runs.using: docker` | A Docker action is a container the workflow builds; refused like `container.options`. |
+| `github.action_path` | The action's files do not reach the runner — only its steps do. Inline what it runs from its directory. |
+| `secrets.*` inside the action | An action has no secrets context, as on GitHub; the workflow passes what it needs as an input. |
+| `continue-on-error`, `timeout-minutes`, `shell`, `working-directory`, `run` on the calling step | They have no single step to apply to. |
+| `timeout-minutes` on an action's step | GitHub does not allow it either. |
+| Any other key in `action.yml` | It would be ignored. |
+
+### Inputs of the built-in actions
+
+An input the three built-in actions do not implement fails the workflow.
 `actions/checkout` accepts exactly:
 
 <!-- inventory: checkout-inputs -->

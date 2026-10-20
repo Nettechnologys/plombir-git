@@ -927,11 +927,33 @@ pub struct CacheConfig {
     /// Built-in defaults of this engine that no row of `docs/ci.md` states,
     /// each with the reason. The list exists so the next unpaired default is a
     /// decision someone wrote down rather than one that slipped past the census.
-    const DEFAULTS_NOT_IN_THE_CI_DOCUMENT: [(&str, &str); 1] = [(
-        "DEFAULT_CI_TOKEN_SCOPES",
-        "the scopes the engine mints `CI_JOB_TOKEN` with; `.plombir-git-ci.yml` has no key \
+    const DEFAULTS_NOT_IN_THE_CI_DOCUMENT: [(&str, &str); 5] = [
+        (
+            "DEFAULT_CI_TOKEN_SCOPES",
+            "the scopes the engine mints `CI_JOB_TOKEN` with; `.plombir-git-ci.yml` has no key \
              for them, so there is no row this could pair with",
-    )];
+        ),
+        (
+            "DEFAULT_ACTIONS_SOURCES",
+            "the operator's `[ci] actions_sources`, held to `plombir-git.example.toml` and \
+             stated in docs/gitea-actions.md; no CI file can set it",
+        ),
+        (
+            "DEFAULT_ACTIONS_UPSTREAM_URL",
+            "the operator's `[ci] actions_upstream_url`, held to `plombir-git.example.toml` and \
+             stated in docs/gitea-actions.md; no CI file can set it",
+        ),
+        (
+            "DEFAULT_ACTIONS_REQUIRE_FULL_SHA",
+            "the operator's `[ci] actions_require_full_sha`, held to `plombir-git.example.toml` \
+             and stated in docs/gitea-actions.md; no CI file can set it",
+        ),
+        (
+            "DEFAULT_ACTIONS_CACHE_MAX_MB",
+            "the operator's `[ci] actions_cache_max_mb`, held to `plombir-git.example.toml` and \
+             stated in docs/gitea-actions.md; no CI file can set it",
+        ),
+    ];
 
     /// Where a fallback comes from.
     #[derive(Debug, PartialEq, Eq)]
