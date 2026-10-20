@@ -102,6 +102,12 @@ pub struct PollJobResponse {
     /// for a native job, whose `script` runs as one program.
     #[serde(default)]
     pub(crate) steps: Option<Vec<rg_process::ci_steps::StepSpec>>,
+    /// What the jobs this one needs left, by the id its expressions use.
+    #[serde(default)]
+    pub(crate) needs: std::collections::BTreeMap<String, rg_process::ci_steps::NeededJob>,
+    /// The job's `outputs:` templates, resolved after its last step.
+    #[serde(default)]
+    pub(crate) outputs: std::collections::BTreeMap<String, String>,
 }
 
 /// Per-request timeout for the heartbeat call.
@@ -1089,11 +1095,41 @@ pub async fn finish_job(
     status: &str,
     exit_code: i32,
 ) {
+    finish_job_with_outputs(
+        client,
+        server,
+        runner_id,
+        job_id,
+        token,
+        status,
+        exit_code,
+        &std::collections::BTreeMap::new(),
+    )
+    .await;
+}
+
+/// [`finish_job`] for a job of steps that left `outputs:` — what the jobs
+/// that need it read as `needs.<id>.outputs.*`. Sent with the finish, so a job
+/// is never seen settled without them.
+#[allow(clippy::too_many_arguments)]
+pub async fn finish_job_with_outputs(
+    client: &reqwest::Client,
+    server: &str,
+    runner_id: i64,
+    job_id: i64,
+    token: &str,
+    status: &str,
+    exit_code: i32,
+    outputs: &std::collections::BTreeMap<String, String>,
+) {
     let url = format!(
         "{}/api/v1/runners/{}/jobs/{}/finish",
         server, runner_id, job_id
     );
-    let payload = serde_json::json!({"status": status, "exit_code": exit_code});
+    let mut payload = serde_json::json!({"status": status, "exit_code": exit_code});
+    if !outputs.is_empty() {
+        payload["outputs"] = serde_json::json!(outputs);
+    }
     let mut backoff = FINISH_JOB_RETRY_BACKOFF;
 
     for attempt in 1..=FINISH_JOB_ATTEMPTS {

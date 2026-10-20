@@ -2889,11 +2889,13 @@ pub(crate) fn build_all_routes(
             api::runners::upload_cache,
             &runner_auth_1gb,
         )
+        // A job of steps hands its outputs over here: up to 1 MiB, which JSON
+        // escaping can take to six times that — past Axum's 2 MiB default.
         .post_with(
             RUNNER_TOKEN,
             "/runners/{id}/jobs/{job_id}/finish",
             api::runners::finish_job,
-            &runner_auth,
+            &runner_auth_job_log,
         )
         .put_with(
             RUNNER_TOKEN,

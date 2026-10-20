@@ -144,11 +144,12 @@ cited in the row added it. Plombir Git's side is specified in full in
 | `services:` | ❌ refused | ✅ |
 | `uses:` actions | ⚠️ `actions/checkout`, `actions/cache`, `actions/upload-artifact` only | ✅ any action |
 | Step `id` | ✅ | ✅ |
-| Composite actions, step outputs | ❌ refused | ✅ |
+| Step outputs, `jobs.<id>.outputs`, `needs.<id>.outputs` | ✅ `$GITHUB_OUTPUT`, 1 MiB per job, masked; `::set-output` refused | ✅ |
+| Composite actions | ❌ refused | ✅ |
 | Step `continue-on-error`, step `timeout-minutes`, step `shell` | ✅ each step is its own process, in both runners; `$GITHUB_ENV` / `$GITHUB_PATH` between steps | ✅ |
 | `permissions`, `vars.*` | ❌ refused | ✅ |
 
-If your workflows lean on marketplace actions, services or step outputs, Gitea
+If your workflows lean on marketplace actions or services, Gitea
 will run them and Plombir Git will not. Plombir Git also has its own pipeline format,
 [`.plombir-git-ci.yml`](docs/ci.md), for what the subset cannot express.
 

@@ -227,6 +227,10 @@ pub struct StepResult {
     pub log: String,
     pub started_at: Option<SystemTime>,
     pub finished_at: Option<SystemTime>,
+    /// What the step wrote to `$GITHUB_OUTPUT` — unmasked, because a later
+    /// step reads it as written; it leaves the job only through the job's own
+    /// `outputs:`, which are masked.
+    pub outputs: BTreeMap<String, String>,
 }
 
 /// What a whole job of steps left.
@@ -239,6 +243,187 @@ pub struct StepsResult {
     /// Every step's log under a header naming it, capped to the job log size.
     pub log: String,
     pub steps: Vec<StepResult>,
+    /// The job's `outputs:`, resolved after its last step and masked. Empty
+    /// when the job declared none — or when they could not be produced, in
+    /// which case the job failed saying why.
+    pub outputs: BTreeMap<String, String>,
+}
+
+/// One job a job `needs:`, as its steps see it: `needs.<id>.result` and
+/// `needs.<id>.outputs.<name>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NeededJob {
+    /// `success`, `failure`, `cancelled` or `skipped`.
+    pub result: String,
+    #[serde(default)]
+    pub outputs: BTreeMap<String, String>,
+}
+
+/// The largest total of `$GITHUB_OUTPUT` values one job may write, and of its
+/// own `outputs:` — GitHub's 1 MiB.
+pub const MAX_JOB_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// A context only a runner has, between two steps: what the earlier steps of
+/// the job left, and what the jobs it needs left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeKey {
+    /// `steps.<id>.outputs.<name>`
+    StepOutput { step: String, name: String },
+    /// `steps.<id>.outcome`
+    StepOutcome(String),
+    /// `steps.<id>.conclusion`
+    StepConclusion(String),
+    /// `needs.<job>.outputs.<name>`
+    NeedsOutput { job: String, name: String },
+    /// `needs.<job>.result`
+    NeedsResult(String),
+}
+
+/// A step id, an output name or a job id as GitHub accepts them: a letter or
+/// `_`, then letters, digits, `-` and `_`.
+pub fn valid_runtime_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+impl RuntimeKey {
+    /// Read one `${{ … }}` key, or `None` when it is not a runtime context.
+    pub fn parse(key: &str) -> Option<Self> {
+        let parts = key.split('.').collect::<Vec<_>>();
+        let named = |names: &[&str]| names.iter().all(|name| valid_runtime_name(name));
+        match parts.as_slice() {
+            ["steps", step, "outputs", name] if named(&[step, name]) => Some(Self::StepOutput {
+                step: step.to_string(),
+                name: name.to_string(),
+            }),
+            ["steps", step, "outcome"] if named(&[step]) => {
+                Some(Self::StepOutcome(step.to_string()))
+            }
+            ["steps", step, "conclusion"] if named(&[step]) => {
+                Some(Self::StepConclusion(step.to_string()))
+            }
+            ["needs", job, "outputs", name] if named(&[job, name]) => Some(Self::NeedsOutput {
+                job: job.to_string(),
+                name: name.to_string(),
+            }),
+            ["needs", job, "result"] if named(&[job]) => Some(Self::NeedsResult(job.to_string())),
+            _ => None,
+        }
+    }
+}
+
+/// What an earlier step of the job left, by its id.
+#[derive(Debug, Clone)]
+struct StepState {
+    outcome: StepOutcome,
+    conclusion: StepOutcome,
+    outputs: BTreeMap<String, String>,
+}
+
+/// What the runtime contexts answer at one moment of a job.
+struct RuntimeContext<'a> {
+    steps: &'a HashMap<String, StepState>,
+    needs: &'a BTreeMap<String, NeededJob>,
+}
+
+impl RuntimeContext<'_> {
+    fn value(&self, key: &RuntimeKey) -> String {
+        match key {
+            RuntimeKey::StepOutput { step, name } => self
+                .steps
+                .get(step)
+                .and_then(|state| state.outputs.get(name))
+                .cloned()
+                .unwrap_or_default(),
+            RuntimeKey::StepOutcome(step) => self
+                .steps
+                .get(step)
+                .map(|state| state.outcome.as_str().to_string())
+                .unwrap_or_default(),
+            RuntimeKey::StepConclusion(step) => self
+                .steps
+                .get(step)
+                .map(|state| state.conclusion.as_str().to_string())
+                .unwrap_or_default(),
+            RuntimeKey::NeedsOutput { job, name } => self
+                .needs
+                .get(job)
+                .and_then(|needed| needed.outputs.get(name))
+                .cloned()
+                .unwrap_or_default(),
+            RuntimeKey::NeedsResult(job) => self
+                .needs
+                .get(job)
+                .map(|needed| needed.result.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Replace every `${{ <runtime key> }}` in `text`, as GitHub does: the
+    /// value goes in as text. Anything else between `${{` and `}}` was
+    /// resolved — or refused — when the workflow was read, and is left alone.
+    fn resolve(&self, text: &str) -> String {
+        if !text.contains("${{") {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find("${{") {
+            let after = &rest[open + 3..];
+            let Some(close) = after.find("}}") else {
+                break;
+            };
+            out.push_str(&rest[..open]);
+            match RuntimeKey::parse(after[..close].trim()) {
+                Some(key) => out.push_str(&self.value(&key)),
+                None => out.push_str(&rest[open..open + 3 + close + 2]),
+            }
+            rest = &after[close + 2..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The runtime keys a step condition reads, by their spelling.
+    fn condition_entries(&self) -> Vec<(String, String)> {
+        let mut entries = Vec::new();
+        for (id, state) in self.steps {
+            entries.push((format!("steps.{id}.outcome"), state.outcome.as_str().into()));
+            entries.push((
+                format!("steps.{id}.conclusion"),
+                state.conclusion.as_str().into(),
+            ));
+            for (name, value) in &state.outputs {
+                entries.push((format!("steps.{id}.outputs.{name}"), value.clone()));
+            }
+        }
+        for (job, needed) in self.needs {
+            entries.push((format!("needs.{job}.result"), needed.result.clone()));
+            for (name, value) in &needed.outputs {
+                entries.push((format!("needs.{job}.outputs.{name}"), value.clone()));
+            }
+        }
+        entries
+    }
+
+    /// `step` with every runtime expression in what it runs resolved.
+    fn resolve_step(&self, step: &StepSpec) -> StepSpec {
+        let mut resolved = step.clone();
+        resolved.run = self.resolve(&step.run);
+        resolved.working_directory = step
+            .working_directory
+            .as_deref()
+            .map(|directory| self.resolve(directory));
+        resolved.env = step
+            .env
+            .iter()
+            .map(|(name, value)| (name.clone(), self.resolve(value)))
+            .collect();
+        resolved
+    }
 }
 
 /// Where the steps run.
@@ -288,13 +473,22 @@ pub struct StepRun<'a> {
     /// How long one minute of `timeout-minutes` is: [`MINUTE`], except in a
     /// test that cannot wait for one.
     pub minute: std::time::Duration,
+    /// The jobs this one `needs:`, by the id its expressions name them with.
+    pub needs: &'a BTreeMap<String, NeededJob>,
+    /// The job's `outputs:`, as templates over `steps.*` and `needs.*`.
+    pub outputs: &'a BTreeMap<String, String>,
 }
 
 /// One minute of a step's `timeout-minutes`.
 pub const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The names a step's process gets from the runner, never from the job.
-const FILE_COMMANDS: [&str; 3] = ["GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY"];
+const FILE_COMMANDS: [&str; 4] = [
+    "GITHUB_ENV",
+    "GITHUB_PATH",
+    "GITHUB_STEP_SUMMARY",
+    "GITHUB_OUTPUT",
+];
 
 /// Variables a `$GITHUB_ENV` line may not set: the runner's own, and the two
 /// that `$GITHUB_PATH` and the runner answer for.
@@ -310,6 +504,43 @@ fn reserved_for_the_runner(name: &str) -> bool {
 /// Parse a `$GITHUB_ENV` file: `NAME=value` lines, and the
 /// `NAME<<DELIMITER` … `DELIMITER` form for a value with newlines.
 pub fn parse_env_file(text: &str) -> Result<Vec<(String, String)>, String> {
+    parse_file_command(text, |name| {
+        if !crate::job_environment::valid_environment_name(name) {
+            return Err(format!("`{name}` is not a valid variable name"));
+        }
+        if reserved_for_the_runner(name) {
+            return Err(format!(
+                "`{name}` is set by the runner and cannot be changed by a step{}",
+                if name == "PATH" {
+                    "; append a directory to $GITHUB_PATH instead"
+                } else {
+                    ""
+                }
+            ));
+        }
+        Ok(())
+    })
+}
+
+/// Parse a `$GITHUB_OUTPUT` file — the format of `$GITHUB_ENV`, with GitHub's
+/// rule for an output's name.
+pub fn parse_output_file(text: &str) -> Result<Vec<(String, String)>, String> {
+    parse_file_command(text, |name| {
+        if valid_runtime_name(name) {
+            Ok(())
+        } else {
+            Err(format!(
+                "`{name}` is not a valid output name (a letter or `_`, then letters, digits, \
+                 `-` and `_`)"
+            ))
+        }
+    })
+}
+
+fn parse_file_command(
+    text: &str,
+    check: impl Fn(&str) -> Result<(), String>,
+) -> Result<Vec<(String, String)>, String> {
     let mut pairs = Vec::new();
     let mut lines = text.lines().enumerate();
     while let Some((index, line)) = lines.next() {
@@ -347,23 +578,7 @@ pub fn parse_env_file(text: &str) -> Result<Vec<(String, String)>, String> {
                 index + 1
             ));
         };
-        if !crate::job_environment::valid_environment_name(&name) {
-            return Err(format!(
-                "line {}: `{name}` is not a valid variable name",
-                index + 1
-            ));
-        }
-        if reserved_for_the_runner(&name) {
-            return Err(format!(
-                "line {}: `{name}` is set by the runner and cannot be changed by a step{}",
-                index + 1,
-                if name == "PATH" {
-                    "; append a directory to $GITHUB_PATH instead"
-                } else {
-                    ""
-                }
-            ));
-        }
+        check(&name).map_err(|reason| format!("line {}: {reason}", index + 1))?;
         pairs.push((name, value));
     }
     Ok(pairs)
@@ -437,6 +652,7 @@ struct StepPaths {
     env: String,
     path: String,
     summary: String,
+    output: String,
     workspace: String,
     temp: String,
 }
@@ -474,12 +690,24 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
     // written, and `$GITHUB_PATH` entries newest first.
     let mut carried_env: Vec<(String, String)> = Vec::new();
     let mut carried_path: Vec<String> = Vec::new();
+    // What each step with an `id:` left, for `steps.<id>.*`.
+    let mut states: HashMap<String, StepState> = HashMap::new();
+    // `$GITHUB_OUTPUT` bytes written so far, against the job's 1 MiB.
+    let mut output_bytes = 0usize;
 
-    for (index, step) in run.steps.iter().enumerate() {
+    for (index, declared) in run.steps.iter().enumerate() {
         let number = index + 1;
+        let runtime = RuntimeContext {
+            steps: &states,
+            needs: run.needs,
+        };
+        let resolved = runtime.resolve_step(declared);
+        let step = &resolved;
         let env = step_environment(run, step, &carried_env, &carried_path, number);
         let condition = step.condition.as_deref().unwrap_or("success()");
-        let runs = match evaluate_step_condition(condition, &step_condition_context(&env), status) {
+        let mut context = step_condition_context(&env);
+        context.extend(runtime.condition_entries());
+        let runs = match evaluate_step_condition(condition, &context, status) {
             Ok(runs) => runs,
             Err(error) => {
                 let result = StepResult {
@@ -493,12 +721,14 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
                     ),
                     started_at: None,
                     finished_at: None,
+                    outputs: BTreeMap::new(),
                 };
                 reporter.finished(&result).await;
                 status.failed = true;
                 if exit_code == 0 {
                     exit_code = -1;
                 }
+                remember(&mut states, step, &result);
                 results.push(result);
                 continue;
             }
@@ -513,8 +743,10 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
                 log: String::new(),
                 started_at: None,
                 finished_at: None,
+                outputs: BTreeMap::new(),
             };
             reporter.finished(&result).await;
+            remember(&mut states, step, &result);
             results.push(result);
             continue;
         }
@@ -526,13 +758,33 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
 
         let mut log = log;
         let mut failed = code != Some(0);
+        let mut outputs = BTreeMap::new();
+        if let Some(line) = log
+            .lines()
+            .find(|line| line.trim_start().starts_with("::set-output "))
+            .map(str::to_string)
+        {
+            push_line(
+                &mut log,
+                &format!(
+                    "[plombir-git-runner] `{}` uses the `::set-output` workflow command, which \
+                     GitHub disabled; write `name=value` to $GITHUB_OUTPUT instead",
+                    line.trim()
+                ),
+            );
+            failed = true;
+        }
         if !failed {
-            match file_commands {
+            match file_commands.and_then(|commands| {
+                within_output_budget(&commands.outputs, &mut output_bytes).map(|()| commands)
+            }) {
                 Ok(FileCommands {
                     env: written,
                     path,
                     summary,
+                    outputs: written_outputs,
                 }) => {
+                    outputs = written_outputs;
                     carried_env.extend(written);
                     for directory in path.into_iter().rev() {
                         carried_path.insert(0, directory);
@@ -585,16 +837,77 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
             log: (run.mask)(&log),
             started_at: Some(started_at),
             finished_at: Some(finished_at),
+            outputs,
         };
         reporter.finished(&result).await;
+        remember(&mut states, step, &result);
         results.push(result);
+    }
+
+    let mut log = combined_log(&results, run.steps.len());
+    let runtime = RuntimeContext {
+        steps: &states,
+        needs: run.needs,
+    };
+    let mut outputs = BTreeMap::new();
+    let mut total = 0usize;
+    for (name, template) in run.outputs {
+        let value = (run.mask)(&runtime.resolve(template));
+        total += name.len() + value.len();
+        if total > MAX_JOB_OUTPUT_BYTES {
+            push_line(
+                &mut log,
+                &format!(
+                    "[plombir-git-runner] the job's outputs pass {MAX_JOB_OUTPUT_BYTES} bytes at \
+                     `{name}`; none of them are kept"
+                ),
+            );
+            outputs.clear();
+            if exit_code == 0 {
+                exit_code = -1;
+            }
+            break;
+        }
+        outputs.insert(name.clone(), value);
     }
 
     StepsResult {
         exit_code,
-        log: combined_log(&results, run.steps.len()),
+        log,
         steps: results,
+        outputs,
     }
+}
+
+/// Keep what a step with an `id:` left, for the steps after it.
+fn remember(states: &mut HashMap<String, StepState>, step: &StepSpec, result: &StepResult) {
+    if let Some(id) = &step.id {
+        states.insert(
+            id.clone(),
+            StepState {
+                outcome: result.outcome,
+                conclusion: result.conclusion,
+                outputs: result.outputs.clone(),
+            },
+        );
+    }
+}
+
+/// Count a step's outputs against the job's budget, naming the key that
+/// crosses it — an output is refused whole rather than cut.
+fn within_output_budget(
+    outputs: &BTreeMap<String, String>,
+    used: &mut usize,
+) -> Result<(), String> {
+    for (name, value) in outputs {
+        *used += name.len() + value.len();
+        if *used > MAX_JOB_OUTPUT_BYTES {
+            return Err(format!(
+                "$GITHUB_OUTPUT `{name}` takes the job's outputs past {MAX_JOB_OUTPUT_BYTES} bytes"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn push_line(log: &mut String, line: &str) {
@@ -617,7 +930,18 @@ fn step_environment(
     number: usize,
 ) -> Vec<(String, String)> {
     let paths = step_paths(run, number, step);
-    let mut env: BTreeMap<String, String> = run.job_env.iter().cloned().collect();
+    // A job variable may read what a needed job left (`env: VERSION:
+    // ${{ needs.build.outputs.version }}`); nothing else in it is a runtime
+    // expression.
+    let needs_only = RuntimeContext {
+        steps: &HashMap::new(),
+        needs: run.needs,
+    };
+    let mut env: BTreeMap<String, String> = run
+        .job_env
+        .iter()
+        .map(|(name, value)| (name.clone(), needs_only.resolve(value)))
+        .collect();
     env.extend(carried_env.iter().cloned());
     env.extend(
         step.env
@@ -642,6 +966,7 @@ fn step_environment(
     env.insert("GITHUB_ENV".into(), paths.env);
     env.insert("GITHUB_PATH".into(), paths.path);
     env.insert("GITHUB_STEP_SUMMARY".into(), paths.summary);
+    env.insert("GITHUB_OUTPUT".into(), paths.output);
     env.insert("GITHUB_WORKSPACE".into(), paths.workspace);
     env.insert("RUNNER_TEMP".into(), paths.temp);
     env.insert("GITHUB_ACTIONS".into(), "true".into());
@@ -664,6 +989,7 @@ fn step_paths(run: &StepRun<'_>, number: usize, step: &StepSpec) -> StepPaths {
         env: format!("{temp}/env-{number}"),
         path: format!("{temp}/path-{number}"),
         summary: format!("{temp}/summary-{number}"),
+        output: format!("{temp}/output-{number}"),
         workspace,
         temp,
     }
@@ -673,6 +999,7 @@ struct FileCommands {
     env: Vec<(String, String)>,
     path: Vec<String>,
     summary: String,
+    outputs: BTreeMap<String, String>,
 }
 
 /// Run one step to its end. Returns its exit code (`None` when it never
@@ -718,6 +1045,7 @@ async fn execute_step(
         format!("env-{number}"),
         format!("path-{number}"),
         format!("summary-{number}"),
+        format!("output-{number}"),
     ] {
         if let Err(error) = std::fs::write(host(&file), b"") {
             return (
@@ -803,7 +1131,17 @@ async fn execute_step(
             .collect();
         let summary =
             read_file_command(&host(&format!("summary-{number}")), "GITHUB_STEP_SUMMARY")?;
-        Ok(FileCommands { env, path, summary })
+        let written = read_file_command(&host(&format!("output-{number}")), "GITHUB_OUTPUT")?;
+        let outputs = parse_output_file(&written)
+            .map_err(|reason| format!("$GITHUB_OUTPUT {reason}"))?
+            .into_iter()
+            .collect();
+        Ok(FileCommands {
+            env,
+            path,
+            summary,
+            outputs,
+        })
     })();
     (code, log, commands)
 }
@@ -932,17 +1270,47 @@ impl Drop for TempGuard {
 /// it had. The container is removed here on the way out; a caller whose
 /// future is dropped first (a timeout, a cancellation) removes it by name, as
 /// it always has.
+/// What a job of steps leaves for the runner to report: its exit code and log,
+/// as a single-script job's execution does, and its `outputs:`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRun {
+    pub exit_code: i32,
+    pub log: String,
+    pub outputs: BTreeMap<String, String>,
+}
+
+/// The job-level half of a job of steps: what it needs and what it outputs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobContext {
+    /// The id each `needs:` entry is named by in the job's expressions → the
+    /// job it is in the pipeline.
+    #[serde(default)]
+    pub needs: BTreeMap<String, String>,
+    /// The job's `outputs:`: name → template over `steps.*` / `needs.*`.
+    #[serde(default)]
+    pub outputs: BTreeMap<String, String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_job_steps(
     steps: &[StepSpec],
     job_env: &[(String, String)],
     workspace: &Path,
     image: Option<StepsImage<'_>>,
     mask: &(dyn Fn(&str) -> String + Sync),
+    needs: &BTreeMap<String, NeededJob>,
+    outputs: &BTreeMap<String, String>,
     reporter: &mut impl StepReporter,
-) -> (i32, String) {
+) -> JobRun {
+    let failed = |exit_code, log| JobRun {
+        exit_code,
+        log,
+        outputs: BTreeMap::new(),
+    };
     let temp = job_temp_dir(workspace);
     if let Err(error) = std::fs::create_dir_all(&temp) {
-        return (
+        return failed(
             -1,
             format!(
                 "[plombir-git-runner] the job's step directory `{}` could not be created: {error}",
@@ -962,11 +1330,17 @@ pub async fn run_job_steps(
                 backend: StepBackend::Local,
                 mask,
                 minute: MINUTE,
+                needs,
+                outputs,
             },
             reporter,
         )
         .await;
-        return (result.exit_code, result.log);
+        return JobRun {
+            exit_code: result.exit_code,
+            log: result.log,
+            outputs: result.outputs,
+        };
     };
 
     let job = crate::docker_job::JobContainer {
@@ -983,7 +1357,11 @@ pub async fn run_job_steps(
         Ok(container) => container,
         Err(failed) => {
             remove_container(image.program, image.name).await;
-            return (failed.exit_code, mask(&failed.log));
+            return JobRun {
+                exit_code: failed.exit_code,
+                log: mask(&failed.log),
+                outputs: BTreeMap::new(),
+            };
         }
     };
     let result = run_steps(
@@ -999,6 +1377,8 @@ pub async fn run_job_steps(
             },
             mask,
             minute: MINUTE,
+            needs,
+            outputs,
         },
         reporter,
     )
@@ -1012,7 +1392,11 @@ pub async fn run_job_steps(
         push_line(&mut log, &format!("[plombir-git-runner] {notice}"));
     }
     log.push_str(&result.log);
-    (result.exit_code, log)
+    JobRun {
+        exit_code: result.exit_code,
+        log,
+        outputs: result.outputs,
+    }
 }
 
 /// `docker rm -f` a job's container, bounded: a daemon that does not answer
@@ -1104,6 +1488,8 @@ mod tests {
                 backend: StepBackend::Local,
                 mask: &mask,
                 minute,
+                needs: &BTreeMap::new(),
+                outputs: &BTreeMap::new(),
             },
             &mut recorder,
         )
@@ -1429,6 +1815,8 @@ mod tests {
                 },
                 mask: &mask,
                 minute: std::time::Duration::from_secs(2),
+                needs: &BTreeMap::new(),
+                outputs: &BTreeMap::new(),
             },
             &mut recorder,
         )
@@ -1467,6 +1855,194 @@ mod tests {
             result.log
         );
         assert!(begun.elapsed() < std::time::Duration::from_secs(120));
+    }
+
+    async fn run_with(
+        steps: &[StepSpec],
+        needs: &BTreeMap<String, NeededJob>,
+        outputs: &BTreeMap<String, String>,
+        job_env: Vec<(String, String)>,
+    ) -> (StepsResult, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let temp = root.path().join("temp");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&temp).unwrap();
+        let mask = |log: &str| log.replace("hunter2", "***");
+        let result = run_steps(
+            &StepRun {
+                steps,
+                job_env: &job_env,
+                workspace: &workspace,
+                temp: &temp,
+                backend: StepBackend::Local,
+                mask: &mask,
+                minute: MINUTE,
+                needs,
+                outputs,
+            },
+            &mut Silent,
+        )
+        .await;
+        (result, root)
+    }
+
+    fn with_id(mut spec: StepSpec, id: &str) -> StepSpec {
+        spec.id = Some(id.into());
+        spec
+    }
+
+    /// card_5013aa8fca9e: what a step writes to `$GITHUB_OUTPUT` is what a
+    /// later step reads as `steps.<id>.outputs.*` — in its script, its `env:`
+    /// and its `if:` — and the job's own `outputs:` are resolved from them
+    /// after the last step, masked.
+    #[tokio::test]
+    async fn step_outputs_reach_later_steps_and_the_jobs_outputs() {
+        let mut gate = step("Gate", "echo gated-in");
+        gate.condition = Some("steps.version.outputs.channel == 'stable'".into());
+        let mut skipped = step("Skipped", "echo never");
+        skipped.condition = Some("steps.version.outputs.channel == 'nightly'".into());
+        let mut reader = step("Read", "echo \"script=${{ steps.version.outputs.number }}\"\necho \"env=$FROM_ENV\"\necho \"outcome=${{ steps.version.outcome }}\"");
+        reader.env.insert(
+            "FROM_ENV".into(),
+            "${{ steps.version.outputs.notes }}".into(),
+        );
+        let steps = [
+            with_id(
+                step(
+                    "Version",
+                    "echo number=1.2.3 >> \"$GITHUB_OUTPUT\"\necho channel=stable >> \"$GITHUB_OUTPUT\"\nprintf 'notes<<END\\nline one\\nline two\\nEND\\n' >> \"$GITHUB_OUTPUT\"\necho secret=hunter2 >> \"$GITHUB_OUTPUT\"",
+                ),
+                "version",
+            ),
+            reader,
+            gate,
+            skipped,
+        ];
+        let outputs = BTreeMap::from([
+            (
+                "version".to_string(),
+                "v${{ steps.version.outputs.number }}".to_string(),
+            ),
+            (
+                "leak".to_string(),
+                "${{ steps.version.outputs.secret }}".to_string(),
+            ),
+        ]);
+        let (result, _root) = run_with(&steps, &BTreeMap::new(), &outputs, job_env()).await;
+        assert_eq!(result.exit_code, 0, "{}", result.log);
+        let read = &result.steps[1].log;
+        assert!(read.contains("script=1.2.3"), "{read}");
+        assert!(read.contains("env=line one\nline two"), "{read}");
+        assert!(read.contains("outcome=success"), "{read}");
+        assert_eq!(result.steps[2].outcome, StepOutcome::Success);
+        assert_eq!(result.steps[3].outcome, StepOutcome::Skipped);
+        assert_eq!(
+            result.outputs,
+            BTreeMap::from([
+                ("leak".to_string(), "***".to_string()),
+                ("version".to_string(), "v1.2.3".to_string()),
+            ]),
+            "the job's outputs are resolved and masked"
+        );
+    }
+
+    /// What a needed job left is read in a step and in a job variable.
+    #[tokio::test]
+    async fn needs_outputs_reach_the_steps_and_the_job_variables() {
+        let needs = BTreeMap::from([(
+            "build".to_string(),
+            NeededJob {
+                result: "success".into(),
+                outputs: BTreeMap::from([("version".to_string(), "4.5.6".to_string())]),
+            },
+        )]);
+        let mut env = job_env();
+        env.push((
+            "JOB_VERSION".into(),
+            "${{ needs.build.outputs.version }}".into(),
+        ));
+        let mut deploy = step(
+            "Deploy",
+            "echo \"step=${{ needs.build.outputs.version }} job=$JOB_VERSION result=${{ needs.build.result }}\"",
+        );
+        deploy.condition = Some("needs.build.result == 'success'".into());
+        let (result, _root) = run_with(&[deploy], &needs, &BTreeMap::new(), env).await;
+        assert!(
+            result.steps[0]
+                .log
+                .contains("step=4.5.6 job=4.5.6 result=success"),
+            "{}",
+            result.log
+        );
+    }
+
+    /// An output that takes the job past its 1 MiB fails the step that wrote
+    /// it, naming the key — it is refused, never cut.
+    #[tokio::test]
+    async fn outputs_past_the_budget_fail_the_step_by_name() {
+        let steps = [
+            with_id(step("Half", "head -c 600000 /dev/zero | tr '\\0' a | sed 's/^/first=/' >> \"$GITHUB_OUTPUT\"; echo >> \"$GITHUB_OUTPUT\""), "half"),
+            with_id(step("Over", "head -c 600000 /dev/zero | tr '\\0' b | sed 's/^/second=/' >> \"$GITHUB_OUTPUT\"; echo >> \"$GITHUB_OUTPUT\""), "over"),
+        ];
+        let (result, _root) = run_with(&steps, &BTreeMap::new(), &BTreeMap::new(), job_env()).await;
+        assert_eq!(
+            result.steps[0].outcome,
+            StepOutcome::Success,
+            "{}",
+            result.log
+        );
+        assert_eq!(result.steps[1].outcome, StepOutcome::Failure);
+        assert!(
+            result.steps[1]
+                .log
+                .contains("$GITHUB_OUTPUT `second` takes the job's outputs past"),
+            "{}",
+            result.steps[1].log
+        );
+    }
+
+    /// `::set-output` is the workflow command GitHub disabled; a step that
+    /// prints one fails saying so instead of setting nothing silently.
+    #[tokio::test]
+    async fn the_set_output_command_fails_its_step_by_name() {
+        let (result, _root) = run_with(
+            &[step("Old", "echo '::set-output name=version::1.0'")],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            job_env(),
+        )
+        .await;
+        assert_eq!(result.steps[0].outcome, StepOutcome::Failure);
+        assert!(
+            result.steps[0].log.contains("$GITHUB_OUTPUT instead"),
+            "{}",
+            result.log
+        );
+    }
+
+    #[test]
+    fn runtime_keys_are_read_by_their_github_spelling() {
+        assert_eq!(
+            RuntimeKey::parse("steps.my-step.outputs.my_value"),
+            Some(RuntimeKey::StepOutput {
+                step: "my-step".into(),
+                name: "my_value".into()
+            })
+        );
+        assert_eq!(
+            RuntimeKey::parse("needs.build.result"),
+            Some(RuntimeKey::NeedsResult("build".into()))
+        );
+        for not_runtime in [
+            "steps.x",
+            "steps.1x.outcome",
+            "needs.a.outputs",
+            "env.X",
+            "steps.x.outputs.a.b",
+        ] {
+            assert_eq!(RuntimeKey::parse(not_runtime), None, "{not_runtime}");
+        }
     }
 
     #[test]

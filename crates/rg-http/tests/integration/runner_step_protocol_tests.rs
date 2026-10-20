@@ -535,3 +535,257 @@ async fn the_external_runner_runs_and_reports_each_step() {
         "{log}"
     );
 }
+
+/// card_5013aa8fca9e: a job of steps hands its resolved `outputs:` over with
+/// its finish. The server masks them like a log before any job that needs
+/// this one can read them, refuses more than a job may leave by size rather
+/// than storing them cut, and takes a full MiB even when JSON escaping makes
+/// the body six times that.
+#[tokio::test]
+async fn a_finished_job_leaves_its_outputs_masked_and_bounded() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed(&base, &db, "outputs").await;
+    let job_id = job(&db, seeded.stage_id, "build", &["Version"]).await;
+    rg_db::ops::pipeline_step_ops::set_job_context(
+        &db,
+        job_id,
+        r#"{"needs":{},"outputs":{"version":"${{ steps.v.outputs.version }}"}}"#,
+    )
+    .await
+    .unwrap();
+    let polled = poll(&base, &seeded, Some("2"))
+        .await
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        polled["outputs"],
+        serde_json::json!({ "version": "${{ steps.v.outputs.version }}" }),
+        "the runner is told what to resolve: {polled}"
+    );
+    assert_eq!(polled["needs"], serde_json::json!({}));
+    let job_token = polled["variables"]["CI_JOB_TOKEN"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let client = reqwest::Client::new();
+    let runner = |path: &str| {
+        format!(
+            "{base}/api/v1/runners/{}/jobs/{job_id}/{path}",
+            seeded.runner_id
+        )
+    };
+    let started = client
+        .post(runner("start"))
+        .bearer_auth(&seeded.runner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+
+    let finish = |outputs: serde_json::Value| {
+        client
+            .post(runner("finish"))
+            .bearer_auth(&seeded.runner_token)
+            .json(&serde_json::json!({ "status": "success", "exit_code": 0, "outputs": outputs }))
+            .send()
+    };
+    let limit = rg_core::ci::MAX_JOB_OUTPUT_BYTES;
+    let over = finish(serde_json::json!({ "big": "a".repeat(limit) }))
+        .await
+        .unwrap();
+    assert_eq!(over.status(), StatusCode::BAD_REQUEST);
+    assert!(over.text().await.unwrap().contains("more than the 1048576"));
+    let still = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still.status, "running", "a refused finish settles nothing");
+    assert_eq!(still.outputs, None);
+
+    // A control character travels as `\u0001`, six bytes of JSON for one of
+    // output: the body is past Axum's 2 MiB default, the output within 1 MiB.
+    let controls = "\u{1}".repeat(limit - 4096);
+    let done = finish(serde_json::json!({
+        "version": "1.2.3",
+        "token": format!("t={job_token}"),
+        "controls": controls,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(
+        done.status(),
+        StatusCode::OK,
+        "{}",
+        done.text().await.unwrap_or_default()
+    );
+    let stored = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "success");
+    let outputs: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(stored.outputs.as_deref().expect("outputs stored")).unwrap();
+    assert_eq!(outputs["version"], "1.2.3");
+    assert_eq!(outputs["controls"], controls);
+    assert!(outputs["token"].starts_with("t="));
+    assert!(
+        !outputs["token"].contains(&job_token),
+        "an output is masked like a log: {}",
+        outputs["token"]
+    );
+}
+
+/// The card's acceptance through the real external runner: job A writes
+/// `version=1.2.3` to `$GITHUB_OUTPUT`, and job B, a stage later and needing
+/// A, reads `${{ needs.A.outputs.version }}` in its step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_external_runner_hands_a_jobs_outputs_to_the_job_that_needs_it() {
+    use sea_orm::ConnectionTrait;
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let owner = "outputs-runner";
+    let (token, _) = register_full(&base, owner, &format!("{owner}@example.com")).await;
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"name":"outputs","auto_init":true,"readme":"default"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let repo_id = created.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let sha = client
+        .get(format!("{base}/api/v1/repos/{owner}/outputs/log"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["commits"][0]["sha"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo_id,
+        &sha,
+        "refs/heads/main",
+        "push",
+        None,
+    )
+    .await
+    .unwrap();
+    // Process-unique ids keep a sibling test process out of these jobs'
+    // workspaces (see `the_external_runner_runs_and_reports_each_step`).
+    let base_id = 3_000_000 + 2 * i64::from(std::process::id());
+    let mut ids = Vec::new();
+    for (position, (name, steps, context)) in [
+        (
+            "A",
+            serde_json::json!([{ "name": "Version", "id": "v", "run": "echo version=1.2.3 >> \"$GITHUB_OUTPUT\"" }]),
+            serde_json::json!({ "outputs": { "version": "${{ steps.v.outputs.version }}" } }),
+        ),
+        (
+            "B",
+            serde_json::json!([{ "name": "Use", "run": "echo \"got=${{ needs.A.outputs.version }} result=${{ needs.A.result }}\"" }]),
+            serde_json::json!({ "needs": { "A": "A" } }),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, name, position as i32)
+            .await
+            .unwrap();
+        let created = rg_db::ops::pipeline_ops::create_job(
+            &db, stage.id, name, "echo flat", None, None, None, None, None, None, false, None,
+            None, None,
+        )
+        .await
+        .unwrap();
+        let job_id = base_id + position as i64;
+        db.execute_unprepared(&format!(
+            "UPDATE pipeline_jobs SET id = {job_id} WHERE id = {}",
+            created.id
+        ))
+        .await
+        .unwrap();
+        rg_db::ops::pipeline_step_ops::create_job_steps(
+            &db,
+            job_id,
+            &steps.to_string(),
+            &[steps[0]["name"].as_str().unwrap().to_string()],
+        )
+        .await
+        .unwrap();
+        rg_db::ops::pipeline_step_ops::set_job_context(&db, job_id, &context.to_string())
+            .await
+            .unwrap();
+        ids.push(job_id);
+    }
+
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo_id,
+        "outputs-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let agent = tokio::spawn(rg_runner::run_jobs_until_shutdown_checking_every(
+        reqwest::Client::new(),
+        base.clone(),
+        runner.id,
+        runner_token,
+        rg_runner::JobLimits::default(),
+        async {
+            drop(stopped.await);
+        },
+        std::time::Duration::from_millis(200),
+    ));
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    let b = loop {
+        let b = rg_db::ops::pipeline_ops::get_job(&db, ids[1])
+            .await
+            .unwrap()
+            .unwrap();
+        if !rg_db::ops::pipeline_ops::is_active_pipeline_work(&b.status) {
+            break b;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "job B never ended: {}",
+            b.status
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), agent)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let a = rg_db::ops::pipeline_ops::get_job(&db, ids[0])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.status, "success", "{:?}", a.log);
+    assert_eq!(a.outputs.as_deref(), Some(r#"{"version":"1.2.3"}"#));
+    assert_eq!(b.status, "success", "{:?}", b.log);
+    let used = rg_db::ops::pipeline_step_ops::find_job_step(&db, ids[1], 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let log = used.log.unwrap_or_default();
+    assert!(log.contains("got=1.2.3 result=success"), "{log}");
+}

@@ -666,6 +666,11 @@ pub struct GiteaJob {
 
     /// Matrix expansion compatible with `strategy.matrix`.
     pub strategy: Option<GiteaStrategy>,
+
+    /// What the job leaves for the jobs that `needs:` it: name → an
+    /// expression over its steps' outputs, read after its last step.
+    #[serde(default)]
+    pub outputs: HashMap<String, String>,
 }
 
 /// The two `runs-on` forms Plombir Git can preserve without weakening runner
@@ -978,7 +983,12 @@ fn context_member<'a>(key: &'a str, context: &str) -> Option<&'a str> {
 }
 
 fn supported_run_expression(key: &str) -> bool {
-    GITHUB_RUN_EXPRESSIONS
+    // `steps.*` / `needs.*` have a value only between two steps; they are
+    // carried to the runner verbatim, and whether each names a step or a job
+    // that exists where it is used is `unresolvable_runtime_references`'s
+    // question.
+    rg_process::ci_steps::RuntimeKey::parse(key).is_some()
+        || GITHUB_RUN_EXPRESSIONS
         .iter()
         .any(|(supported, _)| key == *supported)
         // `vars.*` is deliberately absent. Plombir Git has no repository,
@@ -1165,6 +1175,274 @@ fn unsupported_run_expression_sites(workflow: &GiteaWorkflow) -> Vec<String> {
     }
 
     unsupported
+}
+
+/// The `steps.*` / `needs.*` names a condition reads, outside its quoted
+/// strings. A condition is an expression of its own rather than text with
+/// `${{ }}` in it, so the names are read off its identifiers.
+fn runtime_names_in_condition(condition: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for ch in condition.chars() {
+        if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-') {
+            current.push(ch);
+        } else if !current.is_empty() {
+            names.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        names.push(current);
+    }
+    names
+        .into_iter()
+        .filter(|name| rg_process::ci_steps::RuntimeKey::parse(name).is_some())
+        .collect()
+}
+
+/// The id each `needs:` entry of `job` is named by in its own expressions →
+/// the job's name in `workflow.jobs`.
+///
+/// A job of an expanded reusable workflow is named `caller/child`, and its
+/// `needs:` were rewritten to `caller/sibling` — but the file it came from
+/// spells the sibling `needs.sibling`. The prefix is the caller's, so it is
+/// taken off again for the alias.
+fn needs_aliases(job_name: &str, job: &GiteaJob) -> std::collections::BTreeMap<String, String> {
+    let prefix = job_name
+        .rsplit_once('/')
+        .map(|(prefix, _)| format!("{prefix}/"));
+    job.needs
+        .iter()
+        .flatten()
+        .map(|dependency| {
+            let alias = prefix
+                .as_deref()
+                .and_then(|prefix| dependency.strip_prefix(prefix))
+                .unwrap_or(dependency);
+            (alias.to_string(), dependency.clone())
+        })
+        .collect()
+}
+
+/// `steps.*` and `needs.*` name a step or a job, and the name has to exist
+/// where it is read — a reference to one that does not is refused by its
+/// name here, rather than read as the empty string at run time (which is what
+/// GitHub's own runner would hand the step, silently).
+///
+/// - `steps.<id>` reads a step of the same job that ran before this one; a
+///   job's `outputs:` may read any of its steps.
+/// - `needs.<id>` reads a job this one lists under `needs:`.
+/// - Neither has a value in a workflow or job variable, a working-directory
+///   default, or the inputs of a natively implemented action, which are all
+///   decided before any step runs — except that a job variable may read what
+///   a needed job left.
+fn unresolvable_runtime_references(workflow: &GiteaWorkflow) -> Vec<String> {
+    use rg_process::ci_steps::RuntimeKey;
+    let keys = |text: &str| {
+        workflow_expressions(text)
+            .into_iter()
+            .filter_map(|key| RuntimeKey::parse(&key).map(|parsed| (key, parsed)))
+            .collect::<Vec<_>>()
+    };
+    let mut problems = Vec::new();
+    let nowhere = |site: String, text: &str, problems: &mut Vec<String>| {
+        for (key, _) in keys(text) {
+            problems.push(format!(
+                "{site} expression `{key}`: nothing has run when this is read, so no step or \
+                 needed job has a value for it"
+            ));
+        }
+    };
+    for (name, value) in &workflow.env {
+        nowhere(format!("env.{name}"), value, &mut problems);
+    }
+    if let Some(directory) = workflow
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.run.as_ref())
+        .and_then(|run| run.working_directory.as_deref())
+    {
+        nowhere(
+            "defaults.run.working-directory".into(),
+            directory,
+            &mut problems,
+        );
+    }
+
+    for (job_name, job) in &workflow.jobs {
+        let needs = needs_aliases(job_name, job);
+        let declared_ids = job
+            .steps
+            .iter()
+            .filter_map(|step| step.id.as_deref())
+            .collect::<std::collections::HashSet<_>>();
+        let needed = |site: &str, key: &str, parsed: &RuntimeKey| -> Option<String> {
+            let (RuntimeKey::NeedsOutput { job: needed, .. } | RuntimeKey::NeedsResult(needed)) =
+                parsed
+            else {
+                return None;
+            };
+            (!needs.contains_key(needed)).then(|| {
+                let listed = if needs.is_empty() {
+                    "it needs no job".to_string()
+                } else {
+                    format!(
+                        "it needs {}",
+                        needs.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )
+                };
+                format!(
+                    "{site} expression `{key}`: `{needed}` is not a job this job needs — {listed}"
+                )
+            })
+        };
+        let step_ref = |parsed: &RuntimeKey| match parsed {
+            RuntimeKey::StepOutput { step, .. }
+            | RuntimeKey::StepOutcome(step)
+            | RuntimeKey::StepConclusion(step) => Some(step.clone()),
+            _ => None,
+        };
+
+        let job_level = |site: String, text: &str, problems: &mut Vec<String>| {
+            for (key, parsed) in keys(text) {
+                if step_ref(&parsed).is_some() {
+                    problems.push(format!(
+                        "{site} expression `{key}`: a job variable is set before the job's first \
+                         step runs"
+                    ));
+                } else if let Some(problem) = needed(&site, &key, &parsed) {
+                    problems.push(problem);
+                }
+            }
+        };
+        for (name, value) in &job.env {
+            job_level(format!("{job_name}: env.{name}"), value, &mut problems);
+        }
+        if let Some(container) = &job.container {
+            for (name, value) in &container.env {
+                job_level(
+                    format!("{job_name}: container.env.{name}"),
+                    value,
+                    &mut problems,
+                );
+            }
+        }
+        if let Some(directory) = job
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.run.as_ref())
+            .and_then(|run| run.working_directory.as_deref())
+        {
+            nowhere(
+                format!("{job_name}: defaults.run.working-directory"),
+                directory,
+                &mut problems,
+            );
+        }
+
+        let mut earlier = std::collections::HashSet::new();
+        for (index, step) in job.steps.iter().enumerate() {
+            let site = format!("{job_name}: step {}", index + 1);
+            if step
+                .run
+                .as_deref()
+                .is_some_and(|run| run.contains("::set-output"))
+            {
+                problems.push(format!(
+                    "{site} run uses the `::set-output` workflow command, which GitHub disabled; \
+                     write `name=value` to $GITHUB_OUTPUT instead"
+                ));
+            }
+            if step.uses.is_some() {
+                for (input, value) in &step.with {
+                    nowhere(format!("{site} with.{input}"), value, &mut problems);
+                }
+            }
+            let mut texts = Vec::new();
+            if let Some(run) = &step.run {
+                texts.push(("run".to_string(), keys(run)));
+            }
+            for (name, value) in &step.env {
+                texts.push((format!("env.{name}"), keys(value)));
+            }
+            if let Some(directory) = &step.working_directory {
+                texts.push(("working-directory".to_string(), keys(directory)));
+            }
+            if let Some(condition) = &step.condition {
+                texts.push((
+                    "if".to_string(),
+                    runtime_names_in_condition(condition)
+                        .into_iter()
+                        .filter_map(|key| RuntimeKey::parse(&key).map(|parsed| (key, parsed)))
+                        .collect(),
+                ));
+            }
+            for (field, found) in texts {
+                for (key, parsed) in found {
+                    let at = format!("{site} {field}");
+                    if let Some(id) = step_ref(&parsed) {
+                        if !earlier.contains(id.as_str()) {
+                            let why = if declared_ids.contains(id.as_str()) {
+                                "only a step that ran before this one has a value"
+                            } else {
+                                "no step of this job has that id"
+                            };
+                            problems.push(format!("{at} expression `{key}`: `{id}` — {why}"));
+                        }
+                    } else if let Some(problem) = needed(&at, &key, &parsed) {
+                        problems.push(problem);
+                    }
+                }
+            }
+            if let Some(id) = step.id.as_deref() {
+                earlier.insert(id);
+            }
+        }
+
+        let mut names = job.outputs.keys().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            let site = format!("{job_name}: outputs.{name}");
+            if !rg_process::ci_steps::valid_runtime_name(name) {
+                problems.push(format!(
+                    "{site}: an output name is a letter or `_`, then letters, digits, `-` and `_`"
+                ));
+            }
+            let value = &job.outputs[name];
+            for key in workflow_expressions(value) {
+                match RuntimeKey::parse(&key) {
+                    Some(parsed) => {
+                        if let Some(id) = step_ref(&parsed) {
+                            if !declared_ids.contains(id.as_str()) {
+                                problems.push(format!(
+                                    "{site} expression `{key}`: no step of this job has the id `{id}`"
+                                ));
+                            }
+                        } else if let Some(problem) = needed(&site, &key, &parsed) {
+                            problems.push(problem);
+                        }
+                    }
+                    None if context_member(&key, "env").is_some() => {}
+                    None => problems.push(format!(
+                        "{site} expression `{key}`: a job output reads `steps.*`, `needs.*` and \
+                         `env.*`"
+                    )),
+                }
+            }
+        }
+    }
+    problems.sort();
+    problems
 }
 
 /// Expressions in job fields resolved before a runner starts.
@@ -2058,6 +2336,7 @@ impl GiteaWorkflow {
         }));
         unsupported.extend(unsupported_run_expression_sites(self));
         unsupported.extend(unsupported_job_field_expression_sites(self));
+        unsupported.extend(unresolvable_runtime_references(self));
 
         if unsupported.is_empty() {
             Ok(())
@@ -2270,6 +2549,21 @@ impl GiteaWorkflow {
                 artifacts,
                 steps,
             } = self.build_job_script(name, job, ctx);
+            // What the job's steps read of the jobs it needs, and what it
+            // leaves for the jobs that need it.
+            let job_context = rg_process::ci_steps::JobContext {
+                needs: needs_aliases(name, job),
+                outputs: job
+                    .outputs
+                    .iter()
+                    .map(|(output, value)| {
+                        (
+                            output.clone(),
+                            substitute_expr(value, name, &self.env, &job_vars, None),
+                        )
+                    })
+                    .collect(),
+            };
             let (image, image_template) = split_action_template(
                 job.container
                     .as_ref()
@@ -2332,6 +2626,7 @@ impl GiteaWorkflow {
                     artifacts,
                     action_templates,
                     steps: Some(steps),
+                    job_context: Some(job_context),
                 },
             );
         }
@@ -3800,6 +4095,10 @@ fn substitute_expr(
     step_env: Option<&HashMap<String, String>>,
 ) -> String {
     expand_expressions(input, |key| {
+        if rg_process::ci_steps::RuntimeKey::parse(key).is_some() {
+            // Left for the runner, which substitutes it between steps.
+            return Some(format!("${{{{ {key} }}}}"));
+        }
         if let Some((_, replacement)) = GITHUB_RUN_EXPRESSIONS
             .iter()
             .find(|(supported, _)| key == *supported)
@@ -5735,6 +6034,131 @@ jobs:
         assert!(
             native.jobs["build"].steps.is_none(),
             "a native job runs its script as one program"
+        );
+    }
+
+    /// card_5013aa8fca9e: a `steps.*` / `needs.*` reference names a step or a
+    /// job, and one that names nothing is refused by that name at parse time —
+    /// GitHub would hand the step an empty string instead.
+    #[test]
+    fn runtime_references_must_name_a_step_or_job_that_has_a_value() {
+        for (jobs, named) in [
+            (
+                "  build:\n    steps:\n      - run: echo ${{ steps.versoin.outputs.number }}\n      - id: version\n        run: echo number=1 >> $GITHUB_OUTPUT\n",
+                "build: step 1 run expression `steps.versoin.outputs.number`: `versoin` — no step of this job has that id",
+            ),
+            (
+                "  build:\n    steps:\n      - run: echo ${{ steps.version.outputs.number }}\n      - id: version\n        run: echo number=1 >> $GITHUB_OUTPUT\n",
+                "`version` — only a step that ran before this one has a value",
+            ),
+            (
+                "  build:\n    steps:\n      - run: echo ok\n        if: steps.gone.outcome == 'success'\n",
+                "build: step 1 if expression `steps.gone.outcome`",
+            ),
+            (
+                "  build:\n    steps:\n      - run: echo ${{ needs.lint.outputs.ok }}\n",
+                "`lint` is not a job this job needs — it needs no job",
+            ),
+            (
+                "  lint:\n    steps:\n      - run: echo ok\n  build:\n    needs: lint\n    steps:\n      - run: echo ${{ needs.test.result }}\n",
+                "`test` is not a job this job needs — it needs lint",
+            ),
+            (
+                "  build:\n    env:\n      V: ${{ steps.version.outputs.number }}\n    steps:\n      - id: version\n        run: echo number=1 >> $GITHUB_OUTPUT\n",
+                "build: env.V expression `steps.version.outputs.number`: a job variable is set before the job's first step runs",
+            ),
+            (
+                "  build:\n    outputs:\n      version: ${{ steps.nope.outputs.number }}\n    steps:\n      - run: echo ok\n",
+                "build: outputs.version expression `steps.nope.outputs.number`: no step of this job has the id `nope`",
+            ),
+            (
+                "  build:\n    outputs:\n      version: ${{ github.sha }}\n    steps:\n      - run: echo ok\n",
+                "a job output reads `steps.*`, `needs.*` and `env.*`",
+            ),
+            (
+                "  lint:\n    steps:\n      - run: echo ok\n  build:\n    needs: lint\n    if: needs.lint.result == 'success'\n    steps:\n      - run: echo ok\n",
+                "needs.lint.result",
+            ),
+            (
+                "  lint:\n    steps:\n      - run: echo ok\n  build:\n    needs: lint\n    runs-on: ${{ needs.lint.outputs.os }}\n    steps:\n      - run: echo ok\n",
+                "runs-on expression `needs.lint.outputs.os`",
+            ),
+            (
+                "  build:\n    steps:\n      - run: echo \"::set-output name=v::1\"\n",
+                "build: step 1 run uses the `::set-output` workflow command",
+            ),
+        ] {
+            let yaml = format!("on: push\njobs:\n{jobs}");
+            let error = format!(
+                "{:#}",
+                GiteaWorkflow::parse(&yaml)
+                    .unwrap()
+                    .validate_supported_actions()
+                    .expect_err(&format!("`{jobs}` must be refused"))
+            );
+            assert!(error.contains(named), "`{jobs}`: expected `{named}` in: {error}");
+        }
+        let error = format!(
+            "{:#}",
+            GiteaWorkflow::parse("on: push\nenv:\n  V: ${{ needs.a.result }}\njobs:\n  a:\n    steps:\n      - run: echo ok\n")
+                .unwrap()
+                .validate_supported_actions()
+                .expect_err("a workflow variable is set before anything ran")
+        );
+        assert!(
+            error.contains("env.V expression `needs.a.result`: nothing has run"),
+            "{error}"
+        );
+    }
+
+    /// What a job's steps and its `outputs:` read stays a `${{ }}` the runner
+    /// fills in, and the job carries the map from the ids it reads `needs.*`
+    /// by to the jobs those name.
+    #[test]
+    fn outputs_and_needs_travel_to_the_runner_unresolved() {
+        let workflow = GiteaWorkflow::parse(
+            "on: push\nenv:\n  PREFIX: v\njobs:\n  build:\n    outputs:\n      version: ${{ env.PREFIX }}${{ steps.version.outputs.number }}\n    steps:\n      - id: version\n        run: echo number=1.2.3 >> \"$GITHUB_OUTPUT\"\n      - run: echo ${{ steps.version.outputs.number }}\n        if: steps.version.outputs.number != ''\n  deploy:\n    needs: build\n    env:\n      VERSION: ${{ needs.build.outputs.version }}\n    steps:\n      - run: echo ${{ needs.build.outputs.version }} ${{ needs.build.result }}\n",
+        )
+        .unwrap();
+        workflow.validate_supported_actions().unwrap();
+        let config = workflow.to_ci_config(&test_context());
+
+        let build = &config.jobs["build"];
+        let steps = build.steps.as_ref().unwrap();
+        assert_eq!(steps[1].run, "echo ${{ steps.version.outputs.number }}");
+        assert_eq!(
+            steps[1].condition.as_deref(),
+            Some("steps.version.outputs.number != ''")
+        );
+        let context = build
+            .job_context
+            .as_ref()
+            .expect("an Actions job has a context");
+        assert_eq!(
+            context.outputs.get("version").map(String::as_str),
+            Some("v${{ steps.version.outputs.number }}"),
+            "env is the workflow's, the step output the runner's"
+        );
+        assert!(context.needs.is_empty());
+
+        let deploy = &config.jobs["deploy"];
+        let context = deploy.job_context.as_ref().unwrap();
+        assert_eq!(
+            context.needs,
+            std::collections::BTreeMap::from([("build".to_string(), "build".to_string())])
+        );
+        assert_eq!(
+            deploy.steps.as_ref().unwrap()[0].run,
+            "echo ${{ needs.build.outputs.version }} ${{ needs.build.result }}"
+        );
+        assert_eq!(
+            deploy
+                .variables
+                .as_ref()
+                .and_then(|v| v.get("VERSION"))
+                .map(String::as_str),
+            Some("${{ needs.build.outputs.version }}"),
+            "a job variable reads a needed job's outputs when the job starts"
         );
     }
 

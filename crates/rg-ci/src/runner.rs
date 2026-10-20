@@ -884,6 +884,7 @@ impl PipelineRunner {
                 job.timeout_seconds,
                 job.tags.as_deref(),
                 job.steps.as_deref(),
+                job.job_context.as_deref(),
             )
             .await;
 
@@ -1048,6 +1049,7 @@ impl PipelineRunner {
         timeout_seconds: Option<i64>,
         tags: Option<&str>,
         steps: Option<&str>,
+        job_context: Option<&str>,
     ) -> Result<Option<(i32, String)>> {
         // Asked before the row is marked running, and before a token or a cache
         // is spent on it: a job whose labels this runner does not carry is not
@@ -1206,11 +1208,24 @@ impl PipelineRunner {
                     .context("the job's stored steps cannot be read")
             })
             .transpose()?;
+        let job_context = job_context
+            .map(|json| {
+                serde_json::from_str::<rg_process::ci_steps::JobContext>(json)
+                    .context("the job's stored context cannot be read")
+            })
+            .transpose()?
+            .unwrap_or_default();
         let exec_future = async {
             if let Some(steps) = &steps {
-                Ok(self
-                    .run_job_steps(job_id, steps, image, &job_environment, &secret_values)
-                    .await)
+                self.run_job_steps(
+                    job_id,
+                    steps,
+                    &job_context,
+                    image,
+                    &job_environment,
+                    &secret_values,
+                )
+                .await
             } else if let Some(img) = image {
                 self.run_job_docker(job_id, script, img, &job_environment)
                     .await
@@ -1374,10 +1389,30 @@ impl PipelineRunner {
         &self,
         job_id: i64,
         steps: &[rg_process::ci_steps::StepSpec],
+        job_context: &rg_process::ci_steps::JobContext,
         image: Option<&str>,
         job_environment: &[(String, String)],
         secret_values: &[String],
-    ) -> (i32, String) {
+    ) -> Result<(i32, String)> {
+        // What the jobs it needs left — they ran in earlier stages, so their
+        // rows are settled by now.
+        let needs = rg_db::ops::pipeline_step_ops::needs_context(
+            &self.db,
+            self.pipeline_id,
+            &job_context.needs,
+        )
+        .await?
+        .into_iter()
+        .map(|(alias, needed)| {
+            (
+                alias,
+                rg_process::ci_steps::NeededJob {
+                    result: needed.result,
+                    outputs: needed.outputs,
+                },
+            )
+        })
+        .collect();
         if let Err(error) =
             rg_db::ops::pipeline_step_ops::reset_job_steps(&self.db_write, job_id).await
         {
@@ -1400,15 +1435,26 @@ impl PipelineRunner {
             db: &self.db_write,
             job_id,
         };
-        rg_process::ci_steps::run_job_steps(
+        let run = rg_process::ci_steps::run_job_steps(
             steps,
             job_environment,
             &self.workspace_path(),
             image,
             &mask,
+            &needs,
+            &job_context.outputs,
             &mut reporter,
         )
-        .await
+        .await;
+        // A job's outputs are what the jobs after it read, and only a job that
+        // succeeded leaves them — the needing jobs never start otherwise.
+        if run.exit_code == 0 && !job_context.outputs.is_empty() {
+            let outputs =
+                serde_json::to_string(&run.outputs).context("serialize the job's outputs")?;
+            rg_db::ops::pipeline_step_ops::record_job_outputs(&self.db_write, job_id, &outputs)
+                .await?;
+        }
+        Ok((run.exit_code, run.log))
     }
 
     /// Execute script locally via platform-appropriate shell.
@@ -4608,6 +4654,7 @@ esac
                 job.cache_paths.as_deref(),
                 job.artifacts.as_deref(),
                 job.timeout_seconds,
+                None,
                 None,
                 None,
             )

@@ -6285,6 +6285,53 @@ async fn pipeline_job_steps_are_portable() {
     );
     assert!(one.started_at.is_some() && one.finished_at.is_some());
 
+    // card_5013aa8fca9e: a job's context and outputs, past what `TEXT` holds
+    // on MySQL, and how a job that needs it reads them.
+    let context = serde_json::json!({ "outputs": { "big": big_log } }).to_string();
+    pipeline_step_ops::set_job_context(&db, job.id, &context)
+        .await
+        .unwrap();
+    let outputs = serde_json::json!({ "big": big_log, "version": "1.2.3" }).to_string();
+    assert!(
+        pipeline_step_ops::record_job_outputs(&db, job.id, &outputs)
+            .await
+            .unwrap(),
+        "a running job records its outputs"
+    );
+    let stored = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.job_context.as_deref(), Some(context.as_str()));
+    assert_eq!(stored.outputs.as_deref(), Some(outputs.as_str()));
+    rg_db::ops::pipeline_ops::update_job_result(
+        &db,
+        job.id,
+        "success",
+        Some(0),
+        None,
+        None,
+        Some(chrono::Utc::now().naive_utc()),
+    )
+    .await
+    .unwrap();
+    let needs = pipeline_step_ops::needs_context(
+        &db,
+        pipeline.id,
+        &std::collections::BTreeMap::from([("b".to_string(), "build".to_string())]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(needs["b"].result, "success");
+    assert_eq!(needs["b"].outputs["version"], "1.2.3");
+    assert_eq!(needs["b"].outputs["big"].len(), big_log.len());
+    assert!(
+        !pipeline_step_ops::record_job_outputs(&db, job.id, "{}")
+            .await
+            .unwrap(),
+        "a finished job's outputs are settled"
+    );
+
     pipeline_step_ops::reset_job_steps(&db, job.id)
         .await
         .unwrap();
@@ -6293,4 +6340,12 @@ async fn pipeline_job_steps_are_portable() {
         .unwrap()
         .unwrap();
     assert_eq!((one.status.as_str(), one.log), ("pending", None));
+    let rerun = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rerun.outputs, None,
+        "the outputs of the previous run are not the next run's"
+    );
 }

@@ -7,8 +7,10 @@ Reaching for GitHub's own documentation instead will mislead you, which is why
 this page exists rather than a link. There is no Actions runtime here: a job is
 a shell script the runner executes in a worktree of your repository, so the
 parts of Actions that are *the runtime* — the marketplace, `actions/*` beyond
-two special cases, step outputs, composite actions, service containers — have
-nothing to map onto and are refused.
+three special cases, composite actions, service containers — have nothing to
+map onto and are refused. Steps, their outputs and the outputs one job hands
+to the jobs that need it are implemented by the runner itself; see
+[Steps](#steps) and [Outputs](#outputs).
 
 **Refusals are loud and whole-file.** Every block below carries a closed schema.
 An unknown key, an unrunnable trigger, an action this engine does not implement
@@ -141,8 +143,8 @@ jobs:
 | `env` | map string→string | Variables every job inherits. |
 | `defaults` | block | `run:` defaults every job inherits. See [Defaults](#defaults). |
 
-Anything else at the root — `permissions`, `run-name`, `jobs.<id>.outputs`, and
-the rest of the Actions vocabulary — is an unknown key and fails the file.
+Anything else at the root — `permissions`, `run-name` and the rest of the
+Actions vocabulary — is an unknown key and fails the file.
 
 ## `on:` — triggers
 
@@ -490,6 +492,7 @@ quietly win.
 | `environment` | string or `{ name: … }` | A deployment environment **the repository already has**; a protected one holds the job for approval, and only jobs that declare it read its [secrets](ci.md#secrets-and-workload-identity). |
 | `timeout-minutes` | integer | Per-job timeout. Converted to seconds, and the result must land in `1`–`86400` — so `1`–`1440` minutes. |
 | `continue-on-error` | bool | A failure of this job does not fail the pipeline. |
+| `outputs` | map string→string | What the job leaves for the jobs that need it, read from its steps after the last one. See [Outputs](#outputs). |
 | `uses` / `with` / `secrets` | — | Reusable workflow invocation. See [Reusable workflows](#reusable-workflows). |
 
 `needs:` must name jobs this workflow declares, and the graph must be acyclic.
@@ -512,14 +515,15 @@ parentheses, single-quoted strings, and `startsWith` / `endsWith` / `contains` /
 A **job**'s `if:` is evaluated once, when the pipeline is built, and may also
 read `matrix.NAME`; `success()` is the only status function it has, and it is
 always true there. A **step**'s `if:` is read by the runner between steps — see
-[Steps](#steps) — so it has all four status functions and no `matrix.`.
+[Steps](#steps) — so it has all four status functions and no `matrix.`, and
+reads `steps.*` and `needs.*` ([Outputs](#outputs)), which a job's `if:` cannot.
 
 ## Steps
 
 | Key | Type | Meaning |
 |-----|------|---------|
 | `name` | string | Label for the step. Without one, the step is called `Run` and the first line of its `run:`, as on GitHub. |
-| `id` | string | The step's id: a letter or `_`, then letters, digits, `-` and `_`. Unique in the job. |
+| `id` | string | The step's id: a letter or `_`, then letters, digits, `-` and `_`. Unique in the job. Later steps read what it left as `steps.<id>.*` — see [Outputs](#outputs). |
 | `run` | string | The script. |
 | `shell` | string | `bash`, `sh`, `python`, `pwsh`, or a command line of your own with `{0}` where the script goes. Requires `run:`. |
 | `uses` | string | One of exactly three actions. See [Actions](#actions). |
@@ -574,6 +578,8 @@ defines:
   `$GITHUB_PATH`.
 - `$GITHUB_PATH` — each line is a directory put in front of `PATH` for every
   later step.
+- `$GITHUB_OUTPUT` — `name=value` lines, or the same `name<<DELIMITER` form,
+  become the step's outputs. See [Outputs](#outputs).
 - `$GITHUB_STEP_SUMMARY` — Markdown appended to the step's own log.
 
 `GITHUB_WORKSPACE`, `RUNNER_TEMP` and `GITHUB_ACTIONS=true` are set as on
@@ -608,6 +614,69 @@ built before the step model would run a job's steps as one script and drop
 every step policy, so the server never hands it a job of steps: its poll is
 answered `426` naming the job, and the job waits for an upgraded runner.
 Native `.plombir-git-ci.yml` jobs run on either.
+
+## Outputs
+
+A step with an `id:` leaves values for the steps after it, and a job leaves
+values for the jobs that need it — the same contexts GitHub has:
+
+```yaml
+name: Release
+on: push
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      number: ${{ steps.read.outputs.number }}
+    steps:
+      - id: read
+        run: echo "number=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+      - if: steps.read.outputs.number != ''
+        run: echo "building ${{ steps.read.outputs.number }}"
+  publish:
+    runs-on: ubuntu-latest
+    needs: version
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+    steps:
+      - if: needs.version.result == 'success'
+        run: ./publish.sh "$VERSION"
+```
+
+| Expression | Value |
+|------------|-------|
+| `steps.<id>.outputs.<name>` | What the step wrote to `$GITHUB_OUTPUT`. |
+| `steps.<id>.outcome` | `success`, `failure` or `skipped` — before `continue-on-error`. |
+| `steps.<id>.conclusion` | The same after `continue-on-error`: a failure it let through is `success`. |
+| `needs.<job>.outputs.<name>` | What the needed job's `outputs:` resolved to. |
+| `needs.<job>.result` | `success`, `failure`, `cancelled` or `skipped`. |
+
+They are read in a step's `run:`, `env:`, `working-directory` and `if:`.
+`needs.*` is also read in the job's `env:`, which is set when the job starts;
+`steps.*` is not — a job variable exists before the first step runs. A job's
+`outputs:` reads `steps.*`, `needs.*` and `env.*`, and is resolved after its
+last step.
+
+**A name that resolves to nothing is refused when the workflow is read, not
+read as the empty string.** `steps.<id>` has to be a step of the same job that
+runs *before* the one reading it (a job's `outputs:` may name any of its
+steps); `needs.<job>` has to be a job this one lists under `needs:`. A typo
+fails the file with the site and the name. An output a step simply did not
+write is the empty string, as on GitHub.
+
+**Limits.** A job's outputs, all steps together, are capped at 1 MiB, as on
+GitHub. The step whose `$GITHUB_OUTPUT` passes it fails, naming the output — it
+is never cut. A job's `outputs:` are masked like its log before another job can
+read them, so a secret a step echoed into one arrives as `***`.
+
+**`::set-output` is refused.** GitHub disabled the workflow command; a `run:`
+that contains it fails the file, and a step that prints one at run time fails
+naming it, rather than leaving an output that was never set.
+
+A matrix job's `outputs` are those of the variant that finished last with
+success, and its `result` is `failure` if any variant failed — GitHub's rule.
+`needs.*` is not available in a job's `if:`, `runs-on`, `container.image` or
+`environment`: those are decided when the pipeline is built, before any job ran.
 
 ### Keys parsed only so they can be refused
 
@@ -719,6 +788,9 @@ contexts.
 | `matrix.NAME` | The variant's coordinate. |
 | `inputs.NAME` | The dispatch or call input. |
 
+**Between steps**, the runner resolves `steps.*` and `needs.*` — see
+[Outputs](#outputs).
+
 **In job fields resolved before a runner starts** — `runs-on`,
 `container.image` and `environment` — only the first five `github.*` above, plus
 `matrix.NAME` and `inputs.NAME`. `env.` and `secrets.` have no value at that
@@ -747,9 +819,9 @@ jobs:
       - run: cargo build
 ```
 
-Only `run.working-directory` is honoured; a job's own `defaults.run` overrides
-the workflow's, and a step's `working-directory` overrides both.
-`defaults.run.shell` is refused — see the table above.
+`run.working-directory` and `run.shell` are honoured; a job's own
+`defaults.run` overrides the workflow's, and a step's `working-directory` /
+`shell` overrides both. See [Steps](#steps) for the shells.
 
 ## Containers
 

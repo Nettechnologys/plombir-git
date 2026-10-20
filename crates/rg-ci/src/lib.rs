@@ -1189,6 +1189,14 @@ impl PipelineGraph<'_> {
                 // `pending` row per step, so the job page lists the steps
                 // before a runner takes it. Written in the graph's
                 // transaction: a job is never published without them.
+                if let Some(context) = &job_config.job_context {
+                    rg_db::ops::pipeline_step_ops::set_job_context(
+                        tx,
+                        job.id,
+                        &serde_json::to_string(context).context("serialize job context")?,
+                    )
+                    .await?;
+                }
                 if let Some(steps) = &job_config.steps {
                     let names = steps
                         .iter()
@@ -2732,6 +2740,13 @@ fn try_read_gitea_workflows(
         let mut renamed_jobs = std::collections::HashMap::new();
         for (job_name, mut job) in wf_config.jobs {
             let new_name = format!("{}/{}", wf_prefix, job_name);
+            // The jobs a job needs are renamed with it, so the names its steps
+            // resolve `needs.*` against are the names the pipeline carries.
+            if let Some(context) = job.job_context.as_mut() {
+                for needed in context.needs.values_mut() {
+                    *needed = format!("{wf_prefix}/{needed}");
+                }
+            }
             // Prefix stage names too
             if let Some(ref stage) = job.stage {
                 job.stage = Some(format!("{}/{}", wf_prefix, stage));
@@ -3440,6 +3455,7 @@ mod matrix_tests {
             artifacts: None,
             action_templates: None,
             steps: None,
+            job_context: None,
         }
     }
 
@@ -5102,6 +5118,7 @@ mod matrix_tests {
                 artifacts: None,
                 action_templates: None,
                 steps: None,
+                job_context: None,
             },
         );
         let step = gitea_actions::actions_condition_context(
@@ -10564,6 +10581,46 @@ mod step_model_tests {
     use sea_orm::{NotSet, Set};
 
     async fn run_workflow(workflow: &str) -> (rg_db::DatabaseConnection, i64, tempfile::TempDir) {
+        let (db, pipeline_id, temp) = run_pipeline(workflow).await;
+        let job = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let job = rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, job.id)
+            .await
+            .unwrap()
+            .remove(0);
+        (db, job.id, temp)
+    }
+
+    /// Every job of the pipeline the workflow publishes, by name, once the
+    /// embedded runner ran it.
+    async fn run_pipeline_jobs(
+        workflow: &str,
+    ) -> (
+        rg_db::DatabaseConnection,
+        std::collections::HashMap<String, rg_db::entities::pipeline_job::Model>,
+        tempfile::TempDir,
+    ) {
+        let (db, pipeline_id, temp) = run_pipeline(workflow).await;
+        let mut jobs = std::collections::HashMap::new();
+        for stage in rg_db::ops::pipeline_ops::list_stages_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap()
+        {
+            for job in rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, stage.id)
+                .await
+                .unwrap()
+            {
+                jobs.insert(job.name.clone(), job);
+            }
+        }
+        (db, jobs, temp)
+    }
+
+    async fn run_pipeline(workflow: &str) -> (rg_db::DatabaseConnection, i64, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
         let repo_path = temp.path().join("step-owner/steps");
         std::fs::create_dir_all(repo_path.join(".gitea/workflows")).unwrap();
@@ -10658,17 +10715,7 @@ mod step_model_tests {
         runner.set_repo_id(repo.id);
         runner.set_allow_host_runner(true);
         runner.run().await.unwrap();
-        let job = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&db, pipeline_id)
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        let job = rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, job.id)
-            .await
-            .unwrap()
-            .remove(0);
-        (db, job.id, temp)
+        (db, pipeline_id, temp)
     }
 
     async fn step_rows(
@@ -10764,6 +10811,39 @@ mod step_model_tests {
         );
         let log = job.log.unwrap_or_default();
         assert!(log.contains("▶ step 3/3: Three — skipped"), "{log}");
+    }
+
+    /// card_5013aa8fca9e, through the embedded runner: job A writes
+    /// `version=1.2.3` to `$GITHUB_OUTPUT`, and job B, which needs A, reads it
+    /// as `${{ needs.A.outputs.version }}` — in a step, in a job variable and
+    /// in a step condition.
+    #[tokio::test]
+    async fn a_needed_jobs_outputs_reach_the_job_that_needs_it() {
+        let (db, jobs, _temp) = run_pipeline_jobs(
+            "on: push\njobs:\n  A:\n    outputs:\n      version: ${{ steps.v.outputs.version }}\n    steps:\n      - id: v\n        run: echo version=1.2.3 >> \"$GITHUB_OUTPUT\"\n  B:\n    needs: A\n    env:\n      FROM_JOB: ${{ needs.A.outputs.version }}\n    steps:\n      - run: echo \"step=${{ needs.A.outputs.version }} job=$FROM_JOB result=${{ needs.A.result }}\"\n      - run: echo gated-in\n        if: needs.A.outputs.version == '1.2.3'\n      - run: echo never\n        if: needs.A.outputs.version == '9.9.9'\n",
+        )
+        .await;
+        // A workflow's jobs are named after its file.
+        let a = &jobs["build/A"];
+        assert_eq!(a.status, "success", "{:?}", a.log);
+        assert_eq!(a.outputs.as_deref(), Some(r#"{"version":"1.2.3"}"#));
+        let b = &jobs["build/B"];
+        assert_eq!(b.status, "success", "{:?}", b.log);
+        let first = rg_db::ops::pipeline_step_ops::find_job_step(&db, b.id, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            first
+                .log
+                .unwrap_or_default()
+                .contains("step=1.2.3 job=1.2.3 result=success"),
+            "{:?}",
+            b.log
+        );
+        let rows = step_rows(&db, b.id).await;
+        assert_eq!(rows[1].1, "success", "{rows:?}");
+        assert_eq!(rows[2].1, "skipped", "{rows:?}");
     }
 
     /// Steps are separate processes: a variable exported by one step does not

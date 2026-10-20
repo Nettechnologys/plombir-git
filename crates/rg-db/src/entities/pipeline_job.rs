@@ -48,6 +48,12 @@ pub struct Model {
     /// job, whose `script` is the one thing it runs. A runner executes these
     /// one by one and reports each into `pipeline_job_steps`.
     pub steps: Option<String>,
+    /// For a job of steps: its `needs:` (alias → job name in the pipeline) and
+    /// its `outputs:` templates, as `rg_process::ci_steps::JobContext` JSON.
+    pub job_context: Option<String>,
+    /// The job's resolved, masked `outputs:` as a JSON object, once its last
+    /// step ran; what `needs.<id>.outputs.*` reads in the jobs after it.
+    pub outputs: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

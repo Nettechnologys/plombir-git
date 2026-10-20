@@ -8,9 +8,9 @@ use rg_process::client_policy::{
 };
 
 use crate::api::{
-    deregister_runner, download_workspace, finish_job, job_liveness, poll_job, publish_artifact,
-    register_runner, report_step, restore_cache, save_cache, send_heartbeat, stage_artifact,
-    start_job, upload_log, JobLiveness, JobStart,
+    deregister_runner, download_workspace, finish_job, finish_job_with_outputs, job_liveness,
+    poll_job, publish_artifact, register_runner, report_step, restore_cache, save_cache,
+    send_heartbeat, stage_artifact, start_job, upload_log, JobLiveness, JobStart,
 };
 use crate::config::{
     config_not_persisted_warning, load_config, resolve_auth_token, resolve_runner, save_config,
@@ -1001,6 +1001,9 @@ pub async fn run_jobs_until_shutdown_checking_every(
                     if let Some(name) = &container_name {
                         remember_live_container(live_container, name.clone());
                     }
+                    // What a job of steps leaves for the jobs that need it,
+                    // sent with its finish.
+                    let mut job_outputs = std::collections::BTreeMap::new();
                     let execution = async {
                         if let Some(steps) = &job.steps {
                             let mask =
@@ -1012,7 +1015,7 @@ pub async fn run_jobs_until_shutdown_checking_every(
                                 job_id: job.job_id,
                                 token,
                             };
-                            rg_process::ci_steps::run_job_steps(
+                            let run = rg_process::ci_steps::run_job_steps(
                                 steps,
                                 &variables,
                                 &workspace,
@@ -1028,9 +1031,13 @@ pub async fn run_jobs_until_shutdown_checking_every(
                                     }
                                 }),
                                 &mask,
+                                &job.needs,
+                                &job.outputs,
                                 &mut reporter,
                             )
-                            .await
+                            .await;
+                            job_outputs = run.outputs;
+                            (run.exit_code, run.log)
                         } else if let Some(img) = &job.image {
                             run_job_docker(
                                 img,
@@ -1168,8 +1175,20 @@ pub async fn run_jobs_until_shutdown_checking_every(
 
                     // Finish
                     let status = if exit_code == 0 { "success" } else { "failure" };
-                    finish_job(
-                        &client, server, runner_id, job.job_id, token, status, exit_code,
+                    // Only a job that succeeded leaves outputs: the jobs that
+                    // need it never start otherwise.
+                    if exit_code != 0 {
+                        job_outputs.clear();
+                    }
+                    finish_job_with_outputs(
+                        &client,
+                        server,
+                        runner_id,
+                        job.job_id,
+                        token,
+                        status,
+                        exit_code,
+                        &job_outputs,
                     )
                     .await;
 

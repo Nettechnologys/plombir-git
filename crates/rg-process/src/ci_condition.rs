@@ -94,21 +94,32 @@ pub fn validate_condition(input: &str) -> Result<()> {
     .map(|_| ())
 }
 
-/// [`validate_condition`] for a step: the status functions are accepted too.
+/// [`validate_condition`] for a step: the status functions are accepted too,
+/// and so are the contexts only a runner has between steps —
+/// `steps.<id>.outputs.<name>`, `steps.<id>.outcome` / `.conclusion`,
+/// `needs.<job>.outputs.<name>` and `needs.<job>.result`. Whether each one
+/// names a step or a job that exists is the workflow reader's question.
 pub fn validate_step_condition(input: &str) -> Result<()> {
     evaluate_with(
         input,
-        |name| known_context_name(name).then(String::new),
+        |name| {
+            (known_context_name(name) || crate::ci_steps::RuntimeKey::parse(name).is_some())
+                .then(String::new)
+        },
         Some(StepStatus::default()),
     )
     .map(|_| ())
 }
 
 fn lookup(context: &HashMap<String, String>, name: &str) -> Option<String> {
-    context
-        .get(name)
-        .cloned()
-        .or_else(|| (name.starts_with("env.") || name.starts_with("matrix.")).then(String::new))
+    context.get(name).cloned().or_else(|| {
+        // An output nobody wrote, or the result of a step that never ran, is
+        // the empty string on GitHub too.
+        (name.starts_with("env.")
+            || name.starts_with("matrix.")
+            || crate::ci_steps::RuntimeKey::parse(name).is_some())
+        .then(String::new)
+    })
 }
 
 pub fn evaluate_condition(input: &str, context: &HashMap<String, String>) -> Result<bool> {
@@ -249,8 +260,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             ch if ch.is_ascii_alphanumeric() || ch == '_' => {
                 let start = i;
                 i += 1;
+                // `-` belongs to a name after its first character:
+                // `steps.my-step.outputs.my-value` is one property path, and
+                // this language has no subtraction for it to be mistaken for.
                 while i < chars.len()
-                    && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '_' | '.'))
+                    && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '_' | '.' | '-'))
                 {
                     i += 1;
                 }

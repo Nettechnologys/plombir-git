@@ -63,9 +63,126 @@ pub async fn create_job_steps(
     Ok(())
 }
 
+/// Write a job's context — what it needs, what it outputs — with the graph.
+pub async fn set_job_context(
+    db: &impl ConnectionTrait,
+    job_id: i64,
+    context_json: &str,
+) -> Result<()> {
+    pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(job_id))
+        .col_expr(pipeline_job::Column::JobContext, Expr::value(context_json))
+        .exec(db)
+        .await
+        .context("db: write job context")?;
+    Ok(())
+}
+
+/// Record a job's resolved outputs, only while it runs: a job canceled or
+/// reclaimed meanwhile has no say in what the jobs after it read.
+pub async fn record_job_outputs(
+    db: &impl ConnectionTrait,
+    job_id: i64,
+    outputs_json: &str,
+) -> Result<bool> {
+    Ok(pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(job_id))
+        .filter(pipeline_job::Column::Status.eq("running"))
+        .col_expr(pipeline_job::Column::Outputs, Expr::value(outputs_json))
+        .exec(db)
+        .await
+        .context("db: record job outputs")?
+        .rows_affected
+        == 1)
+}
+
+/// One job a job needs, as its steps read it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NeededJob {
+    /// `success`, `failure`, `cancelled` or `skipped`.
+    pub result: String,
+    pub outputs: std::collections::BTreeMap<String, String>,
+}
+
+/// What each needed job of a pipeline left, by the alias the needing job's
+/// expressions use (`needs` maps alias → job name in the pipeline).
+///
+/// A matrix job is every row named `<name> [<coordinates>]`: its result is a
+/// failure if any variant failed, and its outputs are those of the variant
+/// that finished last with success — GitHub's own rule.
+pub async fn needs_context(
+    db: &impl ConnectionTrait,
+    pipeline_id: i64,
+    needs: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, NeededJob>> {
+    use crate::entities::pipeline_stage;
+    if needs.is_empty() {
+        return Ok(Default::default());
+    }
+    let stage_ids = pipeline_stage::Entity::find()
+        .filter(pipeline_stage::Column::PipelineId.eq(pipeline_id))
+        .all(db)
+        .await
+        .context("db: list the pipeline's stages")?
+        .into_iter()
+        .map(|stage| stage.id)
+        .collect::<Vec<_>>();
+    let jobs = pipeline_job::Entity::find()
+        .filter(pipeline_job::Column::StageId.is_in(stage_ids))
+        .all(db)
+        .await
+        .context("db: list the pipeline's jobs")?;
+    let mut context = std::collections::BTreeMap::new();
+    for (alias, name) in needs {
+        let variant_prefix = format!("{name} [");
+        let mut variants = jobs
+            .iter()
+            .filter(|job| job.name == *name || job.name.starts_with(&variant_prefix))
+            .collect::<Vec<_>>();
+        variants.sort_by_key(|job| job.finished_at);
+        let failed = |status: &str| matches!(status, "failed" | "failure" | "error");
+        let result = if variants.iter().any(|job| failed(&job.status)) {
+            "failure"
+        } else if variants.iter().any(|job| job.status == "canceled") {
+            "cancelled"
+        } else if !variants.is_empty() && variants.iter().all(|job| job.status == "skipped") {
+            "skipped"
+        } else {
+            "success"
+        };
+        let outputs = variants
+            .iter()
+            .rev()
+            .find(|job| job.status == "success")
+            .and_then(|job| job.outputs.as_deref())
+            .map(serde_json::from_str::<std::collections::BTreeMap<String, String>>)
+            .transpose()
+            .context("a needed job's stored outputs are not a JSON object")?
+            .unwrap_or_default();
+        context.insert(
+            alias.clone(),
+            NeededJob {
+                result: result.to_string(),
+                outputs,
+            },
+        );
+    }
+    Ok(context)
+}
+
 /// Put every step of a job back to `pending`, for the run that is about to
-/// start: what the previous run of the same job reported is not this run's.
+/// start: what the previous run of the same job reported is not this run's —
+/// and neither are the outputs it left.
 pub async fn reset_job_steps(db: &impl ConnectionTrait, job_id: i64) -> Result<()> {
+    pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(job_id))
+        .col_expr(
+            pipeline_job::Column::Outputs,
+            Expr::value(Option::<String>::None),
+        )
+        .exec(db)
+        .await
+        .context("db: clear the job's outputs")?;
     pipeline_job_step::Entity::update_many()
         .filter(pipeline_job_step::Column::JobId.eq(job_id))
         .col_expr(pipeline_job_step::Column::Status, Expr::value("pending"))

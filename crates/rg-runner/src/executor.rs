@@ -689,6 +689,8 @@ mod tests {
             artifact_paths: None,
             timeout: 60,
             steps: None,
+            needs: Default::default(),
+            outputs: Default::default(),
         };
         let cache = resolved_cache(&job, &[("CI_SHA".into(), "abc".into())])
             .unwrap()

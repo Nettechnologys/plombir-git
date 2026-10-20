@@ -104,6 +104,22 @@ pub struct PollJobResponse {
     /// [`rg_core::ci::STEPS_PROTOCOL`] is ever handed one.
     #[schema(value_type = Option<Vec<Object>>)]
     steps: Option<Vec<serde_json::Value>>,
+    /// What each job this one needs left — `{result, outputs}` by the id its
+    /// expressions use. Empty for a job that needs none, and for a native job.
+    #[schema(value_type = Object)]
+    needs: serde_json::Map<String, serde_json::Value>,
+    /// The job's `outputs:` templates, resolved by the runner after the last
+    /// step and sent back with `finish`.
+    outputs: std::collections::BTreeMap<String, String>,
+}
+
+/// The job context as `pipeline_jobs.job_context` stores it.
+#[derive(Deserialize, Default)]
+struct StoredJobContext {
+    #[serde(default)]
+    needs: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    outputs: std::collections::BTreeMap<String, String>,
 }
 
 /// The artifact declaration as `pipeline_jobs.artifacts` stores it.
@@ -919,7 +935,44 @@ async fn prepare_dispatch(
             return Err(AppError::internal("invalid stored job steps").into_response());
         }
     };
+    // What the job reads of the jobs it needs, read now: they ran in earlier
+    // stages, which is why this job is the one being handed out.
+    let context = match job
+        .job_context
+        .as_deref()
+        .map(serde_json::from_str::<StoredJobContext>)
+        .transpose()
+    {
+        Ok(context) => context.unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(job_id = job.id, runner_id, %error, "poll_job: stored job context is not valid JSON");
+            return Err(AppError::internal("invalid stored job context").into_response());
+        }
+    };
+    let needs = match rg_db::ops::pipeline_step_ops::needs_context(
+        &state.db,
+        pipeline.id,
+        &context.needs,
+    )
+    .await
+    {
+        Ok(needs) => needs
+            .into_iter()
+            .map(|(alias, needed)| {
+                (
+                    alias,
+                    serde_json::json!({ "result": needed.result, "outputs": needed.outputs }),
+                )
+            })
+            .collect(),
+        Err(error) => {
+            tracing::error!(job_id = job.id, runner_id, error = %format!("{error:#}"), "poll_job: needs context failed");
+            return Err(AppError::from(error).into_response());
+        }
+    };
     let resp = PollJobResponse {
+        needs,
+        outputs: context.outputs,
         steps,
         job_id: job.id,
         pipeline_id: pipeline.id,
@@ -2002,6 +2055,43 @@ pub async fn finish_job(
         Err(error) => return error.into_response(),
     };
 
+    // What a job that succeeded leaves for the jobs that need it — recorded
+    // while it is still `running`, so it is in place before the roll-up below
+    // can release the next stage.
+    if reported == rg_core::ci::JobStatus::Success && !req.outputs.is_empty() {
+        let size = req
+            .outputs
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum::<usize>();
+        // The runner already holds a job to GitHub's 1 MiB.
+        let limit = rg_core::ci::MAX_JOB_OUTPUT_BYTES;
+        if size > limit {
+            return AppError::bad_request(format!(
+                "the job's outputs take {size} bytes, more than the {limit} a job may leave"
+            ))
+            .into_response();
+        }
+        let mut masked = std::collections::BTreeMap::new();
+        for (name, value) in &req.outputs {
+            match sanitized_runner_log(&state, &job, value).await {
+                Ok(value) => {
+                    masked.insert(name.clone(), value);
+                }
+                Err(response) => return response,
+            }
+        }
+        let json = match serde_json::to_string(&masked) {
+            Ok(json) => json,
+            Err(error) => return AppError::internal(error.to_string()).into_response(),
+        };
+        if let Err(error) =
+            rg_db::ops::pipeline_step_ops::record_job_outputs(&state.db, job_id, &json).await
+        {
+            return AppError::from(error).into_response();
+        }
+    }
+
     // The mandatory state transition is one transaction: job outcome, runner
     // availability and any stage/pipeline roll-up either all commit or all
     // remain retryable. The operation preserves the conditional-write fencing
@@ -2096,6 +2186,10 @@ pub struct FinishJobRequest {
     /// lives in that type, not in a comment here.
     status: String,
     exit_code: i32,
+    /// A job of steps' resolved `outputs:`, on success. Masked here before the
+    /// jobs that need it can read them.
+    #[serde(default)]
+    outputs: std::collections::BTreeMap<String, String>,
 }
 
 /// GET /api/v1/admin/runners

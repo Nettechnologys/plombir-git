@@ -150,6 +150,11 @@ pub struct JobConfig {
     /// and the file cannot claim otherwise.
     #[serde(skip)]
     pub(crate) steps: Option<Vec<rg_process::ci_steps::StepSpec>>,
+
+    /// What a job of steps reads of the jobs it needs and leaves for the jobs
+    /// that need it. `#[serde(skip)]` for the reason [`Self::steps`] is.
+    #[serde(skip)]
+    pub(crate) job_context: Option<rg_process::ci_steps::JobContext>,
 }
 
 /// The line every job script starts with, and the reason it has to.
