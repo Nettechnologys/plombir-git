@@ -138,6 +138,8 @@ struct StoredJobContext {
     services: Vec<serde_json::Value>,
     #[serde(default)]
     secrets: Option<std::collections::BTreeSet<String>>,
+    #[serde(default)]
+    token_scopes: Option<String>,
 }
 
 /// The artifact declaration as `pipeline_jobs.artifacts` stores it.
@@ -949,6 +951,7 @@ async fn add_server_variables(
     pipeline: &rg_db::entities::pipeline::Model,
     timeout_secs: u64,
     secret_scope: Option<&std::collections::BTreeSet<String>>,
+    token_scopes: &str,
     variables: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vec<String>, Response> {
     let pipeline_id = pipeline.id;
@@ -1013,7 +1016,7 @@ async fn add_server_variables(
         pipeline.repo_id,
         pipeline.id,
         job.id,
-        "repo:read packages:read",
+        token_scopes,
         &state.jwt_secret,
         rg_core::ci::ci_job_token_ttl_secs(timeout_secs),
     ) {
@@ -1030,7 +1033,11 @@ async fn add_server_variables(
             return Err(AppError::internal("failed to prepare job environment").into_response());
         }
     }
-    if let Some(url) = state.external_url.as_deref() {
+    // Only a token that may be exchanged there is told where.
+    let may_exchange = token_scopes
+        .split_whitespace()
+        .any(|scope| scope == rg_core::ci::ID_TOKEN_SCOPE);
+    if let Some(url) = state.external_url.as_deref().filter(|_| may_exchange) {
         variables.insert(
             "CI_OIDC_TOKEN_URL".into(),
             serde_json::json!(format!(
@@ -1079,6 +1086,10 @@ async fn prepare_dispatch(
         &pipeline,
         timeout_secs,
         context.secrets.as_ref(),
+        context
+            .token_scopes
+            .as_deref()
+            .unwrap_or(rg_core::ci::NATIVE_JOB_TOKEN_SCOPES),
         &mut variables,
     )
     .await?;

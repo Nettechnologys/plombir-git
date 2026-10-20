@@ -208,6 +208,19 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
          repository's pipelines",
     ),
     (
+        "ci_variables",
+        "created_by_id",
+        "SET NULL",
+        "card_a6f59b3d45f5: configuration of the repository every workflow of it reads, like \
+         its secrets",
+    ),
+    (
+        "org_ci_variables",
+        "created_by_id",
+        "SET NULL",
+        "card_a6f59b3d45f5: configuration of the organization every repository of it reads",
+    ),
+    (
         "deploy_keys",
         "created_by_id",
         "SET NULL",

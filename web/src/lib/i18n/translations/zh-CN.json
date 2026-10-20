@@ -1540,6 +1540,19 @@
       "delete_confirm_scoped": "从 {environment} 环境中删除 {name}？",
       "delete_confirm_title": "删除 CI 密钥"
     },
+    "ci_variables": {
+      "title": "CI 变量",
+      "desc": "工作流以 ${{ vars.NAME }} 读取的配置：值会在此显示，并像普通文本一样出现在作业日志中——凭据请放在 CI 密钥中。仓库变量会覆盖其组织中同名的变量。",
+      "desc_org": "本组织的每个仓库都会以 ${{ vars.NAME }} 读取这些配置，除非仓库设置了同名变量。值会在此显示并出现在作业日志中——凭据请放在 CI 密钥中。",
+      "add_title": "添加或替换变量",
+      "name": "名称",
+      "value": "值",
+      "save": "保存变量",
+      "list_title": "已配置的变量",
+      "empty": "尚未配置变量。",
+      "delete_confirm": "删除 {name}？",
+      "delete_confirm_title": "删除 CI 变量"
+    },
     "retention": {
       "title": "CI 保留策略",
       "desc": "控制新上传的产物和被访问过的缓存保留多长时间。过期的存储每小时回收一次。",

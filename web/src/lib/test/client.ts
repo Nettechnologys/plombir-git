@@ -60,6 +60,7 @@ export const branchProtections = namespace();
 export const ciEnvironments = namespace();
 export const ciRetention = namespace();
 export const ciSecrets = namespace();
+export const ciVariables = namespace();
 export const collaborators = namespace();
 export const deployKeys = namespace();
 export const lfsLocks = namespace();

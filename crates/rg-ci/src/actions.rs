@@ -1048,7 +1048,7 @@ fn map_groups(
 }
 
 /// The text of `body` when it is exactly one `'…'` string literal.
-fn single_literal(body: &str) -> Option<String> {
+pub(crate) fn single_literal(body: &str) -> Option<String> {
     let inner = body.strip_prefix('\'')?.strip_suffix('\'')?;
     (!inner.replace("''", "").contains('\'')).then(|| inner.replace("''", "'"))
 }

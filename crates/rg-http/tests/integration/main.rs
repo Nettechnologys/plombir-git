@@ -72,6 +72,7 @@ mod ci_permission_tests;
 mod ci_secret_environment_tests;
 mod ci_secrets_tag_protection_tests;
 mod ci_state_conflict_tests;
+mod ci_variables_tests;
 mod clearable_patch_field_tests;
 mod collaborator_authz_tests;
 mod collaborator_identity_tests;

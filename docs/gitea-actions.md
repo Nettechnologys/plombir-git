@@ -145,9 +145,10 @@ jobs:
 | `concurrency` | block | Pipeline-level serialization. See [Concurrency](#concurrency). |
 | `env` | map string→string | Variables every job inherits. |
 | `defaults` | block | `run:` defaults every job inherits. See [Defaults](#defaults). |
+| `permissions` | `read-all`, `write-all` or map scope→level | What every job's `CI_JOB_TOKEN` may do. See [Permissions](#permissions). |
 
-Anything else at the root — `permissions`, `run-name` and the rest of the
-Actions vocabulary — is an unknown key and fails the file.
+Anything else at the root — `run-name` and the rest of the Actions vocabulary —
+is an unknown key and fails the file.
 
 ## `on:` — triggers
 
@@ -497,6 +498,7 @@ quietly win.
 | `timeout-minutes` | integer | Per-job timeout. Converted to seconds, and the result must land in `1`–`86400` — so `1`–`1440` minutes. |
 | `continue-on-error` | bool | A failure of this job does not fail the pipeline. |
 | `outputs` | map string→string | What the job leaves for the jobs that need it, read from its steps after the last one. See [Outputs](#outputs). |
+| `permissions` | `read-all`, `write-all` or map scope→level | What this job's `CI_JOB_TOKEN` may do, instead of the workflow's. See [Permissions](#permissions). |
 | `uses` / `with` / `secrets` | — | Reusable workflow invocation. See [Reusable workflows](#reusable-workflows). |
 
 `needs:` must name jobs this workflow declares, and the graph must be acyclic.
@@ -920,12 +922,102 @@ contexts.
 boundary; they are refused there by field and expression rather than left in the
 configuration as literal `${{ … }}`.
 
-`vars.NAME` is **not** supported anywhere: Plombir Git has no repository or
-organization configuration-variable store, and silently reading `env.NAME`
-instead would be a different Actions context with the same name.
+`vars.NAME` is read everywhere a workflow can write an expression — see
+[Variables](#variables-vars). It is never `env.NAME`: a variable and an
+environment variable of the same name are two different contexts.
 
 Any unsupported expression fails the workflow, naming the site and the
 expression — including a `${{` that is never closed.
+
+## Variables (`vars.*`)
+
+`${{ vars.NAME }}` is a configuration variable of the repository, or of the
+organization that owns it — a value that is not a secret: a region, a
+deployment URL, a feature flag. A repository's variable overrides its
+organization's of the same name, as on GitHub. An organization being deleted
+stops configuring its repositories at once, and both kinds are removed with
+their owner.
+
+They are set by a repository's administrators under **Settings → CI
+variables** (`PUT /api/v1/repos/{owner}/{name}/actions/variables/{NAME}`) and
+by an organization's administrators on the organization page
+(`PUT /api/v1/orgs/{name}/actions/variables/{NAME}`). A name is
+`[A-Z_][A-Z0-9_]*`, at most 100 characters, and does not start with `GITHUB_`;
+`vars.region` and `vars.REGION` are the same variable. A value holds 1 to
+49 152 bytes, is shown back to the administrators who set it, and is printed by
+a job like any other text — a credential belongs in a [secret](ci.md#secrets-and-workload-identity).
+
+The values are filled in when the workflow is read, as if its author had
+written them:
+
+```yaml
+on: push
+jobs:
+  deploy:
+    runs-on: ${{ vars.DEPLOY_RUNNER }}
+    if: vars.DEPLOYS_ENABLED == 'true'
+    env:
+      REGION: ${{ vars.REGION }}
+    steps:
+      - run: ./deploy --region "$REGION" --url "${{ vars.DEPLOY_URL }}"
+```
+
+- in text — `run:`, `env:`, `with:`, `runs-on`, `container`, `services` — the
+  value as written; a name nobody set is empty;
+- inside an expression or an `if:` — a string literal, so a value never becomes
+  operators of the condition;
+- a value that holds `${{` is refused when a workflow reads it: here it would
+  become an expression of its own, where GitHub inserts it as text.
+
+A run reads the variables as they are when it is triggered; changing one does
+not change a run that already exists.
+
+## Permissions
+
+`permissions:` says what a job's `CI_JOB_TOKEN` may do — at the root for every
+job, on a job for that job alone:
+
+```yaml
+on: push
+permissions:
+  contents: read
+jobs:
+  publish:
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    steps:
+      - run: ./publish-with-workload-identity.sh
+```
+
+The token here is narrower than GitHub's `GITHUB_TOKEN` to begin with: it reads
+the repository (`contents`) and its packages (`packages`), and nothing else. So:
+
+| Scope | `none` | `read` | `write` |
+|-------|--------|--------|---------|
+| `contents` | the token cannot read the repository | ✅ the default | ❌ refused |
+| `packages` | the token cannot read packages | ✅ the default | ❌ refused |
+| `id-token` | ✅ the default — no workload identity | same as `none` | ✅ `CI_OIDC_TOKEN_URL` is set and the token may be exchanged there |
+| every other GitHub scope | accepted, changes nothing | accepted, changes nothing | ❌ refused |
+
+- `read-all` is `read` on every scope; `write-all` and any other `write` but
+  `id-token`'s are refused when the workflow is read, naming the scope: the
+  token cannot push, release or comment, and a workflow that relies on it
+  should fail there rather than halfway through. Push with a deploy key or a
+  token kept in a secret.
+- A workflow that declares nothing gets GitHub's restricted default —
+  `contents: read`, `packages: read`, no `id-token`. A job declaring its own
+  `permissions:` replaces the workflow's, and a scope it does not name is
+  `none`, as on GitHub.
+- A job a [reusable workflow](#reusable-workflows) brings never gets more than
+  the calling job declares, scope by scope.
+- `/api/v1/ci/oidc/token` answers only a token that carries `id-token: write`.
+  A native `.plombir-git-ci.yml` job has no `permissions:` and keeps both its
+  read access and its workload identity.
+- A fork's pull request runs only once a maintainer approves its head commit
+  on the pull request page — a new push needs a new approval — and then with
+  what the workflow declares, its secrets included.
 
 ## Defaults
 

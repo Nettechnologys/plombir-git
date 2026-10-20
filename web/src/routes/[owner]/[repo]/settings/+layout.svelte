@@ -23,6 +23,7 @@
     { path: `/${owner}/${repo}/settings/branches`, label: t('settings.branch_protection.title'), icon: '🛡️', level: 'admin' as Level },
     { path: `/${owner}/${repo}/settings/deploy-keys`, label: t('settings.deploy_keys.title', 'Deploy keys'), icon: '🔑', level: 'admin' as Level },
     { path: `/${owner}/${repo}/settings/ci-secrets`, label: t('settings.ci_secrets.title', 'CI secrets'), icon: '🔒', level: 'admin' as Level },
+    { path: `/${owner}/${repo}/settings/ci-variables`, label: t('settings.ci_variables.title', 'CI variables'), icon: '🔧', level: 'admin' as Level },
     { path: `/${owner}/${repo}/settings/environments`, label: t('settings.environments.title', 'Environments'), icon: '🚀', level: 'admin' as Level },
     { path: `/${owner}/${repo}/settings/retention`, label: t('settings.retention.title', 'CI retention'), icon: '🧹', level: 'admin' as Level },
     { path: `/${owner}/${repo}/settings/tags`, label: t('settings.tag_protection.title', 'Tag protection'), icon: '🏷️', level: 'admin' as Level },

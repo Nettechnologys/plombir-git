@@ -1388,6 +1388,12 @@ pub struct JobContext {
     /// were scoped — is the old reading: every secret, to every step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<BTreeSet<String>>,
+    /// What the job's `CI_JOB_TOKEN` may do, as `permissions:` left it — the
+    /// space-separated scopes the server signs into it. `None` — a native job,
+    /// or one translated before `permissions:` was read — keeps the native
+    /// token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_scopes: Option<String>,
 }
 
 ///

@@ -1875,6 +1875,26 @@ pub(crate) fn build_all_routes(
             api::webhooks::redeliver,
         )
         .get(OrgAdmin, "/orgs/{name}/hooks", api::webhooks::org_list)
+        .get(
+            OrgAdmin,
+            "/orgs/{name}/actions/variables",
+            api::ci_variables::org_list,
+        )
+        .get(
+            OrgAdmin,
+            "/orgs/{name}/actions/variables/{variable_name}",
+            api::ci_variables::org_get,
+        )
+        .put(
+            OrgAdmin,
+            "/orgs/{name}/actions/variables/{variable_name}",
+            api::ci_variables::org_put,
+        )
+        .delete(
+            OrgAdmin,
+            "/orgs/{name}/actions/variables/{variable_name}",
+            api::ci_variables::org_delete,
+        )
         .post(OrgAdmin, "/orgs/{name}/hooks", api::webhooks::org_create)
         .get(OrgAdmin, "/orgs/{name}/hooks/{id}", api::webhooks::org_get)
         .patch(
@@ -2036,6 +2056,27 @@ pub(crate) fn build_all_routes(
             RepoAdmin,
             "/repos/{owner}/{name}/actions/secrets/{secret_name}",
             api::ci_secrets::delete,
+        )
+        // `vars.*`: configuration a workflow reads, shown back to its admins.
+        .get(
+            RepoAdmin,
+            "/repos/{owner}/{name}/actions/variables",
+            api::ci_variables::list,
+        )
+        .get(
+            RepoAdmin,
+            "/repos/{owner}/{name}/actions/variables/{variable_name}",
+            api::ci_variables::get,
+        )
+        .put(
+            RepoAdmin,
+            "/repos/{owner}/{name}/actions/variables/{variable_name}",
+            api::ci_variables::put,
+        )
+        .delete(
+            RepoAdmin,
+            "/repos/{owner}/{name}/actions/variables/{variable_name}",
+            api::ci_variables::delete,
         )
         // Repository archive download
         .get(

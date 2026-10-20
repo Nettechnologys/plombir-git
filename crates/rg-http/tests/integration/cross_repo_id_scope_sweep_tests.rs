@@ -190,6 +190,10 @@ const PER_REPO_PLACEHOLDERS: &[(&str, &str)] = &[
     ("branch", "a ref name, resolved inside the repository"),
     ("archive", "an archive filename derived from a ref"),
     ("secret_name", "CI secrets are named per repository"),
+    (
+        "variable_name",
+        "CI variables are named per repository (`ci_variable_ops`, keyed by repo_id)",
+    ),
     ("pkg_type", "a package registry kind, not an id"),
     ("pkg", "a package name, unique within its registry"),
     ("pkg_name", "a package name, unique within its registry"),

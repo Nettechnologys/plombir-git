@@ -69,7 +69,7 @@ pub struct TokenResponse {
     expires_at: i64,
 }
 
-#[utoipa::path(get, path = "/ci/oidc/token", tag = "CI/CD", params(("audience" = String, Query, description = "Intended relying party")), responses((status = 200, description = "Short-lived workload identity token"), (status = 401, description = "Invalid CI job token"), (status = 403, description = "Job is not running")))]
+#[utoipa::path(get, path = "/ci/oidc/token", tag = "CI/CD", params(("audience" = String, Query, description = "Intended relying party")), responses((status = 200, description = "Short-lived workload identity token"), (status = 401, description = "Invalid CI job token"), (status = 403, description = "Job is not running, or its token lacks id-token:write")))]
 pub async fn token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -87,6 +87,17 @@ pub async fn token(
     else {
         return AppError::unauthorized("invalid or expired CI job token").into_response();
     };
+    // A workload identity is what a cloud role trusts this repository by, so a
+    // token gets one only when its job asked for it — `id-token: write` in an
+    // Actions workflow, every native job — and not merely for running: every
+    // step of the job holds the job token, a downloaded action's included.
+    if !claims.has_scope(rg_core::ci::ID_TOKEN_SCOPE) {
+        return AppError::forbidden(
+            "this job's token may not be exchanged for a workload identity; declare \
+             `permissions: id-token: write` on the job",
+        )
+        .into_response();
+    }
     // The binding lives in `api::auth` because the repository read gate needs
     // exactly the same question answered — a signature that is still in date
     // says nothing about whether the job it names is still running.

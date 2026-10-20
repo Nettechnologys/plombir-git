@@ -50,7 +50,7 @@ async fn oidc_exchange_is_audience_bound_and_persisted_job_bound() {
         repo_id,
         pipeline.id,
         job.id,
-        "repo:read",
+        "repo:read id-token:write",
         "test-secret-key",
         3600,
     )
@@ -83,6 +83,25 @@ async fn oidc_exchange_is_audience_bound_and_persisted_job_bound() {
         .await
         .unwrap();
     assert_eq!(denied.status(), 401);
+    // card_a6f59b3d45f5: a live job's token without `id-token:write` — an
+    // Actions job whose `permissions:` did not ask for it — is no identity.
+    let without_identity = rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
+        repo_id,
+        pipeline.id,
+        job.id,
+        "repo:read packages:read",
+        "test-secret-key",
+        3600,
+    )
+    .unwrap();
+    let refused = client
+        .get(format!("{base}/api/v1/ci/oidc/token?audience=sts.example"))
+        .bearer_auth(&without_identity)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    assert!(refused.text().await.unwrap().contains("id-token: write"));
     let issued = client
         .get(format!("{base}/api/v1/ci/oidc/token?audience=sts.example"))
         .bearer_auth(&ci_token)
@@ -121,7 +140,7 @@ async fn oidc_exchange_is_audience_bound_and_persisted_job_bound() {
         repo_id,
         pipeline.id + 1,
         job.id,
-        "repo:read",
+        "repo:read id-token:write",
         "test-secret-key",
         3600,
     )
@@ -220,7 +239,7 @@ async fn an_environment_job_is_issued_the_environment_subject() {
         repo_id,
         pipeline.id,
         job.id,
-        "repo:read",
+        "repo:read id-token:write",
         "test-secret-key",
         3600,
     )

@@ -22,7 +22,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::config::{
     ActionExpression, ActionJobTemplates, ActionTemplate, ActionTemplatePart, ArtifactsConfig,
@@ -52,6 +52,10 @@ pub struct GiteaWorkflow {
     /// Defaults inherited by every `run:` step unless a job or step overrides
     /// them.
     pub defaults: Option<GiteaDefaults>,
+
+    /// What every job's `CI_JOB_TOKEN` may do unless the job says otherwise
+    /// ([`crate::permissions`]).
+    pub permissions: Option<serde_json::Value>,
 
     /// Values of the `inputs` context after the declaring trigger schema has
     /// supplied defaults and checked the caller. They are kept typed while a
@@ -679,6 +683,16 @@ pub struct GiteaJob {
     /// expression over its steps' outputs, read after its last step.
     #[serde(default)]
     pub outputs: HashMap<String, String>,
+
+    /// What the job's `CI_JOB_TOKEN` may do; the workflow's when absent.
+    pub permissions: Option<serde_json::Value>,
+
+    /// Never in a workflow: what the job's token may do once its own, its
+    /// workflow's and — for a job a reusable workflow brought — its caller's
+    /// `permissions:` are read together (`expand_reusable_jobs`). `None` for
+    /// a job nobody read that way: its own and its workflow's decide.
+    #[serde(skip)]
+    pub(crate) token_permissions: Option<crate::permissions::Permissions>,
 }
 
 /// The two `runs-on` forms Plombir Git can preserve without weakening runner
@@ -2446,6 +2460,19 @@ impl GiteaWorkflow {
                 unsupported.push(format!("defaults.run.shell: {reason}"));
             }
         }
+        if let Some(declared) = &self.permissions {
+            if let Err(reason) = crate::permissions::Permissions::parse(declared, "permissions") {
+                unsupported.push(reason);
+            }
+        }
+        for (job_name, job) in &self.jobs {
+            if let Some(declared) = &job.permissions {
+                if let Err(reason) = crate::permissions::Permissions::parse(declared, "permissions")
+                {
+                    unsupported.push(format!("{job_name}: {reason}"));
+                }
+            }
+        }
         unsupported.extend(self.jobs.iter().filter_map(|(job_name, job)| {
             job.uses
                 .as_ref()
@@ -2859,6 +2886,22 @@ impl GiteaWorkflow {
                     })
                     .collect(),
                 secrets: Some(self.job_secrets(job, &steps)),
+                // Refused by `validate_supported_actions` before any workflow
+                // is converted, so the fallback is never the answer to a
+                // declaration that could not be read.
+                token_scopes: Some(
+                    job.token_permissions
+                        .clone()
+                        .or_else(|| {
+                            effective_permissions(
+                                job.permissions.as_ref(),
+                                self.permissions.as_ref(),
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_default()
+                        .token_scopes(),
+                ),
             };
             let (image, image_template) = split_action_template(
                 job.container
@@ -3339,6 +3382,18 @@ struct JobTranslation {
     steps: Vec<rg_process::ci_steps::StepSpec>,
 }
 
+/// What a job's token may do: its own `permissions:`, else its workflow's,
+/// else GitHub's restricted default.
+fn effective_permissions(
+    job: Option<&serde_json::Value>,
+    workflow: Option<&serde_json::Value>,
+) -> std::result::Result<crate::permissions::Permissions, String> {
+    match job.or(workflow) {
+        Some(declared) => crate::permissions::Permissions::parse(declared, "permissions"),
+        None => Ok(crate::permissions::Permissions::default()),
+    }
+}
+
 fn pin_workflow_working_directory(job: &mut GiteaJob, defaults: &Option<GiteaDefaults>) {
     let Some(working_directory) = defaults
         .as_ref()
@@ -3477,6 +3532,10 @@ fn expand_reusable_jobs(
                 job.env.entry(key.clone()).or_insert_with(|| value.clone());
             }
             pin_workflow_working_directory(&mut job, &workflow.defaults);
+            job.token_permissions = Some(
+                effective_permissions(job.permissions.as_ref(), workflow.permissions.as_ref())
+                    .map_err(|error| anyhow::anyhow!("jobs.{name}.{error}"))?,
+            );
             jobs.insert(name.clone(), job);
             expansion.insert(name.clone(), vec![name.clone()]);
             continue;
@@ -3523,6 +3582,7 @@ fn expand_reusable_jobs(
             concurrency,
             env: _,
             defaults: _,
+            permissions: _,
             resolved_inputs: _,
         } = &called;
         if concurrency.is_some() {
@@ -3549,7 +3609,28 @@ fn expand_reusable_jobs(
             .map(|(job_name, _)| job_name.clone())
             .collect::<std::collections::HashSet<_>>();
 
+        // A called workflow's jobs never get more than the job that calls it
+        // declares, as on GitHub; its own `permissions:` can only narrow.
+        let caller = match original
+            .permissions
+            .as_ref()
+            .or(workflow.permissions.as_ref())
+        {
+            Some(declared) => Some(
+                crate::permissions::Permissions::parse(declared, "permissions")
+                    .map_err(|error| anyhow::anyhow!("jobs.{name}.{error}"))?,
+            ),
+            None => None,
+        };
         for (child_name, mut child) in called_jobs {
+            if let Some(caller) = &caller {
+                child.token_permissions = Some(
+                    child
+                        .token_permissions
+                        .unwrap_or_default()
+                        .intersect(caller),
+                );
+            }
             child.needs = child.needs.map(|needs| {
                 needs
                     .into_iter()
@@ -4449,6 +4530,204 @@ fn expand_expressions(template: &str, lookup: impl Fn(&str) -> Option<String>) -
     out
 }
 
+// ── vars.* ─────────────────────────────────────────────────────────────
+
+/// `expression` with every `vars.<NAME>` outside a string literal replaced by
+/// that variable's value as a string literal — `''` for a name nobody set, as
+/// on GitHub. Names match without regard to case, as GitHub matches them; the
+/// store keeps them upper-case. A value holding `${{` is refused: inserted
+/// here it would become an expression of its own, where GitHub inserts text.
+fn vars_in_expression(
+    expression: &str,
+    vars: &BTreeMap<String, String>,
+) -> std::result::Result<String, String> {
+    let bytes = expression.as_bytes();
+    let mut out = String::with_capacity(expression.len());
+    let mut index = 0;
+    let mut in_string = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\'' {
+            in_string = !in_string;
+            out.push('\'');
+            index += 1;
+            continue;
+        }
+        let boundary = index == 0 || {
+            let before = bytes[index - 1];
+            !(before.is_ascii_alphanumeric() || matches!(before, b'_' | b'-' | b'.'))
+        };
+        if !in_string && boundary && expression[index..].starts_with("vars.") {
+            let start = index + "vars.".len();
+            let len = expression[start..]
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .count();
+            if len > 0 {
+                let name = &expression[start..start + len];
+                let value = vars
+                    .get(&name.to_ascii_uppercase())
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                if value.contains("${{") {
+                    return Err(format!(
+                        "vars.{name} holds `${{{{`, which this engine would read as an \
+                         expression rather than as the variable's text"
+                    ));
+                }
+                out.push('\'');
+                out.push_str(&value.replace('\'', "''"));
+                out.push('\'');
+                index = start + len;
+                continue;
+            }
+        }
+        let ch = expression[index..].chars().next().expect("in bounds");
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    Ok(out)
+}
+
+/// Every `${{ … }}` group of `text`, each one's inside handed to `map`.
+fn map_expression_groups(
+    text: &str,
+    mut map: impl FnMut(&str) -> std::result::Result<String, String>,
+) -> std::result::Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("${{") {
+        let after = &rest[open + 3..];
+        let Some(close) = after.find("}}") else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push_str(&map(after[..close].trim())?);
+        rest = &after[close + 2..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// A text field: `${{ vars.NAME }}` becomes the value as written, and every
+/// other group has its `vars.*` turned into literals — a group left holding a
+/// single literal becomes that literal's text.
+fn vars_in_text(
+    text: &str,
+    vars: &BTreeMap<String, String>,
+) -> std::result::Result<String, String> {
+    if !text.contains("vars.") {
+        return Ok(text.to_string());
+    }
+    map_expression_groups(text, |body| {
+        let body = vars_in_expression(body, vars)?;
+        Ok(match crate::actions::single_literal(&body) {
+            Some(literal) => literal,
+            None => format!("${{{{ {body} }}}}"),
+        })
+    })
+}
+
+/// An `if:`, with or without its `${{ }}`: every `vars.*` becomes a literal,
+/// so a value can never turn into operators of the condition.
+fn vars_in_condition(
+    condition: &str,
+    vars: &BTreeMap<String, String>,
+) -> std::result::Result<String, String> {
+    if !condition.contains("vars.") {
+        return Ok(condition.to_string());
+    }
+    if !condition.contains("${{") {
+        return vars_in_expression(condition, vars);
+    }
+    map_expression_groups(condition, |body| {
+        Ok(format!("${{{{ {} }}}}", vars_in_expression(body, vars)?))
+    })
+}
+
+impl GiteaWorkflow {
+    /// Fill in `vars.*` — the repository's and its organization's
+    /// configuration variables (`rg_db::ops::ci_variable_ops::for_repo`) —
+    /// everywhere a workflow reads them, before anything else reads the file.
+    /// What is left is the workflow as if its author had written the values.
+    ///
+    /// Run after the actions are written into the jobs, so a step an action
+    /// brings reads them too.
+    pub(crate) fn resolve_vars(
+        &mut self,
+        vars: &BTreeMap<String, String>,
+    ) -> std::result::Result<(), String> {
+        let text = |value: &mut String| -> std::result::Result<(), String> {
+            *value = vars_in_text(value, vars)?;
+            Ok(())
+        };
+        let condition = |value: &mut String| -> std::result::Result<(), String> {
+            *value = vars_in_condition(value, vars)?;
+            Ok(())
+        };
+        for value in self.env.values_mut() {
+            text(value)?;
+        }
+        if let Some(concurrency) = &mut self.concurrency {
+            text(&mut concurrency.group)?;
+        }
+        for (job_name, job) in &mut self.jobs {
+            let at = |error: String| format!("jobs.{job_name}: {error}");
+            for value in job.env.values_mut().chain(job.outputs.values_mut()) {
+                text(value).map_err(at)?;
+            }
+            if let Some(job_condition) = &mut job.condition {
+                condition(job_condition).map_err(at)?;
+            }
+            match &mut job.runs_on {
+                Some(GiteaRunsOn::Label(label)) => text(label).map_err(at)?,
+                Some(GiteaRunsOn::Labels(labels)) => {
+                    for label in labels {
+                        text(label).map_err(at)?;
+                    }
+                }
+                None => {}
+            }
+            match &mut job.environment {
+                Some(GiteaEnvironment::Name(name)) => text(name).map_err(at)?,
+                Some(GiteaEnvironment::Details(details)) => text(&mut details.name).map_err(at)?,
+                None => {}
+            }
+            if let Some(container) = &mut job.container {
+                text(&mut container.image).map_err(at)?;
+                for value in container.env.values_mut() {
+                    text(value).map_err(at)?;
+                }
+            }
+            for service in job.services.values_mut() {
+                text(&mut service.image).map_err(at)?;
+                for value in service.env.values_mut() {
+                    text(value).map_err(at)?;
+                }
+                if let Some(credentials) = &mut service.credentials {
+                    text(&mut credentials.username).map_err(at)?;
+                    text(&mut credentials.password).map_err(at)?;
+                }
+            }
+            for step in &mut job.steps {
+                for value in [&mut step.name, &mut step.run, &mut step.working_directory]
+                    .into_iter()
+                    .flatten()
+                {
+                    text(value).map_err(at)?;
+                }
+                for value in step.env.values_mut().chain(step.with.values_mut()) {
+                    text(value).map_err(at)?;
+                }
+                if let Some(step_condition) = &mut step.condition {
+                    condition(step_condition).map_err(at)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Basic `${{ expression }}` substitution.
 fn substitute_expr(
     input: &str,
@@ -4531,6 +4810,97 @@ mod tests {
         assert!(values[1].is_number());
         assert_eq!(values[3], serde_json::Value::Bool(true));
         assert!(values[4].is_string());
+    }
+
+    /// card_a6f59b3d45f5: `permissions:` is what the job token is minted with
+    /// — a job's own over its workflow's, GitHub's restricted default when
+    /// nothing is declared, a called workflow's job never above its caller —
+    /// and a write the token cannot do is refused when the file is read.
+    #[test]
+    fn permissions_become_the_job_tokens_scopes() {
+        let scopes = |workflow: &GiteaWorkflow, job: &str| {
+            workflow.to_ci_config(&test_context()).jobs[job]
+                .job_context
+                .as_ref()
+                .unwrap()
+                .token_scopes
+                .clone()
+                .unwrap()
+        };
+        let workflow = GiteaWorkflow::parse(
+            "on: push\npermissions:\n  contents: read\njobs:\n  plain:\n    steps:\n      - run: echo\n  oidc:\n    permissions:\n      contents: read\n      id-token: write\n    steps:\n      - run: echo\n  call:\n    permissions:\n      contents: read\n    uses: ./.gitea/workflows/called.yml\n",
+        )
+        .unwrap();
+        let sources = HashMap::from([(
+            "called.yml".to_string(),
+            "on: workflow_call\npermissions:\n  contents: read\n  packages: read\n  id-token: write\njobs:\n  inner:\n    steps:\n      - run: echo\n".to_string(),
+        )]);
+        let expanded = workflow.expand_local_reusable_workflows(&sources).unwrap();
+        expanded.validate_supported_actions().unwrap();
+        assert_eq!(scopes(&expanded, "plain"), "repo:read");
+        assert_eq!(scopes(&expanded, "oidc"), "repo:read id-token:write");
+        assert_eq!(scopes(&expanded, "call/inner"), "repo:read");
+
+        let undeclared =
+            GiteaWorkflow::parse("on: push\njobs:\n  a:\n    steps:\n      - run: echo\n").unwrap();
+        assert_eq!(
+            scopes(&undeclared, "a"),
+            rg_core::ci::DEFAULT_ACTIONS_JOB_TOKEN_SCOPES
+        );
+
+        let pushing = GiteaWorkflow::parse(
+            "on: push\njobs:\n  release:\n    permissions:\n      contents: write\n    steps:\n      - run: git push\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", pushing.validate_supported_actions().unwrap_err());
+        assert!(
+            error.contains("release") && error.contains("contents: write"),
+            "{error}"
+        );
+    }
+
+    /// card_a6f59b3d45f5: `vars.*` is read as text where text is written and
+    /// as a literal inside an expression — never as operators — with an unset
+    /// name empty and a value that would become an expression refused.
+    #[test]
+    fn vars_are_filled_in_as_text_and_literals() {
+        let mut workflow = GiteaWorkflow::parse(
+            "on: push\nenv:\n  WHERE: ${{ vars.region }}\njobs:\n  deploy:\n    runs-on: ${{ vars.RUNNER }}\n    if: vars.TIER == 'prod'\n    steps:\n      - if: ${{ vars.QUOTED != '' }}\n        run: echo \"${{ vars.QUOTED }} [${{ vars.MISSING }}]\"\n",
+        )
+        .unwrap();
+        let vars = BTreeMap::from([
+            ("REGION".to_string(), "eu-west".to_string()),
+            ("RUNNER".to_string(), "linux".to_string()),
+            ("TIER".to_string(), "prod".to_string()),
+            ("QUOTED".to_string(), "it's || true".to_string()),
+        ]);
+        workflow.resolve_vars(&vars).unwrap();
+        assert_eq!(workflow.env["WHERE"], "eu-west");
+        let job = &workflow.jobs["deploy"];
+        assert!(matches!(&job.runs_on, Some(GiteaRunsOn::Label(label)) if label == "linux"));
+        assert_eq!(job.condition.as_deref(), Some("'prod' == 'prod'"));
+        assert_eq!(
+            job.steps[0].condition.as_deref(),
+            Some("${{ 'it''s || true' != '' }}")
+        );
+        assert_eq!(
+            job.steps[0].run.as_deref(),
+            Some("echo \"it's || true []\"")
+        );
+
+        let mut workflow =
+            GiteaWorkflow::parse("on: push\njobs:\n  a:\n    steps:\n      - run: ${{ vars.X }}\n")
+                .unwrap();
+        let error = workflow
+            .resolve_vars(&BTreeMap::from([(
+                "X".to_string(),
+                "${{ secrets.DEPLOY }}".to_string(),
+            )]))
+            .unwrap_err();
+        assert!(
+            error.contains("jobs.a") && error.contains("vars.X"),
+            "{error}"
+        );
     }
 
     #[allow(dead_code)]
@@ -4933,6 +5303,10 @@ mod tests {
         workflow.validate_supported_triggers()?;
         let mut workflow = workflow.expand_local_reusable_workflows(sources)?;
         crate::actions::expand_actions(&mut workflow, &DocumentedActions(actions))?
+            .map_err(anyhow::Error::msg)?;
+        // As a trigger reads it: a repository with no variables set.
+        workflow
+            .resolve_vars(&BTreeMap::new())
             .map_err(anyhow::Error::msg)?;
         workflow.validate_supported_actions()?;
         workflow.validate_job_dependencies()

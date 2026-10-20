@@ -1540,6 +1540,19 @@
       "delete_confirm_scoped": "Delete {name} from the {environment} environment?",
       "delete_confirm_title": "Delete CI secret"
     },
+    "ci_variables": {
+      "title": "CI variables",
+      "desc": "Configuration a workflow reads as ${{ vars.NAME }}: values are shown here and printed by jobs like any other text — keep credentials in CI secrets. A repository's variable overrides its organization's of the same name.",
+      "desc_org": "Configuration every repository of this organization reads as ${{ vars.NAME }}, unless the repository sets the same name. Values are shown here and printed by jobs — keep credentials in CI secrets.",
+      "add_title": "Add or replace a variable",
+      "name": "Name",
+      "value": "Value",
+      "save": "Save variable",
+      "list_title": "Configured variables",
+      "empty": "No variables configured.",
+      "delete_confirm": "Delete {name}?",
+      "delete_confirm_title": "Delete CI variable"
+    },
     "retention": {
       "title": "CI retention",
       "desc": "Control how long newly uploaded artifacts and accessed caches remain available. Expired storage is reclaimed hourly.",

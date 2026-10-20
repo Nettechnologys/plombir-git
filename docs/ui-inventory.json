@@ -2349,6 +2349,40 @@
       ]
     },
     {
+      "method": "GET",
+      "url": "/api/v1/orgs/{name}/actions/variables",
+      "access": "OrgAdmin",
+      "handler": "api::ci_variables::org_list",
+      "testedIn": [],
+      "reachedFromUi": false
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/orgs/{name}/actions/variables/{variable_name}",
+      "access": "OrgAdmin",
+      "handler": "api::ci_variables::org_get",
+      "testedIn": [],
+      "reachedFromUi": false
+    },
+    {
+      "method": "PUT",
+      "url": "/api/v1/orgs/{name}/actions/variables/{variable_name}",
+      "access": "OrgAdmin",
+      "handler": "api::ci_variables::org_put",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/orgs/{name}/actions/variables/{variable_name}",
+      "access": "OrgAdmin",
+      "handler": "api::ci_variables::org_delete",
+      "testedIn": [],
+      "reachedFromUi": false
+    },
+    {
       "method": "POST",
       "url": "/api/v1/orgs/{name}/hooks",
       "access": "OrgAdmin",
@@ -2825,6 +2859,38 @@
       "browserScenarios": [
         "repo-ci-secrets"
       ]
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/actions/variables",
+      "access": "RepoAdmin",
+      "handler": "api::ci_variables::list",
+      "testedIn": [],
+      "reachedFromUi": false
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/actions/variables/{variable_name}",
+      "access": "RepoAdmin",
+      "handler": "api::ci_variables::get",
+      "testedIn": [],
+      "reachedFromUi": false
+    },
+    {
+      "method": "PUT",
+      "url": "/api/v1/repos/{owner}/{name}/actions/variables/{variable_name}",
+      "access": "RepoAdmin",
+      "handler": "api::ci_variables::put",
+      "testedIn": [],
+      "reachedFromUi": false
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/repos/{owner}/{name}/actions/variables/{variable_name}",
+      "access": "RepoAdmin",
+      "handler": "api::ci_variables::delete",
+      "testedIn": [],
+      "reachedFromUi": false
     },
     {
       "method": "GET",
@@ -19321,6 +19387,54 @@
       "passive": []
     },
     {
+      "route": "/[owner]/[repo]/settings/ci-variables",
+      "file": "web/src/routes/[owner]/[repo]/settings/ci-variables/+page.svelte",
+      "admin": false,
+      "controls": [
+        {
+          "tag": "form",
+          "label": "i18n:settings.ci_variables.name",
+          "line": 112,
+          "via": "ScopedVariables",
+          "href": null,
+          "handler": "save",
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "textarea",
+          "label": "",
+          "line": 116,
+          "via": "ScopedVariables",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.ci_variables.save",
+          "line": 117,
+          "via": "ScopedVariables",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.delete",
+          "line": 133,
+          "via": "ScopedVariables",
+          "href": null,
+          "handler": "() => remove(item)",
+          "calls": [],
+          "unresolved": false
+        }
+      ],
+      "passive": []
+    },
+    {
       "route": "/[owner]/[repo]/settings/collaborators",
       "file": "web/src/routes/[owner]/[repo]/settings/collaborators/+page.svelte",
       "admin": false,
@@ -26589,9 +26703,19 @@
           "unresolved": false
         },
         {
+          "tag": "a",
+          "label": "i18n:settings.ci_variables.title",
+          "line": 549,
+          "via": null,
+          "href": "`/orgs/${pathSegment(org.name)}/variables`",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
           "tag": "form",
           "label": "editingOrg = false} disabled= >",
-          "line": 554,
+          "line": 555,
           "via": null,
           "href": null,
           "handler": "saveOrganization",
@@ -26621,7 +26745,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.visibility_public",
-          "line": 563,
+          "line": 564,
           "via": null,
           "href": null,
           "handler": null,
@@ -26631,7 +26755,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 570,
+          "line": 571,
           "via": null,
           "href": null,
           "handler": null,
@@ -26641,7 +26765,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 574,
+          "line": 575,
           "via": null,
           "href": null,
           "handler": null,
@@ -26651,7 +26775,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 577,
+          "line": 578,
           "via": null,
           "href": null,
           "handler": "() => editingOrg = false",
@@ -26661,7 +26785,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 600,
+          "line": 601,
           "via": null,
           "href": null,
           "handler": null,
@@ -26671,7 +26795,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 603,
+          "line": 604,
           "via": null,
           "href": null,
           "handler": "createOrgRepo",
@@ -26711,7 +26835,7 @@
         {
           "tag": "a",
           "label": "i18n:orgs.create_repo_advanced",
-          "line": 616,
+          "line": 617,
           "via": null,
           "href": "`/dashboard?owner=${encodeURIComponent(org.name)}`",
           "handler": null,
@@ -26721,7 +26845,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 624,
+          "line": 625,
           "via": null,
           "href": "`/${org.name}/${repo.name}`",
           "handler": null,
@@ -26731,7 +26855,7 @@
         {
           "tag": "form",
           "label": "i18n:orgs.new_team",
-          "line": 639,
+          "line": 640,
           "via": null,
           "href": null,
           "handler": "createTeam",
@@ -26773,7 +26897,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.permission.read",
-          "line": 641,
+          "line": 642,
           "via": null,
           "href": null,
           "handler": null,
@@ -26783,7 +26907,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 646,
+          "line": 647,
           "via": null,
           "href": null,
           "handler": null,
@@ -26793,7 +26917,7 @@
         {
           "tag": "button",
           "label": "i18n:orgs.hide_team_members",
-          "line": 664,
+          "line": 665,
           "via": null,
           "href": null,
           "handler": "() => toggleTeamMembers(team.id)",
@@ -26818,7 +26942,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.delete')}",
-          "line": 668,
+          "line": 669,
           "via": null,
           "href": null,
           "handler": "() => deleteTeam(team)",
@@ -26862,7 +26986,7 @@
         {
           "tag": "form",
           "label": "` ? t('common.loading') : t('common.add')}",
-          "line": 679,
+          "line": 680,
           "via": null,
           "href": null,
           "handler": "(event) => addTeamMember(event, team.id)",
@@ -26905,7 +27029,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 686,
+          "line": 687,
           "via": null,
           "href": null,
           "handler": null,
@@ -26915,7 +27039,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.add')}",
-          "line": 690,
+          "line": 691,
           "via": null,
           "href": null,
           "handler": null,
@@ -26925,7 +27049,7 @@
         {
           "tag": "button",
           "label": "-$ ` ? t('common.loading') : t('common.delete')}",
-          "line": 707,
+          "line": 708,
           "via": null,
           "href": null,
           "handler": "() => removeTeamMember(team.id, teamMember)",
@@ -26968,7 +27092,7 @@
         {
           "tag": "form",
           "label": "i18n:orgs.member_placeholder",
-          "line": 732,
+          "line": 733,
           "via": null,
           "href": null,
           "handler": "addOrganizationMember",
@@ -27012,7 +27136,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 739,
+          "line": 740,
           "via": null,
           "href": null,
           "handler": null,
@@ -27022,7 +27146,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 746,
+          "line": 747,
           "via": null,
           "href": null,
           "handler": null,
@@ -27032,7 +27156,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.delete')}",
-          "line": 760,
+          "line": 761,
           "via": null,
           "href": null,
           "handler": "() => removeOrganizationMember(member)",
@@ -27538,6 +27662,54 @@
           "handler": "() => deleteTarget = null",
           "calls": [],
           "unresolved": true
+        }
+      ],
+      "passive": []
+    },
+    {
+      "route": "/orgs/[name]/variables",
+      "file": "web/src/routes/orgs/[name]/variables/+page.svelte",
+      "admin": false,
+      "controls": [
+        {
+          "tag": "form",
+          "label": "i18n:settings.ci_variables.name",
+          "line": 112,
+          "via": "ScopedVariables",
+          "href": null,
+          "handler": "save",
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "textarea",
+          "label": "",
+          "line": 116,
+          "via": "ScopedVariables",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.ci_variables.save",
+          "line": 117,
+          "via": "ScopedVariables",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.delete",
+          "line": 133,
+          "via": "ScopedVariables",
+          "href": null,
+          "handler": "() => remove(item)",
+          "calls": [],
+          "unresolved": false
         }
       ],
       "passive": []

@@ -146,6 +146,7 @@ export { deployKeys, type DeployKey } from './deployKeys';
 export { lfsLocks, type LfsLock } from './lfsLocks';
 export { lfsStorage, type LfsObject, type LfsPruneOutcome, type LfsUsage } from './lfsStorage';
 export { ciSecrets, type CiSecret } from './ciSecrets';
+export { ciVariables, type CiVariable, type CiVariableScope } from './ciVariables';
 export { tagProtections, type TagProtection, type TagProtectionPayload } from './tagProtections';
 export { buildTagProtectionPayload, type TagProtectionFormState } from './tagProtectionForm';
 export { ciEnvironments, type CiEnvironment, type CiEnvironmentPayload } from './ciEnvironments';

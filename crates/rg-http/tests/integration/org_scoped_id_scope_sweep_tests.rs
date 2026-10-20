@@ -196,6 +196,15 @@ fn signed_off(label: &str) -> bool {
 /// parameters, which is what keeps the two files counting one population: the
 /// guard demands the id be *anchored*, this sweep demands the anchor's two
 /// refusals be indistinguishable.
+/// Placeholders that name something inside the organization rather than
+/// carry a row id, each with why the gate's container already scopes it —
+/// there is no id space for this sweep to walk.
+const NAME_ARGUMENTS: &[(&str, &str)] = &[(
+    "variable_name",
+    "`ci_variable_ops` reads and writes `(org_id, name)` with the organization the gate \
+     resolved; another organization's variable of the same name is another row",
+)];
+
 fn is_global_id(name: &str) -> bool {
     name == "id" || name.ends_with("_id")
 }
@@ -549,10 +558,11 @@ async fn no_org_scoped_route_reaches_another_organizations_row() {
             if name == ORG_PLACEHOLDER {
                 continue;
             }
-            let classified = is_global_id(name)
-                && global_ids(&fact.path)
-                    .into_iter()
-                    .any(|(resource, found)| found == name && role(resource, found).is_some());
+            let classified = NAME_ARGUMENTS.iter().any(|(argument, _)| *argument == name)
+                || is_global_id(name)
+                    && global_ids(&fact.path)
+                        .into_iter()
+                        .any(|(resource, found)| found == name && role(resource, found).is_some());
             if !classified {
                 unknown.insert(format!("  {{{name}}} in {}", fact.label()));
             }

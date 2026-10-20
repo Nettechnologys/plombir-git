@@ -425,8 +425,9 @@ describe('repository settings sections', () => {
 	it('lists every section to an administrator', async () => {
 		const container = await openSettings('admin', '/alice/demo/settings/webhooks');
 
-		expect(container.querySelectorAll('.sidebar a.nav-item')).toHaveLength(15);
+		expect(container.querySelectorAll('.sidebar a.nav-item')).toHaveLength(16);
 		expect(container.querySelector('a[href="/alice/demo/settings/push-mirrors"]')).not.toBeNull();
+		expect(container.querySelector('a[href="/alice/demo/settings/ci-variables"]')).not.toBeNull();
 		expect(container.querySelector('.section-body')).not.toBeNull();
 	});
 });

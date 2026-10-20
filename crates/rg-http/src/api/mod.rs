@@ -16,6 +16,7 @@ pub mod ci_environments;
 pub mod ci_oidc;
 pub mod ci_retention;
 pub mod ci_secrets;
+pub mod ci_variables;
 pub mod clearable;
 pub mod collaborators;
 pub mod commit_signing_keys;

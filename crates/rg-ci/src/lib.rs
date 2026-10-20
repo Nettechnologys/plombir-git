@@ -34,6 +34,7 @@ pub mod condition;
 pub mod config;
 pub mod gitea_actions;
 mod matrix;
+mod permissions;
 pub mod runner;
 
 use anyhow::{Context, Result};
@@ -713,6 +714,9 @@ async fn trigger_pipeline_with_barrier_and_engine(
     // still before anything is written, so no pipeline is ever built against the
     // empty placeholder.
     let identity = rg_core::repo::service::repository_identity(db, repo_id).await;
+    // Held the same way, for the same reason: the file is judged first. A
+    // workflow that reads `vars.*` is judged against none until then.
+    let variables = rg_db::ops::ci_variable_ops::for_repo(db, repo_id).await;
     let (identity_owner, identity_name) = identity
         .as_ref()
         .map(|(owner, name)| (owner.as_str(), name.as_str()))
@@ -736,6 +740,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
         let scheduled = schedule.map(|run| (run.workflow.to_string(), run.cron.to_string()));
         let policy = engine.actions_policy().clone();
         let repo_root = repo_root.to_path_buf();
+        let vars = variables.as_ref().cloned().unwrap_or_default();
         let lookup_db = db.clone();
         let lookup_root = repo_root.clone();
         let runtime = tokio::runtime::Handle::current();
@@ -777,6 +782,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
                         .as_ref()
                         .map(|(workflow, cron)| rg_core::ci::ScheduledRun { workflow, cron }),
                     actions: Some(&loader),
+                    vars: Some(&vars),
                 },
             )
         })
@@ -789,6 +795,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
     // Held until every verdict about the client's file has been given, and still
     // before the first write.
     let (repo_owner, repo_name) = identity?;
+    variables?;
 
     // 2-5. Concurrency control and graph publication — one transaction.
     //
@@ -2457,6 +2464,10 @@ struct WorkflowInvocation<'a> {
     /// refuses, which is what a reader with no trigger behind it — a test, a
     /// schema probe — gets.
     actions: Option<&'a dyn actions::ActionLoader>,
+    /// What `vars.*` reads: the repository's configuration variables over its
+    /// organization's. `None` leaves every `vars.*` for the workflow check to
+    /// refuse, which is what a reader with no repository behind it gets.
+    vars: Option<&'a std::collections::BTreeMap<String, String>>,
 }
 
 /// Read CI configuration from the repo at the given commit.
@@ -2505,6 +2516,7 @@ fn read_ci_config(
             inputs: None,
             schedule: None,
             actions: None,
+            vars: None,
         },
     )
 }
@@ -3064,6 +3076,15 @@ fn try_read_gitea_workflows(
             actions::expand_actions(&mut workflow, loader)?.map_err(|reason| {
                 rg_core::error::invalid_request(format!(
                     "cannot load the actions of {WORKFLOW_DIR}/{name}: {reason}"
+                ))
+            })?;
+        }
+        // After the actions, so a step an action brings reads them too; before
+        // the check, which refuses any `vars.*` still standing.
+        if let Some(vars) = invocation.vars {
+            workflow.resolve_vars(vars).map_err(|reason| {
+                rg_core::error::invalid_request(format!(
+                    "cannot read the variables of {WORKFLOW_DIR}/{name}: {reason}"
                 ))
             })?;
         }
@@ -8031,9 +8052,9 @@ mod matrix_tests {
     fn unknown_gitea_wrapper_keys_are_reported_with_their_file_and_supported_fields() {
         for (key, workflow, supported) in [
             (
-                "permissions",
-                "on: push\npermissions:\n  contents: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
-                &["name", "on", "jobs", "concurrency", "env", "defaults"] as &[&str],
+                "run-name",
+                "on: push\nrun-name: deploy\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+                &["name", "on", "jobs", "concurrency", "env", "defaults", "permissions"] as &[&str],
             ),
             (
                 "cancel-inprogress",
@@ -8692,6 +8713,7 @@ jobs:
                 inputs: Some(&inputs),
                 schedule: None,
                 actions: None,
+                vars: None,
             },
         )
         .expect("typed dispatch inputs must reach the committed workflow");
@@ -8734,6 +8756,7 @@ jobs:
                     inputs: Some(&inputs),
                     schedule: None,
                     actions: None,
+                    vars: None,
                 },
             )
             .expect_err("an invalid dispatch input must refuse the committed workflow");
@@ -8832,6 +8855,7 @@ jobs:
                 inputs: Some(&inputs),
                 schedule: None,
                 actions: None,
+                vars: None,
             },
         )
         .expect("each workflow must receive its slice of the aggregate map");
@@ -8860,6 +8884,7 @@ jobs:
                 inputs: Some(&unknown),
                 schedule: None,
                 actions: None,
+                vars: None,
             },
         )
         .expect_err("an input declared by no matching workflow must be refused");
@@ -8931,6 +8956,7 @@ jobs:
                 inputs: Some(&inputs),
                 schedule: None,
                 actions: None,
+                vars: None,
             },
         )
         .expect("the compatible aggregate must run both workflows");
@@ -9007,6 +9033,7 @@ jobs:
                     inputs: Some(&inputs),
                     schedule: None,
                     actions: None,
+                    vars: None,
                 },
             )
             .expect_err("the real trigger must reject the same aggregate contract");
@@ -10305,6 +10332,42 @@ mod artifact_publication_tests {
             .expect("the workflow's job must reach the pipeline")
     }
 
+    /// card_a6f59b3d45f5: a trigger reads `vars.*` from the database — the
+    /// repository's variable over its organization's of the same name — and
+    /// the job's steps carry the values.
+    #[tokio::test]
+    async fn a_trigger_fills_in_the_repositorys_variables_over_its_organizations() {
+        use rg_db::ops::ci_variable_ops::{upsert, Owner};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        let (temp, sha, db, user, repo, repo_path) = workflow_fixture(
+            b"on: push\njobs:\n  build:\n    steps:\n      - run: echo \"${{ vars.REGION }}/${{ vars.TIER }}\"\n",
+        )
+        .await;
+        let org = rg_db::ops::org_ops::create_org(&db, "vars-org", None, None, user.id, "public")
+            .await
+            .unwrap();
+        rg_db::entities::repository::Entity::update_many()
+            .col_expr(
+                rg_db::entities::repository::Column::OrgId,
+                sea_orm::sea_query::Expr::value(org.id),
+            )
+            .filter(rg_db::entities::repository::Column::Id.eq(repo.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        for (owner, name, value) in [
+            (Owner::Organization(org.id), "REGION", "eu"),
+            (Owner::Organization(org.id), "TIER", "org-tier"),
+            (Owner::Repository(repo.id), "TIER", "repo-tier"),
+        ] {
+            upsert(&db, owner, name, value, user.id).await.unwrap();
+        }
+        let pipeline_id = trigger_graph(&db, temp.path(), &repo_path, repo.id, &sha, user.id).await;
+        let job = only_job(&db, pipeline_id).await;
+        let steps = job.steps.unwrap_or_default();
+        assert!(steps.contains("echo \\\"eu/repo-tier\\\""), "{steps}");
+    }
+
     /// `actions/upload-artifact` reaches the job row as a declaration the
     /// runner can act on.
     ///
@@ -11034,6 +11097,7 @@ jobs:
                     inputs: None,
                     schedule,
                     actions: None,
+                    vars: None,
                 },
             )
         };

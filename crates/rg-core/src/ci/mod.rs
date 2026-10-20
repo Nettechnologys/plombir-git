@@ -245,6 +245,19 @@ pub use rg_process::ci_steps::{
     STEPS_PROTOCOL,
 };
 
+/// What a native `.plombir-git-ci.yml` job's `CI_JOB_TOKEN` may do: read the
+/// repository and its packages, and be exchanged for a workload-identity token
+/// at `CI_OIDC_TOKEN_URL`. The format has no way to ask for less or more.
+pub const NATIVE_JOB_TOKEN_SCOPES: &str = "repo:read packages:read id-token:write";
+
+/// What an Actions job's token may do when its workflow declares no
+/// `permissions:` — GitHub's restricted default: read the repository and its
+/// packages, and no workload identity, which takes `id-token: write`.
+pub const DEFAULT_ACTIONS_JOB_TOKEN_SCOPES: &str = "repo:read packages:read";
+
+/// The scope a job token needs to be exchanged at `/ci/oidc/token`.
+pub const ID_TOKEN_SCOPE: &str = "id-token:write";
+
 pub fn is_builtin_ci_variable(name: &str) -> bool {
     BUILTIN_CI_VARIABLES.contains(&name)
 }

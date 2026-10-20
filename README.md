@@ -147,7 +147,8 @@ cited in the row added it. Plombir Git's side is specified in full in
 | Step outputs, `jobs.<id>.outputs`, `needs.<id>.outputs` | ✅ `$GITHUB_OUTPUT`, 1 MiB per job, masked; `::set-output` refused | ✅ |
 | Composite actions | ✅ `inputs`, `outputs`, nested up to 10 deep; the resolved commit is in the job log; `github.action_path` refused — an action's files do not reach the runner | ✅ |
 | Step `continue-on-error`, step `timeout-minutes`, step `shell` | ✅ each step is its own process, in both runners; `$GITHUB_ENV` / `$GITHUB_PATH` between steps | ✅ |
-| `permissions`, `vars.*` | ❌ refused | ✅ |
+| `vars.*` | ✅ repository and organization variables, the repository's winning | ✅ |
+| `permissions` | ⚠️ narrows the job token (`contents`, `packages`, `id-token: write` for OIDC); any other `write` refused — the token cannot write | ✅ |
 
 If your workflows lean on JavaScript or Docker marketplace actions, Gitea
 will run them and Plombir Git will not. Plombir Git also has its own pipeline format,

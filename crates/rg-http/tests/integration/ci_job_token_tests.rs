@@ -266,7 +266,8 @@ async fn lifecycle_loss_inside_the_job_finalizer_denies_both_consumers() {
             let (owner_token, _) =
                 register_full(&base, &username, &format!("{username}@example.invalid")).await;
             let repo_id = create_private_repo(&base, &owner_token, &repo).await;
-            let (job_token, job_id) = running_job_token(&db, repo_id, "repo:read").await;
+            let (job_token, job_id) =
+                running_job_token(&db, repo_id, "repo:read id-token:write").await;
 
             assert_eq!(
                 redeem_job_token(&client, &base, &username, &repo, &job_token, consumer).await,
@@ -318,7 +319,7 @@ async fn a_failed_job_finalizer_is_5xx_for_both_consumers() {
         let (owner_token, _) =
             register_full(&base, &username, &format!("{username}@example.invalid")).await;
         let repo_id = create_private_repo(&base, &owner_token, &repo).await;
-        let (job_token, job_id) = running_job_token(&db, repo_id, "repo:read").await;
+        let (job_token, job_id) = running_job_token(&db, repo_id, "repo:read id-token:write").await;
 
         assert_eq!(
             redeem_job_token(&client, &base, &username, &repo, &job_token, consumer).await,

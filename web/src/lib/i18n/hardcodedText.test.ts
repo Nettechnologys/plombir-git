@@ -82,6 +82,7 @@ const NON_TRANSLATABLE = new Set([
 	'v*',
 	'repo',
 	'DEPLOY_TOKEN',
+	'DEPLOY_REGION',
 	'alice, bob',
 	'alice-agent',
 	'alice/app',

@@ -15,6 +15,7 @@ mod accepted_values_column_widening;
 mod aggregate_sums_decode;
 mod ci_embedded_runner_atomicity;
 mod ci_initial_graph_atomicity;
+mod ci_variables;
 mod identity_keys_not_blank;
 mod issue_label_duplicates;
 mod job_assignment_race;

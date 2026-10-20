@@ -19,13 +19,13 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 440 |
-| Reachable from the browser | 311 (71%) |
+| Router routes (with declared `Access`) | 448 |
+| Reachable from the browser | 311 (69%) |
 | Layout modules | 2 |
-| Pages | 73 |
-| Interactive controls | 1059 |
+| Pages | 75 |
+| Interactive controls | 1068 |
 | Controls calling an API | 375 |
-| Controls from shared components | 427 |
+| Controls from shared components | 435 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
 | **UI routes without a web/smoke/browser test** | **24** |
 | UI routes without corpus or browser coverage | 0 |
@@ -37,11 +37,11 @@
 | `RepoRead` | 111 | 72 | 4 | 0 |
 | `RepoWrite` | 81 | 62 | 12 | 2 |
 | `User` | 55 | 45 | 5 | 0 |
-| `RepoAdmin` | 49 | 49 | 0 | 0 |
+| `RepoAdmin` | 53 | 49 | 0 | 4 |
 | `InstanceAdmin` | 33 | 28 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
+| `OrgAdmin` | 19 | 14 | 0 | 3 |
 | `RepoAuthRead` | 18 | 18 | 1 | 0 |
-| `OrgAdmin` | 15 | 14 | 0 | 0 |
 | `Foreign:oci.rs` | 14 | 0 | 0 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 13 | 0 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
@@ -61,9 +61,9 @@
 | `/[owner]/[repo]/boards` | 42 | 14 | 15 |
 | `/[owner]/[repo]/issues/[number]` | 40 | 17 | 23 |
 | `/[owner]/[repo]/pulls` | 28 | 12 | 12 |
+| `/orgs/[name]` | 28 | 10 | 2 |
 | `/[owner]/[repo]/pipelines` | 27 | 13 | 14 |
 | `/[owner]/[repo]/releases` | 27 | 12 | 11 |
-| `/orgs/[name]` | 27 | 10 | 2 |
 | `/[owner]/[repo]/issues` | 26 | 9 | 12 |
 | `/[owner]/[repo]` | 25 | 5 | 12 |
 | `/[owner]/[repo]/blob/[...path]` | 25 | 8 | 11 |
@@ -121,8 +121,10 @@
 | `/help` | 5 | 0 | 0 |
 | `/reset-password` | 5 | 1 | 0 |
 | `/[owner]` | 4 | 0 | 0 |
+| `/[owner]/[repo]/settings/ci-variables` | 4 | 0 | 4 |
 | `/[owner]/[repo]/settings/lfs-locks` | 4 | 2 | 2 |
 | `/notifications` | 4 | 4 | 0 |
+| `/orgs/[name]/variables` | 4 | 0 | 4 |
 | `/[owner]/[repo]/settings/retention` | 3 | 2 | 0 |
 | `/explore` | 3 | 2 | 0 |
 | `/forgot-password` | 3 | 1 | 0 |
@@ -1159,22 +1161,22 @@ succeed and which must be denied.
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
 | i18n:common.loading | :544 | `DELETE /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
-| editingOrg = false} disabled= > | :554 | `PATCH /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :603 | `POST /api/v1/repos` | `User` | rust+web+smoke |
-| i18n:common.loading | :603 | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web |
-| i18n:orgs.new_team | :639 | `POST /api/v1/orgs/{name}/teams` | `OrgAdmin` | rust+browser |
-| i18n:orgs.new_team | :639 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
-| i18n:orgs.hide_team_members | :664 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
-| ` ? t('common.loading') : t('common.delete')} | :668 | `DELETE /api/v1/orgs/{name}/teams/{team_id}` | `OrgAdmin` | rust+web+smoke+browser |
-| ` ? t('common.loading') : t('common.delete')} | :668 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
-| ` ? t('common.loading') : t('common.add')} | :679 | `POST /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgAdmin` | rust+web+browser |
-| ` ? t('common.loading') : t('common.add')} | :679 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
-| -$ ` ? t('common.loading') : t('common.delete')} | :707 | `DELETE /api/v1/orgs/{name}/teams/{team_id}/members/{user_id}` | `OrgAdmin` | rust+web+browser |
-| -$ ` ? t('common.loading') : t('common.delete')} | :707 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
-| i18n:orgs.member_placeholder | :732 | `POST /api/v1/orgs/{name}/members` | `OrgAdmin` | rust+web+smoke+browser |
-| i18n:orgs.member_placeholder | :732 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
-| ` ? t('common.loading') : t('common.delete')} | :760 | `DELETE /api/v1/orgs/{name}/members/{user_id}` | `OrgAdmin` | rust+web+smoke+browser |
-| ` ? t('common.loading') : t('common.delete')} | :760 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
+| editingOrg = false} disabled= > | :555 | `PATCH /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
+| i18n:common.loading | :604 | `POST /api/v1/repos` | `User` | rust+web+smoke |
+| i18n:common.loading | :604 | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web |
+| i18n:orgs.new_team | :640 | `POST /api/v1/orgs/{name}/teams` | `OrgAdmin` | rust+browser |
+| i18n:orgs.new_team | :640 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
+| i18n:orgs.hide_team_members | :665 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
+| ` ? t('common.loading') : t('common.delete')} | :669 | `DELETE /api/v1/orgs/{name}/teams/{team_id}` | `OrgAdmin` | rust+web+smoke+browser |
+| ` ? t('common.loading') : t('common.delete')} | :669 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
+| ` ? t('common.loading') : t('common.add')} | :680 | `POST /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgAdmin` | rust+web+browser |
+| ` ? t('common.loading') : t('common.add')} | :680 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
+| -$ ` ? t('common.loading') : t('common.delete')} | :708 | `DELETE /api/v1/orgs/{name}/teams/{team_id}/members/{user_id}` | `OrgAdmin` | rust+web+browser |
+| -$ ` ? t('common.loading') : t('common.delete')} | :708 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
+| i18n:orgs.member_placeholder | :733 | `POST /api/v1/orgs/{name}/members` | `OrgAdmin` | rust+web+smoke+browser |
+| i18n:orgs.member_placeholder | :733 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
+| ` ? t('common.loading') : t('common.delete')} | :761 | `DELETE /api/v1/orgs/{name}/members/{user_id}` | `OrgAdmin` | rust+web+smoke+browser |
+| ` ? t('common.loading') : t('common.delete')} | :761 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+web |
 | _(page load)_ | — | `GET /api/v1/orgs/{name}` | `OrgRead` | rust+web+smoke |
 
 ### `/orgs/[name]/hooks`
@@ -1376,12 +1378,20 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | PUT | `/api/v1/repos/{owner}/{name}/lfs/objects/{oid}` | `Foreign:api/lfs.rs` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/lfs/locks` | `Foreign:api/lfs_locks.rs` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/lfs/locks/verify` | `Foreign:api/lfs_locks.rs` | **—** |
+| GET | `/api/v1/orgs/{name}/actions/variables` | `OrgAdmin` | **—** |
+| GET | `/api/v1/orgs/{name}/actions/variables/{variable_name}` | `OrgAdmin` | **—** |
+| PUT | `/api/v1/orgs/{name}/actions/variables/{variable_name}` | `OrgAdmin` | rust |
+| DELETE | `/api/v1/orgs/{name}/actions/variables/{variable_name}` | `OrgAdmin` | **—** |
 | GET | `/api/v1/orgs/{name}/hooks/{id}` | `OrgAdmin` | rust |
 | GET | `/api/v1/admin/hooks/{id}` | `InstanceAdmin` | **—** |
 | GET | `/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}` | `RepoRead` | rust |
 | GET | `/api/v1/ci/oidc/.well-known/openid-configuration` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/jwks` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/token` | `Foreign:api/ci_oidc.rs` | rust |
+| GET | `/api/v1/repos/{owner}/{name}/actions/variables` | `RepoAdmin` | **—** |
+| GET | `/api/v1/repos/{owner}/{name}/actions/variables/{variable_name}` | `RepoAdmin` | **—** |
+| PUT | `/api/v1/repos/{owner}/{name}/actions/variables/{variable_name}` | `RepoAdmin` | **—** |
+| DELETE | `/api/v1/repos/{owner}/{name}/actions/variables/{variable_name}` | `RepoAdmin` | **—** |
 | GET | `/api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoRead` | rust |
 | DELETE | `/api/v1/repos/{owner}/{name}/branches/protection` | `RepoWrite` | **—** |
 | DELETE | `/api/v1/repos/{owner}/{name}/tags/protection` | `RepoWrite` | **—** |

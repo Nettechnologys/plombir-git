@@ -546,6 +546,7 @@
             </button>
           {/if}
           <a class="btn-secondary" href={`/orgs/${pathSegment(org.name)}/hooks`}>{t('settings.webhooks.title')}</a>
+          <a class="btn-secondary" href={`/orgs/${pathSegment(org.name)}/variables`}>{t('settings.ci_variables.title')}</a>
         </div>
       {/if}
     </div>

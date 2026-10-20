@@ -69,9 +69,10 @@ where
     }
 }
 
-/// Default CI token scopes for jobs.
-/// Grants read access to the triggering repo and packages.
-const DEFAULT_CI_TOKEN_SCOPES: &str = "repo:read packages:read";
+/// The scopes a job's `CI_JOB_TOKEN` is minted with when its context names
+/// none: a native job, or one translated before `permissions:` was read. An
+/// Actions job carries its own ([`rg_process::ci_steps::JobContext::token_scopes`]).
+const DEFAULT_CI_TOKEN_SCOPES: &str = rg_core::ci::NATIVE_JOB_TOKEN_SCOPES;
 
 /// Outcome of running one pipeline stage.
 enum StageOutcome {
@@ -1144,24 +1145,6 @@ impl PipelineRunner {
         let timeout_secs =
             rg_core::ci::resolve_job_timeout_secs(job_id, timeout_seconds, self.job_timeout_secs);
 
-        // Generate CI_JOB_TOKEN if we have the secret and repo_id
-        let ci_job_token = if let Some(ref secret) = self.jwt_secret {
-            if self.repo_id > 0 {
-                rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
-                    self.repo_id,
-                    self.pipeline_id,
-                    job_id,
-                    DEFAULT_CI_TOKEN_SCOPES,
-                    secret,
-                    rg_core::ci::ci_job_token_ttl_secs(timeout_secs),
-                )
-                .ok()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         // A job of steps runs them one by one; a native job runs its script.
         // The steps are decoded before anything starts, so a row this server
         // cannot read fails the job instead of running half of it.
@@ -1178,12 +1161,36 @@ impl PipelineRunner {
             })
             .transpose()?
             .unwrap_or_default();
+        // What `permissions:` left the token, or the native token.
+        let token_scopes = job_context
+            .token_scopes
+            .as_deref()
+            .unwrap_or(DEFAULT_CI_TOKEN_SCOPES);
+        // Generate CI_JOB_TOKEN if we have the secret and repo_id
+        let ci_job_token = if let Some(ref secret) = self.jwt_secret {
+            if self.repo_id > 0 {
+                rg_core::auth::ci_token::generate_ci_job_token_with_ttl(
+                    self.repo_id,
+                    self.pipeline_id,
+                    job_id,
+                    token_scopes,
+                    secret,
+                    rg_core::ci::ci_job_token_ttl_secs(timeout_secs),
+                )
+                .ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let (job_environment, secret_values, ignored_variables) = self
             .job_environment(
                 ci_job_token.as_deref(),
                 variables,
                 environment_id,
                 job_context.secrets.as_ref(),
+                token_scopes,
             )
             .await?;
         let cache = cache_spec(cache_key, cache_paths, &job_environment)?;
@@ -1657,6 +1664,7 @@ impl PipelineRunner {
         variables: Option<&str>,
         environment_id: Option<i64>,
         secret_scope: Option<&std::collections::BTreeSet<String>>,
+        token_scopes: &str,
     ) -> Result<(Vec<(String, String)>, Vec<String>, Vec<String>)> {
         let pipeline = pipeline_ops::get_pipeline(&self.db, self.pipeline_id)
             .await?
@@ -1725,8 +1733,15 @@ impl PipelineRunner {
             secret_values.push(token.to_string());
             env.insert("CI_JOB_TOKEN".into(), token.to_string());
         }
+        // Only a token that may be exchanged there is told where: a job whose
+        // `permissions:` withheld `id-token: write` has nothing to ask it.
         if let Some(url) = &self.oidc_token_url {
-            env.insert("CI_OIDC_TOKEN_URL".into(), url.clone());
+            if token_scopes
+                .split_whitespace()
+                .any(|scope| scope == rg_core::ci::ID_TOKEN_SCOPE)
+            {
+                env.insert("CI_OIDC_TOKEN_URL".into(), url.clone());
+            }
         }
         if let Ok(path) = std::env::var("PATH") {
             env.insert("PATH".into(), path);
@@ -2934,7 +2949,7 @@ mod tests {
             let runner = &runner;
             async move {
                 let (variables, _, _) = runner
-                    .job_environment(None, None, environment, None)
+                    .job_environment(None, None, environment, None, DEFAULT_CI_TOKEN_SCOPES)
                     .await
                     .unwrap();
                 variables
@@ -2976,7 +2991,13 @@ mod tests {
         // one, and every value is still masked.
         let scope = std::collections::BTreeSet::from(["REPO_KEY".to_string()]);
         let (variables, masked, _) = runner
-            .job_environment(None, None, Some(staging), Some(&scope))
+            .job_environment(
+                None,
+                None,
+                Some(staging),
+                Some(&scope),
+                DEFAULT_CI_TOKEN_SCOPES,
+            )
             .await
             .unwrap();
         let secrets: std::collections::BTreeMap<_, _> = variables
@@ -2988,6 +3009,33 @@ mod tests {
             assert!(
                 masked.iter().any(|masked| masked == value),
                 "{value} unmasked"
+            );
+        }
+    }
+
+    /// card_a6f59b3d45f5: only a token that may be exchanged for a workload
+    /// identity is told where — an Actions job whose `permissions:` did not
+    /// ask for `id-token: write` is not.
+    #[tokio::test]
+    async fn the_oidc_address_reaches_only_a_job_whose_token_may_use_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runner = cache_runner(temp.path()).await;
+        runner.set_oidc_token_url("https://forge.example/api/v1/ci/oidc/token".into());
+        for (scopes, expected) in [
+            (rg_core::ci::NATIVE_JOB_TOKEN_SCOPES, true),
+            (rg_core::ci::DEFAULT_ACTIONS_JOB_TOKEN_SCOPES, false),
+            ("repo:read id-token:write", true),
+        ] {
+            let (environment, _, _) = runner
+                .job_environment(None, None, None, None, scopes)
+                .await
+                .unwrap();
+            assert_eq!(
+                environment
+                    .iter()
+                    .any(|(name, _)| name == "CI_OIDC_TOKEN_URL"),
+                expected,
+                "{scopes}"
             );
         }
     }
@@ -3004,6 +3052,7 @@ mod tests {
                 Some(r#"{"CI":"false","CI_JOB_TOKEN":"forged","BAD-NAME":"x","DEPLOY":"prod"}"#),
                 None,
                 None,
+                DEFAULT_CI_TOKEN_SCOPES,
             )
             .await
             .unwrap();
@@ -3059,7 +3108,7 @@ mod tests {
                 .map(|(_, value)| value.clone())
         };
         let (environment, _, _) = runner
-            .job_environment(None, None, None, None)
+            .job_environment(None, None, None, None, DEFAULT_CI_TOKEN_SCOPES)
             .await
             .unwrap();
         assert_eq!(variable(&environment).as_deref(), Some("0 3 * * *"));
@@ -3071,7 +3120,7 @@ mod tests {
             Some("schedule")
         );
         let (environment, _, _) = pushed
-            .job_environment(None, None, None, None)
+            .job_environment(None, None, None, None, DEFAULT_CI_TOKEN_SCOPES)
             .await
             .unwrap();
         assert_eq!(variable(&environment), None);

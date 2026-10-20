@@ -1721,6 +1721,20 @@ async fn seed_repo_rows(
         "fixture: seeding the {SWEEP_SECRET} secret in {repo} failed with {}",
         secret.status()
     );
+    // A variable is addressed by name the same way (`{variable_name}`).
+    let variable = fx
+        .client
+        .put(format!("{prefix}/actions/variables/{SWEEP_VARIABLE}"))
+        .bearer_auth(&fx.owner_token)
+        .json(&serde_json::json!({"value": "sweep-variable-value"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        variable.status().is_success(),
+        "fixture: seeding the {SWEEP_VARIABLE} variable in {repo} failed with {}",
+        variable.status()
+    );
     // Deploy keys are unique instance-wide by fingerprint, so the two
     // repositories cannot share one.
     let deploy_key = json_of(created("deploy key")(
@@ -1998,6 +2012,10 @@ struct Account {
 /// therefore has to create.
 const SWEEP_SECRET: &str = "SWEEP_SECRET";
 
+/// The variable name `fill` puts in `{variable_name}`; the fixture creates it
+/// in both repositories and in the organization.
+const SWEEP_VARIABLE: &str = "SWEEP_VARIABLE";
+
 /// The wiki page title `fill` puts in `{title}`.
 const WIKI_TITLE: &str = "Home";
 
@@ -2193,6 +2211,7 @@ fn fill(fact: &RouteFact, repo: &RepoSeed, globals: &GlobalSeed, org: &str) -> S
             "slug" => "sweep-provider",
             "archive" => "main.zip",
             "secret_name" => SWEEP_SECRET,
+            "variable_name" => SWEEP_VARIABLE,
             // `generic` rather than a protocol: it is the one registry whose
             // upload is a plain byte body, so the `/packages/{pkg_type}/…`
             // family below can be answered by a package this fixture really
@@ -2541,6 +2560,22 @@ async fn every_route_answers_its_declared_access_level() {
         .await
         .expect("fixture: create organization hook");
     assert_eq!(org_hook_response.status(), StatusCode::CREATED);
+    let org_variable = fx
+        .client
+        .put(format!(
+            "{}/api/v1/orgs/{ORG}/actions/variables/{SWEEP_VARIABLE}",
+            fx.base
+        ))
+        .bearer_auth(&fx.owner_token)
+        .json(&serde_json::json!({"value": "sweep-org-variable"}))
+        .send()
+        .await
+        .expect("fixture: create organization variable");
+    assert!(
+        org_variable.status().is_success(),
+        "{}",
+        org_variable.status()
+    );
     let org_hook_id = org_hook_response
         .json::<serde_json::Value>()
         .await
