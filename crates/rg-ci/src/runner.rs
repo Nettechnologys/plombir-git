@@ -403,6 +403,14 @@ impl PipelineRunner {
     /// leaves behind holds CPU, memory and the job's workspace mount.
     async fn remove_job_container(&self, job_id: i64) {
         let container_name = self.job_container_name(job_id);
+        // Its services first: they are named after it, and their network
+        // cannot go while it is still on it — `remove_services_of`
+        // disconnects it before removing the network.
+        rg_process::ci_services::remove_services_of(
+            self.docker_program.as_os_str(),
+            &container_name,
+        )
+        .await;
         let mut command = self.docker_command();
         command.args(["rm", "-f", &container_name]);
         let removal = command.output();
@@ -1238,6 +1246,24 @@ impl PipelineRunner {
             })
             .transpose()?
             .unwrap_or_default();
+        // A service is a container. Without Docker there is nothing to start it
+        // in, and running the steps anyway would hand them a `postgres:5432`
+        // that answers nothing — so the job is refused, naming what it asked
+        // for, the way an `image:` is.
+        if !job_context.services.is_empty() && !self.docker_enabled {
+            let keys: Vec<&str> = job_context
+                .services
+                .iter()
+                .map(|service| service.key.as_str())
+                .collect();
+            let msg = format!(
+                "This job declares services: ({}), which run as Docker containers, but Docker is                  disabled on this runner (ci.docker_enabled = false). Enable Docker, or run the                  job on an external runner that has it.",
+                keys.join(", ")
+            );
+            tracing::warn!(job_id, "{}", msg);
+            return Err(anyhow::anyhow!("{}", msg));
+        }
+        let has_services = !job_context.services.is_empty();
         let exec_future = async {
             if let Some(steps) = &steps {
                 self.run_job_steps(
@@ -1270,7 +1296,7 @@ impl PipelineRunner {
                 {
                     Ok(result) => result,
                     Err(_elapsed) => {
-                        if image.is_some() {
+                        if image.is_some() || has_services {
                             self.remove_job_container(job_id).await;
                         }
                         let msg = format!("Job timed out after {} seconds", timeout_secs);
@@ -1309,7 +1335,7 @@ impl PipelineRunner {
         let Some(result) = result else {
             // Dropping the execution killed a local job's process tree; a
             // container is daemon-owned and has to be removed by name.
-            if image.is_some() {
+            if image.is_some() || has_services {
                 self.remove_job_container(job_id).await;
             }
             return Ok(None);
@@ -1453,6 +1479,13 @@ impl PipelineRunner {
             user: rg_process::container_user(),
             limits: &self.job_limits,
         });
+        let services = rg_process::ci_services::ServicesRun {
+            program: self.docker_program.as_os_str(),
+            owner: &container_name,
+            specs: &job_context.services,
+            limits: &self.job_limits,
+            health_timeout: rg_process::ci_services::HEALTH_TIMEOUT,
+        };
         let mask = |log: &str| rg_core::auth::encryption::mask_values(log, secret_values);
         let mut reporter = DbStepReporter {
             db: &self.db_write,
@@ -1463,6 +1496,7 @@ impl PipelineRunner {
             job_environment,
             &self.workspace_path(),
             image,
+            Some(services),
             &mask,
             &needs,
             &job_context.outputs,
@@ -1576,6 +1610,7 @@ impl PipelineRunner {
                 variables: job_environment,
                 limits: &self.job_limits,
                 temp: None,
+                network: None,
             },
         )
         .await
@@ -4685,6 +4720,55 @@ esac
             .unwrap();
         assert_eq!(outcome, None, "a canceled job was executed");
         assert!(!marker.exists(), "a canceled job's script ran");
+    }
+
+    /// card_bc6676ec0ae3: a service is a container. With Docker off, the job is
+    /// refused naming its services — not run against a `postgres` nothing
+    /// started — and none of its steps runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_job_with_services_is_refused_by_name_without_docker() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("ran");
+        let (runner, _db, job, _pipeline_id) =
+            publishing_job(temp.path(), "services-without-docker", "true").await;
+        let steps = serde_json::json!([{
+            "name": "Query",
+            "run": format!("touch '{}'", marker.display()),
+        }])
+        .to_string();
+        let context = serde_json::json!({
+            "services": [
+                {"key": "postgres", "image": "postgres:16"},
+                {"key": "redis", "image": "redis:7"},
+            ],
+        })
+        .to_string();
+
+        let error = runner
+            .run_job(
+                job.id,
+                job.environment_id,
+                &job.script,
+                None,
+                None,
+                None,
+                None,
+                None,
+                job.timeout_seconds,
+                None,
+                Some(&steps),
+                Some(&context),
+            )
+            .await
+            .expect_err("a job with services cannot run without Docker");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("services: (postgres, redis)")
+                && message.contains("ci.docker_enabled"),
+            "the refusal names the services and the setting: {message}"
+        );
+        assert!(!marker.exists(), "a step ran without its services");
     }
 
     #[tokio::test]

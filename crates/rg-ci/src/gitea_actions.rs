@@ -642,6 +642,12 @@ pub struct GiteaJob {
     /// Container specification.
     pub container: Option<GiteaContainer>,
 
+    /// Containers the job's steps talk to — `services.<key>` — started before
+    /// the first step on a network of the job's own. Docker only; see
+    /// `rg_process::ci_services`.
+    #[serde(default)]
+    pub services: std::collections::BTreeMap<String, GiteaService>,
+
     /// Job-level environment variables.
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -855,6 +861,156 @@ pub struct GiteaContainer {
     /// Environment variables for the container.
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+/// One `jobs.<id>.services.<key>` entry.
+///
+/// `volumes` is not here, and therefore refused by name: a bind mount is a way
+/// into the runner's filesystem, and a named volume outlives the job.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GiteaService {
+    pub image: String,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub ports: Vec<GiteaServicePort>,
+    pub credentials: Option<GiteaServiceCredentials>,
+    /// Health-check flags only; anything else is refused by name
+    /// ([`rg_process::ci_services::parse_health_options`]).
+    pub options: Option<String>,
+}
+
+/// A `ports:` entry, which YAML may hand over as a number.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum GiteaServicePort {
+    Number(u64),
+    Text(String),
+}
+
+impl GiteaServicePort {
+    fn text(&self) -> String {
+        match self {
+            Self::Number(port) => port.to_string(),
+            Self::Text(text) => text.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GiteaServiceCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// What is wrong with each job's `services:`, by the job and the qualified key.
+///
+/// Read here, when the workflow is, so a typo in a port or a flag that would
+/// open the sandbox fails the trigger instead of a job after its runner has
+/// pulled the images. The runner checks again — a stored row is data — but a
+/// workflow it would refuse never gets that far.
+fn unsupported_service_declarations(workflow: &GiteaWorkflow) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (job_name, job) in &workflow.jobs {
+        if job.uses.is_some() && !job.services.is_empty() {
+            problems.push(format!(
+                "{job_name}: services on a job that calls a reusable workflow; declare them on \
+                 the called workflow's jobs"
+            ));
+        }
+        for (key, service) in &job.services {
+            let site = format!("{job_name}: services.{key}");
+            if !rg_process::ci_services::valid_service_key(key) {
+                problems.push(format!(
+                    "{site}: a service key is a letter or digit, then letters, digits, `-` and \
+                     `_`, at most 63 — it is the service's name on the job's network"
+                ));
+            }
+            if service.image.trim().is_empty() {
+                problems.push(format!("{site}.image is empty"));
+            } else if !service.image.contains("${{") {
+                if let Err(rule) =
+                    rg_process::image_reference::validate_image_reference(&service.image)
+                {
+                    problems.push(format!("{site}.image: {rule}"));
+                }
+            }
+            for port in &service.ports {
+                if let Err(reason) = rg_process::ci_services::parse_port(&port.text()) {
+                    problems.push(format!("{site}.ports {reason}"));
+                }
+            }
+            if let Some(options) = &service.options {
+                if let Err(reason) = rg_process::ci_services::parse_health_options(options) {
+                    problems.push(format!("{site}.options {reason}"));
+                }
+            }
+            if let Some(credentials) = &service.credentials {
+                if credentials.username.trim().is_empty() || credentials.password.trim().is_empty()
+                {
+                    problems.push(format!(
+                        "{site}.credentials needs both a username and a password"
+                    ));
+                }
+            }
+            // A service starts before the job's first step, and the runner
+            // fills `steps.*` and `needs.*` in between steps — into a step,
+            // never into a container that is already running. Left in place,
+            // the expression would reach the service as its own text.
+            let mut fields = vec![(format!("{site}.image"), &service.image)];
+            fields.extend(
+                service
+                    .env
+                    .iter()
+                    .map(|(name, value)| (format!("{site}.env.{name}"), value)),
+            );
+            if let Some(credentials) = &service.credentials {
+                fields.push((
+                    format!("{site}.credentials.username"),
+                    &credentials.username,
+                ));
+                fields.push((
+                    format!("{site}.credentials.password"),
+                    &credentials.password,
+                ));
+            }
+            for (field, value) in fields {
+                for key in expression_keys(value) {
+                    if rg_process::ci_steps::RuntimeKey::parse(&key).is_some() {
+                        problems.push(format!(
+                            "{field} expression `{key}`: a service starts before the job's first \
+                             step, so what steps and needed jobs leave cannot reach it"
+                        ));
+                    }
+                }
+            }
+            for name in service.env.keys() {
+                if !rg_process::job_environment::reaches_container(name) {
+                    problems.push(format!(
+                        "{site}.env.{name} is not a variable a container can be given"
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// The trimmed key of every `${{ … }}` group in `text`.
+fn expression_keys(text: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("${{") {
+        let after = &rest[open + 3..];
+        let Some(close) = after.find("}}") else {
+            break;
+        };
+        keys.push(after[..close].trim().to_string());
+        rest = &after[close + 2..];
+    }
+    keys
 }
 
 /// Concurrency configuration (Gitea Actions format).
@@ -1133,6 +1289,22 @@ fn unsupported_run_expression_sites(workflow: &GiteaWorkflow) -> Vec<String> {
         if let Some(container) = &job.container {
             for (name, value) in &container.env {
                 inspect(format!("{job_name}: container.env.{name}"), value);
+            }
+        }
+        for (key, service) in &job.services {
+            inspect(format!("{job_name}: services.{key}.image"), &service.image);
+            for (name, value) in &service.env {
+                inspect(format!("{job_name}: services.{key}.env.{name}"), value);
+            }
+            if let Some(credentials) = &service.credentials {
+                inspect(
+                    format!("{job_name}: services.{key}.credentials.username"),
+                    &credentials.username,
+                );
+                inspect(
+                    format!("{job_name}: services.{key}.credentials.password"),
+                    &credentials.password,
+                );
             }
         }
         if let Some(directory) = job
@@ -2350,6 +2522,7 @@ impl GiteaWorkflow {
             (uploads > 1)
                 .then(|| format!("{job_name}: {uploads} actions/upload-artifact steps in one job"))
         }));
+        unsupported.extend(unsupported_service_declarations(self));
         unsupported.extend(unsupported_run_expression_sites(self));
         unsupported.extend(unsupported_job_field_expression_sites(self));
         unsupported.extend(unresolvable_runtime_references(self));
@@ -2577,6 +2750,45 @@ impl GiteaWorkflow {
                             output.clone(),
                             substitute_expr(value, name, &self.env, &job_vars, None),
                         )
+                    })
+                    .collect(),
+                services: job
+                    .services
+                    .iter()
+                    .map(|(key, service)| {
+                        let substitute =
+                            |value: &str| substitute_expr(value, name, &self.env, &job_vars, None);
+                        rg_process::ci_services::ServiceSpec {
+                            key: key.clone(),
+                            image: substitute(&service.image),
+                            env: service
+                                .env
+                                .iter()
+                                .map(|(env, value)| (env.clone(), substitute(value)))
+                                .collect(),
+                            // Checked by `unsupported_service_declarations`
+                            // before any workflow is converted.
+                            ports: service
+                                .ports
+                                .iter()
+                                .filter_map(|port| {
+                                    rg_process::ci_services::parse_port(&port.text()).ok()
+                                })
+                                .collect(),
+                            credentials: service.credentials.as_ref().map(|credentials| {
+                                rg_process::ci_services::ServiceCredentials {
+                                    username: substitute(&credentials.username),
+                                    password: substitute(&credentials.password),
+                                }
+                            }),
+                            health: service
+                                .options
+                                .as_deref()
+                                .and_then(|options| {
+                                    rg_process::ci_services::parse_health_options(options).ok()
+                                })
+                                .unwrap_or_default(),
+                        }
                     })
                     .collect(),
             };
@@ -6219,6 +6431,102 @@ jobs:
             ),
             "{error}"
         );
+    }
+
+    /// card_bc6676ec0ae3: `services:` reaches the runner as data on the job's
+    /// context — the secret and the matrix value as `${NAME}` the runner fills
+    /// from the job's own variables, the health check as checked flags.
+    #[test]
+    fn services_travel_to_the_runner_on_the_jobs_context() {
+        let workflow = GiteaWorkflow::parse(
+            "on: push\njobs:\n  test:\n    strategy:\n      matrix:\n        pg: ['16']\n    container:\n      image: postgres:16\n    services:\n      postgres:\n        image: postgres:${{ matrix.pg }}\n        env:\n          POSTGRES_PASSWORD: ${{ secrets.PG_PASSWORD }}\n        ports:\n          - 5432\n          - '6543:5432'\n        options: >-\n          --health-cmd pg_isready\n          --health-interval 10s\n        credentials:\n          username: bot\n          password: ${{ secrets.REGISTRY_TOKEN }}\n    steps:\n      - run: pg_isready -h postgres\n",
+        )
+        .unwrap();
+        workflow.validate_supported_actions().unwrap();
+        let config = workflow.to_ci_config(&test_context());
+
+        let services = &config.jobs["test"].job_context.as_ref().unwrap().services;
+        assert_eq!(services.len(), 1);
+        let postgres = &services[0];
+        assert_eq!(postgres.key, "postgres");
+        assert_eq!(postgres.image, "postgres:${MATRIX_PG}");
+        assert_eq!(postgres.env["POSTGRES_PASSWORD"], "${PG_PASSWORD}");
+        assert_eq!(
+            postgres.ports,
+            [
+                rg_process::ci_services::parse_port("5432").unwrap(),
+                rg_process::ci_services::parse_port("6543:5432").unwrap()
+            ]
+        );
+        assert_eq!(
+            postgres.health,
+            ["--health-cmd=pg_isready", "--health-interval=10s"]
+        );
+        let credentials = postgres.credentials.as_ref().unwrap();
+        assert_eq!(credentials.username, "bot");
+        assert_eq!(credentials.password, "${REGISTRY_TOKEN}");
+    }
+
+    /// What `services:` cannot honour is refused by its qualified key, before
+    /// a runner pulls anything.
+    #[test]
+    fn a_service_that_would_open_the_sandbox_or_cannot_run_is_refused_by_name() {
+        let refusal = |service: &str| {
+            let yaml = format!(
+                "on: push\njobs:\n  test:\n    services:\n{service}    steps:\n      - run: true\n"
+            );
+            match GiteaWorkflow::parse(&yaml) {
+                Err(error) => format!("{error:#}"),
+                Ok(workflow) => format!(
+                    "{:#}",
+                    workflow
+                        .validate_supported_actions()
+                        .expect_err("the service must be refused")
+                ),
+            }
+        };
+        for (service, named) in [
+            (
+                "      db:\n        image: postgres\n        options: --privileged\n",
+                "test: services.db.options `--privileged`",
+            ),
+            (
+                "      db:\n        image: postgres\n        options: --health-cmd true --network host\n",
+                "`--network`",
+            ),
+            (
+                "      db:\n        image: postgres\n        ports: ['0.0.0.0:5432:5432']\n",
+                "test: services.db.ports",
+            ),
+            (
+                "      db:\n        image: postgres\n        volumes: ['/:/host']\n",
+                "volumes",
+            ),
+            ("      db.primary:\n        image: postgres\n", "test: services.db.primary"),
+            (
+                "      db:\n        image: '--privileged'\n",
+                "test: services.db.image",
+            ),
+            (
+                "      db:\n        image: postgres\n        env:\n          X: ${{ steps.a.outputs.b }}\n",
+                "test: services.db.env.X",
+            ),
+            (
+                "      db:\n        image: postgres\n        env:\n          Y: ${{ needs.build.outputs.v }}\n",
+                "test: services.db.env.Y expression `needs.build.outputs.v`",
+            ),
+            (
+                "      db:\n        image: postgres\n        env:\n          LD_PRELOAD: x\n",
+                "test: services.db.env.LD_PRELOAD",
+            ),
+            (
+                "      db:\n        image: postgres\n        credentials:\n          username: u\n          password: ''\n",
+                "test: services.db.credentials",
+            ),
+        ] {
+            let error = refusal(service);
+            assert!(error.contains(named), "{named:?} not named in: {error}");
+        }
     }
 
     /// What a job's steps and its `outputs:` read stays a `${{ }}` the runner

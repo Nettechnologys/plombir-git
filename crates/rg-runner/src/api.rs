@@ -67,7 +67,7 @@ pub async fn poll_job(
         // the header the server never hands it a job of steps.
         .header(
             rg_process::ci_steps::RUNNER_PROTOCOL_HEADER,
-            rg_process::ci_steps::STEPS_PROTOCOL.to_string(),
+            rg_process::ci_steps::RUNNER_PROTOCOL.to_string(),
         )
         .send()
         .await?;
@@ -108,6 +108,9 @@ pub struct PollJobResponse {
     /// The job's `outputs:` templates, resolved after its last step.
     #[serde(default)]
     pub(crate) outputs: std::collections::BTreeMap<String, String>,
+    /// The job's `services:`, started before its first step.
+    #[serde(default)]
+    pub(crate) services: Vec<rg_process::ci_services::ServiceSpec>,
 }
 
 /// Per-request timeout for the heartbeat call.

@@ -260,6 +260,10 @@ pub struct JobContainer<'a> {
     /// [`crate::ci_steps::CONTAINER_TEMP`]. Only a steps container
     /// ([`steps_run_args`]) has one.
     pub temp: Option<&'a Path>,
+    /// The Docker network of the job's `services:`, which the container joins
+    /// so it reaches each service by its key (`crate::ci_services`). `None`:
+    /// the daemon's default network, as before services existed.
+    pub network: Option<&'a str>,
 }
 
 /// What a steps container runs until the runner `docker exec`s the job's steps
@@ -363,6 +367,9 @@ fn container_args(
         ]);
     }
     args.extend(["-w".to_string(), "/workspace".to_string()]);
+    if let Some(network) = job.network {
+        args.extend(["--network".to_string(), network.to_string()]);
+    }
     // The workspace is created owner-only and container root holds no capability
     // to override that, so the job runs as the workspace's owner, which keeps
     // everything it builds removable by the cleanup.
@@ -491,9 +498,32 @@ pub async fn resolve_image(
     program: impl AsRef<std::ffi::OsStr>,
     image: &str,
 ) -> Result<ResolvedImage, ImageUnavailable> {
-    let program = program.as_ref();
+    resolve(program.as_ref(), image, None).await
+}
+
+/// [`resolve_image`] with the pull run under the Docker configuration in
+/// `config` — a service image's own registry login
+/// (`crate::ci_services`) — instead of the operator's.
+///
+/// The image is pulled whether or not the daemon already holds it: a local
+/// copy proves nothing about whether this login may read the image, and a
+/// private image another job pulled with other credentials must not start
+/// for a job that brought none that work.
+pub(crate) async fn resolve_image_with_config(
+    program: impl AsRef<std::ffi::OsStr>,
+    image: &str,
+    config: &Path,
+) -> Result<ResolvedImage, ImageUnavailable> {
+    resolve(program.as_ref(), image, Some(config)).await
+}
+
+async fn resolve(
+    program: &std::ffi::OsStr,
+    image: &str,
+    config: Option<&Path>,
+) -> Result<ResolvedImage, ImageUnavailable> {
     let trust = crate::job_environment::content_trust_enabled();
-    if !trust {
+    if !trust && config.is_none() {
         if let Some(id) = local_image_id(program, image).await {
             return Ok(ResolvedImage {
                 id,
@@ -503,6 +533,9 @@ pub async fn resolve_image(
     }
 
     let mut pull = image_client(program);
+    if let Some(config) = config {
+        pull.arg("--config").arg(config);
+    }
     pull.args(["pull", "--", image]);
     let pulled = crate::output_ci_job_in_process_tree(&mut pull)
         .await
@@ -825,6 +858,7 @@ mod tests {
             variables,
             limits: &DEFAULT_LIMITS,
             temp: None,
+            network: None,
         }
     }
 

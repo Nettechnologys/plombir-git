@@ -240,7 +240,9 @@ pub const BUILTIN_CI_VARIABLES: [&str; 12] = rg_process::job_environment::RUNNER
 
 /// The runner protocol of the step model, for the HTTP layer that hands jobs
 /// out — see [`rg_process::ci_steps::STEPS_PROTOCOL`].
-pub use rg_process::ci_steps::{MAX_JOB_OUTPUT_BYTES, RUNNER_PROTOCOL_HEADER, STEPS_PROTOCOL};
+pub use rg_process::ci_steps::{
+    MAX_JOB_OUTPUT_BYTES, RUNNER_PROTOCOL_HEADER, SERVICES_PROTOCOL, STEPS_PROTOCOL,
+};
 
 pub fn is_builtin_ci_variable(name: &str) -> bool {
     BUILTIN_CI_VARIABLES.contains(&name)

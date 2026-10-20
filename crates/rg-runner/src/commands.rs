@@ -716,6 +716,21 @@ const CONTAINER_REMOVAL_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// but the failure is named, because what it leaves behind is a container that
 /// keeps holding CPU, memory and the job's workspace mount.
 async fn remove_job_container(container_name: &str) {
+    // The job's `services:` are named after its container and go with it; the
+    // same bound applies, and what it cannot reach in time the next job with
+    // services sweeps (`rg_process::ci_services::sweep_orphans`).
+    if tokio::time::timeout(
+        CONTAINER_REMOVAL_TIMEOUT,
+        rg_process::ci_services::remove_services_of(std::ffi::OsStr::new("docker"), container_name),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            container_name,
+            "removing the job's services did not finish within {CONTAINER_REMOVAL_TIMEOUT:?}"
+        );
+    }
     let removal = tokio::process::Command::new("docker")
         .args(["rm", "-f", container_name])
         .output();
@@ -997,7 +1012,8 @@ pub async fn run_jobs_until_shutdown_checking_every(
                     // is not `-d`, but dropping this process's docker client does not
                     // stop what it started, so an interrupted container has to be
                     // removed by name.
-                    let container_name = job.image.as_ref().map(|_| job_container_name(job.job_id));
+                    let container_name = (job.image.is_some() || !job.services.is_empty())
+                        .then(|| job_container_name(job.job_id));
                     if let Some(name) = &container_name {
                         remember_live_container(live_container, name.clone());
                     }
@@ -1028,6 +1044,15 @@ pub async fn run_jobs_until_shutdown_checking_every(
                                         image,
                                         user: rg_process::container_user(),
                                         limits: job_limits,
+                                    }
+                                }),
+                                container_name.as_deref().map(|owner| {
+                                    rg_process::ci_services::ServicesRun {
+                                        program: std::ffi::OsStr::new("docker"),
+                                        owner,
+                                        specs: &job.services,
+                                        limits: job_limits,
+                                        health_timeout: rg_process::ci_services::HEALTH_TIMEOUT,
                                     }
                                 }),
                                 &mask,

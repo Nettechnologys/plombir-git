@@ -12,6 +12,7 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 
 pub mod ci_condition;
+pub mod ci_services;
 pub mod ci_steps;
 pub mod client_policy;
 pub mod docker_job;

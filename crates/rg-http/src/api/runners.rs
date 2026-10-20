@@ -111,6 +111,13 @@ pub struct PollJobResponse {
     /// The job's `outputs:` templates, resolved by the runner after the last
     /// step and sent back with `finish`.
     outputs: std::collections::BTreeMap<String, String>,
+    /// The job's `services:` — `{key, image, env, ports, credentials,
+    /// health}` — which the runner starts before the first step. Only a runner
+    /// that speaks [`rg_core::ci::SERVICES_PROTOCOL`] is ever handed a job
+    /// that has any.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<Object>)]
+    services: Vec<serde_json::Value>,
 }
 
 /// The job context as `pipeline_jobs.job_context` stores it.
@@ -120,6 +127,8 @@ struct StoredJobContext {
     needs: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     outputs: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    services: Vec<serde_json::Value>,
 }
 
 /// The artifact declaration as `pipeline_jobs.artifacts` stores it.
@@ -506,7 +515,7 @@ pub async fn deregister(
         (status = 200, description = "Job assigned", body = PollJobResponse),
         (status = 204, description = "No job available (timeout)"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
-        (status = 426, description = "The only work this runner could take is a job of steps, and it did not send the steps protocol header", body = serde_json::Value),
+        (status = 426, description = "The only work this runner could take is a job of steps, or a job with services, and it did not send a protocol header that runs it", body = serde_json::Value),
     ),
 )]
 pub async fn poll_job(
@@ -516,7 +525,9 @@ pub async fn poll_job(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let timeout_secs = query.timeout.unwrap_or(30).min(300);
-    let runs_steps = runner_runs_steps(&headers);
+    let protocol = runner_protocol(&headers);
+    let runs_steps = protocol >= rg_core::ci::STEPS_PROTOCOL;
+    let runs_services = protocol >= rg_core::ci::SERVICES_PROTOCOL;
 
     // Use tokio::time::timeout to wrap a polling loop
     let poll_future = async {
@@ -541,7 +552,11 @@ pub async fn poll_job(
                     return Err(steps_protocol_refusal(runner_id, &job));
                 }
                 Ok(rg_db::ops::pipeline_ops::PendingPick::Job(job)) => {
-                    let (resp, encrypted_mask) = prepare_dispatch(&state, runner_id, job).await?;
+                    let (resp, encrypted_mask) =
+                        prepare_dispatch(&state, runner_id, job.clone()).await?;
+                    if !resp.services.is_empty() && !runs_services {
+                        return Err(services_protocol_refusal(runner_id, &job));
+                    }
                     // Everything the response needs is prepared before the
                     // irreversible claim. The long-poll future can be dropped
                     // at any `.await` (its own timeout, a disconnected client,
@@ -652,12 +667,40 @@ async fn expand_ready_matrices(state: &AppState, repo_id: i64) {
 /// steps through the fields it knows: it would run the flat `script` as one
 /// program, with every step's `continue-on-error`, `timeout-minutes` and
 /// `shell` silently gone. So it is never handed one.
-fn runner_runs_steps(headers: &HeaderMap) -> bool {
+///
+/// The same number says whether it starts a job's `services:`
+/// ([`rg_core::ci::SERVICES_PROTOCOL`]); `0` for a runner that sends none.
+fn runner_protocol(headers: &HeaderMap) -> u32 {
     headers
         .get(rg_core::ci::RUNNER_PROTOCOL_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u32>().ok())
-        .is_some_and(|protocol| protocol >= rg_core::ci::STEPS_PROTOCOL)
+        .unwrap_or(0)
+}
+
+/// [`steps_protocol_refusal`] for a runner that runs steps but not services:
+/// it would run them against a `postgres` that is not there.
+fn services_protocol_refusal(
+    runner_id: i64,
+    job: &rg_db::entities::pipeline_job::Model,
+) -> Response {
+    tracing::warn!(
+        runner_id,
+        job_id = job.id,
+        "poll_job: refused a job with services to a runner that does not start them"
+    );
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(serde_json::json!({
+            "error": format!(
+                "job #{} ({}) declares services:, and this runner does not start them: its steps \
+                 would run against services that are not there. Upgrade plombir-git-runner; the \
+                 job waits for a runner that can run it.",
+                job.id, job.name
+            ),
+        })),
+    )
+        .into_response()
 }
 
 /// What a runner too old for the step model is told when the only work it
@@ -1039,6 +1082,7 @@ async fn prepare_dispatch(
     let resp = PollJobResponse {
         needs,
         outputs: context.outputs,
+        services: context.services,
         steps,
         job_id: job.id,
         pipeline_id: pipeline.id,

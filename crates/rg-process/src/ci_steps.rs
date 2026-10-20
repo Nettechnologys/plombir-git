@@ -49,6 +49,14 @@ pub const RUNNER_PROTOCOL_HEADER: &str = "x-plombir-git-runner-protocol";
 /// never handed a job of steps.
 pub const STEPS_PROTOCOL: u32 = 2;
 
+/// The protocol in which a runner also starts a job's `services:`
+/// ([`crate::ci_services`]). A runner below it is never handed a job that
+/// declares any: it would run the steps against services that are not there.
+pub const SERVICES_PROTOCOL: u32 = 3;
+
+/// What this build's runner speaks, and sends with every poll.
+pub const RUNNER_PROTOCOL: u32 = SERVICES_PROTOCOL;
+
 /// Where a containerised job's workspace is mounted.
 pub const CONTAINER_WORKSPACE: &str = "/workspace";
 
@@ -1290,24 +1298,30 @@ pub struct JobContext {
     /// The job's `outputs:`: name → template over `steps.*` / `needs.*`.
     #[serde(default)]
     pub outputs: BTreeMap<String, String>,
+    /// The job's `services:`, started before its first step
+    /// ([`crate::ci_services`]). Absent from a job that declares none, so a row
+    /// written before services existed reads the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<crate::ci_services::ServiceSpec>,
 }
 
+///
+/// `services`, when the job declares any, are started first, on a network the
+/// job's container joins; they are removed after the job's container, and the
+/// job fails without running a step when one of them does not become healthy.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_job_steps(
     steps: &[StepSpec],
     job_env: &[(String, String)],
     workspace: &Path,
     image: Option<StepsImage<'_>>,
+    services: Option<crate::ci_services::ServicesRun<'_>>,
     mask: &(dyn Fn(&str) -> String + Sync),
     needs: &BTreeMap<String, NeededJob>,
     outputs: &BTreeMap<String, String>,
     reporter: &mut impl StepReporter,
 ) -> JobRun {
-    let failed = |exit_code, log| JobRun {
-        exit_code,
-        log,
-        outputs: BTreeMap::new(),
-    };
+    let failed = failed_job;
     let temp = job_temp_dir(workspace);
     if let Err(error) = std::fs::create_dir_all(&temp) {
         return failed(
@@ -1319,6 +1333,23 @@ pub async fn run_job_steps(
         );
     }
     let _guard = TempGuard(temp.clone());
+
+    // Before the job's container: it is started on the services' network.
+    let services = match services.filter(|services| !services.specs.is_empty()) {
+        None => None,
+        Some(services) => match crate::ci_services::start_services(&services, job_env, &temp).await
+        {
+            Ok(started) => Some(started),
+            Err(failed) => return failed_job(failed.exit_code, mask(&failed.log)),
+        },
+    };
+    let network = services
+        .as_ref()
+        .map(crate::ci_services::StartedServices::network);
+    let services_log = services
+        .as_ref()
+        .map(|started| started.log.clone())
+        .unwrap_or_default();
 
     let Some(image) = image else {
         let result = run_steps(
@@ -1336,9 +1367,12 @@ pub async fn run_job_steps(
             reporter,
         )
         .await;
+        if let Some(services) = services {
+            services.stop().await;
+        }
         return JobRun {
             exit_code: result.exit_code,
-            log: result.log,
+            log: format!("{}{}", mask(&services_log), result.log),
             outputs: result.outputs,
         };
     };
@@ -1352,14 +1386,18 @@ pub async fn run_job_steps(
         variables: job_env,
         limits: image.limits,
         temp: Some(&temp),
+        network: network.as_deref(),
     };
     let container = match crate::docker_job::start_steps_container(image.program, &job).await {
         Ok(container) => container,
         Err(failed) => {
             remove_container(image.program, image.name).await;
+            if let Some(services) = services {
+                services.stop().await;
+            }
             return JobRun {
                 exit_code: failed.exit_code,
-                log: mask(&failed.log),
+                log: mask(&format!("{services_log}{}", failed.log)),
                 outputs: BTreeMap::new(),
             };
         }
@@ -1384,7 +1422,11 @@ pub async fn run_job_steps(
     )
     .await;
     remove_container(image.program, image.name).await;
-    let mut log = container.pull_log;
+    if let Some(services) = services {
+        services.stop().await;
+    }
+    let mut log = mask(&services_log);
+    log.push_str(&container.pull_log);
     if !log.is_empty() && !log.ends_with('\n') {
         log.push('\n');
     }
@@ -1396,6 +1438,14 @@ pub async fn run_job_steps(
         exit_code: result.exit_code,
         log,
         outputs: result.outputs,
+    }
+}
+
+fn failed_job(exit_code: i32, log: String) -> JobRun {
+    JobRun {
+        exit_code,
+        log,
+        outputs: BTreeMap::new(),
     }
 }
 
@@ -1781,6 +1831,7 @@ mod tests {
             variables: &env,
             limits: &limits,
             temp: Some(&temp),
+            network: None,
         };
         let started = match crate::docker_job::start_steps_container("docker", &job).await {
             Ok(started) => started,
@@ -2064,6 +2115,217 @@ mod tests {
         ] {
             let error = parse_env_file(text).expect_err(text);
             assert!(error.contains(named), "{text:?}: {error}");
+        }
+    }
+}
+
+/// `services:` on a real daemon (card_bc6676ec0ae3). Ignored like the other
+/// container tests: they need Docker and the `postgres:17-alpine` image, and
+/// run with `--ignored` where both are there.
+#[cfg(all(test, target_os = "linux"))]
+mod services_docker_tests {
+    use super::*;
+    use crate::ci_services::{ServiceSpec, ServicesRun, OWNER_LABEL};
+
+    const IMAGE: &str = "postgres:17-alpine";
+
+    fn step(name: &str, run: &str) -> StepSpec {
+        StepSpec {
+            name: name.into(),
+            id: None,
+            run: run.into(),
+            shell: Some("sh".into()),
+            working_directory: None,
+            env: BTreeMap::new(),
+            continue_on_error: false,
+            timeout_minutes: None,
+            condition: None,
+        }
+    }
+
+    fn postgres() -> ServiceSpec {
+        ServiceSpec {
+            key: "postgres".into(),
+            image: IMAGE.into(),
+            env: BTreeMap::from([("POSTGRES_PASSWORD".into(), "${PG_PASSWORD}".into())]),
+            ports: Vec::new(),
+            credentials: None,
+            health: crate::ci_services::parse_health_options(
+                "--health-cmd 'pg_isready -U postgres' --health-interval 1s --health-timeout 5s \
+                 --health-retries 60",
+            )
+            .unwrap(),
+        }
+    }
+
+    fn rootless() -> bool {
+        std::process::Command::new("docker")
+            .args(["info", "--format", "{{.SecurityOptions}}"])
+            .output()
+            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("rootless"))
+    }
+
+    /// What the daemon still holds of `owner`'s services: containers and
+    /// networks carrying its label.
+    fn leftovers(owner: &str) -> Vec<String> {
+        let filter = format!("label={OWNER_LABEL}={owner}");
+        let list = |args: &[&str]| {
+            let output = std::process::Command::new("docker")
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let mut left = list(&["ps", "-aq", "--filter", &filter]);
+        left.extend(list(&["network", "ls", "-q", "--filter", &filter]));
+        left
+    }
+
+    struct Job {
+        _root: tempfile::TempDir,
+        workspace: PathBuf,
+        name: String,
+        limits: crate::docker_job::JobLimits,
+        env: Vec<(String, String)>,
+    }
+
+    fn job(tag: &str) -> Job {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        Job {
+            _root: root,
+            workspace,
+            name: format!("plombir-git-services-test-{tag}-{}", std::process::id()),
+            limits: crate::docker_job::JobLimits::default(),
+            env: vec![
+                ("CI".to_string(), "true".to_string()),
+                ("PG_PASSWORD".to_string(), "hunter2".to_string()),
+            ],
+        }
+    }
+
+    async fn run(
+        job: &Job,
+        steps: &[StepSpec],
+        specs: &[ServiceSpec],
+        reporter: &mut impl StepReporter,
+    ) -> JobRun {
+        let mask = |log: &str| log.replace("hunter2", "***");
+        run_job_steps(
+            steps,
+            &job.env,
+            &job.workspace,
+            Some(StepsImage {
+                program: std::ffi::OsStr::new("docker"),
+                name: &job.name,
+                image: IMAGE,
+                user: if rootless() {
+                    Some("0:0".to_string())
+                } else {
+                    crate::container_user()
+                },
+                limits: &job.limits,
+            }),
+            Some(ServicesRun {
+                program: std::ffi::OsStr::new("docker"),
+                owner: &job.name,
+                specs,
+                limits: &job.limits,
+                health_timeout: std::time::Duration::from_secs(120),
+            }),
+            &mask,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            reporter,
+        )
+        .await
+    }
+
+    /// The acceptance of the card: the job's first step reaches the service by
+    /// its key, because the job waited for it to be healthy — `pg_isready`
+    /// answers "no response" to a database still running `initdb`, so a job
+    /// that did not wait fails here. Nothing is left on the daemon after.
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon and the postgres:17-alpine image"]
+    async fn a_step_reaches_a_healthy_service_by_its_key_and_nothing_is_left() {
+        let job = job("healthy");
+        let result = run(
+            &job,
+            &[step("Ready", "pg_isready -h postgres -U postgres")],
+            &[postgres()],
+            &mut Silent,
+        )
+        .await;
+
+        assert_eq!(result.exit_code, 0, "{}", result.log);
+        assert!(
+            result.log.contains("service postgres is healthy"),
+            "{}",
+            result.log
+        );
+        assert!(!result.log.contains("hunter2"), "{}", result.log);
+        assert_eq!(
+            leftovers(&job.name),
+            Vec::<String>::new(),
+            "services outlived the job"
+        );
+    }
+
+    /// Reports when the first step starts, so the test can cancel the job while
+    /// its services are up.
+    struct StartSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl StepReporter for StartSignal {
+        async fn started(&mut self, _number: usize) {
+            if let Some(signal) = self.0.take() {
+                // The test may already have stopped listening; nothing to do.
+                match signal.send(()) {
+                    Ok(()) | Err(()) => {}
+                }
+            }
+        }
+        async fn finished(&mut self, _result: &StepResult) {}
+    }
+
+    /// A job cancelled mid-step — its future dropped, as a timeout or a
+    /// cancellation does in both runners — leaves neither its services nor
+    /// their network once the runner has removed the job's container by name.
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon and the postgres:17-alpine image"]
+    async fn a_cancelled_job_leaves_no_service_and_no_network() {
+        let job = job("cancelled");
+        let (signal, started) = tokio::sync::oneshot::channel();
+        let mut reporter = StartSignal(Some(signal));
+        let steps = [step("Forever", "sleep 600")];
+        let specs = [postgres()];
+        tokio::select! {
+            result = run(&job, &steps, &specs, &mut reporter) => {
+                panic!("the job ended before it was cancelled: {}", result.log)
+            }
+            _ = started => {}
+        }
+        assert!(
+            !leftovers(&job.name).is_empty(),
+            "the services were not running while the step was"
+        );
+        // What both runners do after dropping the job's future.
+        remove_container(std::ffi::OsStr::new("docker"), &job.name).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let left = leftovers(&job.name);
+            if left.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a cancelled job left {left:?} behind"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 }

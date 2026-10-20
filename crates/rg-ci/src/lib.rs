@@ -7890,9 +7890,11 @@ mod matrix_tests {
     #[test]
     fn unknown_gitea_job_keys_are_reported_with_their_file_and_key() {
         for (key, job_body) in [
+            // `services:` itself runs now (card_bc6676ec0ae3); a key it does
+            // not honour is still refused by name.
             (
-                "services",
-                "    services:\n      postgres:\n        image: postgres:17\n",
+                "volumes",
+                "    services:\n      postgres:\n        image: postgres:17\n        volumes: ['/:/host']\n",
             ),
             (
                 "fail-fsat",

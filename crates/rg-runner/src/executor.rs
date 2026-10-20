@@ -212,6 +212,7 @@ pub(crate) async fn run_job_docker(
             variables,
             limits,
             temp: None,
+            network: None,
         },
     )
     .await
@@ -307,6 +308,7 @@ mod tests {
                 variables,
                 limits: &rg_process::docker_job::JobLimits::default(),
                 temp: None,
+                network: None,
             },
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         )
@@ -691,6 +693,7 @@ mod tests {
             steps: None,
             needs: Default::default(),
             outputs: Default::default(),
+            services: Vec::new(),
         };
         let cache = resolved_cache(&job, &[("CI_SHA".into(), "abc".into())])
             .unwrap()

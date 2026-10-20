@@ -789,3 +789,54 @@ async fn the_external_runner_hands_a_jobs_outputs_to_the_job_that_needs_it() {
     let log = used.log.unwrap_or_default();
     assert!(log.contains("got=1.2.3 result=success"), "{log}");
 }
+
+/// card_bc6676ec0ae3: a job's `services:` travel to the runner with the job,
+/// and a runner that runs steps but does not start services — protocol 2 — is
+/// refused such a job by name instead of running its steps against a
+/// `postgres` that is not there.
+#[tokio::test]
+async fn a_job_with_services_goes_only_to_a_runner_that_starts_them() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed(&base, &db, "services").await;
+    let job_id = job(&db, seeded.stage_id, "integration", &["Query"]).await;
+    let context = serde_json::json!({
+        "services": [{
+            "key": "postgres",
+            "image": "postgres:16",
+            "env": {"POSTGRES_PASSWORD": "${PG_PASSWORD}"},
+            "health": ["--health-cmd=pg_isready"],
+        }],
+    });
+    rg_db::ops::pipeline_step_ops::set_job_context(&db, job_id, &context.to_string())
+        .await
+        .unwrap();
+
+    let response = poll(&base, &seeded, Some("2")).await;
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(&format!("job #{job_id}")) && error.contains("services"),
+        "the refusal names the job and what it needs: {body}"
+    );
+    let stored = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (stored.status.as_str(), stored.runner_id),
+        ("pending", None),
+        "a refused job stays for a runner that can run it"
+    );
+
+    let response = poll(
+        &base,
+        &seeded,
+        Some(&rg_core::ci::SERVICES_PROTOCOL.to_string()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["job_id"].as_i64(), Some(job_id));
+    assert_eq!(body["services"], context["services"], "{body}");
+}

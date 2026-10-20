@@ -141,7 +141,7 @@ cited in the row added it. Plombir Git's side is specified in full in
 | Reusable workflows | ✅ same repository only | ✅ |
 | `container.image`, `container.env` | ✅ | ✅ |
 | `container.options` | ❌ refused — it could undo the job sandbox | ✅ |
-| `services:` | ❌ refused | ✅ |
+| `services:` | ✅ Docker mode; a network per job, health-checked before the first step, `ports:` on loopback only; `volumes` and non-health `options` refused | ✅ |
 | `uses:` actions | ⚠️ `actions/checkout`, `actions/cache`, `actions/upload-artifact` only | ✅ any action |
 | Step `id` | ✅ | ✅ |
 | Step outputs, `jobs.<id>.outputs`, `needs.<id>.outputs` | ✅ `$GITHUB_OUTPUT`, 1 MiB per job, masked; `::set-output` refused | ✅ |
@@ -149,7 +149,7 @@ cited in the row added it. Plombir Git's side is specified in full in
 | Step `continue-on-error`, step `timeout-minutes`, step `shell` | ✅ each step is its own process, in both runners; `$GITHUB_ENV` / `$GITHUB_PATH` between steps | ✅ |
 | `permissions`, `vars.*` | ❌ refused | ✅ |
 
-If your workflows lean on marketplace actions or services, Gitea
+If your workflows lean on marketplace actions, Gitea
 will run them and Plombir Git will not. Plombir Git also has its own pipeline format,
 [`.plombir-git-ci.yml`](docs/ci.md), for what the subset cannot express.
 

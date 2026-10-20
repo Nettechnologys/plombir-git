@@ -7,10 +7,10 @@ Reaching for GitHub's own documentation instead will mislead you, which is why
 this page exists rather than a link. There is no Actions runtime here: a job is
 a shell script the runner executes in a worktree of your repository, so the
 parts of Actions that are *the runtime* — the marketplace, `actions/*` beyond
-three special cases, composite actions, service containers — have nothing to
-map onto and are refused. Steps, their outputs and the outputs one job hands
-to the jobs that need it are implemented by the runner itself; see
-[Steps](#steps) and [Outputs](#outputs).
+three special cases, composite actions — have nothing to map onto and are
+refused. Steps, their outputs, the outputs one job hands to the jobs that need
+it and service containers are implemented by the runner itself; see
+[Steps](#steps), [Outputs](#outputs) and [Services](#services).
 
 **Refusals are loud and whole-file.** Every block below carries a closed schema.
 An unknown key, an unrunnable trigger, an action this engine does not implement
@@ -489,6 +489,7 @@ quietly win.
 | `if` | string | Condition evaluated before the job is scheduled. |
 | `env` | map string→string | Variables for this job, overriding the workflow's. |
 | `container` | block | See [Containers](#containers). |
+| `services` | map key→block | Containers the job's steps talk to, in Docker mode. See [Services](#services). |
 | `defaults` | block | `run:` defaults for this job. See [Defaults](#defaults). |
 | `strategy` | block | `matrix`, `fail-fast` and `max-parallel`. See [Matrix](#matrix). |
 | `environment` | string or `{ name: … }` | A deployment environment **the repository already has**; a protected one holds the job for approval, and only jobs that declare it read its [secrets](ci.md#secrets-and-workload-identity). |
@@ -849,6 +850,92 @@ Whether a job may run at all depends on the instance. Docker execution, host
 execution and external runners are all off by default, so a default instance
 runs no job until the operator enables one of them; with Docker on, every job
 wants either a `container.image` or a runner that supplies one.
+
+## Services
+
+```yaml
+name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: postgres:16
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.PG_PASSWORD }}
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-retries 20
+    steps:
+      - run: pg_isready -h postgres
+```
+
+Every key under `services:` is a container the runner starts before the job's
+first step and removes after its last one. The job gets a Docker network of its
+own; each service joins it under its key, and a job in `container:` joins it
+too, so `postgres:5432` reaches the service above. A job that runs on the host
+reaches a service through `ports:` instead, at `localhost:<port>`:
+
+```yaml
+name: CI
+on: push
+jobs:
+  test:
+    runs-on: self-hosted
+    services:
+      cache:
+        image: registry.example.com/acme/redis:7
+        credentials:
+          username: ci-bot
+          password: ${{ secrets.REGISTRY_TOKEN }}
+        ports:
+          - 6379:6379
+        options: --health-cmd "redis-cli ping"
+    steps:
+      - run: redis-cli -h localhost -p 6379 ping
+```
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `image` | string | The service's image. Pulled with the operator's registry setup and the same image rules as `container.image`; `${{ matrix.* }}` and `${{ secrets.* }}` are read. |
+| `env` | map string→string | The service's environment. `${{ secrets.* }}` is filled in by the runner from the job's own secrets and never reaches a command line. |
+| `ports` | list | `<container port>` or `<runner port>:<container port>`, optionally `/tcp` or `/udp`. Published on the runner's **loopback only**; an address in front is refused. Without a runner port Docker picks one — `job.services.*.ports` is not available, so a host job that needs the number names it. |
+| `credentials` | `{ username, password }` | A registry login for this image. The pull runs with a Docker configuration holding just that login, removed right after; the operator's own login is never changed. |
+| `options` | string | Health-check flags only: `--health-cmd`, `--health-interval`, `--health-timeout`, `--health-retries`, `--health-start-period`, `--health-start-interval`. |
+
+Before the first step the runner waits until every service whose image or
+`options:` declares a health check reports **healthy**, for at most five minutes.
+A service that turns unhealthy, stops, or is not healthy in time fails the job
+before any step runs, with the end of the service's log. A service with no
+health check is waited for only until it is running — the same rule GitHub
+uses, so give a database its `--health-cmd`.
+
+A service runs in the job's sandbox: the operator's pid, memory and CPU limits,
+`no-new-privileges`, never privileged, no Docker socket, no workspace mount. It
+keeps the few capabilities an official database image's entrypoint needs to
+take ownership of its data directory and drop to its own user (`CHOWN`,
+`DAC_OVERRIDE`, `FOWNER`, `SETGID`, `SETUID`, `KILL`, `NET_BIND_SERVICE`);
+everything else is dropped.
+
+The services and their network go when the job does — after its last step, on a
+timeout, on a cancellation. A runner that dies with a job in hand leaves them
+behind, and the next job with services on the same machine removes them first.
+
+Services need Docker. The built-in runner refuses a job with `services:` when
+`ci.docker_enabled` is off, naming the services; an external runner without a
+reachable Docker daemon fails the job the same way, and a runner too old to
+start services is never handed such a job.
+
+| Key | Why it is refused |
+|-----|-------------------|
+| `volumes` | A bind mount is a way into the runner's filesystem, and a named volume outlives the job. |
+| `options` other than the health-check flags | Any other `docker run` flag — `--privileged`, `--network`, `-v`, `--cap-add` — could undo the sandbox, the reason `container.options` is refused. |
+| `services` on a job that calls a reusable workflow | The called workflow's jobs carry their own `services:`. |
+| `${{ steps.* }}` or `${{ needs.* }}` in a service's `image`, `env` or `credentials` | A service starts before the job's first step; the runner fills these in between steps, never into a container that is already running. |
 
 ## Matrix
 

@@ -224,11 +224,14 @@ jobs:
       # The step model's container half against a real daemon: one container
       # per job, `docker exec` per step, and a timed-out step killed together
       # with what it started while the container lives on for the next one
-      # (card_c8b3fa9f0ebc). `#[ignore]`d for the reason above.
+      # (card_c8b3fa9f0ebc). `#[ignore]`d for the reason above. With it, the
+      # job's `services:`: a step reaches a healthy postgres by its key, and a
+      # cancelled job leaves no service and no network (card_bc6676ec0ae3).
       - name: Run step-model container test
         run: >-
           cargo nextest run -p rg-process --run-ignored only
-          -E 'test(ci_steps::tests::steps_share_one_container_and_a_timeout_spares_it)'
+          -E 'test(ci_steps::tests::steps_share_one_container_and_a_timeout_spares_it)
+          | test(/^ci_steps::services_docker_tests::/)'
 
       # The same client over an SSH remote, with no HTTP server at all:
       # `git-lfs-transfer` carries the objects and the locks, and the test
