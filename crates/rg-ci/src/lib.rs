@@ -2495,16 +2495,23 @@ fn read_ci_config_with_inputs(
         })
         .transpose()?
         .ok_or_else(|| {
-            // Workflows that exist but sit out this event are not "no config":
-            // saying so is the difference between fixing an `on:` filter and
-            // hunting for a file that is already there.
+            // Workflows that exist but sit out this event are not "no config",
+            // and not a broken one either: there is simply nothing to run, the
+            // way an `only:` filter excluding every job is (card_1d3af3ad4f55).
+            // Automatic producers publish no pipeline for it; a manual run or a
+            // retry still answers `400` with this text, which is the difference
+            // between fixing an `on:` filter and hunting for a file that is
+            // already there.
             if workflows_untriggered {
-                rg_core::error::invalid_request(format!(
-                    "no workflow in {}/ is triggered by event {} on {}, and no native CI config (.plombir-git-ci.yml) at commit {}",
-                    WORKFLOW_DIR,
-                    invocation.event,
+                anyhow::Error::new(rg_core::ci::NoMatchingCiJobs::untriggered(
                     ref_name,
-                    commit_sha
+                    format!(
+                        "no workflow in {}/ is triggered by event {} on {}, and no native CI config (.plombir-git-ci.yml) at commit {}",
+                        WORKFLOW_DIR,
+                        invocation.event,
+                        ref_name,
+                        commit_sha
+                    ),
                 ))
             } else {
                 rg_core::error::invalid_request(format!(
@@ -4249,7 +4256,21 @@ mod matrix_tests {
         rg_db::entities::user::Model,
         rg_db::entities::repository::Model,
     ) {
-        let (temp, sha) = commit_repo(&[(".plombir-git-ci.yml", config)]);
+        trigger_fixture(&[(".plombir-git-ci.yml", config)], database_name).await
+    }
+
+    /// [`concurrency_fixture`] for any set of committed files.
+    async fn trigger_fixture(
+        files: &[(&str, &[u8])],
+        database_name: &str,
+    ) -> (
+        tempfile::TempDir,
+        String,
+        rg_db::DatabaseConnection,
+        rg_db::entities::user::Model,
+        rg_db::entities::repository::Model,
+    ) {
+        let (temp, sha) = commit_repo(files);
         let db = rg_db::connect_with_pool(
             &format!(
                 "sqlite://{}?mode=rwc",
@@ -4376,6 +4397,65 @@ mod matrix_tests {
             vec!["build".to_string(), "check".to_string()],
             "every job the author committed must reach the pipeline, or the run proves nothing"
         );
+    }
+
+    /// card_1d3af3ad4f55: a repository whose one workflow is `on: pull_request`
+    /// has nothing to run on a push. The push producer used to publish a red
+    /// "CI configuration rejected" pipeline on the head of every pull request
+    /// branch it saw pushed — after the pull request's own run, so the merge
+    /// gate judged the red one. Now the engine answers "no work", which the
+    /// producer publishes nothing for, and the same file still runs for the
+    /// pull request.
+    #[tokio::test]
+    async fn a_push_no_workflow_is_triggered_by_publishes_nothing() {
+        let (temp, sha, db, user, repo) = trigger_fixture(
+            &[(
+                ".gitea/workflows/ci.yml",
+                b"on: pull_request\njobs:\n  test:\n    steps:\n      - run: echo checked\n"
+                    as &[u8],
+            )],
+            "push-untriggered.db",
+        )
+        .await;
+
+        let error = trigger_pipeline_with_barrier(
+            concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push"),
+            &CiNotifications::default(),
+            None,
+        )
+        .await
+        .expect_err("no workflow is triggered by push");
+        assert!(
+            error
+                .downcast_ref::<rg_core::ci::NoMatchingCiJobs>()
+                .is_some(),
+            "the producer must be able to tell \"nothing to run\" from a broken file: {error:#}"
+        );
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_none(),
+            "an InvalidRequest is what the producer publishes as a red pipeline: {error:#}"
+        );
+        let (_, total) =
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 10)
+                .await
+                .unwrap();
+        assert_eq!(total, 0, "a push with nothing to run published a pipeline");
+
+        let mut pull_request = concurrency_trigger(
+            &db,
+            temp.path(),
+            repo.id,
+            &sha,
+            user.id,
+            rg_core::pull_request::PULL_REQUEST_EVENT,
+        );
+        pull_request.ref_name = "refs/pull/1/head";
+        pull_request.base_branch = Some("main");
+        trigger_pipeline_with_barrier(pull_request, &CiNotifications::default(), None)
+            .await
+            .expect("the same workflow runs for the pull request");
     }
 
     /// card_6860d4a03e16: `only:` used to run inside `create_jobs`, after the
@@ -6292,6 +6372,22 @@ mod matrix_tests {
         assert!(
             !rendered.contains("no CI config found"),
             "a workflow that exists but is not triggered is not a missing config: {rendered}"
+        );
+        // card_1d3af3ad4f55: nothing to run, not a broken file. As an
+        // `InvalidRequest` the push and pull-request producers published it as
+        // a red pipeline; as `NoMatchingCiJobs` they publish nothing, and a
+        // manual run or retry still answers `400` with the text above.
+        let no_match = error
+            .downcast_ref::<rg_core::ci::NoMatchingCiJobs>()
+            .unwrap_or_else(|| {
+                panic!("an untriggered workflow is no work, not an error: {error:#}")
+            });
+        assert_eq!(no_match.ref_name, "refs/heads/main");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_none(),
+            "an untriggered workflow must not read as a configuration failure: {error:#}"
         );
     }
 

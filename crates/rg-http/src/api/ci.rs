@@ -896,9 +896,15 @@ pub async fn trigger_pipeline(
         .await
     {
         Ok(pipeline_id) => {
-            if let Err(error) =
-                reconcile_published_pipeline_ref(&state.db, &repo_path, &ref_name, pipeline_id)
-                    .await
+            if let Err(error) = reconcile_published_pipeline_ref(
+                &state.db,
+                repo.id,
+                &repo_path,
+                rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                &ref_name,
+                pipeline_id,
+            )
+            .await
             {
                 return error.into_response();
             }
@@ -971,12 +977,20 @@ pub async fn retry_pipeline(
         return AppError::from(e).into_response();
     }
 
-    match resolve_commit_sha(&repo_path, &pipeline.ref_name).await {
-        // Retry deliberately keeps the original commit even when a live branch
-        // has advanced. Existence is the lifecycle question here; equality
-        // would silently change reruns into builds of the branch's new head.
-        Ok(Some(_)) => {}
-        Ok(None) => return missing_pipeline_ref(&pipeline.ref_name).into_response(),
+    // Retry deliberately keeps the original commit even when a live branch
+    // has advanced. Existence is the lifecycle question here; equality would
+    // silently change reruns into builds of the branch's new head.
+    match gone_pipeline_ref(
+        &state.db,
+        repo.id,
+        &repo_path,
+        &pipeline.trigger_type,
+        &pipeline.ref_name,
+    )
+    .await
+    {
+        Ok(None) => {}
+        Ok(Some(gone)) => return gone.into_response(),
         Err(error) => return AppError::from(error).into_response(),
     }
 
@@ -1039,9 +1053,15 @@ pub async fn retry_pipeline(
         .await
     {
         Ok(new_id) => {
-            if let Err(error) =
-                reconcile_published_pipeline_ref(&state.db, &repo_path, &pipeline.ref_name, new_id)
-                    .await
+            if let Err(error) = reconcile_published_pipeline_ref(
+                &state.db,
+                repo.id,
+                &repo_path,
+                &pipeline.trigger_type,
+                &pipeline.ref_name,
+                new_id,
+            )
+            .await
             {
                 return error.into_response();
             }
@@ -1167,6 +1187,41 @@ fn missing_pipeline_ref(ref_name: &str) -> AppError {
     AppError::conflict(format!("pipeline ref no longer exists: {ref_name}"))
 }
 
+/// The `409` for a pipeline whose ref is gone, or `None` while it is alive.
+///
+/// A `pull_request` pipeline is recorded against `refs/pull/<n>/head`, a name
+/// Plombir Git writes into the pipeline row and never into the repository
+/// (`rg_core::pull_request::ci::pull_request_ref`). Looked up as a git ref it
+/// is always absent, so every retry of a pull request's run answered `409
+/// pipeline ref no longer exists` and the button was dead (card_1d3af3ad4f55).
+/// What keeps such a run alive is the pull request being open; once it is
+/// merged or closed its runs are cancelled (`cancel_pull_request_ci`), and a
+/// retry must not start them again.
+async fn gone_pipeline_ref(
+    db: &rg_db::DatabaseConnection,
+    repo_id: i64,
+    repo_path: &std::path::Path,
+    trigger_type: &str,
+    ref_name: &str,
+) -> anyhow::Result<Option<AppError>> {
+    if trigger_type == rg_core::pull_request::PULL_REQUEST_EVENT {
+        if let Some(number) = rg_core::pull_request::pull_request_number_of_ref(ref_name) {
+            let open = rg_db::ops::pull_request_ops::find_by_repo_and_number(db, repo_id, number)
+                .await?
+                .is_some_and(|pr| pr.state == "open");
+            return Ok((!open).then(|| {
+                AppError::conflict(format!(
+                    "pull request #{number} is no longer open, so its pipeline cannot run again"
+                ))
+            }));
+        }
+    }
+    Ok(resolve_commit_sha(repo_path, ref_name)
+        .await?
+        .is_none()
+        .then(|| missing_pipeline_ref(ref_name)))
+}
+
 /// The `workflow_dispatch` inputs a retry has to replay, read off the pipeline
 /// row that recorded them.
 ///
@@ -1207,17 +1262,19 @@ fn stored_dispatch_inputs(
 /// a later ref recreation or independent live run cannot be collateral damage.
 async fn reconcile_published_pipeline_ref(
     db: &rg_db::DatabaseConnection,
+    repo_id: i64,
     repo_path: &std::path::Path,
+    trigger_type: &str,
     ref_name: &str,
     pipeline_id: i64,
 ) -> Result<(), AppError> {
-    match resolve_commit_sha(repo_path, ref_name).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => {
+    match gone_pipeline_ref(db, repo_id, repo_path, trigger_type, ref_name).await {
+        Ok(None) => Ok(()),
+        Ok(Some(gone)) => {
             rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, pipeline_id)
                 .await
                 .map_err(AppError::from)?;
-            Err(missing_pipeline_ref(ref_name))
+            Err(gone)
         }
         // An unreadable repository is not proof that its ref disappeared. The
         // resolver keeps the storage failure diagnostic and we avoid a false,

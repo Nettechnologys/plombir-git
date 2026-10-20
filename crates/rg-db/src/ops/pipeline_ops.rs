@@ -1093,17 +1093,44 @@ pub async fn list_jobs_by_pipeline(
         .context("db: list jobs by pipeline")
 }
 
-/// Find the latest pipeline for a repo + commit SHA.
-/// Used by branch protection status checks to verify CI passed.
+/// Which of a commit's pipelines a status-check lookup may consider.
+///
+/// A commit carries pipelines of every trigger — the pull request's own run,
+/// the push of its branch, a manual run — and "the latest of them" is not a
+/// verdict about any one: a push pipeline published after the pull request's
+/// run used to be what the merge gate judged (card_1d3af3ad4f55).
+#[derive(Debug, Clone, Copy)]
+pub enum PipelineSelector<'a> {
+    /// Only pipelines recorded against this ref (`refs/pull/<n>/head`).
+    OnRef(&'a str),
+    /// Every pipeline except those this trigger produced.
+    NotTriggeredBy(&'a str),
+}
+
+/// Find the latest pipeline for a repo + commit SHA among those `selector`
+/// admits. Used by branch protection status checks to verify CI passed.
+///
+/// `id` breaks a tie on `created_at`: two producers of one push can stamp the
+/// same instant, and "latest" must not then be whichever row the database
+/// happens to return first.
 pub async fn find_latest_by_repo_and_commit(
     db: &DatabaseConnection,
     repo_id: i64,
     commit_sha: &str,
+    selector: PipelineSelector<'_>,
 ) -> Result<Option<pipeline::Model>> {
-    pipeline::Entity::find()
+    let query = pipeline::Entity::find()
         .filter(pipeline::Column::RepoId.eq(repo_id))
-        .filter(pipeline::Column::CommitSha.eq(commit_sha))
+        .filter(pipeline::Column::CommitSha.eq(commit_sha));
+    let query = match selector {
+        PipelineSelector::OnRef(ref_name) => query.filter(pipeline::Column::RefName.eq(ref_name)),
+        PipelineSelector::NotTriggeredBy(trigger_type) => {
+            query.filter(pipeline::Column::TriggerType.ne(trigger_type))
+        }
+    };
+    query
         .order_by_desc(pipeline::Column::CreatedAt)
+        .order_by_desc(pipeline::Column::Id)
         .limit(1)
         .one(db)
         .await

@@ -1114,3 +1114,118 @@ async fn a_retry_replays_the_event_context_of_the_run_it_repeats() {
         "the retry of a run with no previous revision arrived carrying one"
     );
 }
+
+/// card_1d3af3ad4f55: a pull request's pipeline is recorded against
+/// `refs/pull/<n>/head`, a name that exists in the pipeline row and never in
+/// the repository. Looked up as a git ref it was always gone, so Retry answered
+/// `409 pipeline ref no longer exists` for every pull request run. What keeps
+/// such a run alive is the pull request being open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pull_request_pipeline_retries_while_its_pull_request_is_open() {
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let h = harness("retry-pr").await;
+    let client = reqwest::Client::new();
+    write_default_branch(&h, "README.md").await;
+    h.settle().await;
+    let commit_sha = ref_sha(&h.repo_path, "refs/heads/main");
+    let repository = rg_db::entities::repository::Entity::find_by_id(h.repo_id)
+        .one(&h.db)
+        .await
+        .expect("read the repository")
+        .expect("the repository exists");
+    let now = chrono::Utc::now();
+    let pr = rg_db::ops::pull_request_ops::create(
+        &h.db,
+        rg_db::entities::pull_request::ActiveModel {
+            id: sea_orm::NotSet,
+            repo_id: Set(h.repo_id),
+            number: Set(1),
+            title: Set("retry me".to_string()),
+            body: Set(None),
+            state: Set("open".to_string()),
+            is_draft: Set(false),
+            auto_merge_enabled: Set(false),
+            auto_merge_strategy: Set(None),
+            auto_merge_enabled_by_id: Set(None),
+            auto_merge_enabled_at: Set(None),
+            author_id: Set(repository.owner_id),
+            reviewer_id: Set(None),
+            head_branch: Set("main".to_string()),
+            base_branch: Set("main".to_string()),
+            head_sha: Set(Some(commit_sha.clone())),
+            merge_strategy: Set(None),
+            merge_commit_sha: Set(None),
+            head_repo_id: Set(None),
+            ci_approved_sha: Set(None),
+            ci_approved_by: Set(None),
+            ci_approved_at: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            merged_at: Set(None),
+            closed_at: Set(None),
+        },
+    )
+    .await
+    .expect("seed the pull request");
+    let original = rg_db::ops::pipeline_ops::create_pipeline(
+        &h.db,
+        h.repo_id,
+        &commit_sha,
+        "refs/pull/1/head",
+        "pull_request",
+        None,
+    )
+    .await
+    .expect("seed the pull request's pipeline");
+    let retry_url = format!(
+        "{}/api/v1/repos/{}/trg-repo/pipelines/{}/retry",
+        h.base, h.owner, original.id
+    );
+
+    let retried = client
+        .post(&retry_url)
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .expect("retry the open pull request's run");
+    assert_eq!(
+        retried.status(),
+        201,
+        "an open pull request's run must retry: {}",
+        retried.text().await.unwrap_or_default()
+    );
+    assert_eq!(
+        h.engine.refs.lock().unwrap().as_slice(),
+        ["refs/pull/1/head".to_string()],
+        "the retry runs on the pull request's ref, as the original did"
+    );
+    assert_eq!(
+        h.engine.triggered.lock().unwrap().as_slice(),
+        ["pull_request".to_string()]
+    );
+
+    let mut closed: rg_db::entities::pull_request::ActiveModel = pr.into();
+    closed.state = Set("closed".to_string());
+    closed.update(&h.db).await.expect("close the pull request");
+    h.engine.triggered.lock().unwrap().clear();
+
+    let refused = client
+        .post(&retry_url)
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .expect("retry the closed pull request's run");
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    let body = refused.text().await.expect("conflict body");
+    assert!(
+        body.contains("pull request #1 is no longer open"),
+        "the conflict must name the pull request, not a ref nobody wrote: {body}"
+    );
+    assert!(
+        h.engine.triggered.lock().unwrap().is_empty(),
+        "a closed pull request's run must not reach the engine"
+    );
+}

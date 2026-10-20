@@ -338,8 +338,8 @@ async fn tally_approvals(
 ///
 /// The `Ok` half carries [`MergeVerdict::judged_head_sha`]: approvals are
 /// counted for one commit (`pr_review_ops::current_approvers`) and status
-/// checks are looked up for one commit
-/// (`pipeline_ops::find_latest_by_repo_and_commit`), so the answer "this merge
+/// checks are looked up for one commit (`status_check_pipelines`), so the
+/// answer "this merge
 /// is allowed" is only ever true *of that commit*. Merging anything else —
 /// including the branch tip, which is where `refs/heads/<head>` has moved on to
 /// while the row lagged — would be a merge nothing here approved.
@@ -467,9 +467,17 @@ async fn check_matching_merge_rule(
             .await
             .context("db: find PR for status check")?;
 
-        let head_sha = match pr.and_then(|p| p.head_sha) {
-            Some(s) if !s.is_empty() => s,
-            _ => {
+        let (pr, head_sha) = match pr {
+            Some(pr) => match pr.head_sha.clone() {
+                Some(sha) if !sha.is_empty() => (pr, sha),
+                _ => {
+                    return Err(crate::error::forbidden(format!(
+                        "branch '{}' requires status checks but no CI pipeline found for PR {}",
+                        target_branch, pr_id
+                    )));
+                }
+            },
+            None => {
                 return Err(crate::error::forbidden(format!(
                     "branch '{}' requires status checks but no CI pipeline found for PR {}",
                     target_branch, pr_id
@@ -481,59 +489,131 @@ async fn check_matching_merge_rule(
         // commit*, so the verdict is about it and about nothing else.
         verdict.judged_head_sha = Some(head_sha.clone());
 
-        // Find the latest pipeline for this commit
-        let pipeline = pipeline_ops::find_latest_by_repo_and_commit(db, repo_id, &head_sha)
-            .await
-            .context("db: find pipeline for status check")?;
+        let candidates = status_check_pipelines(db, repo_id, &pr, &head_sha).await?;
+        let Some(p) = candidates.verdict() else {
+            return Err(crate::error::forbidden(format!(
+                "branch '{}' requires status checks to pass, but no CI pipeline has run for commit {}",
+                target_branch,
+                &head_sha[..8.min(head_sha.len())]
+            )));
+        };
+        if p.status != "success" {
+            return Err(crate::error::forbidden(format!(
+                "branch '{}' requires all status checks to pass, but pipeline #{} is {}",
+                target_branch, p.id, p.status
+            )));
+        }
 
-        match pipeline {
-            None => {
-                return Err(crate::error::forbidden(format!(
-                    "branch '{}' requires status checks to pass, but no CI pipeline has run for commit {}",
-                    target_branch,
-                    &head_sha[..8.min(head_sha.len())]
-                )));
-            }
-            Some(p) if p.status != "success" => {
-                return Err(crate::error::forbidden(format!(
-                    "branch '{}' requires all status checks to pass, but pipeline #{} is {}",
-                    target_branch, p.id, p.status
-                )));
-            }
-            Some(p) => {
-                // All pipeline jobs must have passed — check job names match required list
-                let jobs = pipeline_ops::list_jobs_by_pipeline(db, p.id).await?;
-                let passed_jobs: std::collections::HashSet<_> = jobs
-                    .iter()
-                    .filter(|j| j.status == "success")
-                    .map(|j| j.name.clone())
-                    .collect();
-
-                let missing: Vec<_> = required_checks
-                    .iter()
-                    .filter(|name| !passed_jobs.contains(*name))
-                    .collect();
-
-                if !missing.is_empty() {
-                    return Err(crate::error::forbidden(format!(
-                        "branch '{}' requires status checks {:?} to pass, but {:?} are missing or failed",
-                        target_branch, required_checks, missing
-                    )));
+        // All pipeline jobs must have passed — check job names match required list
+        let jobs = pipeline_ops::list_jobs_by_pipeline(db, p.id).await?;
+        let mut passed_jobs: std::collections::HashSet<_> = jobs
+            .iter()
+            .filter(|j| j.status == "success")
+            .map(|j| j.name.clone())
+            .collect();
+        // A required check the pull request's run does not *have* at all — not
+        // one it ran and failed — may be the job of an `on: push` workflow
+        // the pull request's workflows never declare. That job's verdict is the
+        // branch's own latest run, as it was before the pull request's run took
+        // precedence; a job the pull request's run did have is judged there and
+        // nowhere else.
+        if let Some(branch_run) = candidates.branch_run_beside_pull_request() {
+            let present: std::collections::HashSet<_> =
+                jobs.iter().map(|j| j.name.as_str()).collect();
+            if required_checks
+                .iter()
+                .any(|name| !present.contains(name.as_str()))
+            {
+                for job in pipeline_ops::list_jobs_by_pipeline(db, branch_run.id).await? {
+                    if job.status == "success" && !present.contains(job.name.as_str()) {
+                        passed_jobs.insert(job.name);
+                    }
                 }
-
-                tracing::info!(
-                    branch = %target_branch,
-                    pipeline_id = %p.id,
-                    checks = ?required_checks,
-                    "Branch protection: all status checks passed"
-                );
             }
         }
+
+        let missing: Vec<_> = required_checks
+            .iter()
+            .filter(|name| !passed_jobs.contains(*name))
+            .collect();
+
+        if !missing.is_empty() {
+            return Err(crate::error::forbidden(format!(
+                "branch '{}' requires status checks {:?} to pass, but {:?} are missing or failed",
+                target_branch, required_checks, missing
+            )));
+        }
+
+        tracing::info!(
+            branch = %target_branch,
+            pipeline_id = %p.id,
+            checks = ?required_checks,
+            "Branch protection: all status checks passed"
+        );
     }
     Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
+
+/// The pipelines a pull request's status checks are judged by.
+struct StatusCheckPipelines {
+    /// The latest run of the pull request itself (`refs/pull/<n>/head`).
+    pull_request: Option<rg_db::entities::pipeline::Model>,
+    /// The latest run on the head commit that no pull request produced — the
+    /// push of the branch, a manual run.
+    branch: Option<rg_db::entities::pipeline::Model>,
+}
+
+impl StatusCheckPipelines {
+    /// The run whose status is the verdict: the pull request's own when it has
+    /// one, the branch's otherwise — a repository with only `on: push`
+    /// workflows gates its pull requests on those.
+    ///
+    /// Not simply the latest run on the commit: a push to the pull request's
+    /// branch publishes its own pipeline *after* the pull request's, so the
+    /// latest was routinely a run of another event — once, a red diagnostic
+    /// for "no workflow is triggered by push" — and it refused a green pull
+    /// request (card_1d3af3ad4f55).
+    fn verdict(&self) -> Option<&rg_db::entities::pipeline::Model> {
+        self.pull_request.as_ref().or(self.branch.as_ref())
+    }
+
+    /// The branch's run when the verdict is the pull request's — the place a
+    /// required check only an `on: push` workflow declares is found.
+    fn branch_run_beside_pull_request(&self) -> Option<&rg_db::entities::pipeline::Model> {
+        self.pull_request.as_ref().and(self.branch.as_ref())
+    }
+}
+
+async fn status_check_pipelines(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    pr: &pull_request::Model,
+    head_sha: &str,
+) -> Result<StatusCheckPipelines> {
+    let pull_request_ref = crate::pull_request::ci::pull_request_ref(pr);
+    let pull_request = pipeline_ops::find_latest_by_repo_and_commit(
+        db,
+        repo_id,
+        head_sha,
+        pipeline_ops::PipelineSelector::OnRef(&pull_request_ref),
+    )
+    .await
+    .context("db: find the pull request's pipeline for status check")?;
+    let branch = pipeline_ops::find_latest_by_repo_and_commit(
+        db,
+        repo_id,
+        head_sha,
+        pipeline_ops::PipelineSelector::NotTriggeredBy(crate::pull_request::ci::PULL_REQUEST_EVENT),
+    )
+    .await
+    .context("db: find the branch pipeline for status check")?;
+    Ok(StatusCheckPipelines {
+        pull_request,
+        branch,
+    })
+}
 
 async fn resolve_repo(
     db: &DatabaseConnection,

@@ -354,3 +354,233 @@ async fn merge_service_rechecks_branch_protection_before_git() {
         "the core service must stop at branch protection, before Git: {error:#}"
     );
 }
+
+/// A finished pipeline on the fixture's head commit, with one job per entry of
+/// `jobs` (`(name, status)`), recorded under `ref_name` by `trigger_type`.
+async fn finished_pipeline(
+    db: &sea_orm::DatabaseConnection,
+    repo_id: i64,
+    ref_name: &str,
+    trigger_type: &str,
+    status: &str,
+    jobs: &[(&str, &str)],
+) -> i64 {
+    use rg_db::ops::pipeline_ops;
+
+    let head = "a".repeat(40);
+    let pipeline = pipeline_ops::create_pipeline_row(
+        db,
+        pipeline_ops::NewPipeline {
+            repo_id,
+            commit_sha: &head,
+            ref_name,
+            trigger_type,
+            triggered_by: None,
+            concurrency_group: None,
+            dispatch_inputs: None,
+            base_branch: None,
+            previous_sha: None,
+            schedule: None,
+        },
+    )
+    .await
+    .expect("create a pipeline row");
+    let stage = pipeline_ops::create_stage(db, pipeline.id, "test", 0)
+        .await
+        .expect("create a stage");
+    let now = chrono::Utc::now().naive_utc();
+    for (name, job_status) in jobs {
+        let job = pipeline_ops::create_job(
+            db, stage.id, name, "", None, None, None, None, None, None, false, None, None, None,
+        )
+        .await
+        .expect("create a job");
+        pipeline_ops::update_job_result(
+            db,
+            job.id,
+            job_status,
+            Some(0),
+            None,
+            Some(now),
+            Some(now),
+        )
+        .await
+        .expect("finish the job");
+    }
+    pipeline_ops::update_pipeline_status(db, pipeline.id, status, Some(now), Some(now))
+        .await
+        .expect("finish the pipeline");
+    pipeline.id
+}
+
+const PULL_REQUEST_REF: &str = "refs/pull/1/head";
+const BRANCH_REF: &str = "refs/heads/feature";
+const GREEN: &[(&str, &str)] = &[("build", "success"), ("test", "success")];
+
+/// card_1d3af3ad4f55, the defect as it met a live pull request: the pull
+/// request's own run is green, and a push to its branch then published a red
+/// pipeline on the same head — after it. The gate took "the latest pipeline on
+/// the commit" and refused the merge.
+#[tokio::test]
+async fn a_later_red_branch_run_does_not_overrule_the_pull_requests_green_run() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (db, repo_id, pr_id, _) = setup(directory.path()).await;
+
+    finished_pipeline(
+        &db,
+        repo_id,
+        PULL_REQUEST_REF,
+        "pull_request",
+        "success",
+        GREEN,
+    )
+    .await;
+    finished_pipeline(
+        &db,
+        repo_id,
+        BRANCH_REF,
+        "push",
+        "failed",
+        &[("CI configuration", "failed")],
+    )
+    .await;
+
+    rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
+        .await
+        .expect("the pull request's own green run is the verdict");
+}
+
+/// The other side: the pull request's run is the verdict, so a red one is not
+/// rescued by a green branch run that happens to be newer.
+#[tokio::test]
+async fn a_later_green_branch_run_does_not_rescue_the_pull_requests_red_run() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (db, repo_id, pr_id, _) = setup(directory.path()).await;
+
+    let red = finished_pipeline(
+        &db,
+        repo_id,
+        PULL_REQUEST_REF,
+        "pull_request",
+        "failed",
+        &[("build", "failed"), ("test", "success")],
+    )
+    .await;
+    finished_pipeline(&db, repo_id, BRANCH_REF, "push", "success", GREEN).await;
+
+    let error =
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
+            .await
+            .expect_err("the pull request's red run holds the gate");
+    assert!(
+        format!("{error}").contains(&format!("pipeline #{red} is failed")),
+        "the refusal must name the pull request's run: {error:#}"
+    );
+}
+
+/// A repository with only `on: push` workflows has no pull request runs at all,
+/// and its pull requests are gated on the branch's run — as before.
+#[tokio::test]
+async fn without_a_pull_request_run_the_branch_run_is_the_verdict() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (db, repo_id, pr_id, _) = setup(directory.path()).await;
+
+    let red = finished_pipeline(
+        &db,
+        repo_id,
+        BRANCH_REF,
+        "push",
+        "failed",
+        &[("build", "failed")],
+    )
+    .await;
+    let error =
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
+            .await
+            .expect_err("a red branch run holds the gate when it is the only run");
+    assert!(
+        format!("{error}").contains(&format!("pipeline #{red} is failed")),
+        "{error:#}"
+    );
+
+    finished_pipeline(&db, repo_id, BRANCH_REF, "push", "success", GREEN).await;
+    rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
+        .await
+        .expect("the newest branch run is green");
+}
+
+/// Another pull request on the same head commit — the same branch proposed
+/// into a second base — has runs of its own, and they are not this one's.
+#[tokio::test]
+async fn another_pull_requests_run_is_not_this_ones_verdict() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (db, repo_id, pr_id, _) = setup(directory.path()).await;
+
+    finished_pipeline(
+        &db,
+        repo_id,
+        "refs/pull/2/head",
+        "pull_request",
+        "success",
+        GREEN,
+    )
+    .await;
+
+    let error =
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
+            .await
+            .expect_err("pull request #2's green run says nothing about #1");
+    assert!(
+        format!("{error}").contains("no CI pipeline has run"),
+        "{error:#}"
+    );
+}
+
+/// A required check only an `on: push` workflow declares is absent from the
+/// pull request's run, not failed in it: it is judged by the branch's run, the
+/// way it was before the pull request's run became the verdict. A check the
+/// pull request's run *did* have is judged there and nowhere else.
+#[tokio::test]
+async fn a_required_check_only_the_branch_run_has_is_judged_there() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (db, repo_id, pr_id, _) = setup(directory.path()).await;
+
+    finished_pipeline(
+        &db,
+        repo_id,
+        PULL_REQUEST_REF,
+        "pull_request",
+        "success",
+        &[("test", "success")],
+    )
+    .await;
+    finished_pipeline(
+        &db,
+        repo_id,
+        BRANCH_REF,
+        "push",
+        "failed",
+        &[("build", "failed"), ("test", "success")],
+    )
+    .await;
+    let error =
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
+            .await
+            .expect_err("`build` failed on the branch, and only the branch runs it");
+    assert!(format!("{error}").contains("[\"build\"]"), "{error:#}");
+
+    finished_pipeline(
+        &db,
+        repo_id,
+        BRANCH_REF,
+        "push",
+        "success",
+        &[("build", "success"), ("test", "failed")],
+    )
+    .await;
+    rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
+        .await
+        .expect(
+            "`build` passed on the branch; `test` is the pull request's own check, and it passed",
+        );
+}

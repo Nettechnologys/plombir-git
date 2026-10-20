@@ -14,7 +14,11 @@ so a pipeline always runs the configuration that was committed with the code.
 **Which format wins:** `.gitea/workflows/*.yml` is tried first. The native file
 is used when that directory is absent at the commit, or when no workflow in it
 is triggered by this event. If neither exists the trigger is refused with a
-message naming both paths. The native format is also the supported escape hatch
+message naming both paths. Workflows that exist but sit out the event are not
+that refusal: a push to the branch of a repository whose only workflow is
+`on: pull_request` simply runs nothing — no pipeline, the way Gitea and GitHub
+treat it — while a manual run or a retry of such an event answers `400` naming
+the event and the ref. The native format is also the supported escape hatch
 for everything the Actions subset cannot express.
 
 **Unknown keys are refused, not ignored.** Every job block, the `concurrency`

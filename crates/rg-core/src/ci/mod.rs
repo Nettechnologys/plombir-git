@@ -192,16 +192,40 @@ pub struct WorkflowSchedule {
 /// Manual and retry requests still need a useful `400`, so the HTTP boundary
 /// classifies this marker separately instead of turning it into a visible
 /// configuration-failure graph.
+///
+/// The same holds for `.gitea/workflows/` files none of which is triggered by
+/// the event ([`NoMatchingCiJobs::untriggered`]): a repository whose one
+/// workflow says `on: pull_request` has nothing to run on a push, which is what
+/// Gitea and GitHub do with it. Reported as a configuration failure, every push
+/// to a pull request's branch published a red `push` pipeline on the head —
+/// after the pull request's own run, so the merge gate read it as the latest
+/// verdict and refused a green pull request (card_1d3af3ad4f55).
 #[derive(Debug, thiserror::Error)]
-#[error("no CI jobs match ref '{ref_name}'; every configured job was excluded by `only:`")]
+#[error("{reason}")]
 pub struct NoMatchingCiJobs {
     pub ref_name: String,
+    reason: String,
 }
 
 impl NoMatchingCiJobs {
+    /// Every job of a native config was excluded by `only:`.
     pub fn new(ref_name: impl Into<String>) -> Self {
+        let ref_name = ref_name.into();
+        Self {
+            reason: format!(
+                "no CI jobs match ref '{ref_name}'; every configured job was excluded by `only:`"
+            ),
+            ref_name,
+        }
+    }
+
+    /// Workflows exist, but none is triggered by this event, and there is no
+    /// native config to fall back to. `reason` names the event and the ref, so
+    /// a manual run or retry is told which `on:` to fix.
+    pub fn untriggered(ref_name: impl Into<String>, reason: impl Into<String>) -> Self {
         Self {
             ref_name: ref_name.into(),
+            reason: reason.into(),
         }
     }
 }

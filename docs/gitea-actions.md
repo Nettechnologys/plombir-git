@@ -22,7 +22,9 @@ the event did not fire.
 
 **Which format wins.** `.gitea/workflows/` is tried first. The native
 [`.plombir-git-ci.yml`](ci.md) is used when this directory is absent at the commit
-being built, or when no workflow in it is triggered by the event. The native
+being built, or when no workflow in it is triggered by the event — and when
+there is no native file either, an automatic event (a push, a pull request, a
+merge group) publishes no pipeline at all rather than a red one. The native
 format is also the supported escape hatch for anything on this page marked
 unsupported.
 

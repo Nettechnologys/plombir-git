@@ -53,8 +53,19 @@ pub const PULL_REQUEST_EVENT: &str = "pull_request";
 /// Deliberately *not* the head branch: a push to that branch already gets its
 /// own `push` pipeline, and sharing the ref would put both in the same
 /// concurrency group, so `cancel_in_progress` would have them cancel each other.
-fn pull_request_ref(pr: &pull_request::Model) -> String {
+pub(crate) fn pull_request_ref(pr: &pull_request::Model) -> String {
     format!("refs/pull/{}/head", pr.number)
+}
+
+/// The pull request number a [`pull_request_ref`] names, or `None` for any
+/// other ref — a branch, a tag, or a spelling `pull_request_ref` never writes.
+pub fn pull_request_number_of_ref(ref_name: &str) -> Option<i64> {
+    let number: i64 = ref_name
+        .strip_prefix("refs/pull/")?
+        .strip_suffix("/head")?
+        .parse()
+        .ok()?;
+    (number > 0 && format!("refs/pull/{number}/head") == ref_name).then_some(number)
 }
 
 /// Close the producer side of the PR-lifecycle race after publishing a graph.
