@@ -211,6 +211,7 @@ pub(crate) async fn run_job_docker(
             user: rg_process::container_user(),
             variables,
             limits,
+            temp: None,
         },
     )
     .await
@@ -305,6 +306,7 @@ mod tests {
                 user: rg_process::container_user(),
                 variables,
                 limits: &rg_process::docker_job::JobLimits::default(),
+                temp: None,
             },
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         )
@@ -686,6 +688,7 @@ mod tests {
             artifact_name: None,
             artifact_paths: None,
             timeout: 60,
+            steps: None,
         };
         let cache = resolved_cache(&job, &[("CI_SHA".into(), "abc".into())])
             .unwrap()

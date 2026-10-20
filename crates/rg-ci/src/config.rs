@@ -143,6 +143,13 @@ pub struct JobConfig {
     /// this field, so its literal strings keep their existing semantics.
     #[serde(skip)]
     pub(crate) action_templates: Option<ActionJobTemplates>,
+
+    /// The steps a runner executes one by one, for a job translated from an
+    /// Actions workflow. `#[serde(skip)]` for the reason [`Self::action_templates`]
+    /// is: a native `.plombir-git-ci.yml` job runs its `script` as one program,
+    /// and the file cannot claim otherwise.
+    #[serde(skip)]
+    pub(crate) steps: Option<Vec<rg_process::ci_steps::StepSpec>>,
 }
 
 /// The line every job script starts with, and the reason it has to.

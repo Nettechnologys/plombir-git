@@ -506,27 +506,108 @@ The same small expression language the native format uses, documented under
 [`if` in the pipeline reference](ci.md#if): `==`, `!=`, `&&`, `||`, `!`,
 parentheses, single-quoted strings, and `startsWith` / `endsWith` / `contains` /
 `success()`. Contexts are `github.ref`, `github.ref_name`, `github.event_name`,
-`github.sha`, `github.repository`, `github.repository_owner`, and `env.NAME`.
+`github.sha`, `github.repository`, `github.repository_owner`,
+`github.event.schedule`, and `env.NAME`.
 
-A **job**'s `if:` may also read `matrix.NAME`. A **step**'s may not — a step
-condition is evaluated while the pipeline is being built, before matrix variants
-exist, so a `matrix.` reference there is refused instead of quietly resolving to
-nothing.
+A **job**'s `if:` is evaluated once, when the pipeline is built, and may also
+read `matrix.NAME`; `success()` is the only status function it has, and it is
+always true there. A **step**'s `if:` is read by the runner between steps — see
+[Steps](#steps) — so it has all four status functions and no `matrix.`.
 
 ## Steps
 
 | Key | Type | Meaning |
 |-----|------|---------|
-| `name` | string | Label for the step. |
-| `run` | string | Shell commands. |
-| `uses` | string | One of exactly two actions. See [Actions](#actions). |
+| `name` | string | Label for the step. Without one, the step is called `Run` and the first line of its `run:`, as on GitHub. |
+| `id` | string | The step's id: a letter or `_`, then letters, digits, `-` and `_`. Unique in the job. |
+| `run` | string | The script. |
+| `shell` | string | `bash`, `sh`, `python`, `pwsh`, or a command line of your own with `{0}` where the script goes. Requires `run:`. |
+| `uses` | string | One of exactly three actions. See [Actions](#actions). |
 | `with` | map | Inputs for that action. |
 | `env` | map string→string | Variables for this step. |
-| `if` | string | Condition. Evaluated while the pipeline is built; a false step is left out. |
+| `if` | string | Condition, read between steps. See below. |
 | `working-directory` | string | Directory for this step's `run:`, relative to the workspace. Requires `run:`. |
+| `continue-on-error` | boolean | A failure of this step does not fail the job. Requires `run:`. |
+| `timeout-minutes` | whole number, 1–1440 | The step is stopped, with everything it started, when it runs longer. Requires `run:`. |
 
-Every `run:` in a job is concatenated into one script, prefixed with `set -e`, so
-the **first** failing command fails the job.
+```yaml
+name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install tools
+        id: tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          echo "PROFILE=ci" >> "$GITHUB_ENV"
+      - name: Flaky integration tests
+        timeout-minutes: 20
+        continue-on-error: true
+        run: make integration
+      - name: Unit tests
+        shell: sh
+        run: make test PROFILE="$PROFILE"
+      - name: Report
+        if: always()
+        shell: python3 {0}
+        run: print("done")
+```
+
+**Each step is its own process.** The runner executes a job's steps one by one —
+on the host, or with `docker exec` in the one container the whole job runs in,
+so what one step installs the next one finds — each with its shell, its working
+directory, its `env:` and its deadline. Nothing else crosses from one step to
+the next: a variable a step `export`s, a directory it `cd`s into and a shell
+option it sets all end with it. What does cross goes through the files GitHub
+defines:
+
+- `$GITHUB_ENV` — `NAME=value` lines, or `NAME<<DELIMITER` … `DELIMITER` for a
+  value over several lines, become variables of every later step. A step's own
+  `env:` still wins over them. A line naming a variable the runner sets
+  (`CI_*`, `PATH`, `HOME`, …) fails the step — extend `PATH` through
+  `$GITHUB_PATH`.
+- `$GITHUB_PATH` — each line is a directory put in front of `PATH` for every
+  later step.
+- `$GITHUB_STEP_SUMMARY` — Markdown appended to the step's own log.
+
+`GITHUB_WORKSPACE`, `RUNNER_TEMP` and `GITHUB_ACTIONS=true` are set as on
+GitHub. Each file is capped at 1 MiB.
+
+**The shells start the way GitHub starts them.** `bash` is
+`bash --noprofile --norc -eo pipefail {0}`, `sh` is `sh -e {0}`, `python` is
+`python {0}`, `pwsh` is `pwsh -command ". '{0}'"`. A step without `shell:` takes
+the job's `defaults.run.shell`, then the workflow's, and with none of them is
+GitHub's unspecified shell: `bash -e {0}`, or `sh -e {0}` where there is no
+bash. `cmd` and `powershell` are refused — the runners are Linux.
+
+**Conditions are read between steps.** `success()` is "no earlier step failed",
+`failure()` its opposite, `always()` runs regardless and `cancelled()` is false
+(a canceled job stops where it stands). A condition that names none of them
+means `success() && <condition>`. A step whose condition says no is shown as
+skipped. `matrix.` is not available to a step condition, and a status function
+other than `success()` on `actions/cache` or `actions/upload-artifact` is
+refused: those run once, after a job that succeeded, not in the sequence.
+
+**A failure stops the job.** After a step fails, the steps after it are
+skipped, unless their condition asks for `failure()` or `always()`. A failing
+step with `continue-on-error: true` is recorded as failed and counts as a
+success for the job and for the steps after it — GitHub's *outcome* and
+*conclusion*.
+
+The job page lists the steps of a job with their status, and each step keeps
+its own log; the job's log carries every step under a header naming it.
+
+**External runners have to speak the step protocol.** A `plombir-git-runner`
+built before the step model would run a job's steps as one script and drop
+every step policy, so the server never hands it a job of steps: its poll is
+answered `426` naming the job, and the job waits for an upgraded runner.
+Native `.plombir-git-ci.yml` jobs run on either.
 
 ### Keys parsed only so they can be refused
 
@@ -540,28 +621,19 @@ on: push
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: pwsh
     container:
       image: rust:1.75
       options: --privileged
     steps:
       - name: Build
-        id: build
-        shell: bash
-        continue-on-error: true
-        timeout-minutes: 5
+        continue-on-error: ${{ matrix.experimental }}
         run: cargo build
 ```
 
 | Key | Why it is refused |
 |-----|-------------------|
-| step `shell`, `defaults.run.shell` | Every script runs under `sh -c` with `set -e`. Accepting the key would promise a shell the runner never invokes. |
-| step `id` | Step outputs and `steps.<id>.*` do not exist here, so an id addresses nothing. |
-| step `continue-on-error` | Steps are one script; the failure boundary is the job. Use `continue-on-error` on the **job**. |
-| step `timeout-minutes` | Same reason — the timeout boundary is the job. |
-| step `working-directory` without `run` | It would apply to nothing. |
+| step `continue-on-error` from an expression | It needs a value the workflow does not have when it is read. Write `true` or `false`. |
+| step `shell`, `continue-on-error`, `timeout-minutes`, `working-directory` without `run` | They would apply to nothing. |
 | `container.options` | Raw `docker run` flags would let a committed workflow undo the sandbox the runner builds around the job — the dropped capabilities, `no-new-privileges`, the pid/memory/cpu limits. There is no honest partial support. A job that needs more memory or CPUs gets them from the operator: `[ci]` `job_memory` / `job_cpus` / `job_pids` for the built-in runner, `--job-memory` / `--job-cpus` / `--job-pids` on an external runner the job selects with `runs-on:`. |
 
 ## Actions

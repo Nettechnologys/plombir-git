@@ -6161,3 +6161,136 @@ async fn ci_schedule_tick_claims_are_portable() {
         "a forgotten entry starts over"
     );
 }
+
+/// card_c8b3fa9f0ebc: a job's step rows are written with the graph, moved by a
+/// runner only while the job runs, and listed without their logs. The guarded
+/// UPDATE reads `pipeline_jobs` in a subquery and the listing decodes a
+/// computed `has_log`, two shapes worth asking the real backend about.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn pipeline_job_steps_are_portable() {
+    use rg_db::ops::pipeline_step_ops::{self, StepReport};
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("jobsteps{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Job Steps Smoke",
+    )
+    .await
+    .expect("create owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("jobstepsrepo{suffix}")),
+    )
+    .await
+    .expect("create repository");
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo.id,
+        "0123456789012345678901234567890123456789",
+        "refs/heads/main",
+        "push",
+        None,
+    )
+    .await
+    .unwrap();
+    let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "build", 0)
+        .await
+        .unwrap();
+    let job = rg_db::ops::pipeline_ops::create_job(
+        &db,
+        stage.id,
+        "build",
+        "echo flat",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let big_log = "x".repeat(200_000);
+    pipeline_step_ops::create_job_steps(
+        &db,
+        job.id,
+        r#"[{"name":"One","run":"echo one"},{"name":"Two","run":"echo two"}]"#,
+        &["One".into(), "Two".into()],
+    )
+    .await
+    .unwrap();
+    let report = |number: i32, status: &'static str| StepReport {
+        number,
+        status,
+        conclusion: (status != "running").then_some(status),
+        exit_code: (status != "running").then_some(0),
+        log: (status != "running").then_some(big_log.as_str()),
+    };
+    assert!(
+        !pipeline_step_ops::report_job_step(&db, job.id, &report(1, "running"))
+            .await
+            .unwrap(),
+        "a pending job takes no step report"
+    );
+    assert!(
+        rg_db::ops::pipeline_ops::start_job_if_active(&db, job.id, None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        pipeline_step_ops::report_job_step(&db, job.id, &report(1, "running"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        pipeline_step_ops::report_job_step(&db, job.id, &report(1, "success"))
+            .await
+            .unwrap()
+    );
+    let summaries = pipeline_step_ops::list_step_summaries(&db, &[job.id])
+        .await
+        .unwrap();
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|step| (step.number, step.status.as_str(), step.has_log))
+            .collect::<Vec<_>>(),
+        [(1, "success", true), (2, "pending", false)]
+    );
+    let one = pipeline_step_ops::find_job_step(&db, job.id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        one.log.as_deref().map(str::len),
+        Some(big_log.len()),
+        "a long step log fits"
+    );
+    assert!(one.started_at.is_some() && one.finished_at.is_some());
+
+    pipeline_step_ops::reset_job_steps(&db, job.id)
+        .await
+        .unwrap();
+    let one = pipeline_step_ops::find_job_step(&db, job.id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((one.status.as_str(), one.log), ("pending", None));
+}

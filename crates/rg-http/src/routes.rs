@@ -1965,6 +1965,11 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/log",
             api::ci::get_job_log,
         )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/steps/{number}/log",
+            api::ci::get_job_step_log,
+        )
         .post(
             RepoWrite,
             "/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/play",
@@ -2858,6 +2863,12 @@ pub(crate) fn build_all_routes(
             RUNNER_TOKEN,
             "/runners/{id}/jobs/{job_id}/log",
             api::runners::upload_log,
+            &runner_auth_job_log,
+        )
+        .post_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/jobs/{job_id}/steps/{number}",
+            api::runners::report_step,
             &runner_auth_job_log,
         )
         .get_with(

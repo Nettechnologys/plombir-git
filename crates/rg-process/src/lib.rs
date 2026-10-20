@@ -11,6 +11,8 @@ compile_error!("rg-process supports Unix and Windows process trees only");
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
+pub mod ci_condition;
+pub mod ci_steps;
 pub mod client_policy;
 pub mod docker_job;
 pub mod image_reference;
@@ -446,6 +448,15 @@ pub async fn output_ci_job_in_process_tree(
     command: &mut tokio::process::Command,
 ) -> std::io::Result<CappedJobOutput> {
     output_in_process_tree_with_capture_limit(command, MAX_JOB_LOG_BYTES / 2).await
+}
+
+/// [`output_ci_job_in_process_tree`] for one step of a job of steps: half the
+/// budget, so a step's log travels to the server in one report and a job of
+/// several steps does not hold several job logs' worth in memory at once.
+pub async fn output_ci_step_in_process_tree(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<CappedJobOutput> {
+    output_in_process_tree_with_capture_limit(command, MAX_JOB_LOG_BYTES / 4).await
 }
 
 async fn read_to_capture_limit<R: tokio::io::AsyncRead + Unpin>(

@@ -19,6 +19,7 @@
     failure:  { color: 'var(--red)',     bg: 'rgba(248, 81, 73, 0.15)' },
     error:    { color: 'var(--red)',     bg: 'rgba(248, 81, 73, 0.15)' },
     canceled: { color: 'var(--text-muted)', bg: 'rgba(110, 118, 129, 0.15)' },
+    cancelled: { color: 'var(--text-muted)', bg: 'rgba(110, 118, 129, 0.15)' },
     skipped:  { color: 'var(--text-muted)', bg: 'rgba(110, 118, 129, 0.15)' },
   };
 
@@ -36,7 +37,7 @@
     ▶
   {:else if status === 'waiting_approval'}
     ◷
-  {:else if status === 'canceled'}
+  {:else if status === 'canceled' || status === 'cancelled'}
     −
   {:else if status === 'skipped'}
     ○

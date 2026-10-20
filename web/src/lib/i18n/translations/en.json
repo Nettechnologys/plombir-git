@@ -1026,7 +1026,8 @@
       "failure": "Failed",
       "error": "Error",
       "canceled": "Canceled",
-      "skipped": "Skipped"
+      "skipped": "Skipped",
+      "cancelled": "Canceled"
     },
     "retry": "↻ Retry",
     "cancel": "✗ Cancel",
@@ -1070,7 +1071,11 @@
       "live": "Live",
       "closed": "Closed",
       "title": "Job Log",
-      "empty": "(no log output)"
+      "empty": "(no log output)",
+      "steps": "Steps",
+      "all_steps": "All steps",
+      "step_load_failed": "Failed to load step log: {error}",
+      "continued_on_error": "failed, continued on error"
     }
   },
   "errors": {

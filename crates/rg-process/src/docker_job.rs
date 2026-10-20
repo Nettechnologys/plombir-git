@@ -220,6 +220,9 @@ pub enum JobContainerRefused {
     /// The job's workspace path cannot be handed to `docker -v` without
     /// changing it.
     WorkspacePathNotUtf8,
+    /// A steps container was asked for without the directory its steps are
+    /// written to.
+    StepsDirectoryMissing,
     /// The job's `image:` is not an image reference; the rule it broke.
     Image(String),
 }
@@ -228,6 +231,9 @@ impl std::fmt::Display for JobContainerRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::WorkspacePathNotUtf8 => f.write_str("repo path is not valid UTF-8"),
+            Self::StepsDirectoryMissing => {
+                f.write_str("a job of steps needs a steps directory to mount")
+            }
             Self::Image(rule) => f.write_str(rule),
         }
     }
@@ -250,7 +256,16 @@ pub struct JobContainer<'a> {
     pub variables: &'a [(String, String)],
     /// The runner operator's ceiling, see [`JobLimits`].
     pub limits: &'a JobLimits,
+    /// The job's directory of step scripts and file commands, mounted at
+    /// [`crate::ci_steps::CONTAINER_TEMP`]. Only a steps container
+    /// ([`steps_run_args`]) has one.
+    pub temp: Option<&'a Path>,
 }
+
+/// What a steps container runs until the runner `docker exec`s the job's steps
+/// into it, one at a time: nothing. `sleep` in a loop rather than one long one
+/// so `TERM` from `docker rm -f` is answered at once.
+const STEPS_KEEPALIVE: &str = "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done";
 
 /// The argument vector for `docker run` of one job container, started from
 /// `image_id` — the content ID [`resolve_image`] found for `job.image`.
@@ -283,6 +298,25 @@ pub fn run_args(
     job: &JobContainer<'_>,
     image_id: &str,
 ) -> Result<Vec<String>, JobContainerRefused> {
+    container_args(job, image_id, false)
+}
+
+/// [`run_args`] for a job that runs as steps: the same sandbox, started
+/// detached with nothing to do, so each step can be `docker exec`ed into the
+/// one container the whole job shares — what one step installs, the next one
+/// finds. The job's step directory is mounted beside the workspace.
+pub fn steps_run_args(
+    job: &JobContainer<'_>,
+    image_id: &str,
+) -> Result<Vec<String>, JobContainerRefused> {
+    container_args(job, image_id, true)
+}
+
+fn container_args(
+    job: &JobContainer<'_>,
+    image_id: &str,
+    steps: bool,
+) -> Result<Vec<String>, JobContainerRefused> {
     let workspace = validate(job)?;
     if !is_image_id(image_id) {
         return Err(JobContainerRefused::Image(format!(
@@ -293,7 +327,7 @@ pub fn run_args(
     }
     let mut args: Vec<String> = [
         "run",
-        "--rm",
+        if steps { "-d" } else { "--rm" },
         "--init",
         "--pull",
         "never",
@@ -317,6 +351,17 @@ pub fn run_args(
         "-v".to_string(),
     ]);
     args.push(format!("{workspace}:/workspace"));
+    if steps {
+        let temp = job
+            .temp
+            .ok_or(JobContainerRefused::StepsDirectoryMissing)?
+            .to_str()
+            .ok_or(JobContainerRefused::WorkspacePathNotUtf8)?;
+        args.extend([
+            "-v".to_string(),
+            format!("{temp}:{}", crate::ci_steps::CONTAINER_TEMP),
+        ]);
+    }
     args.extend(["-w".to_string(), "/workspace".to_string()]);
     // The workspace is created owner-only and container root holds no capability
     // to override that, so the job runs as the workspace's owner, which keeps
@@ -336,7 +381,11 @@ pub fn run_args(
         image_id.to_string(),
         "sh".to_string(),
         "-c".to_string(),
-        job.script.to_string(),
+        if steps {
+            STEPS_KEEPALIVE.to_string()
+        } else {
+            job.script.to_string()
+        },
     ]);
     Ok(args)
 }
@@ -536,6 +585,179 @@ pub async fn prepare(
     })
 }
 
+/// [`prepare`] for a job that runs as steps: the same image resolution, and a
+/// detached `docker run` of [`steps_run_args`] for the caller to start.
+pub async fn prepare_steps(
+    program: impl AsRef<std::ffi::OsStr>,
+    job: &JobContainer<'_>,
+) -> Result<PreparedRun, PrepareFailed> {
+    let program = program.as_ref();
+    validate(job).map_err(PrepareFailed::Refused)?;
+    let image = resolve_image(program, job.image)
+        .await
+        .map_err(PrepareFailed::ImageUnavailable)?;
+    let args = steps_run_args(job, &image.id).map_err(PrepareFailed::Refused)?;
+    let mut command = client(program);
+    command.args(&args);
+    apply_run_environment(&mut command, job.variables);
+    Ok(PreparedRun {
+        command,
+        pull_log: image.pull_log,
+    })
+}
+
+/// A started steps container, ready for its first step.
+pub struct StepsContainer {
+    /// The container's own `PATH`, which `$GITHUB_PATH` entries go in front of.
+    pub path: String,
+    /// The image pull, for the head of the job log; empty when none ran.
+    pub pull_log: String,
+}
+
+/// Why a steps container is not running: the exit code and the log to fail the
+/// job with.
+pub struct StepsContainerFailed {
+    pub exit_code: i32,
+    pub log: String,
+}
+
+/// Find or pull the image, start the job's container detached, and read its
+/// `PATH`. The container is named, so whatever happens after this — the last
+/// step, a timeout, a cancellation — ends with `docker rm -f` by that name.
+pub async fn start_steps_container(
+    program: impl AsRef<std::ffi::OsStr>,
+    job: &JobContainer<'_>,
+) -> Result<StepsContainer, StepsContainerFailed> {
+    let program = program.as_ref();
+    let prepared = match prepare_steps(program, job).await {
+        Ok(prepared) => prepared,
+        Err(PrepareFailed::Refused(refused)) => {
+            return Err(StepsContainerFailed {
+                exit_code: -1,
+                log: refused.to_string(),
+            })
+        }
+        Err(PrepareFailed::ImageUnavailable(unavailable)) => {
+            return Err(StepsContainerFailed {
+                exit_code: unavailable.exit_code,
+                log: unavailable.log,
+            })
+        }
+    };
+    let mut command = prepared.command;
+    let started = crate::output_ci_job_in_process_tree(&mut command)
+        .await
+        .map_err(|error| StepsContainerFailed {
+            exit_code: -1,
+            log: format!("Failed to run docker: {error}"),
+        })?;
+    if !started.status.success() {
+        let exit_code = started.status.code().unwrap_or(-1);
+        return Err(StepsContainerFailed {
+            exit_code,
+            log: format!(
+                "{}docker run exited with code {exit_code}\n{}",
+                prepared.pull_log,
+                started.log()
+            ),
+        });
+    }
+    let mut probe = client(program);
+    probe.args(["exec", job.name, "sh", "-c", "printf %s \"$PATH\""]);
+    let path = match crate::output_ci_job_in_process_tree(&mut probe).await {
+        Ok(output) if output.status.success() => output
+            .stdout
+            .bytes()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_default(),
+        Ok(output) => {
+            return Err(StepsContainerFailed {
+                exit_code: output.status.code().unwrap_or(-1),
+                log: format!(
+                    "{}the job container started, but a shell could not be run in it — the \
+                     image needs `sh`\n{}",
+                    prepared.pull_log,
+                    output.log()
+                ),
+            })
+        }
+        Err(error) => {
+            return Err(StepsContainerFailed {
+                exit_code: -1,
+                log: format!("Failed to run docker exec: {error}"),
+            })
+        }
+    };
+    Ok(StepsContainer {
+        path,
+        pull_log: prepared.pull_log,
+    })
+}
+
+/// The `docker exec` of one step into a running steps container.
+///
+/// The environment travels the way it does for `docker run`: values in the
+/// client's own environment, names on its command line — except `PATH`, which
+/// a host-side client must not take from a job, and which is passed as a
+/// literal so `$GITHUB_PATH` reaches the container.
+pub fn exec_command(
+    program: impl AsRef<std::ffi::OsStr>,
+    container: &str,
+    workdir: &str,
+    env: &[(String, String)],
+    argv: &[String],
+) -> tokio::process::Command {
+    let mut command = client(program);
+    command.args(["exec", "-w", workdir, "-e", CONTAINER_HOME]);
+    for (name, value) in env {
+        if name == "PATH" {
+            command.args(["-e".to_string(), format!("PATH={value}")]);
+        } else if crate::job_environment::reaches_container(name) {
+            command.args(["-e", name]);
+        }
+    }
+    command.arg(container).args(argv);
+    apply_run_environment(&mut command, env);
+    command
+}
+
+/// End a step that ran out of time, and everything it started, without ending
+/// the container the next steps run in.
+///
+/// The step wrote its process id to `pid_file` before it became the shell, and
+/// `docker exec` made it the leader of its own process group: the whole group
+/// goes. Never fails the caller: a step that could not be killed is still a
+/// timed-out step, and the container is removed when the job ends.
+pub async fn kill_exec_group(
+    program: impl AsRef<std::ffi::OsStr>,
+    container: &str,
+    pid_file: &str,
+) {
+    let mut command = client(program);
+    command.args([
+        "exec",
+        container,
+        "sh",
+        "-c",
+        // `kill -KILL -<pgid>`: the one spelling busybox ash and dash both read
+        // as a process group — `--` and `-s KILL` each break one of them.
+        "pid=$(cat \"$0\") && { kill -KILL -\"$pid\" 2>/dev/null || kill -KILL \"$pid\"; }",
+        pid_file,
+    ]);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {}
+        Ok(Ok(output)) => tracing::warn!(
+            container,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "a timed-out step could not be killed in its container"
+        ),
+        Ok(Err(error)) => {
+            tracing::warn!(container, %error, "a timed-out step could not be killed in its container")
+        }
+        Err(_) => tracing::warn!(container, "killing a timed-out step did not answer in time"),
+    }
+}
+
 /// Variables both runners give every job for running on the host: the host's
 /// `PATH` and `LANG`, and the workspace as `HOME`. A container takes these from
 /// its image, so leaving them out is not something to report.
@@ -602,6 +824,7 @@ mod tests {
             user: Some("1000:1000".to_string()),
             variables,
             limits: &DEFAULT_LIMITS,
+            temp: None,
         }
     }
 

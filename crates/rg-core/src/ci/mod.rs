@@ -212,21 +212,11 @@ impl NoMatchingCiJobs {
 /// Both the embedded runner and the external-runner API inject this vocabulary.
 /// Keeping one list prevents a new built-in from being protected on one path
 /// while a user-controlled value can still replace it on the other.
-pub const BUILTIN_CI_VARIABLES: [&str; 12] = [
-    "CI",
-    "PLOMBIR_GIT",
-    "CI_PIPELINE_ID",
-    "CI_COMMIT_SHA",
-    "CI_SHA",
-    "CI_REF",
-    "CI_EVENT",
-    // `github.event.schedule`: the `- cron:` entry a `schedule` run fired for.
-    "CI_EVENT_SCHEDULE",
-    "CI_REPOSITORY",
-    "CI_REPOSITORY_OWNER",
-    "CI_JOB_TOKEN",
-    "CI_OIDC_TOKEN_URL",
-];
+pub const BUILTIN_CI_VARIABLES: [&str; 12] = rg_process::job_environment::RUNNER_OWNED_VARIABLES;
+
+/// The runner protocol of the step model, for the HTTP layer that hands jobs
+/// out — see [`rg_process::ci_steps::STEPS_PROTOCOL`].
+pub use rg_process::ci_steps::{RUNNER_PROTOCOL_HEADER, STEPS_PROTOCOL};
 
 pub fn is_builtin_ci_variable(name: &str) -> bool {
     BUILTIN_CI_VARIABLES.contains(&name)

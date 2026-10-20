@@ -56,6 +56,10 @@ export const pipelines = {
     request<{ content: string; offset: number; next_offset: number; total_length: number }>(
       `${repoPath(owner, repo)}/pipelines/${pipelineId}/jobs/${jobId}/log${qs({ offset, limit })}`,
     ),
+  jobStepLog: (owner: string, repo: string, pipelineId: number, jobId: number, number: number) =>
+    request<{ number: number; status: string; content: string }>(
+      `${repoPath(owner, repo)}/pipelines/${pipelineId}/jobs/${jobId}/steps/${number}/log`,
+    ),
   play: (owner: string, repo: string, pipelineId: number, jobId: number) =>
     request<any>(`${repoPath(owner, repo)}/pipelines/${pipelineId}/jobs/${jobId}/play`, { method: 'POST' }),
   approve: (owner: string, repo: string, pipelineId: number, jobId: number) =>

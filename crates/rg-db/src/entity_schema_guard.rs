@@ -124,6 +124,7 @@ probed_entities!(
     pipeline,
     pipeline_concurrency_lock,
     pipeline_job,
+    pipeline_job_step,
     pipeline_stage,
     pr_event,
     pr_review,

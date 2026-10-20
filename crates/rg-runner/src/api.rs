@@ -63,6 +63,12 @@ pub async fn poll_job(
             server, runner_id
         ))
         .header("Authorization", format!("Bearer {}", token))
+        // This runner runs a job's steps one by one and reports each; without
+        // the header the server never hands it a job of steps.
+        .header(
+            rg_process::ci_steps::RUNNER_PROTOCOL_HEADER,
+            rg_process::ci_steps::STEPS_PROTOCOL.to_string(),
+        )
         .send()
         .await?;
 
@@ -92,6 +98,10 @@ pub struct PollJobResponse {
     pub(crate) artifact_paths: Option<Vec<String>>,
     #[allow(dead_code)]
     pub(crate) timeout: i64,
+    /// The job's steps, for a job translated from an Actions workflow; `None`
+    /// for a native job, whose `script` runs as one program.
+    #[serde(default)]
+    pub(crate) steps: Option<Vec<rg_process::ci_steps::StepSpec>>,
 }
 
 /// Per-request timeout for the heartbeat call.
@@ -148,6 +158,11 @@ const START_JOB_REPORT: Report = Report {
 const UPLOAD_LOG_REPORT: Report = Report {
     call: "job log upload",
     consequence: "the job output is lost — the job page will show no log at all",
+};
+
+const STEP_REPORT: Report = Report {
+    call: "job step report",
+    consequence: "the job page shows the step in its previous state; the job log still carries it",
 };
 
 const FINISH_JOB_REPORT: Report = Report {
@@ -537,6 +552,41 @@ pub async fn upload_log(
             }
             Some(failure) => {
                 warn_report_lost(UPLOAD_LOG_REPORT, runner_id, Some(job_id), &failure);
+                return;
+            }
+        }
+    }
+}
+
+/// Tell the server one step of a job of steps started, or how it ended.
+///
+/// Retried like the log upload: the report is idempotent (it rewrites the
+/// step's row), and a lost one costs the job page the step's progress.
+pub async fn report_step(
+    client: &reqwest::Client,
+    server: &str,
+    runner_id: i64,
+    job_id: i64,
+    token: &str,
+    number: usize,
+    body: &serde_json::Value,
+) {
+    let url = format!("{server}/api/v1/runners/{runner_id}/jobs/{job_id}/steps/{number}");
+    let mut backoff = LOG_UPLOAD_RETRY_BACKOFF;
+    for attempt in 1..=LOG_UPLOAD_ATTEMPTS {
+        let request = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .timeout(LOG_UPLOAD_TIMEOUT)
+            .json(body);
+        match describe_send_failure(request).await {
+            None => return,
+            Some(failure) if failure.retryable && attempt < LOG_UPLOAD_ATTEMPTS => {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            Some(failure) => {
+                warn_report_lost(STEP_REPORT, runner_id, Some(job_id), &failure);
                 return;
             }
         }

@@ -1185,6 +1185,23 @@ impl PipelineGraph<'_> {
                     job_config.condition.as_deref(),
                 )
                 .await?;
+                // A job of steps carries them beside its flat `script`, and one
+                // `pending` row per step, so the job page lists the steps
+                // before a runner takes it. Written in the graph's
+                // transaction: a job is never published without them.
+                if let Some(steps) = &job_config.steps {
+                    let names = steps
+                        .iter()
+                        .map(|step| step.name.clone())
+                        .collect::<Vec<_>>();
+                    rg_db::ops::pipeline_step_ops::create_job_steps(
+                        tx,
+                        job.id,
+                        &serde_json::to_string(steps).context("serialize job steps")?,
+                        &names,
+                    )
+                    .await?;
+                }
                 // Resolved before the job's own `if:` is read, because a name
                 // no environment in this repository carries is the author's
                 // mistake whether or not this particular run reaches the job.
@@ -3422,6 +3439,7 @@ mod matrix_tests {
             cache: None,
             artifacts: None,
             action_templates: None,
+            steps: None,
         }
     }
 
@@ -5083,6 +5101,7 @@ mod matrix_tests {
                 cache: None,
                 artifacts: None,
                 action_templates: None,
+                steps: None,
             },
         );
         let step = gitea_actions::actions_condition_context(
@@ -10534,5 +10553,238 @@ jobs:
                 "{schedule:?}: {error:#}"
             );
         }
+    }
+}
+
+/// card_c8b3fa9f0ebc: a job translated from an Actions workflow runs its steps
+/// one by one in the embedded runner, and each one is recorded on its row.
+#[cfg(test)]
+mod step_model_tests {
+    use super::*;
+    use sea_orm::{NotSet, Set};
+
+    async fn run_workflow(workflow: &str) -> (rg_db::DatabaseConnection, i64, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("step-owner/steps");
+        std::fs::create_dir_all(repo_path.join(".gitea/workflows")).unwrap();
+        std::fs::write(repo_path.join(".gitea/workflows/build.yml"), workflow).unwrap();
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "CI"],
+            vec!["config", "user.email", "ci@example.com"],
+            vec!["add", "-A"],
+            vec!["commit", "-m", "workflow"],
+        ] {
+            assert!(git.run(&args, Some(&repo_path)).unwrap().success());
+        }
+        let sha = git
+            .run(&["rev-parse", "HEAD"], Some(&repo_path))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("steps.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "step-owner",
+            "step-owner@example.com",
+            "unused",
+            "Step Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("steps".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline_id = trigger_pipeline(
+            TriggerPipelineParams {
+                db: &db,
+                repo_root: temp.path(),
+                repo_path: &repo_path,
+                repo_id: repo.id,
+                commit_sha: &sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "push",
+                base_branch: None,
+                previous_sha: None,
+                inputs: None,
+                schedule: None,
+                triggered_by: Some(user.id),
+                docker_enabled: false,
+                // Published only: the runner below is driven and awaited.
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &CiNotifications::default(),
+        )
+        .await
+        .expect("the workflow publishes a pipeline");
+        let mut runner =
+            PipelineRunner::new_local_only(db.clone(), temp.path(), &repo_path, pipeline_id);
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+        let job = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let job = rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, job.id)
+            .await
+            .unwrap()
+            .remove(0);
+        (db, job.id, temp)
+    }
+
+    async fn step_rows(
+        db: &rg_db::DatabaseConnection,
+        job_id: i64,
+    ) -> Vec<(String, String, Option<String>, Option<i32>)> {
+        let mut rows = Vec::new();
+        for number in 1..=10 {
+            let Some(step) = rg_db::ops::pipeline_step_ops::find_job_step(db, job_id, number)
+                .await
+                .unwrap()
+            else {
+                break;
+            };
+            rows.push((step.name, step.status, step.conclusion, step.exit_code));
+        }
+        rows
+    }
+
+    const STEPS: &str = "on: push\njobs:\n  build:\n    steps:\n      - name: One\n        run: echo one\n      - name: Two\n        run: echo two; exit 3\nCONTINUE      - name: Three\n        run: echo three\n";
+
+    /// The card's acceptance, through the embedded runner: step 2 fails under
+    /// `continue-on-error: true`, step 3 runs and the job is green; without
+    /// the flag step 3 is skipped and the job is red.
+    #[tokio::test]
+    async fn continue_on_error_decides_the_job_in_the_embedded_runner() {
+        let (db, job_id, _temp) =
+            run_workflow(&STEPS.replace("CONTINUE", "        continue-on-error: true\n")).await;
+        let job = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "success", "{:?}", job.log);
+        assert_eq!(
+            step_rows(&db, job_id).await,
+            [
+                (
+                    "One".into(),
+                    "success".into(),
+                    Some("success".into()),
+                    Some(0)
+                ),
+                (
+                    "Two".into(),
+                    "failure".into(),
+                    Some("success".into()),
+                    Some(3)
+                ),
+                (
+                    "Three".into(),
+                    "success".into(),
+                    Some("success".into()),
+                    Some(0)
+                ),
+            ]
+        );
+        let three = rg_db::ops::pipeline_step_ops::find_job_step(&db, job_id, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(three.log.unwrap_or_default().contains("three"));
+        assert!(three.started_at.is_some() && three.finished_at.is_some());
+
+        let (db, job_id, _temp) = run_workflow(&STEPS.replace("CONTINUE", "")).await;
+        let job = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "failed");
+        assert_eq!(job.exit_code, Some(3));
+        assert_eq!(
+            step_rows(&db, job_id).await,
+            [
+                (
+                    "One".into(),
+                    "success".into(),
+                    Some("success".into()),
+                    Some(0)
+                ),
+                (
+                    "Two".into(),
+                    "failure".into(),
+                    Some("failure".into()),
+                    Some(3)
+                ),
+                (
+                    "Three".into(),
+                    "skipped".into(),
+                    Some("skipped".into()),
+                    None
+                ),
+            ]
+        );
+        let log = job.log.unwrap_or_default();
+        assert!(log.contains("▶ step 3/3: Three — skipped"), "{log}");
+    }
+
+    /// Steps are separate processes: a variable exported by one step does not
+    /// reach the next, and `$GITHUB_ENV` does.
+    #[tokio::test]
+    async fn one_step_reaches_the_next_only_through_the_file_commands() {
+        let (db, job_id, _temp) = run_workflow(
+            "on: push\njobs:\n  build:\n    steps:\n      - run: |\n          export LEAKED=yes\n          echo SHARED=carried >> \"$GITHUB_ENV\"\n      - run: echo \"leaked=${LEAKED:-no} shared=$SHARED\"\n",
+        )
+        .await;
+        let second = rg_db::ops::pipeline_step_ops::find_job_step(&db, job_id, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.status, "success");
+        assert!(
+            second
+                .log
+                .unwrap_or_default()
+                .contains("leaked=no shared=carried"),
+            "only the file command crosses"
+        );
     }
 }

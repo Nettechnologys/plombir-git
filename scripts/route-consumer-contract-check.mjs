@@ -174,6 +174,7 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
   ['POST /api/v1/runners/{id}/deregister', 'runner'],
   ['POST /api/v1/runners/{id}/jobs/{job_id}/start', 'runner'],
   ['POST /api/v1/runners/{id}/jobs/{job_id}/log', 'runner'],
+  ['POST /api/v1/runners/{id}/jobs/{job_id}/steps/{number}', 'runner'],
   ['PUT /api/v1/runners/{id}/jobs/{job_id}/cache', 'runner'],
   ['POST /api/v1/runners/{id}/jobs/{job_id}/finish', 'runner'],
   ['PUT /api/v1/runners/{id}/jobs/{job_id}/artifacts/staging', 'runner'],

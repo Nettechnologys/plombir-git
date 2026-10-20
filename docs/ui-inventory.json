@@ -2619,6 +2619,17 @@
       ]
     },
     {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/steps/{number}/log",
+      "access": "RepoRead",
+      "handler": "api::ci::get_job_step_log",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
       "method": "POST",
       "url": "/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/play",
       "access": "RepoWrite",
@@ -4788,6 +4799,16 @@
       "url": "/api/v1/runners/{id}/jobs/{job_id}/log",
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::runners::upload_log",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/runners/{id}/jobs/{job_id}/steps/{number}",
+      "access": "Foreign:RUNNER_AUTH_LAYER",
+      "handler": "api::runners::report_step",
       "testedIn": [
         "rust"
       ],
@@ -13129,7 +13150,7 @@
         {
           "tag": "form",
           "label": "updateTriggerRef(event.currentTarget.value)} onchange= place",
-          "line": 799,
+          "line": 827,
           "via": null,
           "href": null,
           "handler": "handleTrigger",
@@ -13212,7 +13233,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 828,
+          "line": 856,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.checked ? 'true' : 'f",
@@ -13222,7 +13243,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 837,
+          "line": 865,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.value)",
@@ -13232,7 +13253,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.starting",
-          "line": 865,
+          "line": 893,
           "via": null,
           "href": null,
           "handler": null,
@@ -13242,7 +13263,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.retry",
-          "line": 928,
+          "line": 956,
           "via": null,
           "href": null,
           "handler": "() => handleRetry(selectedPipeline.id)",
@@ -13309,7 +13330,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.cancel",
-          "line": 931,
+          "line": 959,
           "via": null,
           "href": null,
           "handler": "() => handleCancel(selectedPipeline.id)",
@@ -13333,7 +13354,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.play_manual",
-          "line": 991,
+          "line": 1019,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handlePlay(job.id); }",
@@ -13385,7 +13406,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.approval_recorded",
-          "line": 994,
+          "line": 1022,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handleApprove(job.id); }",
@@ -13437,7 +13458,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_downloading",
-          "line": 1030,
+          "line": 1058,
           "via": null,
           "href": null,
           "handler": "() => downloadArtifact(artifact)",
@@ -13462,7 +13483,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_deleting",
-          "line": 1036,
+          "line": 1064,
           "via": null,
           "href": null,
           "handler": "() => deleteArtifact(artifact)",
@@ -13487,12 +13508,62 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 1073,
+          "line": 1101,
           "via": null,
           "href": null,
           "handler": "closeLog",
           "calls": [],
           "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:pipeline.log.all_steps",
+          "line": 1111,
+          "via": null,
+          "href": null,
+          "handler": "() => showStep(null)",
+          "calls": [
+            {
+              "symbol": "pipelines.jobStepLog",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pipelines/{pipelineId}/jobs/{jobId}/steps/{number}/log",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/steps/{number}/log",
+              "access": "RepoRead",
+              "handler": "api::ci::get_job_step_log",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": ".",
+          "line": 1119,
+          "via": null,
+          "href": null,
+          "handler": "() => showStep(step.number)",
+          "calls": [
+            {
+              "symbol": "pipelines.jobStepLog",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pipelines/{pipelineId}/jobs/{jobId}/steps/{number}/log",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/steps/{number}/log",
+              "access": "RepoRead",
+              "handler": "api::ci::get_job_step_log",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
         },
         {
           "tag": "a",
@@ -29287,7 +29358,7 @@
       "outsider"
     ],
     "scenarios": 52,
-    "inventoryEntries": 822,
+    "inventoryEntries": 824,
     "coveredEntries": 197,
     "coveredRoutes": 187,
     "maxUiRoutesWithoutFrontendTest": 24

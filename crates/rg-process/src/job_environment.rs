@@ -73,6 +73,29 @@ const WINDOWS_PROCESS_VARIABLES: &[&str] = &[
 /// Environment entries are `NAME=VALUE` strings and every reader stops at the
 /// first `=`, so a variable called `PATH=/tmp` becomes the entry
 /// `PATH=/tmp=<value>`, whose effective `PATH` is the job's.
+/// Variables whose values belong to the pipeline runner, never to a committed
+/// job variable, a repository secret or a step's `$GITHUB_ENV`.
+///
+/// Both runners inject this vocabulary — the embedded one and, through the
+/// server, `plombir-git-runner` — and both drop a job's own copy of any of
+/// these names. Kept here, below both, so a new built-in is protected on every
+/// path at once; `rg_core::ci::BUILTIN_CI_VARIABLES` is this list.
+pub const RUNNER_OWNED_VARIABLES: [&str; 12] = [
+    "CI",
+    "PLOMBIR_GIT",
+    "CI_PIPELINE_ID",
+    "CI_COMMIT_SHA",
+    "CI_SHA",
+    "CI_REF",
+    "CI_EVENT",
+    // `github.event.schedule`: the `- cron:` entry a `schedule` run fired for.
+    "CI_EVENT_SCHEDULE",
+    "CI_REPOSITORY",
+    "CI_REPOSITORY_OWNER",
+    "CI_JOB_TOKEN",
+    "CI_OIDC_TOKEN_URL",
+];
+
 pub fn valid_environment_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))

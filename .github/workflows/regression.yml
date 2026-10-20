@@ -221,6 +221,15 @@ jobs:
           -E 'test(/^oci_live_client_tests::/) | test(/^lfs_locks_stock_client_tests::/)
           | test(old_url_clone_with_lfs_checks_out_the_file_content)'
 
+      # The step model's container half against a real daemon: one container
+      # per job, `docker exec` per step, and a timed-out step killed together
+      # with what it started while the container lives on for the next one
+      # (card_c8b3fa9f0ebc). `#[ignore]`d for the reason above.
+      - name: Run step-model container test
+        run: >-
+          cargo nextest run -p rg-process --run-ignored only
+          -E 'test(ci_steps::tests::steps_share_one_container_and_a_timeout_spares_it)'
+
       # The same client over an SSH remote, with no HTTP server at all:
       # `git-lfs-transfer` carries the objects and the locks, and the test
       # counts the SSH connections a push opens (card_f11136311b12).

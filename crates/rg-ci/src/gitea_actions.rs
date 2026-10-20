@@ -1903,14 +1903,15 @@ impl GiteaWorkflow {
                 })
             })
             .collect::<Vec<_>>();
-        if self
+        if let Some(shell) = self
             .defaults
             .as_ref()
             .and_then(|defaults| defaults.run.as_ref())
-            .and_then(|run| run.shell.as_ref())
-            .is_some()
+            .and_then(|run| run.shell.as_deref())
         {
-            unsupported.push("defaults.run.shell".into());
+            if let Err(reason) = rg_process::ci_steps::Shell::parse(Some(shell)) {
+                unsupported.push(format!("defaults.run.shell: {reason}"));
+            }
         }
         unsupported.extend(self.jobs.iter().filter_map(|(job_name, job)| {
             job.uses
@@ -1932,8 +1933,8 @@ impl GiteaWorkflow {
             let step_conditions = job.steps.iter().filter_map(move |step| {
                 step.condition
                     .as_deref()
-                    .filter(|condition| !supported_condition(condition, false))
-                    .map(|condition| format!("{job_name}: unsupported step condition {condition}"))
+                    .and_then(|condition| unsupported_step_condition(step, condition))
+                    .map(|reason| format!("{job_name}: {reason}"))
             });
             job_condition.into_iter().chain(step_conditions)
         }));
@@ -1942,26 +1943,70 @@ impl GiteaWorkflow {
                 .defaults
                 .as_ref()
                 .and_then(|defaults| defaults.run.as_ref())
-                .and_then(|run| run.shell.as_ref())
-                .map(|_| format!("{job_name}: defaults.run.shell"));
+                .and_then(|run| run.shell.as_deref())
+                .and_then(|shell| rg_process::ci_steps::Shell::parse(Some(shell)).err())
+                .map(|reason| format!("{job_name}: defaults.run.shell: {reason}"));
+            let mut ids = std::collections::HashSet::new();
+            let duplicate_ids = job
+                .steps
+                .iter()
+                .filter_map(|step| step.id.as_deref())
+                .filter(|id| !ids.insert(*id))
+                .map(|id| format!("{job_name}: step id `{id}` is used twice"))
+                .collect::<Vec<_>>();
             let step_features = job.steps.iter().enumerate().flat_map(move |(index, step)| {
                 let prefix = format!("{job_name}: step {}", index + 1);
+                let run_only = |key: &str| {
+                    step.run
+                        .is_none()
+                        .then(|| format!("{prefix} {key} without run"))
+                };
                 [
-                    step.shell.as_ref().map(|_| format!("{prefix} shell")),
-                    step.id.as_ref().map(|_| format!("{prefix} id")),
+                    step.shell
+                        .as_ref()
+                        .and_then(|_| run_only("shell"))
+                        .or_else(|| {
+                            step.shell.as_deref().and_then(|shell| {
+                                rg_process::ci_steps::Shell::parse(Some(shell))
+                                    .err()
+                                    .map(|reason| format!("{prefix} shell: {reason}"))
+                            })
+                        }),
+                    step.id
+                        .as_deref()
+                        .filter(|id| !valid_step_id(id))
+                        .map(|id| {
+                            format!(
+                            "{prefix} id `{id}` must start with a letter or `_` and contain only \
+                             letters, digits, `-` and `_`"
+                        )
+                        }),
                     step.continue_on_error
                         .as_ref()
-                        .map(|_| format!("{prefix} continue-on-error")),
+                        .and_then(|_| run_only("continue-on-error"))
+                        .or_else(|| {
+                            step_continue_on_error(step)
+                                .err()
+                                .map(|reason| format!("{prefix} {reason}"))
+                        }),
                     step.timeout_minutes
                         .as_ref()
-                        .map(|_| format!("{prefix} timeout-minutes")),
+                        .and_then(|_| run_only("timeout-minutes"))
+                        .or_else(|| {
+                            step_timeout_minutes(step)
+                                .err()
+                                .map(|reason| format!("{prefix} {reason}"))
+                        }),
                     (step.working_directory.is_some() && step.run.is_none())
                         .then(|| format!("{prefix} working-directory without run")),
                 ]
                 .into_iter()
                 .flatten()
             });
-            default_shell.into_iter().chain(step_features)
+            default_shell
+                .into_iter()
+                .chain(duplicate_ids)
+                .chain(step_features)
         }));
         // `container.options` is raw `docker run` flags. Passing them through
         // would hand a committed workflow the ability to undo the sandbox the
@@ -2218,7 +2263,13 @@ impl GiteaWorkflow {
         // Convert each job
         let mut job_configs: HashMap<String, JobConfig> = HashMap::new();
         for (name, job) in &self.jobs {
-            let (script, job_vars, cache, artifacts) = self.build_job_script(name, job, ctx);
+            let JobTranslation {
+                script,
+                variables: job_vars,
+                cache,
+                artifacts,
+                steps,
+            } = self.build_job_script(name, job, ctx);
             let (image, image_template) = split_action_template(
                 job.container
                     .as_ref()
@@ -2280,6 +2331,7 @@ impl GiteaWorkflow {
                     cache,
                     artifacts,
                     action_templates,
+                    steps: Some(steps),
                 },
             );
         }
@@ -2364,18 +2416,25 @@ impl GiteaWorkflow {
         job_name: &str,
         job: &GiteaJob,
         ctx: &WorkflowContext,
-    ) -> (
-        Vec<String>,
-        HashMap<String, String>,
-        Option<CacheConfig>,
-        Option<ArtifactsConfig>,
-    ) {
+    ) -> JobTranslation {
         // GitHub's default bash invocation is fail-fast; preserving this
         // prevents a later successful step from masking an earlier failure.
         let mut script: Vec<String> = vec!["set -e".into()];
         let mut job_vars: HashMap<String, String> = HashMap::new();
         let mut cache = None;
         let mut artifacts = None;
+        let mut steps = Vec::new();
+        let default_shell = job
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.run.as_ref())
+            .and_then(|run| run.shell.clone())
+            .or_else(|| {
+                self.defaults
+                    .as_ref()
+                    .and_then(|defaults| defaults.run.as_ref())
+                    .and_then(|run| run.shell.clone())
+            });
 
         // Container env first, so workflow- and job-level `env:` override it.
         // The runner turns a job's variables into the container's environment
@@ -2456,11 +2515,21 @@ impl GiteaWorkflow {
             let mut step_vars = job_vars.clone();
             step_vars.extend(resolved_step_env.clone());
 
-            if let Some(condition) = step.condition.as_deref() {
+            // The flat `script` rendering — what the job page shows, and what
+            // a pre-steps runner is told it cannot run — reads every condition
+            // as if the steps before it succeeded. The steps themselves carry
+            // their `if:` to the runner, which reads it between steps.
+            let statically_runs = step.condition.as_deref().is_none_or(|condition| {
                 let context = actions_condition_context(ctx, &step_vars);
-                if !crate::condition::evaluate_condition(condition, &context).unwrap_or(false) {
-                    continue;
-                }
+                crate::condition::evaluate_step_condition(
+                    condition,
+                    &context,
+                    crate::condition::StepStatus::default(),
+                )
+                .unwrap_or(false)
+            });
+            if step.uses.is_some() && !statically_runs {
+                continue;
             }
             // Handle `uses: actions/checkout@vX` — implicit in Plombir Git, skip
             if let Some(ref uses) = step.uses {
@@ -2558,11 +2627,28 @@ impl GiteaWorkflow {
                             Some(&resolved_step_env),
                         )
                     });
-                script.push(step_command(
-                    &expanded_cmd,
-                    &resolved_step_env,
-                    working_directory.as_deref(),
-                ));
+                if statically_runs {
+                    script.push(step_command(
+                        &expanded_cmd,
+                        &resolved_step_env,
+                        working_directory.as_deref(),
+                    ));
+                }
+                steps.push(rg_process::ci_steps::StepSpec {
+                    name: step.name.clone().unwrap_or_else(|| {
+                        // GitHub's own label for an unnamed step: the first
+                        // line of what it runs.
+                        format!("Run {}", run_cmd.lines().next().unwrap_or_default().trim())
+                    }),
+                    id: step.id.clone(),
+                    run: expanded_cmd,
+                    shell: step.shell.clone().or_else(|| default_shell.clone()),
+                    working_directory,
+                    env: resolved_step_env.clone().into_iter().collect(),
+                    continue_on_error: step_continue_on_error(step).unwrap_or(false),
+                    timeout_minutes: step_timeout_minutes(step).unwrap_or(None),
+                    condition: step.condition.clone(),
+                });
             }
         }
 
@@ -2574,8 +2660,25 @@ impl GiteaWorkflow {
             );
         }
 
-        (script, job_vars, cache, artifacts)
+        JobTranslation {
+            script,
+            variables: job_vars,
+            cache,
+            artifacts,
+            steps,
+        }
     }
+}
+
+/// One Actions job, translated: the flat script the job page shows, the
+/// variables every step inherits, the job-level cache and artifact, and the
+/// steps a runner executes one by one.
+struct JobTranslation {
+    script: Vec<String>,
+    variables: HashMap<String, String>,
+    cache: Option<CacheConfig>,
+    artifacts: Option<ArtifactsConfig>,
+    steps: Vec<rg_process::ci_steps::StepSpec>,
 }
 
 fn pin_workflow_working_directory(job: &mut GiteaJob, defaults: &Option<GiteaDefaults>) {
@@ -3521,6 +3624,82 @@ impl GlobStates {
 /// be reached: the `strip_suffix('*')` arm above it answered first.)
 fn match_glob(s: &str, pattern: &str) -> bool {
     glob_segments(s.as_bytes(), pattern.as_bytes())
+}
+
+/// A step `id:` as GitHub accepts it.
+fn valid_step_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+/// The longest `timeout-minutes` a step may ask for: the longest a job may run.
+const MAX_STEP_TIMEOUT_MINUTES: u64 = rg_core::ci::JOB_TIMEOUT_MAX_SECS as u64 / 60;
+
+/// A step's `continue-on-error:`, which has to be a boolean here: an
+/// expression would need a value the workflow does not have when it is read.
+fn step_continue_on_error(step: &GiteaStep) -> std::result::Result<bool, String> {
+    match &step.continue_on_error {
+        None => Ok(false),
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(serde_json::Value::String(value)) if value == "true" => Ok(true),
+        Some(serde_json::Value::String(value)) if value == "false" => Ok(false),
+        Some(other) => Err(format!(
+            "continue-on-error must be true or false, got `{other}` (an expression is not \
+             supported here)"
+        )),
+    }
+}
+
+/// A step's `timeout-minutes:`: a whole number of minutes, at least one and at
+/// most the longest a job may run.
+fn step_timeout_minutes(step: &GiteaStep) -> std::result::Result<Option<u64>, String> {
+    let Some(value) = &step.timeout_minutes else {
+        return Ok(None);
+    };
+    match value.as_u64() {
+        Some(minutes) if (1..=MAX_STEP_TIMEOUT_MINUTES).contains(&minutes) => Ok(Some(minutes)),
+        _ => Err(format!(
+            "timeout-minutes must be a whole number from 1 to {MAX_STEP_TIMEOUT_MINUTES}, got \
+             `{value}`"
+        )),
+    }
+}
+
+/// Why a step's `if:` cannot be honoured, or `None` when it can.
+///
+/// A `run:` step's condition is read by the runner between steps, so the
+/// status functions have an answer there. An action this engine implements
+/// natively (`actions/cache`, `actions/upload-artifact`) is not a step that
+/// runs in that sequence — the cache is saved and the artifact published once,
+/// after a job that succeeded — so a condition asking for it to run after a
+/// failure (`always()`, `failure()`) would be honoured by nothing.
+fn unsupported_step_condition(step: &GiteaStep, condition: &str) -> Option<String> {
+    if let Err(error) = crate::condition::validate_step_condition(condition) {
+        return Some(format!("unsupported step condition {condition}: {error:#}"));
+    }
+    if condition.contains("matrix.") {
+        return Some(format!(
+            "unsupported step condition {condition}: `matrix.` is not available to a step condition"
+        ));
+    }
+    let names_a_status = ["always()", "failure()", "cancelled()"]
+        .iter()
+        .any(|function| {
+            condition
+                .to_ascii_lowercase()
+                .replace(' ', "")
+                .contains(function)
+        });
+    (step.uses.is_some() && names_a_status).then(|| {
+        format!(
+            "step {} if: {condition} — a natively implemented action runs once, after a job that \
+             succeeded, so it cannot run after a failure",
+            step.uses.as_deref().unwrap_or_default()
+        )
+    })
 }
 
 fn supported_condition(condition: &str, allow_matrix: bool) -> bool {
@@ -5409,44 +5588,154 @@ jobs:
         }
     }
 
+    /// card_c8b3fa9f0ebc: a step's own policy keys are honoured now that a step
+    /// is its own process — and a value nothing can honour is still refused by
+    /// the key it was written under, never dropped.
     #[test]
-    fn unsupported_step_semantics_are_rejected_instead_of_ignored() {
+    fn step_policies_are_honoured_or_refused_by_name() {
         for (key, value) in [
             ("shell", "python"),
+            ("shell", "bash"),
+            ("shell", "sh"),
+            ("shell", "pwsh"),
+            ("shell", "'python3 {0}'"),
             ("id", "compile"),
+            ("id", "_build-2"),
             ("continue-on-error", "true"),
+            ("continue-on-error", "false"),
             ("timeout-minutes", "5"),
+            ("if", "always()"),
+            ("if", "failure() && github.ref == 'refs/heads/main'"),
         ] {
             let yaml = format!(
                 "on: push\njobs:\n  build:\n    steps:\n      - run: echo ok\n        {key}: {value}\n"
             );
             let workflow = GiteaWorkflow::parse(&yaml).unwrap();
-            let error = workflow
+            workflow
                 .validate_supported_actions()
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(key), "error must name {key}: {error}");
+                .unwrap_or_else(|error| panic!("`{key}: {value}` must be honoured: {error:#}"));
+        }
+        for at in ["job", "workflow"] {
+            let yaml = if at == "job" {
+                "on: push\njobs:\n  build:\n    defaults:\n      run:\n        shell: bash\n    steps:\n      - run: echo ok\n"
+            } else {
+                "on: push\ndefaults:\n  run:\n    shell: bash\njobs:\n  build:\n    steps:\n      - run: echo ok\n"
+            };
+            GiteaWorkflow::parse(yaml)
+                .unwrap()
+                .validate_supported_actions()
+                .unwrap_or_else(|error| {
+                    panic!("{at} defaults.run.shell must be honoured: {error:#}")
+                });
         }
 
-        let workflow = GiteaWorkflow::parse(
-            "on: push\njobs:\n  build:\n    defaults:\n      run:\n        shell: bash\n    steps:\n      - run: echo ok\n",
-        )
-        .unwrap();
-        let error = workflow
+        for (step, named) in [
+            ("      - run: echo ok\n        shell: cmd\n", "Windows shell"),
+            ("      - run: echo ok\n        shell: zsh\n", "has no `{0}`"),
+            ("      - run: echo ok\n        shell: '{0} python'\n", "must start with the program"),
+            ("      - run: echo ok\n        id: 1st\n", "id `1st` must start with a letter"),
+            (
+                "      - run: echo one\n        id: same\n      - run: echo two\n        id: same\n",
+                "step id `same` is used twice",
+            ),
+            (
+                "      - run: echo ok\n        continue-on-error: ${{ matrix.experimental }}\n",
+                "continue-on-error must be true or false",
+            ),
+            ("      - run: echo ok\n        timeout-minutes: 0\n", "timeout-minutes must be a whole number"),
+            ("      - run: echo ok\n        timeout-minutes: 2.5\n", "timeout-minutes must be a whole number"),
+            ("      - run: echo ok\n        timeout-minutes: 1441\n", "from 1 to 1440"),
+            ("      - uses: actions/checkout@v4\n        shell: bash\n", "shell without run"),
+            (
+                "      - uses: actions/checkout@v4\n        timeout-minutes: 5\n",
+                "timeout-minutes without run",
+            ),
+            (
+                "      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          path: out\n",
+                "cannot run after a failure",
+            ),
+            ("      - run: echo ok\n        if: matrix.os == 'linux'\n", "`matrix.` is not available"),
+            ("      - run: echo ok\n        if: hashFiles('x')\n", "unsupported step condition"),
+        ] {
+            let yaml = format!("on: push\njobs:\n  build:\n    steps:\n{step}");
+            let error = format!(
+                "{:#}",
+                GiteaWorkflow::parse(&yaml)
+                    .unwrap()
+                    .validate_supported_actions()
+                    .expect_err(&format!("`{step}` must be refused"))
+            );
+            assert!(error.contains(named), "`{step}`: expected `{named}` in: {error}");
+        }
+        let error = format!(
+            "{:#}",
+            GiteaWorkflow::parse(
+                "on: push\ndefaults:\n  run:\n    shell: powershell\njobs:\n  build:\n    steps:\n      - run: echo ok\n",
+            )
+            .unwrap()
             .validate_supported_actions()
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("defaults.run.shell"));
+            .expect_err("a Windows default shell is refused")
+        );
+        assert!(error.contains("defaults.run.shell"), "{error}");
+    }
 
+    /// Each `run:` step becomes a step a runner executes on its own, carrying
+    /// exactly what the workflow said about it — and the default shell, which
+    /// the step inherits from the closest `defaults.run.shell`.
+    #[test]
+    fn each_run_step_becomes_a_step_of_its_own() {
         let workflow = GiteaWorkflow::parse(
-            "on: push\ndefaults:\n  run:\n    shell: bash\njobs:\n  build:\n    steps:\n      - run: echo ok\n",
+            "on: push\ndefaults:\n  run:\n    shell: sh\njobs:\n  build:\n    defaults:\n      run:\n        shell: bash\n        working-directory: app\n    env:\n      JOB: job\n    steps:\n      - uses: actions/checkout@v4\n      - name: Compile\n        id: compile\n        run: make\n        env:\n          MODE: ${{ github.ref }}\n        timeout-minutes: 7\n      - run: |\n          make test\n          make lint\n        shell: python\n        continue-on-error: true\n        if: failure()\n        working-directory: tests\n",
         )
         .unwrap();
-        let error = workflow
-            .validate_supported_actions()
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("defaults.run.shell"));
+        workflow.validate_supported_actions().unwrap();
+        let config = workflow.to_ci_config(&test_context());
+        let steps = config.jobs["build"]
+            .steps
+            .as_ref()
+            .expect("an Actions job has steps");
+        assert_eq!(
+            steps.len(),
+            2,
+            "checkout is the workspace, not a step: {steps:?}"
+        );
+
+        assert_eq!(steps[0].name, "Compile");
+        assert_eq!(steps[0].id.as_deref(), Some("compile"));
+        assert_eq!(steps[0].run, "make");
+        assert_eq!(
+            steps[0].shell.as_deref(),
+            Some("bash"),
+            "the job's default wins"
+        );
+        assert_eq!(steps[0].working_directory.as_deref(), Some("app"));
+        assert_eq!(
+            steps[0].env.get("MODE").map(String::as_str),
+            Some("${CI_REF}")
+        );
+        assert!(
+            !steps[0].env.contains_key("JOB"),
+            "job env travels on the job"
+        );
+        assert_eq!(steps[0].timeout_minutes, Some(7));
+        assert!(!steps[0].continue_on_error);
+        assert_eq!(steps[0].condition, None);
+
+        assert_eq!(
+            steps[1].name, "Run make test",
+            "GitHub's label for an unnamed step"
+        );
+        assert_eq!(steps[1].shell.as_deref(), Some("python"));
+        assert_eq!(steps[1].working_directory.as_deref(), Some("tests"));
+        assert!(steps[1].continue_on_error);
+        assert_eq!(steps[1].condition.as_deref(), Some("failure()"));
+        assert_eq!(steps[1].timeout_minutes, None);
+
+        let native: CiConfig = rg_core::yaml::from_str("build:\n  script:\n    - make\n").unwrap();
+        assert!(
+            native.jobs["build"].steps.is_none(),
+            "a native job runs its script as one program"
+        );
     }
 
     #[test]

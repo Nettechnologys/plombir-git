@@ -1,7 +1,7 @@
 //! Every path `rg-runner` builds must be a route this server mounts
 //! (card_66eead51bb23).
 //!
-//! `crates/rg-runner/src/api.rs` spells thirteen `/api/v1/runners/...` URLs out
+//! `crates/rg-runner/src/api.rs` spells fourteen `/api/v1/runners/...` URLs out
 //! as format strings, in a crate that cannot see the route table. Nothing compared
 //! them with [`rg_http::routes`] — the agreement was held by eye, and the server
 //! tests that touch these endpoints (`runner_auth_tests`, `admin_runner_tests`)
@@ -139,9 +139,9 @@ struct RouteExpectation {
 
 /// Every route this sweep drives, spelled the way `routes.rs` spells it.
 ///
-/// `rg-runner` assembles all thirteen URLs out of ids at runtime, so the probes
+/// `rg-runner` assembles all fourteen URLs out of ids at runtime, so the probes
 /// prove the path without any test source ever naming it. `docs/ui-inventory.json`
-/// reads test sources, so all thirteen read there as routes nothing touches — and
+/// reads test sources, so all fourteen read there as routes nothing touches — and
 /// for `POST .../jobs/{job_id}/log` and `PUT .../jobs/{job_id}/artifacts/staging`
 /// there was no other test to fall back on (card_d482cf7e098e).
 ///
@@ -149,7 +149,7 @@ struct RouteExpectation {
 /// holds every recorded request to the row that claims it, so a probe pointed at
 /// another route — or a route renamed on either side — fails here instead of
 /// quietly changing what the artefact claims.
-const ROUTE_EXPECTATIONS: [RouteExpectation; 13] = [
+const ROUTE_EXPECTATIONS: [RouteExpectation; 14] = [
     RouteExpectation {
         probe: "register_runner",
         method: "POST",
@@ -179,6 +179,11 @@ const ROUTE_EXPECTATIONS: [RouteExpectation; 13] = [
         probe: "upload_log",
         method: "POST",
         route: "/api/v1/runners/{id}/jobs/{job_id}/log",
+    },
+    RouteExpectation {
+        probe: "report_step",
+        method: "POST",
+        route: "/api/v1/runners/{id}/jobs/{job_id}/steps/{number}",
     },
     RouteExpectation {
         probe: "download_workspace",
@@ -222,6 +227,8 @@ fn probe_path(route: &str, runner_id: i64, job_id: i64) -> String {
     route
         .replace("{id}", &runner_id.to_string())
         .replace("{job_id}", &job_id.to_string())
+        // The step probe reports step 1.
+        .replace("{number}", "1")
 }
 
 /// This call addressed exactly the route credited to it, and nothing else.
@@ -462,6 +469,22 @@ async fn every_runner_api_call_addresses_a_route_this_server_mounts() {
         "upload_log",
         probe(&recorder, "upload_log", async {
             rg_runner::api::upload_log(&client, &base, runner_id, job_id, token, "probe").await
+        })
+        .await,
+    );
+    record_probe(
+        "report_step",
+        probe(&recorder, "report_step", async {
+            rg_runner::api::report_step(
+                &client,
+                &base,
+                runner_id,
+                job_id,
+                token,
+                1,
+                &serde_json::json!({ "status": "running" }),
+            )
+            .await
         })
         .await,
     );

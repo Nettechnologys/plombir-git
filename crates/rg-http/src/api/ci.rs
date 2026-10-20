@@ -61,6 +61,84 @@ struct JobSummaryResponse {
     has_log: bool,
     started_at: Option<String>,
     finished_at: Option<String>,
+    /// The job's steps, in order, for a job that runs as steps; empty for a
+    /// native job, whose `script` runs as one program. Read each step's own
+    /// log through `.../steps/{number}/log`.
+    steps: Vec<JobStepResponse>,
+}
+
+/// One step of a job, as the job page lists it.
+#[derive(Serialize, utoipa::ToSchema)]
+struct JobStepResponse {
+    /// 1-based, in the order the workflow lists the steps.
+    number: i32,
+    name: String,
+    /// `pending`, `running`, `success`, `failure`, `skipped` or `cancelled`.
+    status: String,
+    /// What the step counts as for the job: a failed step under
+    /// `continue-on-error` concludes as `success`.
+    conclusion: Option<String>,
+    exit_code: Option<i32>,
+    has_log: bool,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+}
+
+impl JobStepResponse {
+    /// The step as the job it belongs to now stands. A job that ended — it was
+    /// canceled, it timed out, its runner went away — leaves the steps it never
+    /// got to (or never finished) as they were; they did not run, and saying
+    /// `running` under a finished job would claim they still might.
+    fn of(step: rg_db::ops::pipeline_step_ops::StepSummary, job_status: &str) -> Self {
+        let unfinished = matches!(step.status.as_str(), "pending" | "running");
+        let status = if unfinished && !rg_db::ops::pipeline_ops::is_active_pipeline_work(job_status)
+        {
+            if job_status == "skipped" {
+                "skipped".to_string()
+            } else {
+                "cancelled".to_string()
+            }
+        } else {
+            step.status
+        };
+        Self {
+            number: step.number,
+            name: step.name,
+            status,
+            conclusion: step.conclusion,
+            exit_code: step.exit_code,
+            has_log: step.has_log,
+            started_at: step.started_at.map(|t| t.to_string()),
+            finished_at: step.finished_at.map(|t| t.to_string()),
+        }
+    }
+}
+
+/// The steps of `jobs`, attached to each of them.
+async fn attach_steps(
+    db: &sea_orm::DatabaseConnection,
+    jobs: &mut [JobSummaryResponse],
+) -> Result<(), AppError> {
+    let ids = jobs.iter().map(|job| job.id).collect::<Vec<_>>();
+    let steps = rg_db::ops::pipeline_step_ops::list_step_summaries(db, &ids)
+        .await
+        .map_err(AppError::from)?;
+    let mut by_job: std::collections::HashMap<
+        i64,
+        Vec<rg_db::ops::pipeline_step_ops::StepSummary>,
+    > = std::collections::HashMap::new();
+    for step in steps {
+        by_job.entry(step.job_id).or_default().push(step);
+    }
+    for job in jobs {
+        job.steps = by_job
+            .remove(&job.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|step| JobStepResponse::of(step, &job.status))
+            .collect();
+    }
+    Ok(())
 }
 
 impl From<rg_db::ops::pipeline_ops::PipelineJobSummary> for JobSummaryResponse {
@@ -82,6 +160,7 @@ impl From<rg_db::ops::pipeline_ops::PipelineJobSummary> for JobSummaryResponse {
             has_log: job.has_log,
             started_at: job.started_at.map(|t| t.to_string()),
             finished_at: job.finished_at.map(|t| t.to_string()),
+            steps: Vec::new(),
         }
     }
 }
@@ -381,13 +460,17 @@ pub async fn get_pipeline(
         Ok(jobs) => jobs,
         Err(e) => return AppError::from(e).into_response(),
     };
+    let mut jobs = jobs
+        .into_iter()
+        .map(JobSummaryResponse::from)
+        .collect::<Vec<_>>();
+    if let Err(error) = attach_steps(&state.db, &mut jobs).await {
+        return error.into_response();
+    }
     let mut jobs_by_stage: std::collections::HashMap<i64, Vec<JobSummaryResponse>> =
         std::collections::HashMap::new();
     for job in jobs {
-        jobs_by_stage
-            .entry(job.stage_id)
-            .or_default()
-            .push(job.into());
+        jobs_by_stage.entry(job.stage_id).or_default().push(job);
     }
     let mut stages_with_jobs: Vec<StageWithJobsResponse> = Vec::with_capacity(stages.len());
     for stage in stages {
@@ -462,7 +545,12 @@ pub async fn get_job(
             if !belongs {
                 return AppError::not_found("job not found").into_response();
             }
-            Json(JobSummaryResponse::from(j)).into_response()
+            let mut job = [JobSummaryResponse::from(j)];
+            if let Err(error) = attach_steps(&state.db, &mut job).await {
+                return error.into_response();
+            }
+            let [job] = job;
+            Json(job).into_response()
         }
         Ok(None) => AppError::not_found("job not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -528,6 +616,63 @@ pub async fn get_job_log(
         content,
     })
     .into_response()
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct JobStepLogResponse {
+    number: i32,
+    status: String,
+    /// The step's own log, masked like the job's; empty until the step ends.
+    content: String,
+}
+
+/// The log of one step of a job that runs as steps.
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/steps/{number}/log",
+    tag = "CI/CD",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        ("id" = i64, Path, description = "pipeline id"),
+        ("job_id" = i64, Path, description = "job id"),
+        ("number" = i32, Path, description = "step number, from 1"),
+    ),
+    responses(
+        (status = 200, description = "The step's log", body = JobStepLogResponse),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "Pipeline, job or step not found", body = serde_json::Value),
+    ),
+)]
+pub async fn get_job_step_log(
+    State(state): State<AppState>,
+    Path((_, _, pipeline_id, job_id, number)): Path<(String, String, i64, i64, i32)>,
+    RepoRead { repo }: RepoRead,
+) -> impl IntoResponse {
+    let pipeline = match pipeline_in_repo(&state, &repo, pipeline_id).await {
+        Ok(pipeline) => pipeline,
+        Err(error) => return error.into_response(),
+    };
+    let job = match rg_db::ops::pipeline_ops::get_job_summary(&state.db, job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return AppError::not_found("job not found").into_response(),
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    match job_belongs_to_pipeline(&state.db, pipeline.id, job.stage_id).await {
+        Ok(true) => {}
+        Ok(false) => return AppError::not_found("job not found").into_response(),
+        Err(error) => return error.into_response(),
+    }
+    match rg_db::ops::pipeline_step_ops::find_job_step(&state.db, job_id, number).await {
+        Ok(Some(step)) => Json(JobStepLogResponse {
+            number: step.number,
+            status: step.status,
+            content: step.log.unwrap_or_default(),
+        })
+        .into_response(),
+        Ok(None) => AppError::not_found("step not found").into_response(),
+        Err(error) => AppError::from(error).into_response(),
+    }
 }
 
 /// POST /api/v1/repos/:owner/:name/pipelines/:id/jobs/:job_id/play

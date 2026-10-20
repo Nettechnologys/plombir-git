@@ -348,6 +348,8 @@ fn plan<'a>(fact: &'a RouteFact, subject: &str, fx: &Fixture) -> Option<Probe<'a
         match name {
             "id" => Some(fx.stranger.id.to_string()),
             "job_id" => Some(fx.job_id.to_string()),
+            // A step number is per job, not an instance-wide id.
+            "number" => Some("1".to_string()),
             "owner" if driver == Driver::Session => Some(OUTSIDER.to_string()),
             "name" if driver == Driver::Session => Some(OUTSIDER_REPO.to_string()),
             _ => None,
@@ -400,6 +402,9 @@ async fn drive_http(fx: &Fixture, fact: &RouteFact, url: &str, token: Option<&st
     // new requirement is a failure here and not a silent pair of 400s.
     if url.ends_with("/cache") {
         request = request.header("x-cache-key", CACHE_KEY);
+    }
+    if url.contains("/steps/") {
+        request = request.json(&serde_json::json!({"status": "running"}));
     }
     if url.ends_with("/finish") {
         request = request.json(&serde_json::json!({"status": "success", "exit_code": 0}));

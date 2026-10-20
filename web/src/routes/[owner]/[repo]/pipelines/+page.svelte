@@ -39,6 +39,16 @@
   let selectedJob = $state<any>(null);
   let showLogPanel = $state(false);
   let logContent = $state('');
+  // A job of steps lists them above its log; picking one shows that step's own
+  // log instead of the whole job's.
+  let selectedStep = $state<number | null>(null);
+  let stepLog = $state('');
+  let stepLogError = $state('');
+  const selectedJobSteps = $derived<any[]>(
+    (selectedPipeline?.stages ?? [])
+      .flatMap((stage: any) => stage.jobs || [])
+      .find((job: any) => job.id === selectedJob?.id)?.steps ?? [],
+  );
   let logStreamStatus = $state<'idle' | 'connected' | 'closed' | 'error'>('idle');
   let logStreamError = $state('');
   let logContentEl = $state<HTMLPreElement | null>(null);
@@ -583,6 +593,9 @@
       selectedJob = job;
       logContent = '';
       logOffset = 0;
+      selectedStep = null;
+      stepLog = '';
+      stepLogError = '';
       activeLogClaim = claim;
       showLogPanel = true;
       startJobLogStream(
@@ -605,6 +618,21 @@
       logContent = t('pipeline.log.load_failed', { error: e.message });
       logStreamStatus = 'error';
       showLogPanel = true;
+    }
+  }
+
+  async function showStep(number: number | null) {
+    selectedStep = number;
+    stepLog = '';
+    stepLogError = '';
+    if (number === null || !selectedJob || selectedPipelineId === null) return;
+    const [expectedOwner, expectedRepo, pipelineId, jobId] = [owner, repo, selectedPipelineId, selectedJob.id];
+    try {
+      const step = await pipelines.jobStepLog(expectedOwner, expectedRepo, pipelineId, jobId, number);
+      if (selectedStep !== number || selectedJob?.id !== jobId || owner !== expectedOwner || repo !== expectedRepo) return;
+      stepLog = step.content;
+    } catch (e: any) {
+      if (selectedStep === number) stepLogError = t('pipeline.log.step_load_failed', { error: e.message });
     }
   }
 
@@ -1078,7 +1106,37 @@
           <code>{selectedJob.if_condition}</code>
         </div>
       {/if}
-      <pre class="log-content" bind:this={logContentEl}><code>{logContent || t('pipeline.log.empty')}</code></pre>
+      {#if selectedJobSteps.length > 0}
+        <nav class="log-steps" aria-label={t('pipeline.log.steps')}>
+          <button
+            type="button"
+            class="log-step"
+            class:active={selectedStep === null}
+            aria-pressed={selectedStep === null}
+            onclick={() => showStep(null)}
+          >{t('pipeline.log.all_steps')}</button>
+          {#each selectedJobSteps as step (step.number)}
+            <button
+              type="button"
+              class="log-step"
+              class:active={selectedStep === step.number}
+              aria-pressed={selectedStep === step.number}
+              onclick={() => showStep(step.number)}
+            >
+              <PipelineBadge status={step.status} />
+              <span class="log-step-name">{step.number}. {step.name}</span>
+              {#if step.status === 'failure' && step.conclusion === 'success'}
+                <span class="log-step-note">{t('pipeline.log.continued_on_error')}</span>
+              {/if}
+            </button>
+          {/each}
+        </nav>
+      {/if}
+      {#if selectedStep !== null}
+        <pre class="log-content"><code>{stepLogError || stepLog || t('pipeline.log.empty')}</code></pre>
+      {:else}
+        <pre class="log-content" bind:this={logContentEl}><code>{logContent || t('pipeline.log.empty')}</code></pre>
+      {/if}
     </div>
   </Modal>
 {/if}
@@ -1320,6 +1378,32 @@
     padding: 8px 16px;
   }
   .log-condition code { color: var(--text-primary); overflow-wrap: anywhere; }
+  .log-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    max-height: 30vh;
+    overflow-y: auto;
+  }
+  .log-step {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border: none;
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .log-step:hover { background: var(--bg-secondary); }
+  .log-step.active { background: var(--bg-tertiary, var(--bg-secondary)); font-weight: 600; }
+  .log-step-name { overflow-wrap: anywhere; }
+  .log-step-note { color: var(--text-secondary); font-size: 12px; }
   .log-live {
     font-size: 11px;
     color: var(--text-muted);

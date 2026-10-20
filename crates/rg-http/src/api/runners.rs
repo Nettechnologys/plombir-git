@@ -97,6 +97,13 @@ pub struct PollJobResponse {
     artifact_name: Option<String>,
     artifact_paths: Option<Vec<String>>,
     timeout: i64,
+    /// The job's steps, for a job translated from an Actions workflow: the
+    /// runner executes them one by one and reports each through
+    /// `POST .../steps/{number}`. `None` for a native job, whose `script` is
+    /// the one program it runs. Only a runner that speaks
+    /// [`rg_core::ci::STEPS_PROTOCOL`] is ever handed one.
+    #[schema(value_type = Option<Vec<Object>>)]
+    steps: Option<Vec<serde_json::Value>>,
 }
 
 /// The artifact declaration as `pipeline_jobs.artifacts` stores it.
@@ -483,14 +490,17 @@ pub async fn deregister(
         (status = 200, description = "Job assigned", body = PollJobResponse),
         (status = 204, description = "No job available (timeout)"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 426, description = "The only work this runner could take is a job of steps, and it did not send the steps protocol header", body = serde_json::Value),
     ),
 )]
 pub async fn poll_job(
     State(state): State<AppState>,
     Path(runner_id): Path<i64>,
     Query(query): Query<PollJobQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let timeout_secs = query.timeout.unwrap_or(30).min(300);
+    let runs_steps = runner_runs_steps(&headers);
 
     // Use tokio::time::timeout to wrap a polling loop
     let poll_future = async {
@@ -499,15 +509,19 @@ pub async fn poll_job(
         loop {
             match crate::metrics::time_db(
                 "pipeline.find_pending_job",
-                rg_db::ops::pipeline_ops::find_pending_job_matching_labels(
+                rg_db::ops::pipeline_ops::find_pending_job_for_runner(
                     &state.db,
                     runner_repo_id,
                     &runner_labels,
+                    runs_steps,
                 ),
             )
             .await
             {
-                Ok(Some(job)) => {
+                Ok(rg_db::ops::pipeline_ops::PendingPick::NeedsSteps(job)) => {
+                    return Err(steps_protocol_refusal(runner_id, &job));
+                }
+                Ok(rg_db::ops::pipeline_ops::PendingPick::Job(job)) => {
                     let (resp, encrypted_mask) = prepare_dispatch(&state, runner_id, job).await?;
                     // Everything the response needs is prepared before the
                     // irreversible claim. The long-poll future can be dropped
@@ -521,7 +535,7 @@ pub async fn poll_job(
                     }
                     continue;
                 }
-                Ok(None) => {
+                Ok(rg_db::ops::pipeline_ops::PendingPick::Nothing) => {
                     // No job yet — wait and retry
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
@@ -547,6 +561,45 @@ pub async fn poll_job(
             (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response()
         }
     }
+}
+
+/// Whether the polling runner runs a job's steps one by one — it says so with
+/// [`rg_core::ci::RUNNER_PROTOCOL_HEADER`].
+///
+/// A runner built before the step model sends nothing, and would read a job of
+/// steps through the fields it knows: it would run the flat `script` as one
+/// program, with every step's `continue-on-error`, `timeout-minutes` and
+/// `shell` silently gone. So it is never handed one.
+fn runner_runs_steps(headers: &HeaderMap) -> bool {
+    headers
+        .get(rg_core::ci::RUNNER_PROTOCOL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .is_some_and(|protocol| protocol >= rg_core::ci::STEPS_PROTOCOL)
+}
+
+/// What a runner too old for the step model is told when the only work it
+/// could take is a job of steps: `426`, naming the job and the remedy, rather
+/// than the job half-run or a silence that looks like an empty queue. The job
+/// stays `pending` for a runner that can run it.
+fn steps_protocol_refusal(runner_id: i64, job: &rg_db::entities::pipeline_job::Model) -> Response {
+    tracing::warn!(
+        runner_id,
+        job_id = job.id,
+        "poll_job: refused a job of steps to a runner that does not run steps"
+    );
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(serde_json::json!({
+            "error": format!(
+                "job #{} ({}) runs its Actions steps one by one, and this runner runs a job as one \
+                 script: it would ignore every step's continue-on-error, timeout-minutes and \
+                 shell. Upgrade plombir-git-runner; the job waits for a runner that can run it.",
+                job.id, job.name
+            ),
+        })),
+    )
+        .into_response()
 }
 
 /// The repository a polling runner serves and the labels it matches jobs by.
@@ -846,7 +899,28 @@ async fn prepare_dispatch(
         }
     };
 
+    // A job of steps whose stored steps this server cannot read is refused
+    // before the claim, like every other undecodable runner-facing column: a
+    // runner handed `steps: null` would run the flat script instead.
+    let steps = match job
+        .steps
+        .as_deref()
+        .map(serde_json::from_str::<Vec<serde_json::Value>>)
+        .transpose()
+    {
+        Ok(steps) => steps,
+        Err(error) => {
+            tracing::error!(
+                job_id = job.id,
+                runner_id,
+                %error,
+                "poll_job: stored job steps are not valid JSON"
+            );
+            return Err(AppError::internal("invalid stored job steps").into_response());
+        }
+    };
     let resp = PollJobResponse {
+        steps,
         job_id: job.id,
         pipeline_id: pipeline.id,
         stage_id: job.stage_id,
@@ -949,6 +1023,13 @@ pub async fn start_job(
         }
     }
 
+    // A job that is run again — handed back, reclaimed, retried — runs its
+    // steps again, and what the previous run reported is not this run's.
+    if let Err(e) = rg_db::ops::pipeline_step_ops::reset_job_steps(&state.db, job_id).await {
+        tracing::error!(job_id, error = %format!("{e:#}"), "start_job: failed to reset the job's steps");
+        return AppError::from(e).into_response();
+    }
+
     // Mark runner as busy. This is not decoration: `busy` is what keeps the
     // scheduler from handing this runner a second job while it executes this
     // one, so a swallowed failure oversubscribes the runner — and answering
@@ -1040,23 +1121,9 @@ pub async fn upload_log(
         Err(error) => return error.into_response(),
     };
 
-    let body = match decrypt_job_mask(&state, &job) {
-        Ok(mut secrets) => {
-            match secrets_for_job(&state, job.stage_id).await {
-                Ok(current) => secrets.extend(current),
-                Err(error) => {
-                    tracing::error!(job_id, error = %format!("{error:#}"), "failed to load current secrets while masking runner log");
-                    return AppError::internal("failed to sanitize job log").into_response();
-                }
-            }
-            let body =
-                rg_core::auth::ci_token::mask_job_tokens_in_log(&body, &state.jwt_secret, job_id);
-            rg_core::auth::encryption::mask_values(&body, &secrets)
-        }
-        Err(error) => {
-            tracing::error!(job_id, error = %format!("{error:#}"), "failed to load issued secret snapshot while masking runner log");
-            return AppError::internal("failed to sanitize job log").into_response();
-        }
+    let body = match sanitized_runner_log(&state, &job, &body).await {
+        Ok(body) => body,
+        Err(response) => return response,
     };
 
     let result = if headers
@@ -1076,6 +1143,125 @@ pub async fn upload_log(
     crate::ws::push_job_log(&state.notification_hub, job_id, &body).await;
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
+}
+
+/// One step's report, as a runner sends it.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StepReportRequest {
+    /// `running` when the step starts; `success`, `failure`, `skipped` or
+    /// `cancelled` when it ends.
+    status: String,
+    /// What the step counts as for the job; required once it ended.
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    /// The step's own log, once it ended. Masked here like the job log.
+    #[serde(default)]
+    log: Option<String>,
+}
+
+const STEP_OUTCOMES: [&str; 4] = ["success", "failure", "skipped", "cancelled"];
+
+/// POST /api/v1/runners/:id/jobs/:job_id/steps/:number
+/// Report one step of a job of steps: when it starts, and how it ended.
+#[utoipa::path(
+    post,
+    path = "/runners/{id}/jobs/{job_id}/steps/{number}",
+    tag = "Runners",
+    params(
+        ("id" = i64, Path, description = "Runner ID"),
+        ("job_id" = i64, Path, description = "Job ID"),
+        ("number" = i32, Path, description = "Step number, from 1"),
+    ),
+    request_body = StepReportRequest,
+    responses(
+        (status = 200, description = "Step recorded", body = serde_json::Value),
+        (status = 400, description = "Not a step status this route records", body = serde_json::Value),
+        (status = 404, description = "Job not found", body = serde_json::Value),
+        (status = 409, description = "The job is no longer running, or has no such step", body = serde_json::Value),
+        (status = 413, description = "Report above the 8 MiB per-request ceiling"),
+    ),
+)]
+pub async fn report_step(
+    State(state): State<AppState>,
+    Path((runner_id, job_id, number)): Path<(i64, i64, i32)>,
+    Json(report): Json<StepReportRequest>,
+) -> impl IntoResponse {
+    let job = match assigned_job(&state, runner_id, job_id).await {
+        Ok(job) => job,
+        Err(error) => return error.into_response(),
+    };
+    let ended = STEP_OUTCOMES.contains(&report.status.as_str());
+    if report.status != "running" && !ended {
+        return AppError::bad_request(
+            "a step's status is `running`, or one of success, failure, skipped, cancelled",
+        )
+        .into_response();
+    }
+    if ended
+        && !report
+            .conclusion
+            .as_deref()
+            .is_some_and(|conclusion| STEP_OUTCOMES.contains(&conclusion))
+    {
+        return AppError::bad_request(
+            "a step that ended reports its conclusion: success, failure, skipped or cancelled",
+        )
+        .into_response();
+    }
+    let log = match report.log.as_deref() {
+        Some(log) if ended => match sanitized_runner_log(&state, &job, log).await {
+            Ok(log) => Some(log),
+            Err(response) => return response,
+        },
+        _ => None,
+    };
+    match rg_db::ops::pipeline_step_ops::report_job_step(
+        &state.db,
+        job_id,
+        &rg_db::ops::pipeline_step_ops::StepReport {
+            number,
+            status: &report.status,
+            conclusion: report.conclusion.as_deref().filter(|_| ended),
+            exit_code: report.exit_code.filter(|_| ended),
+            log: log.as_deref(),
+        },
+    )
+    .await
+    {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
+        Ok(false) => {
+            AppError::conflict("the job is no longer running, or has no such step").into_response()
+        }
+        Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+/// Mask a log a runner sent, with every secret the job was issued and every
+/// secret it could read now — the same mask `upload_log` applies.
+async fn sanitized_runner_log(
+    state: &AppState,
+    job: &rg_db::entities::pipeline_job::Model,
+    log: &str,
+) -> Result<String, Response> {
+    let mut secrets = match decrypt_job_mask(state, job) {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            tracing::error!(job_id = job.id, error = %format!("{error:#}"), "failed to load issued secret snapshot while masking runner log");
+            return Err(AppError::internal("failed to sanitize job log").into_response());
+        }
+    };
+    match secrets_for_job(state, job.stage_id).await {
+        Ok(current) => secrets.extend(current),
+        Err(error) => {
+            tracing::error!(job_id = job.id, error = %format!("{error:#}"), "failed to load current secrets while masking runner log");
+            return Err(AppError::internal("failed to sanitize job log").into_response());
+        }
+    }
+    let log = rg_core::auth::ci_token::mask_job_tokens_in_log(log, &state.jwt_secret, job.id);
+    Ok(rg_core::auth::encryption::mask_values(&log, &secrets))
 }
 
 fn log_write_failure_response(

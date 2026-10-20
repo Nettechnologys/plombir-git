@@ -744,6 +744,15 @@ async fn seed_vault(
     .await
     .expect("fixture: insert job");
     ids.job = job.id;
+    // A step, so `.../jobs/{job_id}/steps/{number}/log` has a row to answer.
+    rg_db::ops::pipeline_step_ops::create_job_steps(
+        db,
+        job.id,
+        r#"[{"name":"scope","run":"true"}]"#,
+        &["scope".to_string()],
+    )
+    .await
+    .expect("fixture: insert the job's step");
     rg_db::ops::artifact_ops::create_artifact(
         db,
         job.id,
@@ -973,6 +982,7 @@ fn coverage(tail: &str, ids: &Ids) -> Coverage {
         | "/pipelines/{id}/artifacts" => probe(&[("id", ids.pipeline)]),
         "/pipelines/{id}/jobs/{job_id}"
         | "/pipelines/{id}/jobs/{job_id}/log"
+        | "/pipelines/{id}/jobs/{job_id}/steps/{number}/log"
         | "/pipelines/{id}/jobs/{job_id}/play" => {
             probe(&[("id", ids.pipeline), ("job_id", ids.job)])
         }

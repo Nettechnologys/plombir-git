@@ -1325,6 +1325,56 @@ pub async fn find_pending_job_matching_labels(
     repo_id: i64,
     runner_labels: &[String],
 ) -> Result<Option<pipeline_job::Model>> {
+    Ok(first_pending_job(db, repo_id, runner_labels, |_| true)
+        .await?
+        .0)
+}
+
+/// What a polling runner may be handed.
+#[derive(Debug)]
+pub enum PendingPick {
+    Job(pipeline_job::Model),
+    /// Nothing this runner can run, but a job of steps it would be able to,
+    /// were it new enough: the poll says so instead of looking empty.
+    NeedsSteps(pipeline_job::Model),
+    Nothing,
+}
+
+/// [`find_pending_job_matching_labels`] for a runner that may or may not run a
+/// job's steps one by one. One that does not is never handed a job of steps —
+/// it would run the flat script and drop every step policy.
+pub async fn find_pending_job_for_runner(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    runner_labels: &[String],
+    runs_steps: bool,
+) -> Result<PendingPick> {
+    if runs_steps {
+        return Ok(
+            match find_pending_job_matching_labels(db, repo_id, runner_labels).await? {
+                Some(job) => PendingPick::Job(job),
+                None => PendingPick::Nothing,
+            },
+        );
+    }
+    Ok(
+        match first_pending_job(db, repo_id, runner_labels, |job| job.steps.is_none()).await? {
+            (Some(job), _) => PendingPick::Job(job),
+            (None, Some(stepped)) => PendingPick::NeedsSteps(stepped),
+            (None, None) => PendingPick::Nothing,
+        },
+    )
+}
+
+/// The first pending job `runner_labels` cover that `accept` takes, and the
+/// first covered one it turned down.
+async fn first_pending_job(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    runner_labels: &[String],
+    accept: impl Fn(&pipeline_job::Model) -> bool,
+) -> Result<(Option<pipeline_job::Model>, Option<pipeline_job::Model>)> {
+    let mut declined = None;
     // Keep the capability boundary in the database query. Apart from being the
     // narrowest place to enforce it, this prevents another repository's backlog
     // from turning every poll into an instance-wide scan.
@@ -1333,7 +1383,7 @@ pub async fn find_pending_job_matching_labels(
         .await
         .context("db: find pending jobs")?;
     if candidates.is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     // A job of a later stage stays `pending` while the earlier stages run, so
@@ -1384,10 +1434,13 @@ pub async fn find_pending_job_matching_labels(
         };
 
         if uncovered_job_tags(&job_tags, runner_labels).is_empty() {
-            return Ok(Some(job));
+            if accept(&job) {
+                return Ok((Some(job), declined));
+            }
+            declined.get_or_insert(job);
         }
     }
-    Ok(None)
+    Ok((None, declined))
 }
 
 /// Pending, unassigned jobs of one repository whose stage and pipeline would

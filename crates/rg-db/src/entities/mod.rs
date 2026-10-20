@@ -58,6 +58,7 @@ pub mod password_reset_token;
 pub mod pipeline;
 pub mod pipeline_concurrency_lock;
 pub mod pipeline_job;
+pub mod pipeline_job_step;
 pub mod pipeline_stage;
 pub mod pr_event;
 pub mod pr_review;

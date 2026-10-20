@@ -19,12 +19,12 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 438 |
-| Reachable from the browser | 310 (71%) |
+| Router routes (with declared `Access`) | 440 |
+| Reachable from the browser | 311 (71%) |
 | Layout modules | 2 |
 | Pages | 73 |
-| Interactive controls | 1057 |
-| Controls calling an API | 373 |
+| Interactive controls | 1059 |
+| Controls calling an API | 375 |
 | Controls from shared components | 427 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
 | **UI routes without a web/smoke/browser test** | **24** |
@@ -34,7 +34,7 @@
 
 | `Access` | routes | reachable from UI | no frontend test | no corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 110 | 71 | 4 | 0 |
+| `RepoRead` | 111 | 72 | 4 | 0 |
 | `RepoWrite` | 81 | 62 | 12 | 2 |
 | `User` | 55 | 45 | 5 | 0 |
 | `RepoAdmin` | 49 | 49 | 0 | 0 |
@@ -43,7 +43,7 @@
 | `RepoAuthRead` | 18 | 18 | 1 | 0 |
 | `OrgAdmin` | 15 | 14 | 0 | 0 |
 | `Foreign:oci.rs` | 14 | 0 | 0 | 0 |
-| `Foreign:RUNNER_AUTH_LAYER` | 12 | 0 | 0 | 0 |
+| `Foreign:RUNNER_AUTH_LAYER` | 13 | 0 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
 | `OrgRead` | 5 | 4 | 0 | 0 |
 | `Foreign:api/lfs_locks.rs` | 4 | 2 | 0 | 1 |
@@ -61,12 +61,12 @@
 | `/[owner]/[repo]/boards` | 42 | 14 | 15 |
 | `/[owner]/[repo]/issues/[number]` | 40 | 17 | 23 |
 | `/[owner]/[repo]/pulls` | 28 | 12 | 12 |
+| `/[owner]/[repo]/pipelines` | 27 | 13 | 14 |
 | `/[owner]/[repo]/releases` | 27 | 12 | 11 |
 | `/orgs/[name]` | 27 | 10 | 2 |
 | `/[owner]/[repo]/issues` | 26 | 9 | 12 |
 | `/[owner]/[repo]` | 25 | 5 | 12 |
 | `/[owner]/[repo]/blob/[...path]` | 25 | 8 | 11 |
-| `/[owner]/[repo]/pipelines` | 25 | 11 | 14 |
 | `/admin/users` 🔒 | 25 | 8 | 4 |
 | `/[owner]/[repo]/wiki/[title]` | 24 | 9 | 13 |
 | `/[owner]/[repo]/packages` | 23 | 11 | 12 |
@@ -495,23 +495,25 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| updateTriggerRef(event.currentTarget.value)} onchange= place | :799 | `POST /api/v1/repos/{owner}/{name}/pipelines` | `RepoWrite` | rust+web+browser |
-| updateTriggerRef(event.currentTarget.value)} onchange= place | :799 | `GET /api/v1/repos/{owner}/{name}/pipelines` | `RepoRead` | rust+web+browser |
-| updateTriggerRef(event.currentTarget.value)} onchange= place | :799 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web+browser |
-| updateTriggerRef(event.currentTarget.value)} onchange= place | :799 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web+browser |
-| i18n:pipeline.retry | :928 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/retry` | `RepoWrite` | rust+web |
-| i18n:pipeline.retry | :928 | `GET /api/v1/repos/{owner}/{name}/pipelines` | `RepoRead` | rust+web |
-| i18n:pipeline.retry | :928 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
-| i18n:pipeline.retry | :928 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
-| i18n:pipeline.cancel | :931 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/cancel` | `RepoWrite` | rust |
-| i18n:pipeline.play_manual | :991 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/play` | `RepoWrite` | rust |
-| i18n:pipeline.play_manual | :991 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
-| i18n:pipeline.play_manual | :991 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
-| i18n:pipeline.approval_recorded | :994 | `POST /api/v1/repos/{owner}/{name}/pipelines/{pipeline_id}/jobs/{job_id}/approve` | `RepoAuthRead` | rust |
-| i18n:pipeline.approval_recorded | :994 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
-| i18n:pipeline.approval_recorded | :994 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
-| i18n:pipeline.artifact_downloading | :1030 | `GET /api/v1/artifacts/{id}/download` | `RepoRead` | rust+web |
-| i18n:pipeline.artifact_deleting | :1036 | `DELETE /api/v1/artifacts/{id}` | `RepoWrite` | rust+web |
+| updateTriggerRef(event.currentTarget.value)} onchange= place | :827 | `POST /api/v1/repos/{owner}/{name}/pipelines` | `RepoWrite` | rust+web+browser |
+| updateTriggerRef(event.currentTarget.value)} onchange= place | :827 | `GET /api/v1/repos/{owner}/{name}/pipelines` | `RepoRead` | rust+web+browser |
+| updateTriggerRef(event.currentTarget.value)} onchange= place | :827 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web+browser |
+| updateTriggerRef(event.currentTarget.value)} onchange= place | :827 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web+browser |
+| i18n:pipeline.retry | :956 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/retry` | `RepoWrite` | rust+web |
+| i18n:pipeline.retry | :956 | `GET /api/v1/repos/{owner}/{name}/pipelines` | `RepoRead` | rust+web |
+| i18n:pipeline.retry | :956 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
+| i18n:pipeline.retry | :956 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
+| i18n:pipeline.cancel | :959 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/cancel` | `RepoWrite` | rust |
+| i18n:pipeline.play_manual | :1019 | `POST /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/play` | `RepoWrite` | rust |
+| i18n:pipeline.play_manual | :1019 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
+| i18n:pipeline.play_manual | :1019 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
+| i18n:pipeline.approval_recorded | :1022 | `POST /api/v1/repos/{owner}/{name}/pipelines/{pipeline_id}/jobs/{job_id}/approve` | `RepoAuthRead` | rust |
+| i18n:pipeline.approval_recorded | :1022 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
+| i18n:pipeline.approval_recorded | :1022 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
+| i18n:pipeline.artifact_downloading | :1058 | `GET /api/v1/artifacts/{id}/download` | `RepoRead` | rust+web |
+| i18n:pipeline.artifact_deleting | :1064 | `DELETE /api/v1/artifacts/{id}` | `RepoWrite` | rust+web |
+| i18n:pipeline.log.all_steps | :1111 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/steps/{number}/log` | `RepoRead` | rust+web |
+| . | :1119 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}/steps/{number}/log` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -1426,6 +1428,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/start` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/{job_id}/status` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/log` | `Foreign:RUNNER_AUTH_LAYER` | rust |
+| POST | `/api/v1/runners/{id}/jobs/{job_id}/steps/{number}` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/{job_id}/workspace` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/{job_id}/cache` | `Foreign:RUNNER_AUTH_LAYER` | rust+smoke |
 | PUT | `/api/v1/runners/{id}/jobs/{job_id}/cache` | `Foreign:RUNNER_AUTH_LAYER` | rust |

@@ -5274,6 +5274,7 @@ dependencies = [
 name = "rg-process"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "libc",
  "reqwest 0.12.28",
  "serde",

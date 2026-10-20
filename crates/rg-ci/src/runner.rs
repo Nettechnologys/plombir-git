@@ -883,6 +883,7 @@ impl PipelineRunner {
                 job.artifacts.as_deref(),
                 job.timeout_seconds,
                 job.tags.as_deref(),
+                job.steps.as_deref(),
             )
             .await;
 
@@ -1046,6 +1047,7 @@ impl PipelineRunner {
         artifacts: Option<&str>,
         timeout_seconds: Option<i64>,
         tags: Option<&str>,
+        steps: Option<&str>,
     ) -> Result<Option<(i32, String)>> {
         // Asked before the row is marked running, and before a token or a cache
         // is spent on it: a job whose labels this runner does not carry is not
@@ -1195,8 +1197,21 @@ impl PipelineRunner {
             return Err(anyhow::anyhow!("{}", msg));
         }
 
+        // A job of steps runs them one by one; a native job runs its script.
+        // The steps are decoded before anything starts, so a row this server
+        // cannot read fails the job instead of running half of it.
+        let steps = steps
+            .map(|json| {
+                serde_json::from_str::<Vec<rg_process::ci_steps::StepSpec>>(json)
+                    .context("the job's stored steps cannot be read")
+            })
+            .transpose()?;
         let exec_future = async {
-            if let Some(img) = image {
+            if let Some(steps) = &steps {
+                Ok(self
+                    .run_job_steps(job_id, steps, image, &job_environment, &secret_values)
+                    .await)
+            } else if let Some(img) = image {
                 self.run_job_docker(job_id, script, img, &job_environment)
                     .await
             } else {
@@ -1349,6 +1364,53 @@ impl PipelineRunner {
         })
     }
 
+    /// Run a job of steps, each in its own process, and record each step on
+    /// its row as it starts and ends.
+    ///
+    /// The rows are put back to `pending` first: a job that was handed back
+    /// or retried runs its steps again, and what the previous run reported is
+    /// not this run's.
+    async fn run_job_steps(
+        &self,
+        job_id: i64,
+        steps: &[rg_process::ci_steps::StepSpec],
+        image: Option<&str>,
+        job_environment: &[(String, String)],
+        secret_values: &[String],
+    ) -> (i32, String) {
+        if let Err(error) =
+            rg_db::ops::pipeline_step_ops::reset_job_steps(&self.db_write, job_id).await
+        {
+            tracing::warn!(
+                job_id,
+                error = %format!("{error:#}"),
+                "failed to reset the job's steps; the job page may show the previous run's"
+            );
+        }
+        let container_name = self.job_container_name(job_id);
+        let image = image.map(|image| rg_process::ci_steps::StepsImage {
+            program: self.docker_program.as_os_str(),
+            name: &container_name,
+            image,
+            user: rg_process::container_user(),
+            limits: &self.job_limits,
+        });
+        let mask = |log: &str| rg_core::auth::encryption::mask_values(log, secret_values);
+        let mut reporter = DbStepReporter {
+            db: &self.db_write,
+            job_id,
+        };
+        rg_process::ci_steps::run_job_steps(
+            steps,
+            job_environment,
+            &self.workspace_path(),
+            image,
+            &mask,
+            &mut reporter,
+        )
+        .await
+    }
+
     /// Execute script locally via platform-appropriate shell.
     ///
     /// The process runs with a sanitized environment (standard CI vars + PATH/LANG)
@@ -1444,6 +1506,7 @@ impl PipelineRunner {
                 user: rg_process::container_user(),
                 variables: job_environment,
                 limits: &self.job_limits,
+                temp: None,
             },
         )
         .await
@@ -1964,6 +2027,53 @@ const JOB_NOTICE_PREFIX: &str = "[plombir-git] ";
 /// Notices are multi-line (an actionable path error carries a `hint:` line), so
 /// every line is prefixed individually — a diagnostic that blends into script
 /// output is one nobody reads.
+/// Records each step of an embedded job on its row as it starts and ends.
+///
+/// A row that cannot be written costs the job page its progress, never the
+/// job: the step has run either way, and the job's log carries it.
+struct DbStepReporter<'a> {
+    db: &'a DatabaseConnection,
+    job_id: i64,
+}
+
+impl rg_process::ci_steps::StepReporter for DbStepReporter<'_> {
+    async fn started(&mut self, number: usize) {
+        self.write(&rg_db::ops::pipeline_step_ops::StepReport {
+            number: i32::try_from(number).unwrap_or(i32::MAX),
+            status: "running",
+            conclusion: None,
+            exit_code: None,
+            log: None,
+        })
+        .await;
+    }
+
+    async fn finished(&mut self, result: &rg_process::ci_steps::StepResult) {
+        self.write(&rg_db::ops::pipeline_step_ops::StepReport {
+            number: i32::try_from(result.number).unwrap_or(i32::MAX),
+            status: result.outcome.as_str(),
+            conclusion: Some(result.conclusion.as_str()),
+            exit_code: result.exit_code,
+            log: Some(&result.log),
+        })
+        .await;
+    }
+}
+
+impl DbStepReporter<'_> {
+    async fn write(&self, report: &rg_db::ops::pipeline_step_ops::StepReport<'_>) {
+        match rg_db::ops::pipeline_step_ops::report_job_step(self.db, self.job_id, report).await {
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                job_id = self.job_id,
+                step = report.number,
+                error = %format!("{error:#}"),
+                "failed to record a job step"
+            ),
+        }
+    }
+}
+
 fn append_job_notices(mut log: String, notices: &[String]) -> String {
     if notices.is_empty() {
         return log;
@@ -4498,6 +4608,7 @@ esac
                 job.cache_paths.as_deref(),
                 job.artifacts.as_deref(),
                 job.timeout_seconds,
+                None,
                 None,
             )
             .await

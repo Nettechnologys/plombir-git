@@ -43,6 +43,11 @@ pub struct Model {
     pub updated_at: Option<DateTime>,
     #[sea_orm(nullable)]
     pub tags: Option<String>, // JSON array of runner tag requirements
+    /// The job's steps as a JSON array of `rg_process::ci_steps::StepSpec`,
+    /// for a job translated from an Actions workflow; `None` for a native
+    /// job, whose `script` is the one thing it runs. A runner executes these
+    /// one by one and reports each into `pipeline_job_steps`.
+    pub steps: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

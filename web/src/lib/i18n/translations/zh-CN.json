@@ -1026,7 +1026,8 @@
       "failure": "失败",
       "error": "错误",
       "canceled": "已取消",
-      "skipped": "已跳过"
+      "skipped": "已跳过",
+      "cancelled": "已取消"
     },
     "retry": "↻ 重试",
     "cancel": "✗ 取消",
@@ -1070,7 +1071,11 @@
       "live": "实时",
       "closed": "已关闭",
       "title": "任务日志",
-      "empty": "（无日志输出）"
+      "empty": "（无日志输出）",
+      "steps": "步骤",
+      "all_steps": "全部步骤",
+      "step_load_failed": "加载步骤日志失败：{error}",
+      "continued_on_error": "失败，已继续执行"
     }
   },
   "errors": {

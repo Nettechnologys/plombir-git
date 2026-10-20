@@ -616,7 +616,11 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// card_5d25bc3276a3: `api::push_mirrors::{update,delete,sync}_push_mirror`
 /// take a push mirror id, each a scoped call — every service and `rg_db` call
 /// receives the gated repository's id beside it and finds the row only by both.
-const CENSUS_TOTAL: usize = 157;
+/// 161 since card_c8b3fa9f0ebc: `api::runners::report_step` takes the runner
+/// and job ids — the route layer anchors the first, `assigned_job` the second —
+/// and `api::ci::get_job_step_log` a pipeline and a job id, anchored by
+/// `pipeline_in_repo` and `job_belongs_to_pipeline` as the job-log route is.
+const CENSUS_TOTAL: usize = 161;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

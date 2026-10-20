@@ -9,8 +9,8 @@ use rg_process::client_policy::{
 
 use crate::api::{
     deregister_runner, download_workspace, finish_job, job_liveness, poll_job, publish_artifact,
-    register_runner, restore_cache, save_cache, send_heartbeat, stage_artifact, start_job,
-    upload_log, JobLiveness, JobStart,
+    register_runner, report_step, restore_cache, save_cache, send_heartbeat, stage_artifact,
+    start_job, upload_log, JobLiveness, JobStart,
 };
 use crate::config::{
     config_not_persisted_warning, load_config, resolve_auth_token, resolve_runner, save_config,
@@ -658,6 +658,48 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
     Ok(())
 }
 
+/// Reports each step of a job of steps to the server as it starts and ends.
+struct HttpStepReporter<'a> {
+    client: &'a reqwest::Client,
+    server: &'a str,
+    runner_id: i64,
+    job_id: i64,
+    token: &'a str,
+}
+
+impl rg_process::ci_steps::StepReporter for HttpStepReporter<'_> {
+    async fn started(&mut self, number: usize) {
+        report_step(
+            self.client,
+            self.server,
+            self.runner_id,
+            self.job_id,
+            self.token,
+            number,
+            &serde_json::json!({ "status": "running" }),
+        )
+        .await;
+    }
+
+    async fn finished(&mut self, result: &rg_process::ci_steps::StepResult) {
+        report_step(
+            self.client,
+            self.server,
+            self.runner_id,
+            self.job_id,
+            self.token,
+            result.number,
+            &serde_json::json!({
+                "status": result.outcome.as_str(),
+                "conclusion": result.conclusion.as_str(),
+                "exit_code": result.exit_code,
+                "log": result.log,
+            }),
+        )
+        .await;
+    }
+}
+
 /// Longest this runner waits on `docker rm`.
 ///
 /// Both callers are already on a clock — a job that has blown its timeout, or a
@@ -960,7 +1002,36 @@ pub async fn run_jobs_until_shutdown_checking_every(
                         remember_live_container(live_container, name.clone());
                     }
                     let execution = async {
-                        if let Some(img) = &job.image {
+                        if let Some(steps) = &job.steps {
+                            let mask =
+                                |log: &str| mask_polled_job_token(log, job.variables.as_ref());
+                            let mut reporter = HttpStepReporter {
+                                client: &client,
+                                server,
+                                runner_id,
+                                job_id: job.job_id,
+                                token,
+                            };
+                            rg_process::ci_steps::run_job_steps(
+                                steps,
+                                &variables,
+                                &workspace,
+                                job.image.as_deref().map(|image| {
+                                    rg_process::ci_steps::StepsImage {
+                                        program: std::ffi::OsStr::new("docker"),
+                                        name: container_name
+                                            .as_deref()
+                                            .expect("docker job has a container name"),
+                                        image,
+                                        user: rg_process::container_user(),
+                                        limits: job_limits,
+                                    }
+                                }),
+                                &mask,
+                                &mut reporter,
+                            )
+                            .await
+                        } else if let Some(img) = &job.image {
                             run_job_docker(
                                 img,
                                 &script_str,

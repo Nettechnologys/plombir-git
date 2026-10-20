@@ -143,8 +143,9 @@ cited in the row added it. Plombir Git's side is specified in full in
 | `container.options` | ❌ refused — it could undo the job sandbox | ✅ |
 | `services:` | ❌ refused | ✅ |
 | `uses:` actions | ⚠️ `actions/checkout`, `actions/cache`, `actions/upload-artifact` only | ✅ any action |
-| Composite actions, step `id` and outputs | ❌ refused | ✅ |
-| Step `continue-on-error`, step `timeout-minutes`, step `shell` | ❌ refused — a job's steps run as one script | ✅ |
+| Step `id` | ✅ | ✅ |
+| Composite actions, step outputs | ❌ refused | ✅ |
+| Step `continue-on-error`, step `timeout-minutes`, step `shell` | ✅ each step is its own process, in both runners; `$GITHUB_ENV` / `$GITHUB_PATH` between steps | ✅ |
 | `permissions`, `vars.*` | ❌ refused | ✅ |
 
 If your workflows lean on marketplace actions, services or step outputs, Gitea

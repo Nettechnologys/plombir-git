@@ -1938,6 +1938,15 @@ async fn seed_repo_rows(
     )
     .await
     .unwrap_or_else(|error| panic!("fixture: seeding the job in {repo} failed: {error}"));
+    // One step, so `.../jobs/{job_id}/steps/{number}/log` has a row to answer.
+    rg_db::ops::pipeline_step_ops::create_job_steps(
+        db,
+        job.id,
+        r#"[{"name":"unit","run":"echo ok"}]"#,
+        &["unit".to_string()],
+    )
+    .await
+    .unwrap_or_else(|error| panic!("fixture: seeding the job's step in {repo} failed: {error}"));
 
     RepoSeed {
         name: repo.to_string(),
@@ -2117,6 +2126,8 @@ fn fill(fact: &RouteFact, repo: &RepoSeed, globals: &GlobalSeed, org: &str) -> S
             "comment_id" => &repo.comment_id,
             "number" if deletes && path.ends_with("/pulls/{number}") => &repo.doomed_pull_number,
             "number" if path.contains("/pulls/") => &repo.pull_number,
+            // A job's steps are numbered from 1; the seeded job has one.
+            "number" if path.contains("/steps/{number}") => "1",
             "attachment_id" if path.contains("/pulls/comments/") => {
                 &repo.review_comment_attachment_id
             }
