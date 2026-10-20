@@ -4616,6 +4616,7 @@ async fn merge_claimed_pr(
     let foreign_locks = crate::lfs::locks::held_by_others(db, pr.repo_id, Some(actor_id))
         .await
         .context("load the LFS locks other people hold")?;
+    let identity = merge_identity(db, &pr, actor_id).await?;
 
     // Read the base tip *before* the merge: afterwards the old commit is only
     // reachable through the reflog, and the post-push hooks need the `before`
@@ -4749,8 +4750,15 @@ async fn merge_claimed_pr(
 
         let repo_path_for_git = repo_path.clone();
         let pr_for_git = pr.clone();
+        let identity = identity.clone();
         let merge_commit_sha = tokio::task::spawn_blocking(move || -> Result<String> {
-            let merged = merge_head_rev(&repo_path_for_git, &pr_for_git, &head_sha, strategy);
+            let merged = merge_head_rev(
+                &repo_path_for_git,
+                &pr_for_git,
+                &head_sha,
+                strategy,
+                &identity,
+            );
             discard_fork_ref(&repo_path_for_git, &merge_ref);
             discard_legacy_fork_ref(&repo_path_for_git, &legacy_ref);
             merged
@@ -4783,7 +4791,7 @@ async fn merge_claimed_pr(
         let repo_path = repo_path.clone();
         let pr = pr.clone();
         tokio::task::spawn_blocking(move || -> Result<String> {
-            merge_head_rev(&repo_path, &pr, &head_sha, strategy)
+            merge_head_rev(&repo_path, &pr, &head_sha, strategy, &identity)
         })
         .await??
     };
@@ -4839,21 +4847,194 @@ fn merge_head_rev(
     pr: &PullRequest,
     head_rev: &str,
     strategy: MergeStrategy,
+    identity: &MergeIdentity,
 ) -> Result<String> {
     match strategy {
         MergeStrategy::Merge => {
-            let merge_msg = format!("Merge pull request #{} from {}", pr.number, pr.head_branch);
-            gix_merge_no_ff(repo_path, &pr.base_branch, head_rev, &merge_msg)
+            let merge_msg = merge_commit_message(pr);
+            gix_merge_no_ff(
+                repo_path,
+                &pr.base_branch,
+                head_rev,
+                &merge_msg,
+                &identity.committer,
+            )
         }
-        MergeStrategy::Squash => {
-            let squash_msg = format!(
-                "Squash merge pull request #{} from {}",
-                pr.number, pr.head_branch
-            );
-            gix_squash_merge(repo_path, &pr.base_branch, head_rev, &squash_msg)
+        MergeStrategy::Squash => gix_squash_merge(repo_path, pr, head_rev, identity),
+        MergeStrategy::Rebase => {
+            git_rebase_merge(repo_path, &pr.base_branch, head_rev, &identity.committer)
         }
-        MergeStrategy::Rebase => git_rebase_merge(repo_path, &pr.base_branch, head_rev),
     }
+}
+
+/// Who a merge writes into the commits it produces.
+///
+/// Resolved from the database before the blocking phase that writes them, so
+/// the merge itself never looks an identity up — and never falls back to the
+/// host's git configuration or to a server-wide name. GitHub and Gitea agree on
+/// the shape, and so does this:
+///
+/// - `committer` is whoever merged: the account that pressed the button, or —
+///   for auto-merge and the merge queue — the account that asked for it.
+/// - `author` is whose work landed. For a squash that is the pull request's
+///   author, because the one commit replaces theirs; a merge commit is the
+///   merger's own act and names them twice; a rebase keeps every replayed
+///   commit's original author and only takes the committer from here.
+///
+/// Before this, all three strategies signed as `Plombir Git
+/// <noreply@plombir-git.local>`, so a squash erased the author from the base
+/// branch's history (card_422fc7bcac73).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeIdentity {
+    author: GitPerson,
+    committer: GitPerson,
+}
+
+/// One name/email pair as git writes it into a commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitPerson {
+    name: String,
+    email: String,
+}
+
+impl GitPerson {
+    /// The account as the web editor's commits already name it: username and
+    /// account email (see `repo::service::create_or_update_file`).
+    fn of(user: &rg_db::entities::user::Model) -> Self {
+        Self {
+            name: user.username.clone(),
+            email: user.email.clone(),
+        }
+    }
+
+    /// Plombir Git itself, for commits no person asked for: the merge queue's
+    /// rehearsal replay, whose commits never reach a branch.
+    fn server() -> Self {
+        Self {
+            name: MERGE_SIGNATURE_NAME.to_string(),
+            email: MERGE_SIGNATURE_EMAIL.to_string(),
+        }
+    }
+
+    /// Stamped at `time`, the raw `<seconds> <offset>` form gix borrows.
+    fn signature<'a>(&'a self, time: &'a str) -> gix::actor::SignatureRef<'a> {
+        gix::actor::SignatureRef {
+            name: self.name.as_str().into(),
+            email: self.email.as_str().into(),
+            time,
+        }
+    }
+}
+
+/// Resolve [`MergeIdentity`] for `actor_id` merging `pr`.
+///
+/// The actor was checked to be an active account by [`merge_pr`]; reading it
+/// again here is what supplies the name. A pull request whose author account no
+/// longer exists is squashed under the merger's name rather than refused: the
+/// work is still mergeable, and there is nobody else to credit.
+async fn merge_identity(
+    db: &DatabaseConnection,
+    pr: &PullRequest,
+    actor_id: i64,
+) -> Result<MergeIdentity> {
+    let committer = rg_db::ops::user_ops::find_by_id(db, actor_id)
+        .await
+        .context("load the merging account")?
+        .map(|user| GitPerson::of(&user))
+        .ok_or_else(|| crate::error::forbidden("pull request merge requires an active account"))?;
+    let author = if pr.author_id == actor_id {
+        committer.clone()
+    } else {
+        rg_db::ops::user_ops::find_by_id(db, pr.author_id)
+            .await
+            .context("load the pull request author")?
+            .map(|user| GitPerson::of(&user))
+            .unwrap_or_else(|| committer.clone())
+    };
+    Ok(MergeIdentity { author, committer })
+}
+
+/// The message of a `merge`-strategy commit: GitHub's form, the pull request's
+/// title under the generated subject so `git log` says what was merged.
+fn merge_commit_message(pr: &PullRequest) -> String {
+    let subject = format!("Merge pull request #{} from {}", pr.number, pr.head_branch);
+    let title = pr.title.trim();
+    if title.is_empty() {
+        subject
+    } else {
+        format!("{subject}\n\n{title}")
+    }
+}
+
+/// How many squashed commit subjects a squash message lists before it stops.
+const SQUASH_MESSAGE_SUBJECTS: usize = 100;
+
+/// The message of a squash commit: `<title> (#N)`, then the pull request's
+/// description — or, when it has none, the subjects of the commits the squash
+/// replaces, oldest first, the way GitHub fills an empty one.
+///
+/// The commits are what the author wrote down about the change; a squash that
+/// drops both them and the description leaves `git log` a generated line that
+/// says nothing (card_422fc7bcac73).
+fn squash_commit_message(pr: &PullRequest, squashed_subjects: &[String]) -> String {
+    let title = pr.title.trim();
+    let subject = if title.is_empty() {
+        format!(
+            "Squash merge pull request #{} from {}",
+            pr.number, pr.head_branch
+        )
+    } else {
+        format!("{title} (#{})", pr.number)
+    };
+    let description = pr.body.as_deref().map(str::trim).unwrap_or_default();
+    let body = if !description.is_empty() {
+        description.to_string()
+    } else {
+        let mut listed: Vec<String> = squashed_subjects
+            .iter()
+            .take(SQUASH_MESSAGE_SUBJECTS)
+            .map(|subject| format!("* {subject}"))
+            .collect();
+        if squashed_subjects.len() > SQUASH_MESSAGE_SUBJECTS {
+            listed.push(format!(
+                "* … and {} more",
+                squashed_subjects.len() - SQUASH_MESSAGE_SUBJECTS
+            ));
+        }
+        listed.join("\n")
+    };
+    if body.is_empty() {
+        subject
+    } else {
+        format!("{subject}\n\n{body}")
+    }
+}
+
+/// Subjects of the commits `head` brings that `base` does not have, oldest
+/// first — what a squash of `head` onto `base` replaces.
+fn squashed_commit_subjects(
+    repo: &gix::Repository,
+    base: gix::ObjectId,
+    head: gix::ObjectId,
+) -> Result<Vec<String>> {
+    let walk = repo
+        .rev_walk([head])
+        .with_hidden([base])
+        .all()
+        .context("failed to walk the commits a squash replaces")?;
+    let mut subjects = Vec::new();
+    for info in walk {
+        let info = info.context("failed to walk the commits a squash replaces")?;
+        let commit = info
+            .object()
+            .context("failed to read a commit a squash replaces")?;
+        let message = commit
+            .message()
+            .context("failed to read the message of a commit a squash replaces")?;
+        subjects.push(message.summary().to_string());
+    }
+    subjects.reverse();
+    Ok(subjects)
 }
 
 /// Update PR state after successful merge.
@@ -5088,6 +5269,7 @@ fn git_rebase_merge(
     repo_path: &std::path::Path,
     base_branch: &str,
     head_ref: &str,
+    committer: &GitPerson,
 ) -> Result<String> {
     let canonical_repo = std::fs::canonicalize(repo_path)
         .with_context(|| format!("failed to canonicalize repository: {:?}", repo_path))?;
@@ -5103,27 +5285,33 @@ fn git_rebase_merge(
     // `upstream_sha` is the base the replay was built on, read before the rebase
     // ran: a rejected push below is only the caller's conflict if that moved
     // underneath us.
-    let upstream_before =
-        match replay_rebase(&git, &canonical_repo, worktree.path(), &upstream, &head_sha)? {
-            RebaseReplay::Replayed { upstream_sha } => upstream_sha,
-            // A rebase git stopped on is the same *state* outcome the merge and
-            // squash strategies already report as a `409`: the request was
-            // correct, the server understood it, and the author has something to
-            // do about it. Only the strategy differed, so the status must not.
-            // The stderr stays in the log — a `Conflict` renders verbatim to the
-            // client and must not carry a git command line (H-05).
-            RebaseReplay::Conflicted { git_output } => {
-                tracing::warn!(
-                    base_branch,
-                    head_ref,
-                    stderr = %git_output,
-                    "rebase merge stopped on a conflict"
-                );
-                return Err(crate::error::conflict(
-                    "rebase conflict: the pull request no longer applies onto the base branch",
-                ));
-            }
-        };
+    let upstream_before = match replay_rebase(
+        &git,
+        &canonical_repo,
+        worktree.path(),
+        &upstream,
+        &head_sha,
+        committer,
+    )? {
+        RebaseReplay::Replayed { upstream_sha } => upstream_sha,
+        // A rebase git stopped on is the same *state* outcome the merge and
+        // squash strategies already report as a `409`: the request was
+        // correct, the server understood it, and the author has something to
+        // do about it. Only the strategy differed, so the status must not.
+        // The stderr stays in the log — a `Conflict` renders verbatim to the
+        // client and must not carry a git command line (H-05).
+        RebaseReplay::Conflicted { git_output } => {
+            tracing::warn!(
+                base_branch,
+                head_ref,
+                stderr = %git_output,
+                "rebase merge stopped on a conflict"
+            );
+            return Err(crate::error::conflict(
+                "rebase conflict: the pull request no longer applies onto the base branch",
+            ));
+        }
+    };
 
     let target_ref = format!("HEAD:refs/heads/{base_branch}");
     let push = git.run(&["push", "origin", &target_ref], Some(worktree.path()))?;
@@ -5190,7 +5378,16 @@ pub(super) fn rebase_group_tree(
     let git = rg_git::invocation::local(gateway);
 
     let worktree = RebaseWorktree::new(repo_path, crate::staging::WorktreePurpose::MergeGroup)?;
-    match replay_rebase(&git, &canonical_repo, worktree.path(), base_sha, head_sha)? {
+    // The rehearsal's commits never reach a branch — only their tree does — so
+    // nobody's name belongs on them.
+    match replay_rebase(
+        &git,
+        &canonical_repo,
+        worktree.path(),
+        base_sha,
+        head_sha,
+        &GitPerson::server(),
+    )? {
         RebaseReplay::Conflicted { git_output } => Ok(MergeGroupRebase::Conflict(git_output)),
         RebaseReplay::Replayed { .. } => {
             // The replay wrote its result into the clone, and the clone is about
@@ -5245,12 +5442,17 @@ enum RebaseReplay {
 /// not of `/etc/gitconfig`, of the `~/.gitconfig` of the account the server runs under, or of
 /// the server process's own `GIT_*` (card_dfee2b7016b9). The identity below already said *who*
 /// signed the replay; the policy says what the replay is.
+///
+/// `committer` is whoever merged ([`MergeIdentity`]). git keeps each replayed
+/// commit's own author whatever the environment says, so the `GIT_AUTHOR_*`
+/// pair only satisfies git's identity check; the committer is what lands.
 fn replay_rebase(
     git: &rg_git::invocation::LocalGitInvocation<'_>,
     canonical_repo: &std::path::Path,
     worktree: &std::path::Path,
     upstream: &str,
     head_sha: &str,
+    committer: &GitPerson,
 ) -> Result<RebaseReplay> {
     let repo_arg = canonical_repo.to_string_lossy();
     let worktree_arg = worktree.to_string_lossy();
@@ -5269,10 +5471,10 @@ fn replay_rebase(
         &["rebase", upstream],
         Some(worktree),
         &[
-            ("GIT_AUTHOR_NAME", MERGE_SIGNATURE_NAME),
-            ("GIT_AUTHOR_EMAIL", MERGE_SIGNATURE_EMAIL),
-            ("GIT_COMMITTER_NAME", MERGE_SIGNATURE_NAME),
-            ("GIT_COMMITTER_EMAIL", MERGE_SIGNATURE_EMAIL),
+            ("GIT_AUTHOR_NAME", committer.name.as_str()),
+            ("GIT_AUTHOR_EMAIL", committer.email.as_str()),
+            ("GIT_COMMITTER_NAME", committer.name.as_str()),
+            ("GIT_COMMITTER_EMAIL", committer.email.as_str()),
         ],
     )?;
     if rebase.success() {
@@ -5425,42 +5627,24 @@ fn get_ref_sha(repo_path: &std::path::Path, branch: &str) -> Result<String> {
 
 // ── Gix merge helpers ───────────────────────────────────────────────────
 
-/// The identity Plombir Git signs merge commits with.
+/// The identity Plombir Git signs the commits nobody asked for with — today
+/// only the merge queue's rehearsal replay ([`rebase_group_tree`]).
 ///
-/// Load-bearing, not cosmetic: `gix`'s plain `Repository::commit` resolves the
-/// author and committer from the host's git configuration, and refuses with
-/// "Author identity is not configured" when the machine has none. A server in a
-/// container has none, so every `merge` and `squash` merge answered
-/// `500 INTERNAL_ERROR` there while passing on a developer's box — and where the
-/// host *did* have one, the merge commit was signed with whoever happened to
-/// have run `git config --global` on that machine.
-///
-/// Both halves are the same bug: the commit's identity must come from
-/// Plombir Git, not from the host it runs on. The rebase strategy already passed
-/// this identity to `git rebase` explicitly; these constants are now the single
-/// place all three strategies read it from.
+/// Every commit that lands on a branch names people instead
+/// ([`MergeIdentity`]). Either way the identity is stated, never looked up:
+/// `gix`'s plain `Repository::commit` resolves the author and committer from
+/// the host's git configuration, and refused with "Author identity is not
+/// configured" in a container while signing with whoever ran `git config
+/// --global` on a developer's box.
 const MERGE_SIGNATURE_NAME: &str = "Plombir Git";
 const MERGE_SIGNATURE_EMAIL: &str = "noreply@plombir-git.local";
 
-/// [`MERGE_SIGNATURE_NAME`] / [`MERGE_SIGNATURE_EMAIL`] as a `gix` signature
-/// stamped at the current time.
+/// The `<seconds> +0000` stamp [`GitPerson::signature`] borrows.
 ///
-/// `SignatureRef::time` is the raw git wire form — `<seconds> <offset>` — so it
-/// is rendered here rather than borrowed from a config file. UTC, because the
-/// server's local zone is an operator's deployment choice and must not end up
-/// inside the object a merge produces.
-fn merge_signature(time: &str) -> gix::actor::SignatureRef<'_> {
-    gix::actor::SignatureRef {
-        name: MERGE_SIGNATURE_NAME.into(),
-        email: MERGE_SIGNATURE_EMAIL.into(),
-        time,
-    }
-}
-
-/// The `<seconds> +0000` stamp [`merge_signature`] borrows.
-///
-/// Kept separate so the caller owns the string: `SignatureRef` borrows its time,
-/// and a temporary built inside `merge_signature` would not outlive the call.
+/// `SignatureRef::time` is the raw git wire form, so it is rendered here rather
+/// than borrowed from a config file. UTC, because the server's local zone is an
+/// operator's deployment choice and must not end up inside the object a merge
+/// produces. Kept separate so the caller owns the string the signature borrows.
 fn merge_signature_time() -> String {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5677,6 +5861,7 @@ fn gix_merge_no_ff(
     base_branch: &str,
     head_ref: &str,
     message: &str,
+    merger: &GitPerson,
 ) -> Result<String> {
     // `rg_git::repository::open`, not `gix::open`: the bytes of a merge must not
     // depend on the machine — see [`plombir_git_merge_options`].
@@ -5698,11 +5883,10 @@ fn gix_merge_no_ff(
     // `commit_as`, not `commit`: the latter reads the identity out of the host's
     // git configuration — see [`MERGE_SIGNATURE_NAME`].
     let stamp = merge_signature_time();
-    let signature = merge_signature(&stamp);
     let commit_id = repo
         .commit_as(
-            signature,
-            signature,
+            merger.signature(&stamp),
+            merger.signature(&stamp),
             base_ref.as_str(),
             message,
             merged_tree_id.detach(),
@@ -5716,10 +5900,11 @@ fn gix_merge_no_ff(
 /// Perform a squash merge: merge commits, then create a single-parent commit.
 fn gix_squash_merge(
     repo_path: &std::path::Path,
-    base_branch: &str,
+    pr: &PullRequest,
     head_ref: &str,
-    message: &str,
+    identity: &MergeIdentity,
 ) -> Result<String> {
+    let base_branch = pr.base_branch.as_str();
     // Opened the same way `gix_merge_no_ff` is, and for the same reason.
     let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
@@ -5734,16 +5919,19 @@ fn gix_squash_merge(
 
     let merged_tree_id = gix_merge_commits_to_tree(&repo, our_commit, their_commit, head_ref)?;
 
-    // Squash merge: single-parent commit, signed the same way the merge commit
-    // above is — see [`MERGE_SIGNATURE_NAME`] for why not `repo.commit`.
+    let subjects = squashed_commit_subjects(&repo, our_commit.detach(), their_commit.detach())?;
+    let message = squash_commit_message(pr, &subjects);
+
+    // Squash merge: single-parent commit, authored by the pull request's author
+    // and committed by the merger — see [`MergeIdentity`], and
+    // [`MERGE_SIGNATURE_NAME`] for why not `repo.commit`.
     let stamp = merge_signature_time();
-    let signature = merge_signature(&stamp);
     let commit_id = repo
         .commit_as(
-            signature,
-            signature,
+            identity.committer.signature(&stamp),
+            identity.author.signature(&stamp),
             base_ref.as_str(),
-            message,
+            message.as_str(),
             merged_tree_id.detach(),
             [our_commit.detach()],
         )
@@ -6734,8 +6922,13 @@ mod rebase_configuration_ownership_tests {
     /// times the replay happened to run at, which differ between two runs of the
     /// same correct code.
     fn rebased_tree_plombir_git_way(served: &Path) -> String {
-        let head = super::git_rebase_merge(served, "main", "refs/heads/feature")
-            .expect("Plombir Git rebases this fixture");
+        let head = super::git_rebase_merge(
+            served,
+            "main",
+            "refs/heads/feature",
+            &super::GitPerson::server(),
+        )
+        .expect("Plombir Git rebases this fixture");
         git_stdout(served, &["rev-parse", &format!("{head}^{{tree}}")])
     }
 
@@ -7077,6 +7270,58 @@ mod merge_conflict_gate_tests {
     /// Read a path out of a commit with git itself, so what is asserted is what
     /// a client cloning this repository would get — not gix's view of its own
     /// output.
+    /// The `merge` strategy's entry point, with the arguments the gate cares
+    /// about; who signs is beside the point here.
+    fn merge_no_ff(
+        worktree: &Path,
+        base: &str,
+        head: &str,
+        message: &str,
+    ) -> anyhow::Result<String> {
+        super::gix_merge_no_ff(worktree, base, head, message, &super::GitPerson::server())
+    }
+
+    /// The `squash` strategy's entry point, shaped like [`merge_no_ff`].
+    fn squash(worktree: &Path, base: &str, head: &str, message: &str) -> anyhow::Result<String> {
+        let now = chrono::Utc::now();
+        let pr = super::PullRequest {
+            id: 1,
+            repo_id: 1,
+            number: 1,
+            title: message.to_string(),
+            body: None,
+            state: "open".to_string(),
+            is_draft: false,
+            auto_merge_enabled: false,
+            auto_merge_strategy: None,
+            auto_merge_enabled_by_id: None,
+            auto_merge_enabled_at: None,
+            author_id: 1,
+            reviewer_id: None,
+            head_branch: "feature".to_string(),
+            base_branch: base.to_string(),
+            head_sha: None,
+            merge_strategy: None,
+            merge_commit_sha: None,
+            head_repo_id: None,
+            ci_approved_sha: None,
+            ci_approved_by: None,
+            ci_approved_at: None,
+            milestone_id: None,
+            labels: None,
+            created_at: now,
+            updated_at: now,
+            closed_at: None,
+            merged_at: None,
+        };
+        let server = super::GitPerson::server();
+        let identity = super::MergeIdentity {
+            author: server.clone(),
+            committer: server,
+        };
+        super::gix_squash_merge(worktree, &pr, head, &identity)
+    }
+
     fn file_at(worktree: &Path, commit_sha: &str, path: &str) -> String {
         let spec = format!("{commit_sha}:{path}");
         let output = rg_git::cli_gateway::global_gateway()
@@ -7100,9 +7345,9 @@ mod merge_conflict_gate_tests {
         for (label, merge) in [
             (
                 "merge",
-                super::gix_merge_no_ff as fn(&Path, &str, &str, &str) -> anyhow::Result<String>,
+                merge_no_ff as fn(&Path, &str, &str, &str) -> anyhow::Result<String>,
             ),
-            ("squash", super::gix_squash_merge),
+            ("squash", squash),
         ] {
             let dir = tempfile::tempdir().expect("fixture directory");
             let worktree = content_merge_fixture(dir.path());
@@ -7133,9 +7378,9 @@ mod merge_conflict_gate_tests {
         for (label, merge) in [
             (
                 "merge",
-                super::gix_merge_no_ff as fn(&Path, &str, &str, &str) -> anyhow::Result<String>,
+                merge_no_ff as fn(&Path, &str, &str, &str) -> anyhow::Result<String>,
             ),
-            ("squash", super::gix_squash_merge),
+            ("squash", squash),
         ] {
             let dir = tempfile::tempdir().expect("fixture directory");
             let worktree = line_conflict_fixture(dir.path());
@@ -7255,7 +7500,12 @@ mod rebase_merge_status_tests {
         let bare = dir.path().join("served.git");
         serve_bare(&worktree, &bare);
 
-        let error = match super::git_rebase_merge(&bare, "main", "refs/heads/feature") {
+        let error = match super::git_rebase_merge(
+            &bare,
+            "main",
+            "refs/heads/feature",
+            &super::GitPerson::server(),
+        ) {
             Ok(sha) => panic!("rebase accepted two rewrites of one line as commit {sha}"),
             Err(error) => error,
         };
@@ -7291,7 +7541,12 @@ mod rebase_merge_status_tests {
             "git rev-parse refs/heads/main^ > \"${GIT_DIR:-.}/refs/heads/main\"\nexit 1\n",
         );
 
-        let error = match super::git_rebase_merge(&bare, "main", "refs/heads/feature") {
+        let error = match super::git_rebase_merge(
+            &bare,
+            "main",
+            "refs/heads/feature",
+            &super::GitPerson::server(),
+        ) {
             Ok(sha) => panic!("the rejected push was reported as merge commit {sha}"),
             Err(error) => error,
         };
@@ -7317,7 +7572,12 @@ mod rebase_merge_status_tests {
         serve_bare(&worktree, &bare);
         plant_pre_receive(&bare, "exit 1\n");
 
-        let error = match super::git_rebase_merge(&bare, "main", "refs/heads/feature") {
+        let error = match super::git_rebase_merge(
+            &bare,
+            "main",
+            "refs/heads/feature",
+            &super::GitPerson::server(),
+        ) {
             Ok(sha) => panic!("the rejected push was reported as merge commit {sha}"),
             Err(error) => error,
         };
@@ -7387,6 +7647,104 @@ mod fork_fetch_tests {
             refs_in(&base),
             vec![scratch],
             "the fetch wrote more than its scratch ref into the base repository"
+        );
+    }
+}
+
+#[cfg(test)]
+mod merge_message_tests {
+    use super::{merge_commit_message, squash_commit_message, PullRequest};
+
+    fn pull_request(title: &str, body: Option<&str>) -> PullRequest {
+        let now = chrono::Utc::now();
+        PullRequest {
+            id: 1,
+            repo_id: 1,
+            number: 7,
+            title: title.to_string(),
+            body: body.map(str::to_string),
+            state: "open".to_string(),
+            is_draft: false,
+            auto_merge_enabled: false,
+            auto_merge_strategy: None,
+            auto_merge_enabled_by_id: None,
+            auto_merge_enabled_at: None,
+            author_id: 1,
+            reviewer_id: None,
+            head_branch: "feature".to_string(),
+            base_branch: "main".to_string(),
+            head_sha: None,
+            merge_strategy: None,
+            merge_commit_sha: None,
+            head_repo_id: None,
+            ci_approved_sha: None,
+            ci_approved_by: None,
+            ci_approved_at: None,
+            milestone_id: None,
+            labels: None,
+            created_at: now,
+            updated_at: now,
+            closed_at: None,
+            merged_at: None,
+        }
+    }
+
+    fn subjects(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// card_422fc7bcac73: the squash commit is the only trace the pull request
+    /// leaves on the base branch, so its subject is the title and its body the
+    /// description.
+    #[test]
+    fn a_squash_is_titled_after_the_pull_request_and_carries_its_description() {
+        let pr = pull_request("Add the parser", Some("  Why: the old one leaked.\n"));
+        assert_eq!(
+            squash_commit_message(&pr, &subjects(&["wip", "fix"])),
+            "Add the parser (#7)\n\nWhy: the old one leaked."
+        );
+    }
+
+    #[test]
+    fn a_squash_without_a_description_lists_the_commits_it_replaces() {
+        let pr = pull_request("Add the parser", Some("   "));
+        assert_eq!(
+            squash_commit_message(&pr, &subjects(&["first", "second"])),
+            "Add the parser (#7)\n\n* first\n* second"
+        );
+    }
+
+    #[test]
+    fn a_long_squash_list_stops_and_says_how_many_it_left_out() {
+        let pr = pull_request("Big", None);
+        let many: Vec<String> = (0..super::SQUASH_MESSAGE_SUBJECTS + 3)
+            .map(|index| format!("c{index}"))
+            .collect();
+        let message = squash_commit_message(&pr, &many);
+        assert_eq!(
+            message
+                .lines()
+                .filter(|line| line.starts_with("* c"))
+                .count(),
+            super::SQUASH_MESSAGE_SUBJECTS
+        );
+        assert!(message.ends_with("* … and 3 more"), "{message}");
+    }
+
+    #[test]
+    fn a_squash_with_nothing_to_say_falls_back_to_the_generated_subject() {
+        let pr = pull_request("  ", None);
+        assert_eq!(
+            squash_commit_message(&pr, &[]),
+            "Squash merge pull request #7 from feature"
+        );
+    }
+
+    #[test]
+    fn a_merge_commit_carries_the_title_under_the_generated_subject() {
+        assert_eq!(
+            merge_commit_message(&pull_request("Add the parser", None)),
+            "Merge pull request #7 from feature\n\nAdd the parser"
         );
     }
 }

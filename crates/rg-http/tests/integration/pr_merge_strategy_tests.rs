@@ -123,6 +123,10 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
     crate::common::wait_for_listener(&addr).await;
 
     let (token, _) = register_full(&base, "merge-owner", "merge-owner@example.com").await;
+    // The pull request is opened by someone other than the merger, so the two
+    // halves of a merge's identity — whose work, who merged it — can be told
+    // apart in the commit (card_422fc7bcac73).
+    let (author_token, _) = register_full(&base, "pr-author", "pr-author@example.com").await;
     let client = reqwest::Client::new();
 
     for (strategy, expected_new_commits, expected_parent_fields) in
@@ -130,9 +134,24 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
     {
         let repo = format!("{strategy}-repo");
         create_repo_and_pr(&base, &token, &repo).await;
+        let collaborator = client
+            .post(format!(
+                "{base}/api/v1/repos/merge-owner/{repo}/collaborators"
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"username": "pr-author", "permission": "write"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            collaborator.status(),
+            201,
+            "{}",
+            collaborator.text().await.unwrap()
+        );
         let bare_path = repo_root.join(format!("merge-owner/{repo}.git"));
         let (_worktree, base_sha) = seed_diverged_repository(&bare_path);
-        open_pr(&base, &token, &repo, "main").await;
+        open_pr(&base, &author_token, &repo, "main").await;
 
         let merged = client
             .post(format!(
@@ -180,37 +199,56 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
             "feature b"
         );
 
-        // The commit this merge produced must be signed by Plombir Git, not by
-        // whatever identity the host happens to carry. `gix`'s plain
-        // `Repository::commit` read that from the host's git configuration:
-        // where there was none — a container — `merge` and `squash` answered
-        // 500, and where there was one the merge commit went out under the
-        // machine owner's name. The worktree that seeded this repository is
-        // configured as `Merge Test <merge-test@example.com>` precisely so an
-        // inherited identity is visible here rather than plausible.
+        // The commit this merge produced names people, not the server and not
+        // the host. `gix`'s plain `Repository::commit` read the identity from
+        // the host's git configuration — 500 in a container, the machine
+        // owner's name elsewhere — and the fix for that signed every merge as
+        // `Plombir Git <noreply@plombir-git.local>`, which erased the author of
+        // a squashed pull request from history (card_422fc7bcac73). The
+        // worktree that seeded this repository is configured as
+        // `Merge Test <merge-test@example.com>`, so an inherited host identity
+        // is visible here rather than plausible.
         //
-        // The committer is the assertion that holds for all three strategies:
-        // it names whoever *created* this object. `rebase` deliberately keeps
-        // each replayed commit's original author — that is what a rebase is —
-        // so only the two strategies that mint a new commit are checked on
-        // `%an` as well.
-        let committer = git(
-            &["show", "-s", "--format=%cn <%ce>", "refs/heads/main"],
-            Some(&bare_path),
-        );
-        assert_eq!(
-            committer, "Plombir Git <noreply@plombir-git.local>",
-            "{strategy} merge took its committer from the host's git config"
-        );
-        if strategy != "rebase" {
-            let author = git(
-                &["show", "-s", "--format=%an <%ae>", "refs/heads/main"],
+        // The committer is whoever merged, for all three strategies. The
+        // author is whose work it is: the pull request's author for a squash,
+        // the merger for the merge commit they made, and — what a rebase is —
+        // each replayed commit's original author.
+        let show = |format: &str| {
+            git(
+                &[
+                    "show",
+                    "-s",
+                    &format!("--format={format}"),
+                    "refs/heads/main",
+                ],
                 Some(&bare_path),
-            );
-            assert_eq!(
-                author, "Plombir Git <noreply@plombir-git.local>",
-                "{strategy} merge took its author from the host's git config"
-            );
+            )
+        };
+        assert_eq!(
+            show("%cn <%ce>"),
+            "merge-owner <merge-owner@example.com>",
+            "{strategy} merge must be committed by the account that merged it"
+        );
+        let expected_author = match strategy {
+            "merge" => "merge-owner <merge-owner@example.com>",
+            "squash" => "pr-author <pr-author@example.com>",
+            _ => "Merge Test <merge-test@example.com>",
+        };
+        assert_eq!(
+            show("%an <%ae>"),
+            expected_author,
+            "{strategy} merge named the wrong author"
+        );
+        match strategy {
+            "merge" => assert_eq!(
+                show("%B").trim_end(),
+                "Merge pull request #1 from feature\n\nMerge the feature"
+            ),
+            "squash" => assert_eq!(
+                show("%B").trim_end(),
+                "Merge the feature (#1)\n\n* feature a\n* feature b"
+            ),
+            _ => assert_eq!(show("%s"), "feature b"),
         }
 
         let pr = client
