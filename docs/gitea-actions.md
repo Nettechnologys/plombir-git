@@ -191,19 +191,18 @@ jobs:
 | `pull_request` | A pull request opened, updated or reopened. |
 | `merge_group` | The merge queue's speculative merge. |
 | `workflow_dispatch` | The Run button, or the API. |
+| `schedule` | A tick of one of its `- cron:` entries. See [Scheduled runs](#scheduled-runs). |
 | `workflow_call` | Nothing — it declares the file *callable* by another workflow. See [Reusable workflows](#reusable-workflows). |
 
 Every other `on:` name is refused by the name you wrote, with that list in the
-message. That includes names Actions defines and Plombir Git has no producer for
-— `schedule` (there is no scheduler in the tree) and `pull_request_target` (it
-would run the workflow from the base branch, which nothing here does):
+message. That includes a name Actions defines and Plombir Git has no producer
+for — `pull_request_target` (it would run the workflow from the base branch,
+which nothing here does):
 
 <!-- example: refused -->
 ```yaml
-name: Nightly
+name: Review
 on:
-  schedule:
-    - cron: '0 3 * * *'
   pull_request_target:
     branches:
       - main
@@ -217,6 +216,70 @@ jobs:
 Refusing beats accepting here. A workflow declaring an event nobody emits parses
 perfectly and then never runs, and "my CI is silent" is a much worse thing to
 debug than a named error at push time.
+
+### Scheduled runs
+
+`on: schedule` runs the workflow at each tick of one of its `- cron:` entries:
+
+```yaml
+name: Nightly
+on:
+  schedule:
+    - cron: '0 3 * * *'
+    - cron: '30 12 * * MON-FRI'
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - if: github.event.schedule == '0 3 * * *'
+        run: cargo audit
+      - run: echo "fired by ${{ github.event.schedule }}"
+```
+
+- **The dialect is GitHub's.** Five fields — minute, hour, day of month, month,
+  day of week — each a list of `*`, values, ranges and `/steps`, with month and
+  weekday names (`JAN`, `MON`) accepted in any case. A day of month and a day of
+  week both written without `*` match on *either*: `0 0 1 * MON` is the 1st and
+  every Monday. `N/step` without a range reads as `N-<max>/step`, as Gitea reads
+  it. Refused by name: the `@daily` family (GitHub does not accept it either), a
+  sixth field, values out of range, an entry key other than `cron`, an entry
+  longer than 255 bytes, and a schedule that can never fire (`0 0 30 2 *`).
+- **Times are UTC.**
+- **The schedule is the default branch's.** Entries on any other branch schedule
+  nothing, and neither do a pull mirror's: its workflows are its upstream's,
+  which is also why a mirror sync runs no `push` pipeline. A push to the default branch that adds, changes or removes an entry
+  takes effect at the next minute; the run builds the default branch's tip,
+  with `github.ref` the branch and `github.event_name` `schedule`.
+- **One tick, one run.** Each entry of each file keeps the last tick it ran in
+  the database, and a tick is run by whoever moves that record past it in one
+  conditional write — a restart cannot run a tick twice, nor can two replicas.
+  Two files with the same cron are two runs, each with only its own jobs.
+- **Missed ticks are not caught up.** A server that was down through several
+  ticks runs one of them when it comes back, as GitHub does.
+- **A new entry waits for its next tick.** A `0 3 * * *` pushed at 15:00 first
+  runs at the next 03:00, not straight away.
+- **There is a floor on frequency.** No entry runs more often than every
+  `[ci] schedule_min_interval_minutes` (five by default, GitHub's floor):
+  `* * * * *` runs every fifth minute.
+- **`github.event.schedule`** is the entry that fired, spelled as the file spells
+  it — in a condition, and as `${CI_EVENT_SCHEDULE}` in a `run:`.
+- **A run that cannot be built is still a run.** When the tick's configuration is
+  refused, a failed `schedule` pipeline says why; retrying it replays the same
+  entry of the same file.
+
+A bare `on: schedule` — or `schedule` inside a list — names the event without
+any entry to say when, and is refused:
+
+<!-- example: refused -->
+```yaml
+name: Nightly
+on: [push, schedule]
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo audit
+```
 
 ### Event filters
 
@@ -578,13 +641,14 @@ contexts.
 | `github.event_name` | `${CI_EVENT}` |
 | `github.repository` | `${CI_REPOSITORY}` |
 | `github.repository_owner` | `${CI_REPOSITORY_OWNER}` |
+| `github.event.schedule` | `${CI_EVENT_SCHEDULE}` — the `- cron:` entry of a `schedule` run; empty for any other event. |
 | `env.NAME` | The variable's value. |
 | `secrets.NAME` | The secret: the environment's value when the job declares an environment that sets the name, the repository-wide one otherwise. |
 | `matrix.NAME` | The variant's coordinate. |
 | `inputs.NAME` | The dispatch or call input. |
 
 **In job fields resolved before a runner starts** — `runs-on`,
-`container.image` and `environment` — only the five `github.*` above, plus
+`container.image` and `environment` — only the first five `github.*` above, plus
 `matrix.NAME` and `inputs.NAME`. `env.` and `secrets.` have no value at that
 boundary; they are refused there by field and expression rather than left in the
 configuration as literal `${{ … }}`.

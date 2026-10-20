@@ -29,6 +29,42 @@ pub async fn count_non_deleted(db: &DatabaseConnection) -> Result<u64> {
         .context("db: count non-deleted repositories")
 }
 
+/// One page of the repositories whose own workflows may be scheduled, in id
+/// order, after `after_id`: live ones that are not pull mirrors.
+///
+/// A pull mirror's branches are its upstream's, and running an upstream's
+/// workflows on this instance's runners is a decision nobody took — its
+/// mirror pass triggers no `push` pipeline for the same reason
+/// (`RefMoveOrigin::MirrorPass`), and a `schedule` would otherwise run them
+/// anyway, once a minute.
+///
+/// The `on: schedule` pass walks every such repository each minute; paging by
+/// id keeps one pass from holding the whole table at once, and a repository
+/// created or deleted while the walk is under way is simply seen, or not, on
+/// the next minute.
+pub async fn list_schedulable_after(
+    db: &DatabaseConnection,
+    after_id: i64,
+    limit: u64,
+) -> Result<Vec<Repo>> {
+    RepoEntity::find()
+        .filter(repository::Column::DeletedAt.is_null())
+        .filter(
+            repository::Column::Id.not_in_subquery(
+                Query::select()
+                    .column(mirror::Column::RepoId)
+                    .from(mirror::Entity)
+                    .to_owned(),
+            ),
+        )
+        .filter(repository::Column::Id.gt(after_id))
+        .order_by_asc(repository::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("db: list live repositories")
+}
+
 /// Find a non-deleted repository by ID.
 pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Repo>> {
     RepoEntity::find_by_id(id)

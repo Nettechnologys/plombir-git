@@ -205,7 +205,8 @@ job log.
 
 The runner supplies these on its own: `CI_PIPELINE_ID`, `CI_COMMIT_SHA`,
 `CI_SHA`, `CI_REF`, `CI_EVENT`, `CI_REPOSITORY`, `CI_REPOSITORY_OWNER`, and —
-where a job token is issued — `CI_JOB_TOKEN`.
+where a job token is issued — `CI_JOB_TOKEN`. A run of an Actions workflow's
+`on: schedule` also gets `CI_EVENT_SCHEDULE`, the cron entry that fired.
 
 ### `when`
 

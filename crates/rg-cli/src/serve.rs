@@ -2119,6 +2119,25 @@ fn build_transports(
         )
     });
     let mirror_sync = spawn_mirror_sync(&settings, storage, &post_push_context, shutdown_rx)?;
+    // `on: schedule`. Always on: a workflow that declares a schedule asks for
+    // it, and the floor below is the operator's only knob over how often.
+    let schedule_config = rg_core::ci::schedule::ScheduleConfig {
+        min_interval_minutes: settings
+            .cfg
+            .as_ref()
+            .and_then(|config| config.ci.schedule_min_interval_minutes)
+            .unwrap_or(rg_core::ci::schedule::DEFAULT_MIN_INTERVAL_MINUTES),
+    };
+    tracing::info!(
+        min_interval_minutes = schedule_config.min_interval_minutes,
+        "CI schedule pass enabled"
+    );
+    let ci_schedule = rg_core::ci::schedule::spawn_scheduler(
+        storage.db.clone(),
+        post_push_context.clone(),
+        schedule_config,
+        Some(shutdown_rx.clone()),
+    )?;
     // Push mirrors are not a schedule `[mirror].enabled` switches off: a push
     // into a repository with one owes that remote the same push.
     let push_mirrors = rg_core::mirror::push_scheduler::spawn_push_mirrors_with_shutdown(
@@ -2220,6 +2239,7 @@ fn build_transports(
             .into_iter()
             .chain(mirror_sync)
             .chain(Some(push_mirrors))
+            .chain(Some(ci_schedule))
             .collect(),
     })
 }

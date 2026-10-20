@@ -165,6 +165,11 @@ allow_host_runner = false
 # job_memory = "2g"
 # job_cpus = "2"
 # job_pids = 512
+# `on: schedule` runs a workflow at most this often per `- cron:` entry, in
+# minutes: `* * * * *` then runs every fifth minute, as on GitHub. Schedules are
+# read from each repository's default branch and evaluated in UTC; ticks missed
+# while the server was down are not caught up, at most one of them runs.
+# schedule_min_interval_minutes = 5
 
 [releases]
 # Serve the release-asset attestation endpoints: a user with write access signs

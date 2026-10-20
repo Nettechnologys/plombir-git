@@ -37,6 +37,7 @@ pub async fn create_pipeline(
             dispatch_inputs: None,
             base_branch: None,
             previous_sha: None,
+            schedule: None,
         },
     )
     .await
@@ -73,6 +74,9 @@ pub struct NewPipeline<'a> {
     /// retry whose `paths:` filters have to see the same diff. See
     /// [`pipeline::Model::previous_sha`].
     pub previous_sha: Option<&'a str>,
+    /// The workflow file and `- cron:` entry a `schedule` run fired for. See
+    /// [`pipeline::Model::schedule_workflow`].
+    pub schedule: Option<(&'a str, &'a str)>,
 }
 
 /// Create a pipeline row recording the full provenance of its run.
@@ -95,6 +99,8 @@ pub async fn create_pipeline_row(
         dispatch_inputs: Set(new.dispatch_inputs.map(str::to_string)),
         base_branch: Set(new.base_branch.map(str::to_string)),
         previous_sha: Set(new.previous_sha.map(str::to_string)),
+        schedule_workflow: Set(new.schedule.map(|(workflow, _)| workflow.to_string())),
+        schedule_cron: Set(new.schedule.map(|(_, cron)| cron.to_string())),
         started_at: Set(None),
         finished_at: Set(None),
         created_at: Set(now),

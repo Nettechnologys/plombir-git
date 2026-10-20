@@ -322,6 +322,17 @@ async fn poll_keeps_the_wire_contract_for_decodable_and_null_job_columns() {
         ))
         .await
         .expect("store the runner-facing columns");
+        // The decodable run is a scheduled one: its entry must reach the
+        // runner as `CI_EVENT_SCHEDULE`, and the other run must carry none.
+        if suffix == "decodable" {
+            db.execute_unprepared(&format!(
+                "UPDATE pipelines SET trigger_type = 'schedule', schedule_workflow = 'nightly.yml', \
+                 schedule_cron = '0 3 * * *' WHERE id = {}",
+                seeded.pipeline_id
+            ))
+            .await
+            .expect("make the pipeline a scheduled run");
+        }
 
         let response = reqwest::Client::new()
             .get(format!(
@@ -363,6 +374,16 @@ async fn poll_keeps_the_wire_contract_for_decodable_and_null_job_columns() {
             assert_eq!(
                 body["variables"]["BUILD_MODE"],
                 serde_json::json!("release")
+            );
+            assert_eq!(
+                body["variables"]["CI_EVENT_SCHEDULE"],
+                serde_json::json!("0 3 * * *"),
+                "{body}"
+            );
+        } else {
+            assert!(
+                body["variables"].get("CI_EVENT_SCHEDULE").is_none(),
+                "{body}"
             );
         }
 

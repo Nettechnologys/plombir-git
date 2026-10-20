@@ -1209,6 +1209,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
             jwt_secret: params.jwt_secret,
             encryption_key: params.encryption_key,
             external_url: params.external_url,
+            schedule: None,
         })
         .await
     {
@@ -1241,6 +1242,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
                     // whenever someone presses the button.
                     base_branch: None,
                     previous_sha: Some(&update.old_sha),
+                    schedule: None,
                 },
                 &error,
             )

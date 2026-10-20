@@ -54,6 +54,16 @@ pub struct Model {
     /// too-narrow range for a fast-forward of several, so a job the push ran
     /// would be skipped on its retry.
     pub previous_sha: Option<String>,
+    /// For a `schedule` run: the workflow file under `.gitea/workflows/` whose
+    /// `- cron:` entry fired. `None` for every other event.
+    ///
+    /// The same provenance as the three above. A retry replays the event its
+    /// run was created under, and `schedule` on its own selects nothing — a
+    /// tick belongs to one entry of one file.
+    pub schedule_workflow: Option<String>,
+    /// For a `schedule` run: the `- cron:` value that fired, as the file spells
+    /// it — also what the job reads as `github.event.schedule`.
+    pub schedule_cron: Option<String>,
     pub started_at: Option<DateTime>,
     pub finished_at: Option<DateTime>,
     pub created_at: DateTime,

@@ -1,7 +1,9 @@
 //! CI/CD business logic and utilities.
 
+pub mod cron;
 pub mod embedded_runners;
 pub mod log_write_queue;
+pub mod schedule;
 
 use anyhow::{Context, Result};
 use sea_orm::{DatabaseConnection, TransactionTrait};
@@ -143,12 +145,44 @@ pub fn ensure_dispatch_inputs_fit(
 /// producers have already made exactly that mistake (`suggestion`, `manual`,
 /// `retry`), and each failed the same way: a workflow file that is perfectly
 /// valid, and no pipeline.
-pub const PIPELINE_EVENTS: [&str; 4] = [
+pub const PIPELINE_EVENTS: [&str; 5] = [
     "push",
     crate::pull_request::ci::PULL_REQUEST_EVENT,
     "merge_group",
     WORKFLOW_DISPATCH_EVENT,
+    SCHEDULE_EVENT,
 ];
+
+/// The event a cron tick of `on: schedule` runs a workflow under.
+///
+/// Produced by [`schedule`] alone, once per tick of one `- cron:` entry of one
+/// workflow file on the repository's default branch.
+pub const SCHEDULE_EVENT: &str = "schedule";
+
+/// Which `- cron:` entry of which workflow file a scheduled run is for.
+///
+/// A tick belongs to one entry of one file: two workflows that both declare
+/// `0 3 * * *` are two runs on GitHub, and a workflow with two entries is
+/// triggered by each of them separately — `github.event.schedule` says which.
+/// So the trigger has to be told both, and the matcher selects exactly that
+/// file and that entry rather than every workflow that declares `schedule`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledRun<'a> {
+    /// The workflow's file name under `.gitea/workflows/`, e.g. `nightly.yml`.
+    pub workflow: &'a str,
+    /// The `- cron:` value exactly as the file spells it.
+    pub cron: &'a str,
+}
+
+/// The `on: schedule` entries one workflow file declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowSchedule {
+    /// The file name under `.gitea/workflows/`.
+    pub workflow: String,
+    /// Every `- cron:` value, as written, each already accepted by
+    /// [`cron::CronSchedule::parse`].
+    pub crons: Vec<String>,
+}
 
 /// A valid CI definition selected no work for this ref.
 ///
@@ -178,7 +212,7 @@ impl NoMatchingCiJobs {
 /// Both the embedded runner and the external-runner API inject this vocabulary.
 /// Keeping one list prevents a new built-in from being protected on one path
 /// while a user-controlled value can still replace it on the other.
-pub const BUILTIN_CI_VARIABLES: [&str; 11] = [
+pub const BUILTIN_CI_VARIABLES: [&str; 12] = [
     "CI",
     "PLOMBIR_GIT",
     "CI_PIPELINE_ID",
@@ -186,6 +220,8 @@ pub const BUILTIN_CI_VARIABLES: [&str; 11] = [
     "CI_SHA",
     "CI_REF",
     "CI_EVENT",
+    // `github.event.schedule`: the `- cron:` entry a `schedule` run fired for.
+    "CI_EVENT_SCHEDULE",
     "CI_REPOSITORY",
     "CI_REPOSITORY_OWNER",
     "CI_JOB_TOKEN",
@@ -370,6 +406,10 @@ pub struct TriggerPipelineParams<'a> {
     /// Named values supplied by a `workflow_dispatch` caller. Other producers
     /// pass `None`; an explicit empty map is equivalent to omitting `inputs`.
     pub inputs: Option<&'a HashMap<String, String>>,
+    /// The workflow file and `- cron:` entry a [`SCHEDULE_EVENT`] run is for.
+    /// `None` for every other producer. A schedule run without it selects no
+    /// workflow at all — there is no "every scheduled workflow" event.
+    pub schedule: Option<ScheduledRun<'a>>,
     pub triggered_by: Option<i64>,
     pub docker_enabled: bool,
     pub external_runners: bool,
@@ -526,6 +566,10 @@ pub struct ConfigurationFailureParams<'a> {
     /// Where the ref stood before the event that produced this run, the same
     /// value the producer hands [`TriggerPipelineParams::previous_sha`].
     pub previous_sha: Option<&'a str>,
+    /// The cron entry a `schedule` run fired for, the same value the producer
+    /// hands [`TriggerPipelineParams::schedule`]: without it the retry of this
+    /// row selects no workflow at all.
+    pub schedule: Option<ScheduledRun<'a>>,
 }
 
 /// Publish a terminal pipeline for a repository-owned CI configuration error.
@@ -580,6 +624,7 @@ pub async fn publish_configuration_failure(
         triggered_by,
         base_branch,
         previous_sha,
+        schedule,
     } = params;
     let now = chrono::Utc::now().naive_utc();
     let log = format!("CI configuration rejected before any job could run.\n\n{reason}\n");
@@ -600,6 +645,7 @@ pub async fn publish_configuration_failure(
                 dispatch_inputs: None,
                 base_branch,
                 previous_sha,
+                schedule: schedule.map(|run| (run.workflow, run.cron)),
             },
         )
         .await?;
@@ -768,6 +814,20 @@ pub trait CiTrigger: Send + Sync {
         anyhow::bail!("this CI engine does not expose workflow_dispatch input schemas")
     }
 
+    /// The `on: schedule` entries the workflows at an immutable commit declare,
+    /// one item per workflow file that has any, sorted by file name.
+    ///
+    /// Fails loudly by default for the reason
+    /// [`Self::workflow_dispatch_schema`] does: an engine that inherited an
+    /// empty answer would have a scheduler that never fires and says nothing.
+    fn scheduled_workflows(
+        &self,
+        _repo_path: &Path,
+        _commit_sha: &str,
+    ) -> Result<Vec<WorkflowSchedule>> {
+        anyhow::bail!("this CI engine does not expose `on: schedule` declarations")
+    }
+
     /// Trigger a CI pipeline. Returns the pipeline ID.
     fn trigger_pipeline<'a>(
         &'a self,
@@ -917,6 +977,7 @@ mod configuration_failure_tests {
             triggered_by: Some(repo.owner_id),
             base_branch: Some("develop"),
             previous_sha: None,
+            schedule: None,
         };
         let refusal =
             crate::error::invalid_request("unsupported key `types` in .gitea/workflows/pr.yml");

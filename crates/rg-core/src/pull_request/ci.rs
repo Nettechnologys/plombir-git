@@ -266,6 +266,7 @@ pub async fn trigger_pull_request_ci(
             jwt_secret: ci.jwt_secret,
             encryption_key: ci.encryption_key,
             external_url: ci.external_url,
+            schedule: None,
         })
         .await
     {
@@ -331,6 +332,7 @@ pub async fn trigger_pull_request_ci_best_effort(
                         // into any other branch selects a different graph.
                         base_branch: Some(&pr.base_branch),
                         previous_sha: None,
+                        schedule: None,
                     },
                     &error,
                 )

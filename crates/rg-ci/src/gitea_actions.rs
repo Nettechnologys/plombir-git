@@ -5,6 +5,8 @@
 //!
 //! Supported features:
 //! - `on: push`, `on: pull_request` triggers with branch filtering
+//! - `on: schedule` cron entries, run from the default branch by
+//!   `rg_core::ci::schedule`
 //! - `jobs.<id>.runs-on` → runner tags
 //! - `jobs.<id>.steps[].run` → script commands
 //! - workflow/job `defaults.run.working-directory` and per-step
@@ -98,7 +100,15 @@ pub struct WorkflowTriggerSingle {
     /// merge-queue checks at all, with no error anywhere (card_69d4f18b0b23).
     #[serde(default, deserialize_with = "deserialize_present_filter")]
     pub merge_group: Option<EventFilter>,
-    pub schedule: Option<Vec<ScheduleTrigger>>,
+    /// `on: schedule`, kept as the YAML the author wrote.
+    ///
+    /// Not deserialized into a typed list: [`WorkflowTriggers`] is untagged, so
+    /// a wrongly shaped entry would collapse into serde's context-free "did not
+    /// match any variant", and an empty `schedule:` would read as absent.
+    /// [`schedule_crons`] judges the value instead, naming the entry and the
+    /// field it cannot honour.
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub schedule: Option<serde_json::Value>,
     /// Manual runs. Read with the same "present, even if empty" deserializer as
     /// `workflow_call`: the usual spelling is a bare `workflow_dispatch:` with
     /// nothing under it, which plain `Option` turns into `None` — and a trigger
@@ -295,10 +305,67 @@ const SUPPORTED_EVENT_FILTERS: &[&str] = &[
     "paths-ignore",
 ];
 
-/// Schedule trigger with cron expression.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ScheduleTrigger {
-    pub cron: String,
+/// The longest `- cron:` value a workflow may declare.
+///
+/// The value is the key of the tick ledger (`ci_schedule_ticks`) and of a
+/// scheduled pipeline's provenance, both `VARCHAR(255)`. A five-field cron
+/// longer than that is a list nobody can read anyway.
+const MAX_CRON_BYTES: usize = 255;
+
+/// The `- cron:` entries of an `on: schedule` declaration, or the reason it
+/// cannot be run, naming the entry.
+///
+/// GitHub gives an entry one key, `cron`. Anything else under it — and any
+/// value that is not a cron expression GitHub would accept — is refused here,
+/// where the file is read, rather than parsed and never fired.
+fn schedule_crons(value: &serde_json::Value) -> std::result::Result<Vec<String>, String> {
+    // `schedule:` with nothing under it is an empty list, not an absent key.
+    let entries = match value {
+        serde_json::Value::Null => &[][..],
+        value => value
+            .as_array()
+            .ok_or("schedule must be a list of `- cron: '<five fields>'` entries")?,
+    };
+    if entries.is_empty() {
+        return Err(
+            "schedule declares no `- cron:` entry, so nothing would ever run the workflow".into(),
+        );
+    }
+    let mut crons = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(entry) = entry.as_object() else {
+            return Err(format!(
+                "schedule[{index}] must be a mapping with a `cron:` key"
+            ));
+        };
+        let mut unknown = entry
+            .keys()
+            .filter(|key| *key != "cron")
+            .cloned()
+            .collect::<Vec<_>>();
+        unknown.sort();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "schedule[{index}] has unsupported key(s) {}; an entry has only `cron`",
+                unknown.join(", ")
+            ));
+        }
+        let Some(cron) = entry.get("cron").and_then(serde_json::Value::as_str) else {
+            return Err(format!(
+                "schedule[{index}].cron is required and must be a string"
+            ));
+        };
+        if cron.len() > MAX_CRON_BYTES {
+            return Err(format!(
+                "schedule[{index}].cron is {} bytes long; it may be at most {MAX_CRON_BYTES}",
+                cron.len()
+            ));
+        }
+        rg_core::ci::cron::CronSchedule::parse(cron)
+            .map_err(|reason| format!("schedule[{index}].cron `{cron}`: {reason}"))?;
+        crons.push(cron.to_string());
+    }
+    Ok(crons)
 }
 
 /// `on:` names that are not events a producer emits.
@@ -314,8 +381,8 @@ const MERGE_GROUP_TRIGGER: &str = "merge_group";
 /// Parsed, matched by nothing: the workflow would be taken from the base branch
 /// rather than from the PR's head, which no producer here does (card_c8f24edaee89).
 const PULL_REQUEST_TARGET_TRIGGER: &str = "pull_request_target";
-/// Parsed, matched by nothing, and there is no scheduler in the tree to emit it.
-const SCHEDULE_TRIGGER: &str = "schedule";
+/// Emitted by `rg_core::ci::schedule`, one run per tick of one `- cron:` entry.
+const SCHEDULE_TRIGGER: &str = rg_core::ci::SCHEDULE_EVENT;
 
 /// Whether an `on:` name is something this engine can actually run.
 fn is_runnable_trigger(name: &str) -> bool {
@@ -888,12 +955,15 @@ fn unsupported_action_inputs(job_name: &str, index: usize, step: &GiteaStep) -> 
     unknown
 }
 
-const GITHUB_RUN_EXPRESSIONS: [(&str, &str); 5] = [
+const GITHUB_RUN_EXPRESSIONS: [(&str, &str); 6] = [
     ("github.ref", "${CI_REF}"),
     ("github.sha", "${CI_SHA}"),
     ("github.event_name", "${CI_EVENT}"),
     ("github.repository", "${CI_REPOSITORY}"),
     ("github.repository_owner", "${CI_REPOSITORY_OWNER}"),
+    // Set by both runners for a `schedule` run only; empty otherwise, which is
+    // what GitHub's `null` reads as in a string.
+    ("github.event.schedule", "${CI_EVENT_SCHEDULE}"),
 ];
 
 fn context_member<'a>(key: &'a str, context: &str) -> Option<&'a str> {
@@ -1153,6 +1223,9 @@ pub struct WorkflowContext {
     pub event: String,
     pub repo_owner: String,
     pub repo_name: String,
+    /// The `- cron:` entry a `schedule` run fired for — `github.event.schedule`.
+    /// `None` for every other event.
+    pub event_schedule: Option<String>,
 }
 
 impl WorkflowContext {
@@ -1692,12 +1765,13 @@ impl GiteaWorkflow {
 
     /// Reject a workflow whose `on:` clause names something nothing here emits.
     ///
-    /// `on: schedule`, `on: pull_request_target` and `on: release` all parse.
-    /// None of them ever ran: `matches_event` answers `false` for every event a
-    /// producer in this tree can name, and for `schedule` there is no scheduler
-    /// in the tree at all. The file was accepted, reported as valid, and never
-    /// produced a pipeline — the author's only evidence being that nothing
-    /// happened (card_c8f24edaee89).
+    /// `on: pull_request_target` and `on: release` both parse, and neither ever
+    /// ran: no producer in this tree emits them. The file was accepted,
+    /// reported as valid, and never produced a pipeline — the author's only
+    /// evidence being that nothing happened (card_c8f24edaee89). `schedule` was
+    /// the third until `rg_core::ci::schedule` became its producer; what is
+    /// still refused about it is a declaration that cannot say when to run
+    /// ([`Self::validate_schedule`]).
     ///
     /// So the declaration is refused where the file is read, rather than
     /// half-honoured at match time. That is the same answer this module already
@@ -1716,6 +1790,7 @@ impl GiteaWorkflow {
     /// [`validate_supported_actions`]: GiteaWorkflow::validate_supported_actions
     pub fn validate_supported_triggers(&self) -> Result<()> {
         self.validate_trigger_input_schemas()?;
+        self.validate_schedule()?;
         let unsupported_filters = self.unsupported_event_filter_keys();
         if !unsupported_filters.is_empty() {
             anyhow::bail!(
@@ -1754,6 +1829,57 @@ impl GiteaWorkflow {
             unrunnable.join(", "),
             supported_trigger_list()
         )
+    }
+
+    /// Refuse an `on: schedule` that cannot fire as written.
+    ///
+    /// The bare spellings — `on: schedule`, `on: [push, schedule]` — name the
+    /// event and carry no `- cron:` entry, so nothing could ever say when to
+    /// run them. The mapped one is judged entry by entry by [`schedule_crons`].
+    fn validate_schedule(&self) -> Result<()> {
+        let bare = match &self.on {
+            WorkflowTriggers::Simple(name) => name == SCHEDULE_TRIGGER,
+            WorkflowTriggers::Array(names) => names.iter().any(|name| name == SCHEDULE_TRIGGER),
+            WorkflowTriggers::Single(trigger) => {
+                if let Some(value) = &trigger.schedule {
+                    schedule_crons(value)
+                        .map_err(|reason| anyhow::anyhow!("invalid `on: schedule`: {reason}"))?;
+                }
+                false
+            }
+        };
+        if bare {
+            anyhow::bail!(
+                "`schedule` needs its `- cron:` entries, which the bare event name cannot carry; \
+                 write it as a mapping: `on:` / `  schedule:` / `    - cron: '0 3 * * *'`"
+            );
+        }
+        Ok(())
+    }
+
+    /// The `- cron:` entries this workflow declares, as written. Empty for a
+    /// workflow without `on: schedule`, and for one whose declaration
+    /// [`Self::validate_supported_triggers`] refuses.
+    pub fn schedules(&self) -> Vec<String> {
+        match &self.on {
+            WorkflowTriggers::Single(trigger) => trigger
+                .schedule
+                .as_ref()
+                .and_then(|value| schedule_crons(value).ok())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether one tick of `cron` runs this workflow.
+    ///
+    /// The schedule event is the one [`Self::matches_event`] cannot answer on
+    /// its own: a tick belongs to one entry, and the event name says nothing
+    /// about which. A workflow is selected by an entry it declares, spelled
+    /// exactly as it declares it — two files that both say `0 3 * * *` each get
+    /// their own tick, and their own run.
+    pub fn matches_schedule(&self, cron: &str) -> bool {
+        self.schedules().iter().any(|declared| declared == cron)
     }
 
     /// Reject workflows that would otherwise appear successful after silently
@@ -2013,13 +2139,13 @@ impl GiteaWorkflow {
             WorkflowTriggers::Simple(name) => declares(name),
             WorkflowTriggers::Array(names) => names.iter().any(|name| declares(name)),
             WorkflowTriggers::Single(trigger) => {
-                // The three `_` bindings are triggers no producer emits, so no
-                // arm below could ever be reached through them. They are not
-                // silently dropped any more: `validate_supported_triggers` — run
-                // where the file is read, before this — refuses a workflow that
-                // declares `pull_request_target` or `schedule` outright, and
+                // `pull_request_target` has no producer, and
+                // `validate_supported_triggers` — run where the file is read,
+                // before this — refuses a workflow that declares it outright.
                 // `workflow_call` marks a reusable file that is expanded into
-                // its caller rather than triggered on its own.
+                // its caller rather than triggered on its own. `schedule` does
+                // have a producer, but a tick belongs to one `- cron:` entry
+                // and only `matches_schedule` is told which.
                 let WorkflowTriggerSingle {
                     push,
                     pull_request,
@@ -2068,6 +2194,8 @@ impl GiteaWorkflow {
                     // `workflow_dispatch` takes `inputs`, not `branches` — so
                     // declaring the trigger *is* the match.
                     rg_core::ci::WORKFLOW_DISPATCH_EVENT => workflow_dispatch.is_some(),
+                    // Selected through `matches_schedule`, never by name alone.
+                    SCHEDULE_TRIGGER => false,
                     _ => false,
                 }
             }
@@ -2732,6 +2860,18 @@ where
     Ok(Some(
         Option::<EventFilter>::deserialize(deserializer)?.unwrap_or_default(),
     ))
+}
+
+/// `on:\n  schedule:` with nothing under it is a declaration, not an absence:
+/// read as `None` it would vanish from the trigger set instead of being refused
+/// for carrying no `- cron:` entry.
+fn deserialize_present_value<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 fn deserialize_present_trigger<'de, D>(
@@ -3406,6 +3546,10 @@ pub(crate) fn actions_condition_context(
         ("github.sha".into(), ctx.sha.clone()),
         ("github.repository".into(), ctx.repository()),
         ("github.repository_owner".into(), ctx.repo_owner.clone()),
+        (
+            "github.event.schedule".into(),
+            ctx.event_schedule.clone().unwrap_or_default(),
+        ),
     ]);
     for (name, value) in variables {
         context.insert(format!("env.{name}"), value.clone());
@@ -3554,6 +3698,7 @@ mod tests {
             event: "push".into(),
             repo_owner: "owner".into(),
             repo_name: "repo".into(),
+            event_schedule: None,
         }
     }
 
@@ -4147,9 +4292,11 @@ pub struct GiteaStep {
         );
         // A model that stops being reachable takes its keys out of `checked`
         // along with itself, so the key floor alone cannot tell "documented"
-        // from "no longer looked at".
+        // from "no longer looked at". Thirteen since `on: schedule` stopped
+        // being a struct: its one key, `cron`, is judged by `schedule_crons`
+        // and pinned by `a_schedule_that_cannot_fire_as_written_is_refused_by_name`.
         assert!(
-            models >= 14,
+            models >= 13,
             "only {models} struct models reached from GiteaWorkflow — a block of the workflow \
              format has dropped out of this check rather than out of the format"
         );
@@ -4275,6 +4422,7 @@ jobs:
             event: "push".into(),
             repo_owner: "owner".into(),
             repo_name: "repo".into(),
+            event_schedule: None,
         };
         let ci_config = wf.to_ci_config(&ctx);
         assert_eq!(ci_config.jobs.len(), 1);
@@ -4917,6 +5065,7 @@ jobs:
             event: "push".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
+            event_schedule: None,
         };
         let job = workflow.to_ci_config(&ctx).jobs.remove("build").unwrap();
         let variables = job.variables.expect("container env must become variables");
@@ -5362,6 +5511,7 @@ jobs:
             event: "push".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
+            event_schedule: None,
         });
         let cache = ci.jobs["test"].cache.as_ref().unwrap();
         assert_eq!(cache.key, "build-${CI_SHA}");
@@ -5431,6 +5581,7 @@ jobs:
             event: "push".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
+            event_schedule: None,
         });
         assert!(ci.jobs["shared/build"]
             .script
@@ -5512,6 +5663,7 @@ jobs:
             event: "push".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
+            event_schedule: None,
         });
         assert_eq!(ci.jobs["test"].allow_failure, Some(true));
         assert_eq!(ci.jobs["test"].timeout_seconds, Some(180));
@@ -5526,6 +5678,7 @@ jobs:
             event: "push".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
+            event_schedule: None,
         });
         assert_eq!(
             ci.jobs["test"].condition.as_deref(),
@@ -5615,12 +5768,6 @@ jobs:
     #[test]
     fn a_trigger_no_producer_emits_is_refused_by_name() {
         for (label, on) in [
-            (
-                "schedule, mapped shape",
-                "on:\n  schedule:\n    - cron: '0 3 * * *'\n",
-            ),
-            ("schedule, bare name", "on: schedule\n"),
-            ("schedule, in an array", "on: [push, schedule]\n"),
             ("pull_request_target", "on:\n  pull_request_target:\n"),
             ("an event this engine has never heard of", "on: release\n"),
             // Serde drops unknown fields, so before `other` this shape declared
@@ -5637,13 +5784,11 @@ jobs:
                 .validate_supported_triggers()
                 .expect_err(&format!("{label} must be refused, not silently accepted"))
                 .to_string();
-            let named = on
-                .contains("schedule")
-                .then_some("schedule")
-                .or(on
-                    .contains("pull_request_target")
-                    .then_some("pull_request_target"))
-                .unwrap_or("release");
+            let named = if on.contains("pull_request_target") {
+                "pull_request_target"
+            } else {
+                "release"
+            };
             assert!(
                 error.contains(named),
                 "{label}: the refusal must name the offending trigger, got: {error}"
@@ -5658,11 +5803,26 @@ jobs:
     /// The other half: everything with a producer still loads, and so does a
     /// reusable file, whose `workflow_call` is a declaration rather than an
     /// event and must not be mistaken for an unrunnable trigger.
+    ///
+    /// `schedule` is the one event whose declaration cannot be empty: its body
+    /// is the `- cron:` list that says when to run. It is asked here in the only
+    /// shape that can run; the other shapes are
+    /// `a_schedule_that_cannot_fire_as_written_is_refused_by_name`.
     #[test]
     fn every_trigger_with_a_producer_is_accepted() {
         let body =
             "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
         for event in rg_core::ci::PIPELINE_EVENTS {
+            if event == SCHEDULE_TRIGGER {
+                let scheduled = format!("on:\n  schedule:\n    - cron: '0 3 * * *'\n{body}");
+                GiteaWorkflow::parse(&scheduled)
+                    .unwrap()
+                    .validate_supported_triggers()
+                    .unwrap_or_else(|e| {
+                        panic!("a cron-carrying `on: schedule` must be accepted: {e}")
+                    });
+                continue;
+            }
             let mapped = format!("on:\n  {event}:\n{body}");
             GiteaWorkflow::parse(&mapped)
                 .unwrap()
@@ -5700,6 +5860,7 @@ jobs:
             event: "push".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
+            event_schedule: None,
         };
         let ci = wf.to_ci_config(&ctx);
         let job = ci.jobs.get("build").unwrap();
@@ -5728,6 +5889,7 @@ jobs:
             event: "push".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
+            event_schedule: None,
         };
         let ci = wf.to_ci_config(&ctx);
         let job = ci.jobs.get("build").unwrap();
@@ -5763,6 +5925,7 @@ jobs:
             event: "push".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
+            event_schedule: None,
         };
         let ci = wf.to_ci_config(&ctx);
         assert_eq!(ci.jobs.len(), 3);
@@ -5817,6 +5980,7 @@ jobs:
             event: "push".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
+            event_schedule: None,
         };
         let unguarded = workflow("buidl").to_ci_config(&ctx);
         assert_eq!(unguarded.jobs["build"].stage.as_deref(), Some("stage-0"));
@@ -5964,6 +6128,7 @@ jobs:
             event: "push".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
+            event_schedule: None,
         };
         let ci = wf.to_ci_config(&ctx);
         let cc = ci.concurrency.as_ref().unwrap();
@@ -5991,6 +6156,7 @@ jobs:
             event: "push".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
+            event_schedule: None,
         });
         let job = ci.jobs.get("test").unwrap();
         let matrix = job.matrix.as_ref().unwrap();
@@ -6145,9 +6311,30 @@ mod tail_tests {
     /// Every event is spelled here as it is raised — including the empty-bodied
     /// `on:\n  <event>:` form, which read as "not declared" until this test
     /// asked.
+    ///
+    /// `schedule` is answered by `matches_schedule`, which is told the entry a
+    /// tick fired for; the event name alone is deliberately not enough.
     #[test]
     fn the_matcher_answers_yes_to_a_workflow_that_declares_any_canonical_event() {
         for event in rg_core::ci::PIPELINE_EVENTS {
+            if event == SCHEDULE_TRIGGER {
+                let workflow = GiteaWorkflow::parse(
+                    "name: W\non:\n  schedule:\n    - cron: '0 3 * * *'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+                )
+                .unwrap();
+                workflow.validate_supported_triggers().unwrap();
+                assert!(workflow.matches_schedule("0 3 * * *"));
+                assert!(
+                    !workflow.matches_event(
+                        event,
+                        "refs/heads/main",
+                        "main",
+                        &ChangedPaths::unknown()
+                    ),
+                    "a tick must name its cron entry; the event name alone selects nothing"
+                );
+                continue;
+            }
             let yaml = format!(
                 "name: W\non:\n  {event}:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
             );
@@ -6193,6 +6380,7 @@ jobs:
             event: "push".into(),
             repo_owner: "owner".into(),
             repo_name: "repo".into(),
+            event_schedule: None,
         });
         let script = ci.jobs["build"].script.join("\n");
 
@@ -6283,6 +6471,138 @@ jobs:
 
 /// Test-only re-export: the pattern rules are exercised from `lib.rs`'s
 /// filter tests, next to the filters that use them.
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    const BODY: &str =
+        "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+
+    fn refusal(on: &str) -> String {
+        let yaml = format!("{on}{BODY}");
+        let workflow =
+            GiteaWorkflow::parse(&yaml).unwrap_or_else(|e| panic!("`{on}` must parse: {e}"));
+        format!(
+            "{:#}",
+            workflow
+                .validate_supported_triggers()
+                .expect_err(&format!("`{on}` must be refused"))
+        )
+    }
+
+    /// Every shape that parses and could never fire is refused where the file
+    /// is read, naming the entry and what is wrong with it — the silence of a
+    /// nightly that never runs is what `on:` validation is for.
+    #[test]
+    fn a_schedule_that_cannot_fire_as_written_is_refused_by_name() {
+        for (on, named) in [
+            ("on: schedule\n", "bare event name"),
+            ("on: [push, schedule]\n", "bare event name"),
+            ("on:\n  schedule:\n", "no `- cron:` entry"),
+            ("on:\n  schedule: []\n", "no `- cron:` entry"),
+            ("on:\n  schedule: '0 3 * * *'\n", "must be a list"),
+            (
+                "on:\n  schedule:\n    - '0 3 * * *'\n",
+                "schedule[0] must be a mapping",
+            ),
+            (
+                "on:\n  schedule:\n    - cron: 3\n",
+                "schedule[0].cron is required",
+            ),
+            (
+                "on:\n  schedule:\n    - cron: '0 3 * * *'\n      timezone: Europe/Prague\n",
+                "schedule[0] has unsupported key(s) timezone",
+            ),
+            (
+                "on:\n  schedule:\n    - cron: '0 3 * * *'\n    - cron: '@daily'\n",
+                "schedule[1].cron `@daily`",
+            ),
+            (
+                "on:\n  schedule:\n    - cron: '0 25 * * *'\n",
+                "outside 0-23",
+            ),
+            (
+                "on:\n  schedule:\n    - cron: '0 0 30 2 *'\n",
+                "never fires",
+            ),
+        ] {
+            let error = refusal(on);
+            assert!(
+                error.contains(named),
+                "`{on}`: the refusal must say `{named}`, got: {error}"
+            );
+        }
+        let long = format!(
+            "on:\n  schedule:\n    - cron: '{} * * * *'\n",
+            (0..59)
+                .map(|minute| minute.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+                .repeat(2)
+        );
+        assert!(refusal(&long).contains("may be at most 255"));
+    }
+
+    /// A tick selects the workflow by the entry it fired for, spelled exactly
+    /// as the file spells it; a workflow with two entries is selected by each.
+    #[test]
+    fn a_tick_selects_its_workflow_by_the_entry_it_fired_for() {
+        let workflow = GiteaWorkflow::parse(&format!(
+            "on:\n  push:\n  schedule:\n    - cron: '0 3 * * *'\n    - cron: '*/30 * * * MON-FRI'\n{BODY}"
+        ))
+        .unwrap();
+        workflow.validate_supported_triggers().unwrap();
+        assert_eq!(
+            workflow.schedules(),
+            ["0 3 * * *", "*/30 * * * MON-FRI"],
+            "the entries are listed as written, in order"
+        );
+        assert!(workflow.matches_schedule("0 3 * * *"));
+        assert!(workflow.matches_schedule("*/30 * * * MON-FRI"));
+        assert!(
+            !workflow.matches_schedule("0 3 * * * "),
+            "the ledger keys on the spelling; a different spelling is a different entry"
+        );
+        assert!(!workflow.matches_schedule("0 4 * * *"));
+        // The push half of the same file is untouched.
+        assert!(workflow.matches_event(
+            "push",
+            "refs/heads/main",
+            "main",
+            &ChangedPaths::unknown()
+        ));
+    }
+
+    /// `github.event.schedule` is the entry that fired: a variable both runners
+    /// set for a scheduled run, and a condition key both contexts answer.
+    #[test]
+    fn the_entry_that_fired_is_github_event_schedule() {
+        let workflow = GiteaWorkflow::parse(
+            "on:\n  schedule:\n    - cron: '0 3 * * *'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - if: github.event.schedule == '0 3 * * *'\n        run: echo \"fired by ${{ github.event.schedule }}\"\n      - if: github.event.schedule == '0 4 * * *'\n        run: echo never\n",
+        )
+        .unwrap();
+        workflow.validate_supported_triggers().unwrap();
+        workflow.validate_supported_actions().unwrap();
+        let config = workflow.to_ci_config(&WorkflowContext {
+            ref_name: "refs/heads/main".into(),
+            sha: "abc".into(),
+            event: "schedule".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            event_schedule: Some("0 3 * * *".into()),
+        });
+        let script = config.jobs["build"].script.join("\n");
+        assert!(
+            script.contains("echo \"fired by ${CI_EVENT_SCHEDULE}\""),
+            "the run expression must become the runner variable: {script}"
+        );
+        assert!(
+            !script.contains("echo never"),
+            "the step whose condition names another entry must not run: {script}"
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn match_path_pattern_for_test(path: &str, pattern: &str) -> bool {
     match_path_pattern(path, pattern)

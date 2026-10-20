@@ -308,6 +308,14 @@ impl rg_core::ci::CiTrigger for CiEngine {
         workflow_dispatch_schema(query.repo_path, query.commit_sha)
     }
 
+    fn scheduled_workflows(
+        &self,
+        repo_path: &std::path::Path,
+        commit_sha: &str,
+    ) -> Result<Vec<rg_core::ci::WorkflowSchedule>> {
+        scheduled_workflows(repo_path, commit_sha)
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
@@ -626,6 +634,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
         base_branch,
         previous_sha,
         inputs,
+        schedule,
         triggered_by,
         docker_enabled,
         external_runners,
@@ -666,6 +675,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
         let base_branch = base_branch.map(str::to_string);
         let previous_sha = previous_sha.map(str::to_string);
         let inputs = inputs.cloned();
+        let scheduled = schedule.map(|run| (run.workflow.to_string(), run.cron.to_string()));
         tokio::task::spawn_blocking(move || {
             read_ci_config_with_inputs(
                 &repo_path,
@@ -680,6 +690,9 @@ async fn trigger_pipeline_with_barrier_and_engine(
                     base_branch: base_branch.as_deref(),
                     previous_sha: previous_sha.as_deref(),
                     inputs: inputs.as_ref(),
+                    schedule: scheduled
+                        .as_ref()
+                        .map(|(workflow, cron)| rg_core::ci::ScheduledRun { workflow, cron }),
                 },
             )
         })
@@ -790,6 +803,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
             dispatch_inputs: dispatch_inputs.as_deref(),
             base_branch: persisted_replay_value(base_branch),
             previous_sha: persisted_replay_value(previous_sha),
+            schedule,
             config: &config,
         }
         .create(&tx)
@@ -997,6 +1011,10 @@ struct PipelineGraph<'a> {
     /// the diff the original event saw, and not the narrower one against the
     /// commit's first parent (card_74d58ec3ac1e).
     previous_sha: Option<&'a str>,
+    /// The cron entry a `schedule` run fired for, written onto the row for the
+    /// retry that has to select the same file again, and read by a job
+    /// condition as `github.event.schedule`.
+    schedule: Option<rg_core::ci::ScheduledRun<'a>>,
     config: &'a CiConfig,
 }
 
@@ -1020,6 +1038,7 @@ impl PipelineGraph<'_> {
                 dispatch_inputs: self.dispatch_inputs,
                 base_branch: self.base_branch,
                 previous_sha: self.previous_sha,
+                schedule: self.schedule.map(|run| (run.workflow, run.cron)),
             },
         )
         .await?;
@@ -1057,6 +1076,7 @@ impl PipelineGraph<'_> {
             commit_sha,
             ref_name,
             trigger_type,
+            schedule,
             config,
             ..
         } = *self;
@@ -1187,6 +1207,7 @@ impl PipelineGraph<'_> {
                             trigger_type,
                             commit_sha,
                             repository,
+                            schedule.map(|run| run.cron),
                             &variant.variables,
                             job_config,
                         ),
@@ -1769,6 +1790,7 @@ fn job_condition_context(
     event: &str,
     sha: &str,
     repository: RepositoryName<'_>,
+    event_schedule: Option<&str>,
     variables: &std::collections::BTreeMap<String, String>,
     config: &config::JobConfig,
 ) -> std::collections::HashMap<String, String> {
@@ -1791,6 +1813,10 @@ fn job_condition_context(
         (
             "github.repository_owner".into(),
             repository.owner.to_string(),
+        ),
+        (
+            "github.event.schedule".into(),
+            event_schedule.unwrap_or_default().to_string(),
         ),
     ]);
     for (name, value) in variables {
@@ -2047,6 +2073,9 @@ struct WorkflowInvocation<'a> {
     base_branch: Option<&'a str>,
     previous_sha: Option<&'a str>,
     inputs: Option<&'a std::collections::HashMap<String, String>>,
+    /// The cron entry a `schedule` tick fired for; see
+    /// [`rg_core::ci::TriggerPipelineParams::schedule`].
+    schedule: Option<rg_core::ci::ScheduledRun<'a>>,
 }
 
 /// Read CI configuration from the repo at the given commit.
@@ -2093,6 +2122,7 @@ fn read_ci_config(
             base_branch,
             previous_sha,
             inputs: None,
+            schedule: None,
         },
     )
 }
@@ -2114,6 +2144,24 @@ fn read_ci_config_with_inputs(
     if let GiteaWorkflows::Config(config) = gitea {
         tracing::info!("Using Gitea Actions workflow from {}/", WORKFLOW_DIR);
         return Ok(config);
+    }
+
+    // A tick names one workflow file, and the native format has no `on:` at
+    // all: falling through would run `.plombir-git-ci.yml` — a pipeline nobody
+    // scheduled — every time a cron entry that no longer exists comes round.
+    if invocation.event == rg_core::ci::SCHEDULE_EVENT {
+        let named = invocation
+            .schedule
+            .map(|run| {
+                format!(
+                    "{WORKFLOW_DIR}/{} with `- cron: '{}'`",
+                    run.workflow, run.cron
+                )
+            })
+            .unwrap_or_else(|| "no workflow file at all".to_string());
+        return Err(rg_core::error::invalid_request(format!(
+            "this scheduled run is for {named}, which commit {commit_sha} does not declare"
+        )));
     }
 
     // A native config has no `inputs` context. Falling through after accepting
@@ -2242,6 +2290,55 @@ pub fn workflow_dispatch_schema(
     };
     let workflows = parse_gitea_workflows(&workflow_sources)?;
     Ok(WorkflowDispatchContract::from_workflows(&workflows)?.into_schema())
+}
+
+/// The `on: schedule` entries committed at `commit_sha`, one item per workflow
+/// file that declares any, in file-name order.
+///
+/// Each file is judged on its own. One that does not parse, or whose `on:`
+/// clause is refused, contributes nothing and is logged — the push that
+/// committed it was already refused with the reason, and every *other* file's
+/// schedule still stands. Whether the run a tick produces can be built is the
+/// trigger's question, asked with the whole set as every event asks it.
+pub fn scheduled_workflows(
+    repo_path: &std::path::Path,
+    commit_sha: &str,
+) -> Result<Vec<rg_core::ci::WorkflowSchedule>> {
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository at {}", repo_path.display()))?;
+    let Some(sources) = load_workflow_sources(&repo, commit_sha)? else {
+        return Ok(Vec::new());
+    };
+    let mut schedules = Vec::new();
+    for (name, yml) in sorted_workflows(&sources) {
+        let workflow = match gitea_actions::GiteaWorkflow::parse(yml) {
+            Ok(workflow) => workflow,
+            Err(error) => {
+                tracing::warn!(
+                    workflow = %name,
+                    commit_sha,
+                    "a workflow that does not parse declares no schedule: {error:#}"
+                );
+                continue;
+            }
+        };
+        if let Err(error) = workflow.validate_supported_triggers() {
+            tracing::warn!(
+                workflow = %name,
+                commit_sha,
+                "a workflow whose `on:` is refused declares no schedule: {error:#}"
+            );
+            continue;
+        }
+        let crons = workflow.schedules();
+        if !crons.is_empty() {
+            schedules.push(rg_core::ci::WorkflowSchedule {
+                workflow: name.clone(),
+                crons,
+            });
+        }
+    }
+    Ok(schedules)
 }
 
 /// [`read_ci_config`] in the shape the tests ask it.
@@ -2536,9 +2633,19 @@ fn try_read_gitea_workflows(
     // is kept rather than folded as it goes.
     let mut declared_concurrency: Vec<(String, config::ConcurrencyConfig)> = Vec::new();
 
+    // A tick is for one `- cron:` entry of one file, and nothing else runs for
+    // it — not the other workflows that also declare `schedule`, not a second
+    // file that happens to spell the same cron.
+    let scheduled = invocation
+        .schedule
+        .filter(|_| invocation.event == rg_core::ci::SCHEDULE_EVENT);
     for (name, mut workflow) in workflows {
         // Check if this workflow should be triggered
-        if !workflow.matches_event(invocation.event, ref_name, &match_branch, &changed) {
+        let triggered = match scheduled {
+            Some(run) => name == run.workflow && workflow.matches_schedule(run.cron),
+            None => workflow.matches_event(invocation.event, ref_name, &match_branch, &changed),
+        };
+        if !triggered {
             continue;
         }
         if let Some(contract) = &dispatch_contract {
@@ -2585,6 +2692,7 @@ fn try_read_gitea_workflows(
             event: invocation.event.to_string(),
             repo_owner: repository.owner.to_string(),
             repo_name: repository.name.to_string(),
+            event_schedule: scheduled.map(|run| run.cron.to_string()),
         };
 
         let mut wf_config = workflow.to_ci_config(&ctx);
@@ -3450,6 +3558,7 @@ mod matrix_tests {
                 jwt_secret: Some("secret"),
                 encryption_key: Some("secret"),
                 external_url: None,
+                schedule: None,
             },
             &CiNotifications::default(),
         )
@@ -3555,6 +3664,7 @@ mod matrix_tests {
                 jwt_secret: Some("secret"),
                 encryption_key: Some("secret"),
                 external_url: None,
+                schedule: None,
             },
             &CiNotifications::default(),
         )
@@ -3691,6 +3801,7 @@ mod matrix_tests {
                 jwt_secret: Some("secret"),
                 encryption_key: Some("secret"),
                 external_url: None,
+                schedule: None,
             },
             &CiNotifications::default(),
         )
@@ -3858,6 +3969,7 @@ mod matrix_tests {
             jwt_secret: Some("secret"),
             encryption_key: Some("secret"),
             external_url: None,
+            schedule: None,
         }
     }
 
@@ -4426,6 +4538,7 @@ mod matrix_tests {
                 dispatch_inputs: None,
                 base_branch: None,
                 previous_sha: None,
+                schedule: None,
             },
         )
         .await
@@ -4463,6 +4576,7 @@ mod matrix_tests {
                 jwt_secret: Some("secret"),
                 encryption_key: Some("secret"),
                 external_url: None,
+                schedule: None,
             },
             &CiNotifications::default(),
         )
@@ -4579,6 +4693,7 @@ mod matrix_tests {
                 dispatch_inputs: None,
                 base_branch: None,
                 previous_sha: None,
+                schedule: None,
             },
         )
         .await
@@ -4603,6 +4718,7 @@ mod matrix_tests {
                 jwt_secret: Some("secret"),
                 encryption_key: Some("secret"),
                 external_url: None,
+                schedule: None,
             },
             &CiNotifications::default(),
         )
@@ -4667,6 +4783,7 @@ mod matrix_tests {
                 jwt_secret: Some("secret"),
                 encryption_key: Some("secret"),
                 external_url: None,
+                schedule: None,
             },
             &CiNotifications::default(),
         )
@@ -4779,6 +4896,7 @@ mod matrix_tests {
                         jwt_secret: Some("secret"),
                         encryption_key: Some("secret"),
                         external_url: None,
+                        schedule: None,
                     },
                     &CiNotifications::default(),
                 )
@@ -4804,6 +4922,7 @@ mod matrix_tests {
                         dispatch_inputs: None,
                         base_branch: None,
                         previous_sha: None,
+                        schedule: None,
                     },
                 )
                 .await
@@ -4933,16 +5052,20 @@ mod matrix_tests {
     /// Asserted in both directions, because each catches a different mistake:
     /// forgetting to answer a canonical name, and answering a name the validator
     /// would have rejected.
+    ///
+    /// The run is a scheduled one so that `github.event.schedule` — the one key
+    /// only some events give a value — is asked for a value too.
     #[test]
     fn every_condition_key_the_validator_accepts_is_answered_by_both_contexts() {
         let job = job_condition_context(
             "refs/heads/main",
-            "push",
+            "schedule",
             "abc123",
             RepositoryName {
                 owner: "acme",
                 name: "api",
             },
+            Some("0 3 * * *"),
             &std::collections::BTreeMap::new(),
             &config::JobConfig {
                 stage: None,
@@ -4966,9 +5089,10 @@ mod matrix_tests {
             &gitea_actions::WorkflowContext {
                 ref_name: "refs/heads/main".into(),
                 sha: "abc123".into(),
-                event: "push".into(),
+                event: "schedule".into(),
                 repo_owner: "acme".into(),
                 repo_name: "api".into(),
+                event_schedule: Some("0 3 * * *".into()),
             },
             &std::collections::HashMap::new(),
         );
@@ -5096,6 +5220,7 @@ mod matrix_tests {
                 jwt_secret: Some("secret"),
                 encryption_key: Some("secret"),
                 external_url: None,
+                schedule: None,
             },
             &CiNotifications::default(),
         )
@@ -5948,6 +6073,7 @@ mod matrix_tests {
                     jwt_secret: Some("secret"),
                     encryption_key: Some("secret"),
                     external_url: None,
+                    schedule: None,
                 },
                 &CiNotifications::default(),
             )
@@ -6029,6 +6155,7 @@ mod matrix_tests {
                     jwt_secret: Some("secret"),
                     encryption_key: Some("secret"),
                     external_url: None,
+                    schedule: None,
                 },
                 &CiNotifications::default(),
             )
@@ -6188,6 +6315,7 @@ mod matrix_tests {
                     jwt_secret: Some("secret"),
                     encryption_key: Some("secret"),
                     external_url: None,
+                    schedule: None,
                 },
                 &CiNotifications::default(),
             )
@@ -6334,6 +6462,7 @@ mod matrix_tests {
                 jwt_secret: Some("secret"),
                 encryption_key: Some("secret"),
                 external_url: None,
+                schedule: None,
             },
             &CiNotifications::default(),
         )
@@ -7595,6 +7724,7 @@ mod matrix_tests {
                 jwt_secret: Some("secret"),
                 encryption_key: Some("secret"),
                 external_url: None,
+                schedule: None,
             },
             &CiNotifications::default(),
         )
@@ -8041,6 +8171,7 @@ jobs:
                 base_branch: None,
                 previous_sha: None,
                 inputs: Some(&inputs),
+                schedule: None,
             },
         )
         .expect("typed dispatch inputs must reach the committed workflow");
@@ -8081,6 +8212,7 @@ jobs:
                     base_branch: None,
                     previous_sha: None,
                     inputs: Some(&inputs),
+                    schedule: None,
                 },
             )
             .expect_err("an invalid dispatch input must refuse the committed workflow");
@@ -8177,6 +8309,7 @@ jobs:
                 base_branch: None,
                 previous_sha: None,
                 inputs: Some(&inputs),
+                schedule: None,
             },
         )
         .expect("each workflow must receive its slice of the aggregate map");
@@ -8203,6 +8336,7 @@ jobs:
                 base_branch: None,
                 previous_sha: None,
                 inputs: Some(&unknown),
+                schedule: None,
             },
         )
         .expect_err("an input declared by no matching workflow must be refused");
@@ -8272,6 +8406,7 @@ jobs:
                 base_branch: None,
                 previous_sha: None,
                 inputs: Some(&inputs),
+                schedule: None,
             },
         )
         .expect("the compatible aggregate must run both workflows");
@@ -8346,6 +8481,7 @@ jobs:
                     base_branch: None,
                     previous_sha: None,
                     inputs: Some(&inputs),
+                    schedule: None,
                 },
             )
             .expect_err("the real trigger must reject the same aggregate contract");
@@ -8540,6 +8676,7 @@ jobs:
             jwt_secret: Some("secret"),
             encryption_key: Some("secret"),
             external_url: None,
+            schedule: None,
         }
     }
 
@@ -9619,6 +9756,7 @@ mod artifact_publication_tests {
                 jwt_secret: Some("secret"),
                 encryption_key: Some("secret"),
                 external_url: None,
+                schedule: None,
             },
             &CiNotifications::default(),
         )
@@ -9894,5 +10032,507 @@ mod artifact_publication_tests {
                 .is_empty(),
             "an empty archive published under the name a real run uses is worse than none"
         );
+    }
+}
+
+/// card_372a240bf59d: `on: schedule` driven end to end — the real engine reading
+/// real workflow files, the real tick ledger, a held clock.
+#[cfg(test)]
+mod schedule_pass_tests {
+    use super::*;
+
+    const OWNER: &str = "schedule-owner";
+    const REPO: &str = "nightly";
+
+    const NIGHTLY: &[u8] = b"name: Nightly
+on:
+  schedule:
+    - cron: '0 3 * * *'
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo audit
+";
+
+    struct Fixture {
+        root: tempfile::TempDir,
+        db: sea_orm::DatabaseConnection,
+        repo_id: i64,
+    }
+
+    impl Fixture {
+        fn repo_path(&self) -> std::path::PathBuf {
+            self.root.path().join(format!("{OWNER}/{REPO}.git"))
+        }
+
+        /// The working copy commits are made in; the repository the server
+        /// reads is the bare one under the storage root, pushed to.
+        fn work_path(&self) -> std::path::PathBuf {
+            self.root.path().join("work")
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+            let output = git.run(args, Some(&self.work_path())).unwrap();
+            assert!(output.success(), "git {args:?}: {}", output.stdout_str());
+            output.stdout_str().trim().to_owned()
+        }
+
+        /// Write `files` (an empty body removes the file), commit on `main` and
+        /// push it to the repository the server reads.
+        fn commit(&self, files: &[(&str, &[u8])]) -> String {
+            for (path, contents) in files {
+                let target = self.work_path().join(path);
+                if contents.is_empty() {
+                    std::fs::remove_file(target).unwrap();
+                } else {
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::fs::write(target, contents).unwrap();
+                }
+            }
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-m", "change"]);
+            let bare = self.repo_path();
+            self.git(&["push", "--quiet", bare.to_str().unwrap(), "main"]);
+            self.git(&["rev-parse", "HEAD"])
+        }
+
+        fn context(&self) -> rg_core::push_hooks::PostPushContext {
+            rg_core::push_hooks::PostPushContext {
+                repo_root: self.root.path().to_path_buf(),
+                docker_enabled: false,
+                // Pipelines are published and left for a runner, so the test
+                // reads the graph the tick produced rather than racing one.
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret".into()),
+                encryption_key: Some("secret".into()),
+                smtp_config: None,
+                ci_engine: std::sync::Arc::new(CiEngine::new()),
+                external_url: None,
+                notifier: None,
+                delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
+                write_pool: None,
+                storage_limits: rg_core::storage_quota::StorageLimits::default(),
+            }
+        }
+
+        async fn pass(
+            &self,
+            cache: &mut rg_core::ci::schedule::ScheduleCache,
+            config: rg_core::ci::schedule::ScheduleConfig,
+            now: &str,
+        ) -> Vec<rg_core::ci::schedule::ScheduledPipeline> {
+            let now = chrono::DateTime::parse_from_rfc3339(now)
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            rg_core::ci::schedule::run_pass(&self.db, &self.context(), config, cache, now)
+                .await
+                .expect("the schedule pass runs")
+        }
+
+        async fn pipelines(&self) -> Vec<rg_db::entities::pipeline::Model> {
+            use sea_orm::{EntityTrait, QueryOrder};
+            rg_db::entities::pipeline::Entity::find()
+                .order_by_asc(rg_db::entities::pipeline::Column::Id)
+                .all(&self.db)
+                .await
+                .unwrap()
+        }
+
+        async fn job_names(&self, pipeline_id: i64) -> Vec<String> {
+            let mut names = Vec::new();
+            for stage in rg_db::ops::pipeline_ops::list_stages_by_pipeline(&self.db, pipeline_id)
+                .await
+                .unwrap()
+            {
+                for job in rg_db::ops::pipeline_ops::list_jobs_by_stage(&self.db, stage.id)
+                    .await
+                    .unwrap()
+                {
+                    names.push(job.name);
+                }
+            }
+            names.sort();
+            names
+        }
+    }
+
+    async fn fixture(files: &[(&str, &[u8])]) -> Fixture {
+        use sea_orm::ActiveValue::{NotSet, Set};
+
+        let root = tempfile::tempdir().unwrap();
+        let repo_path = root.path().join(format!("{OWNER}/{REPO}.git"));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        std::fs::create_dir_all(root.path().join("work")).unwrap();
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        assert!(git
+            .run(
+                &["init", "--bare", "--quiet", "-b", "main"],
+                Some(&repo_path)
+            )
+            .unwrap()
+            .success());
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                root.path().join("schedule.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            OWNER,
+            "schedule-owner@example.com",
+            "unused",
+            "Schedule Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set(REPO.into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        let fixture = Fixture {
+            root,
+            db,
+            repo_id: repo.id,
+        };
+        fixture.git(&["init", "-b", "main"]);
+        fixture.git(&["config", "user.name", "CI"]);
+        fixture.git(&["config", "user.email", "ci@example.com"]);
+        fixture.commit(files);
+        fixture
+    }
+
+    fn default_config() -> rg_core::ci::schedule::ScheduleConfig {
+        rg_core::ci::schedule::ScheduleConfig::default()
+    }
+
+    /// The acceptance of the card: a tick runs exactly one pipeline, and the
+    /// same tick asked again — by the same process, by a restarted one with an
+    /// empty cache, by a second replica — runs nothing.
+    #[tokio::test]
+    async fn a_tick_runs_one_pipeline_and_its_repeat_runs_none() {
+        let fixture = fixture(&[(".gitea/workflows/nightly.yml", NIGHTLY)]).await;
+        let mut cache = rg_core::ci::schedule::ScheduleCache::default();
+
+        // First sight: the entry is recorded, the tick that passed before it was
+        // seen is not run.
+        assert!(fixture
+            .pass(&mut cache, default_config(), "2026-10-20T02:00:00Z")
+            .await
+            .is_empty());
+        assert!(fixture.pipelines().await.is_empty());
+
+        let ran = fixture
+            .pass(&mut cache, default_config(), "2026-10-20T03:00:30Z")
+            .await;
+        assert_eq!(ran.len(), 1, "{ran:?}");
+        assert_eq!(ran[0].workflow, "nightly.yml");
+        assert_eq!(ran[0].cron, "0 3 * * *");
+        assert_eq!(ran[0].tick.to_rfc3339(), "2026-10-20T03:00:00+00:00");
+
+        // The same minute again, and the same tick from a process that never
+        // saw it (a restart, or a second replica).
+        assert!(fixture
+            .pass(&mut cache, default_config(), "2026-10-20T03:00:50Z")
+            .await
+            .is_empty());
+        let mut replica = rg_core::ci::schedule::ScheduleCache::default();
+        assert!(fixture
+            .pass(&mut replica, default_config(), "2026-10-20T03:59:00Z")
+            .await
+            .is_empty());
+
+        let pipelines = fixture.pipelines().await;
+        assert_eq!(pipelines.len(), 1, "one tick, one pipeline: {pipelines:?}");
+        let pipeline = &pipelines[0];
+        assert_eq!(Some(pipeline.id), ran[0].pipeline_id);
+        assert_eq!(pipeline.trigger_type, "schedule");
+        assert_eq!(pipeline.ref_name, "refs/heads/main");
+        assert_eq!(pipeline.schedule_workflow.as_deref(), Some("nightly.yml"));
+        assert_eq!(pipeline.schedule_cron.as_deref(), Some("0 3 * * *"));
+        assert_eq!(fixture.job_names(pipeline.id).await, ["nightly/audit"]);
+    }
+
+    /// Six ticks missed while the server was down are one run when it comes
+    /// back, not six.
+    #[tokio::test]
+    async fn ticks_missed_while_down_are_not_caught_up() {
+        let fixture = fixture(&[(".gitea/workflows/nightly.yml", NIGHTLY)]).await;
+        let mut cache = rg_core::ci::schedule::ScheduleCache::default();
+        fixture
+            .pass(&mut cache, default_config(), "2026-10-14T12:00:00Z")
+            .await;
+        let ran = fixture
+            .pass(&mut cache, default_config(), "2026-10-20T12:00:00Z")
+            .await;
+        assert_eq!(ran.len(), 1, "{ran:?}");
+        assert_eq!(ran[0].tick.to_rfc3339(), "2026-10-20T03:00:00+00:00");
+        assert_eq!(fixture.pipelines().await.len(), 1);
+    }
+
+    /// `* * * * *` on a default instance runs every fifth minute.
+    #[tokio::test]
+    async fn no_entry_runs_more_often_than_the_floor() {
+        let fixture = fixture(&[(
+            ".gitea/workflows/often.yml",
+            b"on:\n  schedule:\n    - cron: '* * * * *'\njobs:\n  ping:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ping\n",
+        )])
+        .await;
+        let mut cache = rg_core::ci::schedule::ScheduleCache::default();
+        let mut ran_at = Vec::new();
+        for minute in 0..=11 {
+            let now = format!("2026-10-20T10:{minute:02}:05Z");
+            if !fixture
+                .pass(&mut cache, default_config(), &now)
+                .await
+                .is_empty()
+            {
+                ran_at.push(minute);
+            }
+        }
+        assert_eq!(
+            ran_at,
+            [5, 10],
+            "first sight at :00, then every fifth minute"
+        );
+
+        let one_minute = rg_core::ci::schedule::ScheduleConfig {
+            min_interval_minutes: 1,
+        };
+        assert_eq!(
+            fixture
+                .pass(&mut cache, one_minute, "2026-10-20T10:12:05Z")
+                .await
+                .len(),
+            1,
+            "a one-minute floor lets the 10:12 tick run two minutes after 10:10"
+        );
+    }
+
+    /// A tick belongs to one entry of one file: a second workflow on the same
+    /// cron is its own run, and neither run carries the other's jobs — nor the
+    /// jobs of a workflow that is not scheduled at all.
+    #[tokio::test]
+    async fn each_scheduled_workflow_is_its_own_run() {
+        let fixture = fixture(&[
+            (".gitea/workflows/nightly.yml", NIGHTLY),
+            (
+                ".gitea/workflows/backup.yml",
+                b"on:\n  schedule:\n    - cron: '0 3 * * *'\njobs:\n  dump:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo dump\n",
+            ),
+            (
+                ".gitea/workflows/ci.yml",
+                b"on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo test\n",
+            ),
+        ])
+        .await;
+        let mut cache = rg_core::ci::schedule::ScheduleCache::default();
+        fixture
+            .pass(&mut cache, default_config(), "2026-10-20T02:00:00Z")
+            .await;
+        let ran = fixture
+            .pass(&mut cache, default_config(), "2026-10-20T03:00:00Z")
+            .await;
+        assert_eq!(ran.len(), 2, "{ran:?}");
+        let mut jobs = Vec::new();
+        for pipeline in fixture.pipelines().await {
+            jobs.push(fixture.job_names(pipeline.id).await);
+        }
+        jobs.sort();
+        assert_eq!(jobs, [vec!["backup/dump"], vec!["nightly/audit"]]);
+    }
+
+    /// The default branch is the schedule. A push that removes an entry stops
+    /// it at once, and putting it back starts over — it does not run straight
+    /// away for a tick that passed while it was gone.
+    #[tokio::test]
+    async fn a_push_to_the_default_branch_reschedules() {
+        let fixture = fixture(&[(".gitea/workflows/nightly.yml", NIGHTLY)]).await;
+        let mut cache = rg_core::ci::schedule::ScheduleCache::default();
+        fixture
+            .pass(&mut cache, default_config(), "2026-10-20T02:00:00Z")
+            .await;
+
+        fixture.commit(&[(".gitea/workflows/nightly.yml", b"")]);
+        assert!(fixture
+            .pass(&mut cache, default_config(), "2026-10-20T03:00:00Z")
+            .await
+            .is_empty());
+        assert!(
+            rg_db::ops::ci_schedule_ops::list_for_repo(&fixture.db, fixture.repo_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an entry the branch no longer declares leaves the ledger"
+        );
+
+        fixture.commit(&[(".gitea/workflows/nightly.yml", NIGHTLY)]);
+        assert!(fixture
+            .pass(&mut cache, default_config(), "2026-10-21T02:00:00Z")
+            .await
+            .is_empty());
+        assert_eq!(
+            fixture
+                .pass(&mut cache, default_config(), "2026-10-21T03:00:00Z")
+                .await
+                .len(),
+            1
+        );
+    }
+
+    /// A pull mirror's workflows are its upstream's: the mirror pass runs no
+    /// `push` pipeline for them, and a schedule must not run them either.
+    #[tokio::test]
+    async fn a_pull_mirror_is_not_scheduled() {
+        use sea_orm::ActiveValue::{NotSet, Set};
+
+        let fixture = fixture(&[(".gitea/workflows/nightly.yml", NIGHTLY)]).await;
+        let now = chrono::Utc::now();
+        rg_db::ops::mirror_ops::create(
+            &fixture.db,
+            rg_db::entities::mirror::ActiveModel {
+                id: NotSet,
+                repo_id: Set(fixture.repo_id),
+                url: Set("https://example.invalid/upstream.git".into()),
+                username: Set(None),
+                password_encrypted: Set(None),
+                sync_interval_seconds: Set(3600),
+                next_sync_at: Set(None),
+                last_sync_at: Set(None),
+                last_sync_error: Set(None),
+                status: Set("active".into()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            },
+        )
+        .await
+        .unwrap();
+        let mut cache = rg_core::ci::schedule::ScheduleCache::default();
+        for now in ["2026-10-20T02:00:00Z", "2026-10-20T03:00:00Z"] {
+            assert!(fixture
+                .pass(&mut cache, default_config(), now)
+                .await
+                .is_empty());
+        }
+        assert!(fixture.pipelines().await.is_empty());
+        assert!(
+            rg_db::ops::ci_schedule_ops::list_for_repo(&fixture.db, fixture.repo_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a mirror is not even read for schedules"
+        );
+    }
+
+    /// A tick whose run cannot be built leaves a failed `schedule` pipeline
+    /// that says why — and that a retry can replay, because the row names the
+    /// entry. Anything less is a nightly that silently stopped.
+    #[tokio::test]
+    async fn a_refused_run_is_recorded_where_ci_is_read() {
+        let fixture = fixture(&[(
+            ".gitea/workflows/nightly.yml",
+            b"on:\n  schedule:\n    - cron: '0 3 * * *'\njobs:\n  audit:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: someone/else@v1\n",
+        )])
+        .await;
+        let mut cache = rg_core::ci::schedule::ScheduleCache::default();
+        fixture
+            .pass(&mut cache, default_config(), "2026-10-20T02:00:00Z")
+            .await;
+        let ran = fixture
+            .pass(&mut cache, default_config(), "2026-10-20T03:00:00Z")
+            .await;
+        assert_eq!(ran.len(), 1, "{ran:?}");
+        let pipelines = fixture.pipelines().await;
+        assert_eq!(pipelines.len(), 1);
+        assert_eq!(pipelines[0].status, "failed");
+        assert_eq!(pipelines[0].trigger_type, "schedule");
+        assert_eq!(
+            pipelines[0].schedule_workflow.as_deref(),
+            Some("nightly.yml")
+        );
+        assert_eq!(pipelines[0].schedule_cron.as_deref(), Some("0 3 * * *"));
+    }
+
+    /// The trigger half of a retry: the recorded entry selects its file again,
+    /// and a scheduled run that names no entry — or one the commit does not
+    /// declare — is refused rather than falling through to the native config,
+    /// which nobody scheduled.
+    #[test]
+    fn a_scheduled_run_selects_its_entry_and_nothing_else() {
+        let (temp, sha) = super::matrix_tests::commit_repo(&[
+            (".gitea/workflows/nightly.yml", NIGHTLY),
+            (
+                ".plombir-git-ci.yml",
+                b"native:\n  script:\n    - echo native\n",
+            ),
+        ]);
+        let read = |schedule: Option<rg_core::ci::ScheduledRun<'_>>| {
+            read_ci_config_with_inputs(
+                temp.path(),
+                RepositoryName {
+                    owner: "owner",
+                    name: "repo",
+                },
+                &sha,
+                "refs/heads/main",
+                WorkflowInvocation {
+                    event: "schedule",
+                    base_branch: None,
+                    previous_sha: None,
+                    inputs: None,
+                    schedule,
+                },
+            )
+        };
+        let config = read(Some(rg_core::ci::ScheduledRun {
+            workflow: "nightly.yml",
+            cron: "0 3 * * *",
+        }))
+        .expect("the recorded entry selects its workflow");
+        assert_eq!(config.jobs.keys().collect::<Vec<_>>(), ["nightly/audit"]);
+        for schedule in [
+            None,
+            Some(rg_core::ci::ScheduledRun {
+                workflow: "nightly.yml",
+                cron: "0 4 * * *",
+            }),
+            Some(rg_core::ci::ScheduledRun {
+                workflow: "other.yml",
+                cron: "0 3 * * *",
+            }),
+        ] {
+            let error = read(schedule).expect_err("no entry, no run — and no native fallback");
+            assert!(
+                format!("{error:#}").contains("does not declare"),
+                "{schedule:?}: {error:#}"
+            );
+        }
     }
 }

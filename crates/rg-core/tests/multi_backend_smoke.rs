@@ -3053,6 +3053,7 @@ async fn dispatch_inputs_at_the_ceiling_fit_the_pipeline_row() {
             dispatch_inputs: Some(&stored),
             base_branch: None,
             previous_sha: None,
+            schedule: None,
         },
     )
     .await
@@ -3388,6 +3389,7 @@ async fn free_text_at_the_ceiling_round_trips() {
             dispatch_inputs: None,
             base_branch: None,
             previous_sha: None,
+            schedule: None,
         },
     )
     .await
@@ -3428,6 +3430,7 @@ async fn free_text_at_the_ceiling_round_trips() {
             dispatch_inputs: None,
             base_branch: None,
             previous_sha: None,
+            schedule: None,
         },
     )
     .await
@@ -6077,4 +6080,84 @@ async fn neighbouring_issue_relabels_all_land() {
             "issue {number} holds the labels of its last edit"
         );
     }
+}
+
+/// card_372a240bf59d: the `on: schedule` tick ledger decides "is this tick
+/// still due" and "it is mine now" in one statement. Its insert spells
+/// `ON CONFLICT DO NOTHING` differently on every backend (MySQL has none and
+/// gets a no-op update of the key), so the four answers are asked on the real
+/// database rather than assumed from SQLite.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn ci_schedule_tick_claims_are_portable() {
+    use rg_db::ops::ci_schedule_ops::{self, TickClaim};
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("scheduletick{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Schedule Tick Smoke",
+    )
+    .await
+    .expect("create schedule owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("scheduletickrepo{suffix}")),
+    )
+    .await
+    .expect("create schedule repository");
+
+    let claim =
+        |tick: i64| ci_schedule_ops::claim_tick(&db, repo.id, "nightly.yml", "0 3 * * *", tick, 5);
+    assert_eq!(claim(1_000).await.unwrap(), TickClaim::Recorded);
+    assert_eq!(
+        claim(1_000).await.unwrap(),
+        TickClaim::NotDue,
+        "a second first sight is a no-op, not an error and not a claim"
+    );
+    assert_eq!(
+        claim(1_003).await.unwrap(),
+        TickClaim::NotDue,
+        "under the floor"
+    );
+    assert_eq!(claim(1_005).await.unwrap(), TickClaim::Claimed);
+    assert_eq!(
+        claim(1_005).await.unwrap(),
+        TickClaim::NotDue,
+        "the same tick is claimed once"
+    );
+    assert_eq!(
+        claim(1_004).await.unwrap(),
+        TickClaim::NotDue,
+        "never backwards"
+    );
+
+    // Two claimants of one tick, at once: exactly one wins.
+    let (left, right) = tokio::join!(claim(1_010), claim(1_010));
+    let mut outcomes = [left.unwrap(), right.unwrap()];
+    outcomes.sort_by_key(|claim| *claim == TickClaim::Claimed);
+    assert_eq!(outcomes, [TickClaim::NotDue, TickClaim::Claimed]);
+
+    assert_eq!(
+        ci_schedule_ops::forget_undeclared(&db, repo.id, &[])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        claim(1_020).await.unwrap(),
+        TickClaim::Recorded,
+        "a forgotten entry starts over"
+    );
 }

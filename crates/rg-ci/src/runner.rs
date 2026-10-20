@@ -1533,6 +1533,9 @@ impl PipelineRunner {
         env.insert("CI_SHA".into(), pipeline.commit_sha);
         env.insert("CI_REF".into(), pipeline.ref_name);
         env.insert("CI_EVENT".into(), pipeline.trigger_type);
+        if let Some(cron) = pipeline.schedule_cron {
+            env.insert("CI_EVENT_SCHEDULE".into(), cron);
+        }
         let (repository_owner, repository_name) =
             rg_core::repo::service::repository_identity(&self.db, pipeline.repo_id).await?;
         env.insert(
@@ -2770,6 +2773,57 @@ mod tests {
         assert_eq!(value("DEPLOY"), Some("prod"));
         assert_eq!(value("CI_JOB_TOKEN"), None);
         assert_eq!(value("BAD-NAME"), None);
+    }
+
+    /// card_372a240bf59d: a scheduled run hands its job the entry that fired
+    /// as `CI_EVENT_SCHEDULE` — what `${{ github.event.schedule }}` becomes —
+    /// and a run under any other event has no such variable.
+    #[tokio::test]
+    async fn a_scheduled_job_reads_the_entry_that_fired() {
+        let temp = tempfile::tempdir().unwrap();
+        let pushed = cache_runner(temp.path()).await;
+        let scheduled = pipeline_ops::create_pipeline_row(
+            &pushed.db,
+            pipeline_ops::NewPipeline {
+                repo_id: pushed.repo_id,
+                commit_sha: &"0".repeat(40),
+                ref_name: "refs/heads/main",
+                trigger_type: rg_core::ci::SCHEDULE_EVENT,
+                triggered_by: None,
+                concurrency_group: None,
+                dispatch_inputs: None,
+                base_branch: None,
+                previous_sha: None,
+                schedule: Some(("nightly.yml", "0 3 * * *")),
+            },
+        )
+        .await
+        .unwrap();
+        let mut runner = PipelineRunner::new_local_only(
+            pushed.db.clone(),
+            &temp.path().join("repos"),
+            &temp.path().join("repos/owner/repo.git"),
+            scheduled.id,
+        );
+        runner.set_repo_id(pushed.repo_id);
+
+        let variable = |environment: &[(String, String)]| {
+            environment
+                .iter()
+                .find(|(name, _)| name == "CI_EVENT_SCHEDULE")
+                .map(|(_, value)| value.clone())
+        };
+        let (environment, _, _) = runner.job_environment(None, None, None).await.unwrap();
+        assert_eq!(variable(&environment).as_deref(), Some("0 3 * * *"));
+        assert_eq!(
+            environment
+                .iter()
+                .find(|(name, _)| name == "CI_EVENT")
+                .map(|(_, value)| value.as_str()),
+            Some("schedule")
+        );
+        let (environment, _, _) = pushed.job_environment(None, None, None).await.unwrap();
+        assert_eq!(variable(&environment), None);
     }
 
     /// A runner for a pipeline on `ref_name` of `repo_id`, in `db`.

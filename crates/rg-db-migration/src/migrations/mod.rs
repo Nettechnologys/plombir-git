@@ -163,6 +163,7 @@ pub mod m20261014_000004_repositories_name_fold_case;
 pub mod m20261015_000001_create_push_mirrors;
 pub mod m20261016_000001_free_text_columns_mysql;
 pub mod m20261016_000002_pipeline_job_image_mysql_text;
+pub mod m20261020_000001_ci_schedules;
 
 use sea_orm_migration::prelude::*;
 
@@ -416,6 +417,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261015_000001_create_push_mirrors::Migration),
             Box::new(m20261016_000001_free_text_columns_mysql::Migration),
             Box::new(m20261016_000002_pipeline_job_image_mysql_text::Migration),
+            Box::new(m20261020_000001_ci_schedules::Migration),
         ]
     }
 }

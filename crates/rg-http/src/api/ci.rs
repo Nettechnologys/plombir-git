@@ -746,6 +746,7 @@ pub async fn trigger_pipeline(
             jwt_secret: Some(&state.jwt_secret),
             encryption_key: Some(&state.encryption_key),
             external_url: state.external_url.as_deref(),
+            schedule: None,
         })
         .await
     {
@@ -882,6 +883,13 @@ pub async fn retry_pipeline(
             jwt_secret: Some(&state.jwt_secret),
             encryption_key: Some(&state.encryption_key),
             external_url: state.external_url.as_deref(),
+            // A scheduled run is replayed for the same cron entry of the same
+            // file: `schedule` on its own names no workflow at all.
+            schedule: pipeline
+                .schedule_workflow
+                .as_deref()
+                .zip(pipeline.schedule_cron.as_deref())
+                .map(|(workflow, cron)| rg_core::ci::ScheduledRun { workflow, cron }),
         })
         .await
     {

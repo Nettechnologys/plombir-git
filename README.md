@@ -128,7 +128,8 @@ cited in the row added it. Plombir Git's side is specified in full in
 | Workflow syntax | Plombir Git | Gitea 28 |
 |-----------------|-----------|----------|
 | `on:` `push`, `pull_request`, `workflow_dispatch`, `workflow_call` | ✅ | ✅ |
-| `on:` `schedule`, `pull_request_target`; `on.<event>.types` | ❌ refused by name | ✅ |
+| `on: schedule` | ✅ cron in UTC, from the default branch; one run per tick, missed ticks not caught up | ✅ |
+| `on:` `pull_request_target`; `on.<event>.types` | ❌ refused by name | ✅ |
 | Branch, tag and path filters, `!` negation | ✅ GitHub globs; `+`, `?` and `[…]` refused rather than read differently | ✅ |
 | `concurrency` (workflow level) | ✅ `group`, `cancel-in-progress` | ✅ since 1.26 ([notes](https://blog.gitea.com/release-of-1.26.0/)) |
 | `jobs.<id>.timeout-minutes` | ✅ | ✅ with Runner 2.0 ([notes](https://blog.gitea.com/release-of-runner-2.0.0/)) |

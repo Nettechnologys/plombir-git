@@ -1097,6 +1097,7 @@ async fn settle_refused_merge_group_config(
             // there is no previous revision, here or there.
             base_branch: Some(base_branch),
             previous_sha: None,
+            schedule: None,
         },
         &error,
     )
@@ -1680,6 +1681,7 @@ async fn ensure_merge_group_ci(
                     jwt_secret: ci.jwt_secret,
                     encryption_key: ci.encryption_key,
                     external_url: ci.external_url,
+                    schedule: None,
                 })
                 .await;
             let pipeline_id = match triggered {

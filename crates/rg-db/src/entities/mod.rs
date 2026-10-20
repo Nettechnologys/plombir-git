@@ -13,6 +13,7 @@ pub mod ci_environment;
 pub mod ci_environment_approval;
 pub mod ci_environment_approver_grant;
 pub mod ci_retention_policy;
+pub mod ci_schedule_tick;
 pub mod ci_secret;
 pub mod commit_signing_key;
 pub mod commit_status;

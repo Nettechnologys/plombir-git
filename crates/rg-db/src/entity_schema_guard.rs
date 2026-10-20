@@ -79,6 +79,7 @@ probed_entities!(
     ci_environment_approval,
     ci_environment_approver_grant,
     ci_retention_policy,
+    ci_schedule_tick,
     ci_secret,
     commit_signing_key,
     commit_status,

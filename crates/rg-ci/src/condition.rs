@@ -49,13 +49,15 @@ enum Token {
 /// which a comparison reports as a plain `false` — a silently wrong answer, not
 /// an error. `every_condition_key_the_validator_accepts_is_answered_by_both_contexts`
 /// holds the three together.
-pub const GITHUB_CONTEXT_KEYS: [&str; 6] = [
+pub const GITHUB_CONTEXT_KEYS: [&str; 7] = [
     "github.ref",
     "github.ref_name",
     "github.event_name",
     "github.sha",
     "github.repository",
     "github.repository_owner",
+    // The `- cron:` entry of a `schedule` run; the empty string otherwise.
+    "github.event.schedule",
 ];
 
 pub fn validate_condition(input: &str) -> Result<()> {

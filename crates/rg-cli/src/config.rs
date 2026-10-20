@@ -226,6 +226,11 @@ pub(crate) struct CiConfig {
     /// [`rg_process::docker_job::PIDS_LIMIT`].
     #[serde(default)]
     pub(crate) job_pids: Option<u64>,
+    /// The floor on how often one `on: schedule` cron entry may run, in
+    /// minutes. Absent keeps
+    /// [`rg_core::ci::schedule::DEFAULT_MIN_INTERVAL_MINUTES`].
+    #[serde(default)]
+    pub(crate) schedule_min_interval_minutes: Option<u64>,
 }
 
 /// Resolve `[ci]` `job_memory` / `job_cpus` / `job_pids` into the ceiling the
@@ -2087,6 +2092,12 @@ mod tests {
                 "job_pids",
                 "rg_process::docker_job::PIDS_LIMIT",
                 rg_process::docker_job::PIDS_LIMIT.to_string(),
+            ),
+            row(
+                "ci",
+                "schedule_min_interval_minutes",
+                "rg_core::ci::schedule::DEFAULT_MIN_INTERVAL_MINUTES",
+                rg_core::ci::schedule::DEFAULT_MIN_INTERVAL_MINUTES.to_string(),
             ),
             row(
                 "limits",

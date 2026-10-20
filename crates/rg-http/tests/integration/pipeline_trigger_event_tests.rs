@@ -143,6 +143,7 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
                     dispatch_inputs: stored_inputs.as_deref(),
                     base_branch: base_branch.as_deref(),
                     previous_sha: previous_sha.as_deref(),
+                    schedule: None,
                 },
             )
             .await?;
@@ -1044,6 +1045,7 @@ async fn a_retry_replays_the_event_context_of_the_run_it_repeats() {
             dispatch_inputs: None,
             base_branch: Some("develop"),
             previous_sha: Some(previous_sha),
+            schedule: None,
         },
     )
     .await
