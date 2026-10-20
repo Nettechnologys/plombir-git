@@ -840,3 +840,71 @@ async fn a_job_with_services_goes_only_to_a_runner_that_starts_them() {
     assert_eq!(body["job_id"].as_i64(), Some(job_id));
     assert_eq!(body["services"], context["services"], "{body}");
 }
+
+/// card_e42a6d0af271: an Actions job is given only the secrets it names, the
+/// runner is told which they are, and a runner that would hand them to every
+/// step — protocol 3 — is refused the job by name. A job that names none goes
+/// to that runner with no secret at all.
+#[tokio::test]
+async fn an_actions_job_is_given_only_the_secrets_it_names() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed(&base, &db, "secrets").await;
+    for (name, value) in [("ALPHA", "alpha-value"), ("BRAVO", "bravo-value")] {
+        let stored = reqwest::Client::new()
+            .put(format!(
+                "{base}/api/v1/repos/{owner}/{owner}/actions/secrets/{name}",
+                owner = seeded.owner
+            ))
+            .bearer_auth(&seeded.owner_token)
+            .json(&serde_json::json!({ "value": value }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::CREATED);
+    }
+    let quiet = job(&db, seeded.stage_id, "quiet", &["Build"]).await;
+    rg_db::ops::pipeline_step_ops::set_job_context(&db, quiet, r#"{"secrets":[]}"#)
+        .await
+        .unwrap();
+
+    // Names none: an old runner takes it, and it carries neither secret.
+    let response = poll(&base, &seeded, Some("3")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["job_id"].as_i64(), Some(quiet));
+    let variables = body["variables"].as_object().unwrap();
+    assert!(
+        !variables.contains_key("ALPHA") && !variables.contains_key("BRAVO"),
+        "{body}"
+    );
+    assert_eq!(body["secrets"], serde_json::json!([]));
+
+    let deploy = job(&db, seeded.stage_id, "deploy", &["Deploy"]).await;
+    rg_db::ops::pipeline_step_ops::set_job_context(&db, deploy, r#"{"secrets":["ALPHA"]}"#)
+        .await
+        .unwrap();
+    let response = poll(&base, &seeded, Some("3")).await;
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    let error = response.json::<serde_json::Value>().await.unwrap()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains(&format!("job #{deploy}")) && error.contains("secrets"),
+        "{error}"
+    );
+
+    let response = poll(
+        &base,
+        &seeded,
+        Some(&rg_core::ci::SCOPED_SECRETS_PROTOCOL.to_string()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["job_id"].as_i64(), Some(deploy));
+    let variables = body["variables"].as_object().unwrap();
+    assert_eq!(variables["ALPHA"], "alpha-value", "{body}");
+    assert!(!variables.contains_key("BRAVO"), "{body}");
+    assert_eq!(body["secrets"], serde_json::json!(["ALPHA"]));
+}

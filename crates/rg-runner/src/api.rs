@@ -111,6 +111,10 @@ pub struct PollJobResponse {
     /// The job's `services:`, started before its first step.
     #[serde(default)]
     pub(crate) services: Vec<rg_process::ci_services::ServiceSpec>,
+    /// Which of `variables` are the secrets the job names, of which each step
+    /// gets only its own; `None` for a job that does not scope them.
+    #[serde(default)]
+    pub(crate) secrets: Option<std::collections::BTreeSet<String>>,
 }
 
 /// Per-request timeout for the heartbeat call.

@@ -27,7 +27,7 @@
 //! execute through this module, so a step means the same thing wherever it
 //! lands.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -54,8 +54,14 @@ pub const STEPS_PROTOCOL: u32 = 2;
 /// declares any: it would run the steps against services that are not there.
 pub const SERVICES_PROTOCOL: u32 = 3;
 
+/// The protocol in which a runner hands each step only the secrets that step
+/// names ([`StepSpec::secrets`], [`JobContext::secrets`]). A runner below it
+/// would give every step all the secrets the job was given — a downloaded
+/// action's steps included — so it is never handed a job that reads any.
+pub const SCOPED_SECRETS_PROTOCOL: u32 = 4;
+
 /// What this build's runner speaks, and sends with every poll.
-pub const RUNNER_PROTOCOL: u32 = SERVICES_PROTOCOL;
+pub const RUNNER_PROTOCOL: u32 = SCOPED_SECRETS_PROTOCOL;
 
 /// Where a containerised job's workspace is mounted.
 pub const CONTAINER_WORKSPACE: &str = "/workspace";
@@ -99,6 +105,14 @@ pub struct StepSpec {
     /// The step's `if:`, read between steps. `None` is `success()`.
     #[serde(default)]
     pub condition: Option<String>,
+    /// The secrets this step's process gets, by name: those the step's own
+    /// text names, those the job's and the workflow's `env:` name, and — for a
+    /// step of an action — only what the workflow's step passed the action
+    /// in `with:` / `env:`. Every other secret of [`JobContext::secrets`] is
+    /// left out of its environment. Empty, and absent from the JSON, when the
+    /// step may read none.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub secrets: BTreeSet<String>,
 }
 
 /// The shells a step can ask for, and how each one is started — GitHub's own
@@ -485,6 +499,9 @@ pub struct StepRun<'a> {
     pub needs: &'a BTreeMap<String, NeededJob>,
     /// The job's `outputs:`, as templates over `steps.*` and `needs.*`.
     pub outputs: &'a BTreeMap<String, String>,
+    /// [`JobContext::secrets`]: the names in `job_env` that are secrets, of
+    /// which each step gets only its own. `None` hides none.
+    pub secrets: Option<&'a BTreeSet<String>>,
 }
 
 /// One minute of a step's `timeout-minutes`.
@@ -930,6 +947,9 @@ fn push_line(log: &mut String, line: &str) {
 /// job's, then what earlier steps wrote to `$GITHUB_ENV`, then the step's own
 /// `env:`, then the runner's file-command paths and the `PATH` with every
 /// `$GITHUB_PATH` entry in front.
+///
+/// A secret of the job the step does not name ([`StepSpec::secrets`]) is not
+/// in it, and no `${NAME}` in it reads one.
 fn step_environment(
     run: &StepRun<'_>,
     step: &StepSpec,
@@ -938,6 +958,10 @@ fn step_environment(
     number: usize,
 ) -> Vec<(String, String)> {
     let paths = step_paths(run, number, step);
+    let hidden = |name: &str| {
+        run.secrets
+            .is_some_and(|secrets| secrets.contains(name) && !step.secrets.contains(name))
+    };
     // A job variable may read what a needed job left (`env: VERSION:
     // ${{ needs.build.outputs.version }}`); nothing else in it is a runtime
     // expression.
@@ -945,16 +969,37 @@ fn step_environment(
         steps: &HashMap::new(),
         needs: run.needs,
     };
-    let mut env: BTreeMap<String, String> = run
+    let job_env: BTreeMap<String, String> = run
         .job_env
         .iter()
+        .filter(|(name, _)| !hidden(name))
         .map(|(name, value)| (name.clone(), needs_only.resolve(value)))
+        .collect();
+    // What `${NAME}` in a declared value reads: what the step may see.
+    let mut visible = job_env.clone();
+    visible.extend(carried_env.iter().cloned());
+    let mut env: BTreeMap<String, String> = job_env
+        .iter()
+        .map(|(name, value)| {
+            // A secret's own value is data, never a template; a job that
+            // predates scoped secrets cannot tell its secrets from its
+            // variables, and keeps its values as they were.
+            let declared = run
+                .secrets
+                .is_some_and(|secrets| !secrets.contains(name) && !reserved_for_the_runner(name));
+            let value = if declared {
+                expand_placeholders(value, &visible)
+            } else {
+                value.clone()
+            };
+            (name.clone(), value)
+        })
         .collect();
     env.extend(carried_env.iter().cloned());
     env.extend(
         step.env
             .iter()
-            .map(|(name, value)| (name.clone(), value.clone())),
+            .map(|(name, value)| (name.clone(), expand_placeholders(value, &visible))),
     );
     let base_path = match &run.backend {
         StepBackend::Local => env.get("PATH").cloned().unwrap_or_default(),
@@ -979,6 +1024,39 @@ fn step_environment(
     env.insert("RUNNER_TEMP".into(), paths.temp);
     env.insert("GITHUB_ACTIONS".into(), "true".into());
     env.into_iter().collect()
+}
+
+/// Replace each `${NAME}` in a declared value — what `${{ secrets.NAME }}`,
+/// `${{ matrix.x }}` and `${{ inputs.x }}` became when the workflow was read —
+/// with what `NAME` holds in `visible`, empty when it holds nothing: what the
+/// shell did with the same text when steps were one script. Only names the
+/// translation writes, `[A-Z_][A-Z0-9_]*`, are read; any other `$` is text.
+fn expand_placeholders(value: &str, visible: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(open) = rest.find("${") {
+        let after = &rest[open + 2..];
+        let name_len = after
+            .bytes()
+            .take_while(|byte| matches!(byte, b'A'..=b'Z' | b'0'..=b'9' | b'_'))
+            .count();
+        let named = after[..name_len]
+            .bytes()
+            .next()
+            .is_some_and(|first| !first.is_ascii_digit());
+        if named && after[name_len..].starts_with('}') {
+            out.push_str(&rest[..open]);
+            if let Some(found) = visible.get(&after[..name_len]) {
+                out.push_str(found);
+            }
+            rest = &after[name_len + 1..];
+        } else {
+            out.push_str(&rest[..open + 2]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn step_paths(run: &StepRun<'_>, number: usize, step: &StepSpec) -> StepPaths {
@@ -1303,6 +1381,13 @@ pub struct JobContext {
     /// written before services existed reads the same.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<crate::ci_services::ServiceSpec>,
+    /// Every secret the job names anywhere — its steps, its `env:`, its
+    /// services, its container — and so all the job is handed: the server
+    /// gives the job no other. Each step gets the part its
+    /// [`StepSpec::secrets`] names. `None` — a job translated before secrets
+    /// were scoped — is the old reading: every secret, to every step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<BTreeSet<String>>,
 }
 
 ///
@@ -1319,6 +1404,7 @@ pub async fn run_job_steps(
     mask: &(dyn Fn(&str) -> String + Sync),
     needs: &BTreeMap<String, NeededJob>,
     outputs: &BTreeMap<String, String>,
+    secrets: Option<&BTreeSet<String>>,
     reporter: &mut impl StepReporter,
 ) -> JobRun {
     let failed = failed_job;
@@ -1333,6 +1419,18 @@ pub async fn run_job_steps(
         );
     }
     let _guard = TempGuard(temp.clone());
+
+    // What a killed runner on this machine left running — a steps container,
+    // a service, a network — goes before this job adds its own.
+    let docker = image.as_ref().map(|image| image.program).or_else(|| {
+        services
+            .as_ref()
+            .filter(|services| !services.specs.is_empty())
+            .map(|services| services.program)
+    });
+    if let Some(program) = docker {
+        crate::ci_services::sweep_orphans(program).await;
+    }
 
     // Before the job's container: it is started on the services' network.
     let services = match services.filter(|services| !services.specs.is_empty()) {
@@ -1363,6 +1461,7 @@ pub async fn run_job_steps(
                 minute: MINUTE,
                 needs,
                 outputs,
+                secrets,
             },
             reporter,
         )
@@ -1417,6 +1516,7 @@ pub async fn run_job_steps(
             minute: MINUTE,
             needs,
             outputs,
+            secrets,
         },
         reporter,
     )
@@ -1478,6 +1578,7 @@ mod tests {
             continue_on_error: false,
             timeout_minutes: None,
             condition: None,
+            secrets: BTreeSet::new(),
         }
     }
 
@@ -1540,11 +1641,101 @@ mod tests {
                 minute,
                 needs: &BTreeMap::new(),
                 outputs: &BTreeMap::new(),
+                secrets: None,
             },
             &mut recorder,
         )
         .await;
         (result, recorder.events, root)
+    }
+
+    /// card_e42a6d0af271: a step sees the secrets it names and none of the
+    /// job's others — a step of an action, which names none, sees none — while
+    /// a job variable built from a secret the job's `env:` names reaches every
+    /// step, as on GitHub. `${NAME}` in a declared value is filled from what
+    /// the step may see, never from a secret it may not.
+    #[tokio::test]
+    async fn each_step_gets_only_the_secrets_it_names() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let temp = root.path().join("temp");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut env = job_env();
+        env.extend([
+            ("ALPHA".to_string(), "alpha-value".to_string()),
+            ("BRAVO".to_string(), "bravo-value".to_string()),
+            ("SHARED".to_string(), "shared-value".to_string()),
+            // A job variable from `env: FROM_JOB: ${{ secrets.SHARED }}`, and
+            // one a needed job's output filled with a secret's placeholder.
+            ("FROM_JOB".to_string(), "${SHARED}".to_string()),
+            ("MATRIX_X".to_string(), "${BRAVO}".to_string()),
+        ]);
+        let secrets = BTreeSet::from(["ALPHA".into(), "BRAVO".into(), "SHARED".into()]);
+        let print = "echo \"a=${ALPHA:-none} b=${BRAVO:-none} s=${SHARED:-none} \
+                     j=$FROM_JOB m=$MATRIX_X t=${TOKEN:-none}\"";
+        let mut workflow = step("Workflow", print);
+        workflow.secrets = BTreeSet::from(["ALPHA".into(), "SHARED".into()]);
+        workflow
+            .env
+            .insert("TOKEN".into(), "pre-${ALPHA}-${lower}-$ALPHA".into());
+        let mut action = step("Action / Run", print);
+        action.secrets = BTreeSet::from(["SHARED".into()]);
+        let mask = |log: &str| log.to_string();
+        let result = run_steps(
+            &StepRun {
+                steps: &[workflow, action],
+                job_env: &env,
+                workspace: &workspace,
+                temp: &temp,
+                backend: StepBackend::Local,
+                mask: &mask,
+                minute: MINUTE,
+                needs: &BTreeMap::new(),
+                outputs: &BTreeMap::new(),
+                secrets: Some(&secrets),
+            },
+            &mut Recorder::default(),
+        )
+        .await;
+        assert!(
+            result.steps[0].log.contains(
+                "a=alpha-value b=none s=shared-value j=shared-value m= \
+                 t=pre-alpha-value-${lower}-$ALPHA"
+            ),
+            "{}",
+            result.steps[0].log
+        );
+        assert!(
+            result.steps[1]
+                .log
+                .contains("a=none b=none s=shared-value j=shared-value m= t=none"),
+            "{}",
+            result.steps[1].log
+        );
+    }
+
+    /// A job translated before secrets were scoped carries no list, and every
+    /// step keeps all of them, values untouched.
+    #[test]
+    fn a_job_without_a_secret_list_hides_nothing() {
+        let env = vec![("ALPHA".to_string(), "${KEPT}".to_string())];
+        let mask = |log: &str| log.to_string();
+        let root = tempfile::tempdir().unwrap();
+        let run = StepRun {
+            steps: &[],
+            job_env: &env,
+            workspace: root.path(),
+            temp: root.path(),
+            backend: StepBackend::Local,
+            mask: &mask,
+            minute: MINUTE,
+            needs: &BTreeMap::new(),
+            outputs: &BTreeMap::new(),
+            secrets: None,
+        };
+        let built = step_environment(&run, &step("S", "true"), &[], &[], 1);
+        assert!(built.contains(&("ALPHA".to_string(), "${KEPT}".to_string())));
     }
 
     /// The card's acceptance: a failing step under `continue-on-error` lets
@@ -1868,6 +2059,7 @@ mod tests {
                 minute: std::time::Duration::from_secs(2),
                 needs: &BTreeMap::new(),
                 outputs: &BTreeMap::new(),
+                secrets: None,
             },
             &mut recorder,
         )
@@ -1931,6 +2123,7 @@ mod tests {
                 minute: MINUTE,
                 needs,
                 outputs,
+                secrets: None,
             },
             &mut Silent,
         )
@@ -2140,6 +2333,7 @@ mod services_docker_tests {
             continue_on_error: false,
             timeout_minutes: None,
             condition: None,
+            secrets: BTreeSet::new(),
         }
     }
 
@@ -2240,6 +2434,7 @@ mod services_docker_tests {
             &mask,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            None,
             reporter,
         )
         .await

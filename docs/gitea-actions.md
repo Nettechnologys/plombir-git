@@ -784,11 +784,24 @@ The operator decides which of those may be used, in `[ci]`:
 A tag or a branch is resolved to a commit every time the workflow is read; the
 job log's first step for the action says which commit, and from where.
 
-**An action's steps are your job's steps.** They run with every variable the
-job has — and the job's environment holds the repository's CI secrets — so an
-action can read what a `run:` step of yours can. Allow `"upstream"` only for
-forges whose actions you would paste into a workflow yourself, and pin them
+**An action's steps run with your job's variables, not with your secrets.**
+A job is given only the secrets the workflow names somewhere in it, and each
+step's process gets only those it names itself — in its `run:`, `env:`,
+`with:`, `working-directory` or `if:` — plus those the workflow's and the
+job's `env:` name, which every step gets as on GitHub. An action's steps get
+exactly what the workflow's step hands the action in `with:` or `env:`,
+whatever the action's own text says; one handed nothing sees no secret. Every
+secret value is still masked in every log. What an action does with an input
+you hand it is up to the action, so allow `"upstream"` only for forges whose
+actions you would paste into a workflow yourself, and pin them
 (`actions_require_full_sha`).
+
+`plombir-git-runner` scopes secrets this way from runner protocol 4; an older
+runner is not handed a job that names a secret (`426`, naming the job), and
+the job waits for one that is. A job translated before this change keeps the
+old reading — every secret to every step — until its pipeline is run again. A
+native `.plombir-git-ci.yml` job is not affected: it gets all of the
+repository's secrets, as GitLab CI variables do.
 
 What `action.yml` (or `action.yaml`) may say:
 
@@ -894,7 +907,7 @@ contexts.
 | `github.repository_owner` | `${CI_REPOSITORY_OWNER}` |
 | `github.event.schedule` | `${CI_EVENT_SCHEDULE}` — the `- cron:` entry of a `schedule` run; empty for any other event. |
 | `env.NAME` | The variable's value. |
-| `secrets.NAME` | The secret: the environment's value when the job declares an environment that sets the name, the repository-wide one otherwise. |
+| `secrets.NAME` | The secret: the environment's value when the job declares an environment that sets the name, the repository-wide one otherwise. Naming it is also what gives the step — and the job — the secret at all (see [Composite actions](#composite-actions)). |
 | `matrix.NAME` | The variant's coordinate. |
 | `inputs.NAME` | The dispatch or call input. |
 

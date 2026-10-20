@@ -22,7 +22,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::config::{
     ActionExpression, ActionJobTemplates, ActionTemplate, ActionTemplatePart, ArtifactsConfig,
@@ -848,6 +848,63 @@ pub struct GiteaStep {
     /// Input parameters for the action.
     #[serde(default)]
     pub with: HashMap<String, String>,
+
+    /// Never in a workflow: set on each step an action's `uses:` was
+    /// replaced by ([`crate::actions`]) to the secrets the workflow's own step
+    /// passed it in `with:` and `env:` — all such a step may read, whatever
+    /// its text names (card_e42a6d0af271). `None` on a step the workflow
+    /// wrote, which may read what it names.
+    #[serde(skip)]
+    pub(crate) granted_secrets: Option<BTreeSet<String>>,
+}
+
+/// The secrets `text` names: every `secrets.<name>` in it, read the way
+/// `substitute_expr` reads one. Text outside `${{ }}` counts too — an `if:`
+/// may omit the braces — which can only add a name the workflow itself wrote.
+pub(crate) fn secrets_named(text: &str, names: &mut BTreeSet<String>) {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(found) = text[from..].find("secrets.") {
+        let start = from + found;
+        from = start + "secrets.".len();
+        let boundary = start == 0 || {
+            let before = bytes[start - 1];
+            !(before.is_ascii_alphanumeric() || matches!(before, b'_' | b'-' | b'.'))
+        };
+        let name_len = text[from..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            .count();
+        if boundary && name_len > 0 {
+            names.insert(text[from..from + name_len].to_string());
+        }
+    }
+}
+
+/// [`secrets_named`] over every text field of a step.
+pub(crate) fn secrets_named_by_step(step: &GiteaStep, names: &mut BTreeSet<String>) {
+    let GiteaStep {
+        name,
+        uses,
+        run,
+        shell,
+        working_directory,
+        id: _,
+        continue_on_error: _,
+        timeout_minutes: _,
+        env,
+        condition,
+        with,
+        granted_secrets: _,
+    } = step;
+    for text in [name, uses, run, shell, working_directory, condition]
+        .into_iter()
+        .flatten()
+        .chain(env.values())
+        .chain(with.values())
+    {
+        secrets_named(text, names);
+    }
 }
 
 /// Container specification for a job.
@@ -2801,6 +2858,7 @@ impl GiteaWorkflow {
                         }
                     })
                     .collect(),
+                secrets: Some(self.job_secrets(job, &steps)),
             };
             let (image, image_template) = split_action_template(
                 job.container
@@ -3016,6 +3074,17 @@ impl GiteaWorkflow {
             ));
         }
 
+        // A secret the workflow's or the job's `env:` names is in a variable
+        // every step gets, so every step may read it by name too.
+        let mut job_level_secrets = BTreeSet::new();
+        for value in self.env.values().chain(job.env.values()).chain(
+            job.container
+                .iter()
+                .flat_map(|container| container.env.values()),
+        ) {
+            secrets_named(value, &mut job_level_secrets);
+        }
+
         // Process steps
         let mut has_checkout = false;
         let default_working_directory = job
@@ -3180,6 +3249,14 @@ impl GiteaWorkflow {
                     continue_on_error: step_continue_on_error(step).unwrap_or(false),
                     timeout_minutes: step_timeout_minutes(step).unwrap_or(None),
                     condition: step.condition.clone(),
+                    secrets: {
+                        let mut secrets = job_level_secrets.clone();
+                        match &step.granted_secrets {
+                            Some(granted) => secrets.extend(granted.iter().cloned()),
+                            None => secrets_named_by_step(step, &mut secrets),
+                        }
+                        secrets
+                    },
                 });
             }
         }
@@ -3199,6 +3276,55 @@ impl GiteaWorkflow {
             artifacts,
             steps,
         }
+    }
+}
+
+impl GiteaWorkflow {
+    /// Every secret `job` names, and so all the server gives it
+    /// ([`rg_process::ci_steps::JobContext::secrets`]): what its steps may
+    /// read, plus what its services, its container, its outputs and the steps
+    /// the engine runs itself (`actions/cache`, `actions/upload-artifact`)
+    /// name. A step written from an action counts only for what it was
+    /// granted — its own text is the action's, not the workflow's.
+    fn job_secrets(
+        &self,
+        job: &GiteaJob,
+        steps: &[rg_process::ci_steps::StepSpec],
+    ) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for step in steps {
+            names.extend(step.secrets.iter().cloned());
+        }
+        for step in &job.steps {
+            match &step.granted_secrets {
+                Some(granted) => names.extend(granted.iter().cloned()),
+                None => secrets_named_by_step(step, &mut names),
+            }
+        }
+        let mut texts: Vec<&str> = self.env.values().map(String::as_str).collect();
+        texts.extend(job.env.values().map(String::as_str));
+        texts.extend(job.outputs.values().map(String::as_str));
+        if let Some(container) = &job.container {
+            texts.push(&container.image);
+            texts.extend(container.env.values().map(String::as_str));
+        }
+        for service in job.services.values() {
+            texts.push(&service.image);
+            texts.extend(service.env.values().map(String::as_str));
+            if let Some(credentials) = &service.credentials {
+                texts.push(&credentials.username);
+                texts.push(&credentials.password);
+            }
+        }
+        if let Some(environment) = &job.environment {
+            texts.push(environment.name());
+        }
+        let tags = runs_on_tags(&job.runs_on).unwrap_or_default();
+        texts.extend(tags.iter().map(String::as_str));
+        for text in texts {
+            secrets_named(text, &mut names);
+        }
+        names
     }
 }
 

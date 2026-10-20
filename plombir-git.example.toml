@@ -176,9 +176,10 @@ allow_host_runner = false
 # network into a cache under repo_root. Anything else is refused by the name of
 # the source it would have come from; an empty list leaves only `uses: ./path`
 # and the three built-in actions. `uses: ./path` always works: it reads the
-# workflow's own repository. An action's steps run as the job's own, with its
-# environment — CI secrets included — so allow "upstream" only for a forge whose
-# actions you would paste into a workflow yourself.
+# workflow's own repository. An action's steps run with the job's variables,
+# and see only the CI secrets the workflow hands the action in `with:`/`env:`
+# — still code you run, so allow "upstream" only for a forge whose actions you
+# would paste into a workflow yourself.
 # actions_sources = ["instance"]
 # The forge "upstream" means: https://, or a file:// directory of mirrors.
 # actions_upstream_url = "https://github.com"

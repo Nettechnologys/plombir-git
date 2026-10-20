@@ -30,7 +30,9 @@
 //! `StartedServices`' `Drop` when the job's future is dropped by a timeout or
 //! a cancellation, by [`remove_services_of`] wherever a runner removes a job's
 //! container by name, and — for a runner that died with a job in hand — by the
-//! sweep every later job with services runs first (`sweep_orphans`).
+//! sweep every later Docker job runs first, and the external runner runs when
+//! it starts ([`sweep_orphans`]). The same sweep removes such a runner's steps
+//! container, which carries `STEPS_LABEL`.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -43,6 +45,11 @@ pub(crate) const OWNER_LABEL: &str = "plombir-git.service-of";
 const HOST_LABEL: &str = "plombir-git.service-host";
 const BOOT_LABEL: &str = "plombir-git.service-boot";
 const PID_LABEL: &str = "plombir-git.service-pid";
+/// The label a job's steps container carries instead of `OWNER_LABEL`, with
+/// its own name: it is not one of its services, and `remove_services_of` must
+/// not take it, but a runner that dies with it running leaves it to the same
+/// sweep. Host, boot and pid are the labels above.
+const STEPS_LABEL: &str = "plombir-git.steps-job";
 
 /// Longest a job waits for its services to become healthy before it fails.
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -546,41 +553,123 @@ impl Starter {
     }
 }
 
-/// Remove the services and networks a runner on this machine started and then
-/// died without removing: their labels name a process that is gone.
+/// The labels a job's steps container is started with
+/// ([`crate::docker_job::steps_run_args`]), so [`sweep_orphans`] can remove it
+/// once the process that started it is gone. Off Linux only its name: without
+/// a host label no sweep ever judges it.
+pub(crate) fn steps_container_labels(name: &str) -> Vec<String> {
+    let mut labels = vec!["--label".to_string(), format!("{STEPS_LABEL}={name}")];
+    if let Some(starter) = Starter::this_process() {
+        labels.extend(
+            [
+                (HOST_LABEL, starter.host),
+                (BOOT_LABEL, starter.boot),
+                (PID_LABEL, starter.pid.to_string()),
+            ]
+            .into_iter()
+            .flat_map(|(label, value)| ["--label".to_string(), format!("{label}={value}")]),
+        );
+    }
+    labels
+}
+
+/// What a dead runner left on this machine, by name.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Leftovers {
+    /// Jobs whose services and network are to go (`OWNER_LABEL` values).
+    services_of: std::collections::BTreeSet<String>,
+    /// Steps containers to remove.
+    steps: std::collections::BTreeSet<String>,
+}
+
+/// The `--format` of a sweep listing: name, then `OWNER_LABEL`, `STEPS_LABEL`,
+/// host, boot and pid, tab-separated. `name_field` is `.Names` for
+/// `docker ps` and `.Name` for `docker network ls`, which has no `.Names` and
+/// refuses a template that asks for it.
+fn sweep_format(name_field: &str) -> String {
+    format!(
+        "{{{{{name_field}}}}}\t{{{{.Label \"{OWNER_LABEL}\"}}}}\t{{{{.Label \"{STEPS_LABEL}\"}}}}\t\
+         {{{{.Label \"{HOST_LABEL}\"}}}}\t{{{{.Label \"{BOOT_LABEL}\"}}}}\t\
+         {{{{.Label \"{PID_LABEL}\"}}}}"
+    )
+}
+
+/// Read sweep listings: what among them a process that is gone started.
+fn leftovers(starter: &Starter, listings: &[String]) -> Leftovers {
+    let mut found = Leftovers::default();
+    for line in listings.iter().flat_map(|listing| listing.lines()) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [_, owner, steps, host, boot, pid] = fields.as_slice() else {
+            continue;
+        };
+        if !starter.is_gone(host, boot, pid) {
+            continue;
+        }
+        if !owner.is_empty() {
+            found.services_of.insert(owner.to_string());
+        }
+        if !steps.is_empty() {
+            found.steps.insert(steps.to_string());
+        }
+    }
+    found
+}
+
+/// Remove the steps containers, services and networks a runner on this machine
+/// started and then died without removing: their labels name a process that is
+/// gone.
 ///
-/// Run before every job that starts services, so a crashed runner's database
-/// does not outlive it by more than the next such job. Never fails the job.
-async fn sweep_orphans(program: &OsStr) {
+/// Run before every job that uses Docker and when the external runner starts,
+/// so a crashed runner's job container or database does not outlive it by more
+/// than the next such job. Never fails the job.
+pub async fn sweep_orphans(program: &OsStr) {
     let Some(starter) = Starter::this_process() else {
         return;
     };
     let filter = format!("label={HOST_LABEL}={}", starter.host);
-    let format = format!(
-        "{{{{.Names}}}}\t{{{{.Label \"{OWNER_LABEL}\"}}}}\t{{{{.Label \"{HOST_LABEL}\"}}}}\t\
-         {{{{.Label \"{BOOT_LABEL}\"}}}}\t{{{{.Label \"{PID_LABEL}\"}}}}"
-    );
-    let mut owners = std::collections::BTreeSet::new();
-    for listing in [
-        bounded(cli(program).args(["ps", "-a", "--filter", &filter, "--format", &format])).await,
-        bounded(cli(program).args(["network", "ls", "--filter", &filter, "--format", &format]))
-            .await,
+    let listings: Vec<String> = [
+        bounded(cli(program).args([
+            "ps",
+            "-a",
+            "--filter",
+            &filter,
+            "--format",
+            &sweep_format(".Names"),
+        ]))
+        .await,
+        bounded(cli(program).args([
+            "network",
+            "ls",
+            "--filter",
+            &filter,
+            "--format",
+            &sweep_format(".Name"),
+        ]))
+        .await,
     ]
     .into_iter()
     .flatten()
-    {
-        for line in listing.lines() {
-            let fields: Vec<&str> = line.split('\t').collect();
-            if let [_, owner, host, boot, pid] = fields.as_slice() {
-                if !owner.is_empty() && starter.is_gone(host, boot, pid) {
-                    owners.insert(owner.to_string());
-                }
-            }
+    .collect();
+    let found = leftovers(&starter, &listings);
+    for name in &found.steps {
+        tracing::info!(
+            container = name,
+            "removing the steps container of a job whose runner is gone"
+        );
+        if bounded(cli(program).args(["rm", "-f", name]))
+            .await
+            .is_none()
+        {
+            tracing::warn!(
+                container = name,
+                "failed to remove an orphaned steps container"
+            );
         }
     }
-    for owner in owners {
+    // A steps container is the owner its services are named after.
+    for owner in found.services_of.iter().chain(&found.steps) {
         tracing::info!(owner, "removing the services of a job whose runner is gone");
-        remove_services_of(program, &owner).await;
+        remove_services_of(program, owner).await;
     }
 }
 
@@ -596,7 +685,6 @@ pub(crate) async fn start_services(
     job_env: &[(String, String)],
     scratch: &std::path::Path,
 ) -> Result<StartedServices, ServicesFailed> {
-    sweep_orphans(run.program).await;
     let starter = Starter::this_process();
     let labels = match &starter {
         Some(starter) => starter.labels(run.owner),
@@ -1160,5 +1248,148 @@ mod tests {
             "a dead process's"
         );
         assert!(!starter.is_gone("runner-a", "boot-1", "garbage"));
+    }
+
+    #[test]
+    fn a_dead_runners_steps_container_is_swept_and_a_live_or_foreign_one_is_not() {
+        let starter = Starter {
+            host: "runner-a".into(),
+            boot: "boot-1".into(),
+            pid: std::process::id(),
+        };
+        let me = std::process::id().to_string();
+        let dead = "4294967295";
+        let ps = [
+            format!("job-dead\t\tjob-dead\trunner-a\tboot-1\t{dead}"),
+            format!("job-live\t\tjob-live\trunner-a\tboot-1\t{me}"),
+            format!("job-foreign\t\tjob-foreign\trunner-b\tboot-1\t{dead}"),
+            format!("job-rebooted\t\tjob-rebooted\trunner-a\tboot-0\t{me}"),
+            format!("job-dead-svc-db\tjob-dead\t\trunner-a\tboot-1\t{dead}"),
+            format!("job-live-svc-db\tjob-live\t\trunner-a\tboot-1\t{me}"),
+        ]
+        .join("\n");
+        let networks = format!("job-gone-net\tjob-gone\t\trunner-a\tboot-0\t{me}");
+        let found = leftovers(&starter, &[ps, networks]);
+        assert_eq!(
+            found.steps.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["job-dead", "job-rebooted"]
+        );
+        assert_eq!(
+            found
+                .services_of
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["job-dead", "job-gone"]
+        );
+    }
+
+    #[test]
+    fn the_sweep_asks_each_listing_for_the_name_field_it_has() {
+        // `docker network ls` has `.Name` and refuses a template naming
+        // `.Names`, which left every orphaned network unlisted.
+        assert!(sweep_format(".Name").starts_with("{{.Name}}\t"));
+        assert!(sweep_format(".Names").starts_with("{{.Names}}\t"));
+        assert_eq!(sweep_format(".Name").split('\t').count(), 6);
+    }
+
+    /// The sweep on a real daemon: a dead process's steps container and its
+    /// lone network go, a live process's container stays.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon and the alpine:3.20 image"]
+    async fn the_sweep_removes_a_dead_runners_container_and_network_on_a_real_daemon() {
+        let Some(starter) = Starter::this_process() else {
+            return;
+        };
+        let docker = OsStr::new("docker");
+        let tag = format!("plombir-git-sweep-test-{}", std::process::id());
+        let dead = format!("{tag}-dead");
+        let live = format!("{tag}-live");
+        let lone = format!("{tag}-lone");
+        let labels = |steps: Option<&str>, owner: Option<&str>, pid: &str| {
+            let mut labels = vec![
+                format!("{HOST_LABEL}={}", starter.host),
+                format!("{BOOT_LABEL}={}", starter.boot),
+                format!("{PID_LABEL}={pid}"),
+            ];
+            labels.extend(steps.map(|name| format!("{STEPS_LABEL}={name}")));
+            labels.extend(owner.map(|name| format!("{OWNER_LABEL}={name}")));
+            labels
+                .into_iter()
+                .flat_map(|label| ["--label".to_string(), label])
+                .collect::<Vec<_>>()
+        };
+        let me = std::process::id().to_string();
+        for (name, pid) in [(&dead, "4294967295"), (&live, me.as_str())] {
+            let started = bounded(
+                cli(docker)
+                    .args(["run", "-d", "--name", name])
+                    .args(labels(Some(name), None, pid))
+                    .args(["alpine:3.20", "sleep", "600"]),
+            )
+            .await;
+            assert!(started.is_some(), "could not start {name}");
+        }
+        let created = bounded(
+            cli(docker)
+                .args(["network", "create"])
+                .args(labels(None, Some(&lone), "4294967295"))
+                .arg(network_name(&lone)),
+        )
+        .await;
+        assert!(created.is_some(), "could not create the lone network");
+
+        sweep_orphans(docker).await;
+
+        let exists = |args: Vec<String>| async move {
+            bounded(cli(docker).args(&args))
+                .await
+                .is_some_and(|stdout| !stdout.trim().is_empty())
+        };
+        let container = |name: &str| {
+            vec![
+                "ps".to_string(),
+                "-aq".to_string(),
+                "--filter".to_string(),
+                format!("name=^{name}$"),
+            ]
+        };
+        let dead_left = exists(container(&dead)).await;
+        let live_left = exists(container(&live)).await;
+        let network_left = exists(vec![
+            "network".into(),
+            "ls".into(),
+            "-q".into(),
+            "--filter".into(),
+            format!("name=^{}$", network_name(&lone)),
+        ])
+        .await;
+        let _ = bounded(cli(docker).args(["rm", "-f", &dead, &live])).await;
+        let _ = bounded(cli(docker).args(["network", "rm", &network_name(&lone)])).await;
+        assert!(
+            !dead_left,
+            "a dead runner's steps container survived the sweep"
+        );
+        assert!(live_left, "a live runner's steps container was swept");
+        assert!(
+            !network_left,
+            "a dead runner's lone network survived the sweep"
+        );
+    }
+
+    #[test]
+    fn a_steps_container_is_labelled_for_the_sweep_and_not_as_a_service() {
+        let labels = steps_container_labels("job-7").join(" ");
+        assert!(
+            labels.contains(&format!("--label {STEPS_LABEL}=job-7")),
+            "{labels}"
+        );
+        assert!(!labels.contains(OWNER_LABEL), "{labels}");
+        if Starter::this_process().is_some() {
+            for label in [HOST_LABEL, BOOT_LABEL, PID_LABEL] {
+                assert!(labels.contains(&format!("--label {label}=")), "{labels}");
+            }
+        }
     }
 }

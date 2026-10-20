@@ -1162,8 +1162,29 @@ impl PipelineRunner {
         } else {
             None
         };
+        // A job of steps runs them one by one; a native job runs its script.
+        // The steps are decoded before anything starts, so a row this server
+        // cannot read fails the job instead of running half of it.
+        let steps = steps
+            .map(|json| {
+                serde_json::from_str::<Vec<rg_process::ci_steps::StepSpec>>(json)
+                    .context("the job's stored steps cannot be read")
+            })
+            .transpose()?;
+        let job_context = job_context
+            .map(|json| {
+                serde_json::from_str::<rg_process::ci_steps::JobContext>(json)
+                    .context("the job's stored context cannot be read")
+            })
+            .transpose()?
+            .unwrap_or_default();
         let (job_environment, secret_values, ignored_variables) = self
-            .job_environment(ci_job_token.as_deref(), variables, environment_id)
+            .job_environment(
+                ci_job_token.as_deref(),
+                variables,
+                environment_id,
+                job_context.secrets.as_ref(),
+            )
             .await?;
         let cache = cache_spec(cache_key, cache_paths, &job_environment)?;
         // A cache failure never fails the job, so the server log is the only
@@ -1230,22 +1251,6 @@ impl PipelineRunner {
             return Err(anyhow::anyhow!("{}", msg));
         }
 
-        // A job of steps runs them one by one; a native job runs its script.
-        // The steps are decoded before anything starts, so a row this server
-        // cannot read fails the job instead of running half of it.
-        let steps = steps
-            .map(|json| {
-                serde_json::from_str::<Vec<rg_process::ci_steps::StepSpec>>(json)
-                    .context("the job's stored steps cannot be read")
-            })
-            .transpose()?;
-        let job_context = job_context
-            .map(|json| {
-                serde_json::from_str::<rg_process::ci_steps::JobContext>(json)
-                    .context("the job's stored context cannot be read")
-            })
-            .transpose()?
-            .unwrap_or_default();
         // A service is a container. Without Docker there is nothing to start it
         // in, and running the steps anyway would hand them a `postgres:5432`
         // that answers nothing — so the job is refused, naming what it asked
@@ -1500,6 +1505,7 @@ impl PipelineRunner {
             &mask,
             &needs,
             &job_context.outputs,
+            job_context.secrets.as_ref(),
             &mut reporter,
         )
         .await;
@@ -1650,6 +1656,7 @@ impl PipelineRunner {
         ci_job_token: Option<&str>,
         variables: Option<&str>,
         environment_id: Option<i64>,
+        secret_scope: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<(Vec<(String, String)>, Vec<String>, Vec<String>)> {
         let pipeline = pipeline_ops::get_pipeline(&self.db, self.pipeline_id)
             .await?
@@ -1689,7 +1696,11 @@ impl PipelineRunner {
                         format!("failed to decrypt CI secret '{}'", secret.name)
                     })?;
                     secret_values.push(value.clone());
-                    env.insert(secret.name, value);
+                    // Masked whether or not the job gets it; an Actions job
+                    // gets only the secrets it names (card_e42a6d0af271).
+                    if secret_scope.is_none_or(|scope| scope.contains(&secret.name)) {
+                        env.insert(secret.name, value);
+                    }
                 }
             }
         }
@@ -2923,7 +2934,7 @@ mod tests {
             let runner = &runner;
             async move {
                 let (variables, _, _) = runner
-                    .job_environment(None, None, environment)
+                    .job_environment(None, None, environment, None)
                     .await
                     .unwrap();
                 variables
@@ -2960,6 +2971,25 @@ mod tests {
                 ("REPO_KEY", "repo-value")
             ])
         );
+
+        // card_e42a6d0af271: an Actions job that names one secret gets that
+        // one, and every value is still masked.
+        let scope = std::collections::BTreeSet::from(["REPO_KEY".to_string()]);
+        let (variables, masked, _) = runner
+            .job_environment(None, None, Some(staging), Some(&scope))
+            .await
+            .unwrap();
+        let secrets: std::collections::BTreeMap<_, _> = variables
+            .into_iter()
+            .filter(|(name, _)| name.ends_with("_KEY") || name == "DEPLOY_TOKEN")
+            .collect();
+        assert_eq!(secrets, pairs(&[("REPO_KEY", "repo-value")]));
+        for value in ["repository-deploy", "repo-value", "staging-value"] {
+            assert!(
+                masked.iter().any(|masked| masked == value),
+                "{value} unmasked"
+            );
+        }
     }
 
     /// card_a79579f79c29: a name the runner keeps for itself is dropped and
@@ -2972,6 +3002,7 @@ mod tests {
             .job_environment(
                 None,
                 Some(r#"{"CI":"false","CI_JOB_TOKEN":"forged","BAD-NAME":"x","DEPLOY":"prod"}"#),
+                None,
                 None,
             )
             .await
@@ -3027,7 +3058,10 @@ mod tests {
                 .find(|(name, _)| name == "CI_EVENT_SCHEDULE")
                 .map(|(_, value)| value.clone())
         };
-        let (environment, _, _) = runner.job_environment(None, None, None).await.unwrap();
+        let (environment, _, _) = runner
+            .job_environment(None, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(variable(&environment).as_deref(), Some("0 3 * * *"));
         assert_eq!(
             environment
@@ -3036,7 +3070,10 @@ mod tests {
                 .map(|(_, value)| value.as_str()),
             Some("schedule")
         );
-        let (environment, _, _) = pushed.job_environment(None, None, None).await.unwrap();
+        let (environment, _, _) = pushed
+            .job_environment(None, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(variable(&environment), None);
     }
 

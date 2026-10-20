@@ -227,11 +227,15 @@ jobs:
       # (card_c8b3fa9f0ebc). `#[ignore]`d for the reason above. With it, the
       # job's `services:`: a step reaches a healthy postgres by its key, and a
       # cancelled job leaves no service and no network (card_bc6676ec0ae3).
+      # And the sweep after a killed runner: its steps container and a network
+      # its containers no longer hold go, a live runner's stay
+      # (card_1bc3247315ff).
       - name: Run step-model container test
         run: >-
           cargo nextest run -p rg-process --run-ignored only
           -E 'test(ci_steps::tests::steps_share_one_container_and_a_timeout_spares_it)
-          | test(/^ci_steps::services_docker_tests::/)'
+          | test(/^ci_steps::services_docker_tests::/)
+          | test(ci_services::tests::the_sweep_removes_a_dead_runners_container_and_network_on_a_real_daemon)'
 
       # The same client over an SSH remote, with no HTTP server at all:
       # `git-lfs-transfer` carries the objects and the locks, and the test

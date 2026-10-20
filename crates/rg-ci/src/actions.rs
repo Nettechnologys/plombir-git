@@ -630,6 +630,17 @@ impl Expansion<'_> {
             .iter()
             .filter_map(|inner| inner.id.clone())
             .collect::<Vec<_>>();
+        // All of the job's secrets the action's steps may read: what the
+        // workflow's step hands it — or, for an action an action calls, what
+        // the outermost one was handed. An action has no secrets context of
+        // its own, so nothing it writes can ask for more (card_e42a6d0af271).
+        let granted = step.granted_secrets.clone().unwrap_or_else(|| {
+            let mut names = std::collections::BTreeSet::new();
+            for value in step.with.values().chain(step.env.values()) {
+                crate::gitea_actions::secrets_named(value, &mut names);
+            }
+            names
+        });
         let context = ActionContext {
             label: &label,
             inputs: &inputs,
@@ -637,6 +648,7 @@ impl Expansion<'_> {
             caller_id: &caller_id,
             reference: &reference,
             sha: &loaded.sha,
+            granted: &granted,
         };
 
         // What `uses:` resolved to goes in the job log before anything of the
@@ -656,6 +668,7 @@ impl Expansion<'_> {
             env: HashMap::new(),
             condition: step.condition.clone(),
             with: HashMap::new(),
+            granted_secrets: Some(std::collections::BTreeSet::new()),
         })?;
 
         for inner in action.steps {
@@ -698,6 +711,7 @@ impl Expansion<'_> {
                 env,
                 condition: step.condition.clone(),
                 with: HashMap::new(),
+                granted_secrets: Some(granted.clone()),
             })?;
         }
         Ok(())
@@ -767,6 +781,8 @@ struct ActionContext<'a> {
     caller_id: &'a str,
     reference: &'a ActionReference,
     sha: &'a str,
+    /// The secrets every step of this use may read.
+    granted: &'a std::collections::BTreeSet<String>,
 }
 
 impl ActionContext<'_> {
@@ -845,6 +861,7 @@ impl ActionContext<'_> {
             env,
             condition,
             with,
+            granted_secrets: Some(self.granted.clone()),
         })
     }
 
@@ -855,19 +872,39 @@ impl ActionContext<'_> {
     /// A text field: every `${{ inputs.<name> }}` becomes the input's value
     /// as written, every other expression has its `inputs.*` and the
     /// action's own `steps.*` rewritten in place.
+    ///
+    /// The result holds no `${{` but the ones written here: the caller's input
+    /// values and the expressions rewritten in place. Text that would become
+    /// an expression only once its own pieces are read — `$${{ '{' }}{
+    /// secrets.X }}` — is refused, or an action could name a secret its
+    /// expressions are not allowed to.
     fn text(&self, text: &str) -> Result<String, String> {
-        map_groups(text, |expression| {
+        let mut written = 0;
+        let out = map_groups(text, |expression| {
             if let Some(name) = whole_input(expression) {
-                return Ok(self.input(name)?.to_string());
+                let value = self.input(name)?.to_string();
+                written += value.matches("${{").count();
+                return Ok(value);
             }
             let body = self.expression_body(expression)?;
             // `${{ github.action_ref }}` became one string literal: in text it
             // is that text, not an expression the job would have to evaluate.
             Ok(match single_literal(&body) {
                 Some(literal) => literal,
-                None => format!("${{{{ {body} }}}}"),
+                None => {
+                    written += 1;
+                    format!("${{{{ {body} }}}}")
+                }
             })
-        })
+        })?;
+        if out.matches("${{").count() != written {
+            return Err(format!(
+                "action {} writes `${{{{` that is not an expression of its own — text that turns \
+                 into an expression only after its pieces are read is not supported",
+                self.label
+            ));
+        }
+        Ok(out)
     }
 
     /// An `if:`, with or without its `${{ }}`. An input is always a string
@@ -1619,6 +1656,11 @@ mod tests {
                 "runs:\n  using: composite\n  steps:\n    - shell: sh\n      run: echo ${{ secrets.TOKEN }}\n",
                 "no secrets context",
             ),
+            (
+                "      - uses: acme/greet@v1\n",
+                "runs:\n  using: composite\n  steps:\n    - shell: sh\n      run: echo $${{ '{' }}{ secrets.TOKEN }}\n",
+                "not an expression of its own",
+            ),
         ];
         for (step, manifest, expected) in cases {
             let error = expand(&workflow(step), &[("acme/greet@v1", manifest)]).unwrap_err();
@@ -1646,6 +1688,58 @@ mod tests {
         );
         assert_eq!(single_literal("'it''s'").as_deref(), Some("it's"));
         assert_eq!(single_literal("'a' == 'b'"), None);
+    }
+
+    /// card_e42a6d0af271: each step's process gets the secrets that step
+    /// names; an action's steps get only what the workflow's step passed it,
+    /// whatever the action's text says; what the workflow's `env:` names
+    /// reaches every step; the job is given the union and nothing else.
+    #[test]
+    fn each_step_is_granted_only_the_secrets_it_is_handed() {
+        let workflow = expand(
+            "on: push\nenv:\n  SHARED: ${{ secrets.WF }}\njobs:\n  build:\n    steps:\n      - run: echo ${{ secrets.ALPHA }}\n      - id: hi\n        uses: acme/greet@v1\n        with:\n          who: ${{ secrets.BRAVO }}\n      - uses: acme/quiet@v1\n",
+            &[
+                ("acme/greet@v1", GREET),
+                (
+                    "acme/quiet@v1",
+                    "runs:\n  using: composite\n  steps:\n    - shell: sh\n      run: echo \"$CHARLIE secrets.CHARLIE\"\n",
+                ),
+            ],
+        )
+        .unwrap();
+        let config = workflow.to_ci_config(&crate::gitea_actions::WorkflowContext {
+            ref_name: "refs/heads/main".into(),
+            sha: "abc".into(),
+            event: "push".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            event_schedule: None,
+        });
+        let job = &config.jobs["build"];
+        let granted: Vec<(String, Vec<&str>)> = job
+            .steps
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|step| {
+                (
+                    step.name.clone(),
+                    step.secrets.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        let names = |step: usize| granted[step].1.clone();
+        assert_eq!(names(0), ["ALPHA", "WF"], "{granted:#?}");
+        assert_eq!(names(1), ["WF"], "the set-up step: {granted:#?}");
+        for step in 2..=4 {
+            assert_eq!(names(step), ["BRAVO", "WF"], "{granted:#?}");
+        }
+        assert_eq!(names(6), ["WF"], "an action handed nothing: {granted:#?}");
+        let job_secrets = job.job_context.as_ref().unwrap().secrets.as_ref().unwrap();
+        assert_eq!(
+            job_secrets.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["ALPHA", "BRAVO", "WF"]
+        );
     }
 
     #[test]

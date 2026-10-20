@@ -118,6 +118,13 @@ pub struct PollJobResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schema(value_type = Vec<Object>)]
     services: Vec<serde_json::Value>,
+    /// For an Actions job: the names among `variables` that are the secrets
+    /// it names — the only ones it was given — of which each step gets the
+    /// ones its own `secrets` lists. Only a runner that speaks
+    /// [`rg_core::ci::SCOPED_SECRETS_PROTOCOL`] is ever handed a job that names
+    /// any. Absent for a job that does not scope its secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secrets: Option<std::collections::BTreeSet<String>>,
 }
 
 /// The job context as `pipeline_jobs.job_context` stores it.
@@ -129,6 +136,8 @@ struct StoredJobContext {
     outputs: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     services: Vec<serde_json::Value>,
+    #[serde(default)]
+    secrets: Option<std::collections::BTreeSet<String>>,
 }
 
 /// The artifact declaration as `pipeline_jobs.artifacts` stores it.
@@ -528,6 +537,7 @@ pub async fn poll_job(
     let protocol = runner_protocol(&headers);
     let runs_steps = protocol >= rg_core::ci::STEPS_PROTOCOL;
     let runs_services = protocol >= rg_core::ci::SERVICES_PROTOCOL;
+    let scopes_secrets = protocol >= rg_core::ci::SCOPED_SECRETS_PROTOCOL;
 
     // Use tokio::time::timeout to wrap a polling loop
     let poll_future = async {
@@ -556,6 +566,11 @@ pub async fn poll_job(
                         prepare_dispatch(&state, runner_id, job.clone()).await?;
                     if !resp.services.is_empty() && !runs_services {
                         return Err(services_protocol_refusal(runner_id, &job));
+                    }
+                    if resp.secrets.as_ref().is_some_and(|names| !names.is_empty())
+                        && !scopes_secrets
+                    {
+                        return Err(scoped_secrets_protocol_refusal(runner_id, &job));
                     }
                     // Everything the response needs is prepared before the
                     // irreversible claim. The long-poll future can be dropped
@@ -696,6 +711,33 @@ fn services_protocol_refusal(
                 "job #{} ({}) declares services:, and this runner does not start them: its steps \
                  would run against services that are not there. Upgrade plombir-git-runner; the \
                  job waits for a runner that can run it.",
+                job.id, job.name
+            ),
+        })),
+    )
+        .into_response()
+}
+
+/// [`steps_protocol_refusal`] for a runner that runs steps and services but
+/// would hand every step all the secrets the job names — a downloaded
+/// action's steps included.
+fn scoped_secrets_protocol_refusal(
+    runner_id: i64,
+    job: &rg_db::entities::pipeline_job::Model,
+) -> Response {
+    tracing::warn!(
+        runner_id,
+        job_id = job.id,
+        "poll_job: refused a job that reads secrets to a runner that does not scope them per step"
+    );
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(serde_json::json!({
+            "error": format!(
+                "job #{} ({}) reads secrets, and this runner would give each of them to every \
+                 step — the steps of an action it downloads included — instead of only to the \
+                 steps that name them. Upgrade plombir-git-runner; the job waits for a runner \
+                 that can run it.",
                 job.id, job.name
             ),
         })),
@@ -906,6 +948,7 @@ async fn add_server_variables(
     job: &rg_db::entities::pipeline_job::Model,
     pipeline: &rg_db::entities::pipeline::Model,
     timeout_secs: u64,
+    secret_scope: Option<&std::collections::BTreeSet<String>>,
     variables: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vec<String>, Response> {
     let pipeline_id = pipeline.id;
@@ -917,7 +960,11 @@ async fn add_server_variables(
         Ok(secrets) => {
             for (name, value) in secrets {
                 mask_secrets.push(value.clone());
-                variables.insert(name, serde_json::json!(value));
+                // Masked either way; an Actions job is given only the secrets
+                // it names (card_e42a6d0af271).
+                if secret_scope.is_none_or(|scope| scope.contains(&name)) {
+                    variables.insert(name, serde_json::json!(value));
+                }
             }
         }
         Err(error) => {
@@ -1013,8 +1060,28 @@ async fn prepare_dispatch(
     // is handed, sharing the range the config validator enforces.
     let timeout_secs =
         rg_core::ci::resolve_job_timeout_secs(job.id, job.timeout_seconds, state.job_timeout_secs);
-    let mask_secrets =
-        add_server_variables(state, &job, &pipeline, timeout_secs, &mut variables).await?;
+    // The stored context comes first: it says which secrets the job is given.
+    let context = match job
+        .job_context
+        .as_deref()
+        .map(serde_json::from_str::<StoredJobContext>)
+        .transpose()
+    {
+        Ok(context) => context.unwrap_or_default(),
+        Err(error) => {
+            tracing::error!(job_id = job.id, runner_id, %error, "poll_job: stored job context is not valid JSON");
+            return Err(AppError::internal("invalid stored job context").into_response());
+        }
+    };
+    let mask_secrets = add_server_variables(
+        state,
+        &job,
+        &pipeline,
+        timeout_secs,
+        context.secrets.as_ref(),
+        &mut variables,
+    )
+    .await?;
 
     let encrypted_mask = match encrypt_job_mask(state, &mask_secrets) {
         Ok(snapshot) => snapshot,
@@ -1046,18 +1113,6 @@ async fn prepare_dispatch(
     };
     // What the job reads of the jobs it needs, read now: they ran in earlier
     // stages, which is why this job is the one being handed out.
-    let context = match job
-        .job_context
-        .as_deref()
-        .map(serde_json::from_str::<StoredJobContext>)
-        .transpose()
-    {
-        Ok(context) => context.unwrap_or_default(),
-        Err(error) => {
-            tracing::error!(job_id = job.id, runner_id, %error, "poll_job: stored job context is not valid JSON");
-            return Err(AppError::internal("invalid stored job context").into_response());
-        }
-    };
     let needs = match rg_db::ops::pipeline_step_ops::needs_context(
         &state.db,
         pipeline.id,
@@ -1083,6 +1138,7 @@ async fn prepare_dispatch(
         needs,
         outputs: context.outputs,
         services: context.services,
+        secrets: context.secrets,
         steps,
         job_id: job.id,
         pipeline_id: pipeline.id,

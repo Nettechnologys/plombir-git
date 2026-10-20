@@ -694,6 +694,7 @@ mod tests {
             needs: Default::default(),
             outputs: Default::default(),
             services: Vec::new(),
+            secrets: None,
         };
         let cache = resolved_cache(&job, &[("CI_SHA".into(), "abc".into())])
             .unwrap()

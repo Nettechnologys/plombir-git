@@ -376,6 +376,11 @@ fn container_args(
     if let Some(user) = &job.user {
         args.extend(["--user".to_string(), user.clone()]);
     }
+    // A detached container outlives a runner that is killed: these let the
+    // next one on this machine find and remove it.
+    if steps {
+        args.extend(crate::ci_services::steps_container_labels(job.name));
+    }
     for (key, _) in job.variables {
         if crate::job_environment::reaches_container(key) {
             args.extend(["-e".to_string(), key.clone()]);

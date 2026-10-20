@@ -583,6 +583,10 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
             "swept runner job files left behind by a previous run"
         );
     }
+    // The same for the Docker side: a steps container is started detached and
+    // does nothing on its own, so one a killed runner left keeps its memory
+    // and the job's workspace mount until something removes it.
+    rg_process::ci_services::sweep_orphans(std::ffi::OsStr::new("docker")).await;
 
     let client = build_runner_client();
 
@@ -1058,6 +1062,7 @@ pub async fn run_jobs_until_shutdown_checking_every(
                                 &mask,
                                 &job.needs,
                                 &job.outputs,
+                                job.secrets.as_ref(),
                                 &mut reporter,
                             )
                             .await;
