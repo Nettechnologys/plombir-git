@@ -818,6 +818,28 @@ pub trait CiTrigger: Send + Sync {
         anyhow::bail!("this CI engine does not expose `on: schedule` declarations")
     }
 
+    /// Replace the placeholder of a matrix that reads a needed job's outputs
+    /// with its variants, once the stage it is in may run.
+    ///
+    /// `Some(pipeline)` when what the needed job left made no matrix, the
+    /// placeholder failed, and that finished the pipeline: the caller owes it
+    /// the completion hooks a finished job would have fired.
+    ///
+    /// Fails loudly by default: an engine that inherited a silent no-op would
+    /// leave the placeholder `pending` for good, its pipeline running with no
+    /// job anyone can take.
+    #[allow(clippy::type_complexity)]
+    fn expand_deferred_matrix<'a>(
+        &'a self,
+        _db: &'a DatabaseConnection,
+        _placeholder: &'a rg_db::entities::pipeline_job::Model,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<rg_db::entities::pipeline::Model>>> + Send + 'a>>
+    {
+        Box::pin(async {
+            anyhow::bail!("this CI engine cannot expand a matrix decided at run time")
+        })
+    }
+
     /// Trigger a CI pipeline. Returns the pipeline ID.
     fn trigger_pipeline<'a>(
         &'a self,

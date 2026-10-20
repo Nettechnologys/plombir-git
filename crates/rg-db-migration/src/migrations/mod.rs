@@ -166,6 +166,7 @@ pub mod m20261016_000002_pipeline_job_image_mysql_text;
 pub mod m20261020_000001_ci_schedules;
 pub mod m20261020_000002_pipeline_job_steps;
 pub mod m20261020_000003_pipeline_job_outputs;
+pub mod m20261020_000004_pipeline_job_matrix;
 
 use sea_orm_migration::prelude::*;
 
@@ -422,6 +423,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000001_ci_schedules::Migration),
             Box::new(m20261020_000002_pipeline_job_steps::Migration),
             Box::new(m20261020_000003_pipeline_job_outputs::Migration),
+            Box::new(m20261020_000004_pipeline_job_matrix::Migration),
         ]
     }
 }

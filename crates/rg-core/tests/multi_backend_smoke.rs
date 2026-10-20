@@ -6349,3 +6349,205 @@ async fn pipeline_job_steps_are_portable() {
         "the outputs of the previous run are not the next run's"
     );
 }
+
+/// card_d97de416d0b0: the variants of a matrix job on a real backend — the
+/// `max-parallel` claim under the graph lock, the `fail-fast` cancellation in
+/// the failing finish, and the placeholder of a matrix decided at run time,
+/// taken by a conditional DELETE and replaced inside one transaction.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn pipeline_matrix_variants_are_portable() {
+    use rg_db::ops::{pipeline_matrix_ops, pipeline_ops};
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("matrix{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Matrix Smoke",
+    )
+    .await
+    .expect("create owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("matrixrepo{suffix}")),
+    )
+    .await
+    .expect("create repository");
+    let (runner, _) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo.id,
+        &format!("matrix-runner-{suffix}"),
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let pipeline = pipeline_ops::create_pipeline(
+        &db,
+        repo.id,
+        "0123456789012345678901234567890123456789",
+        "refs/heads/main",
+        "push",
+        None,
+    )
+    .await
+    .unwrap();
+    let first = pipeline_ops::create_stage(&db, pipeline.id, "first", 0)
+        .await
+        .unwrap();
+    let job = |stage_id: i64, name: String| {
+        let db = db.clone();
+        async move {
+            pipeline_ops::create_job(
+                &db, stage_id, &name, "echo ok", None, None, None, None, None, None, false, None,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .id
+        }
+    };
+    let mut variants = Vec::new();
+    for n in 1..=3 {
+        let id = job(first.id, format!("test [n={n}]")).await;
+        pipeline_matrix_ops::set_matrix_membership(&db, id, "test", true, Some(1))
+            .await
+            .unwrap();
+        variants.push(id);
+    }
+
+    assert!(pipeline_ops::assign_job(&db, variants[0], runner.id)
+        .await
+        .unwrap());
+    assert!(
+        !pipeline_ops::assign_job(&db, variants[1], runner.id)
+            .await
+            .unwrap(),
+        "max-parallel 1 holds the second variant back"
+    );
+    assert!(pipeline_ops::start_job_if_active(&db, variants[0], None)
+        .await
+        .unwrap());
+    pipeline_ops::finish_runner_job(
+        &db,
+        runner.id,
+        variants[0],
+        first.id,
+        "failed",
+        Some(1),
+        None,
+        Some(chrono::Utc::now().naive_utc()),
+    )
+    .await
+    .unwrap();
+    for id in &variants[1..] {
+        let job = pipeline_ops::get_job(&db, *id).await.unwrap().unwrap();
+        assert_eq!(job.status, "canceled", "fail-fast");
+        assert!(job.log.unwrap_or_default().contains("strategy.fail-fast"));
+    }
+
+    // A second pipeline: its first stage succeeds, so the placeholder in the
+    // second is ready.
+    let pipeline = pipeline_ops::create_pipeline(
+        &db,
+        repo.id,
+        "1123456789012345678901234567890123456789",
+        "refs/heads/main",
+        "push",
+        None,
+    )
+    .await
+    .unwrap();
+    let first = pipeline_ops::create_stage(&db, pipeline.id, "first", 0)
+        .await
+        .unwrap();
+    let second_stage = pipeline_ops::create_stage(&db, pipeline.id, "second", 1)
+        .await
+        .unwrap();
+    let setup = job(first.id, "setup".into()).await;
+    pipeline_ops::finish_embedded_job(
+        &db,
+        pipeline.id,
+        first.id,
+        setup,
+        "success",
+        Some(0),
+        None,
+        Some(chrono::Utc::now().naive_utc()),
+    )
+    .await
+    .unwrap();
+    let big = format!("{{\"steps\":\"{}\"}}", "x".repeat(200_000));
+    let placeholder = job(second_stage.id, "test".into()).await;
+    let doomed = job(second_stage.id, "other".into()).await;
+    for id in [placeholder, doomed] {
+        pipeline_matrix_ops::set_deferred_matrix(&db, id, &big)
+            .await
+            .unwrap();
+    }
+    let ready = pipeline_matrix_ops::ready_deferred_jobs(&db, repo.id)
+        .await
+        .unwrap();
+    let mut ready_ids = ready.iter().map(|job| job.id).collect::<Vec<_>>();
+    ready_ids.sort_unstable();
+    assert_eq!(ready_ids, [placeholder, doomed]);
+    assert_eq!(
+        ready[0].deferred_matrix.as_deref().map(str::len),
+        Some(big.len()),
+        "a stored matrix past what TEXT holds"
+    );
+    let taken = ready.iter().find(|job| job.id == placeholder).unwrap();
+    let stage_id = second_stage.id;
+    for expected in [true, false] {
+        let expanded = pipeline_matrix_ops::expand_deferred_job(&db, taken, |tx| async move {
+            let written = pipeline_ops::create_job(
+                &tx,
+                stage_id,
+                "test [n=x]",
+                "echo x",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map(|_| ());
+            (tx, written)
+        })
+        .await
+        .unwrap();
+        assert_eq!(expanded, expected, "one caller takes the placeholder");
+    }
+    assert!(pipeline_ops::get_job(&db, placeholder)
+        .await
+        .unwrap()
+        .is_none());
+    let doomed_job = ready.iter().find(|job| job.id == doomed).unwrap();
+    pipeline_matrix_ops::fail_deferred_job(&db, doomed_job, "The matrix could not be expanded\n")
+        .await
+        .unwrap();
+    let failed = pipeline_ops::get_job(&db, doomed).await.unwrap().unwrap();
+    assert_eq!(
+        (failed.status.as_str(), failed.deferred_matrix),
+        ("failed", None)
+    );
+}

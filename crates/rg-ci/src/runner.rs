@@ -715,10 +715,42 @@ impl PipelineRunner {
             return Ok(StageOutcome::Settled);
         }
 
+        // A matrix that reads what an earlier stage's jobs left becomes its
+        // variants now, before the stage's jobs are read.
+        for placeholder in
+            rg_db::ops::pipeline_matrix_ops::deferred_jobs_in_stage(&self.db_write, stage.id)
+                .await?
+        {
+            // A matrix that cannot be expanded fails its placeholder and
+            // rolls the stage up; the walk below sees that like any failure,
+            // and the pipeline's own completion is this runner's to announce.
+            crate::expand_deferred_matrix(&self.db_write, &placeholder).await?;
+        }
+
         let mut stage_failed = false;
-        let jobs = pipeline_ops::list_jobs_by_stage(&self.db, stage.id).await?;
+        let jobs = pipeline_ops::list_jobs_by_stage(&self.db_write, stage.id).await?;
 
         for job in &jobs {
+            // Re-read: a variant that failed under `strategy.fail-fast` has
+            // canceled the siblings after it since the list was taken.
+            let Some(job) = pipeline_ops::get_job(&self.db_write, job.id).await? else {
+                continue;
+            };
+            let job = &job;
+            // A finished job is walked past before the pipeline's liveness is
+            // asked: when fail-fast canceled the rest of a stage, the failing
+            // variant's own transaction already rolled the stage and pipeline
+            // up, and stopping here as "settled" would leave the pipeline's
+            // end unannounced — no webhook, no failure notice.
+            if matches!(job.status.as_str(), "success" | "skipped" | "canceled") {
+                continue;
+            }
+            if matches!(job.status.as_str(), "failed" | "failure" | "error") {
+                if !job.allow_failure {
+                    stage_failed = true;
+                }
+                continue;
+            }
             // `jobs` is a snapshot taken before the first job ran. A
             // cancellation that lands mid-stage is invisible in it, so the
             // liveness of the pipeline is re-read per job rather than assumed
@@ -730,15 +762,6 @@ impl PipelineRunner {
                     "pipeline settled mid-stage — stopping before the next job"
                 );
                 return Ok(StageOutcome::Settled);
-            }
-            if matches!(job.status.as_str(), "success" | "skipped" | "canceled") {
-                continue;
-            }
-            if matches!(job.status.as_str(), "failed" | "failure" | "error") {
-                if !job.allow_failure {
-                    stage_failed = true;
-                }
-                continue;
             }
             if job.status == "manual" {
                 if !pipeline_ops::pause_embedded_stage_at_gate(

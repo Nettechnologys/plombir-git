@@ -155,6 +155,17 @@ pub struct JobConfig {
     /// that need it. `#[serde(skip)]` for the reason [`Self::steps`] is.
     #[serde(skip)]
     pub(crate) job_context: Option<rg_process::ci_steps::JobContext>,
+
+    /// An Actions job's `strategy.matrix`, `include` and `exclude` and all. A
+    /// native job keeps its plain product in [`Self::matrix`]. One that reads
+    /// a needed job's outputs is expanded only once the stage it is in is
+    /// reached.
+    #[serde(skip)]
+    pub(crate) actions_matrix: Option<crate::matrix::MatrixSpec>,
+
+    /// `strategy.fail-fast` / `strategy.max-parallel` of an Actions matrix job.
+    #[serde(skip)]
+    pub(crate) matrix_strategy: Option<crate::matrix::MatrixStrategy>,
 }
 
 /// The line every job script starts with, and the reason it has to.
@@ -189,7 +200,7 @@ impl JobConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ActionJobTemplates {
     pub(crate) image: Option<ActionTemplate>,
     pub(crate) tags: Option<Vec<ActionTemplate>>,
@@ -202,7 +213,7 @@ impl ActionJobTemplates {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ActionTemplate {
     parts: Vec<ActionTemplatePart>,
 }
@@ -246,13 +257,13 @@ impl ActionTemplate {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum ActionTemplatePart {
     Literal(String),
     Expression(ActionExpression),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum ActionExpression {
     GithubRef,
     GithubSha,

@@ -32,6 +32,7 @@
 pub mod condition;
 pub mod config;
 pub mod gitea_actions;
+mod matrix;
 pub mod runner;
 
 use anyhow::{Context, Result};
@@ -314,6 +315,20 @@ impl rg_core::ci::CiTrigger for CiEngine {
         commit_sha: &str,
     ) -> Result<Vec<rg_core::ci::WorkflowSchedule>> {
         scheduled_workflows(repo_path, commit_sha)
+    }
+
+    fn expand_deferred_matrix<'a>(
+        &'a self,
+        db: &'a sea_orm::DatabaseConnection,
+        placeholder: &'a rg_db::entities::pipeline_job::Model,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<rg_db::entities::pipeline::Model>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(expand_deferred_matrix(db, placeholder))
     }
 
     fn trigger_pipeline<'a>(
@@ -1096,175 +1111,419 @@ impl PipelineGraph<'_> {
                 )));
             };
 
-            for variant in expand_matrix(job_name, job_config)? {
-                let fields = resolve_action_job_fields(
-                    job_name,
-                    job_config,
-                    &variant,
+            // A matrix that reads a needed job's outputs has no variants yet:
+            // the job is one placeholder until its stage is reached.
+            if let Some(spec) = job_config
+                .actions_matrix
+                .as_ref()
+                .filter(|spec| !spec.needs_outputs().is_empty())
+            {
+                create_deferred_matrix_job(tx, stage_id, job_name, job_config, spec).await?;
+                continue;
+            }
+            let rows = JobRowContext {
+                repo_id,
+                repository,
+                commit_sha,
+                ref_name,
+                trigger_type,
+                schedule_cron: schedule.map(|run| run.cron),
+            };
+            create_variant_jobs(
+                tx,
+                &rows,
+                stage_id,
+                job_name,
+                job_config,
+                expand_matrix(job_name, job_config)?,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+/// What every job row of one pipeline is written against.
+#[derive(Clone, Copy)]
+struct JobRowContext<'a> {
+    repo_id: i64,
+    repository: RepositoryName<'a>,
+    commit_sha: &'a str,
+    ref_name: &'a str,
+    trigger_type: &'a str,
+    schedule_cron: Option<&'a str>,
+}
+
+/// Write the rows of one job of the graph, one per matrix variant: the job
+/// itself, its steps and context, its matrix membership, its environment and
+/// the verdict of its `if:`. The pipeline build calls it for every job, and a
+/// matrix decided at run time calls it once its placeholder is taken.
+async fn create_variant_jobs(
+    tx: &sea_orm::DatabaseTransaction,
+    rows: &JobRowContext<'_>,
+    stage_id: i64,
+    job_name: &str,
+    job_config: &config::JobConfig,
+    variants: Vec<MatrixVariant>,
+) -> Result<()> {
+    let JobRowContext {
+        repo_id,
+        repository,
+        commit_sha,
+        ref_name,
+        trigger_type,
+        schedule_cron,
+    } = *rows;
+    for variant in variants {
+        let fields = resolve_action_job_fields(
+            job_name,
+            job_config,
+            &variant,
+            ref_name,
+            trigger_type,
+            commit_sha,
+            repository,
+        )?;
+        // Both executors refuse a value that is not an image reference
+        // before it reaches `docker run`, but by then the pipeline is
+        // published and the job just fails. Checked here, after a
+        // matrix value has been rendered into it, the author gets the
+        // rule back when the file is read (card_857c0d4ab7a6).
+        if let Some(image) = fields.image.as_deref() {
+            rg_process::image_reference::validate_image_reference(image).map_err(|rule| {
+                rg_core::error::invalid_request(format!("job '{}': {rule}", variant.name))
+            })?;
+        }
+        // A name a process cannot carry is never delivered, and
+        // `PATH=/tmp` would be read as `PATH`: that is the file being
+        // wrong, so it is refused here. A *valid* name the runner keeps
+        // for itself (`CI`, `LANG`, `HTTP_PROXY`) is not — the runner
+        // drops it and says so in the job log (card_a79579f79c29).
+        if let Some(name) = variant
+            .variables
+            .keys()
+            .find(|name| !rg_process::job_environment::valid_environment_name(name))
+        {
+            return Err(rg_core::error::invalid_request(format!(
+                "job '{}' sets the variable '{}', which is not a valid environment \
+                     variable name (letters, digits and '_', not starting with a digit)",
+                variant.name,
+                name.escape_debug()
+            )));
+        }
+        let tags_json = fields
+            .tags
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize job tags")?;
+        let variables_json = if variant.variables.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&variant.variables)?)
+        };
+        let cache_paths_json = job_config
+            .cache
+            .as_ref()
+            .map(|cache| serde_json::to_string(&cache.paths))
+            .transpose()?;
+        // Resolved per variant, so a matrix job's artifacts are named
+        // after the variant that produced them rather than all landing
+        // under one name where each run overwrites the last.
+        let artifacts_json = match job_config.artifacts.as_ref() {
+            Some(artifacts) => {
+                let (name, paths) = artifact_spec(&variant.name, artifacts)
+                    .map_err(rg_core::error::invalid_request)?;
+                Some(serde_json::to_string(&serde_json::json!({
+                    "name": name,
+                    "paths": paths,
+                }))?)
+            }
+            None => None,
+        };
+        let job = rg_db::ops::pipeline_ops::create_job(
+            tx,
+            stage_id,
+            &variant.name,
+            &job_config.shell_script(),
+            fields.image.as_deref(),
+            tags_json.as_deref(),
+            variables_json.as_deref(),
+            job_config.cache.as_ref().map(|cache| cache.key.as_str()),
+            cache_paths_json.as_deref(),
+            artifacts_json.as_deref(),
+            job_config.allow_failure.unwrap_or(DEFAULT_ALLOW_FAILURE),
+            job_config.timeout_seconds,
+            job_config.when.as_deref(),
+            job_config.condition.as_deref(),
+        )
+        .await?;
+        // Every variant names its matrix job and carries the job's
+        // strategy: `fail-fast` and `max-parallel` are read off the rows.
+        if let Some(strategy) = &job_config.matrix_strategy {
+            rg_db::ops::pipeline_matrix_ops::set_matrix_membership(
+                tx,
+                job.id,
+                job_name,
+                strategy.fail_fast,
+                strategy.max_parallel,
+            )
+            .await?;
+        }
+        // A job of steps carries them beside its flat `script`, and one
+        // `pending` row per step, so the job page lists the steps
+        // before a runner takes it. Written in the graph's
+        // transaction: a job is never published without them.
+        if let Some(context) = &job_config.job_context {
+            rg_db::ops::pipeline_step_ops::set_job_context(
+                tx,
+                job.id,
+                &serde_json::to_string(context).context("serialize job context")?,
+            )
+            .await?;
+        }
+        if let Some(steps) = &job_config.steps {
+            let names = steps
+                .iter()
+                .map(|step| step.name.clone())
+                .collect::<Vec<_>>();
+            rg_db::ops::pipeline_step_ops::create_job_steps(
+                tx,
+                job.id,
+                &serde_json::to_string(steps).context("serialize job steps")?,
+                &names,
+            )
+            .await?;
+        }
+        // Resolved before the job's own `if:` is read, because a name
+        // no environment in this repository carries is the author's
+        // mistake whether or not this particular run reaches the job.
+        // Resolving it only on the runs that fire would hold the
+        // refusal back until the first deploy that actually needed the
+        // approval.
+        let environment = match fields.environment.as_deref() {
+            Some(environment_name) => Some((
+                environment_name,
+                resolve_job_environment(tx, repo_id, &variant.name, environment_name).await?,
+            )),
+            None => None,
+        };
+        let should_run = if let Some(condition) = job_config.condition.as_deref() {
+            condition::evaluate_condition(
+                condition,
+                &job_condition_context(
                     ref_name,
                     trigger_type,
                     commit_sha,
                     repository,
-                )?;
-                // Both executors refuse a value that is not an image reference
-                // before it reaches `docker run`, but by then the pipeline is
-                // published and the job just fails. Checked here, after a
-                // matrix value has been rendered into it, the author gets the
-                // rule back when the file is read (card_857c0d4ab7a6).
-                if let Some(image) = fields.image.as_deref() {
-                    rg_process::image_reference::validate_image_reference(image).map_err(
-                        |rule| {
-                            rg_core::error::invalid_request(format!(
-                                "job '{}': {rule}",
-                                variant.name
-                            ))
-                        },
-                    )?;
-                }
-                // A name a process cannot carry is never delivered, and
-                // `PATH=/tmp` would be read as `PATH`: that is the file being
-                // wrong, so it is refused here. A *valid* name the runner keeps
-                // for itself (`CI`, `LANG`, `HTTP_PROXY`) is not — the runner
-                // drops it and says so in the job log (card_a79579f79c29).
-                if let Some(name) = variant
-                    .variables
-                    .keys()
-                    .find(|name| !rg_process::job_environment::valid_environment_name(name))
-                {
-                    return Err(rg_core::error::invalid_request(format!(
-                        "job '{}' sets the variable '{}', which is not a valid environment \
-                         variable name (letters, digits and '_', not starting with a digit)",
-                        variant.name,
-                        name.escape_debug()
-                    )));
-                }
-                let tags_json = fields
-                    .tags
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .context("serialize job tags")?;
-                let variables_json = if variant.variables.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&variant.variables)?)
-                };
-                let cache_paths_json = job_config
-                    .cache
-                    .as_ref()
-                    .map(|cache| serde_json::to_string(&cache.paths))
-                    .transpose()?;
-                // Resolved per variant, so a matrix job's artifacts are named
-                // after the variant that produced them rather than all landing
-                // under one name where each run overwrites the last.
-                let artifacts_json = match job_config.artifacts.as_ref() {
-                    Some(artifacts) => {
-                        let (name, paths) = artifact_spec(&variant.name, artifacts)
-                            .map_err(rg_core::error::invalid_request)?;
-                        Some(serde_json::to_string(&serde_json::json!({
-                            "name": name,
-                            "paths": paths,
-                        }))?)
-                    }
-                    None => None,
-                };
-                let job = rg_db::ops::pipeline_ops::create_job(
-                    tx,
-                    stage_id,
-                    &variant.name,
-                    &job_config.shell_script(),
-                    fields.image.as_deref(),
-                    tags_json.as_deref(),
-                    variables_json.as_deref(),
-                    job_config.cache.as_ref().map(|cache| cache.key.as_str()),
-                    cache_paths_json.as_deref(),
-                    artifacts_json.as_deref(),
-                    job_config.allow_failure.unwrap_or(DEFAULT_ALLOW_FAILURE),
-                    job_config.timeout_seconds,
-                    job_config.when.as_deref(),
-                    job_config.condition.as_deref(),
-                )
-                .await?;
-                // A job of steps carries them beside its flat `script`, and one
-                // `pending` row per step, so the job page lists the steps
-                // before a runner takes it. Written in the graph's
-                // transaction: a job is never published without them.
-                if let Some(context) = &job_config.job_context {
-                    rg_db::ops::pipeline_step_ops::set_job_context(
-                        tx,
-                        job.id,
-                        &serde_json::to_string(context).context("serialize job context")?,
-                    )
-                    .await?;
-                }
-                if let Some(steps) = &job_config.steps {
-                    let names = steps
-                        .iter()
-                        .map(|step| step.name.clone())
-                        .collect::<Vec<_>>();
-                    rg_db::ops::pipeline_step_ops::create_job_steps(
-                        tx,
-                        job.id,
-                        &serde_json::to_string(steps).context("serialize job steps")?,
-                        &names,
-                    )
-                    .await?;
-                }
-                // Resolved before the job's own `if:` is read, because a name
-                // no environment in this repository carries is the author's
-                // mistake whether or not this particular run reaches the job.
-                // Resolving it only on the runs that fire would hold the
-                // refusal back until the first deploy that actually needed the
-                // approval.
-                let environment = match fields.environment.as_deref() {
-                    Some(environment_name) => Some((
-                        environment_name,
-                        resolve_job_environment(tx, repo_id, &variant.name, environment_name)
-                            .await?,
-                    )),
-                    None => None,
-                };
-                let should_run = if let Some(condition) = job_config.condition.as_deref() {
-                    condition::evaluate_condition(
-                        condition,
-                        &job_condition_context(
-                            ref_name,
-                            trigger_type,
-                            commit_sha,
-                            repository,
-                            schedule.map(|run| run.cron),
-                            &variant.variables,
-                            job_config,
-                        ),
-                    )?
-                } else {
-                    true
-                };
-                if !should_run {
-                    let now = chrono::Utc::now().naive_utc();
-                    rg_db::ops::pipeline_ops::update_job_result(
-                        tx,
-                        job.id,
-                        "skipped",
-                        None,
-                        None,
-                        None,
-                        Some(now),
-                    )
-                    .await?;
-                } else if let Some((environment_name, environment)) = environment {
-                    rg_db::ops::ci_environment_ops::attach_job(
-                        tx,
-                        job.id,
-                        Some(&environment),
-                        environment_name,
-                    )
-                    .await?;
-                }
-            }
+                    schedule_cron,
+                    &variant.variables,
+                    &variant.coordinates,
+                ),
+            )?
+        } else {
+            true
+        };
+        if !should_run {
+            let now = chrono::Utc::now().naive_utc();
+            rg_db::ops::pipeline_ops::update_job_result(
+                tx,
+                job.id,
+                "skipped",
+                None,
+                None,
+                None,
+                Some(now),
+            )
+            .await?;
+        } else if let Some((environment_name, environment)) = environment {
+            rg_db::ops::ci_environment_ops::attach_job(
+                tx,
+                job.id,
+                Some(&environment),
+                environment_name,
+            )
+            .await?;
         }
-        Ok(())
     }
+    Ok(())
+}
+
+/// What a job whose matrix reads a needed job's outputs is built from once its
+/// stage is reached: the job as the workflow translated it, including the
+/// parts a committed file cannot set (and `JobConfig` therefore does not
+/// serialize), and the matrix still to resolve.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeferredMatrixJob {
+    config: config::JobConfig,
+    action_templates: Option<config::ActionJobTemplates>,
+    steps: Option<Vec<rg_process::ci_steps::StepSpec>>,
+    job_context: Option<rg_process::ci_steps::JobContext>,
+    matrix: matrix::MatrixSpec,
+    strategy: Option<matrix::MatrixStrategy>,
+}
+
+impl DeferredMatrixJob {
+    fn of(job_config: &config::JobConfig, spec: &matrix::MatrixSpec) -> Self {
+        Self {
+            config: job_config.clone(),
+            action_templates: job_config.action_templates.clone(),
+            steps: job_config.steps.clone(),
+            job_context: job_config.job_context.clone(),
+            matrix: spec.clone(),
+            strategy: job_config.matrix_strategy,
+        }
+    }
+
+    fn job_config(self) -> config::JobConfig {
+        config::JobConfig {
+            action_templates: self.action_templates,
+            steps: self.steps,
+            job_context: self.job_context,
+            actions_matrix: Some(self.matrix),
+            matrix_strategy: self.strategy,
+            ..self.config
+        }
+    }
+}
+
+/// The one row a job whose matrix reads a needed job's outputs has until its
+/// stage is reached. Its name is the job's; it is never handed to a runner,
+/// and [`expand_deferred_matrix`] replaces it with the variants.
+async fn create_deferred_matrix_job(
+    tx: &sea_orm::DatabaseTransaction,
+    stage_id: i64,
+    job_name: &str,
+    job_config: &config::JobConfig,
+    spec: &matrix::MatrixSpec,
+) -> Result<()> {
+    let job = rg_db::ops::pipeline_ops::create_job(
+        tx,
+        stage_id,
+        job_name,
+        &job_config.shell_script(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        job_config.allow_failure.unwrap_or(DEFAULT_ALLOW_FAILURE),
+        job_config.timeout_seconds,
+        None,
+        job_config.condition.as_deref(),
+    )
+    .await?;
+    let stored = serde_json::to_string(&DeferredMatrixJob::of(job_config, spec))
+        .context("serialize a deferred matrix job")?;
+    rg_db::ops::pipeline_matrix_ops::set_deferred_matrix(tx, job.id, &stored).await?;
+    Ok(())
+}
+
+/// Replace the placeholder of a matrix that reads a needed job's outputs with
+/// the variants those outputs make, now that the needed jobs have finished.
+///
+/// What the needed job left is the workflow's input like any other: when it
+/// does not make a matrix — not JSON, not the right shape, past the 256-variant
+/// cap, a variant the job cannot be written for — the placeholder fails with
+/// the reason in its log and the pipeline rolls up, rather than the error
+/// surfacing as this server's. A placeholder another caller already expanded
+/// is left alone. `Some(pipeline)` when the failure finished the pipeline, for
+/// the caller's completion hooks.
+pub async fn expand_deferred_matrix(
+    db: &sea_orm::DatabaseConnection,
+    placeholder: &rg_db::entities::pipeline_job::Model,
+) -> Result<Option<rg_db::entities::pipeline::Model>> {
+    let Some(stored) = placeholder.deferred_matrix.as_deref() else {
+        return Ok(None);
+    };
+    let stored: DeferredMatrixJob = serde_json::from_str(stored)
+        .context("a deferred matrix job's stored form is unreadable")?;
+    let stage = rg_db::ops::pipeline_ops::get_stage_by_id(db, placeholder.stage_id)
+        .await?
+        .with_context(|| {
+            format!(
+                "stage {} of a deferred matrix job is gone",
+                placeholder.stage_id
+            )
+        })?;
+    let pipeline = rg_db::ops::pipeline_ops::get_pipeline(db, stage.pipeline_id)
+        .await?
+        .with_context(|| {
+            format!(
+                "pipeline {} of a deferred matrix job is gone",
+                stage.pipeline_id
+            )
+        })?;
+    let (owner, name) = rg_core::repo::service::repository_identity(db, pipeline.repo_id).await?;
+    let job_name = placeholder.name.clone();
+    let spec = stored.matrix.clone();
+    let job_config = stored.job_config();
+    let needs = job_config
+        .job_context
+        .as_ref()
+        .map(|context| context.needs.clone())
+        .unwrap_or_default();
+    let needed = rg_db::ops::pipeline_step_ops::needs_context(db, pipeline.id, &needs).await?;
+    let combinations = spec
+        .resolve(|reference| {
+            needed
+                .get(&reference.job)
+                .and_then(|job| job.outputs.get(&reference.output))
+                .cloned()
+        })
+        .and_then(|matrix| matrix::combinations(&matrix));
+    let variants = match combinations
+        .map_err(|reason| rg_core::error::invalid_request(format!("job '{job_name}' {reason}")))
+        .and_then(|combinations| matrix_variants(&job_name, &job_config, Some(combinations)))
+    {
+        Ok(variants) => variants,
+        Err(error) => return fail_deferred_matrix(db, placeholder, error).await,
+    };
+    let rows = JobRowContext {
+        repo_id: pipeline.repo_id,
+        repository: RepositoryName {
+            owner: &owner,
+            name: &name,
+        },
+        commit_sha: &pipeline.commit_sha,
+        ref_name: &pipeline.ref_name,
+        trigger_type: &pipeline.trigger_type,
+        schedule_cron: pipeline.schedule_cron.as_deref(),
+    };
+    let expanded = rg_db::ops::pipeline_matrix_ops::expand_deferred_job(db, placeholder, |tx| {
+        let (rows, job_name, job_config, variants) = (&rows, &job_name, &job_config, &variants);
+        async move {
+            let written =
+                create_variant_jobs(&tx, rows, stage.id, job_name, job_config, variants.clone())
+                    .await;
+            (tx, written)
+        }
+    })
+    .await;
+    match expanded {
+        Ok(_) => Ok(None),
+        Err(error) => fail_deferred_matrix(db, placeholder, error).await,
+    }
+}
+
+/// Fail the placeholder when `reason` is the workflow's — an
+/// [`rg_core::error::InvalidRequest`] — and hand any other error back: a
+/// database that did not answer is no verdict on the matrix.
+async fn fail_deferred_matrix(
+    db: &sea_orm::DatabaseConnection,
+    placeholder: &rg_db::entities::pipeline_job::Model,
+    reason: anyhow::Error,
+) -> Result<Option<rg_db::entities::pipeline::Model>> {
+    if reason
+        .downcast_ref::<rg_core::error::InvalidRequest>()
+        .is_none()
+    {
+        return Err(reason);
+    }
+    let log = format!("The matrix could not be expanded: {reason:#}\n");
+    rg_db::ops::pipeline_matrix_ops::fail_deferred_job(db, placeholder, &log).await
 }
 
 /// Resolve the environment a job names, refusing a name this repository has no
@@ -1817,7 +2076,7 @@ fn job_condition_context(
     repository: RepositoryName<'_>,
     event_schedule: Option<&str>,
     variables: &std::collections::BTreeMap<String, String>,
-    config: &config::JobConfig,
+    coordinates: &std::collections::BTreeMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
     let mut context = std::collections::HashMap::from([
         ("github.ref".into(), ref_name.to_string()),
@@ -1847,20 +2106,20 @@ fn job_condition_context(
     for (name, value) in variables {
         context.insert(format!("env.{name}"), value.clone());
     }
-    if let Some(matrix) = &config.matrix {
-        for name in matrix.keys() {
-            if let Some(value) = variables.get(name) {
-                context.insert(format!("matrix.{name}"), value.clone());
-            }
-        }
+    for (name, value) in coordinates {
+        context.insert(format!("matrix.{name}"), value.clone());
     }
     context
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MatrixVariant {
     name: String,
     variables: std::collections::BTreeMap<String, String>,
+    /// `matrix.<key>` → value: what the variant's expressions read. Not
+    /// `variables`, which holds a key only when it is a valid variable name —
+    /// `matrix.node-version` has no variable of its own.
+    coordinates: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1893,7 +2152,7 @@ fn action_expression_value(
         config::ActionExpression::GithubRepositoryOwner => {
             Some(context.repository.owner.to_owned())
         }
-        config::ActionExpression::Matrix(name) => context.variant.variables.get(name).cloned(),
+        config::ActionExpression::Matrix(name) => context.variant.coordinates.get(name).cloned(),
         config::ActionExpression::Input(name) => context
             .variant
             .variables
@@ -1989,89 +2248,112 @@ fn matrix_variable_name(key: &str) -> String {
 }
 
 fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<MatrixVariant>> {
+    // Same split as `validate_execution_semantics`: an unusable `matrix:` block
+    // is the user's file being wrong, not this server failing, and it is only
+    // reached from the pipeline build inside `trigger_pipeline` — where a bare
+    // `anyhow` became a sanitized 500 that named neither the job nor the limit.
+    let refused =
+        |reason: String| rg_core::error::invalid_request(format!("job '{job_name}' {reason}"));
+    let combinations = if let Some(spec) = &config.actions_matrix {
+        let matrix = spec.resolve(|_| None).map_err(refused)?;
+        Some(matrix::combinations(&matrix).map_err(refused)?)
+    } else if let Some(matrix) = &config.matrix {
+        if matrix.values().any(Vec::is_empty) {
+            return Err(refused("has an empty matrix dimension".into()));
+        }
+        let count = matrix
+            .values()
+            .try_fold(1usize, |total, values| total.checked_mul(values.len()))
+            .ok_or_else(|| {
+                refused(format!(
+                    "matrix is too large to expand; maximum is {} variants",
+                    matrix::MAX_MATRIX_VARIANTS
+                ))
+            })?;
+        if count > matrix::MAX_MATRIX_VARIANTS {
+            return Err(refused(format!(
+                "matrix expands to {count} variants; maximum is {}",
+                matrix::MAX_MATRIX_VARIANTS
+            )));
+        }
+        let mut product = vec![matrix::Combination::new()];
+        for (key, values) in matrix {
+            product = product
+                .into_iter()
+                .flat_map(|combination| {
+                    values.iter().map(move |value| {
+                        let mut combination = combination.clone();
+                        combination.push((key.clone(), value.clone()));
+                        combination
+                    })
+                })
+                .collect();
+        }
+        Some(product)
+    } else {
+        None
+    };
+    matrix_variants(job_name, config, combinations)
+}
+
+/// One job row per combination, named and labelled by its coordinates;
+/// `None` is the job without a matrix.
+fn matrix_variants(
+    job_name: &str,
+    config: &config::JobConfig,
+    combinations: Option<Vec<matrix::Combination>>,
+) -> Result<Vec<MatrixVariant>> {
     let base: std::collections::BTreeMap<String, String> = config
         .variables
         .clone()
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let Some(matrix) = &config.matrix else {
+    let Some(combinations) = combinations else {
         return Ok(vec![MatrixVariant {
             name: job_name.to_owned(),
             variables: base,
+            coordinates: Default::default(),
         }]);
     };
-    // Same split as `validate_execution_semantics`: an unusable `matrix:` block
-    // is the user's file being wrong, not this server failing, and it is only
-    // reached from the pipeline build inside `trigger_pipeline` — where a bare
-    // `anyhow` became a sanitized 500 that named neither the job nor the limit.
-    if matrix.values().any(Vec::is_empty) {
-        return Err(rg_core::error::invalid_request(format!(
-            "job '{job_name}' has an empty matrix dimension"
-        )));
-    }
-    let count = matrix
-        .values()
-        .try_fold(1usize, |total, values| total.checked_mul(values.len()))
-        .ok_or_else(|| {
-            rg_core::error::invalid_request(format!(
-                "job '{job_name}' matrix is too large to expand; maximum is 256 variants"
-            ))
-        })?;
-    if count > 256 {
-        return Err(rg_core::error::invalid_request(format!(
-            "job '{job_name}' matrix expands to {count} variants; maximum is 256"
-        )));
-    }
-    // A matrix key is what the variant is labelled with, and its variable is
-    // the derived `MATRIX_<KEY>`: `node-version` is a common key and becomes
-    // `MATRIX_NODE_VERSION`. That derived name has to be one a process can
-    // carry; the key itself only becomes a variable as well when it already is.
-    for key in matrix.keys() {
-        let derived = matrix_variable_name(key);
-        if !rg_process::job_environment::valid_environment_name(&derived) {
-            return Err(rg_core::error::invalid_request(format!(
-                "job '{job_name}' matrix key '{key}' gives the variable name '{derived}', which is \
-                 not a valid environment variable name (letters, digits and '_', and '-' in the \
-                 key)"
-            )));
-        }
-    }
-    let mut variants = vec![(Vec::<(String, String)>::new(), base)];
-    for (key, values) in matrix {
-        let mut next = Vec::new();
-        for (labels, variables) in variants {
-            for value in values {
-                let mut labels = labels.clone();
-                labels.push((key.clone(), value.clone()));
-                let mut variables = variables.clone();
-                if rg_process::job_environment::valid_environment_name(key) {
-                    variables.insert(key.clone(), value.clone());
-                }
-                variables.insert(matrix_variable_name(key), value.clone());
-                next.push((labels, variables));
+    let mut variants = Vec::with_capacity(combinations.len());
+    for combination in combinations {
+        let mut variables = base.clone();
+        for (key, value) in &combination {
+            // A matrix key is what the variant is labelled with, and its
+            // variable is the derived `MATRIX_<KEY>`: `node-version` is a
+            // common key and becomes `MATRIX_NODE_VERSION`. That derived name
+            // has to be one a process can carry; the key itself only becomes a
+            // variable as well when it already is.
+            let derived = matrix_variable_name(key);
+            if !rg_process::job_environment::valid_environment_name(&derived) {
+                return Err(rg_core::error::invalid_request(format!(
+                    "job '{job_name}' matrix key '{key}' gives the variable name '{derived}', which \
+                     is not a valid environment variable name (letters, digits and '_', and '-' in \
+                     the key)"
+                )));
             }
+            if rg_process::job_environment::valid_environment_name(key) {
+                variables.insert(key.clone(), value.clone());
+            }
+            variables.insert(derived, value.clone());
         }
-        variants = next;
-    }
-    let variants: Vec<MatrixVariant> = variants
-        .into_iter()
-        .map(|(labels, variables)| MatrixVariant {
-            name: format!(
-                "{job_name} [{}]",
-                labels
-                    .into_iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+        let name = format!(
+            "{job_name} [{}]",
+            combination
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        // The label grows with the values, so a job whose own name fits can
+        // still have a variant whose name does not.
+        check_stored_name("the matrix job name", &name)?;
+        variants.push(MatrixVariant {
+            name,
             variables,
-        })
-        .collect();
-    // The label grows with the values, so a job whose own name fits can still
-    // have a variant whose name does not.
-    for variant in &variants {
-        check_stored_name("the matrix job name", &variant.name)?;
+            coordinates: combination.into_iter().collect(),
+        });
     }
     Ok(variants)
 }
@@ -3456,7 +3738,44 @@ mod matrix_tests {
             action_templates: None,
             steps: None,
             job_context: None,
+            actions_matrix: None,
+            matrix_strategy: None,
         }
+    }
+
+    /// A matrix key that is no variable name (`node-version`) still has a
+    /// value in the job fields resolved per variant: they read the variant's
+    /// coordinates, not its variables, which only carry `MATRIX_NODE_VERSION`.
+    #[test]
+    fn a_dashed_matrix_key_resolves_in_runs_on() {
+        let workflow = gitea_actions::GiteaWorkflow::parse(
+            "on: push\njobs:\n  test:\n    runs-on: node-${{ matrix.node-version }}\n    strategy:\n      matrix:\n        node-version: [18]\n    steps:\n      - run: echo ok\n",
+        )
+        .unwrap();
+        let config = workflow.to_ci_config(&gitea_actions::WorkflowContext {
+            ref_name: "refs/heads/main".into(),
+            sha: "abc".into(),
+            event: "push".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            event_schedule: None,
+        });
+        let job = &config.jobs["test"];
+        let variant = expand_matrix("test", job).unwrap().remove(0);
+        let fields = resolve_action_job_fields(
+            "test",
+            job,
+            &variant,
+            "refs/heads/main",
+            "push",
+            "abc",
+            RepositoryName {
+                owner: "o",
+                name: "r",
+            },
+        )
+        .unwrap();
+        assert_eq!(fields.tags, Some(vec!["node-18".to_string()]));
     }
 
     #[test]
@@ -5101,25 +5420,7 @@ mod matrix_tests {
             },
             Some("0 3 * * *"),
             &std::collections::BTreeMap::new(),
-            &config::JobConfig {
-                stage: None,
-                script: vec!["echo ok".into()],
-                image: None,
-                only: None,
-                variables: None,
-                when: None,
-                condition: None,
-                environment: None,
-                allow_failure: None,
-                timeout_seconds: None,
-                tags: None,
-                matrix: None,
-                cache: None,
-                artifacts: None,
-                action_templates: None,
-                steps: None,
-                job_context: None,
-            },
+            &std::collections::BTreeMap::new(),
         );
         let step = gitea_actions::actions_condition_context(
             &gitea_actions::WorkflowContext {
@@ -7473,15 +7774,14 @@ mod matrix_tests {
             read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
                 .expect("every supported scalar must survive the committed-workflow path");
         let (job_name, job) = config.jobs.iter().next().expect("one workflow job");
+        let targets = expand_matrix(job_name, job)
+            .expect("supported scalars expand")
+            .into_iter()
+            .map(|variant| variant.variables["MATRIX_TARGET"].clone())
+            .collect::<Vec<_>>();
         assert_eq!(
-            job.matrix.as_ref().expect("matrix")["target"],
-            ["linux", "42", "true", "false", "1.5"]
-        );
-        assert_eq!(
-            expand_matrix(job_name, job)
-                .expect("supported scalars expand")
-                .len(),
-            5,
+            targets,
+            ["linux", "42", "true", "false", "1.5"],
             "one declared scalar must produce one concrete variant"
         );
     }
@@ -7489,8 +7789,8 @@ mod matrix_tests {
     /// card_4223cbf9a0a1: a declaration below `jobs.<name>` must either be
     /// translated or fail where the committed workflow is read. Serde normally
     /// discards every field a struct does not name, so these three workflows
-    /// used to create runnable jobs after silently losing `services`,
-    /// `strategy.fail-fast`, or `container.credentials`.
+    /// used to create runnable jobs after silently losing `services`, a
+    /// misspelt `strategy` key, or `container.credentials`.
     #[test]
     fn unknown_gitea_job_keys_are_reported_with_their_file_and_key() {
         for (key, job_body) in [
@@ -7499,8 +7799,8 @@ mod matrix_tests {
                 "    services:\n      postgres:\n        image: postgres:17\n",
             ),
             (
-                "fail-fast",
-                "    strategy:\n      fail-fast: false\n      matrix:\n        os: [linux]\n",
+                "fail-fsat",
+                "    strategy:\n      fail-fsat: false\n      matrix:\n        os: [linux]\n",
             ),
             (
                 "credentials",
@@ -10621,6 +10921,20 @@ mod step_model_tests {
     }
 
     async fn run_pipeline(workflow: &str) -> (rg_db::DatabaseConnection, i64, tempfile::TempDir) {
+        let (db, pipeline_id, repo_id, temp) = publish_pipeline(workflow).await;
+        let repo_path = temp.path().join("step-owner/steps");
+        let mut runner =
+            PipelineRunner::new_local_only(db.clone(), temp.path(), &repo_path, pipeline_id);
+        runner.set_repo_id(repo_id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+        (db, pipeline_id, temp)
+    }
+
+    /// The pipeline the workflow publishes, not yet run: (db, pipeline, repo).
+    async fn publish_pipeline(
+        workflow: &str,
+    ) -> (rg_db::DatabaseConnection, i64, i64, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
         let repo_path = temp.path().join("step-owner/steps");
         std::fs::create_dir_all(repo_path.join(".gitea/workflows")).unwrap();
@@ -10710,12 +11024,7 @@ mod step_model_tests {
         )
         .await
         .expect("the workflow publishes a pipeline");
-        let mut runner =
-            PipelineRunner::new_local_only(db.clone(), temp.path(), &repo_path, pipeline_id);
-        runner.set_repo_id(repo.id);
-        runner.set_allow_host_runner(true);
-        runner.run().await.unwrap();
-        (db, pipeline_id, temp)
+        (db, pipeline_id, repo.id, temp)
     }
 
     async fn step_rows(
@@ -10844,6 +11153,254 @@ mod step_model_tests {
         let rows = step_rows(&db, b.id).await;
         assert_eq!(rows[1].1, "success", "{rows:?}");
         assert_eq!(rows[2].1, "skipped", "{rows:?}");
+    }
+
+    async fn step_log(db: &rg_db::DatabaseConnection, job_id: i64, number: i32) -> String {
+        rg_db::ops::pipeline_step_ops::find_job_step(db, job_id, number)
+            .await
+            .unwrap()
+            .and_then(|step| step.log)
+            .unwrap_or_default()
+    }
+
+    /// card_d97de416d0b0's acceptance, through the embedded runner: the
+    /// matrix of `test` is what `setup` wrote to its outputs, `include` and
+    /// all; the placeholder `test` is gone and its variants ran.
+    #[tokio::test]
+    async fn a_matrix_built_from_a_needed_jobs_outputs_runs_its_variants() {
+        let (db, jobs, _temp) = run_pipeline_jobs(
+            "on: push\njobs:\n  setup:\n    outputs:\n      matrix: ${{ steps.list.outputs.matrix }}\n    steps:\n      - id: list\n        run: echo 'matrix={\"package\":[\"api\",\"web\"],\"include\":[{\"package\":\"web\",\"node-version\":20}]}' >> \"$GITHUB_OUTPUT\"\n  test:\n    needs: setup\n    strategy:\n      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}\n    steps:\n      - run: echo \"package=${{ matrix.package }} node=${{ matrix.node-version }}\"\n",
+        )
+        .await;
+        let mut names = jobs.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "build/setup",
+                "build/test [package=api]",
+                "build/test [package=web, node-version=20]",
+            ],
+            "the placeholder is replaced by the variants"
+        );
+        for (name, expected) in [
+            ("build/test [package=api]", "package=api node=\n"),
+            (
+                "build/test [package=web, node-version=20]",
+                "package=web node=20",
+            ),
+        ] {
+            let job = &jobs[name];
+            assert_eq!(job.status, "success", "{name}: {:?}", job.log);
+            assert!(
+                step_log(&db, job.id, 1).await.contains(expected),
+                "{name}: {:?}",
+                job.log
+            );
+            assert_eq!(job.matrix_group.as_deref(), Some("build/test"));
+            assert_eq!(job.matrix_fail_fast, Some(true), "GitHub's default");
+        }
+    }
+
+    /// The external-runner path through the real engine: the placeholder of
+    /// a matrix decided at run time survives being stored — steps, context,
+    /// strategy and all — and once its needed job has succeeded, the engine
+    /// writes the variants a polling runner is then handed, never the
+    /// placeholder itself.
+    #[tokio::test]
+    async fn the_engine_expands_a_stored_matrix_for_a_polling_runner() {
+        let (db, pipeline_id, repo_id, _temp) = publish_pipeline(
+            "on: push\njobs:\n  setup:\n    outputs:\n      os: ${{ steps.list.outputs.os }}\n    steps:\n      - id: list\n        run: echo 'os=[\"linux\",\"mac\"]' >> \"$GITHUB_OUTPUT\"\n  test:\n    needs: setup\n    strategy:\n      max-parallel: 1\n      matrix:\n        os: ${{ fromJSON(needs.setup.outputs.os) }}\n    steps:\n      - run: echo \"on ${{ matrix.os }} after ${{ needs.setup.result }}\"\n",
+        )
+        .await;
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        let setup = jobs.iter().find(|job| job.name == "build/setup").unwrap();
+        let placeholder = jobs.iter().find(|job| job.name == "build/test").unwrap();
+        assert!(placeholder.deferred_matrix.is_some());
+        assert!(
+            rg_db::ops::pipeline_matrix_ops::ready_deferred_jobs(&db, repo_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "setup has not run"
+        );
+
+        assert!(
+            rg_db::ops::pipeline_ops::start_job_if_active(&db, setup.id, None)
+                .await
+                .unwrap()
+        );
+        assert!(rg_db::ops::pipeline_step_ops::record_job_outputs(
+            &db,
+            setup.id,
+            r#"{"os":"[\"linux\",\"mac\"]"}"#
+        )
+        .await
+        .unwrap());
+        rg_db::ops::pipeline_ops::finish_embedded_job(
+            &db,
+            pipeline_id,
+            setup.stage_id,
+            setup.id,
+            "success",
+            Some(0),
+            None,
+            Some(chrono::Utc::now().naive_utc()),
+        )
+        .await
+        .unwrap();
+
+        let ready = rg_db::ops::pipeline_matrix_ops::ready_deferred_jobs(&db, repo_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            ready.iter().map(|job| job.id).collect::<Vec<_>>(),
+            [placeholder.id]
+        );
+        let finished =
+            rg_core::ci::CiTrigger::expand_deferred_matrix(&CiEngine::new(), &db, &ready[0])
+                .await
+                .unwrap();
+        assert!(finished.is_none());
+
+        let variants = rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, placeholder.stage_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            variants
+                .iter()
+                .map(|job| job.name.as_str())
+                .collect::<Vec<_>>(),
+            ["build/test [os=linux]", "build/test [os=mac]"]
+        );
+        for variant in &variants {
+            assert_eq!(variant.matrix_group.as_deref(), Some("build/test"));
+            assert_eq!(variant.matrix_max_parallel, Some(1));
+            assert!(variant
+                .steps
+                .as_deref()
+                .unwrap_or_default()
+                .contains("${MATRIX_OS}"));
+            assert!(variant
+                .job_context
+                .as_deref()
+                .unwrap_or_default()
+                .contains("build/setup"));
+        }
+        let picked = rg_db::ops::pipeline_ops::find_pending_job_for_runner(&db, repo_id, &[], true)
+            .await
+            .unwrap();
+        let rg_db::ops::pipeline_ops::PendingPick::Job(picked) = picked else {
+            panic!("a variant is there to hand out: {picked:?}");
+        };
+        assert_eq!(picked.name, "build/test [os=linux]");
+        assert!(
+            rg_core::ci::CiTrigger::expand_deferred_matrix(&CiEngine::new(), &db, &ready[0])
+                .await
+                .unwrap()
+                .is_none()
+                && rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, placeholder.stage_id)
+                    .await
+                    .unwrap()
+                    .len()
+                    == 2,
+            "a second expansion of the same placeholder writes nothing"
+        );
+    }
+
+    /// What the needed job left has to be a matrix; when it is not, the job
+    /// fails saying why, and so does the pipeline.
+    #[tokio::test]
+    async fn a_matrix_the_needed_job_did_not_leave_fails_its_job_by_reason() {
+        let many = format!(
+            "{{\\\"n\\\":[{}]}}",
+            (0..257)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for (written, reason) in [
+            (
+                "not-json".to_string(),
+                "`needs.setup.outputs.matrix` is not JSON",
+            ),
+            (
+                "{\\\"n\\\":[]}".to_string(),
+                "matrix dimension `n` has no values",
+            ),
+            (many, "matrix expands to 257 variants; maximum is 256"),
+        ] {
+            let (_db, jobs, _temp) = run_pipeline_jobs(&format!(
+                "on: push\njobs:\n  setup:\n    outputs:\n      matrix: ${{{{ steps.list.outputs.matrix }}}}\n    steps:\n      - id: list\n        run: echo \"matrix={written}\" >> \"$GITHUB_OUTPUT\"\n  test:\n    needs: setup\n    strategy:\n      matrix: ${{{{ fromJSON(needs.setup.outputs.matrix) }}}}\n    steps:\n      - run: echo never\n",
+            ))
+            .await;
+            let test = &jobs["build/test"];
+            assert_eq!(test.status, "failed", "{written}: {jobs:?}");
+            let log = test.log.clone().unwrap_or_default();
+            assert!(log.contains(reason), "{written}: {log}");
+            assert_eq!(test.deferred_matrix, None);
+            assert_eq!(jobs.len(), 2, "no variant was written: {jobs:?}");
+        }
+    }
+
+    /// `strategy.fail-fast`: the built-in runner runs the variants in order,
+    /// so the first one failing cancels the two after it — and with
+    /// `fail-fast: false` they run.
+    ///
+    /// The runner re-reads each job before it starts it: a stale `pending`
+    /// would send it to start a variant fail-fast canceled, find the job no
+    /// longer its own and walk away from the pipeline before announcing how
+    /// it ended — the pipeline-finished hook is what shows that.
+    #[tokio::test]
+    async fn fail_fast_cancels_the_unfinished_variants_unless_switched_off() {
+        static FINISHED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        fn observe(status: &str) {
+            FINISHED.lock().unwrap().push(status.to_string());
+        }
+        rg_core::metrics_hook::set_ci_pipeline_finished_observer(observe);
+        let workflow = "on: push\njobs:\n  test:\n    strategy:\nFAIL_FAST      matrix:\n        n: [a, b, c]\n    steps:\n      - run: test \"${{ matrix.n }}\" != a\n";
+        let (_db, jobs, _temp) = run_pipeline_jobs(&workflow.replace("FAIL_FAST", "")).await;
+        let status =
+            |jobs: &std::collections::HashMap<String, rg_db::entities::pipeline_job::Model>,
+             n: &str| { jobs[&format!("build/test [n={n}]")].status.clone() };
+        assert_eq!(
+            [status(&jobs, "a"), status(&jobs, "b"), status(&jobs, "c")],
+            ["failed", "canceled", "canceled"]
+        );
+        let canceled = jobs["build/test [n=b]"].log.clone().unwrap_or_default();
+        assert!(
+            canceled.contains(
+                "`build/test [n=a]` failed, and the matrix job's strategy.fail-fast is on"
+            ),
+            "{canceled}"
+        );
+        assert_eq!(
+            *FINISHED.lock().unwrap(),
+            ["failed"],
+            "the runner saw the pipeline through to its end"
+        );
+
+        let (_db, jobs, _temp) =
+            run_pipeline_jobs(&workflow.replace("FAIL_FAST", "      fail-fast: false\n")).await;
+        assert_eq!(
+            [status(&jobs, "a"), status(&jobs, "b"), status(&jobs, "c")],
+            ["failed", "success", "success"]
+        );
+    }
+
+    /// `matrix.<key>` reads the variant's coordinate even when the key is no
+    /// variable name: `node-version` has only `MATRIX_NODE_VERSION`, and the
+    /// job's `if:` used to read nothing for it and skip every variant.
+    #[tokio::test]
+    async fn a_job_condition_reads_a_matrix_key_that_is_no_variable_name() {
+        let (_db, jobs, _temp) = run_pipeline_jobs(
+            "on: push\njobs:\n  test:\n    if: matrix.node-version == '20'\n    strategy:\n      matrix:\n        node-version: [18, 20]\n    steps:\n      - run: echo ok\n",
+        )
+        .await;
+        assert_eq!(jobs["build/test [node-version=18]"].status, "skipped");
+        assert_eq!(jobs["build/test [node-version=20]"].status, "success");
     }
 
     /// Steps are separate processes: a variable exported by one step does not

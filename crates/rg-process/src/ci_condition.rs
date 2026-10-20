@@ -82,7 +82,17 @@ pub struct StepStatus {
 fn known_context_name(name: &str) -> bool {
     GITHUB_CONTEXT_KEYS.contains(&name)
         || name.strip_prefix("env.").is_some_and(valid_context_key)
-        || name.strip_prefix("matrix.").is_some_and(valid_context_key)
+        || name.strip_prefix("matrix.").is_some_and(valid_matrix_key)
+}
+
+/// A matrix key may carry `-` as well — `node-version` is the common one —
+/// since it is a label, and only its derived `MATRIX_*` has to be a variable
+/// name.
+fn valid_matrix_key(key: &str) -> bool {
+    key.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 }
 
 pub fn validate_condition(input: &str) -> Result<()> {

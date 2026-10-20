@@ -298,6 +298,8 @@ async fn copy_migrated_template(db_path: &std::path::Path) {
 /// adds a seam to.
 #[derive(Default)]
 pub struct StateOverrides {
+    /// Replaces the CI engine double that answers "no workflow" to everything.
+    pub ci_engine: Option<Arc<dyn rg_core::ci::CiTrigger + Send + Sync>>,
     /// Replaces the `LocalBlobStorage` this harness would otherwise build.
     ///
     /// The OCI storage is layered on the same backend, so overriding this one
@@ -484,7 +486,9 @@ pub fn build_test_app_state_with(
         job_timeout_secs: rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
-        ci_engine: Arc::new(NoopCiEngine),
+        ci_engine: overrides
+            .ci_engine
+            .unwrap_or_else(|| Arc::new(NoopCiEngine)),
         // Enabled in the test harness so attestation endpoints are reachable;
         // production defaults to off (opt-in).
         attestation_enabled: true,

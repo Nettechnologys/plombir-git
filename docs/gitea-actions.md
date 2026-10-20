@@ -488,7 +488,7 @@ quietly win.
 | `env` | map string→string | Variables for this job, overriding the workflow's. |
 | `container` | block | See [Containers](#containers). |
 | `defaults` | block | `run:` defaults for this job. See [Defaults](#defaults). |
-| `strategy` | block | Only `matrix`. See [Matrix](#matrix). |
+| `strategy` | block | `matrix`, `fail-fast` and `max-parallel`. See [Matrix](#matrix). |
 | `environment` | string or `{ name: … }` | A deployment environment **the repository already has**; a protected one holds the job for approval, and only jobs that declare it read its [secrets](ci.md#secrets-and-workload-identity). |
 | `timeout-minutes` | integer | Per-job timeout. Converted to seconds, and the result must land in `1`–`86400` — so `1`–`1440` minutes. |
 | `continue-on-error` | bool | A failure of this job does not fail the pipeline. |
@@ -868,10 +868,90 @@ jobs:
       - run: cargo test --features ${{ matrix.features }}
 ```
 
-`strategy` accepts `matrix` and nothing else — no `fail-fast`, no
-`max-parallel`. Values must be strings, numbers or booleans. The rules of the
-expansion itself (naming, the `MATRIX_*` variables, the 256-variant cap) are the
-native format's and are documented under [Matrix](ci.md#matrix).
+Values must be strings, numbers or booleans. The rules of the expansion itself
+(naming, the `MATRIX_*` variables, the 256-variant cap) are the native format's
+and are documented under [Matrix](ci.md#matrix); `matrix.NAME` reads a
+variant's coordinate in `runs-on`, `container.image`, `environment` and the
+job's `if:`, also for a key such as `node-version` that is no variable name.
+
+### `include` and `exclude`
+
+```yaml
+name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [linux, mac]
+        node: [18, 20]
+        exclude:
+          - os: mac
+            node: 18
+        include:
+          - os: linux
+            node: 20
+            coverage: true
+          - os: windows-wsl
+            node: 20
+    steps:
+      - run: npm test
+```
+
+GitHub's rules, exactly: the dimensions multiply out; `exclude` drops every
+combination one of its entries matches, and a partial match is enough; then
+each `include` entry is added to every original combination none of whose
+dimension values it would overwrite (values an earlier `include` added may be
+overwritten), and an entry that fits no combination becomes one of its own.
+The 256-variant cap counts what `include` adds. Entries are mappings of
+strings, numbers and booleans.
+
+### A matrix from a needed job's outputs
+
+```yaml
+name: CI
+on: push
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - id: list
+        run: echo 'matrix={"package":["api","web"]}' >> "$GITHUB_OUTPUT"
+  test:
+    runs-on: ubuntu-latest
+    needs: setup
+    strategy:
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - run: make test PACKAGE=${{ matrix.package }}
+```
+
+The whole matrix, one dimension, `include` or `exclude` may be
+`${{ fromJSON(needs.<job>.outputs.<name>) }}` — that expression and nothing
+around it, naming a job this one lists under `needs:`. Such a job cannot be
+expanded when the workflow is read: until its stage is reached the pipeline
+shows it as one pending job under its own name, which is then replaced by its
+variants. What the needed job left is checked like a matrix in the file; when
+it is not one — empty, not JSON, the wrong shape, more than 256 variants — that
+job fails with the reason in its log, and the pipeline fails with it.
+
+### `fail-fast` and `max-parallel`
+
+- `fail-fast` — `true` unless the workflow says `false`, as on GitHub: once a
+  variant fails, the variants of the same job that have not finished are
+  canceled, with a line in their log saying which one failed. A variant that
+  fails under the job's `continue-on-error: true` does not trigger it.
+- `max-parallel` — at most that many variants of the job are handed to
+  runners at once; the next one waits until one of them finishes. The built-in
+  runner runs the jobs of a stage one after another anyway.
+
+Both must be literal values: an expression has no value when the graph is
+written, and is refused by name.
 
 ## Concurrency
 

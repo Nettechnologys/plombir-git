@@ -523,6 +523,9 @@ pub async fn poll_job(
         let (runner_repo_id, runner_labels) = poll_scope(&state, runner_id).await?;
 
         loop {
+            // A matrix that reads a needed job's outputs becomes its variants
+            // once its stage may run; only then is there a variant to hand out.
+            expand_ready_matrices(&state, runner_repo_id).await;
             match crate::metrics::time_db(
                 "pipeline.find_pending_job",
                 rg_db::ops::pipeline_ops::find_pending_job_for_runner(
@@ -575,6 +578,69 @@ pub async fn poll_job(
                 "poll_job: long-poll elapsed without an available job"
             );
             (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response()
+        }
+    }
+}
+
+/// What a pipeline that a runner-side transition settled is owed:
+/// `completed_now` is whether this transition is the one that settled it.
+async fn pipeline_finished(
+    state: &AppState,
+    pipeline: &rg_db::entities::pipeline::Model,
+    completed_now: bool,
+) {
+    if pipeline.status == "success" {
+        // The graph is committed before success follow-ups can move refs
+        // or spawn new work. Re-running this hook remains guarded by the
+        // merge/queue operations it evaluates.
+        state
+            .evaluate_merges_and_spawn_hooks(pipeline.repo_id, &pipeline.commit_sha, None)
+            .await;
+    }
+    if completed_now {
+        crate::metrics::recorder::ci_pipeline_finished(&pipeline.status);
+        if let Err(hook_error) = rg_core::webhook::service::trigger_ci_status(
+            &state.db_pools(),
+            pipeline.repo_id,
+            pipeline.id,
+            &pipeline.status,
+        )
+        .await
+        {
+            tracing::warn!(pipeline_id = pipeline.id, error = %hook_error, "failed to trigger CI webhook");
+        }
+        if pipeline.status == "failed" {
+            rg_core::notification::thread::notify_ci_failed(&state.db_pools(), pipeline.id);
+        }
+    }
+}
+
+/// Expand every matrix of `repo_id` whose stage was reached. A failure is the
+/// expansion's own to report — the placeholder fails with the reason, or the
+/// error is logged here — and never the poll's: the runner asked for work,
+/// and other jobs may still be there to give it.
+async fn expand_ready_matrices(state: &AppState, repo_id: i64) {
+    let ready = match rg_db::ops::pipeline_matrix_ops::ready_deferred_jobs(&state.db, repo_id).await
+    {
+        Ok(ready) => ready,
+        Err(error) => {
+            tracing::error!(repo_id, error = %format!("{error:#}"), "poll_job: deferred matrices could not be listed");
+            return;
+        }
+    };
+    for placeholder in ready {
+        match state
+            .ci_engine
+            .expand_deferred_matrix(&state.db, &placeholder)
+            .await
+        {
+            Ok(Some(pipeline)) => pipeline_finished(state, &pipeline, true).await,
+            Ok(None) => {}
+            Err(error) => tracing::error!(
+                job_id = placeholder.id,
+                error = %format!("{error:#}"),
+                "poll_job: a deferred matrix could not be expanded"
+            ),
         }
     }
 }
@@ -2140,30 +2206,7 @@ pub async fn finish_job(
     crate::api::artifacts::discard_job_staging(&state, job_id).await;
 
     if let Some(pipeline) = transition.completed_pipeline {
-        if pipeline.status == "success" {
-            // The graph is committed before success follow-ups can move refs
-            // or spawn new work. Re-running this hook remains guarded by the
-            // merge/queue operations it evaluates.
-            state
-                .evaluate_merges_and_spawn_hooks(pipeline.repo_id, &pipeline.commit_sha, None)
-                .await;
-        }
-        if transition.pipeline_completed_now {
-            crate::metrics::recorder::ci_pipeline_finished(&pipeline.status);
-            if let Err(hook_error) = rg_core::webhook::service::trigger_ci_status(
-                &state.db_pools(),
-                pipeline.repo_id,
-                pipeline.id,
-                &pipeline.status,
-            )
-            .await
-            {
-                tracing::warn!(pipeline_id = pipeline.id, error = %hook_error, "failed to trigger CI webhook");
-            }
-            if pipeline.status == "failed" {
-                rg_core::notification::thread::notify_ci_failed(&state.db_pools(), pipeline.id);
-            }
-        }
+        pipeline_finished(&state, &pipeline, transition.pipeline_completed_now).await;
     }
 
     // Metrics: job left the running set — count its outcome and, if we know when

@@ -547,7 +547,7 @@ async fn lock_pipeline_for_transition(
         .ok_or_else(|| anyhow::anyhow!("pipeline {pipeline_id} not found for {transition}"))
 }
 
-async fn lock_graph_for_stage_transition(
+pub(crate) async fn lock_graph_for_stage_transition(
     tx: &DatabaseTransaction,
     stage_id: i64,
     pipeline_id: i64,
@@ -1434,6 +1434,11 @@ async fn first_pending_job(
         };
 
         if uncovered_job_tags(&job_tags, runner_labels).is_empty() {
+            // A matrix at its `max-parallel` keeps its next variant back; the
+            // claim re-checks under the graph lock.
+            if !crate::ops::pipeline_matrix_ops::below_max_parallel(db, &job).await? {
+                continue;
+            }
             if accept(&job) {
                 return Ok((Some(job), declined));
             }
@@ -1455,7 +1460,15 @@ async fn first_pending_job(
 /// The `(status, runner_id)` index on `pipeline_jobs` lets the engine start
 /// from the handful of pending jobs instead of walking every pipeline the
 /// repository ever ran; `query_plan_tests` holds it to that.
+///
+/// A placeholder for a matrix decided at run time is not among them: it is
+/// replaced by its variants, never run (see `pipeline_matrix_ops`).
 pub(crate) fn pending_jobs_query(repo_id: i64) -> Select<pipeline_job::Entity> {
+    active_pending_jobs_query(repo_id).filter(pipeline_job::Column::DeferredMatrix.is_null())
+}
+
+/// [`pending_jobs_query`] with the matrix placeholders still in it.
+pub(crate) fn active_pending_jobs_query(repo_id: i64) -> Select<pipeline_job::Entity> {
     pipeline_job::Entity::find()
         .join(
             JoinType::InnerJoin,
@@ -1478,7 +1491,7 @@ pub(crate) fn pending_jobs_query(repo_id: i64) -> Select<pipeline_job::Entity> {
 }
 
 /// Whether every stage that comes before `stage` in its pipeline succeeded.
-fn earlier_stages_succeeded(
+pub(crate) fn earlier_stages_succeeded(
     stage: &pipeline_stage::Model,
     stages: &[pipeline_stage::Model],
 ) -> bool {
@@ -1967,6 +1980,52 @@ async fn assign_job_with_snapshot(
     runner_id: i64,
     encrypted_snapshot: Option<&str>,
 ) -> Result<bool> {
+    // A variant of a matrix with `max-parallel` is claimed under the graph
+    // lock: two pollers that both saw one slot left must not both take it.
+    if let Some(job) = get_job(db, job_id)
+        .await?
+        .filter(|job| job.matrix_max_parallel.is_some())
+    {
+        let stage = get_stage_by_id(db, job.stage_id)
+            .await?
+            .with_context(|| format!("stage {} of job {job_id} is gone", job.stage_id))?;
+        return crate::contention::retry_transaction("claim a matrix variant", || async {
+            let tx = db.begin().await.context("db: begin matrix variant claim")?;
+            let claimed = async {
+                lock_graph_for_stage_transition(&tx, stage.id, stage.pipeline_id, "matrix claim")
+                    .await?;
+                if !crate::ops::pipeline_matrix_ops::below_max_parallel(&tx, &job).await? {
+                    return Ok(false);
+                }
+                claim_pending_job(&tx, job_id, runner_id, encrypted_snapshot).await
+            }
+            .await;
+            match claimed {
+                Ok(claimed) => {
+                    tx.commit()
+                        .await
+                        .context("db: commit matrix variant claim")?;
+                    Ok(claimed)
+                }
+                Err(error) => {
+                    if let Err(rollback) = tx.rollback().await {
+                    tracing::error!(error = %format!("{rollback:#}"), "matrix variant claim could not be rolled back");
+                }
+                    Err(error)
+                }
+            }
+        })
+        .await;
+    }
+    claim_pending_job(db, job_id, runner_id, encrypted_snapshot).await
+}
+
+async fn claim_pending_job(
+    db: &impl ConnectionTrait,
+    job_id: i64,
+    runner_id: i64,
+    encrypted_snapshot: Option<&str>,
+) -> Result<bool> {
     let now = chrono::Utc::now().naive_utc();
     let result = pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::Id.eq(job_id))
@@ -2427,6 +2486,12 @@ pub async fn finish_runner_job(
             let job_settled =
                 settle_job_if_active(&tx, job_id, status, exit_code, log, finished_at).await?;
             crate::ops::runner_ops::update_status(&tx, runner_id, "online").await?;
+            if job_settled {
+                if let Some(job) = &job_before {
+                    crate::ops::pipeline_matrix_ops::cancel_fail_fast_siblings(&tx, job, status)
+                        .await?;
+                }
+            }
 
             if !job_settled {
                 return Ok(FinishRunnerJobTransition {
@@ -2570,6 +2635,10 @@ pub async fn finish_embedded_job(
                 }
                 if !settle_job_if_active(&tx, job_id, status, exit_code, log, finished_at).await? {
                     return Ok(EmbeddedJobTransition::default());
+                }
+                if let Some(job) = &job {
+                    crate::ops::pipeline_matrix_ops::cancel_fail_fast_siblings(&tx, job, status)
+                        .await?;
                 }
                 let stage_status = try_update_stage(&tx, stage_id).await?;
                 let pipeline_status = match stage_status {

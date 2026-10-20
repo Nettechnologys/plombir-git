@@ -54,6 +54,15 @@ pub struct Model {
     /// The job's resolved, masked `outputs:` as a JSON object, once its last
     /// step ran; what `needs.<id>.outputs.*` reads in the jobs after it.
     pub outputs: Option<String>,
+    /// What a job whose matrix reads a needed job's outputs will expand from,
+    /// on the one placeholder row that stands for it until its stage is
+    /// reached. Such a row is never handed to a runner.
+    pub deferred_matrix: Option<String>,
+    /// The matrix job this row is a variant of — its name in the pipeline —
+    /// and that job's `strategy.fail-fast` / `strategy.max-parallel`.
+    pub matrix_group: Option<String>,
+    pub matrix_fail_fast: Option<bool>,
+    pub matrix_max_parallel: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

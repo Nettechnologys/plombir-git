@@ -752,49 +752,38 @@ impl GiteaEnvironment {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GiteaStrategy {
-    #[serde(default)]
-    pub matrix: std::collections::BTreeMap<String, Vec<GiteaMatrixValue>>,
+    /// A mapping of dimensions with `include` / `exclude`, any part of which
+    /// — or all of it — may read a needed job's outputs through `fromJSON`.
+    #[serde(default, deserialize_with = "deserialize_matrix")]
+    pub(crate) matrix: Option<crate::matrix::MatrixSpec>,
+    /// A failed variant cancels the variants that have not finished; `true`
+    /// unless the workflow says otherwise, as on GitHub.
+    #[serde(default, rename = "fail-fast")]
+    pub fail_fast: Option<bool>,
+    /// At most this many variants run at once.
+    #[serde(default, rename = "max-parallel")]
+    pub max_parallel: Option<u32>,
 }
 
-/// A matrix value Plombir Git can preserve as one concrete job variant.
-///
-/// Keeping this closed after the raw-YAML diagnostic pass makes loss impossible
-/// in `to_ci_config`: every value in the typed workflow has a string form, so
-/// conversion cannot use `filter_map` and silently reduce the Cartesian product.
-#[derive(Debug, Clone)]
-pub enum GiteaMatrixValue {
-    String(String),
-    Bool(bool),
-    Number(serde_json::Number),
-}
-
-impl GiteaMatrixValue {
-    fn from_yaml(value: serde_json::Value) -> std::result::Result<Self, String> {
-        match value {
-            serde_json::Value::String(value) => Ok(Self::String(value)),
-            serde_json::Value::Bool(value) => Ok(Self::Bool(value)),
-            serde_json::Value::Number(value) => Ok(Self::Number(value)),
-            _ => Err("must be a string, number, or boolean".into()),
-        }
-    }
-
-    fn as_string(&self) -> String {
-        match self {
-            Self::String(value) => value.clone(),
-            Self::Bool(value) => value.to_string(),
-            Self::Number(value) => value.to_string(),
+impl GiteaStrategy {
+    pub(crate) fn matrix_strategy(&self) -> crate::matrix::MatrixStrategy {
+        crate::matrix::MatrixStrategy {
+            fail_fast: self.fail_fast.unwrap_or(true),
+            max_parallel: self.max_parallel,
         }
     }
 }
 
-impl<'de> Deserialize<'de> for GiteaMatrixValue {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        Self::from_yaml(value).map_err(serde::de::Error::custom)
-    }
+fn deserialize_matrix<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<crate::matrix::MatrixSpec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    crate::matrix::MatrixSpec::parse(&raw)
+        .map(Some)
+        .map_err(|(at, reason)| serde::de::Error::custom(format!("strategy.matrix{at} {reason}")))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1313,6 +1302,26 @@ fn unresolvable_runtime_references(workflow: &GiteaWorkflow) -> Vec<String> {
             _ => None,
         };
 
+        if let Some(spec) = job
+            .strategy
+            .as_ref()
+            .and_then(|strategy| strategy.matrix.as_ref())
+        {
+            for reference in spec.needs_outputs() {
+                let parsed = RuntimeKey::NeedsOutput {
+                    job: reference.job.clone(),
+                    name: reference.output.clone(),
+                };
+                if let Some(problem) = needed(
+                    &format!("{job_name}: strategy.matrix"),
+                    &reference.to_string(),
+                    &parsed,
+                ) {
+                    problems.push(problem);
+                }
+            }
+        }
+
         let job_level = |site: String, text: &str, problems: &mut Vec<String>| {
             for (key, parsed) in keys(text) {
                 if step_ref(&parsed).is_some() {
@@ -1567,9 +1576,12 @@ fn validate_job_environments(raw: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// Validate `jobs.<name>.strategy.matrix.<dimension>[index]` while the job and
-/// author-written path are still available for the client-facing refusal.
-fn validate_job_matrix_values(raw: &serde_json::Value) -> Result<()> {
+/// Validate `jobs.<name>.strategy` while the job and author-written path are
+/// still available for the client-facing refusal: every matrix value becomes
+/// one concrete variant or the file is refused, and `fail-fast` /
+/// `max-parallel` are the literal values they have to be when the graph is
+/// written.
+fn validate_job_strategies(raw: &serde_json::Value) -> Result<()> {
     let Some(jobs) = raw
         .as_object()
         .and_then(|root| root.get("jobs"))
@@ -1579,30 +1591,34 @@ fn validate_job_matrix_values(raw: &serde_json::Value) -> Result<()> {
     };
 
     for (job_name, job) in jobs {
-        let Some(matrix) = job
+        let Some(strategy) = job
             .as_object()
             .and_then(|job| job.get("strategy"))
             .and_then(serde_json::Value::as_object)
-            .and_then(|strategy| strategy.get("matrix"))
         else {
             continue;
         };
-        let Some(matrix) = matrix.as_object() else {
-            anyhow::bail!("job '{job_name}' strategy.matrix must be a mapping");
-        };
-
-        for (dimension, values) in matrix {
-            let Some(values) = values.as_array() else {
+        if let Some(matrix) = strategy.get("matrix") {
+            crate::matrix::MatrixSpec::parse(matrix).map_err(|(at, reason)| {
+                anyhow::anyhow!("job '{job_name}' strategy.matrix{at} {reason}")
+            })?;
+        }
+        if let Some(fail_fast) = strategy.get("fail-fast") {
+            if !fail_fast.is_boolean() {
                 anyhow::bail!(
-                    "job '{job_name}' strategy.matrix.{dimension} must be a list of strings, numbers, or booleans"
+                    "job '{job_name}' strategy.fail-fast must be true or false; an expression \
+                     has no value when the graph is written"
                 );
-            };
-            for (index, value) in values.iter().enumerate() {
-                GiteaMatrixValue::from_yaml(value.clone()).map_err(|reason| {
-                    anyhow::anyhow!(
-                        "job '{job_name}' strategy.matrix.{dimension}[{index}] {reason}"
-                    )
-                })?;
+            }
+        }
+        if let Some(max_parallel) = strategy.get("max-parallel") {
+            if !max_parallel
+                .as_u64()
+                .is_some_and(|value| (1..=u64::from(u32::MAX)).contains(&value))
+            {
+                anyhow::bail!(
+                    "job '{job_name}' strategy.max-parallel must be a whole number of at least 1"
+                );
             }
         }
     }
@@ -1639,7 +1655,7 @@ impl GiteaWorkflow {
         let raw: serde_json::Value = rg_core::yaml::from_str(yaml)?;
         validate_job_runs_on(&raw)?;
         validate_job_environments(&raw)?;
-        validate_job_matrix_values(&raw)?;
+        validate_job_strategies(&raw)?;
         let wf: GiteaWorkflow = rg_core::yaml::from_str(yaml)?;
         Ok(wf)
     }
@@ -2611,22 +2627,21 @@ impl GiteaWorkflow {
                         i64::try_from(minutes.saturating_mul(60)).unwrap_or(i64::MAX)
                     }),
                     tags,
-                    matrix: job.strategy.as_ref().map(|strategy| {
-                        strategy
-                            .matrix
-                            .iter()
-                            .map(|(key, values)| {
-                                let values =
-                                    values.iter().map(GiteaMatrixValue::as_string).collect();
-                                (key.clone(), values)
-                            })
-                            .collect()
-                    }),
+                    matrix: None,
                     cache,
                     artifacts,
                     action_templates,
                     steps: Some(steps),
                     job_context: Some(job_context),
+                    actions_matrix: job
+                        .strategy
+                        .as_ref()
+                        .and_then(|strategy| strategy.matrix.clone()),
+                    matrix_strategy: job
+                        .strategy
+                        .as_ref()
+                        .filter(|strategy| strategy.matrix.is_some())
+                        .map(GiteaStrategy::matrix_strategy),
                 },
             );
         }
@@ -4152,13 +4167,22 @@ mod tests {
         );
         assert_eq!(wf.env["MODE"], "0755");
         assert_eq!(wf.env["FLAG"], "yes");
-        let matrix = &wf.jobs["build"].strategy.as_ref().unwrap().matrix["mode"];
-        let rendered: Vec<String> = matrix.iter().map(GiteaMatrixValue::as_string).collect();
+        let matrix = wf.jobs["build"]
+            .strategy
+            .as_ref()
+            .unwrap()
+            .matrix
+            .as_ref()
+            .unwrap()
+            .resolve(|_| None)
+            .unwrap();
+        let values = matrix["mode"].as_array().unwrap();
+        let rendered: Vec<String> = values.iter().map(crate::matrix::value_string).collect();
         assert_eq!(rendered, ["0755", "1", "1.1", "true", "on"]);
-        assert!(matches!(matrix[0], GiteaMatrixValue::String(_)));
-        assert!(matches!(matrix[1], GiteaMatrixValue::Number(_)));
-        assert!(matches!(matrix[3], GiteaMatrixValue::Bool(true)));
-        assert!(matches!(matrix[4], GiteaMatrixValue::String(_)));
+        assert!(values[0].is_string());
+        assert!(values[1].is_number());
+        assert_eq!(values[3], serde_json::Value::Bool(true));
+        assert!(values[4].is_string());
     }
 
     #[allow(dead_code)]
@@ -6111,6 +6135,92 @@ jobs:
         );
     }
 
+    /// card_d97de416d0b0: `strategy` takes `matrix`, `fail-fast` and
+    /// `max-parallel`, and each one it cannot honour is refused by job and key.
+    #[test]
+    fn strategy_keys_are_honoured_or_refused_by_name() {
+        let workflow = GiteaWorkflow::parse(
+            "on: push\njobs:\n  setup:\n    steps:\n      - run: echo ok\n  test:\n    needs: setup\n    strategy:\n      fail-fast: false\n      max-parallel: 2\n      matrix:\n        os: ${{ fromJSON(needs.setup.outputs.os) }}\n        include: [{os: linux, big: true}]\n    steps:\n      - run: echo ok\n",
+        )
+        .unwrap();
+        workflow.validate_supported_actions().unwrap();
+        let config = workflow.to_ci_config(&test_context());
+        let test = &config.jobs["test"];
+        assert_eq!(
+            test.matrix_strategy,
+            Some(crate::matrix::MatrixStrategy {
+                fail_fast: false,
+                max_parallel: Some(2)
+            })
+        );
+        assert_eq!(
+            test.actions_matrix
+                .as_ref()
+                .unwrap()
+                .needs_outputs()
+                .iter()
+                .map(|reference| reference.to_string())
+                .collect::<Vec<_>>(),
+            ["needs.setup.outputs.os"]
+        );
+        assert_eq!(
+            config.jobs["setup"].matrix_strategy, None,
+            "a job without a matrix has no strategy to keep"
+        );
+
+        for (strategy, named) in [
+            (
+                "      fail-fast: ${{ github.ref == 'refs/heads/main' }}\n      matrix:\n        os: [linux]\n",
+                "job 'test' strategy.fail-fast must be true or false",
+            ),
+            (
+                "      max-parallel: 0\n      matrix:\n        os: [linux]\n",
+                "job 'test' strategy.max-parallel must be a whole number of at least 1",
+            ),
+            (
+                "      matrix: ${{ fromJSON(inputs.matrix) }}\n",
+                "job 'test' strategy.matrix `${{ fromJSON(inputs.matrix) }}` is not a matrix this engine can read",
+            ),
+            (
+                "      matrix:\n        os: ${{ matrix.other }}\n",
+                "job 'test' strategy.matrix.os `${{ matrix.other }}` is not a matrix this engine can read",
+            ),
+            (
+                "      matrix:\n        include: [linux]\n",
+                "job 'test' strategy.matrix.include[0] must be a mapping",
+            ),
+            (
+                "      matrix:\n        os: [linux]\n      parallelism: 3\n",
+                "parallelism",
+            ),
+        ] {
+            let yaml = format!(
+                "on: push\njobs:\n  test:\n    strategy:\n{strategy}    steps:\n      - run: echo ok\n"
+            );
+            let error = format!(
+                "{:#}",
+                GiteaWorkflow::parse(&yaml).expect_err(&format!("`{strategy}` must be refused"))
+            );
+            assert!(error.contains(named), "`{strategy}`: expected `{named}` in: {error}");
+        }
+
+        let error = format!(
+            "{:#}",
+            GiteaWorkflow::parse(
+                "on: push\njobs:\n  setup:\n    steps:\n      - run: echo ok\n  test:\n    strategy:\n      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}\n    steps:\n      - run: echo ok\n",
+            )
+            .unwrap()
+            .validate_supported_actions()
+            .expect_err("a matrix can only read a job this one needs")
+        );
+        assert!(
+            error.contains(
+                "test: strategy.matrix expression `needs.setup.outputs.matrix`: `setup` is not a job this job needs — it needs no job"
+            ),
+            "{error}"
+        );
+    }
+
     /// What a job's steps and its `outputs:` read stays a `${{ }}` the runner
     /// fills in, and the job carries the map from the ids it reads `needs.*`
     /// by to the jobs those name.
@@ -6872,9 +6982,20 @@ jobs:
             event_schedule: None,
         });
         let job = ci.jobs.get("test").unwrap();
-        let matrix = job.matrix.as_ref().unwrap();
-        assert_eq!(matrix["os"], vec!["linux", "macos"]);
-        assert_eq!(matrix["version"], vec!["1", "2"]);
+        let names = crate::expand_matrix("test", job)
+            .unwrap()
+            .into_iter()
+            .map(|variant| variant.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "test [os=linux, version=1]",
+                "test [os=linux, version=2]",
+                "test [os=macos, version=1]",
+                "test [os=macos, version=2]",
+            ]
+        );
         assert!(job
             .script
             .iter()

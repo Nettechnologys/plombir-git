@@ -136,8 +136,8 @@ cited in the row added it. Plombir Git's side is specified in full in
 | `jobs.<id>.continue-on-error` | ✅ | ✅ with Runner 2.0 and Gitea ≥ 1.27 |
 | `jobs.<id>.environment` | ✅ an existing environment; a protected one waits for a person's approval | ⚠️ ignored |
 | `needs`, `if`, `env`, `defaults.run.working-directory` | ✅ | ✅ |
-| `strategy.matrix` | ✅ static | ✅ static and dynamic |
-| `strategy.fail-fast`, `strategy.max-parallel` | ❌ refused | ✅ |
+| `strategy.matrix` | ✅ static and dynamic (`fromJSON(needs.<job>.outputs.<name>)`), `include` / `exclude` | ✅ static and dynamic |
+| `strategy.fail-fast`, `strategy.max-parallel` | ✅ | ✅ |
 | Reusable workflows | ✅ same repository only | ✅ |
 | `container.image`, `container.env` | ✅ | ✅ |
 | `container.options` | ❌ refused — it could undo the job sandbox | ✅ |
