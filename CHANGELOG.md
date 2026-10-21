@@ -53,6 +53,12 @@ This project records user-facing changes here. The format follows
 
 ### Fixed
 
+- An approval or a change request an import brought no longer counts toward
+  branch protection. It was given on another platform, on a commit nobody
+  verified here; on a pull request with no recorded head — every GitLab merge
+  request imported before its head was kept — it counted as the importer's own
+  approval.
+
 - "Files changed" of a merged or closed pull request shows what it changed.
   It was measured from the base branch's tip *now*, which after a merge
   already holds the head, so a merged pull request showed no changes at all;

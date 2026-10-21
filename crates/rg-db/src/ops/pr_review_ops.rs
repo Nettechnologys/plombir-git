@@ -48,6 +48,16 @@ pub async fn current_approvers(
     let reviews = list_by_pr(db, pr_id).await?;
     let mut latest = std::collections::HashMap::new();
     for review in reviews {
+        // A verdict an import brought is history from another platform: given
+        // there, on a commit nobody verified here, and stored under the account
+        // that ran the import (card_04088376105b). It neither approves nor
+        // blocks. Counted, an imported approval on a pull request with no
+        // recorded head — every GitLab merge request imported before its head
+        // was kept — authorized a merge as the importer, and would authorize
+        // it as whoever the review is later re-attributed to.
+        if review.original_service.is_some() {
+            continue;
+        }
         if matches!(review.action.as_str(), "approve" | "request_changes") {
             latest.insert(review.reviewer_id, review);
         }
