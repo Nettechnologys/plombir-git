@@ -790,6 +790,201 @@ async fn the_external_runner_hands_a_jobs_outputs_to_the_job_that_needs_it() {
     assert!(log.contains("got=1.2.3 result=success"), "{log}");
 }
 
+/// card_5e09bc40b020's acceptance on the external runner: a variant's
+/// `working-directory: ${{ matrix.dir }}`, stored as `${MATRIX_DIR}` beside
+/// the variant's `MATRIX_DIR`, runs the step in that variant's directory, and
+/// `${{ inputs.dir }}` that became `../..` is refused by name — the runner
+/// hands no shell this field, so it is the one that reads the value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_external_runner_reads_a_working_directory_from_the_jobs_variables() {
+    use sea_orm::ConnectionTrait;
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let owner = "directory-runner";
+    let (token, _) = register_full(&base, owner, &format!("{owner}@example.com")).await;
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"name":"directory","auto_init":true,"readme":"default"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let repo_id = created.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let sha = client
+        .get(format!("{base}/api/v1/repos/{owner}/directory/log"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["commits"][0]["sha"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo_id,
+        &sha,
+        "refs/heads/main",
+        "push",
+        None,
+    )
+    .await
+    .unwrap();
+    let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "build", 0)
+        .await
+        .unwrap();
+    // Process-unique ids keep a sibling test process out of these jobs'
+    // workspaces (see `the_external_runner_runs_and_reports_each_step`).
+    let base_id = 30_000_000 + 3 * i64::from(std::process::id());
+    let in_variant = serde_json::json!([
+        { "name": "Make", "run": "mkdir -p a b" },
+        {
+            "name": "Where",
+            "run": "echo \"in=[$(basename \"$PWD\")]\"",
+            "working_directory": "${MATRIX_DIR}",
+        },
+    ]);
+    let climbing = serde_json::json!([
+        { "name": "Climb", "run": "pwd", "working_directory": "${INPUT_DIR}" },
+    ]);
+    let mut ids = Vec::new();
+    for (position, (name, steps, variables)) in [
+        (
+            "test [dir=a]",
+            &in_variant,
+            r#"{"MATRIX_DIR":"a","dir":"a"}"#,
+        ),
+        (
+            "test [dir=b]",
+            &in_variant,
+            r#"{"MATRIX_DIR":"b","dir":"b"}"#,
+        ),
+        ("climb", &climbing, r#"{"INPUT_DIR":"../.."}"#),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let created = rg_db::ops::pipeline_ops::create_job(
+            &db,
+            stage.id,
+            name,
+            "echo flat",
+            None,
+            None,
+            Some(variables),
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let job_id = base_id + position as i64;
+        db.execute_unprepared(&format!(
+            "UPDATE pipeline_jobs SET id = {job_id} WHERE id = {}",
+            created.id
+        ))
+        .await
+        .unwrap();
+        let names = steps
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        rg_db::ops::pipeline_step_ops::create_job_steps(&db, job_id, &steps.to_string(), &names)
+            .await
+            .unwrap();
+        ids.push(job_id);
+    }
+
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo_id,
+        "directory-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let agent = tokio::spawn(rg_runner::run_jobs_until_shutdown_checking_every(
+        reqwest::Client::new(),
+        base.clone(),
+        runner.id,
+        runner_token,
+        rg_runner::JobLimits::default(),
+        async {
+            drop(stopped.await);
+        },
+        std::time::Duration::from_millis(200),
+    ));
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    let mut finished = Vec::new();
+    for &job_id in &ids {
+        let job = loop {
+            let job = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if !rg_db::ops::pipeline_ops::is_active_pipeline_work(&job.status) {
+                break job;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "job {} never ended: {}",
+                job.name,
+                job.status
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        finished.push(job);
+    }
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), agent)
+        .await
+        .unwrap()
+        .unwrap();
+
+    for (position, dir) in [(0, "a"), (1, "b")] {
+        assert_eq!(
+            finished[position].status, "success",
+            "{:?}",
+            finished[position].log
+        );
+        let log = rg_db::ops::pipeline_step_ops::find_job_step(&db, ids[position], 2)
+            .await
+            .unwrap()
+            .unwrap()
+            .log
+            .unwrap_or_default();
+        assert!(log.contains(&format!("in=[{dir}]")), "{dir}: {log}");
+    }
+    assert_eq!(finished[2].status, "failure", "{:?}", finished[2].log);
+    let log = rg_db::ops::pipeline_step_ops::find_job_step(&db, ids[2], 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .log
+        .unwrap_or_default();
+    assert!(
+        log.contains("working-directory `../..` must stay inside the workspace"),
+        "{log}"
+    );
+}
+
 /// card_bc6676ec0ae3: a job's `services:` travel to the runner with the job,
 /// and a runner that runs steps but does not start services — protocol 2 — is
 /// refused such a job by name instead of running its steps against a

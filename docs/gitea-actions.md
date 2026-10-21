@@ -651,7 +651,7 @@ which is read before the job's first step runs.
 | `with` | map | Inputs for that action. |
 | `env` | map string→string | Variables for this step. |
 | `if` | string | Condition, read between steps. See below. |
-| `working-directory` | string | Directory for this step's `run:`, relative to the workspace. Requires `run:`. |
+| `working-directory` | string | Directory for this step's `run:`, relative to the workspace. Requires `run:`. Expressions in it (`${{ matrix.dir }}`, `${{ inputs.dir }}`) are read before the step starts, and what they became must stay inside the workspace: an absolute path or a `..` fails the step by name. |
 | `continue-on-error` | boolean | A failure of this step does not fail the job. Requires `run:`. |
 | `timeout-minutes` | whole number, 1–1440 | The step is stopped, with everything it started, when it runs longer. Requires `run:`. |
 

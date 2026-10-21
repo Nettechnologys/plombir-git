@@ -12967,6 +12967,47 @@ jobs:
             .unwrap_or_default()
     }
 
+    /// card_5e09bc40b020's acceptance, through the embedded runner: a step's
+    /// `working-directory: ${{ matrix.dir }}` — and a job's
+    /// `defaults.run.working-directory` reading it — runs each variant in its
+    /// own directory. It used to become `${MATRIX_DIR}`, which no shell reads
+    /// there, and every variant failed with "No such file or directory".
+    #[tokio::test]
+    async fn a_working_directory_reads_the_matrix_variant() {
+        let (jobs, status, db, _temp) = run_pipeline_on(
+            "on: push\njobs:\n  step:\n    strategy:\n      matrix:\n        dir: [a, b]\n    steps:\n      - run: mkdir -p a b\n      - run: echo \"in=[$(basename \"$PWD\")]\"\n        working-directory: ${{ matrix.dir }}\n  defaulted:\n    strategy:\n      matrix:\n        dir: [a, b]\n    defaults:\n      run:\n        working-directory: ${{ matrix.dir }}\n    steps:\n      - run: mkdir -p a b\n        working-directory: .\n      - run: echo \"in=[$(basename \"$PWD\")]\"\n",
+            "push",
+            None,
+        )
+        .await;
+        assert_eq!(status, "success", "{jobs:?}");
+        for job in ["step", "defaulted"] {
+            for dir in ["a", "b"] {
+                let name = format!("build/{job} [dir={dir}]");
+                let log = step_log(&db, jobs[&name].id, 2).await;
+                assert!(log.contains(&format!("in=[{dir}]")), "{name}: {log}");
+            }
+        }
+    }
+
+    /// A dispatch form names the directory too, so the value it became is what
+    /// has to stay inside the workspace: `../..` is refused by name.
+    #[tokio::test]
+    async fn a_working_directory_from_a_dispatch_input_stays_inside_the_workspace() {
+        let (jobs, status, db, _temp) = run_pipeline_on(
+            "on:\n  workflow_dispatch:\n    inputs:\n      dir:\n        type: string\njobs:\n  ship:\n    steps:\n      - run: pwd\n        working-directory: ${{ inputs.dir }}\n",
+            rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+            Some(&[("dir", "../..")]),
+        )
+        .await;
+        assert_eq!(status, "failed", "{jobs:?}");
+        let log = step_log(&db, jobs["build/ship"].id, 1).await;
+        assert!(
+            log.contains("working-directory `../..` must stay inside the workspace"),
+            "{log}"
+        );
+    }
+
     /// card_d97de416d0b0's acceptance, through the embedded runner: the
     /// matrix of `test` is what `setup` wrote to its outputs, `include` and
     /// all; the placeholder `test` is gone and its variants ran.

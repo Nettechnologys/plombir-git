@@ -785,18 +785,27 @@ struct StepPaths {
     temp: String,
 }
 
-/// The working directory a step runs in, relative to the workspace, refused
-/// when it would leave it.
-/// Where a step runs: `(in the action's directory, relative path)`. A
-/// composite action's step may start its `working-directory` with
-/// [`ACTION_PATH_PLACEHOLDER`] — `${{ github.action_path }}` — and then runs in
-/// the action's files; any other one is inside the workspace.
-fn step_working_directory(step: &StepSpec) -> Result<(bool, Option<&str>), String> {
+/// Where a step runs: `(in the action's directory, relative path)`, refused
+/// when it would leave the workspace. A composite action's step may start its
+/// `working-directory` with [`ACTION_PATH_PLACEHOLDER`] —
+/// `${{ github.action_path }}` — and then runs in the action's files; any
+/// other one is inside the workspace.
+///
+/// No shell reads this field: the directory goes to the process as it is. So
+/// each `${NAME}` the translation wrote in it — `${{ matrix.dir }}`,
+/// `${{ inputs.dir }}`, `${{ github.ref_name }}` — is replaced here from
+/// `placeholders`, as in `env:` values, and the value it became is what has to
+/// stay inside: a matrix entry or a dispatch form can say `../..`.
+fn step_working_directory(
+    step: &StepSpec,
+    placeholders: &BTreeMap<String, String>,
+) -> Result<(bool, Option<String>), String> {
     let Some(declared) = step.working_directory.as_deref() else {
         return Ok((false, None));
     };
     let Some(rest) = declared.strip_prefix(ACTION_PATH_PLACEHOLDER) else {
-        return working_directory(Some(declared)).map(|directory| (false, directory));
+        let expanded = expand_placeholders(declared, placeholders);
+        return working_directory(&expanded).map(|()| (false, Some(expanded)));
     };
     if step.action.is_none() {
         return Err(format!(
@@ -804,19 +813,24 @@ fn step_working_directory(step: &StepSpec) -> Result<(bool, Option<&str>), Strin
              an action's"
         ));
     }
-    let rest = rest.trim_start_matches('/');
+    let expanded = expand_placeholders(rest, placeholders);
+    let rest = expanded.trim_start_matches('/');
     if rest.is_empty() {
         return Ok((true, None));
     }
-    working_directory(Some(rest))
-        .map(|directory| (true, directory))
-        .map_err(|_| format!("working-directory `{declared}` must stay inside the action's files"))
+    working_directory(rest)
+        .map(|()| (true, Some(rest.to_string())))
+        .map_err(|_| {
+            format!(
+                "working-directory `{ACTION_PATH_PLACEHOLDER}/{rest}` must stay inside the \
+                 action's files"
+            )
+        })
 }
 
-fn working_directory(declared: Option<&str>) -> Result<Option<&str>, String> {
-    let Some(declared) = declared else {
-        return Ok(None);
-    };
+/// Refuse a directory that is not relative to where the step starts, or that
+/// climbs out of it.
+fn working_directory(declared: &str) -> Result<(), String> {
     let path = Path::new(declared);
     if path.is_absolute()
         || path.components().any(|component| {
@@ -832,7 +846,7 @@ fn working_directory(declared: Option<&str>) -> Result<Option<&str>, String> {
             "working-directory `{declared}` must stay inside the workspace"
         ));
     }
-    Ok(Some(declared))
+    Ok(())
 }
 
 /// Run every step of a job and report each one as it goes.
@@ -872,9 +886,9 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
             .and_then(|action| action_states.get(&action.state))
             .cloned()
             .unwrap_or_default();
-        let env = step_environment(run, step, &carried_env, &carried_path, number, &state);
+        let environment = step_environment(run, step, &carried_env, &carried_path, number, &state);
         let condition = step.condition.as_deref().unwrap_or("success()");
-        let mut context = step_condition_context(&env);
+        let mut context = step_condition_context(&environment.env);
         context.extend(runtime.condition_entries());
         let runs = match evaluate_step_condition(condition, &context, status) {
             Ok(runs) => runs,
@@ -927,7 +941,7 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
             None => Ok(()),
         };
         let (code, log, file_commands) = match prepared {
-            Ok(()) => execute_step(run, step, number, &env).await,
+            Ok(()) => execute_step(run, step, number, &environment).await,
             Err(reason) => (
                 None,
                 format!("[plombir-git-runner] the action's files are not here: {reason}\n"),
@@ -1120,7 +1134,7 @@ fn step_environment(
     carried_path: &[String],
     number: usize,
     action_state: &[(String, String)],
-) -> Vec<(String, String)> {
+) -> StepEnvironment {
     let paths = step_paths(run, number, step);
     let hidden = |name: &str| {
         run.secrets
@@ -1226,7 +1240,21 @@ fn step_environment(
     if let Some(id) = &step.id {
         env.insert("GITHUB_ACTION".into(), id.clone());
     }
-    env.into_iter().collect()
+    StepEnvironment {
+        env: env.into_iter().collect(),
+        placeholders: visible,
+    }
+}
+
+/// What [`step_environment`] made of one step.
+struct StepEnvironment {
+    /// The step's process environment.
+    env: Vec<(String, String)>,
+    /// What `${NAME}` in the step's declared values reads: the job's
+    /// variables the step may see, what earlier steps wrote to `$GITHUB_ENV`
+    /// and, in an action's step, `GITHUB_ACTION_PATH` — never the step's own
+    /// `env:`.
+    placeholders: BTreeMap<String, String>,
 }
 
 /// The file `$GITHUB_EVENT_PATH` names, in the job's step directory: an
@@ -1358,8 +1386,9 @@ async fn execute_step(
     run: &StepRun<'_>,
     step: &StepSpec,
     number: usize,
-    env: &[(String, String)],
+    environment: &StepEnvironment,
 ) -> (Option<i32>, String, Result<FileCommands, String>) {
+    let env = &environment.env;
     let no_commands = || Err(String::new());
     let shell = match Shell::parse(step.shell.as_deref()) {
         Ok(shell) => shell,
@@ -1371,7 +1400,7 @@ async fn execute_step(
             )
         }
     };
-    let (in_action, directory) = match step_working_directory(step) {
+    let (in_action, directory) = match step_working_directory(step, &environment.placeholders) {
         Ok(directory) => directory,
         Err(reason) => {
             return (
@@ -2462,7 +2491,7 @@ mod tests {
             secrets: None,
             support: JobSupport::default(),
         };
-        let built = step_environment(&run, &step("S", "true"), &[], &[], 1, &[]);
+        let built = step_environment(&run, &step("S", "true"), &[], &[], 1, &[]).env;
         assert!(built.contains(&("ALPHA".to_string(), "${KEPT}".to_string())));
     }
 
@@ -2901,6 +2930,51 @@ mod tests {
         )
         .await;
         (result, root)
+    }
+
+    /// card_5e09bc40b020: no shell reads a step's `working-directory`, so the
+    /// `${NAME}` the translation wrote there — `${{ matrix.dir }}` became
+    /// `${MATRIX_DIR}` — is replaced before the directory is used, from the
+    /// job's variables and never the step's own `env:`; and what it became is
+    /// what has to stay inside the workspace.
+    #[tokio::test]
+    async fn a_working_directory_reads_the_values_its_expressions_became() {
+        let mut make = step("Make", "mkdir -p from-matrix/deeper");
+        make.shell = Some("sh".into());
+        let mut matrix = step("Matrix", "echo \"in=[$(basename \"$PWD\")]\"");
+        matrix.working_directory = Some("${MATRIX_DIR}/${MATRIX_SUB}".into());
+        // The step's own `env:` is not where `${{ matrix.dir }}` comes from.
+        matrix.env.insert("MATRIX_DIR".into(), "elsewhere".into());
+        let mut climbing = step("Climb", "pwd");
+        climbing.working_directory = Some("${INPUT_DIR}".into());
+        climbing.continue_on_error = true;
+        let mut env = job_env();
+        env.extend([
+            ("MATRIX_DIR".to_string(), "from-matrix".to_string()),
+            ("MATRIX_SUB".to_string(), "deeper".to_string()),
+            ("INPUT_DIR".to_string(), "../..".to_string()),
+        ]);
+        let (result, _root) = run_with(
+            &[make, matrix, climbing],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            env,
+        )
+        .await;
+        assert_eq!(result.steps[1].exit_code, Some(0), "{}", result.log);
+        assert!(
+            result.steps[1].log.contains("in=[deeper]"),
+            "{}",
+            result.steps[1].log
+        );
+        assert_eq!(result.steps[2].exit_code, None, "{}", result.log);
+        assert!(
+            result.steps[2]
+                .log
+                .contains("working-directory `../..` must stay inside the workspace"),
+            "{}",
+            result.steps[2].log
+        );
     }
 
     fn with_id(mut spec: StepSpec, id: &str) -> StepSpec {
