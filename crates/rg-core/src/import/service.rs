@@ -3670,7 +3670,15 @@ async fn import_github_pr(
         base_branch: Set(pr.base.ref_name.clone()),
         head_sha: Set(Some(pr.head.sha.clone())),
         merge_strategy: Set(None),
-        merge_commit_sha: Set(None),
+        // What a pull request that is no longer open is diffed between: the
+        // base it was measured against on GitHub, and for a merged one the
+        // commit it became (card_95b947a371fc). An open one reads its branches.
+        merge_commit_sha: Set(if state == "merged" {
+            pr.merge_commit_sha.clone()
+        } else {
+            None
+        }),
+        base_sha: Set((state != "open").then(|| pr.base.sha.clone())),
         head_repo_id: Set(None),
         ci_approved_sha: Set(None),
         ci_approved_by: Set(None),
@@ -4174,9 +4182,18 @@ async fn import_gitlab_mr(
         reviewer_id: Set(None),
         head_branch: Set(mr.source_branch.clone()),
         base_branch: Set(mr.target_branch.clone()),
-        head_sha: Set(None),
+        head_sha: Set(mr.sha.clone()),
         merge_strategy: Set(None),
-        merge_commit_sha: Set(None),
+        // GitLab names no base for a merge request; a merged one is measured
+        // from its merge or squash commit's first parent (card_95b947a371fc).
+        merge_commit_sha: Set(if state == "merged" {
+            mr.merge_commit_sha
+                .clone()
+                .or_else(|| mr.squash_commit_sha.clone())
+        } else {
+            None
+        }),
+        base_sha: Set(None),
         head_repo_id: Set(mr.source_project_id),
         ci_approved_sha: Set(None),
         ci_approved_by: Set(None),
@@ -4711,6 +4728,7 @@ mod imported_issue_label_tests {
             created_at: "2024-01-03T00:00:00Z".to_string(),
             updated_at: "2024-01-03T01:00:00Z".to_string(),
             closed_at: None,
+            merge_commit_sha: None,
         }
     }
 
@@ -4733,6 +4751,9 @@ mod imported_issue_label_tests {
             created_at: "2024-01-04T00:00:00Z".to_string(),
             updated_at: "2024-01-04T01:00:00Z".to_string(),
             closed_at: None,
+            sha: None,
+            merge_commit_sha: None,
+            squash_commit_sha: None,
         }
     }
 
@@ -5003,6 +5024,65 @@ mod imported_issue_label_tests {
         assert_eq!(pr_stats.prs_imported, 1);
         assert_eq!(pr_stats.prs_failed.len(), 1);
         assert_eq!(pr_stats.prs_failed[0].source, "pull request #61");
+    }
+
+    /// A pull request that is no longer open is diffed between commits rather
+    /// than branches, so the import writes the ones its source names: the base
+    /// it was measured against, and for a merged one the commit it became. An
+    /// open one reads its branches, and GitHub's `merge_commit_sha` on it is a
+    /// test merge nobody made.
+    #[tokio::test]
+    async fn github_pull_requests_carry_the_commits_their_diff_is_read_between() {
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let base_sha = "2222222222222222222222222222222222222222";
+        let merge_sha = "3333333333333333333333333333333333333333";
+        for (number, state, merged) in [
+            (1, "open", false),
+            (2, "closed", true),
+            (3, "closed", false),
+        ] {
+            let mut pr = github_pr();
+            pr.number = number;
+            pr.state = state.to_string();
+            pr.merged = Some(merged);
+            pr.merge_commit_sha = Some(merge_sha.to_string());
+            import_github_pr(
+                &db,
+                1,
+                &pr,
+                &[],
+                &[],
+                IMPORTER_ID,
+                &HashMap::new(),
+                &mut stats,
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut rows: Vec<(i64, String, Option<String>, Option<String>)> =
+            rg_db::entities::pull_request::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|pr| (pr.number, pr.state, pr.base_sha, pr.merge_commit_sha))
+                .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            [
+                (1, "open".to_string(), None, None),
+                (
+                    2,
+                    "merged".to_string(),
+                    Some(base_sha.to_string()),
+                    Some(merge_sha.to_string())
+                ),
+                (3, "closed".to_string(), Some(base_sha.to_string()), None),
+            ]
+        );
     }
 
     #[tokio::test]

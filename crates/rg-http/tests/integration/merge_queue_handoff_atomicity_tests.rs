@@ -66,6 +66,7 @@ async fn fixture(owner: &'static str, repo_name: &'static str) -> Fixture {
             head_sha: Set(Some("1".repeat(40))),
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
+            base_sha: Set(None),
             head_repo_id: Set(None),
             ci_approved_sha: Set(None),
             ci_approved_by: Set(None),

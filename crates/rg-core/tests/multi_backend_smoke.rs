@@ -4689,6 +4689,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             head_sha: Set(Some(initial_pr_head.to_string())),
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
+            base_sha: Set(None),
             head_repo_id: Set(None),
             ci_approved_sha: Set(None),
             ci_approved_by: Set(None),

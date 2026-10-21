@@ -127,6 +127,7 @@ pub async fn create_pr(
         head_sha: Set(Some(head_sha)),
         merge_strategy: Set(None),
         merge_commit_sha: Set(None),
+        base_sha: Set(None),
         head_repo_id: Set(head_repo_id),
         ci_approved_sha: Set(None),
         ci_approved_by: Set(None),
@@ -940,6 +941,35 @@ pub async fn compute_diff(
         if !base_repo_path.exists() {
             bail!("repository path does not exist: {:?}", base_repo_path);
         }
+        // A merged or closed pull request is read from the commits it recorded,
+        // not from its branches: deleting the branch is how a pull request
+        // ordinarily ends, and after a merge the base's tip already holds the
+        // head, so `base...head` measured now is empty (card_95b947a371fc).
+        if let Some((base_sha, head_sha)) = settled_diff_revs(&base_repo_path, &pr)? {
+            let key = DiffCacheKey {
+                base_repo: base_repo_path.clone(),
+                head_repo: base_repo_path.clone(),
+                base_branch: pr.base_branch.clone(),
+                head_branch: pr.head_branch.clone(),
+                base_sha: base_sha.clone(),
+                head_sha: head_sha.clone(),
+                reviewed_head_sha: pr.head_sha.clone(),
+            };
+            if let Some(diff) = pr_diff_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+            {
+                return Ok(diff);
+            }
+            // Two commits, both immutable: nothing can move under this entry.
+            let diff = diff_between(&base_repo_path, &pr, &base_sha, &head_sha)?;
+            pr_diff_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, diff.clone());
+            return Ok(diff);
+        }
         require_pull_request_branch(&base_repo_path, "base", &pr.base_branch)?;
         require_pull_request_branch(&head_repo_path, "head", &pr.head_branch)?;
         // Resolve the current refs even when the review is pinned to an older
@@ -1001,6 +1031,85 @@ pub async fn compute_diff(
         Ok(diff)
     })
     .await
+}
+
+/// The two commits a pull request that is no longer open is diffed between,
+/// when `repo_path` holds them; `None` leaves it to the branches, as before.
+///
+/// * The head is `pr.head_sha`, the commit the pull request ended on. It must
+///   be in this repository: a merge brought it here, and so does an import
+///   (`refs/imported-pulls/`). A fork head that neither did is read from the
+///   fork, as before.
+/// * The base is `pr.base_sha` when it was recorded — the tip the merge
+///   moved, or the base an import was told by its source — and this
+///   repository holds it.
+/// * Otherwise the base of a merged pull request is the first parent of its
+///   merge commit — the base's tip just before the merge, for each strategy:
+///   [`gix_merge_no_ff`]'s commit lists the base first, a squash
+///   has the base as its only parent, and a rebase's last commit sits on the
+///   one before it, whose merge base with the original head is the branch
+///   point. Measured from the base's tip *now*, the head of a merge is an
+///   ancestor and the diff is empty.
+/// * A pull request closed unmerged is measured from the base branch's
+///   current tip, which does not hold its head. So is a merged row from
+///   before `base_sha` whose merge commit is the head itself — a rebase that
+///   rewrote nothing — which shows an empty diff, as it always did. Without
+///   the base branch there is no base to read, and the caller says so.
+fn settled_diff_revs(
+    repo_path: &std::path::Path,
+    pr: &PullRequest,
+) -> Result<Option<(String, String)>> {
+    if pr.state == "open" {
+        return Ok(None);
+    }
+    let Some(recorded_head) = pr.head_sha.as_deref().filter(|sha| !sha.is_empty()) else {
+        return Ok(None);
+    };
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+    let Some(head) = held_commit(&repo, recorded_head)? else {
+        return Ok(None);
+    };
+    let merge_parent = match pr.merge_commit_sha.as_deref().filter(|sha| !sha.is_empty()) {
+        Some(merge) => match held_commit(&repo, merge)? {
+            Some(merge) if merge != head => repo
+                .find_commit(merge)
+                .with_context(|| format!("failed to read merge commit {merge}"))?
+                .parent_ids()
+                .next()
+                .map(|parent| parent.detach()),
+            _ => None,
+        },
+        None => None,
+    };
+    let recorded_base = match pr.base_sha.as_deref().filter(|sha| !sha.is_empty()) {
+        Some(base) => held_commit(&repo, base)?,
+        None => None,
+    };
+    let base = match recorded_base.or(merge_parent) {
+        Some(base) => base.to_string(),
+        None => match crate::repo::service::try_get_branch_sha(repo_path, &pr.base_branch)? {
+            Some(tip) => tip,
+            None => return Ok(None),
+        },
+    };
+    Ok(Some((base, head.to_string())))
+}
+
+/// `sha` as a commit `repo` holds. `None` for a value that names no object
+/// here — a fork head never fetched, a commit the source no longer had —
+/// which is a fact about the row, not a failed read; a store that cannot
+/// answer stays an error.
+fn held_commit(repo: &gix::Repository, sha: &str) -> Result<Option<gix::ObjectId>> {
+    let Ok(id) = gix::ObjectId::from_hex(sha.as_bytes()) else {
+        return Ok(None);
+    };
+    let header = repo
+        .try_find_header(id)
+        .with_context(|| format!("failed to look up commit {sha}"))?;
+    Ok(header
+        .filter(|header| header.kind() == gix::object::Kind::Commit)
+        .map(|_| id))
 }
 
 /// The head revision a pull request's diff is about.
@@ -1195,13 +1304,25 @@ fn plombir_git_patch_text(
 /// Compute diff for same-repo PR.
 fn compute_same_repo_diff(repo_path: &std::path::Path, pr: &PullRequest) -> Result<PrDiff> {
     let head_rev = diff_head_rev(repo_path, pr, &format!("refs/heads/{}", pr.head_branch));
-
-    // Both halves below read the same two commits — see `plombir_git_diff_revs`.
-    let (old_rev, new_rev) = plombir_git_diff_revs(
+    diff_between(
         repo_path,
+        pr,
         &format!("refs/heads/{}", pr.base_branch),
         &head_rev,
-    )?;
+    )
+}
+
+/// What `head_rev` adds to `base_rev`, read in `repo_path`: the one reader of a
+/// pull request's diff for both the branches of an open pull request and the
+/// recorded commits of a settled one ([`settled_diff_revs`]).
+fn diff_between(
+    repo_path: &std::path::Path,
+    pr: &PullRequest,
+    base_rev: &str,
+    head_rev: &str,
+) -> Result<PrDiff> {
+    // Both halves below read the same two commits — see `plombir_git_diff_revs`.
+    let (old_rev, new_rev) = plombir_git_diff_revs(repo_path, base_rev, head_rev)?;
 
     // Use gix tree-diff for numstat (files_changed + per-file additions/deletions)
     let (files_changed, stats) = gix_diff_numstat(repo_path, old_rev.clone(), new_rev.clone())?;
@@ -2901,6 +3022,7 @@ mod diff_tests {
             head_sha: None,
             merge_strategy: None,
             merge_commit_sha: None,
+            base_sha: None,
             head_repo_id: None,
             ci_approved_sha: None,
             ci_approved_by: None,
@@ -3293,7 +3415,7 @@ mod diff_tests {
     fn both_diff_paths_take_their_two_revisions_from_one_place() {
         let source = include_str!("service.rs");
 
-        for function in ["compute_same_repo_diff", "compute_cross_repo_diff"] {
+        for function in ["diff_between", "compute_cross_repo_diff"] {
             assert_eq!(
                 rust_source::production_function_call_sites(
                     source,
@@ -3322,7 +3444,7 @@ mod diff_tests {
     fn both_diff_paths_read_their_patch_under_one_rename_model() {
         let source = include_str!("service.rs");
 
-        for function in ["compute_same_repo_diff", "compute_cross_repo_diff"] {
+        for function in ["diff_between", "compute_cross_repo_diff"] {
             assert_eq!(
                 rust_source::production_function_call_sites(
                     source,
@@ -5106,6 +5228,9 @@ async fn update_pr_merged(
     pr.state = "merged".to_string();
     pr.merge_strategy = Some(format!("{:?}", strategy).to_lowercase());
     pr.merge_commit_sha = Some(merge_commit_sha.clone());
+    // What the merged pull request's diff is measured from from now on: the
+    // tip it merged onto (card_95b947a371fc).
+    pr.base_sha = base_sha_before.clone();
     pr.merged_at = Some(Utc::now());
     pr.closed_at = Some(Utc::now());
     pr.updated_at = Utc::now();
@@ -5119,6 +5244,7 @@ async fn update_pr_merged(
     active.state = Set(merged.state.clone());
     active.merge_strategy = Set(merged.merge_strategy.clone());
     active.merge_commit_sha = Set(merged.merge_commit_sha.clone());
+    active.base_sha = Set(merged.base_sha.clone());
     active.auto_merge_enabled = Set(false);
     active.merged_at = Set(merged.merged_at);
     active.closed_at = Set(merged.closed_at);
@@ -6239,6 +6365,7 @@ mod number_allocation_tests {
             head_sha: Set(None),
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
+            base_sha: Set(None),
             head_repo_id: Set(None),
             ci_approved_sha: Set(None),
             ci_approved_by: Set(None),
@@ -7392,6 +7519,7 @@ mod merge_conflict_gate_tests {
             head_sha: None,
             merge_strategy: None,
             merge_commit_sha: None,
+            base_sha: None,
             head_repo_id: None,
             ci_approved_sha: None,
             ci_approved_by: None,
@@ -7765,6 +7893,7 @@ mod merge_message_tests {
             head_sha: None,
             merge_strategy: None,
             merge_commit_sha: None,
+            base_sha: None,
             head_repo_id: None,
             ci_approved_sha: None,
             ci_approved_by: None,

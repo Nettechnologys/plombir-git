@@ -38,6 +38,7 @@ async fn insert_pr(db: &sea_orm::DatabaseConnection, repo_id: i64, author_id: i6
             head_sha: Set(Some("0".repeat(40))),
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
+            base_sha: Set(None),
             head_repo_id: Set(None),
             ci_approved_sha: Set(None),
             ci_approved_by: Set(None),

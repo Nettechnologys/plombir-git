@@ -463,6 +463,7 @@ async fn insert_pr(
             head_sha: Set(Some("0000000000000000000000000000000000000000".to_string())),
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
+            base_sha: Set(None),
             head_repo_id: Set(None),
             ci_approved_sha: Set(None),
             ci_approved_by: Set(None),

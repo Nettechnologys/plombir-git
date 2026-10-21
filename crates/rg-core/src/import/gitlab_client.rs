@@ -89,6 +89,15 @@ pub struct GitLabMR {
     pub created_at: String,
     pub updated_at: String,
     pub closed_at: Option<String>,
+    /// The merge request's head commit.
+    #[serde(default)]
+    pub sha: Option<String>,
+    /// The merge commit, when the merge made one; `None` for a fast-forward.
+    #[serde(default)]
+    pub merge_commit_sha: Option<String>,
+    /// The squash commit, when the merge request was squashed.
+    #[serde(default)]
+    pub squash_commit_sha: Option<String>,
 }
 
 /// Milestone from GitLab API.

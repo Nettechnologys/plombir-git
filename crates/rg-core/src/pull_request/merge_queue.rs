@@ -2083,6 +2083,7 @@ mod merge_group_ref_cleanup_tests {
             head_sha: Set(None),
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
+            base_sha: Set(None),
             head_repo_id: Set(None),
             ci_approved_sha: Set(None),
             ci_approved_by: Set(None),

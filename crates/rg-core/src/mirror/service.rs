@@ -1825,6 +1825,7 @@ mod tests {
                 head_sha: Set(Some(reviewed.clone())),
                 merge_strategy: Set(None),
                 merge_commit_sha: Set(None),
+                base_sha: Set(None),
                 head_repo_id: Set(None),
                 ci_approved_sha: Set(None),
                 ci_approved_by: Set(None),

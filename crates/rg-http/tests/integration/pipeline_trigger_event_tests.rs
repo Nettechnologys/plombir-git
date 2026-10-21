@@ -1175,6 +1175,7 @@ async fn a_pull_request_pipeline_retries_while_its_pull_request_is_open() {
             head_sha: Set(Some(commit_sha.clone())),
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
+            base_sha: Set(None),
             head_repo_id: Set(None),
             ci_approved_sha: Set(None),
             ci_approved_by: Set(None),

@@ -154,6 +154,7 @@ async fn ssh_push_runs_the_post_push_hooks() {
             head_sha: Set(Some(stale_sha.to_string())),
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
+            base_sha: Set(None),
             head_repo_id: Set(None),
             ci_approved_sha: Set(None),
             ci_approved_by: Set(None),

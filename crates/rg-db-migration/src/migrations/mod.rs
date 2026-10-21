@@ -171,6 +171,7 @@ pub mod m20261021_000001_ci_variables;
 pub mod m20261021_000002_pipeline_job_deferred_condition;
 pub mod m20261021_000003_pipeline_head_branch;
 pub mod m20261021_000004_pipeline_job_display_name;
+pub mod m20261021_000005_pull_request_base_sha;
 
 use sea_orm_migration::prelude::*;
 
@@ -432,6 +433,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261021_000002_pipeline_job_deferred_condition::Migration),
             Box::new(m20261021_000003_pipeline_head_branch::Migration),
             Box::new(m20261021_000004_pipeline_job_display_name::Migration),
+            Box::new(m20261021_000005_pull_request_base_sha::Migration),
         ]
     }
 }

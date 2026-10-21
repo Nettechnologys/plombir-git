@@ -72,6 +72,7 @@ async fn setup(directory: &std::path::Path) -> (sea_orm::DatabaseConnection, i64
             head_sha: Set(Some("a".repeat(40))),
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
+            base_sha: Set(None),
             head_repo_id: Set(None),
             ci_approved_sha: Set(None),
             ci_approved_by: Set(None),

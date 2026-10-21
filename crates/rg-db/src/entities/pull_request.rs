@@ -37,6 +37,13 @@ pub struct Model {
     pub merge_strategy: Option<String>,
     /// SHA of the merge commit (null = not yet merged)
     pub merge_commit_sha: Option<String>,
+    /// The base commit a pull request that is no longer open is measured from
+    /// (card_95b947a371fc): the tip a merge moved, or the base an import's
+    /// source recorded. `None` while it is open — its diff reads the branch —
+    /// for one closed unmerged here, whose base branch's tip serves, and on rows
+    /// from before the column, whose diff falls back to the merge commit's
+    /// first parent.
+    pub base_sha: Option<String>,
     /// For fork PRs: the repository where head_branch lives (null = same as repo_id)
     pub head_repo_id: Option<i64>,
     /// The head commit a maintainer has permitted CI to run for.

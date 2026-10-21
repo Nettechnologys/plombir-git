@@ -44,6 +44,17 @@ This project records user-facing changes here. The format follows
 
 ### Fixed
 
+- "Files changed" of a merged or closed pull request shows what it changed.
+  It was measured from the base branch's tip *now*, which after a merge
+  already holds the head, so a merged pull request showed no changes at all;
+  and once its branch was deleted the diff answered `409` even though the
+  commit was still in the repository. A pull request that is no longer open is
+  now diffed between the commits it recorded: its head, and the base tip the
+  merge moved (the new `pull_requests.base_sha`), or the base the import's
+  source named. Rows merged before this release fall back to the merge
+  commit's first parent, which covers every strategy except a rebase that
+  rewrote nothing.
+
 - An import from GitHub or GitLab keeps the head commit of every pull request
   the source has, under the server-private `refs/imported-pulls/<n>/head`.
   `git clone --bare` brings branches and tags only, so a merged pull request

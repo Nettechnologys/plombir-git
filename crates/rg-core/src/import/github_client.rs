@@ -83,6 +83,12 @@ pub struct GitHubPR {
     pub created_at: String,
     pub updated_at: String,
     pub closed_at: Option<String>,
+    /// The commit a merged pull request became on its base: the merge commit,
+    /// the squash, or the last rebased commit. For one that is not merged GitHub
+    /// fills it with a test merge nobody made, which is why the import reads it
+    /// only when `merged` is true.
+    #[serde(default)]
+    pub merge_commit_sha: Option<String>,
 }
 
 /// Git reference in a PR.

@@ -75,6 +75,7 @@ async fn seed_pull_request(db: &rg_db::DatabaseConnection, repo_id: i64, author_
             head_sha: Set(None),
             merge_strategy: Set(None),
             merge_commit_sha: Set(None),
+            base_sha: Set(None),
             head_repo_id: Set(None),
             ci_approved_sha: Set(None),
             ci_approved_by: Set(None),
