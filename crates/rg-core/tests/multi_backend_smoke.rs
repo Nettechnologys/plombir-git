@@ -3744,6 +3744,8 @@ const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
         &[
             "auto_merge_strategy",
             "base_branch",
+            // A commit id the merge or the import writes (card_95b947a371fc).
+            "base_sha",
             "head_branch",
             "head_sha",
             "labels",
