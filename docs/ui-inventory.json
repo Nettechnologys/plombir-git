@@ -4892,6 +4892,16 @@
     },
     {
       "method": "GET",
+      "url": "/api/v1/runners/{id}/jobs/{job_id}/actions/{key}",
+      "access": "Foreign:RUNNER_AUTH_LAYER",
+      "handler": "api::runners::download_action",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "GET",
       "url": "/api/v1/runners/{id}/jobs/{job_id}/cache",
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::runners::download_cache",

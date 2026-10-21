@@ -241,8 +241,8 @@ pub const BUILTIN_CI_VARIABLES: [&str; 12] = rg_process::job_environment::RUNNER
 /// The runner protocol of the step model, for the HTTP layer that hands jobs
 /// out — see [`rg_process::ci_steps::STEPS_PROTOCOL`].
 pub use rg_process::ci_steps::{
-    MAX_JOB_OUTPUT_BYTES, RUNNER_PROTOCOL_HEADER, SCOPED_SECRETS_PROTOCOL, SERVICES_PROTOCOL,
-    STEPS_PROTOCOL,
+    JS_ACTIONS_PROTOCOL, MAX_JOB_OUTPUT_BYTES, RUNNER_PROTOCOL_HEADER, SCOPED_SECRETS_PROTOCOL,
+    SERVICES_PROTOCOL, STEPS_PROTOCOL,
 };
 
 /// What a native `.plombir-git-ci.yml` job's `CI_JOB_TOKEN` may do: read the
@@ -254,6 +254,12 @@ pub const NATIVE_JOB_TOKEN_SCOPES: &str = "repo:read packages:read id-token:writ
 /// `permissions:` — GitHub's restricted default: read the repository and its
 /// packages, and no workload identity, which takes `id-token: write`.
 pub const DEFAULT_ACTIONS_JOB_TOKEN_SCOPES: &str = "repo:read packages:read";
+
+/// The directory under the repository root that holds the archives of the
+/// JavaScript actions' files runners fetch: one tar per (repository, commit,
+/// directory), named by its key. Written when a workflow is read, served to
+/// the external runner by `GET /runners/{id}/jobs/{job_id}/actions/{key}`.
+pub const ACTION_ARCHIVES_DIR: &str = "_ci_action_archives";
 
 /// The scope a job token needs to be exchanged at `/ci/oidc/token`.
 pub const ID_TOKEN_SCOPE: &str = "id-token:write";

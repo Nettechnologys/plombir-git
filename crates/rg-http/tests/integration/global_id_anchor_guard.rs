@@ -620,7 +620,7 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// and job ids — the route layer anchors the first, `assigned_job` the second —
 /// and `api::ci::get_job_step_log` a pipeline and a job id, anchored by
 /// `pipeline_in_repo` and `job_belongs_to_pipeline` as the job-log route is.
-const CENSUS_TOTAL: usize = 161;
+const CENSUS_TOTAL: usize = 163;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

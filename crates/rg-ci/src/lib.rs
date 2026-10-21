@@ -12028,3 +12028,114 @@ mod composite_action_tests {
             .expect("a SHA the cache holds needs no upstream");
     }
 }
+
+/// card_a1290adf28fd: the acceptance — the real `actions/setup-node` and
+/// `actions/setup-go`, pinned by commit, loaded from GitHub the way an
+/// operator's `actions_sources = ["upstream"]` loads them, packed into the
+/// server's archives and run by the step runner with Node. Ignored: it needs
+/// the network (github.com, nodejs.org, go.dev) and Node.js on the host.
+#[cfg(test)]
+mod javascript_action_tests {
+    use super::*;
+
+    const SETUP_NODE: &str = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
+    const SETUP_GO: &str = "actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5";
+
+    #[tokio::test]
+    #[ignore = "needs the network (github.com, nodejs.org, go.dev) and Node.js on the host"]
+    async fn setup_node_and_setup_go_run_from_their_pinned_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let repo_root = root.path().join("repos");
+        let workflow_repo = root.path().join("workflow");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::create_dir_all(&workflow_repo).unwrap();
+        let mut workflow = gitea_actions::GiteaWorkflow::parse(&format!(
+            "on: push\njobs:\n  build:\n    steps:\n      - id: node\n        uses: {SETUP_NODE}\n        with:\n          node-version: '20.18.0'\n      - run: echo \"node=$(node --version) said=${{{{ steps.node.outputs.node-version }}}}\"\n      - uses: {SETUP_GO}\n        with:\n          go-version: '1.22.5'\n          cache: false\n      - run: go version\n"
+        ))
+        .unwrap();
+        let policy = actions::ActionsPolicy::default()
+            .with_sources("ci.actions_sources", &["upstream".into()])
+            .unwrap()
+            .with_require_full_sha(true);
+        let lookup = |_: &str, _: &str| Ok(None);
+        let loader = actions::RepositoryActionLoader {
+            policy: &policy,
+            workflow_repo: &workflow_repo,
+            workflow_repo_id: 1,
+            commit_sha: &"0".repeat(40),
+            repo_root: &repo_root,
+            lookup: &lookup,
+        };
+        // Fetching and packing block, as they do on the trigger's blocking
+        // thread; a test may wait on them in place.
+        actions::expand_actions(&mut workflow, &loader)
+            .unwrap()
+            .unwrap();
+        let expanded = workflow;
+        expanded.validate_supported_actions().unwrap();
+        let config = expanded.to_ci_config(&gitea_actions::WorkflowContext {
+            ref_name: "refs/heads/main".into(),
+            sha: "0".repeat(40),
+            event: "push".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            event_schedule: None,
+        });
+        let job = &config.jobs["build"];
+        let steps = job.steps.clone().unwrap();
+        assert!(
+            steps.iter().any(|step| step.action.is_some()),
+            "no step runs an action: {steps:#?}"
+        );
+
+        let workspace = root.path().join("workspace");
+        let tool_cache = root.path().join("tool-cache");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&tool_cache).unwrap();
+        let mut env = vec![
+            ("CI".to_string(), "true".to_string()),
+            ("CI_REF".to_string(), "refs/heads/main".to_string()),
+            ("CI_EVENT".to_string(), "push".to_string()),
+            ("CI_REPOSITORY".to_string(), "o/r".to_string()),
+            (
+                "HOME".to_string(),
+                root.path().to_string_lossy().into_owned(),
+            ),
+        ];
+        if let Ok(path) = std::env::var("PATH") {
+            env.push(("PATH".to_string(), path));
+        }
+        let archives = runner::ServerActionArchives {
+            root: repo_root.join(actions::ACTION_ARCHIVES_DIR),
+        };
+        let mask = |log: &str| log.to_string();
+        let run = rg_process::ci_steps::run_job_steps(
+            &steps,
+            &env,
+            &workspace,
+            None,
+            None,
+            &mask,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            None,
+            rg_process::ci_steps::JobSupport {
+                actions: Some(&archives),
+                tool_cache: Some(&tool_cache),
+            },
+            &mut rg_process::ci_steps::Silent,
+        )
+        .await;
+        assert_eq!(run.exit_code, 0, "{}", run.log);
+        assert!(
+            run.log.contains("node=v20.18.0 said=v20.18.0"),
+            "{}",
+            run.log
+        );
+        assert!(run.log.contains("go version go1.22.5"), "{}", run.log);
+        assert!(
+            std::fs::read_dir(&tool_cache).unwrap().count() >= 2,
+            "the toolchains were not kept in the tool cache"
+        );
+    }
+}

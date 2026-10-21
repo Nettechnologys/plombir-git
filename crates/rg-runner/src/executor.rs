@@ -213,6 +213,7 @@ pub(crate) async fn run_job_docker(
             limits,
             temp: None,
             network: None,
+            tool_cache: None,
         },
     )
     .await
@@ -309,6 +310,7 @@ mod tests {
                 limits: &rg_process::docker_job::JobLimits::default(),
                 temp: None,
                 network: None,
+                tool_cache: None,
             },
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         )

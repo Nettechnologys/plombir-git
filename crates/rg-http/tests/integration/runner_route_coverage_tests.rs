@@ -1,7 +1,7 @@
 //! Every path `rg-runner` builds must be a route this server mounts
 //! (card_66eead51bb23).
 //!
-//! `crates/rg-runner/src/api.rs` spells fourteen `/api/v1/runners/...` URLs out
+//! `crates/rg-runner/src/api.rs` spells fifteen `/api/v1/runners/...` URLs out
 //! as format strings, in a crate that cannot see the route table. Nothing compared
 //! them with [`rg_http::routes`] — the agreement was held by eye, and the server
 //! tests that touch these endpoints (`runner_auth_tests`, `admin_runner_tests`)
@@ -139,9 +139,9 @@ struct RouteExpectation {
 
 /// Every route this sweep drives, spelled the way `routes.rs` spells it.
 ///
-/// `rg-runner` assembles all fourteen URLs out of ids at runtime, so the probes
+/// `rg-runner` assembles all fifteen URLs out of ids at runtime, so the probes
 /// prove the path without any test source ever naming it. `docs/ui-inventory.json`
-/// reads test sources, so all fourteen read there as routes nothing touches — and
+/// reads test sources, so all fifteen read there as routes nothing touches — and
 /// for `POST .../jobs/{job_id}/log` and `PUT .../jobs/{job_id}/artifacts/staging`
 /// there was no other test to fall back on (card_d482cf7e098e).
 ///
@@ -149,7 +149,7 @@ struct RouteExpectation {
 /// holds every recorded request to the row that claims it, so a probe pointed at
 /// another route — or a route renamed on either side — fails here instead of
 /// quietly changing what the artefact claims.
-const ROUTE_EXPECTATIONS: [RouteExpectation; 14] = [
+const ROUTE_EXPECTATIONS: [RouteExpectation; 15] = [
     RouteExpectation {
         probe: "register_runner",
         method: "POST",
@@ -191,6 +191,11 @@ const ROUTE_EXPECTATIONS: [RouteExpectation; 14] = [
         route: "/api/v1/runners/{id}/jobs/{job_id}/workspace",
     },
     RouteExpectation {
+        probe: "fetch_action",
+        method: "GET",
+        route: "/api/v1/runners/{id}/jobs/{job_id}/actions/{key}",
+    },
+    RouteExpectation {
         probe: "restore_cache",
         method: "GET",
         route: "/api/v1/runners/{id}/jobs/{job_id}/cache",
@@ -229,7 +234,11 @@ fn probe_path(route: &str, runner_id: i64, job_id: i64) -> String {
         .replace("{job_id}", &job_id.to_string())
         // The step probe reports step 1.
         .replace("{number}", "1")
+        .replace("{key}", PROBE_ACTION_KEY)
 }
+
+/// The archive key the action probe asks for.
+const PROBE_ACTION_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// This call addressed exactly the route credited to it, and nothing else.
 fn assert_addressed_the_credited_route(name: &str, seen: &[Seen], runner_id: i64, job_id: i64) {
@@ -492,6 +501,21 @@ async fn every_runner_api_call_addresses_a_route_this_server_mounts() {
         "download_workspace",
         probe(&recorder, "download_workspace", async {
             rg_runner::api::download_workspace(&client, &base, runner_id, job_id, token).await
+        })
+        .await,
+    );
+    record_probe(
+        "fetch_action",
+        probe(&recorder, "fetch_action", async {
+            rg_runner::api::HttpActionArchives {
+                client: &client,
+                server: &base,
+                runner_id,
+                job_id,
+                token,
+            }
+            .download(PROBE_ACTION_KEY, &workspace.join("action.tar"))
+            .await
         })
         .await,
     );

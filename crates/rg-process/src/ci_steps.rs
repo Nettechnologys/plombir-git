@@ -60,8 +60,13 @@ pub const SERVICES_PROTOCOL: u32 = 3;
 /// action's steps included — so it is never handed a job that reads any.
 pub const SCOPED_SECRETS_PROTOCOL: u32 = 4;
 
+/// The protocol in which a runner also runs JavaScript actions: it fetches an
+/// action's files ([`ActionFiles::Archive`]) and runs [`ActionStep::entry`]
+/// with Node. A runner below it is never handed a job with such a step.
+pub const JS_ACTIONS_PROTOCOL: u32 = 5;
+
 /// What this build's runner speaks, and sends with every poll.
-pub const RUNNER_PROTOCOL: u32 = SCOPED_SECRETS_PROTOCOL;
+pub const RUNNER_PROTOCOL: u32 = JS_ACTIONS_PROTOCOL;
 
 /// Where a containerised job's workspace is mounted.
 pub const CONTAINER_WORKSPACE: &str = "/workspace";
@@ -113,7 +118,67 @@ pub struct StepSpec {
     /// step may read none.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub secrets: BTreeSet<String>,
+    /// A step of a JavaScript action: it runs [`ActionStep::entry`] with Node
+    /// instead of `run`. Absent from every other step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ActionStep>,
 }
+
+/// A step that runs one file of a JavaScript action (`runs.using: node*`)
+/// with Node: the action's `pre`, `main` or `post`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionStep {
+    /// Where the action's files are.
+    pub files: ActionFiles,
+    /// `owner/repo` — `GITHUB_ACTION_REPOSITORY`; empty for `./path`.
+    pub repository: String,
+    /// The ref the workflow named — `GITHUB_ACTION_REF`.
+    pub git_ref: String,
+    /// `runs.using`: `node20`, `node24`, …, for the message when Node is missing.
+    pub using: String,
+    /// The file to run, relative to the action's directory.
+    pub entry: String,
+    /// Shared by the `pre`, `main` and `post` of one use of the action: what
+    /// one of them writes to `$GITHUB_STATE` the later ones read as `STATE_*`.
+    pub state: String,
+}
+
+/// Where a JavaScript action's files come from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActionFiles {
+    /// A tar archive the server made of the action's directory when it read
+    /// the workflow, fetched by `key` ([`ActionArchives`]).
+    Archive { key: String },
+    /// `uses: ./path`: a directory of the workflow's own repository, which is
+    /// the job's workspace.
+    Workspace { path: String },
+}
+
+/// Where a runner fetches the archive of an action's files from.
+pub trait ActionArchives: Sync {
+    /// Write the archive named `key` to `into` (a file this module removes).
+    fn fetch<'a>(
+        &'a self,
+        key: &'a str,
+        into: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+/// What a job of steps may need besides its steps: where the files of its
+/// JavaScript actions come from, and the runner's tool cache.
+#[derive(Clone, Copy, Default)]
+pub struct JobSupport<'a> {
+    pub actions: Option<&'a dyn ActionArchives>,
+    /// `RUNNER_TOOL_CACHE`: a directory that outlives the job, on this runner,
+    /// so `setup-node` and its kind download a toolchain once. Mounted into a
+    /// container job at [`CONTAINER_TOOL_CACHE`].
+    pub tool_cache: Option<&'a Path>,
+}
+
+/// Where a containerised job sees the runner's tool cache.
+pub const CONTAINER_TOOL_CACHE: &str = "/plombir-git/toolcache";
 
 /// The shells a step can ask for, and how each one is started — GitHub's own
 /// command lines for each name.
@@ -502,6 +567,8 @@ pub struct StepRun<'a> {
     /// [`JobContext::secrets`]: the names in `job_env` that are secrets, of
     /// which each step gets only its own. `None` hides none.
     pub secrets: Option<&'a BTreeSet<String>>,
+    /// Where JavaScript actions' files come from, and the tool cache.
+    pub support: JobSupport<'a>,
 }
 
 /// One minute of a step's `timeout-minutes`.
@@ -522,7 +589,15 @@ fn reserved_for_the_runner(name: &str) -> bool {
         || FILE_COMMANDS.contains(&name)
         || matches!(
             name,
-            "PATH" | "HOME" | "GITHUB_WORKSPACE" | "RUNNER_TEMP" | "GITHUB_ACTIONS"
+            "PATH"
+                | "HOME"
+                | "GITHUB_WORKSPACE"
+                | "RUNNER_TEMP"
+                | "GITHUB_ACTIONS"
+                | "GITHUB_STATE"
+                | "GITHUB_EVENT_PATH"
+                | "GITHUB_ACTION_PATH"
+                | "RUNNER_TOOL_CACHE"
         )
 }
 
@@ -678,6 +753,7 @@ struct StepPaths {
     path: String,
     summary: String,
     output: String,
+    state: String,
     workspace: String,
     temp: String,
 }
@@ -719,6 +795,15 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
     let mut states: HashMap<String, StepState> = HashMap::new();
     // `$GITHUB_OUTPUT` bytes written so far, against the job's 1 MiB.
     let mut output_bytes = 0usize;
+    // What each use of a JavaScript action left in `$GITHUB_STATE`, for its
+    // later steps (`ActionStep::state`).
+    let mut action_states: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    // Values a step asked to be masked (`::add-mask::`), hidden from that
+    // step's log on, beside the secrets `run.mask` already hides.
+    let mut added: Vec<String> = Vec::new();
+    if let Err(error) = std::fs::write(run.temp.join(EVENT_FILE), b"{}") {
+        tracing::warn!(%error, "could not write the job's event file");
+    }
 
     for (index, declared) in run.steps.iter().enumerate() {
         let number = index + 1;
@@ -728,7 +813,13 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
         };
         let resolved = runtime.resolve_step(declared);
         let step = &resolved;
-        let env = step_environment(run, step, &carried_env, &carried_path, number);
+        let state = step
+            .action
+            .as_ref()
+            .and_then(|action| action_states.get(&action.state))
+            .cloned()
+            .unwrap_or_default();
+        let env = step_environment(run, step, &carried_env, &carried_path, number, &state);
         let condition = step.condition.as_deref().unwrap_or("success()");
         let mut context = step_condition_context(&env);
         context.extend(runtime.condition_entries());
@@ -778,8 +869,20 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
 
         reporter.started(number).await;
         let started_at = SystemTime::now();
-        let (code, log, file_commands) = execute_step(run, step, number, &env).await;
+        let prepared = match &step.action {
+            Some(action) => materialize_action(run, action).await,
+            None => Ok(()),
+        };
+        let (code, log, file_commands) = match prepared {
+            Ok(()) => execute_step(run, step, number, &env).await,
+            Err(reason) => (
+                None,
+                format!("[plombir-git-runner] the action's files are not here: {reason}\n"),
+                Err(String::new()),
+            ),
+        };
         let finished_at = SystemTime::now();
+        added.extend(added_masks(&log));
 
         let mut log = log;
         let mut failed = code != Some(0);
@@ -808,8 +911,15 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
                     path,
                     summary,
                     outputs: written_outputs,
+                    state: written_state,
                 }) => {
                     outputs = written_outputs;
+                    if let Some(action) = &step.action {
+                        action_states
+                            .entry(action.state.clone())
+                            .or_default()
+                            .extend(written_state);
+                    }
                     carried_env.extend(written);
                     for directory in path.into_iter().rev() {
                         carried_path.insert(0, directory);
@@ -859,7 +969,7 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
             outcome,
             conclusion,
             exit_code: code,
-            log: (run.mask)(&log),
+            log: mask_values(&(run.mask)(&log), &added),
             started_at: Some(started_at),
             finished_at: Some(finished_at),
             outputs,
@@ -877,7 +987,7 @@ pub async fn run_steps(run: &StepRun<'_>, reporter: &mut impl StepReporter) -> S
     let mut outputs = BTreeMap::new();
     let mut total = 0usize;
     for (name, template) in run.outputs {
-        let value = (run.mask)(&runtime.resolve(template));
+        let value = mask_values(&(run.mask)(&runtime.resolve(template)), &added);
         total += name.len() + value.len();
         if total > MAX_JOB_OUTPUT_BYTES {
             push_line(
@@ -956,6 +1066,7 @@ fn step_environment(
     carried_env: &[(String, String)],
     carried_path: &[String],
     number: usize,
+    action_state: &[(String, String)],
 ) -> Vec<(String, String)> {
     let paths = step_paths(run, number, step);
     let hidden = |name: &str| {
@@ -1016,15 +1127,107 @@ fn step_environment(
         // The container keeps its own `PATH`; the host's never reaches it.
         env.remove("PATH");
     }
-    env.insert("GITHUB_ENV".into(), paths.env);
-    env.insert("GITHUB_PATH".into(), paths.path);
-    env.insert("GITHUB_STEP_SUMMARY".into(), paths.summary);
-    env.insert("GITHUB_OUTPUT".into(), paths.output);
-    env.insert("GITHUB_WORKSPACE".into(), paths.workspace);
-    env.insert("RUNNER_TEMP".into(), paths.temp);
+    env.insert("GITHUB_ENV".into(), paths.env.clone());
+    env.insert("GITHUB_PATH".into(), paths.path.clone());
+    env.insert("GITHUB_STEP_SUMMARY".into(), paths.summary.clone());
+    env.insert("GITHUB_OUTPUT".into(), paths.output.clone());
+    env.insert("GITHUB_WORKSPACE".into(), paths.workspace.clone());
+    env.insert(
+        "GITHUB_EVENT_PATH".into(),
+        format!("{}/{EVENT_FILE}", paths.temp),
+    );
+    env.insert("RUNNER_TEMP".into(), paths.temp.clone());
     env.insert("GITHUB_ACTIONS".into(), "true".into());
+    github_context_variables(&mut env);
+    if run.support.tool_cache.is_some() {
+        let cache = match run.backend {
+            StepBackend::Local => run
+                .support
+                .tool_cache
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            StepBackend::Docker { .. } => CONTAINER_TOOL_CACHE.to_string(),
+        };
+        env.insert("RUNNER_TOOL_CACHE".into(), cache);
+    }
+    if let Some(action) = &step.action {
+        env.insert(
+            "GITHUB_ACTION_PATH".into(),
+            action_directory(action, &paths),
+        );
+        env.insert("GITHUB_ACTION_REPOSITORY".into(), action.repository.clone());
+        env.insert("GITHUB_ACTION_REF".into(), action.git_ref.clone());
+        env.insert("GITHUB_STATE".into(), paths.state.clone());
+        for (name, value) in action_state {
+            env.insert(format!("STATE_{name}"), value.clone());
+        }
+    }
+    if let Some(id) = &step.id {
+        env.insert("GITHUB_ACTION".into(), id.clone());
+    }
     env.into_iter().collect()
 }
+
+/// The file `$GITHUB_EVENT_PATH` names, in the job's step directory: an
+/// empty event — this engine has no webhook payload to hand an action — so a
+/// toolkit that reads it finds JSON rather than a missing file.
+const EVENT_FILE: &str = "event.json";
+
+/// GitHub's names for what the runner already says as `CI_*`, for the
+/// actions and scripts written against them.
+fn github_context_variables(env: &mut BTreeMap<String, String>) {
+    for (github, ci) in [
+        ("GITHUB_REPOSITORY", "CI_REPOSITORY"),
+        ("GITHUB_REPOSITORY_OWNER", "CI_REPOSITORY_OWNER"),
+        ("GITHUB_SHA", "CI_SHA"),
+        ("GITHUB_REF", "CI_REF"),
+        ("GITHUB_EVENT_NAME", "CI_EVENT"),
+        ("GITHUB_RUN_ID", "CI_PIPELINE_ID"),
+    ] {
+        if let Some(value) = env.get(ci).cloned() {
+            env.insert(github.to_string(), value);
+        }
+    }
+    if let Some(reference) = env.get("CI_REF").cloned() {
+        let name = reference
+            .strip_prefix("refs/heads/")
+            .or_else(|| reference.strip_prefix("refs/tags/"))
+            .unwrap_or(&reference)
+            .to_string();
+        env.insert("GITHUB_REF_NAME".into(), name);
+    }
+    env.insert(
+        "RUNNER_OS".into(),
+        match std::env::consts::OS {
+            "macos" => "macOS",
+            "windows" => "Windows",
+            _ => "Linux",
+        }
+        .into(),
+    );
+    env.insert(
+        "RUNNER_ARCH".into(),
+        match std::env::consts::ARCH {
+            "aarch64" => "ARM64",
+            "arm" => "ARM",
+            "x86" => "X86",
+            _ => "X64",
+        }
+        .into(),
+    );
+}
+
+/// Where a JavaScript action's files are, as the step sees them.
+fn action_directory(action: &ActionStep, paths: &StepPaths) -> String {
+    match &action.files {
+        ActionFiles::Archive { key } => format!("{}/{ACTIONS_DIRECTORY}/{key}", paths.temp),
+        ActionFiles::Workspace { path } => format!("{}/{path}", paths.workspace),
+    }
+}
+
+/// The directory in the job's step directory that the archives of its
+/// JavaScript actions are unpacked into, one per key.
+const ACTIONS_DIRECTORY: &str = "_actions";
 
 /// Replace each `${NAME}` in a declared value — what `${{ secrets.NAME }}`,
 /// `${{ matrix.x }}` and `${{ inputs.x }}` became when the workflow was read —
@@ -1076,6 +1279,7 @@ fn step_paths(run: &StepRun<'_>, number: usize, step: &StepSpec) -> StepPaths {
         path: format!("{temp}/path-{number}"),
         summary: format!("{temp}/summary-{number}"),
         output: format!("{temp}/output-{number}"),
+        state: format!("{temp}/state-{number}"),
         workspace,
         temp,
     }
@@ -1086,6 +1290,8 @@ struct FileCommands {
     path: Vec<String>,
     summary: String,
     outputs: BTreeMap<String, String>,
+    /// What a JavaScript action's step wrote to `$GITHUB_STATE`.
+    state: Vec<(String, String)>,
 }
 
 /// Run one step to its end. Returns its exit code (`None` when it never
@@ -1120,18 +1326,21 @@ async fn execute_step(
     };
     let host = |name: &str| run.temp.join(name);
     let extension = shell.extension();
-    if let Err(error) = std::fs::write(host(&format!("step-{number}.{extension}")), &step.run) {
-        return (
-            None,
-            format!("[plombir-git-runner] the step script could not be written: {error}\n"),
-            no_commands(),
-        );
+    if step.action.is_none() {
+        if let Err(error) = std::fs::write(host(&format!("step-{number}.{extension}")), &step.run) {
+            return (
+                None,
+                format!("[plombir-git-runner] the step script could not be written: {error}\n"),
+                no_commands(),
+            );
+        }
     }
     for file in [
         format!("env-{number}"),
         format!("path-{number}"),
         format!("summary-{number}"),
         format!("output-{number}"),
+        format!("state-{number}"),
     ] {
         if let Err(error) = std::fs::write(host(&file), b"") {
             return (
@@ -1144,7 +1353,15 @@ async fn execute_step(
         }
     }
     let paths = step_paths(run, number, step);
-    let argv = shell.argv(&paths.script);
+    // A JavaScript action's step is its entry file run by Node, in the
+    // workspace; everything else is the step's script run by its shell.
+    let argv = match &step.action {
+        Some(action) => vec![
+            "node".to_string(),
+            format!("{}/{}", action_directory(action, &paths), action.entry),
+        ],
+        None => shell.argv(&paths.script),
+    };
     let timeout = step.timeout_minutes.map(|minutes| {
         run.minute
             .saturating_mul(u32::try_from(minutes).unwrap_or(u32::MAX))
@@ -1222,14 +1439,124 @@ async fn execute_step(
             .map_err(|reason| format!("$GITHUB_OUTPUT {reason}"))?
             .into_iter()
             .collect();
+        let written = read_file_command(&host(&format!("state-{number}")), "GITHUB_STATE")?;
+        let state =
+            parse_output_file(&written).map_err(|reason| format!("$GITHUB_STATE {reason}"))?;
         Ok(FileCommands {
             env,
             path,
             summary,
             outputs,
+            state,
         })
     })();
+    let log = match &step.action {
+        Some(action) if node_missing(code, &log) => format!(
+            "{log}[plombir-git-runner] this step runs a JavaScript action (runs.using: {}), and \
+             there is no `node` to run it with: {}\n",
+            action.using,
+            match run.backend {
+                StepBackend::Local => "put Node.js on this runner's PATH",
+                StepBackend::Docker { .. } =>
+                    "use a job image that has Node.js, or install it in a step before this one",
+            }
+        ),
+        _ => log,
+    };
     (code, log, commands)
+}
+
+/// Whether a step that was to run `node` found none: the program could not
+/// be started on the host, or the container's shell said it is not there.
+fn node_missing(code: Option<i32>, log: &str) -> bool {
+    match code {
+        None => log.contains("could not be started"),
+        Some(127) => true,
+        Some(_) => false,
+    }
+}
+
+/// Unpack the archive of a JavaScript action's files into the job's step
+/// directory, once per key; a `./path` action is already in the workspace.
+async fn materialize_action(run: &StepRun<'_>, action: &ActionStep) -> Result<(), String> {
+    match &action.files {
+        ActionFiles::Workspace { path } => {
+            if !valid_relative_path(path) {
+                return Err(format!("`{path}` is not a directory inside the workspace"));
+            }
+            Ok(())
+        }
+        ActionFiles::Archive { key } => {
+            if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("`{key}` is not the key of an action's files"));
+            }
+            let directory = run.temp.join(ACTIONS_DIRECTORY).join(key);
+            if directory.is_dir() {
+                return Ok(());
+            }
+            let Some(archives) = run.support.actions else {
+                return Err("this runner was given no way to fetch an action's files".into());
+            };
+            let staging = run.temp.join(ACTIONS_DIRECTORY);
+            std::fs::create_dir_all(&staging)
+                .map_err(|error| format!("{}: {error}", staging.display()))?;
+            let archive = staging.join(format!("{key}.tar"));
+            archives.fetch(key, &archive).await?;
+            let unpacked = staging.join(format!("{key}.partial"));
+            // An action's tree is megabytes of files: unpacked off the
+            // runtime's workers, like every other archive a runner restores.
+            let result = {
+                let (archive, unpacked, directory) =
+                    (archive.clone(), unpacked.clone(), directory.clone());
+                tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&archive)
+                        .and_then(|file| crate::workspace_archive::unpack_into(file, &unpacked))
+                        .and_then(|()| std::fs::rename(&unpacked, &directory))
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            };
+            if let Err(error) = std::fs::remove_file(&archive) {
+                tracing::warn!(%error, "could not remove a fetched action archive");
+            }
+            if result.is_err() {
+                let _discarded = std::fs::remove_dir_all(&unpacked);
+            }
+            result.map_err(|error| format!("the action's files could not be unpacked: {error}"))
+        }
+    }
+}
+
+/// A relative path that stays inside the directory it is joined to.
+fn valid_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+/// `text` with every value in `masks` replaced by `***`, longest first so a
+/// value inside another is not left half-shown.
+fn mask_values(text: &str, masks: &[String]) -> String {
+    let mut sorted: Vec<&String> = masks.iter().filter(|value| !value.is_empty()).collect();
+    sorted.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    let mut masked = text.to_string();
+    for value in sorted {
+        masked = masked.replace(value.as_str(), "***");
+    }
+    masked
+}
+
+/// The values a step asked to be masked with the `::add-mask::` workflow
+/// command, from its raw output.
+fn added_masks(log: &str) -> Vec<String> {
+    log.lines()
+        .filter_map(|line| line.trim_start().strip_prefix("::add-mask::"))
+        .map(|value| value.trim_end_matches('\r').to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 fn step_output(output: std::io::Result<crate::CappedJobOutput>) -> (Option<i32>, String) {
@@ -1411,6 +1738,7 @@ pub async fn run_job_steps(
     needs: &BTreeMap<String, NeededJob>,
     outputs: &BTreeMap<String, String>,
     secrets: Option<&BTreeSet<String>>,
+    support: JobSupport<'_>,
     reporter: &mut impl StepReporter,
 ) -> JobRun {
     let failed = failed_job;
@@ -1468,6 +1796,7 @@ pub async fn run_job_steps(
                 needs,
                 outputs,
                 secrets,
+                support,
             },
             reporter,
         )
@@ -1492,6 +1821,7 @@ pub async fn run_job_steps(
         limits: image.limits,
         temp: Some(&temp),
         network: network.as_deref(),
+        tool_cache: support.tool_cache,
     };
     let container = match crate::docker_job::start_steps_container(image.program, &job).await {
         Ok(container) => container,
@@ -1523,6 +1853,7 @@ pub async fn run_job_steps(
             needs,
             outputs,
             secrets,
+            support,
         },
         reporter,
     )
@@ -1585,6 +1916,7 @@ mod tests {
             timeout_minutes: None,
             condition: None,
             secrets: BTreeSet::new(),
+            action: None,
         }
     }
 
@@ -1648,11 +1980,208 @@ mod tests {
                 needs: &BTreeMap::new(),
                 outputs: &BTreeMap::new(),
                 secrets: None,
+                support: JobSupport::default(),
             },
             &mut recorder,
         )
         .await;
         (result, recorder.events, root)
+    }
+
+    /// An archive of one JavaScript action, handed out by key.
+    struct OneArchive {
+        key: String,
+        tar: Vec<u8>,
+    }
+
+    impl ActionArchives for OneArchive {
+        fn fetch<'a>(
+            &'a self,
+            key: &'a str,
+            into: &'a Path,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if key != self.key {
+                    return Err(format!("no archive {key}"));
+                }
+                std::fs::write(into, &self.tar).map_err(|error| error.to_string())
+            })
+        }
+    }
+
+    fn js_step(name: &str, id: Option<&str>, files: ActionFiles, entry: &str) -> StepSpec {
+        let mut spec = step(name, "");
+        spec.id = id.map(str::to_string);
+        spec.action = Some(ActionStep {
+            files,
+            repository: "acme/js".into(),
+            git_ref: "v1".into(),
+            using: "node20".into(),
+            entry: entry.into(),
+            state: "use-1".into(),
+        });
+        spec
+    }
+
+    /// card_a1290adf28fd: a JavaScript action runs with Node from its own
+    /// files — fetched by key, or a `./path` of the workspace — with
+    /// `INPUT_*`, `$GITHUB_OUTPUT`, and `$GITHUB_STATE` carried from its main
+    /// step to its post step; a value it masks with `::add-mask::` is hidden
+    /// from then on, the command's own line included.
+    #[tokio::test]
+    async fn a_javascript_action_runs_with_node_and_keeps_its_state_for_post() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let temp = root.path().join("temp");
+        std::fs::create_dir_all(workspace.join("local-action")).unwrap();
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(
+            workspace.join("local-action/index.js"),
+            "console.log('local ran in ' + process.env.GITHUB_ACTION_PATH);",
+        )
+        .unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, body) in [
+            (
+                "dist/main.js",
+                "const fs = require('fs');\n\
+                 console.log('::add-mask::s3cr3t-value');\n\
+                 console.log('greeting=' + process.env.INPUT_WHO + ' s3cr3t-value');\n\
+                 fs.appendFileSync(process.env.GITHUB_OUTPUT, 'said=hello ' + process.env.INPUT_WHO + '\\n');\n\
+                 fs.appendFileSync(process.env.GITHUB_STATE, 'started=yes\\n');\n",
+            ),
+            (
+                "dist/post.js",
+                "console.log('post sees ' + process.env.STATE_started + ' tool=' + (process.env.RUNNER_TOOL_CACHE ? 'set' : 'unset'));",
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, body.as_bytes()).unwrap();
+        }
+        let key = "a".repeat(64);
+        let archives = OneArchive {
+            key: key.clone(),
+            tar: builder.into_inner().unwrap(),
+        };
+        let tool_cache = root.path().join("tool-cache");
+        std::fs::create_dir_all(&tool_cache).unwrap();
+
+        let mut main = js_step(
+            "Main",
+            Some("greet"),
+            ActionFiles::Archive { key: key.clone() },
+            "dist/main.js",
+        );
+        main.env.insert("INPUT_WHO".into(), "world".into());
+        let mut post = js_step(
+            "Post",
+            None,
+            ActionFiles::Archive { key: key.clone() },
+            "dist/post.js",
+        );
+        post.condition = Some("always() && steps.greet.outcome != 'skipped'".into());
+        let local = js_step(
+            "Local",
+            None,
+            ActionFiles::Workspace {
+                path: "local-action".into(),
+            },
+            "index.js",
+        );
+        let reader = step(
+            "Read",
+            "echo \"read=${{ steps.greet.outputs.said }} s3cr3t-value\"",
+        );
+        let env = job_env();
+        let mask = |log: &str| log.to_string();
+        let result = run_steps(
+            &StepRun {
+                steps: &[main, reader, local, post],
+                job_env: &env,
+                workspace: &workspace,
+                temp: &temp,
+                backend: StepBackend::Local,
+                mask: &mask,
+                minute: MINUTE,
+                needs: &BTreeMap::new(),
+                outputs: &BTreeMap::new(),
+                secrets: None,
+                support: JobSupport {
+                    actions: Some(&archives),
+                    tool_cache: Some(&tool_cache),
+                },
+            },
+            &mut Recorder::default(),
+        )
+        .await;
+        let logs: Vec<&str> = result.steps.iter().map(|step| step.log.as_str()).collect();
+        assert_eq!(result.exit_code, 0, "{logs:#?}");
+        assert!(logs[0].contains("greeting=world ***"), "{}", logs[0]);
+        assert!(!logs[0].contains("s3cr3t-value"), "{}", logs[0]);
+        assert!(logs[1].contains("read=hello world ***"), "{}", logs[1]);
+        assert!(
+            logs[2].contains(&format!(
+                "local ran in {}",
+                workspace.join("local-action").display()
+            )),
+            "{}",
+            logs[2]
+        );
+        assert!(logs[3].contains("post sees yes tool=set"), "{}", logs[3]);
+    }
+
+    /// No Node to run an action with is said as that, not as a failed script.
+    #[tokio::test]
+    async fn a_javascript_action_without_node_is_named_as_such() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let temp = root.path().join("temp");
+        std::fs::create_dir_all(workspace.join("a")).unwrap();
+        std::fs::create_dir_all(&temp).unwrap();
+        let env: Vec<(String, String)> = job_env()
+            .into_iter()
+            .map(|(name, value)| {
+                if name == "PATH" {
+                    (name, "/nonexistent".to_string())
+                } else {
+                    (name, value)
+                }
+            })
+            .collect();
+        let mask = |log: &str| log.to_string();
+        let result = run_steps(
+            &StepRun {
+                steps: &[js_step(
+                    "Main",
+                    None,
+                    ActionFiles::Workspace { path: "a".into() },
+                    "index.js",
+                )],
+                job_env: &env,
+                workspace: &workspace,
+                temp: &temp,
+                backend: StepBackend::Local,
+                mask: &mask,
+                minute: MINUTE,
+                needs: &BTreeMap::new(),
+                outputs: &BTreeMap::new(),
+                secrets: None,
+                support: JobSupport::default(),
+            },
+            &mut Recorder::default(),
+        )
+        .await;
+        assert_ne!(result.exit_code, 0);
+        assert!(
+            result.steps[0].log.contains("no `node` to run it with"),
+            "{}",
+            result.steps[0].log
+        );
     }
 
     /// card_e42a6d0af271: a step sees the secrets it names and none of the
@@ -1700,6 +2229,7 @@ mod tests {
                 needs: &BTreeMap::new(),
                 outputs: &BTreeMap::new(),
                 secrets: Some(&secrets),
+                support: JobSupport::default(),
             },
             &mut Recorder::default(),
         )
@@ -1739,8 +2269,9 @@ mod tests {
             needs: &BTreeMap::new(),
             outputs: &BTreeMap::new(),
             secrets: None,
+            support: JobSupport::default(),
         };
-        let built = step_environment(&run, &step("S", "true"), &[], &[], 1);
+        let built = step_environment(&run, &step("S", "true"), &[], &[], 1, &[]);
         assert!(built.contains(&("ALPHA".to_string(), "${KEPT}".to_string())));
     }
 
@@ -2029,6 +2560,7 @@ mod tests {
             limits: &limits,
             temp: Some(&temp),
             network: None,
+            tool_cache: None,
         };
         let started = match crate::docker_job::start_steps_container("docker", &job).await {
             Ok(started) => started,
@@ -2066,6 +2598,7 @@ mod tests {
                 needs: &BTreeMap::new(),
                 outputs: &BTreeMap::new(),
                 secrets: None,
+                support: JobSupport::default(),
             },
             &mut recorder,
         )
@@ -2130,6 +2663,7 @@ mod tests {
                 needs,
                 outputs,
                 secrets: None,
+                support: JobSupport::default(),
             },
             &mut Silent,
         )
@@ -2340,6 +2874,7 @@ mod services_docker_tests {
             timeout_minutes: None,
             condition: None,
             secrets: BTreeSet::new(),
+            action: None,
         }
     }
 
@@ -2441,6 +2976,7 @@ mod services_docker_tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             None,
+            JobSupport::default(),
             reporter,
         )
         .await

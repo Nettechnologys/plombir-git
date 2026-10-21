@@ -13,10 +13,14 @@
 //! otherwise), or neither. A `uses:` the policy does not allow is refused by
 //! the name of the source it would have come from.
 //!
-//! Only `runs.using: composite` is executed. A JavaScript action
-//! (`runs.using: node*`) or a Docker action is refused by name, and so is
-//! anything in `action.yml` this engine would otherwise have to ignore — the
-//! promise every other key of a workflow keeps: it runs, or it is refused.
+//! `runs.using: composite` and the JavaScript runtimes (`node12` … `node24`)
+//! are executed. A JavaScript action's steps are its `pre`, `main` and `post`
+//! files run with Node on the runner, from an archive of the action's
+//! directory the server makes when it reads the workflow ([`ActionLoader::files`]);
+//! its `post` runs after the job's last step, as on GitHub. A Docker action is
+//! refused by name, and so is anything in `action.yml` this engine would
+//! otherwise have to ignore — the promise every other key of a workflow keeps:
+//! it runs, or it is refused.
 //!
 //! The three actions the engine implements natively — `actions/checkout`,
 //! `actions/cache`, `actions/upload-artifact` — are never loaded: they keep
@@ -311,6 +315,10 @@ pub(crate) struct LoadedAction {
     pub origin: String,
     /// The `action.yml` text.
     pub manifest: String,
+    /// The repository on this server the action was read from, which an
+    /// archive of its files is made from. `None` for `./path`, whose files
+    /// are the workspace, and for a loader with nothing on disk.
+    pub source: Option<PathBuf>,
 }
 
 /// Why an action could not be loaded.
@@ -333,6 +341,32 @@ impl From<anyhow::Error> for ActionLoadError {
 /// Where the workflow's actions are read from.
 pub(crate) trait ActionLoader {
     fn load(&self, reference: &ActionReference) -> Result<LoadedAction, ActionLoadError>;
+
+    /// Where a runner finds a JavaScript action's files: the workspace for
+    /// `./path`, an archive the server keeps otherwise. This default names the
+    /// archive without making it — for a reader that runs nothing.
+    fn files(
+        &self,
+        reference: &ActionReference,
+        loaded: &LoadedAction,
+    ) -> Result<rg_process::ci_steps::ActionFiles, ActionLoadError> {
+        Ok(match reference {
+            ActionReference::Local { path } => {
+                rg_process::ci_steps::ActionFiles::Workspace { path: path.clone() }
+            }
+            ActionReference::Remote { path, .. } => rg_process::ci_steps::ActionFiles::Archive {
+                key: archive_key(&reference.label(), &loaded.sha, path),
+            },
+        })
+    }
+}
+
+/// The name of the archive of one directory of one commit of one repository.
+pub(crate) fn archive_key(source: &str, sha: &str, path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(
+        format!("{source}\0{sha}\0{path}").as_bytes(),
+    ))
 }
 
 // ── action.yml ─────────────────────────────────────────────────────────
@@ -400,8 +434,30 @@ fn scalar_text(value: &serde_json::Value) -> Option<String> {
 struct ParsedAction {
     inputs: BTreeMap<String, ActionInput>,
     outputs: BTreeMap<String, ActionOutput>,
-    steps: Vec<GiteaStep>,
+    runs: ParsedRuns,
 }
+
+enum ParsedRuns {
+    Composite(Vec<GiteaStep>),
+    Node(NodeRuns),
+}
+
+/// `runs:` of a JavaScript action.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeRuns {
+    using: String,
+    main: String,
+    pre: Option<String>,
+    #[serde(rename = "pre-if")]
+    pre_if: Option<String>,
+    post: Option<String>,
+    #[serde(rename = "post-if")]
+    post_if: Option<String>,
+}
+
+/// The Node runtimes `runs.using` may name.
+const NODE_RUNTIMES: &[&str] = &["node12", "node16", "node20", "node24"];
 
 fn parse_manifest(label: &str, manifest: &str) -> Result<ParsedAction, String> {
     let manifest: ActionManifest = rg_core::yaml::from_str(manifest)
@@ -411,18 +467,46 @@ fn parse_manifest(label: &str, manifest: &str) -> Result<ParsedAction, String> {
         .get("using")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("action {label}: action.yml has no runs.using"))?;
-    match using {
-        "composite" => {}
+    let runs = match using {
+        "composite" => {
+            let runs: CompositeRuns = serde_json::from_value(manifest.runs)
+                .map_err(|error| format!("action {label}: action.yml runs: {error}"))?;
+            ParsedRuns::Composite(runs.steps)
+        }
+        javascript if NODE_RUNTIMES.contains(&javascript) => {
+            let runs: NodeRuns = serde_json::from_value(manifest.runs)
+                .map_err(|error| format!("action {label}: action.yml runs: {error}"))?;
+            for (key, entry) in [
+                ("main", Some(&runs.main)),
+                ("pre", runs.pre.as_ref()),
+                ("post", runs.post.as_ref()),
+            ] {
+                if let Some(entry) = entry {
+                    let sound = !entry.is_empty()
+                        && !entry.starts_with('/')
+                        && entry.split('/').all(|segment| {
+                            !segment.is_empty() && segment != "." && segment != ".."
+                        });
+                    if !sound {
+                        return Err(format!(
+                            "action {label}: runs.{key} `{entry}` is not a file inside the action"
+                        ));
+                    }
+                }
+            }
+            ParsedRuns::Node(runs)
+        }
         javascript if javascript.starts_with("node") => {
             return Err(format!(
-                "action {label} is a JavaScript action (runs.using: {javascript}); only composite \
-                 actions run here"
+                "action {label}: runs.using: {javascript} is not a Node runtime this engine runs \
+                 ({})",
+                NODE_RUNTIMES.join(", ")
             ))
         }
         "docker" => {
             return Err(format!(
-                "action {label} is a Docker action (runs.using: docker); only composite actions \
-                 run here"
+                "action {label} is a Docker action (runs.using: docker); only composite and \
+                 JavaScript actions run here"
             ))
         }
         other => {
@@ -430,9 +514,7 @@ fn parse_manifest(label: &str, manifest: &str) -> Result<ParsedAction, String> {
                 "action {label}: runs.using: {other} is not an action runtime this engine knows"
             ))
         }
-    }
-    let runs: CompositeRuns = serde_json::from_value(manifest.runs)
-        .map_err(|error| format!("action {label}: action.yml runs: {error}"))?;
+    };
     for (name, input) in &manifest.inputs {
         if !crate::gitea_actions::valid_input_name(name) {
             return Err(format!(
@@ -460,7 +542,8 @@ fn parse_manifest(label: &str, manifest: &str) -> Result<ParsedAction, String> {
                 "action {label}: output `{name}` is not a valid output name"
             ));
         }
-        if output.value.is_none() {
+        // A JavaScript action writes its outputs itself, to $GITHUB_OUTPUT.
+        if matches!(runs, ParsedRuns::Composite(_)) && output.value.is_none() {
             return Err(format!(
                 "action {label}: output `{name}` has no value — a composite action's output says \
                  which step it comes from"
@@ -470,7 +553,7 @@ fn parse_manifest(label: &str, manifest: &str) -> Result<ParsedAction, String> {
     Ok(ParsedAction {
         inputs: manifest.inputs,
         outputs: manifest.outputs,
-        steps: runs.steps,
+        runs,
     })
 }
 
@@ -515,12 +598,18 @@ pub(crate) fn expand_actions(
             job_name: &job_name,
             anonymous: 0,
             out: Vec::new(),
+            posts: Vec::new(),
         };
         for step in steps {
             match expansion.step(step, 0) {
                 Ok(()) => {}
                 Err(StepError::Refused(reason)) => return Ok(Err(format!("{job_name}: {reason}"))),
                 Err(StepError::Failed(error)) => return Err(error),
+            }
+        }
+        while let Some(post) = expansion.posts.pop() {
+            if let Err(StepError::Refused(reason)) = expansion.push(post) {
+                return Ok(Err(format!("{job_name}: {reason}")));
             }
         }
         workflow
@@ -551,9 +640,130 @@ struct Expansion<'a> {
     /// still be told apart.
     anonymous: usize,
     out: Vec<GiteaStep>,
+    /// The `post` steps of the JavaScript actions used so far, in the order
+    /// the actions were; written after the job's last step, last first.
+    posts: Vec<GiteaStep>,
+}
+
+/// One use of a JavaScript action, about to become steps.
+struct NodeUse<'a> {
+    runs: NodeRuns,
+    files: rg_process::ci_steps::ActionFiles,
+    reference: &'a ActionReference,
+    inputs: &'a BTreeMap<String, String>,
+    caller: &'a GiteaStep,
+    caller_id: String,
+    caller_name: String,
+    granted: std::collections::BTreeSet<String>,
+}
+
+/// A step that runs one file of a JavaScript action.
+fn node_step(
+    use_: &NodeUse<'_>,
+    name: String,
+    id: Option<String>,
+    entry: &str,
+    env: HashMap<String, String>,
+    condition: Option<String>,
+) -> GiteaStep {
+    let (repository, git_ref) = match use_.reference {
+        ActionReference::Local { .. } => (String::new(), String::new()),
+        ActionReference::Remote {
+            owner,
+            repo,
+            git_ref,
+            ..
+        } => (format!("{owner}/{repo}"), git_ref.clone()),
+    };
+    GiteaStep {
+        name: Some(name),
+        uses: None,
+        run: None,
+        shell: None,
+        working_directory: None,
+        id,
+        continue_on_error: None,
+        timeout_minutes: None,
+        env,
+        condition,
+        with: HashMap::new(),
+        granted_secrets: Some(use_.granted.clone()),
+        action: Some(rg_process::ci_steps::ActionStep {
+            files: use_.files.clone(),
+            repository,
+            git_ref,
+            using: use_.runs.using.clone(),
+            entry: entry.to_string(),
+            state: use_.caller_id.clone(),
+        }),
+    }
+}
+
+/// `a` and `b` as one condition; `None` when neither says anything.
+fn both(a: Option<&str>, b: Option<&str>) -> Option<String> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(one), None) | (None, Some(one)) => Some(one.to_string()),
+        (Some(a), Some(b)) => Some(format!(
+            "({}) && ({})",
+            unwrap_expression(a),
+            unwrap_expression(b)
+        )),
+    }
 }
 
 impl Expansion<'_> {
+    /// Write a JavaScript action's `pre` and `main` into the job, and keep
+    /// its `post` for after the job's last step — where GitHub runs it, in
+    /// the reverse order of the actions that declared one.
+    ///
+    /// The `main` step carries the caller's id, so `steps.<id>.outputs.*`
+    /// are what it writes to `$GITHUB_OUTPUT`. Each step's environment is the
+    /// caller's `env:` and every input as `INPUT_<NAME>`.
+    fn node_steps(&mut self, use_: NodeUse<'_>) -> Result<(), StepError> {
+        let mut env = use_.caller.env.clone();
+        for (name, value) in use_.inputs {
+            env.insert(
+                format!("INPUT_{}", name.to_ascii_uppercase().replace(' ', "_")),
+                value.clone(),
+            );
+        }
+        if let Some(pre) = &use_.runs.pre {
+            let pre_if = use_.runs.pre_if.as_deref().unwrap_or("always()");
+            self.push(node_step(
+                &use_,
+                format!("Pre {}", use_.caller_name),
+                None,
+                pre,
+                env.clone(),
+                both(use_.caller.condition.as_deref(), Some(pre_if)),
+            ))?;
+        }
+        self.push(node_step(
+            &use_,
+            use_.caller_name.clone(),
+            Some(use_.caller_id.clone()),
+            &use_.runs.main,
+            env.clone(),
+            use_.caller.condition.clone(),
+        ))?;
+        if let Some(post) = &use_.runs.post {
+            let post_if = use_.runs.post_if.as_deref().unwrap_or("always()");
+            // Only after a main that ran: a skipped action has nothing to
+            // clean up.
+            let ran = format!("steps.{}.outcome != 'skipped'", use_.caller_id);
+            self.posts.push(node_step(
+                &use_,
+                format!("Post {}", use_.caller_name),
+                None,
+                post,
+                env,
+                both(Some(&ran), Some(post_if)),
+            ));
+        }
+        Ok(())
+    }
+
     fn push(&mut self, step: GiteaStep) -> Result<(), StepError> {
         if self.out.len() >= MAX_EXPANDED_STEPS {
             return Err(StepError::Refused(format!(
@@ -625,11 +835,13 @@ impl Expansion<'_> {
             }
         };
         let caller_name = step.name.clone().unwrap_or_else(|| label.clone());
-        let inner_ids = action
-            .steps
-            .iter()
-            .filter_map(|inner| inner.id.clone())
-            .collect::<Vec<_>>();
+        let inner_ids = match &action.runs {
+            ParsedRuns::Composite(steps) => steps.as_slice(),
+            ParsedRuns::Node(_) => &[],
+        }
+        .iter()
+        .filter_map(|inner| inner.id.clone())
+        .collect::<Vec<_>>();
         // All of the job's secrets the action's steps may read: what the
         // workflow's step hands it — or, for an action an action calls, what
         // the outermost one was handed. An action has no secrets context of
@@ -669,9 +881,37 @@ impl Expansion<'_> {
             condition: step.condition.clone(),
             with: HashMap::new(),
             granted_secrets: Some(std::collections::BTreeSet::new()),
+            action: None,
         })?;
 
-        for inner in action.steps {
+        let steps = match action.runs {
+            ParsedRuns::Composite(steps) => steps,
+            ParsedRuns::Node(runs) => {
+                let files = match self.loader.files(&reference, &loaded) {
+                    Ok(files) => files,
+                    Err(ActionLoadError::Refused(reason)) => {
+                        return Err(StepError::Refused(format!("uses: {uses} — {reason}")))
+                    }
+                    Err(ActionLoadError::Failed(error)) => {
+                        return Err(StepError::Failed(error.context(format!(
+                            "packing action {uses} for job {}",
+                            self.job_name
+                        ))))
+                    }
+                };
+                return self.node_steps(NodeUse {
+                    runs,
+                    files,
+                    reference: &reference,
+                    inputs: &inputs,
+                    caller: &step,
+                    caller_id,
+                    caller_name,
+                    granted,
+                });
+            }
+        };
+        for inner in steps {
             let inner = context.rewrite(inner, &step, &caller_name)?;
             self.step(inner, depth + 1)?;
         }
@@ -712,6 +952,7 @@ impl Expansion<'_> {
                 condition: step.condition.clone(),
                 with: HashMap::new(),
                 granted_secrets: Some(granted.clone()),
+                action: None,
             })?;
         }
         Ok(())
@@ -756,7 +997,7 @@ fn resolve_inputs(
         let value = match given {
             Some(value) => value,
             None => match input.default.as_ref().and_then(scalar_text) {
-                Some(default) => default,
+                Some(default) => input_default(&default),
                 None if input.required.as_ref().and_then(required_flag) == Some(true) => {
                     return Err(format!(
                         "action {label} requires input `{name}`, and the step gives it no value"
@@ -768,6 +1009,35 @@ fn resolve_inputs(
         inputs.insert(name.to_ascii_lowercase(), value);
     }
     Ok(inputs)
+}
+
+/// An input's default with the expressions this engine answers when it reads
+/// the workflow filled in — the shape `actions/setup-node`'s `token:` has,
+/// `${{ github.server_url == 'https://github.com' && github.token || '' }}`.
+///
+/// `github.token` is empty: GitHub's token does not exist here, and the job's
+/// own `CI_JOB_TOKEN` is never handed to an action under its name — it would
+/// travel to whatever API the action calls with it. `github.server_url` is
+/// empty too, so a default that compares it with GitHub's address says no. An
+/// expression that reads anything else is left as written, for the workflow
+/// check to judge.
+fn input_default(text: &str) -> String {
+    if !text.contains("${{") {
+        return text.to_string();
+    }
+    let context: HashMap<String, String> = ["github.token", "github.server_url"]
+        .into_iter()
+        .map(|name| (name.to_string(), String::new()))
+        .collect();
+    map_groups(text, |body| {
+        Ok(
+            match rg_process::ci_condition::evaluate_text(body, &context) {
+                Ok(value) => value,
+                Err(_) => format!("${{{{ {body} }}}}"),
+            },
+        )
+    })
+    .unwrap_or_else(|_: String| text.to_string())
 }
 
 /// What one use of an action resolves its steps' text against.
@@ -862,6 +1132,7 @@ impl ActionContext<'_> {
             condition,
             with,
             granted_secrets: Some(self.granted.clone()),
+            action: None,
         })
     }
 
@@ -1115,12 +1386,157 @@ pub(crate) struct RepositoryActionLoader<'a> {
 /// Underscore-led like `_ci_cache`, so no owner name can collide with it.
 pub(crate) const ACTIONS_CACHE_DIR: &str = "_ci_actions";
 
+/// See [`rg_core::ci::ACTION_ARCHIVES_DIR`]; archives are named by
+/// [`archive_key`].
+pub(crate) const ACTION_ARCHIVES_DIR: &str = rg_core::ci::ACTION_ARCHIVES_DIR;
+
+/// Make the archive of `path` at `sha` of `repository` under `archives`,
+/// unless it is already there — `git archive`, so what a runner unpacks is
+/// exactly the committed tree. Bounded by `max_mb` (`0`: no bound) like the
+/// upstream cache, and the archives used least recently go once they hold
+/// more.
+pub(crate) fn pack_action(
+    archives: &Path,
+    repository: &Path,
+    sha: &str,
+    path: &str,
+    key: &str,
+    max_mb: u64,
+) -> Result<PathBuf, ActionLoadError> {
+    let target = archives.join(format!("{key}.tar"));
+    if target.is_file() {
+        touch_file(&target);
+        return Ok(target);
+    }
+    std::fs::create_dir_all(archives).map_err(|error| {
+        ActionLoadError::Failed(anyhow::anyhow!(
+            "failed to create {}: {error}",
+            archives.display()
+        ))
+    })?;
+    let partial = archives.join(format!("{key}.{}.partial", uuid::Uuid::new_v4().simple()));
+    let git = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|error| ActionLoadError::Failed(anyhow::anyhow!("{error}")))?;
+    let tree = if path.is_empty() {
+        sha.to_string()
+    } else {
+        format!("{sha}:{path}")
+    };
+    let partial_text = partial.to_string_lossy().into_owned();
+    let packed = rg_git::invocation::local(git)
+        .run(
+            &["archive", "--format=tar", "-o", &partial_text, &tree],
+            Some(repository),
+        )
+        .and_then(|output| output.ensure_success());
+    if let Err(error) = packed {
+        discard_file(&partial);
+        return Err(ActionLoadError::Failed(
+            error.context("pack an action's files"),
+        ));
+    }
+    let bytes = std::fs::metadata(&partial)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    if max_mb > 0 && bytes > max_mb.saturating_mul(1024 * 1024) {
+        discard_file(&partial);
+        return Err(ActionLoadError::Refused(format!(
+            "the action's files are {} MiB, more than ci.actions_cache_max_mb = {max_mb}",
+            bytes / (1024 * 1024)
+        )));
+    }
+    std::fs::rename(&partial, &target).map_err(|error| {
+        discard_file(&partial);
+        ActionLoadError::Failed(anyhow::anyhow!("failed to keep an action archive: {error}"))
+    })?;
+    evict_archives(archives, &target, max_mb);
+    Ok(target)
+}
+
+fn discard_file(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), %error, "failed to remove a partial action archive");
+        }
+    }
+}
+
+/// Mark an archive used, for the eviction below.
+fn touch_file(path: &Path) {
+    if let Ok(file) = std::fs::File::options().append(true).open(path) {
+        let _touched = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// Remove the archives used least recently once they hold more than `max_mb`,
+/// never `keep`.
+fn evict_archives(archives: &Path, keep: &Path, max_mb: u64) {
+    if max_mb == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(archives) else {
+        return;
+    };
+    let mut found: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tar"))
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            Some((meta.modified().ok()?, meta.len(), entry.path()))
+        })
+        .collect();
+    let mut total: u64 = found.iter().map(|(_, bytes, _)| *bytes).sum();
+    found.sort_by_key(|(used, _, _)| *used);
+    for (_, bytes, path) in found {
+        if total <= max_mb.saturating_mul(1024 * 1024) {
+            break;
+        }
+        if path == keep {
+            continue;
+        }
+        discard_file(&path);
+        total = total.saturating_sub(bytes);
+    }
+}
+
 /// Serialises every fetch into the upstream cache in this process: two
 /// triggers fetching into one cached repository, or an eviction under a fetch,
 /// would otherwise race on the same directory.
 static UPSTREAM_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl ActionLoader for RepositoryActionLoader<'_> {
+    fn files(
+        &self,
+        reference: &ActionReference,
+        loaded: &LoadedAction,
+    ) -> Result<rg_process::ci_steps::ActionFiles, ActionLoadError> {
+        let (ActionReference::Remote { path, .. }, Some(source)) = (reference, &loaded.source)
+        else {
+            return Ok(match reference {
+                ActionReference::Local { path } => {
+                    rg_process::ci_steps::ActionFiles::Workspace { path: path.clone() }
+                }
+                ActionReference::Remote { .. } => {
+                    return Err(ActionLoadError::Failed(anyhow::anyhow!(
+                        "action {} was loaded from no repository on this server",
+                        reference.label()
+                    )))
+                }
+            });
+        };
+        let key = archive_key(&source.to_string_lossy(), &loaded.sha, path);
+        pack_action(
+            &self.repo_root.join(ACTION_ARCHIVES_DIR),
+            source,
+            &loaded.sha,
+            path,
+            &key,
+            self.policy.cache_max_mb(),
+        )?;
+        Ok(rg_process::ci_steps::ActionFiles::Archive { key })
+    }
+
     fn load(&self, reference: &ActionReference) -> Result<LoadedAction, ActionLoadError> {
         match reference {
             ActionReference::Local { path } => {
@@ -1134,6 +1550,7 @@ impl ActionLoader for RepositoryActionLoader<'_> {
                     sha: self.commit_sha.to_string(),
                     origin: "this repository".to_string(),
                     manifest,
+                    source: None,
                 })
             }
             ActionReference::Remote {
@@ -1216,6 +1633,7 @@ impl RepositoryActionLoader<'_> {
             sha,
             origin: "this instance".to_string(),
             manifest,
+            source: Some(instance.path.clone()),
         })
     }
 
@@ -1335,6 +1753,7 @@ impl RepositoryActionLoader<'_> {
             sha,
             origin: url,
             manifest,
+            source: Some(cached),
         })
     }
 }
@@ -1528,6 +1947,7 @@ mod tests {
                     sha: "a".repeat(40),
                     origin: "test".into(),
                     manifest: manifest.clone(),
+                    source: None,
                 })
                 .ok_or_else(|| ActionLoadError::Refused("not in the fixture".into()))
         }
@@ -1622,8 +2042,13 @@ mod tests {
             ),
             (
                 "      - uses: acme/greet@v1\n",
-                "runs:\n  using: node20\n  main: index.js\n",
-                "JavaScript action (runs.using: node20)",
+                "runs:\n  using: node10\n  main: index.js\n",
+                "runs.using: node10 is not a Node runtime",
+            ),
+            (
+                "      - uses: acme/greet@v1\n",
+                "runs:\n  using: node20\n  main: ../outside.js\n",
+                "runs.main `../outside.js` is not a file inside the action",
             ),
             (
                 "      - uses: acme/greet@v1\n",
@@ -1740,6 +2165,70 @@ mod tests {
             job_secrets.iter().map(String::as_str).collect::<Vec<_>>(),
             ["ALPHA", "BRAVO", "WF"]
         );
+    }
+
+    const SETUP: &str = "inputs:\n  version:\n    required: true\n  token:\n    default: ${{ github.server_url == 'https://github.com' && github.token || '' }}\n  cache:\n    default: false\noutputs:\n  version:\n    description: what was set up\nruns:\n  using: node20\n  pre: dist/pre.js\n  main: dist/main.js\n  post: dist/post.js\n  post-if: success()\n";
+
+    /// card_a1290adf28fd: a JavaScript action becomes its `pre` and `main` in
+    /// place and its `post` after the job's last step, last action first; its
+    /// inputs are `INPUT_*` — `setup-node`'s token default empty, never the
+    /// job token — and it is granted only what the workflow's step hands it.
+    #[test]
+    fn a_javascript_action_becomes_pre_main_and_a_post_after_the_last_step() {
+        let workflow = expand(
+            "on: push\njobs:\n  build:\n    steps:\n      - id: node\n        uses: acme/setup@v4\n        with:\n          version: ${{ secrets.VERSION }}\n      - uses: acme/setup@v4\n        with:\n          version: '22'\n      - run: node --version\n",
+            &[("acme/setup@v4", SETUP)],
+        )
+        .unwrap();
+        let steps = &workflow.jobs["build"].steps;
+        let names: Vec<&str> = steps
+            .iter()
+            .map(|step| step.name.as_deref().unwrap_or("<run>"))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Set up acme/setup@v4",
+                "Pre acme/setup@v4",
+                "acme/setup@v4",
+                "Set up acme/setup@v4",
+                "Pre acme/setup@v4",
+                "acme/setup@v4",
+                "<run>",
+                "Post acme/setup@v4",
+                "Post acme/setup@v4",
+            ],
+            "{steps:#?}"
+        );
+        let main = &steps[2];
+        assert_eq!(main.id.as_deref(), Some("node"));
+        let action = main.action.as_ref().unwrap();
+        assert_eq!(
+            (action.entry.as_str(), action.state.as_str()),
+            ("dist/main.js", "node")
+        );
+        assert_eq!(action.repository, "acme/setup");
+        assert_eq!(main.env["INPUT_VERSION"], "${{ secrets.VERSION }}");
+        assert_eq!(main.env["INPUT_TOKEN"], "");
+        assert_eq!(main.env["INPUT_CACHE"], "false");
+        assert_eq!(
+            main.granted_secrets
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            ["VERSION"]
+        );
+        // The last action's post runs first, and only after a main that ran.
+        assert_eq!(
+            steps[7].condition.as_deref(),
+            Some("(steps.__action1.outcome != 'skipped') && (success())")
+        );
+        assert_eq!(
+            steps[8].condition.as_deref(),
+            Some("(steps.node.outcome != 'skipped') && (success())")
+        );
+        assert_eq!(steps[8].action.as_ref().unwrap().state, "node");
     }
 
     #[test]

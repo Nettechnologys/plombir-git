@@ -142,7 +142,7 @@ cited in the row added it. Plombir Git's side is specified in full in
 | `container.image`, `container.env` | ✅ | ✅ |
 | `container.options` | ❌ refused — it could undo the job sandbox | ✅ |
 | `services:` | ✅ Docker mode; a network per job, health-checked before the first step, `ports:` on loopback only; `volumes` and non-health `options` refused | ✅ |
-| `uses:` actions | ⚠️ composite actions from `./path`, this instance or an upstream the operator allows (`[ci] actions_sources`), plus the built-in `actions/checkout`, `actions/cache`, `actions/upload-artifact`; JavaScript and Docker actions refused by name | ✅ any action |
+| `uses:` actions | ⚠️ composite and JavaScript (`node12`–`node24`) actions from `./path`, this instance or an upstream the operator allows (`[ci] actions_sources`), plus the built-in `actions/checkout`, `actions/cache`, `actions/upload-artifact`; Docker actions refused by name; GitHub's artifact, cache and OIDC services not emulated | ✅ any action |
 | Step `id` | ✅ | ✅ |
 | Step outputs, `jobs.<id>.outputs`, `needs.<id>.outputs` | ✅ `$GITHUB_OUTPUT`, 1 MiB per job, masked; `::set-output` refused | ✅ |
 | Composite actions | ✅ `inputs`, `outputs`, nested up to 10 deep; the resolved commit is in the job log; `github.action_path` refused — an action's files do not reach the runner | ✅ |
@@ -150,8 +150,9 @@ cited in the row added it. Plombir Git's side is specified in full in
 | `vars.*` | ✅ repository and organization variables, the repository's winning | ✅ |
 | `permissions` | ⚠️ narrows the job token (`contents`, `packages`, `id-token: write` for OIDC); any other `write` refused — the token cannot write | ✅ |
 
-If your workflows lean on JavaScript or Docker marketplace actions, Gitea
-will run them and Plombir Git will not. Plombir Git also has its own pipeline format,
+If your workflows lean on Docker marketplace actions, or on JavaScript actions
+that talk to GitHub's artifact, cache or OIDC services, Gitea will run them and
+Plombir Git will not. Plombir Git also has its own pipeline format,
 [`.plombir-git-ci.yml`](docs/ci.md), for what the subset cannot express.
 
 ## Memory: measured

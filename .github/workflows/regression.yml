@@ -237,6 +237,15 @@ jobs:
           | test(/^ci_steps::services_docker_tests::/)
           | test(ci_services::tests::the_sweep_removes_a_dead_runners_container_and_network_on_a_real_daemon)'
 
+      # The real `actions/setup-node` and `actions/setup-go`, pinned by commit,
+      # fetched from github.com, packed and run with Node by the step runner
+      # (card_a1290adf28fd). `#[ignore]`d: it needs the network and Node.js,
+      # which this job has and a developer's offline `cargo test` may not.
+      - name: Run JavaScript actions test
+        run: >-
+          cargo nextest run -p rg-ci --run-ignored only
+          -E 'test(javascript_action_tests::setup_node_and_setup_go_run_from_their_pinned_commits)'
+
       # The same client over an SSH remote, with no HTTP server at all:
       # `git-lfs-transfer` carries the objects and the locks, and the test
       # counts the SSH connections a push opens (card_f11136311b12).

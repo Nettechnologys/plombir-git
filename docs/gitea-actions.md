@@ -833,13 +833,84 @@ Refused, by name:
 
 | What | Why |
 |------|-----|
-| `runs.using: node*` | A JavaScript action needs a Node runtime on the runner; there is none. |
+| `runs.using: node10` or any Node runtime but `node12`, `node16`, `node20`, `node24` | Not a runtime this engine knows. |
 | `runs.using: docker` | A Docker action is a container the workflow builds; refused like `container.options`. |
-| `github.action_path` | The action's files do not reach the runner — only its steps do. Inline what it runs from its directory. |
+| `github.action_path` in a composite action | A composite action's files do not reach the runner — only its steps do. Inline what it runs from its directory. (A JavaScript action's files do; see below.) |
 | `secrets.*` inside the action | An action has no secrets context, as on GitHub; the workflow passes what it needs as an input. |
 | `continue-on-error`, `timeout-minutes`, `shell`, `working-directory`, `run` on the calling step | They have no single step to apply to. |
 | `timeout-minutes` on an action's step | GitHub does not allow it either. |
 | Any other key in `action.yml` | It would be ignored. |
+
+### JavaScript actions
+
+`runs.using: node12`, `node16`, `node20` or `node24` — `actions/setup-node`,
+`actions/setup-go`, `actions/setup-python` and most of the Marketplace. Loaded
+from the same sources, under the same `[ci] actions_*` policy, as a composite
+action:
+
+<!-- example: action acme/hello@v1 -->
+```yaml
+name: Hello
+inputs:
+  who:
+    required: true
+outputs:
+  greeting:
+    description: what was said
+runs:
+  using: node20
+  pre: dist/pre.js
+  main: dist/index.js
+  post: dist/post.js
+  post-if: success()
+```
+
+```yaml
+on: push
+jobs:
+  build:
+    steps:
+      - id: hello
+        uses: acme/hello@v1
+        with:
+          who: world
+      - run: echo "${{ steps.hello.outputs.greeting }}"
+```
+
+When the workflow is read, the server packs the action's directory at the
+resolved commit into an archive it keeps (`_ci_action_archives` under the
+repository root, within `actions_cache_max_mb`, least recently used evicted).
+The job gets three kinds of step: `pre` (when the action has one, under its
+`pre-if`, `always()` by default) and `main` where the `uses:` was, and `post`
+after the job's last step — the last action's first — when `main` ran and its
+`post-if` (`always()` by default) holds. Each runs `node <action>/<file>` in
+the workspace, with what a GitHub runner gives an action:
+
+| What | Here |
+|------|------|
+| `INPUT_<NAME>` | Each input: the step's `with:`, else the default. A default that reads `github.token` or `github.server_url` gets the empty string for them — `setup-node`'s and `setup-go`'s `token` default is empty here. |
+| `$GITHUB_OUTPUT`, `$GITHUB_ENV`, `$GITHUB_PATH`, `$GITHUB_STEP_SUMMARY` | As for any step. The calling step's `id` is the `main` step's, so `steps.<id>.outputs.*` is what it wrote. |
+| `$GITHUB_STATE` | What `pre` or `main` writes there, `post` and the later steps of the same use read as `STATE_<name>`. |
+| `GITHUB_ACTION_PATH`, `GITHUB_ACTION_REPOSITORY`, `GITHUB_ACTION_REF`, `GITHUB_ACTION` | The action's directory, `owner/repo`, the ref the workflow named, the step's id. |
+| `GITHUB_REPOSITORY`, `GITHUB_REPOSITORY_OWNER`, `GITHUB_SHA`, `GITHUB_REF`, `GITHUB_REF_NAME`, `GITHUB_EVENT_NAME`, `GITHUB_RUN_ID`, `GITHUB_WORKSPACE`, `GITHUB_EVENT_PATH`, `RUNNER_OS`, `RUNNER_ARCH`, `RUNNER_TEMP` | Every step gets these, from the run's own `CI_*`. `$GITHUB_EVENT_PATH` is `{}`: no webhook payload is kept for a run. |
+| `RUNNER_TOOL_CACHE` | A directory that outlives the job, so a toolchain is downloaded once: per repository on the embedded runner, per runner on `plombir-git-runner` (which serves one repository); mounted at `/plombir-git/toolcache` in a job container. |
+| `::add-mask::<value>` | Any step may print it, a JavaScript action's or a `run:`; the value is `***` in that step's log and every later one, the command's own line included. Other workflow commands (`::group::`, `::error::`, …) stay in the log as text. |
+
+Node is the one on the runner's `PATH`, or in the job's `container:` image; a
+step that finds none fails saying so. `plombir-git-runner` runs JavaScript
+actions from runner protocol 5; an older runner is not handed a job with one
+(`426`, naming the job). Secrets reach an action's steps as for a composite
+action: only what the calling step hands it.
+
+Not emulated — an action that needs one of these fails the way it fails
+anywhere it is missing:
+
+| Variable or context | Why |
+|---------------------|-----|
+| `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_RUNTIME_URL`, `ACTIONS_CACHE_URL`, `ACTIONS_RESULTS_URL` | GitHub's artifact and cache services (`actions/upload-artifact@v4` as an action, `@actions/cache`). Caching inside `setup-*` reports the cache service unavailable and goes on; use the built-in `actions/cache` and `actions/upload-artifact`. |
+| `ACTIONS_ID_TOKEN_REQUEST_URL`, `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | GitHub's OIDC endpoint. Here a job with `permissions: id-token: write` exchanges `CI_JOB_TOKEN` at `CI_OIDC_TOKEN_URL` (see [Permissions](#permissions)). |
+| `github.token`, `GITHUB_TOKEN` | GitHub's token does not exist here, and the job token is never handed to an action under its name: it would travel to whatever API the action calls. |
+| `GITHUB_SERVER_URL`, `GITHUB_API_URL`, `GITHUB_GRAPHQL_URL` | This instance does not speak GitHub's API. An action that defaults to `https://github.com` keeps doing so. |
 
 ### Inputs of the built-in actions
 

@@ -631,6 +631,7 @@ pub(crate) fn stamp_security(
         crate::api::runners::delete_runner_admin,
         crate::api::runners::deregister,
         crate::api::runners::download_workspace,
+        crate::api::runners::download_action,
         crate::api::runners::download_cache,
         crate::api::runners::upload_cache,
         // Artifacts

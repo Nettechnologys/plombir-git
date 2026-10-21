@@ -57,6 +57,16 @@ fn job_workspace_path_in(temp_root: &Path, job_id: i64) -> PathBuf {
     jobs_root_in(temp_root).join(format!("{job_id}-{}", uuid::Uuid::new_v4()))
 }
 
+/// `RUNNER_TOOL_CACHE`: beside the jobs directory `workspace` is in, never
+/// swept with them, so a toolchain an action downloaded is there for this
+/// runner's next job. The runner serves one repository, so no other
+/// repository's job reads it.
+pub(crate) fn tool_cache_path(workspace: &Path) -> Option<PathBuf> {
+    Some(workspace.parent()?.parent()?.join(TOOL_CACHE_DIRECTORY))
+}
+
+const TOOL_CACHE_DIRECTORY: &str = "tool-cache";
+
 pub(crate) fn job_workspace_path(job_id: i64) -> PathBuf {
     job_workspace_path_in(&std::env::temp_dir(), job_id)
 }

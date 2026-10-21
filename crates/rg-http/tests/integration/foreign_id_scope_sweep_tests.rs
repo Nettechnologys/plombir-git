@@ -350,6 +350,9 @@ fn plan<'a>(fact: &'a RouteFact, subject: &str, fx: &Fixture) -> Option<Probe<'a
             "job_id" => Some(fx.job_id.to_string()),
             // A step number is per job, not an instance-wide id.
             "number" => Some("1".to_string()),
+            // An action archive is named by a content key the job's steps
+            // carry, not by an id; one nobody's job names.
+            "key" => Some("0".repeat(64)),
             "owner" if driver == Driver::Session => Some(OUTSIDER.to_string()),
             "name" if driver == Driver::Session => Some(OUTSIDER_REPO.to_string()),
             _ => None,

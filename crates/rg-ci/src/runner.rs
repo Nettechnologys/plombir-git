@@ -74,6 +74,33 @@ where
 /// Actions job carries its own ([`rg_process::ci_steps::JobContext::token_scopes`]).
 const DEFAULT_CI_TOKEN_SCOPES: &str = rg_core::ci::NATIVE_JOB_TOKEN_SCOPES;
 
+/// The directory under the storage root that holds each repository's
+/// `RUNNER_TOOL_CACHE` for the embedded runner, one per repository id.
+const TOOL_CACHE_DIR: &str = "_ci_tool_cache";
+
+/// The archives of JavaScript actions' files, read from this server's store.
+pub(crate) struct ServerActionArchives {
+    pub(crate) root: std::path::PathBuf,
+}
+
+impl rg_process::ci_steps::ActionArchives for ServerActionArchives {
+    fn fetch<'a>(
+        &'a self,
+        key: &'a str,
+        into: &'a std::path::Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("`{key}` is not the key of an action's files"));
+            }
+            tokio::fs::copy(self.root.join(format!("{key}.tar")), into)
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("the archive of the action's files: {error}"))
+        })
+    }
+}
+
 /// Outcome of running one pipeline stage.
 enum StageOutcome {
     /// The stage finished; the bool is whether it failed (a non-`allow_failure`
@@ -1503,6 +1530,21 @@ impl PipelineRunner {
             db: &self.db_write,
             job_id,
         };
+        // JavaScript actions' files come from the archives this server made
+        // when it read the workflow; the tool cache is the repository's own,
+        // so one repository's job cannot plant a toolchain another one runs.
+        let archives = ServerActionArchives {
+            root: self
+                .storage_root()
+                .join(crate::actions::ACTION_ARCHIVES_DIR),
+        };
+        let tool_cache = self
+            .storage_root()
+            .join(TOOL_CACHE_DIR)
+            .join(self.repo_id.to_string());
+        if let Err(error) = std::fs::create_dir_all(&tool_cache) {
+            tracing::warn!(job_id, %error, "could not create the repository's tool cache");
+        }
         let run = rg_process::ci_steps::run_job_steps(
             steps,
             job_environment,
@@ -1513,6 +1555,10 @@ impl PipelineRunner {
             &needs,
             &job_context.outputs,
             job_context.secrets.as_ref(),
+            rg_process::ci_steps::JobSupport {
+                actions: Some(&archives),
+                tool_cache: tool_cache.is_dir().then_some(tool_cache.as_path()),
+            },
             &mut reporter,
         )
         .await;
@@ -1624,6 +1670,7 @@ impl PipelineRunner {
                 limits: &self.job_limits,
                 temp: None,
                 network: None,
+                tool_cache: None,
             },
         )
         .await

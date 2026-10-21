@@ -132,6 +132,29 @@ fn lookup(context: &HashMap<String, String>, name: &str) -> Option<String> {
     })
 }
 
+/// The value an expression evaluates to, as text — `${{ a && b || '' }}`
+/// is the empty string or `b`, not `false`. Only the names `context` holds
+/// may be read; any other is an error, so a caller can tell an expression it
+/// cannot answer from one whose answer is empty.
+pub fn evaluate_text(input: &str, context: &HashMap<String, String>) -> Result<String> {
+    let expression = unwrap_expression(input)?;
+    let tokens = tokenize(expression)?;
+    let resolver = |name: &str| context.get(name).cloned();
+    let mut parser = Parser {
+        tokens,
+        position: 0,
+        resolver: &resolver,
+        depth: 0,
+        status: None,
+        named_status: false,
+    };
+    let result = parser.parse_or()?;
+    if parser.peek() != &Token::End {
+        bail!("unexpected token after expression");
+    }
+    Ok(result.text())
+}
+
 pub fn evaluate_condition(input: &str, context: &HashMap<String, String>) -> Result<bool> {
     evaluate_with(input, |name| lookup(context, name), None).map(|outcome| outcome.value)
 }
@@ -334,7 +357,9 @@ impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
         while self.peek() == &Token::Or {
             self.take();
             let right = self.parse_and()?;
-            left = Value::Bool(left.truthy() || right.truthy());
+            // The operand, not a boolean, as on GitHub: `a || 'default'`
+            // is a value. Truthiness — all a condition reads — is the same.
+            left = if left.truthy() { left } else { right };
         }
         Ok(left)
     }
@@ -343,7 +368,7 @@ impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
         while self.peek() == &Token::And {
             self.take();
             let right = self.parse_equality()?;
-            left = Value::Bool(left.truthy() && right.truthy());
+            left = if left.truthy() { right } else { left };
         }
         Ok(left)
     }
@@ -445,6 +470,29 @@ impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `&&` and `||` give back an operand, as on GitHub — the default of
+    /// `actions/setup-node`'s `token:` is `''` here, not `false` — while a
+    /// condition, which reads only truthiness, answers as before.
+    #[test]
+    fn and_and_or_give_back_an_operand() {
+        let context = HashMap::from([
+            ("github.server_url".to_string(), String::new()),
+            ("github.token".to_string(), String::new()),
+            ("env.NAME".to_string(), "x".to_string()),
+        ]);
+        let text = |input: &str| evaluate_text(input, &context).unwrap();
+        assert_eq!(
+            text("${{ github.server_url == 'https://github.com' && github.token || '' }}"),
+            ""
+        );
+        assert_eq!(text("env.NAME || 'fallback'"), "x");
+        assert_eq!(text("'' || 'fallback'"), "fallback");
+        assert_eq!(text("env.NAME && 'both'"), "both");
+        assert!(evaluate_text("github.unknown || ''", &context).is_err());
+        assert!(evaluate_condition("env.NAME && 'both'", &context).unwrap());
+        assert!(!evaluate_condition("'' || ''", &context).unwrap());
+    }
 
     /// Parse `input` on a thread with a small stack, the way a hostile `if:`
     /// would meet the parser: without the nesting limit these inputs overflow

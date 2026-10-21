@@ -2920,6 +2920,12 @@ pub(crate) fn build_all_routes(
         )
         .get_with(
             RUNNER_TOKEN,
+            "/runners/{id}/jobs/{job_id}/actions/{key}",
+            api::runners::download_action,
+            &runner_auth,
+        )
+        .get_with(
+            RUNNER_TOKEN,
             "/runners/{id}/jobs/{job_id}/cache",
             api::runners::download_cache,
             &runner_auth,

@@ -870,6 +870,12 @@ pub struct GiteaStep {
     /// wrote, which may read what it names.
     #[serde(skip)]
     pub(crate) granted_secrets: Option<BTreeSet<String>>,
+
+    /// Never in a workflow: set on a step a JavaScript action's `uses:` was
+    /// replaced by ([`crate::actions`]) — the file of the action it runs with
+    /// Node, in place of `run:`.
+    #[serde(skip)]
+    pub(crate) action: Option<rg_process::ci_steps::ActionStep>,
 }
 
 /// The secrets `text` names: every `secrets.<name>` in it, read the way
@@ -910,6 +916,7 @@ pub(crate) fn secrets_named_by_step(step: &GiteaStep, names: &mut BTreeSet<Strin
         condition,
         with,
         granted_secrets: _,
+        action: _,
     } = step;
     for text in [name, uses, run, shell, working_directory, condition]
         .into_iter()
@@ -3248,6 +3255,39 @@ impl GiteaWorkflow {
                 continue;
             }
 
+            // A step of a JavaScript action: its file, run with Node by the
+            // runner. The flat script cannot run one, and says so.
+            if let Some(action) = &step.action {
+                let name = step.name.clone().unwrap_or_default();
+                if statically_runs {
+                    script.push(format!(
+                        "echo \"Step '{}' runs a JavaScript action, which only a runner that \
+                         runs steps one by one can run\" >&2; exit 78",
+                        name.replace(['"', '\\', '$', '`'], "")
+                    ));
+                }
+                steps.push(rg_process::ci_steps::StepSpec {
+                    name,
+                    id: step.id.clone(),
+                    run: String::new(),
+                    shell: None,
+                    working_directory: None,
+                    env: resolved_step_env.clone().into_iter().collect(),
+                    continue_on_error: step_continue_on_error(step).unwrap_or(false),
+                    timeout_minutes: step_timeout_minutes(step).unwrap_or(None),
+                    condition: step.condition.clone(),
+                    secrets: {
+                        let mut secrets = job_level_secrets.clone();
+                        if let Some(granted) = &step.granted_secrets {
+                            secrets.extend(granted.iter().cloned());
+                        }
+                        secrets
+                    },
+                    action: Some(action.clone()),
+                });
+                continue;
+            }
+
             // Handle `run:` commands
             if let Some(ref run_cmd) = step.run {
                 // Substitute expressions in the command
@@ -3300,6 +3340,7 @@ impl GiteaWorkflow {
                         }
                         secrets
                     },
+                    action: None,
                 });
             }
         }
@@ -5285,6 +5326,7 @@ mod tests {
                     sha: "0".repeat(40),
                     origin: "the documentation".into(),
                     manifest: manifest.clone(),
+                    source: None,
                 })
                 .ok_or_else(|| {
                     crate::actions::ActionLoadError::Refused(

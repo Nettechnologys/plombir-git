@@ -264,6 +264,10 @@ pub struct JobContainer<'a> {
     /// so it reaches each service by its key (`crate::ci_services`). `None`:
     /// the daemon's default network, as before services existed.
     pub network: Option<&'a str>,
+    /// The runner's tool cache, mounted at
+    /// [`crate::ci_steps::CONTAINER_TOOL_CACHE`] in a steps container so a
+    /// toolchain `setup-node` downloads outlives the job.
+    pub tool_cache: Option<&'a Path>,
 }
 
 /// What a steps container runs until the runner `docker exec`s the job's steps
@@ -365,6 +369,15 @@ fn container_args(
             "-v".to_string(),
             format!("{temp}:{}", crate::ci_steps::CONTAINER_TEMP),
         ]);
+        if let Some(cache) = job.tool_cache {
+            let cache = cache
+                .to_str()
+                .ok_or(JobContainerRefused::WorkspacePathNotUtf8)?;
+            args.extend([
+                "-v".to_string(),
+                format!("{cache}:{}", crate::ci_steps::CONTAINER_TOOL_CACHE),
+            ]);
+        }
     }
     args.extend(["-w".to_string(), "/workspace".to_string()]);
     if let Some(network) = job.network {
@@ -864,6 +877,7 @@ mod tests {
             limits: &DEFAULT_LIMITS,
             temp: None,
             network: None,
+            tool_cache: None,
         }
     }
 

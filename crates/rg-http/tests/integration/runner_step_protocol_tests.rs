@@ -908,3 +908,90 @@ async fn an_actions_job_is_given_only_the_secrets_it_names() {
     assert!(!variables.contains_key("BRAVO"), "{body}");
     assert_eq!(body["secrets"], serde_json::json!(["ALPHA"]));
 }
+
+/// card_a1290adf28fd: a job that runs a JavaScript action goes only to a
+/// runner that runs them — protocol 4 is refused it by name — and that runner
+/// fetches the action's files by the key its step names, and by no other.
+#[tokio::test]
+async fn a_javascript_action_goes_only_to_a_runner_that_runs_it_with_its_files() {
+    let (base, db, repo_root) = crate::common::spawn_test_app_with_db_and_repo_root().await;
+    let seeded = seed(&base, &db, "javascript").await;
+    let job_id = job(&db, seeded.stage_id, "build", &[]).await;
+    let key = "c".repeat(64);
+    let other = "d".repeat(64);
+    let steps = serde_json::json!([{
+        "name": "Set up Node",
+        "run": "",
+        "action": {
+            "files": { "kind": "archive", "key": key },
+            "repository": "actions/setup-node",
+            "git_ref": "v4",
+            "using": "node20",
+            "entry": "dist/setup/index.js",
+            "state": "node",
+        },
+    }]);
+    rg_db::ops::pipeline_step_ops::create_job_steps(
+        &db,
+        job_id,
+        &steps.to_string(),
+        &["Set up Node".to_string()],
+    )
+    .await
+    .unwrap();
+    let archives = repo_root.join(rg_core::ci::ACTION_ARCHIVES_DIR);
+    std::fs::create_dir_all(&archives).unwrap();
+    std::fs::write(archives.join(format!("{key}.tar")), b"archive-bytes").unwrap();
+    std::fs::write(archives.join(format!("{other}.tar")), b"someone-else").unwrap();
+
+    let response = poll(
+        &base,
+        &seeded,
+        Some(&rg_core::ci::SCOPED_SECRETS_PROTOCOL.to_string()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    let error = response.json::<serde_json::Value>().await.unwrap()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains(&format!("job #{job_id}")) && error.contains("JavaScript action"),
+        "{error}"
+    );
+
+    let response = poll(
+        &base,
+        &seeded,
+        Some(&rg_core::ci::JS_ACTIONS_PROTOCOL.to_string()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["job_id"].as_i64(), Some(job_id));
+    assert_eq!(body["steps"][0]["action"]["files"]["key"], key.as_str());
+
+    let fetch = |key: String| {
+        let base = base.clone();
+        let token = seeded.runner_token.clone();
+        let runner_id = seeded.runner_id;
+        async move {
+            reqwest::Client::new()
+                .get(format!(
+                    "{base}/api/v1/runners/{runner_id}/jobs/{job_id}/actions/{key}"
+                ))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let fetched = fetch(key.clone()).await;
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(fetched.bytes().await.unwrap().as_ref(), b"archive-bytes");
+    assert_eq!(fetch(other).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        fetch("../../etc".into()).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}

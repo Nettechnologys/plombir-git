@@ -540,6 +540,7 @@ pub async fn poll_job(
     let runs_steps = protocol >= rg_core::ci::STEPS_PROTOCOL;
     let runs_services = protocol >= rg_core::ci::SERVICES_PROTOCOL;
     let scopes_secrets = protocol >= rg_core::ci::SCOPED_SECRETS_PROTOCOL;
+    let runs_javascript = protocol >= rg_core::ci::JS_ACTIONS_PROTOCOL;
 
     // Use tokio::time::timeout to wrap a polling loop
     let poll_future = async {
@@ -573,6 +574,9 @@ pub async fn poll_job(
                         && !scopes_secrets
                     {
                         return Err(scoped_secrets_protocol_refusal(runner_id, &job));
+                    }
+                    if !runs_javascript && runs_javascript_action(&resp) {
+                        return Err(javascript_protocol_refusal(runner_id, &job));
                     }
                     // Everything the response needs is prepared before the
                     // irreversible claim. The long-poll future can be dropped
@@ -713,6 +717,39 @@ fn services_protocol_refusal(
                 "job #{} ({}) declares services:, and this runner does not start them: its steps \
                  would run against services that are not there. Upgrade plombir-git-runner; the \
                  job waits for a runner that can run it.",
+                job.id, job.name
+            ),
+        })),
+    )
+        .into_response()
+}
+
+/// Whether a step of the job runs a JavaScript action.
+fn runs_javascript_action(resp: &PollJobResponse) -> bool {
+    resp.steps
+        .iter()
+        .flatten()
+        .any(|step| step.get("action").is_some_and(|action| !action.is_null()))
+}
+
+/// [`steps_protocol_refusal`] for a runner that does not run JavaScript
+/// actions: it would read such a step as one with an empty `run:`.
+fn javascript_protocol_refusal(
+    runner_id: i64,
+    job: &rg_db::entities::pipeline_job::Model,
+) -> Response {
+    tracing::warn!(
+        runner_id,
+        job_id = job.id,
+        "poll_job: refused a job with a JavaScript action to a runner that does not run them"
+    );
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(serde_json::json!({
+            "error": format!(
+                "job #{} ({}) runs a JavaScript action, and this runner does not run them: it \
+                 would read the action's step as an empty script. Upgrade plombir-git-runner; \
+                 the job waits for a runner that can run it.",
                 job.id, job.name
             ),
         })),
@@ -1520,6 +1557,71 @@ mod log_queue_failure_tests {
             log_write_failure_response(rg_core::ci::log_write_queue::LogWriteError::Full);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
+}
+
+/// Download the files of a JavaScript action one of the job's steps runs.
+///
+/// Only the runner holding the job, and only an archive one of its steps
+/// names: a key is no capability on its own, and an archive another
+/// repository's workflow made is not this job's to read.
+#[utoipa::path(
+    get,
+    path = "/runners/{id}/jobs/{job_id}/actions/{key}",
+    tag = "Runners",
+    params(
+        ("id" = i64, Path, description = "Runner ID"),
+        ("job_id" = i64, Path, description = "Job ID, which must be assigned to this runner"),
+        ("key" = String, Path, description = "The archive key a step of the job names"),
+    ),
+    responses(
+        (status = 200, description = "Tar archive of the action's directory", content_type = "application/x-tar"),
+        (status = 404, description = "Job not assigned to this runner, or no step of it names the key", body = serde_json::Value),
+    ),
+)]
+pub async fn download_action(
+    State(state): State<AppState>,
+    Path((runner_id, job_id, key)): Path<(i64, i64, String)>,
+) -> impl IntoResponse {
+    let job = match assigned_job(&state, runner_id, job_id).await {
+        Ok(job) => job,
+        Err(error) => return error.into_response(),
+    };
+    let named = key.len() == 64
+        && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && job
+            .steps
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(json).ok())
+            .is_some_and(|steps| {
+                steps.iter().any(|step| {
+                    let files = &step["action"]["files"];
+                    files["kind"] == "archive" && files["key"] == key.as_str()
+                })
+            });
+    if !named {
+        return AppError::not_found("no step of this job runs that action").into_response();
+    }
+    let path = state
+        .repo_root
+        .join(rg_core::ci::ACTION_ARCHIVES_DIR)
+        .join(format!("{key}.tar"));
+    let (file, size) = match crate::http_stream::open_local_file_for_stream(&path).await {
+        Ok(pair) => pair,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return AppError::not_found("the action's files are no longer kept").into_response();
+        }
+        Err(error) => return cache_path_error("action archive", &path, &error).into_response(),
+    };
+    let content_length = size.to_string();
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-tar"),
+            (axum::http::header::CONTENT_LENGTH, content_length.as_str()),
+        ],
+        crate::http_stream::file_body_with_idle(file, state.git_idle_timeout_secs),
+    )
+        .into_response()
 }
 
 /// Download a tar snapshot of the exact commit assigned to an external job.

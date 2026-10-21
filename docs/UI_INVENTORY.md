@@ -19,7 +19,7 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 448 |
+| Router routes (with declared `Access`) | 449 |
 | Reachable from the browser | 311 (69%) |
 | Layout modules | 2 |
 | Pages | 75 |
@@ -43,7 +43,7 @@
 | `OrgAdmin` | 19 | 14 | 0 | 3 |
 | `RepoAuthRead` | 18 | 18 | 1 | 0 |
 | `Foreign:oci.rs` | 14 | 0 | 0 | 0 |
-| `Foreign:RUNNER_AUTH_LAYER` | 13 | 0 | 0 | 0 |
+| `Foreign:RUNNER_AUTH_LAYER` | 14 | 0 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
 | `OrgRead` | 5 | 4 | 0 | 0 |
 | `Foreign:api/lfs_locks.rs` | 4 | 2 | 0 | 1 |
@@ -1440,6 +1440,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/log` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/steps/{number}` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/{job_id}/workspace` | `Foreign:RUNNER_AUTH_LAYER` | rust |
+| GET | `/api/v1/runners/{id}/jobs/{job_id}/actions/{key}` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/{job_id}/cache` | `Foreign:RUNNER_AUTH_LAYER` | rust+smoke |
 | PUT | `/api/v1/runners/{id}/jobs/{job_id}/cache` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/finish` | `Foreign:RUNNER_AUTH_LAYER` | rust |

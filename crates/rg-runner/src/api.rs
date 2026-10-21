@@ -606,6 +606,55 @@ pub async fn report_step(
     }
 }
 
+/// The files of the JavaScript actions a job's steps run, fetched from the
+/// server by the key each step names — only the runner holding the job may.
+pub struct HttpActionArchives<'a> {
+    pub client: &'a reqwest::Client,
+    pub server: &'a str,
+    pub runner_id: i64,
+    pub job_id: i64,
+    pub token: &'a str,
+}
+
+impl rg_process::ci_steps::ActionArchives for HttpActionArchives<'_> {
+    fn fetch<'a>(
+        &'a self,
+        key: &'a str,
+        into: &'a std::path::Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(self.download(key, into))
+    }
+}
+
+impl HttpActionArchives<'_> {
+    /// Spool the archive named `key` to `into`.
+    pub async fn download(&self, key: &str, into: &std::path::Path) -> Result<(), String> {
+        {
+            let response = self
+                .client
+                .get(format!(
+                    "{}/api/v1/runners/{}/jobs/{}/actions/{key}",
+                    self.server, self.runner_id, self.job_id
+                ))
+                .bearer_auth(self.token)
+                .send()
+                .await
+                .map_err(|error| format!("the server did not answer: {error}"))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                return Err(format!(
+                    "the server answered {status}: {}",
+                    response.text().await.unwrap_or_default()
+                ));
+            }
+            spool_response_body(response, into, "action archive")
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"))
+        }
+    }
+}
+
 pub async fn download_workspace(
     client: &reqwest::Client,
     server: &str,

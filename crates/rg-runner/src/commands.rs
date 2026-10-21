@@ -1035,6 +1035,25 @@ pub async fn run_jobs_until_shutdown_checking_every(
                                 job_id: job.job_id,
                                 token,
                             };
+                            let archives = crate::api::HttpActionArchives {
+                                client: &client,
+                                server,
+                                runner_id,
+                                job_id: job.job_id,
+                                token,
+                            };
+                            let tool_cache = crate::workspace::tool_cache_path(&workspace)
+                                .and_then(|path| match std::fs::create_dir_all(&path) {
+                                    Ok(()) => Some(path),
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            %error,
+                                            path = %path.display(),
+                                            "could not create the runner's tool cache"
+                                        );
+                                        None
+                                    }
+                                });
                             let run = rg_process::ci_steps::run_job_steps(
                                 steps,
                                 &variables,
@@ -1063,6 +1082,10 @@ pub async fn run_jobs_until_shutdown_checking_every(
                                 &job.needs,
                                 &job.outputs,
                                 job.secrets.as_ref(),
+                                rg_process::ci_steps::JobSupport {
+                                    actions: Some(&archives),
+                                    tool_cache: tool_cache.as_deref(),
+                                },
                                 &mut reporter,
                             )
                             .await;
