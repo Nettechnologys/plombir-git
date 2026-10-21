@@ -59,6 +59,10 @@ export interface Issue {
   author?: string | null;
   /** When the author is a bot account, the person it acts for. */
   author_bot_owner?: string | null;
+  /** Who wrote it on the platform it was imported from; `null` when written here. */
+  original_author?: string | null;
+  /** `github` / `gitlab`, beside `original_author`. */
+  original_service?: string | null;
   assignee_id: number | null;
   /** The assignee's username, when the issue is on someone whose account resolves. */
   assignee?: string | null;
@@ -77,6 +81,9 @@ export interface IssueComment {
   /** Absent on the row an edit answers with; the listing carries it. */
   author?: string | null;
   author_bot_owner?: string | null;
+  /** Who wrote it on the platform it was imported from; `null` when written here. */
+  original_author?: string | null;
+  original_service?: string | null;
   body: string;
   created_at: string;
   /** Later than `created_at` once the comment was edited. */

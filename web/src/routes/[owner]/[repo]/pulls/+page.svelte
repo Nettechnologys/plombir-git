@@ -3,6 +3,7 @@
   import { untrack } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
+  import ImportedBadge from '$lib/components/ImportedBadge.svelte';
   import { pulls, repos } from '$lib/api/client.svelte';
   import type { RepositoryFork } from '$lib/api/repos';
   import { getUser } from '$lib/stores/auth.svelte';
@@ -496,7 +497,7 @@
               {#if pr.is_draft}<span class="draft-badge">{t('pulls.draft')}</span>{/if}
             </div>
             <div class="pr-meta">
-              {t('pulls.meta', { number: pr.number, date: formatDate(pr.created_at), author: pr.author || t('common.unknown') })}<BotBadge owner={pr.author_bot_owner} link={false} />
+              {t('pulls.meta', { number: pr.number, date: formatDate(pr.created_at), author: pr.author || t('common.unknown') })}<BotBadge owner={pr.author_bot_owner} link={false} /><ImportedBadge login={pr.original_author} service={pr.original_service} />
               <span class="branch-label">{pr.head_branch}</span> → <span class="branch-label">{pr.base_branch}</span>
             </div>
           </div>

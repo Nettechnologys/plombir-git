@@ -62,6 +62,9 @@ async fn seed_pr(
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await

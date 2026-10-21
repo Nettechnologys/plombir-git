@@ -2361,6 +2361,9 @@ async fn exercise_release_asset_mutation_contract(
             author_id: Set(Some(actor_id)),
             created_at: Set(now),
             updated_at: Set(now),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await
@@ -3644,7 +3647,10 @@ async fn assert_free_text_columns_are_wide(db: &DatabaseConnection) {
 /// replays — a workflow file name and a `- cron:` entry — are refused past 255
 /// bytes as well, the cron when the workflow is read and the file name before a
 /// tick is claimed: the ledger keys a unique index on them, which MySQL cannot
-/// build over `TEXT`. A column joins this list only with the same answer.
+/// build over `TEXT`. An imported object's `original_author` is a source login,
+/// refused past 255 characters before the write, and `original_service` is
+/// `github` or `gitlab` (card_04088376105b). A column joins this list only with
+/// the same answer.
 const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
     ("access_tokens", &["name", "scopes", "token_hash"]),
     ("artifacts", &["name", "sha256"]),
@@ -3664,7 +3670,11 @@ const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
         "import_tasks",
         &["platform", "stage", "status", "target_name", "target_owner"],
     ),
-    ("issues", &["state", "title"]),
+    ("issue_comments", &["original_author", "original_service"]),
+    (
+        "issues",
+        &["original_author", "original_service", "state", "title"],
+    ),
     ("labels", &["color", "description", "name"]),
     ("lfs_objects", &["oid", "publisher_token"]),
     ("login_logs", &["failure_reason", "username"]),
@@ -3736,7 +3746,10 @@ const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
         ],
     ),
     ("pr_events", &["event_type"]),
-    ("pr_reviews", &["action", "commit_id"]),
+    (
+        "pr_reviews",
+        &["action", "commit_id", "original_author", "original_service"],
+    ),
     ("protected_branches", &["branch_name"]),
     ("protected_tags", &["pattern"]),
     (
@@ -3751,12 +3764,23 @@ const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
             "labels",
             "merge_commit_sha",
             "merge_strategy",
+            "original_author",
+            "original_service",
             "state",
             "title",
         ],
     ),
     ("release_assets", &["content_type", "filename", "sha256"]),
-    ("releases", &["tag_name", "target_commitish", "title"]),
+    (
+        "releases",
+        &[
+            "original_author",
+            "original_service",
+            "tag_name",
+            "target_commitish",
+            "title",
+        ],
+    ),
     ("repo_collaborators", &["permission"]),
     ("repo_watches", &["watch_state"]),
     ("repositories", &["default_branch", "name", "name_key"]),
@@ -4702,6 +4726,9 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             updated_at: Set(pr_now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await
@@ -5285,6 +5312,9 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             author_id: Set(Some(user.id)),
             created_at: Set(board_now),
             updated_at: Set(board_now),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await

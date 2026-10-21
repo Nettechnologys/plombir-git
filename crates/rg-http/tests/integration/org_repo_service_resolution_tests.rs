@@ -76,6 +76,9 @@ async fn insert_pr(db: &rg_db::DatabaseConnection, repo_id: i64, author_id: i64,
             updated_at: Set(Utc::now()),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await

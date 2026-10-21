@@ -2094,6 +2094,9 @@ mod merge_group_ref_cleanup_tests {
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         }
         .insert(&db)
         .await

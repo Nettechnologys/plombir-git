@@ -196,6 +196,9 @@ async fn apply_a_suggestion(fault: Option<&str>) -> Applied {
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await

@@ -151,6 +151,9 @@ pub async fn create_issue(
         updated_at: Set(Utc::now()),
         closed_at: Set(None),
         deleted_at: Set(None),
+        original_author: sea_orm::NotSet,
+        original_author_id: sea_orm::NotSet,
+        original_service: sea_orm::NotSet,
     };
 
     // FTS sync is handled by database triggers created in the migration chain.
@@ -814,6 +817,9 @@ pub async fn add_comment(
         body: Set(body),
         created_at: Set(now),
         updated_at: Set(now),
+        original_author: sea_orm::NotSet,
+        original_author_id: sea_orm::NotSet,
+        original_service: sea_orm::NotSet,
     };
 
     let comment = issue_comment_ops::create(db, model).await?;
@@ -1027,6 +1033,9 @@ mod number_allocation_tests {
             updated_at: Set(now),
             closed_at: Set(None),
             deleted_at: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         }
     }
 

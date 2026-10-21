@@ -341,6 +341,9 @@ async fn a_pipeline_going_green_runs_the_hooks_for_the_merge_it_triggers() {
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await
@@ -523,6 +526,9 @@ async fn a_merge_the_hooks_trigger_cascades_once_and_terminates() {
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await
@@ -697,6 +703,9 @@ async fn a_queue_pass_that_fails_later_still_runs_the_hooks_for_what_it_merged()
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await

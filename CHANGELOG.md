@@ -8,6 +8,15 @@ This project records user-facing changes here. The format follows
 
 ### Added
 
+- What an import from GitHub or GitLab brings — issues, their comments, pull
+  and merge requests, their reviews and conversation, releases — names who
+  wrote it on the source: `original_author` (the login), `original_author_id`
+  (the source's account id) and `original_service` (`github` / `gitlab`) on
+  each row, `original_author` on pull request timeline events, and an
+  "originally by @alice" badge in the issue and pull request views. The rows
+  still belong to the account that ran the import; a login is never matched to
+  a local account.
+
 - A repository brought over from GitHub runs its `.github/workflows/*.yml` as
   it is: the workflows are read from there when the commit has no
   `.gitea/workflows`, the order Gitea uses. The two directories are never

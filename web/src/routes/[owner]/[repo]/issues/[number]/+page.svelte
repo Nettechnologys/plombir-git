@@ -4,6 +4,7 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
+  import ImportedBadge from '$lib/components/ImportedBadge.svelte';
   import LabelChip from '$lib/components/LabelChip.svelte';
   import Modal from '$lib/components/Modal.svelte';
   import ThreadSubscription from '$lib/components/ThreadSubscription.svelte';
@@ -383,7 +384,7 @@
             {t(`issues.state.${issue.state}`, undefined, formatTranslationFallback(issue.state))}
           </span>
           <span class="text-secondary">
-            {t('issues.opened_by', { date: formatDate(issue.created_at), author: issue.author || t('common.unknown') })}<BotBadge owner={issue.author_bot_owner} />
+            {t('issues.opened_by', { date: formatDate(issue.created_at), author: issue.author || t('common.unknown') })}<BotBadge owner={issue.author_bot_owner} /><ImportedBadge login={issue.original_author} service={issue.original_service} />
           </span>
           {#if issue.labels?.length}
             {#each issue.labels as label}
@@ -427,7 +428,7 @@
       {#if issue.body}
         <div class="issue-body">
           <div class="comment-header">
-            {t('issues.commented', { author: issue.author || t('common.unknown'), date: formatDate(issue.created_at) })}<BotBadge owner={issue.author_bot_owner} />
+            {t('issues.commented', { author: issue.author || t('common.unknown'), date: formatDate(issue.created_at) })}<BotBadge owner={issue.author_bot_owner} /><ImportedBadge login={issue.original_author} service={issue.original_service} />
           </div>
           <div class="comment-body markdown-body">{@html renderMarkdown(issue.body)}</div>
         </div>
@@ -440,7 +441,7 @@
         <div class="comment" id="comment-{comment.id}" data-comment={comment.id}>
           <div class="comment-header">
             <span>
-              {t('issues.commented', { author: comment.author || t('common.unknown'), date: formatDate(comment.created_at) })}<BotBadge owner={comment.author_bot_owner} />
+              {t('issues.commented', { author: comment.author || t('common.unknown'), date: formatDate(comment.created_at) })}<BotBadge owner={comment.author_bot_owner} /><ImportedBadge login={comment.original_author} service={comment.original_service} />
               {#if isEdited(comment)}
                 <span class="edited-marker" title={formatDate(comment.updated_at)}>{t('comments.edited')}</span>
               {/if}

@@ -66,6 +66,9 @@ async fn create_review_with_event<C: ConnectionTrait>(
         created_at: Set(Utc::now()),
         dismissed_at: Set(None),
         dismissed_by: Set(None),
+        original_author: sea_orm::NotSet,
+        original_author_id: sea_orm::NotSet,
+        original_service: sea_orm::NotSet,
     };
 
     let review = pr_review_ops::create(db, model).await?;

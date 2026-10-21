@@ -474,6 +474,9 @@ async fn insert_pr(
             updated_at: Set(Utc::now()),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await
@@ -577,6 +580,9 @@ async fn seed_vault(
             created_at: Set(Utc::now()),
             dismissed_at: Set(None),
             dismissed_by: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await

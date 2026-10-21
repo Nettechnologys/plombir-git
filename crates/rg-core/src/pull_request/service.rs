@@ -138,6 +138,9 @@ pub async fn create_pr(
         updated_at: Set(Utc::now()),
         closed_at: Set(None),
         merged_at: Set(None),
+        original_author: sea_orm::NotSet,
+        original_author_id: sea_orm::NotSet,
+        original_service: sea_orm::NotSet,
     };
 
     let pr = insert_with_repo_number(db, repo_id, model).await?;
@@ -3033,6 +3036,9 @@ mod diff_tests {
             updated_at: now,
             closed_at: None,
             merged_at: None,
+            original_author: None,
+            original_author_id: None,
+            original_service: None,
         }
     }
 
@@ -6376,6 +6382,9 @@ mod number_allocation_tests {
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         }
     }
 
@@ -7530,6 +7539,9 @@ mod merge_conflict_gate_tests {
             updated_at: now,
             closed_at: None,
             merged_at: None,
+            original_author: None,
+            original_author_id: None,
+            original_service: None,
         };
         let server = super::GitPerson::server();
         let identity = super::MergeIdentity {
@@ -7904,6 +7916,9 @@ mod merge_message_tests {
             updated_at: now,
             closed_at: None,
             merged_at: None,
+            original_author: None,
+            original_author_id: None,
+            original_service: None,
         }
     }
 

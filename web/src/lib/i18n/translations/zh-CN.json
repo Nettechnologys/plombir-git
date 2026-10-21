@@ -78,7 +78,9 @@
   "author": {
     "bot": "机器人",
     "bot_title": "AI 智能体账户",
-    "on_behalf_of": "代表"
+    "on_behalf_of": "代表",
+    "imported_title": "导入的内容：旁边的账户执行了导入",
+    "originally_by": "原作者"
   },
   "ssh_keys": {
     "title": "SSH 密钥",

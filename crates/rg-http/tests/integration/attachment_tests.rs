@@ -418,6 +418,9 @@ async fn an_author_without_write_access_may_attach_to_each_own_target() {
             updated_at: Set(Utc::now()),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await
@@ -595,6 +598,9 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
             updated_at: Set(Utc::now()),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await

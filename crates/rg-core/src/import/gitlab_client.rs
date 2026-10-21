@@ -132,6 +132,9 @@ pub struct GitLabRelease {
     pub description: Option<String>,
     pub created_at: String,
     pub released_at: Option<String>,
+    /// Who created the release on GitLab.
+    #[serde(default)]
+    pub author: Option<GitLabUser>,
     pub assets: GitLabReleaseAssets,
 }
 

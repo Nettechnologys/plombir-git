@@ -203,6 +203,9 @@ async fn issue_pages_partition_a_batch_filed_in_one_instant() {
                 updated_at: Set(at),
                 closed_at: Set(None),
                 deleted_at: Set(None),
+                original_author: NotSet,
+                original_author_id: NotSet,
+                original_service: NotSet,
             },
             &db,
         )

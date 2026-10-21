@@ -12,6 +12,15 @@ pub struct Model {
     pub issue_id: i64,
     /// User who wrote the comment
     pub author_id: i64,
+    /// Who wrote this on the platform it was imported from — a byline beside
+    /// the local author, never in place of it (card_04088376105b). `None` for
+    /// everything written here.
+    pub original_author: Option<String>,
+    /// The source platform's numeric id for [`Self::original_author`], which a
+    /// rename cannot reassign.
+    pub original_author_id: Option<i64>,
+    /// The platform that issued [`Self::original_author_id`]: `github` / `gitlab`.
+    pub original_service: Option<String>,
     pub body: String,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,

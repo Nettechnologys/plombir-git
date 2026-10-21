@@ -4,6 +4,7 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
+  import ImportedBadge from '$lib/components/ImportedBadge.svelte';
   import Modal from '$lib/components/Modal.svelte';
   import ThreadSubscription from '$lib/components/ThreadSubscription.svelte';
   import { pulls, reviews } from '$lib/api/client.svelte';
@@ -685,7 +686,7 @@
           </span>
           {#if pr.is_draft}<span class="draft-badge">{t('pulls.draft')}</span>{/if}
           <span class="text-secondary">
-            {aroundAuthor(t('pulls.opened_by_author', { date: formatDate(pr.created_at) }))[0]}<strong>{pr.author || t('common.unknown')}</strong><BotBadge owner={pr.author_bot_owner} />{aroundAuthor(t('pulls.opened_by_author', { date: formatDate(pr.created_at) }))[1]}
+            {aroundAuthor(t('pulls.opened_by_author', { date: formatDate(pr.created_at) }))[0]}<strong>{pr.author || t('common.unknown')}</strong><BotBadge owner={pr.author_bot_owner} /><ImportedBadge login={pr.original_author} service={pr.original_service} />{aroundAuthor(t('pulls.opened_by_author', { date: formatDate(pr.created_at) }))[1]}
           </span>
           <span class="branch-pair">
             <span class="branch-label">{pr.head_branch}</span>
@@ -703,7 +704,7 @@
       {#if pr.body}
         <div class="pr-body">
           <div class="comment-header">
-            {aroundAuthor(t('pulls.author_commented'))[0]}<strong>{pr.author || t('common.unknown')}</strong><BotBadge owner={pr.author_bot_owner} />{aroundAuthor(t('pulls.author_commented'))[1]}
+            {aroundAuthor(t('pulls.author_commented'))[0]}<strong>{pr.author || t('common.unknown')}</strong><BotBadge owner={pr.author_bot_owner} /><ImportedBadge login={pr.original_author} service={pr.original_service} />{aroundAuthor(t('pulls.author_commented'))[1]}
           </div>
           <div class="comment-body markdown-body">{@html renderMarkdown(pr.body)}</div>
         </div>
@@ -866,7 +867,7 @@
                   <span class="timeline-dot"></span>
                   <div>
                     <div class="timeline-summary">
-                      <strong>{event.actor?.username || t('pulls.timeline.system')}</strong><BotBadge owner={event.actor?.bot_owner} />
+                      <strong>{event.actor?.username || t('pulls.timeline.system')}</strong><BotBadge owner={event.actor?.bot_owner} /><ImportedBadge login={event.original_author?.login} service={event.original_author?.service} />
                       <span>{t(`pulls.timeline.${event.kind}`, event.metadata || {}, formatTranslationFallback(event.kind))}</span>
                       {#if verdict?.dismissed_at}
                         <span class="withdrawn-badge">{t('pulls.review.withdrawn')}</span>

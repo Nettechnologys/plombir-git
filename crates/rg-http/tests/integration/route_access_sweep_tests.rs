@@ -1453,6 +1453,9 @@ async fn seed_repo_rows(
             updated_at: Set(chrono::Utc::now()),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await
@@ -1489,6 +1492,9 @@ async fn seed_repo_rows(
             updated_at: Set(chrono::Utc::now()),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await

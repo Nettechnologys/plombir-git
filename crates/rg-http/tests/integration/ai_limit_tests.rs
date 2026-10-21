@@ -386,6 +386,9 @@ async fn seed_pull_request(
             updated_at: Set(created_at),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await

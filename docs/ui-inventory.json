@@ -9193,7 +9193,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.open",
-          "line": 214,
+          "line": 215,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('open')",
@@ -9218,7 +9218,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.closed",
-          "line": 221,
+          "line": 222,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('closed')",
@@ -9243,7 +9243,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.all",
-          "line": 228,
+          "line": 229,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('all')",
@@ -9268,7 +9268,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.new",
-          "line": 236,
+          "line": 237,
           "via": null,
           "href": null,
           "handler": "openCreate",
@@ -9315,7 +9315,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.create_form.cancel",
-          "line": 248,
+          "line": 249,
           "via": null,
           "href": null,
           "handler": "() => showChooser = false",
@@ -9325,7 +9325,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.templates.get_started",
-          "line": 257,
+          "line": 258,
           "via": null,
           "href": null,
           "handler": "() => chooseTemplate(template)",
@@ -9335,7 +9335,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.templates.open_blank",
-          "line": 266,
+          "line": 267,
           "via": null,
           "href": null,
           "handler": "() => chooseTemplate()",
@@ -9345,7 +9345,7 @@
         {
           "tag": "a",
           "label": "i18n:issues.templates.open_link",
-          "line": 275,
+          "line": 276,
           "via": null,
           "href": "link.url",
           "handler": null,
@@ -9355,7 +9355,7 @@
         {
           "tag": "form",
           "label": "toggleLabel(label.name, event.currentTarget.checked)} /> }>",
-          "line": 284,
+          "line": 285,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -9402,7 +9402,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 291,
+          "line": 292,
           "via": null,
           "href": null,
           "handler": null,
@@ -9412,7 +9412,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 309,
+          "line": 310,
           "via": null,
           "href": null,
           "handler": "(event) => toggleLabel(label.name, event.currentTarget.checked)",
@@ -9422,7 +9422,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.create_form.submit",
-          "line": 323,
+          "line": 324,
           "via": null,
           "href": null,
           "handler": null,
@@ -9432,7 +9432,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.create_form.cancel",
-          "line": 324,
+          "line": 325,
           "via": null,
           "href": null,
           "handler": "() => { showCreate = false; if (issueTemplates.length > 0 || templateConfig.cont",
@@ -9442,7 +9442,7 @@
         {
           "tag": "a",
           "label": ")}",
-          "line": 343,
+          "line": 344,
           "via": null,
           "href": "`/${owner}/${repo}/issues/${issue.number}`",
           "handler": null,
@@ -9714,7 +9714,7 @@
         {
           "tag": "select",
           "label": "i18n:issues.unassigned",
-          "line": 403,
+          "line": 404,
           "via": null,
           "href": null,
           "handler": null,
@@ -9724,7 +9724,7 @@
         {
           "tag": "select",
           "label": "· `, undefined, formatTranslationFallback(milestone.state))}",
-          "line": 412,
+          "line": 413,
           "via": null,
           "href": null,
           "handler": null,
@@ -9734,7 +9734,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 420,
+          "line": 421,
           "via": null,
           "href": null,
           "handler": "saveLinks",
@@ -9759,7 +9759,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 450,
+          "line": 451,
           "via": null,
           "href": null,
           "handler": "() => startEdit(comment)",
@@ -9769,7 +9769,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 451,
+          "line": 452,
           "via": null,
           "href": null,
           "handler": "() => askDeleteComment(comment)",
@@ -9779,7 +9779,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 457,
+          "line": 458,
           "via": null,
           "href": null,
           "handler": null,
@@ -9789,7 +9789,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 462,
+          "line": 463,
           "via": null,
           "href": null,
           "handler": "() => saveEdit(comment)",
@@ -9817,7 +9817,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 465,
+          "line": 466,
           "via": null,
           "href": null,
           "handler": "cancelEdit",
@@ -9827,7 +9827,7 @@
         {
           "tag": "form",
           "label": "i18n:issues.comment_placeholder",
-          "line": 479,
+          "line": 480,
           "via": null,
           "href": null,
           "handler": "handleComment",
@@ -9955,7 +9955,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 480,
+          "line": 481,
           "via": null,
           "href": null,
           "handler": null,
@@ -9965,7 +9965,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.comment",
-          "line": 482,
+          "line": 483,
           "via": null,
           "href": null,
           "handler": null,
@@ -9975,7 +9975,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.close_issue",
-          "line": 484,
+          "line": 485,
           "via": null,
           "href": null,
           "handler": "toggleState",
@@ -10088,7 +10088,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.delete.button",
-          "line": 496,
+          "line": 497,
           "via": null,
           "href": null,
           "handler": "() => { issueDeleteOpen = true; issueDeleteError = ''; }",
@@ -10098,7 +10098,7 @@
         {
           "tag": "button",
           "label": "i18n:common.deleting",
-          "line": 513,
+          "line": 514,
           "via": null,
           "href": null,
           "handler": "confirmDeleteComment",
@@ -10127,7 +10127,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 516,
+          "line": 517,
           "via": null,
           "href": null,
           "handler": "closeDeleteComment",
@@ -10137,7 +10137,7 @@
         {
           "tag": "button",
           "label": "i18n:common.deleting",
-          "line": 529,
+          "line": 530,
           "via": null,
           "href": null,
           "handler": "confirmDeleteIssue",
@@ -10165,7 +10165,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 532,
+          "line": 533,
           "via": null,
           "href": null,
           "handler": "closeDeleteIssue",
@@ -13977,7 +13977,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.open",
-          "line": 349,
+          "line": 350,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('open')",
@@ -14002,7 +14002,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.closed",
-          "line": 356,
+          "line": 357,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('closed')",
@@ -14027,7 +14027,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.merged",
-          "line": 363,
+          "line": 364,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('merged')",
@@ -14052,7 +14052,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.new",
-          "line": 371,
+          "line": 372,
           "via": null,
           "href": null,
           "handler": "openCreate",
@@ -14081,7 +14081,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 382,
+          "line": 383,
           "via": null,
           "href": null,
           "handler": "() => loadBranches(owner, repo, routeGeneration)",
@@ -14105,7 +14105,7 @@
         {
           "tag": "form",
           "label": "selectHeadRepo(event.currentTarget.value)} disabled= > / / `",
-          "line": 392,
+          "line": 393,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -14152,7 +14152,7 @@
         {
           "tag": "select",
           "label": "/ / ` : ''}",
-          "line": 396,
+          "line": 397,
           "via": null,
           "href": null,
           "handler": "(event) => selectHeadRepo(event.currentTarget.value)",
@@ -14176,7 +14176,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 417,
+          "line": 418,
           "via": null,
           "href": null,
           "handler": "() => loadHeadBranches(headRepoOwner, owner, repo, routeGeneration)",
@@ -14200,7 +14200,7 @@
         {
           "tag": "select",
           "label": "i18n:pulls.create_form.select_branch",
-          "line": 430,
+          "line": 431,
           "via": null,
           "href": null,
           "handler": null,
@@ -14210,7 +14210,7 @@
         {
           "tag": "select",
           "label": "i18n:repo.browser.default_branch",
-          "line": 444,
+          "line": 445,
           "via": null,
           "href": null,
           "handler": null,
@@ -14220,7 +14220,7 @@
         {
           "tag": "a",
           "label": "i18n:pulls.create_form.compare",
-          "line": 452,
+          "line": 453,
           "via": null,
           "href": "compareLink",
           "handler": null,
@@ -14230,7 +14230,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 460,
+          "line": 461,
           "via": null,
           "href": null,
           "handler": null,
@@ -14240,7 +14240,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 463,
+          "line": 464,
           "via": null,
           "href": null,
           "handler": null,
@@ -14250,7 +14250,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.create_form.submit",
-          "line": 467,
+          "line": 468,
           "via": null,
           "href": null,
           "handler": null,
@@ -14260,7 +14260,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.create_form.cancel",
-          "line": 472,
+          "line": 473,
           "via": null,
           "href": null,
           "handler": "() => showCreate = false",
@@ -14270,7 +14270,7 @@
         {
           "tag": "a",
           "label": ")} →",
-          "line": 489,
+          "line": 490,
           "via": null,
           "href": "`/${owner}/${repo}/pulls/${pr.number}`",
           "handler": null,
@@ -14542,7 +14542,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 675,
+          "line": 676,
           "via": null,
           "href": null,
           "handler": "reloadPR",
@@ -14651,7 +14651,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.mark_ready",
-          "line": 696,
+          "line": 697,
           "via": null,
           "href": null,
           "handler": "toggleDraft",
@@ -14680,7 +14680,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.conversation",
-          "line": 716,
+          "line": 717,
           "via": null,
           "href": null,
           "handler": "() => activeTab = 'conversation'",
@@ -14690,7 +14690,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.changes",
-          "line": 719,
+          "line": 720,
           "via": null,
           "href": null,
           "handler": "() => activeTab = 'diff'",
@@ -14700,7 +14700,7 @@
         {
           "tag": "button",
           "label": "( )",
-          "line": 722,
+          "line": 723,
           "via": null,
           "href": null,
           "handler": "() => activeTab = 'review'",
@@ -14710,7 +14710,7 @@
         {
           "tag": "button",
           "label": "×",
-          "line": 741,
+          "line": 742,
           "via": null,
           "href": null,
           "handler": "() => removeReviewer(reviewer.username)",
@@ -14738,7 +14738,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.reviewers.request",
-          "line": 754,
+          "line": 755,
           "via": null,
           "href": null,
           "handler": "requestReviewer",
@@ -14780,7 +14780,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.fork_ci.approving",
-          "line": 769,
+          "line": 770,
           "via": null,
           "href": null,
           "handler": "approveForkCi",
@@ -14902,7 +14902,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.leave_queue",
-          "line": 801,
+          "line": 802,
           "via": null,
           "href": null,
           "handler": "cancelQueuedMerge",
@@ -15027,7 +15027,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.disable_auto",
-          "line": 814,
+          "line": 815,
           "via": null,
           "href": null,
           "handler": "disableAutoMerge",
@@ -15054,7 +15054,7 @@
         {
           "tag": "select",
           "label": "i18n:pulls.merge.strategy.merge",
-          "line": 821,
+          "line": 822,
           "via": null,
           "href": null,
           "handler": null,
@@ -15064,7 +15064,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.merging",
-          "line": 826,
+          "line": 827,
           "via": null,
           "href": null,
           "handler": "handleMerge",
@@ -15187,7 +15187,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.enabling_auto",
-          "line": 829,
+          "line": 830,
           "via": null,
           "href": null,
           "handler": "enableAutoMerge",
@@ -15313,7 +15313,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.joining_queue",
-          "line": 832,
+          "line": 833,
           "via": null,
           "href": null,
           "handler": "enqueueMerge",
@@ -15439,7 +15439,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 837,
+          "line": 838,
           "via": null,
           "href": null,
           "handler": null,
@@ -15449,7 +15449,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.dismissing",
-          "line": 884,
+          "line": 885,
           "via": null,
           "href": null,
           "handler": "() => dismissReview(verdict.id)",
@@ -15572,7 +15572,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.dismiss_cancel",
-          "line": 891,
+          "line": 892,
           "via": null,
           "href": null,
           "handler": "cancelDismissal",
@@ -15582,7 +15582,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.dismiss",
-          "line": 894,
+          "line": 895,
           "via": null,
           "href": null,
           "handler": "() => startDismissal(verdict.id)",
@@ -15592,7 +15592,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.suggestion.applying_selected",
-          "line": 908,
+          "line": 909,
           "via": null,
           "href": null,
           "handler": "applySelectedSuggestions",
@@ -15714,7 +15714,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 933,
+          "line": 934,
           "via": null,
           "href": null,
           "handler": "() => toggleSuggestionSelection(comment.id)",
@@ -15724,7 +15724,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.suggestion.apply",
-          "line": 950,
+          "line": 951,
           "via": null,
           "href": null,
           "handler": "() => applySuggestion(comment)",
@@ -15846,7 +15846,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.threads.reopen",
-          "line": 962,
+          "line": 963,
           "via": null,
           "href": null,
           "handler": "() => setThreadResolved(comment, !comment.resolved_at)",
@@ -15882,7 +15882,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 1000,
+          "line": 1001,
           "via": null,
           "href": null,
           "handler": "() => startInlineComment(target, line.content)",
@@ -15892,7 +15892,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.suggestion.apply",
-          "line": 1021,
+          "line": 1022,
           "via": null,
           "href": null,
           "handler": "() => applySuggestion(comment)",
@@ -16014,7 +16014,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.threads.reopen",
-          "line": 1031,
+          "line": 1032,
           "via": null,
           "href": null,
           "handler": "() => setThreadResolved(comment, !comment.resolved_at)",
@@ -16055,7 +16055,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 1039,
+          "line": 1040,
           "via": null,
           "href": null,
           "handler": null,
@@ -16065,7 +16065,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 1041,
+          "line": 1042,
           "via": null,
           "href": null,
           "handler": null,
@@ -16075,7 +16075,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 1047,
+          "line": 1048,
           "via": null,
           "href": null,
           "handler": null,
@@ -16085,7 +16085,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.diff.submit_comment",
-          "line": 1051,
+          "line": 1052,
           "via": null,
           "href": null,
           "handler": "submitInlineComment",
@@ -16127,7 +16127,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 1052,
+          "line": 1053,
           "via": null,
           "href": null,
           "handler": "() => commentTarget = null",
@@ -16137,7 +16137,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 1063,
+          "line": 1064,
           "via": null,
           "href": null,
           "handler": "reloadPR",
@@ -16246,7 +16246,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 1077,
+          "line": 1078,
           "via": null,
           "href": null,
           "handler": null,
@@ -16256,7 +16256,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 1081,
+          "line": 1082,
           "via": null,
           "href": null,
           "handler": null,
@@ -16266,7 +16266,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 1085,
+          "line": 1086,
           "via": null,
           "href": null,
           "handler": null,
@@ -16276,7 +16276,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 1089,
+          "line": 1090,
           "via": null,
           "href": null,
           "handler": null,
@@ -16286,7 +16286,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.submit",
-          "line": 1090,
+          "line": 1091,
           "via": null,
           "href": null,
           "handler": "handleSubmitReview",
@@ -16440,7 +16440,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.delete.button",
-          "line": 1100,
+          "line": 1101,
           "via": null,
           "href": null,
           "handler": "() => { prDeleteOpen = true; prDeleteError = ''; }",
@@ -16450,7 +16450,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 1118,
+          "line": 1119,
           "via": null,
           "href": null,
           "handler": null,
@@ -16460,7 +16460,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 1123,
+          "line": 1124,
           "via": null,
           "href": null,
           "handler": "() => saveEdit(comment)",
@@ -16488,7 +16488,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 1126,
+          "line": 1127,
           "via": null,
           "href": null,
           "handler": "cancelEdit",
@@ -16498,7 +16498,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 1136,
+          "line": 1137,
           "via": null,
           "href": null,
           "handler": "() => startEdit(comment)",
@@ -16508,7 +16508,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 1137,
+          "line": 1138,
           "via": null,
           "href": null,
           "handler": "() => askDeleteComment(comment)",
@@ -16518,7 +16518,7 @@
         {
           "tag": "button",
           "label": "i18n:common.deleting",
-          "line": 1152,
+          "line": 1153,
           "via": null,
           "href": null,
           "handler": "confirmDeleteComment",
@@ -16546,7 +16546,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 1155,
+          "line": 1156,
           "via": null,
           "href": null,
           "handler": "closeDeleteComment",
@@ -16556,7 +16556,7 @@
         {
           "tag": "button",
           "label": "i18n:common.deleting",
-          "line": 1168,
+          "line": 1169,
           "via": null,
           "href": null,
           "handler": "confirmDeletePr",
@@ -16584,7 +16584,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 1171,
+          "line": 1172,
           "via": null,
           "href": null,
           "handler": "closeDeletePr",

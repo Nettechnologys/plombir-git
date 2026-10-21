@@ -18,6 +18,15 @@ pub struct Model {
     pub state: String,
     /// User who created the issue
     pub author_id: i64,
+    /// Who wrote this on the platform it was imported from — a byline beside
+    /// the local author, never in place of it (card_04088376105b). `None` for
+    /// everything written here.
+    pub original_author: Option<String>,
+    /// The source platform's numeric id for [`Self::original_author`], which a
+    /// rename cannot reassign.
+    pub original_author_id: Option<i64>,
+    /// The platform that issued [`Self::original_author_id`]: `github` / `gitlab`.
+    pub original_service: Option<String>,
     /// Assigned user (nullable)
     pub assignee_id: Option<i64>,
     /// Milestone id (nullable)

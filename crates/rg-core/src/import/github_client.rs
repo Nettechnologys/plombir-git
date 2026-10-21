@@ -134,6 +134,9 @@ pub struct GitHubRelease {
     pub draft: bool,
     pub created_at: String,
     pub published_at: Option<String>,
+    /// Who published the release on GitHub.
+    #[serde(default)]
+    pub author: Option<GitHubUser>,
     #[serde(default)]
     pub assets: Vec<GitHubAsset>,
 }

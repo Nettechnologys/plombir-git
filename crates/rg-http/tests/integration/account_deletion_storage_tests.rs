@@ -141,6 +141,9 @@ async fn ghost_review_stays_in_history_but_stops_authorizing_merge() {
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await
@@ -158,6 +161,9 @@ async fn ghost_review_stays_in_history_but_stops_authorizing_merge() {
             created_at: Set(now),
             dismissed_at: Set(None),
             dismissed_by: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await
@@ -1105,6 +1111,9 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
             updated_at: Set(now),
             closed_at: Set(None),
             deleted_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
         &db,
     )
@@ -1119,6 +1128,9 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
             body: Set("This context must stay".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await
@@ -1156,6 +1168,9 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await
@@ -1173,6 +1188,9 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
             created_at: Set(now),
             dismissed_at: Set(None),
             dismissed_by: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await

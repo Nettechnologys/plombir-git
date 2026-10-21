@@ -181,6 +181,9 @@ mod tests {
             updated_at: Set(Utc::now()),
             closed_at: Set(None),
             deleted_at: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         };
         model.insert(db).await.expect("create test issue")
     }

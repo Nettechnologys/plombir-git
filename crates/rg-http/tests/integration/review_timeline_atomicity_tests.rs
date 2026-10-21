@@ -79,6 +79,9 @@ async fn fixture(prefix: &str) -> Fixture {
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await
@@ -122,6 +125,9 @@ async fn seed_review(fixture: &Fixture) -> rg_db::entities::pr_review::Model {
             created_at: Set(Utc::now()),
             dismissed_at: Set(None),
             dismissed_by: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await

@@ -111,6 +111,7 @@ mod import_target_namespace_tests;
 mod import_token_tests;
 mod import_trusted_origin_tests;
 mod import_worker_cancellation_tests;
+mod imported_byline_tests;
 mod issue_assignee_identity_tests;
 mod issue_lookup_failure_status_tests;
 mod issue_template_tests;

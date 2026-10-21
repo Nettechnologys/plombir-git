@@ -83,6 +83,9 @@ async fn setup(directory: &std::path::Path) -> (sea_orm::DatabaseConnection, i64
             updated_at: Set(now),
             merged_at: Set(None),
             closed_at: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await

@@ -762,6 +762,9 @@ async fn artifact_and_attachment_db_outages_return_503_after_healthy_baselines()
             updated_at: Set(chrono::Utc::now()),
             closed_at: Set(None),
             deleted_at: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
         &db,
     )

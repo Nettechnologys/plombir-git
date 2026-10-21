@@ -133,6 +133,9 @@ async fn a_web_editor_commit_runs_the_post_push_hooks() {
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await
@@ -291,6 +294,9 @@ async fn a_web_editor_delete_runs_the_post_push_hooks() {
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await

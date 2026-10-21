@@ -138,6 +138,9 @@ async fn reviewer_requests_and_thread_resolution_enforce_permissions() {
             created_at: Set(Utc::now()),
             dismissed_at: Set(None),
             dismissed_by: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await
@@ -331,6 +334,9 @@ async fn insert_pr(
             updated_at: Set(Utc::now()),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await
@@ -412,6 +418,9 @@ async fn review_id_must_belong_to_the_pr_in_the_route() {
             created_at: Set(Utc::now()),
             dismissed_at: Set(None),
             dismissed_by: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await
@@ -463,6 +472,9 @@ async fn review_and_parent_ids_in_the_body_are_scoped_to_their_pull_request() {
             created_at: Set(Utc::now()),
             dismissed_at: Set(None),
             dismissed_by: Set(None),
+            original_author: sea_orm::NotSet,
+            original_author_id: sea_orm::NotSet,
+            original_service: sea_orm::NotSet,
         },
     )
     .await

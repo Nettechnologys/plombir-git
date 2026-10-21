@@ -1419,6 +1419,9 @@ mod author_enrichment_tests {
             updated_at: now,
             closed_at: None,
             deleted_at: None,
+            original_author: None,
+            original_author_id: None,
+            original_service: None,
         }
     }
 
@@ -1431,6 +1434,9 @@ mod author_enrichment_tests {
             body: format!("comment {id}"),
             created_at: now,
             updated_at: now,
+            original_author: None,
+            original_author_id: None,
+            original_service: None,
         }
     }
 

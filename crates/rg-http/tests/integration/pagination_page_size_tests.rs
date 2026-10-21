@@ -86,6 +86,9 @@ async fn seed_pull_request(db: &rg_db::DatabaseConnection, repo_id: i64, author_
             updated_at: Set(now),
             closed_at: Set(None),
             merged_at: Set(None),
+            original_author: NotSet,
+            original_author_id: NotSet,
+            original_service: NotSet,
         },
     )
     .await

@@ -1303,6 +1303,9 @@ mod update_delete_tests {
                 author_id: Set(Some(owner.id)),
                 created_at: Set(now),
                 updated_at: Set(now),
+                original_author: NotSet,
+                original_author_id: NotSet,
+                original_service: NotSet,
             },
         )
         .await
@@ -1422,6 +1425,9 @@ mod download_source_tests {
                 author_id: Set(Some(owner_row.id)),
                 created_at: Set(now),
                 updated_at: Set(now),
+                original_author: NotSet,
+                original_author_id: NotSet,
+                original_service: NotSet,
             },
         )
         .await

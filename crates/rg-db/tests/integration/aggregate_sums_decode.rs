@@ -115,6 +115,9 @@ async fn setup_with_owner() -> (DatabaseConnection, Option<TempDb>, i64, i64, i6
         updated_at: Set(now),
         closed_at: Set(None),
         deleted_at: Set(None),
+        original_author: NotSet,
+        original_author_id: NotSet,
+        original_service: NotSet,
     }
     .insert(&db)
     .await

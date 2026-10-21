@@ -14,6 +14,15 @@ pub struct Model {
     pub repo_id: i64,
     /// User who submitted the review
     pub reviewer_id: i64,
+    /// Who wrote this on the platform it was imported from — a byline beside
+    /// the local author, never in place of it (card_04088376105b). `None` for
+    /// everything written here.
+    pub original_author: Option<String>,
+    /// The source platform's numeric id for [`Self::original_author`], which a
+    /// rename cannot reassign.
+    pub original_author_id: Option<i64>,
+    /// The platform that issued [`Self::original_author_id`]: `github` / `gitlab`.
+    pub original_service: Option<String>,
     /// comment / approve / request_changes. `dismiss` also occurs, but only on
     /// rows imported from a foreign forge that reported a withdrawn review
     /// without saying which verdict it had been.

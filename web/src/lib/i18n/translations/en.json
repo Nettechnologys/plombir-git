@@ -78,7 +78,9 @@
   "author": {
     "bot": "bot",
     "bot_title": "An AI agent account",
-    "on_behalf_of": "on behalf of"
+    "on_behalf_of": "on behalf of",
+    "imported_title": "Imported: the account beside it ran the import",
+    "originally_by": "originally by"
   },
   "ssh_keys": {
     "title": "SSH Keys",

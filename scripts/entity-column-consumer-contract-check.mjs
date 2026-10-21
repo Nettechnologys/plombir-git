@@ -166,6 +166,17 @@ function hasReader({ field, variant }) {
 // Each entry states why a written column may stay unread. An entry naming a
 // column that no longer exists, or one that has since grown a reader, fails
 // this check: the list describes the tree or it describes nothing.
+// The source platform's account id beside an imported object's byline
+// (card_04088376105b). Serde reads it today — each of these models reaches the
+// API whole through `#[serde(flatten)]` or `Json(row)` — and the re-attribution
+// to whoever signs in with that source account (card_2a006cf365f6) is the Rust
+// reader it was stored for. It has to be written from the first import on: a
+// row imported before that reader ships has no other record of the id.
+const IMPORTED_AUTHOR_ID_REASON =
+  'serde reads it: the model goes out whole through `#[serde(flatten)]` / `Json(row)`, and the ' +
+  're-attribution on source sign-in (card_2a006cf365f6) is the reader it is kept for — rows ' +
+  'imported before that ships have no other record of the source account id';
+
 const ALLOWED_WITHOUT_CONSUMER = new Map([
   [
     'board.created_by',
@@ -184,6 +195,26 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
       '`m20260811_000002_rubygems_protocol_version_key` built over ' +
       '`(package_id, version, protocol_variant_key)`, which is what keeps two rubygems platform ' +
       'variants of one version from colliding; no Rust has to read it back for that to work',
+  ],
+  [
+    'issue.original_author_id',
+    IMPORTED_AUTHOR_ID_REASON,
+  ],
+  [
+    'issue_comment.original_author_id',
+    IMPORTED_AUTHOR_ID_REASON,
+  ],
+  [
+    'pull_request.original_author_id',
+    IMPORTED_AUTHOR_ID_REASON,
+  ],
+  [
+    'pr_review.original_author_id',
+    IMPORTED_AUTHOR_ID_REASON,
+  ],
+  [
+    'release.original_author_id',
+    IMPORTED_AUTHOR_ID_REASON,
   ],
 ]);
 

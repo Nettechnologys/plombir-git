@@ -90,9 +90,31 @@ pub struct ReviewTimelineEvent {
     pub id: String,
     pub kind: String,
     pub actor: Option<TimelineActor>,
+    /// Who wrote this on the platform it was imported from, beside the local
+    /// `actor` that ran the import (card_04088376105b). On the event rather
+    /// than the actor: the byline outlives the local account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_author: Option<OriginalAuthor>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub body: Option<String>,
     pub metadata: serde_json::Value,
+}
+
+/// The source platform's login for something an import brought, and the
+/// platform it is a login on.
+#[derive(Serialize)]
+pub struct OriginalAuthor {
+    pub login: String,
+    pub service: String,
+}
+
+impl OriginalAuthor {
+    fn of(login: &Option<String>, service: &Option<String>) -> Option<Self> {
+        Some(Self {
+            login: login.clone()?,
+            service: service.clone()?,
+        })
+    }
 }
 
 /// The read gate itself is stated in the handler signature (`RepoAuthRead`);
@@ -860,6 +882,7 @@ impl TimelineBuilder {
             id: format!("pr:{}:opened", pr.id),
             kind: "pull_request_opened".to_string(),
             actor,
+            original_author: OriginalAuthor::of(&pr.original_author, &pr.original_service),
             created_at: pr.created_at,
             body: pr.body.clone(),
             metadata: serde_json::json!({"title": pr.title, "head_sha": pr.head_sha}),
@@ -877,6 +900,10 @@ impl TimelineBuilder {
                 id: format!("review:{}", review.id),
                 kind,
                 actor,
+                original_author: OriginalAuthor::of(
+                    &review.original_author,
+                    &review.original_service,
+                ),
                 created_at: review.created_at,
                 body: review.body,
                 metadata: serde_json::json!({"commit_id": review.commit_id}),
@@ -899,6 +926,7 @@ impl TimelineBuilder {
                     id: format!("comment:{}", comment.id),
                     kind: comment_kind.to_string(),
                     actor,
+                    original_author: None,
                     created_at: comment.created_at,
                     body: Some(comment.body.clone()),
                     metadata: serde_json::json!({
@@ -921,6 +949,7 @@ impl TimelineBuilder {
                         id: format!("comment:{}:applied", comment.id),
                         kind: "suggestion_applied".to_string(),
                         actor,
+                        original_author: None,
                         created_at: applied_at,
                         body: None,
                         metadata: serde_json::json!({
@@ -939,6 +968,7 @@ impl TimelineBuilder {
                         id: format!("comment:{}:resolved", comment.id),
                         kind: "thread_resolved".to_string(),
                         actor,
+                        original_author: None,
                         created_at: resolved_at,
                         body: None,
                         metadata: serde_json::json!({"comment_id": comment.id}),
@@ -959,6 +989,7 @@ impl TimelineBuilder {
                 id: format!("reviewer-request:{}", request.id),
                 kind: "reviewer_requested".to_string(),
                 actor,
+                original_author: None,
                 created_at: request.created_at,
                 body: None,
                 metadata: serde_json::json!({
@@ -983,6 +1014,7 @@ impl TimelineBuilder {
                     id: format!("pr:{}:auto-merge", pr.id),
                     kind: "auto_merge_enabled".to_string(),
                     actor,
+                    original_author: None,
                     created_at: enabled_at,
                     body: None,
                     metadata: serde_json::json!({"strategy": pr.auto_merge_strategy}),
@@ -996,6 +1028,7 @@ impl TimelineBuilder {
                     id: format!("queue:{}:enqueued", entry.id),
                     kind: "merge_queue_enqueued".to_string(),
                     actor,
+                    original_author: None,
                     created_at: entry.created_at,
                     body: None,
                     metadata: serde_json::json!({"strategy": entry.strategy}),
@@ -1008,6 +1041,7 @@ impl TimelineBuilder {
                         id: format!("queue:{}:{}", entry.id, entry.status),
                         kind,
                         actor: None,
+                        original_author: None,
                         created_at: finished_at,
                         body: entry.failure_reason,
                         metadata: serde_json::json!({}),
@@ -1026,6 +1060,7 @@ impl TimelineBuilder {
                     id: format!("pr:{}:{}", pr.id, pr.state),
                     kind: kind.to_string(),
                     actor: None,
+                    original_author: None,
                     created_at: closed_at,
                     body: None,
                     metadata: serde_json::json!({
@@ -1046,6 +1081,7 @@ impl TimelineBuilder {
                 id: format!("event:{}", event.id),
                 kind: event.event_type,
                 actor,
+                original_author: None,
                 created_at: event.created_at,
                 body: event.body,
                 metadata,

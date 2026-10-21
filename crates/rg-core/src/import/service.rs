@@ -145,6 +145,49 @@ pub struct ImportStats {
     pub lfs_objects_failed: Vec<crate::lfs::fetch::LfsFetchFailure>,
 }
 
+/// The source platform's record of who wrote an imported object, kept as a
+/// byline beside the importer's `author_id` (card_04088376105b).
+///
+/// Never a local account: the source's `alice` and this instance's `alice` are
+/// unrelated, which is why `author_id` stays the importer (see the module
+/// docs). An object the source names no author for — a deleted account, a
+/// ghost — keeps no byline rather than an invented one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OriginalAuthor {
+    login: Option<String>,
+    id: Option<i64>,
+    service: Option<&'static str>,
+}
+
+impl OriginalAuthor {
+    /// The most a byline column holds (`varchar(255)` on MySQL). Both
+    /// platforms cap logins far below it; a longer one is not a login.
+    const MAX_LOGIN_CHARS: usize = 255;
+
+    fn github(user: Option<&crate::import::github_client::GitHubUser>) -> Self {
+        user.map_or_else(Self::default, |user| {
+            Self::named("github", &user.login, user.id)
+        })
+    }
+
+    fn gitlab(user: Option<&crate::import::gitlab_client::GitLabUser>) -> Self {
+        user.map_or_else(Self::default, |user| {
+            Self::named("gitlab", &user.username, user.id)
+        })
+    }
+
+    fn named(service: &'static str, login: &str, id: i64) -> Self {
+        if login.is_empty() || login.chars().count() > Self::MAX_LOGIN_CHARS {
+            return Self::default();
+        }
+        Self {
+            login: Some(login.to_string()),
+            id: Some(id),
+            service: Some(service),
+        }
+    }
+}
+
 /// A safe, actionable summary for the task owner. Raw database errors and
 /// source-supplied response text stay in the server log.
 #[derive(Debug, serde::Serialize)]
@@ -270,6 +313,7 @@ mod release_import_tests {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             published_at: None,
             assets: Vec::new(),
+            author: None,
         }
     }
 
@@ -285,6 +329,7 @@ mod release_import_tests {
                 sources: Vec::new(),
                 links: Vec::new(),
             },
+            author: None,
         }
     }
 
@@ -297,7 +342,16 @@ mod release_import_tests {
             1,
             2,
             &[
-                github_release("v1"),
+                GitHubRelease {
+                    author: Some(crate::import::github_client::GitHubUser {
+                        id: 51,
+                        login: "release-author".to_string(),
+                        email: None,
+                        avatar_url: None,
+                        user_type: None,
+                    }),
+                    ..github_release("v1")
+                },
                 github_release("v1"),
                 github_release(""),
             ],
@@ -313,6 +367,15 @@ mod release_import_tests {
             .unwrap()
             .unwrap();
         assert_eq!(saved.author_id, Some(2));
+        assert_eq!(
+            (
+                saved.original_author.as_deref(),
+                saved.original_author_id,
+                saved.original_service.as_deref()
+            ),
+            (Some("release-author"), Some(51), Some("github")),
+            "the release keeps who published it on GitHub as a byline"
+        );
         assert_eq!(stats.releases_failed.len(), 2);
         assert_eq!(stats.releases_failed[0].tag_name, "v1");
         assert_eq!(
@@ -3496,6 +3559,11 @@ async fn import_github_issue(
         updated_at: Set(updated_at),
         closed_at: Set(closed_at),
         deleted_at: Set(None),
+        original_author: Set(OriginalAuthor::github(issue.user.as_ref()).login.clone()),
+        original_author_id: Set(OriginalAuthor::github(issue.user.as_ref()).id),
+        original_service: Set(OriginalAuthor::github(issue.user.as_ref())
+            .service
+            .map(str::to_string)),
     };
 
     let Some(saved) = skip_taken_number(
@@ -3518,6 +3586,11 @@ async fn import_github_issue(
             body: Set(comment.body.clone().unwrap_or_default()),
             created_at: Set(created_at),
             updated_at: Set(updated_at),
+            original_author: Set(OriginalAuthor::github(comment.user.as_ref()).login.clone()),
+            original_author_id: Set(OriginalAuthor::github(comment.user.as_ref()).id),
+            original_service: Set(OriginalAuthor::github(comment.user.as_ref())
+                .service
+                .map(str::to_string)),
         };
 
         match issue_comment_ops::create(db, cm).await {
@@ -3689,6 +3762,11 @@ async fn import_github_pr(
         updated_at: Set(updated_at),
         closed_at: Set(closed_at),
         merged_at: Set(merged_at),
+        original_author: Set(OriginalAuthor::github(pr.user.as_ref()).login.clone()),
+        original_author_id: Set(OriginalAuthor::github(pr.user.as_ref()).id),
+        original_service: Set(OriginalAuthor::github(pr.user.as_ref())
+            .service
+            .map(str::to_string)),
     };
 
     let Some(saved) = skip_taken_number(
@@ -3714,6 +3792,7 @@ async fn import_github_pr(
             repo_id,
             saved.id,
             author_id,
+            &OriginalAuthor::github(comment.user.as_ref()),
             comment.body.clone().unwrap_or_default(),
             created_at,
             format!("pull request #{} comment {}", pr.number, comment.id),
@@ -3754,6 +3833,11 @@ async fn import_github_pr(
             created_at: Set(submitted_at),
             dismissed_at: Set(dismissed_at),
             dismissed_by: Set(None),
+            original_author: Set(OriginalAuthor::github(review.user.as_ref()).login.clone()),
+            original_author_id: Set(OriginalAuthor::github(review.user.as_ref()).id),
+            original_service: Set(OriginalAuthor::github(review.user.as_ref())
+                .service
+                .map(str::to_string)),
         };
 
         match pr_review_ops::create(db, rv).await {
@@ -3779,6 +3863,7 @@ async fn import_pr_conversation_comment(
     repo_id: i64,
     pr_id: i64,
     author_id: i64,
+    original: &OriginalAuthor,
     body: String,
     created_at: chrono::DateTime<Utc>,
     source: String,
@@ -3795,6 +3880,9 @@ async fn import_pr_conversation_comment(
         created_at: Set(created_at),
         dismissed_at: Set(None),
         dismissed_by: Set(None),
+        original_author: Set(original.login.clone()),
+        original_author_id: Set(original.id),
+        original_service: Set(original.service.map(str::to_string)),
     };
     match pr_review_ops::create(db, row).await {
         Ok(_) => stats.pr_comments_imported += 1,
@@ -3805,6 +3893,36 @@ async fn import_pr_conversation_comment(
                 ImportedObject::Comment,
                 &e,
             )),
+    }
+}
+
+/// Write the source's byline onto a release the import just created.
+///
+/// Releases are made through [`crate::release::service::create_release`], which
+/// knows nothing of imports, so the byline is a second write. Not fatal: the
+/// release is there and downloadable, and a byline that could not be written
+/// leaves it reading as the importer's, as every imported release did before.
+async fn record_release_byline(
+    db: &DatabaseConnection,
+    created: rg_db::entities::release::Model,
+    original: OriginalAuthor,
+) {
+    use sea_orm::ActiveModelTrait;
+
+    if original == OriginalAuthor::default() {
+        return;
+    }
+    let tag = created.tag_name.clone();
+    let mut active: rg_db::entities::release::ActiveModel = created.into();
+    active.original_author = Set(original.login);
+    active.original_author_id = Set(original.id);
+    active.original_service = Set(original.service.map(str::to_string));
+    if let Err(error) = active.update(db).await {
+        tracing::warn!(
+            tag = %tag,
+            error = %format!("{error:#}"),
+            "the imported release was created, but its source author could not be recorded"
+        );
     }
 }
 
@@ -3840,7 +3958,11 @@ async fn import_github_releases(
         )
         .await
         {
-            Ok(_) => count += 1,
+            Ok(created) => {
+                count += 1;
+                record_release_byline(db, created, OriginalAuthor::github(release.author.as_ref()))
+                    .await;
+            }
             Err(e) => {
                 tracing::warn!(tag = %release.tag_name, error = %format!("{e:#}"), "failed to import release");
                 stats.releases_failed.push(ReleaseImportFailure {
@@ -4041,6 +4163,11 @@ async fn import_gitlab_issue(
         updated_at: Set(updated_at),
         closed_at: Set(closed_at),
         deleted_at: Set(None),
+        original_author: Set(OriginalAuthor::gitlab(issue.author.as_ref()).login.clone()),
+        original_author_id: Set(OriginalAuthor::gitlab(issue.author.as_ref()).id),
+        original_service: Set(OriginalAuthor::gitlab(issue.author.as_ref())
+            .service
+            .map(str::to_string)),
     };
 
     let Some(saved) = skip_taken_number(
@@ -4067,6 +4194,11 @@ async fn import_gitlab_issue(
             body: Set(note.body.clone().unwrap_or_default()),
             created_at: Set(created_at),
             updated_at: Set(updated_at),
+            original_author: Set(OriginalAuthor::gitlab(note.author.as_ref()).login.clone()),
+            original_author_id: Set(OriginalAuthor::gitlab(note.author.as_ref()).id),
+            original_service: Set(OriginalAuthor::gitlab(note.author.as_ref())
+                .service
+                .map(str::to_string)),
         };
 
         match issue_comment_ops::create(db, cm).await {
@@ -4204,6 +4336,11 @@ async fn import_gitlab_mr(
         updated_at: Set(updated_at),
         closed_at: Set(closed_at),
         merged_at: Set(merged_at),
+        original_author: Set(OriginalAuthor::gitlab(mr.author.as_ref()).login.clone()),
+        original_author_id: Set(OriginalAuthor::gitlab(mr.author.as_ref()).id),
+        original_service: Set(OriginalAuthor::gitlab(mr.author.as_ref())
+            .service
+            .map(str::to_string)),
     };
 
     let Some(saved) = skip_taken_number(
@@ -4229,6 +4366,7 @@ async fn import_gitlab_mr(
             repo_id,
             saved.id,
             author_id,
+            &OriginalAuthor::gitlab(note.author.as_ref()),
             note.body.clone().unwrap_or_default(),
             created_at,
             format!("merge request !{} note {}", mr.iid, note.id),
@@ -4271,7 +4409,11 @@ async fn import_gitlab_releases(
         )
         .await
         {
-            Ok(_) => count += 1,
+            Ok(created) => {
+                count += 1;
+                record_release_byline(db, created, OriginalAuthor::gitlab(release.author.as_ref()))
+                    .await;
+            }
             Err(e) => {
                 tracing::warn!(tag = %release.tag_name, error = %format!("{e:#}"), "failed to import release");
                 stats.releases_failed.push(ReleaseImportFailure {
@@ -4655,6 +4797,16 @@ mod imported_issue_label_tests {
         )
         .await
         .unwrap()
+    }
+
+    fn gitlab_user(id: i64, username: &str) -> crate::import::gitlab_client::GitLabUser {
+        crate::import::gitlab_client::GitLabUser {
+            id,
+            username: username.to_string(),
+            name: username.to_string(),
+            email: None,
+            avatar_url: None,
+        }
     }
 
     fn github_user(id: i64, login: &str) -> crate::import::github_client::GitHubUser {
@@ -5362,7 +5514,8 @@ mod imported_issue_label_tests {
         .unwrap();
 
         // The payload names a source-platform author, and it is *not* the
-        // importer. Nothing about that login may reach the stored rows.
+        // importer — even though its login spells the importer's name. That
+        // login reaches the byline and nothing else: never `author_id`.
         let mut issue = github_issue(GitHubLabel {
             id: 10,
             name: "bug".to_string(),
@@ -5412,6 +5565,154 @@ mod imported_issue_label_tests {
             stored_comments[0].author_id, 7,
             "a comment must not fall through to user id 1 either"
         );
+
+        // card_04088376105b: who wrote them on the source is kept as a byline,
+        // keyed by the source's account id so a rename cannot move it.
+        assert_eq!(
+            (
+                imported.original_author.as_deref(),
+                imported.original_author_id,
+                imported.original_service.as_deref()
+            ),
+            (Some("importer"), Some(999), Some("github"))
+        );
+        assert_eq!(
+            (
+                stored_comments[0].original_author.as_deref(),
+                stored_comments[0].original_author_id,
+                stored_comments[0].original_service.as_deref()
+            ),
+            (Some("stranger"), Some(1000), Some("github"))
+        );
+    }
+
+    /// The bylines of the rest of an import: a pull request, its conversation,
+    /// a review, and on GitLab an issue, a note and a merge request. A source
+    /// object with no author — a deleted account — keeps no byline rather than
+    /// an invented one.
+    #[tokio::test]
+    async fn every_imported_object_carries_its_source_author() {
+        use rg_db::entities::{issue_comment, pr_review, pull_request};
+
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let mut pr = github_pr();
+        pr.user = Some(github_user(31, "octo-author"));
+        let comment = GitHubComment {
+            user: Some(github_user(32, "octo-commenter")),
+            ..github_comment(901)
+        };
+        let review = GitHubReview {
+            id: 801,
+            user: Some(github_user(33, "octo-reviewer")),
+            state: "APPROVED".to_string(),
+            body: None,
+            submitted_at: Some("2024-01-05T00:00:00Z".to_string()),
+        };
+        import_github_pr(
+            &db,
+            1,
+            &pr,
+            &[comment],
+            &[review],
+            IMPORTER_ID,
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        let mut issue = gitlab_issue("bug");
+        issue.labels.clear();
+        issue.author = Some(gitlab_user(41, "lab-author"));
+        let note = GitLabNote {
+            author: Some(gitlab_user(42, "lab-noter")),
+            ..gitlab_note(902)
+        };
+        import_gitlab_issue(
+            &db,
+            1,
+            "owner",
+            "imported",
+            &issue,
+            &[note],
+            IMPORTER_ID,
+            &HashMap::new(),
+            None,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        let mut mr = gitlab_mr();
+        mr.author = None;
+        import_gitlab_mr(&db, 1, &mr, &[], IMPORTER_ID, &HashMap::new(), &mut stats)
+            .await
+            .unwrap();
+
+        let bylines = |rows: Vec<(Option<String>, Option<i64>, Option<String>)>| {
+            let mut rows: Vec<(Option<String>, Option<i64>, Option<String>)> = rows;
+            rows.sort();
+            rows
+        };
+        let prs = pull_request::Entity::find().all(&db).await.unwrap();
+        assert_eq!(
+            bylines(
+                prs.into_iter()
+                    .map(|pr| (
+                        pr.original_author,
+                        pr.original_author_id,
+                        pr.original_service
+                    ))
+                    .collect()
+            ),
+            [
+                (None, None, None),
+                (
+                    Some("octo-author".to_string()),
+                    Some(31),
+                    Some("github".to_string())
+                ),
+            ],
+            "the GitLab merge request had no author, and keeps no byline"
+        );
+        let reviews = pr_review::Entity::find().all(&db).await.unwrap();
+        assert_eq!(
+            bylines(
+                reviews
+                    .into_iter()
+                    .map(|review| (
+                        review.original_author,
+                        review.original_author_id,
+                        review.original_service
+                    ))
+                    .collect()
+            ),
+            [
+                (
+                    Some("octo-commenter".to_string()),
+                    Some(32),
+                    Some("github".to_string())
+                ),
+                (
+                    Some("octo-reviewer".to_string()),
+                    Some(33),
+                    Some("github".to_string())
+                ),
+            ]
+        );
+        let gitlab_issue_row = issue::Entity::find().one(&db).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                gitlab_issue_row.original_author.as_deref(),
+                gitlab_issue_row.original_author_id,
+                gitlab_issue_row.original_service.as_deref()
+            ),
+            (Some("lab-author"), Some(41), Some("gitlab"))
+        );
+        let notes = issue_comment::Entity::find().all(&db).await.unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].original_author.as_deref(), Some("lab-noter"));
+        assert_eq!(notes[0].original_service.as_deref(), Some("gitlab"));
     }
 
     /// The source's issues and merge requests are listed **once**, by the step
