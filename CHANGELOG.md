@@ -44,6 +44,14 @@ This project records user-facing changes here. The format follows
 
 ### Fixed
 
+- An issue or pull request imported from GitHub or GitLab keeps the number it
+  had there. The import used to take the next free number in the order the
+  source listed them — newest first on GitHub — so the newest issue became
+  `#1` and every `Fixes #N` in the imported history pointed at another issue.
+  One whose number the target repository already holds is now named in the
+  task's stats (`issues_failed`, `prs_failed`) instead of being written under
+  another number, so importing the same source twice no longer duplicates it.
+
 - Deleting an OCI image from the web UI leaves an `oci.manifest.delete` audit
   entry, as deleting it through the registry API already did.
 - The hourly storage cleanup logs passes that only collected OCI blobs or

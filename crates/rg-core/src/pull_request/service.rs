@@ -275,7 +275,45 @@ pub(crate) async fn insert_with_repo_number(
     repo_id: i64,
     model: pull_request::ActiveModel,
 ) -> Result<PullRequest> {
-    let pr = insert_with_repo_number_gated(db, repo_id, model, |_| std::future::ready(())).await?;
+    insert_counted(db, repo_id, model, Numbering::Next).await
+}
+
+/// Insert one pull request under exactly `number` — the number it had on the
+/// platform it is imported from, so `#45` in a commit message or another
+/// issue still means the pull request it meant there.
+///
+/// A number someone already holds is final, not a race to re-read past: the
+/// insert fails with the UNIQUE violation ([`rg_db::is_unique_violation_anyhow`]
+/// tells it apart) instead of taking another number. Renumbering it quietly is
+/// exactly what sends every reference to the wrong object. Busy-backend
+/// outcomes are still retried, as for any create.
+pub(crate) async fn insert_with_source_number(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    number: i64,
+    model: pull_request::ActiveModel,
+) -> Result<PullRequest> {
+    insert_counted(db, repo_id, model, Numbering::Source(number)).await
+}
+
+/// Which number the insert loop writes.
+#[derive(Clone, Copy, Debug)]
+enum Numbering {
+    /// The next free one, `MAX(number) + 1`, re-read after every lost race.
+    Next,
+    /// Exactly this one; see [`insert_with_source_number`].
+    Source(i64),
+}
+
+async fn insert_counted(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    model: pull_request::ActiveModel,
+    numbering: Numbering,
+) -> Result<PullRequest> {
+    let pr =
+        insert_with_repo_number_gated(db, repo_id, model, numbering, |_| std::future::ready(()))
+            .await?;
     crate::metrics_hook::record_pr_opened();
     if pr.state == "merged" {
         crate::metrics_hook::record_pr_merged();
@@ -293,6 +331,7 @@ async fn insert_with_repo_number_gated<F, Fut>(
     db: &DatabaseConnection,
     repo_id: i64,
     model: pull_request::ActiveModel,
+    numbering: Numbering,
     after_allocate: F,
 ) -> Result<PullRequest>
 where
@@ -308,7 +347,10 @@ where
         // lookup because someone else is mid-write has said "ask again", not
         // "this create is impossible".
         let numbered: Result<PullRequest> = async {
-            let number = pull_request_ops::next_number(db, repo_id).await?;
+            let number = match numbering {
+                Numbering::Next => pull_request_ops::next_number(db, repo_id).await?,
+                Numbering::Source(number) => number,
+            };
             after_allocate(attempt).await;
 
             let mut candidate = model.clone();
@@ -320,6 +362,13 @@ where
         match numbered {
             Ok(pr) => return Ok(pr),
             Err(error) => {
+                if let Numbering::Source(number) = numbering {
+                    if rg_db::is_unique_violation_anyhow(&error) {
+                        return Err(error).context(format!(
+                            "pull request #{number} already exists in this repository"
+                        ));
+                    }
+                }
                 let retry = crate::db_retry::classify_anyhow(&error);
                 if retry.is_worthwhile() && budget.may_retry() {
                     retry.wait(attempt).await;
@@ -6227,12 +6276,14 @@ mod number_allocation_tests {
             &db,
             repo_id,
             pr_model(repo_id, user_id, "first"),
+            Numbering::Next,
             gate(same_read.clone()),
         );
         let second = insert_with_repo_number_gated(
             &db,
             repo_id,
             pr_model(repo_id, user_id, "second"),
+            Numbering::Next,
             gate(same_read.clone()),
         );
 
@@ -6246,6 +6297,43 @@ mod number_allocation_tests {
             numbers,
             [1, 2],
             "both correct creates keep a number, and the numbers are consecutive"
+        );
+    }
+
+    /// An imported pull request keeps the number it had at its source, gaps
+    /// and all, and one whose number is already held here is refused rather
+    /// than moved to the next free one: a moved number is a `#45` that now
+    /// means somebody else's pull request.
+    #[tokio::test]
+    async fn a_source_number_is_written_as_is_and_never_moved() {
+        let (_dir, db, user_id, repo_id) = repo_fixture("prsource").await;
+
+        let imported =
+            insert_with_source_number(&db, repo_id, 61, pr_model(repo_id, user_id, "from GitHub"))
+                .await
+                .expect("a free source number is written");
+        assert_eq!(imported.number, 61);
+
+        let error = insert_with_source_number(
+            &db,
+            repo_id,
+            61,
+            pr_model(repo_id, user_id, "imported twice"),
+        )
+        .await
+        .expect_err("a held source number is not renumbered");
+        assert!(rg_db::is_unique_violation_anyhow(&error), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("pull request #61 already exists"),
+            "{error:#}"
+        );
+
+        let next = insert_with_repo_number(&db, repo_id, pr_model(repo_id, user_id, "native"))
+            .await
+            .unwrap();
+        assert_eq!(
+            next.number, 62,
+            "a native create continues after the import"
         );
     }
 
@@ -6265,6 +6353,7 @@ mod number_allocation_tests {
             &db,
             repo_id,
             pr_model(repo_id, user_id, "mine"),
+            Numbering::Next,
             |attempt| {
                 let db = db.clone();
                 let planted = planted.clone();

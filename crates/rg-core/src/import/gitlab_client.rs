@@ -256,7 +256,7 @@ impl GitLabClient {
         Self::paginate_all(
             &self.client,
             &format!(
-                "{}/projects/{}/issues?state=all&scope=all&per_page=100",
+                "{}/projects/{}/issues?state=all&scope=all&order_by=created_at&sort=asc&per_page=100",
                 self.base_url,
                 urlencoding(project_id)
             ),
@@ -269,7 +269,7 @@ impl GitLabClient {
         Self::paginate_all(
             &self.client,
             &format!(
-                "{}/projects/{}/merge_requests?state=all&scope=all&per_page=100",
+                "{}/projects/{}/merge_requests?state=all&scope=all&order_by=created_at&sort=asc&per_page=100",
                 self.base_url,
                 urlencoding(project_id)
             ),

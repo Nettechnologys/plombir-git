@@ -102,6 +102,10 @@ pub struct ImportStats {
     /// point at one of these are imported without their milestone.
     pub milestones_failed: Vec<ImportedObjectFailure>,
     pub issues_imported: usize,
+    /// Issues the target could not write. An issue keeps the number it had at
+    /// its source, so one whose number the target already holds lands here
+    /// rather than under another number.
+    pub issues_failed: Vec<ImportedObjectFailure>,
     /// Issue comments (GitHub) and issue notes (GitLab) actually written.
     pub issue_comments_imported: usize,
     /// Pull-request conversation comments (GitHub) and merge-request notes
@@ -115,6 +119,9 @@ pub struct ImportStats {
     /// wrote. Counted so the source's note total still adds up.
     pub system_notes_skipped: usize,
     pub prs_imported: usize,
+    /// Pull and merge requests the target could not write, for the same
+    /// reason as [`Self::issues_failed`].
+    pub prs_failed: Vec<ImportedObjectFailure>,
     pub pr_reviews_imported: usize,
     /// Reviews the target could not write, or that carry no time they were
     /// submitted at. Unsubmitted (`PENDING`) GitHub drafts are not reviews
@@ -154,6 +161,8 @@ pub struct ImportedObjectFailure {
 enum ImportedObject {
     Label,
     Milestone,
+    Issue,
+    PullRequest,
     Comment,
     Review,
 }
@@ -171,11 +180,23 @@ impl ImportedObjectFailure {
         let reason = match (object, rg_db::is_unique_violation_anyhow(error)) {
             (ImportedObject::Label, true) => "a label with this name already exists",
             (ImportedObject::Milestone, true) => "a milestone with this title already exists",
+            (ImportedObject::Issue, true) => {
+                "the target repository already has an issue with this number"
+            }
+            (ImportedObject::PullRequest, true) => {
+                "the target repository already has a pull request with this number"
+            }
             (ImportedObject::Label, false) => {
                 "label creation failed; ask the instance operator to check the server log"
             }
             (ImportedObject::Milestone, false) => {
                 "milestone creation failed; ask the instance operator to check the server log"
+            }
+            (ImportedObject::Issue, false) => {
+                "issue creation failed; ask the instance operator to check the server log"
+            }
+            (ImportedObject::PullRequest, false) => {
+                "pull request creation failed; ask the instance operator to check the server log"
             }
             (ImportedObject::Comment, _) => {
                 "comment creation failed; ask the instance operator to check the server log"
@@ -412,6 +433,8 @@ impl ImportStats {
         let not_imported: Vec<String> = [
             (self.labels_failed.len(), "label"),
             (self.milestones_failed.len(), "milestone"),
+            (self.issues_failed.len(), "issue"),
+            (self.prs_failed.len(), "pull request"),
             (self.comments_failed.len(), "comment"),
             (self.pr_reviews_failed.len(), "review"),
             (self.releases_failed.len(), "release"),
@@ -524,9 +547,11 @@ pub const MAX_STORED_STATS_BYTES: usize = 48 * 1024;
 const MAX_STORED_FAILURE_FIELD_CHARS: usize = 512;
 
 /// The [`ImportStats`] fields whose length the source decides.
-const STORED_FAILURE_LISTS: [&str; 6] = [
+const STORED_FAILURE_LISTS: [&str; 8] = [
     "labels_failed",
     "milestones_failed",
+    "issues_failed",
+    "prs_failed",
     "comments_failed",
     "pr_reviews_failed",
     "releases_failed",
@@ -1246,14 +1271,48 @@ fn resolve_imported_label_ids(
 async fn create_imported_issue(
     db: &DatabaseConnection,
     repo_id: i64,
+    source_number: i64,
     model: issue::ActiveModel,
     label_ids: Vec<i64>,
 ) -> Result<issue::Model> {
-    // The same allocator as an ordinary create: an import running next to live
-    // traffic (or next to a second import of the same repository) must not lose
-    // a correct row to a number someone else took between the read and the
-    // write.
-    crate::issue::service::insert_with_repo_number(db, repo_id, model, Some(label_ids)).await
+    // The number the issue had at its source, not the next free one: the
+    // imported history says `Fixes #45`, and so do the other issues' bodies.
+    // Taking `MAX + 1` in the order the source lists them — newest first on
+    // GitHub — gave the newest issue `#1`, and every reference pointed at
+    // someone else's issue. A number the target already holds is refused, not
+    // moved; see [`skip_taken_number`].
+    crate::issue::service::insert_with_source_number(
+        db,
+        repo_id,
+        source_number,
+        model,
+        Some(label_ids),
+    )
+    .await
+}
+
+/// The outcome of writing one imported issue or pull request under its source
+/// number.
+///
+/// A number the target already holds — an import into a repository that has
+/// issues of its own, or the same source imported twice — is that one object's
+/// failure: it is named in `failed` and the import goes on without it, instead
+/// of writing it under another number. Every other refusal stops the import, as
+/// it did before.
+fn skip_taken_number<T>(
+    written: Result<T>,
+    source: String,
+    object: ImportedObject,
+    failed: &mut Vec<ImportedObjectFailure>,
+) -> Result<Option<T>> {
+    match written {
+        Ok(row) => Ok(Some(row)),
+        Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
+            failed.push(ImportedObjectFailure::insert_failed(source, object, &error));
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1376,7 +1435,6 @@ async fn run_github_import(
                 stats,
             )
             .await?;
-            stats.issues_imported += 1;
 
             let pct = 35 + (i as f64 / total.max(1) as f64 * 20.0) as i32;
             update_stage(
@@ -1414,7 +1472,6 @@ async fn run_github_import(
                 stats,
             )
             .await?;
-            stats.prs_imported += 1;
 
             let pct = 60 + (i as f64 / total.max(1) as f64 * 15.0) as i32;
             update_stage(
@@ -1595,7 +1652,6 @@ async fn run_gitlab_import(
                 stats,
             )
             .await?;
-            stats.issues_imported += 1;
 
             let pct = 35 + (i as f64 / total.max(1) as f64 * 20.0) as i32;
             update_stage(
@@ -1618,7 +1674,6 @@ async fn run_gitlab_import(
         for (i, mr) in mrs.iter().enumerate() {
             let notes = client.list_mr_notes(&project_path, mr.iid).await?;
             import_gitlab_mr(db, repo_id, mr, &notes, task.user_id, &milestone_map, stats).await?;
-            stats.prs_imported += 1;
 
             let pct = 60 + (i as f64 / total.max(1) as f64 * 15.0) as i32;
             update_stage(
@@ -3240,7 +3295,16 @@ async fn import_github_issue(
         deleted_at: Set(None),
     };
 
-    let saved = create_imported_issue(db, repo_id, model, label_ids).await?;
+    let Some(saved) = skip_taken_number(
+        create_imported_issue(db, repo_id, issue.number, model, label_ids).await,
+        format!("issue #{}", issue.number),
+        ImportedObject::Issue,
+        &mut stats.issues_failed,
+    )?
+    else {
+        return Ok(());
+    };
+    stats.issues_imported += 1;
 
     // Import comments
     for (comment, (created_at, updated_at)) in comments.iter().zip(comment_timestamps) {
@@ -3416,7 +3480,17 @@ async fn import_github_pr(
         merged_at: Set(merged_at),
     };
 
-    let saved = crate::pull_request::service::insert_with_repo_number(db, repo_id, model).await?;
+    let Some(saved) = skip_taken_number(
+        crate::pull_request::service::insert_with_source_number(db, repo_id, pr.number, model)
+            .await,
+        format!("pull request #{}", pr.number),
+        ImportedObject::PullRequest,
+        &mut stats.prs_failed,
+    )?
+    else {
+        return Ok(());
+    };
+    stats.prs_imported += 1;
 
     // The pull request's conversation. ForgeKeep has no comment table for
     // pull requests; a comment-only review is how its own UI and API record
@@ -3758,7 +3832,16 @@ async fn import_gitlab_issue(
         deleted_at: Set(None),
     };
 
-    let saved = create_imported_issue(db, repo_id, model, label_ids).await?;
+    let Some(saved) = skip_taken_number(
+        create_imported_issue(db, repo_id, issue.iid, model, label_ids).await,
+        format!("issue #{}", issue.iid),
+        ImportedObject::Issue,
+        &mut stats.issues_failed,
+    )?
+    else {
+        return Ok(());
+    };
+    stats.issues_imported += 1;
 
     // Import notes (skip system notes)
     for (note, (created_at, updated_at)) in notes
@@ -3903,7 +3986,16 @@ async fn import_gitlab_mr(
         merged_at: Set(merged_at),
     };
 
-    let saved = crate::pull_request::service::insert_with_repo_number(db, repo_id, model).await?;
+    let Some(saved) = skip_taken_number(
+        crate::pull_request::service::insert_with_source_number(db, repo_id, mr.iid, model).await,
+        format!("merge request !{}", mr.iid),
+        ImportedObject::PullRequest,
+        &mut stats.prs_failed,
+    )?
+    else {
+        return Ok(());
+    };
+    stats.prs_imported += 1;
 
     // Import MR notes (skip system notes) into the merge request's
     // conversation — see `import_github_pr` for why not `issue_comments`.
@@ -4491,10 +4583,7 @@ mod imported_issue_label_tests {
         assert!(rendered.contains("GitHub issue 41"), "{rendered}");
         assert!(rendered.contains("`created_at`"), "{rendered}");
         assert!(
-            issue_ops::find_by_repo_and_number(&db, 1, 1)
-                .await
-                .unwrap()
-                .is_none(),
+            issue::Entity::find().all(&db).await.unwrap().is_empty(),
             "the malformed issue must not be stored with an invented timestamp"
         );
 
@@ -4519,12 +4608,178 @@ mod imported_issue_label_tests {
         assert!(rendered.contains("GitHub issue comment 501"), "{rendered}");
         assert!(rendered.contains("`updated_at`"), "{rendered}");
         assert!(
-            issue_ops::find_by_repo_and_number(&db, 1, 1)
-                .await
-                .unwrap()
-                .is_none(),
+            issue::Entity::find().all(&db).await.unwrap().is_empty(),
             "child timestamps are validated before the parent issue is written"
         );
+    }
+
+    /// GitHub lists issues and pull requests newest first, and the import used
+    /// to number them `MAX + 1` in that order: the newest issue became `#1`
+    /// and every `Fixes #N` in the history pointed at somebody else's issue.
+    /// Each now keeps its source number — gaps included, since issues and pull
+    /// requests share one sequence on GitHub — and native creates continue
+    /// after them.
+    #[tokio::test]
+    async fn github_issues_and_pull_requests_keep_their_source_numbers() {
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let label = GitHubLabel {
+            id: 10,
+            name: "bug".to_string(),
+            color: "ee0701".to_string(),
+            description: None,
+        };
+
+        // Newest first, the way GitHub answers by default.
+        for number in [3, 1] {
+            let mut issue = github_issue(label.clone());
+            issue.number = number;
+            issue.labels.clear();
+            import_github_issue(
+                &db,
+                1,
+                "owner",
+                "imported",
+                &issue,
+                &[],
+                IMPORTER_ID,
+                &HashMap::new(),
+                None,
+                &mut stats,
+            )
+            .await
+            .unwrap();
+        }
+        let mut pr = github_pr();
+        pr.number = 2;
+        import_github_pr(
+            &db,
+            1,
+            &pr,
+            &[],
+            &[],
+            IMPORTER_ID,
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        let mut issue_numbers: Vec<i64> = issue::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.number)
+            .collect();
+        issue_numbers.sort_unstable();
+        assert_eq!(issue_numbers, [1, 3]);
+        let pr_numbers: Vec<i64> = rg_db::entities::pull_request::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|pr| pr.number)
+            .collect();
+        assert_eq!(pr_numbers, [2]);
+        assert_eq!((stats.issues_imported, stats.prs_imported), (2, 1));
+        assert!(stats.issues_failed.is_empty() && stats.prs_failed.is_empty());
+
+        assert_eq!(
+            issue_ops::next_number(&db, 1).await.unwrap(),
+            4,
+            "a native issue created after the import continues the sequence"
+        );
+    }
+
+    /// A number the target already holds — the same source imported twice, or
+    /// an import into a repository with issues of its own — is that object's
+    /// named failure, never a write under another number, and the import goes
+    /// on with the rest.
+    #[tokio::test]
+    async fn a_source_number_the_target_holds_is_named_not_renumbered() {
+        let db = test_db().await;
+        let label = GitHubLabel {
+            id: 10,
+            name: "bug".to_string(),
+            color: "ee0701".to_string(),
+            description: None,
+        };
+        let mut issue = github_issue(label);
+        issue.labels.clear();
+        async fn import_issue(
+            db: &DatabaseConnection,
+            issue: &GitHubIssue,
+            stats: &mut ImportStats,
+        ) -> Result<()> {
+            import_github_issue(
+                db,
+                1,
+                "owner",
+                "imported",
+                issue,
+                &[github_comment(901)],
+                IMPORTER_ID,
+                &HashMap::new(),
+                None,
+                stats,
+            )
+            .await
+        }
+
+        let mut first = ImportStats::default();
+        import_issue(&db, &issue, &mut first).await.unwrap();
+        let mut again = ImportStats::default();
+        import_issue(&db, &issue, &mut again)
+            .await
+            .expect("a taken number does not stop the import");
+
+        let issues = issue::Entity::find().all(&db).await.unwrap();
+        assert_eq!(issues.len(), 1, "the second import wrote no second row");
+        assert_eq!(issues[0].number, 41);
+        assert_eq!(again.issues_imported, 0);
+        assert_eq!(
+            again.issue_comments_imported, 0,
+            "the comments of an issue that was not written are not written either"
+        );
+        let named: Vec<(&str, &str)> = again
+            .issues_failed
+            .iter()
+            .map(|failure| (failure.source.as_str(), failure.reason))
+            .collect();
+        assert_eq!(
+            named,
+            [(
+                "issue #41",
+                "the target repository already has an issue with this number"
+            )]
+        );
+        assert!(
+            again
+                .completion_stage()
+                .contains("1 issue(s) could not be imported"),
+            "{}",
+            again.completion_stage()
+        );
+
+        let mut pr_stats = ImportStats::default();
+        for _ in 0..2 {
+            import_github_pr(
+                &db,
+                1,
+                &github_pr(),
+                &[],
+                &[],
+                IMPORTER_ID,
+                &HashMap::new(),
+                &mut pr_stats,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(pr_stats.prs_imported, 1);
+        assert_eq!(pr_stats.prs_failed.len(), 1);
+        assert_eq!(pr_stats.prs_failed[0].source, "pull request #61");
     }
 
     #[tokio::test]
@@ -4653,10 +4908,7 @@ mod imported_issue_label_tests {
         let rendered = format!("{error:#}");
         assert!(rendered.contains("GitLab issue 52"), "{rendered}");
         assert!(rendered.contains("`updated_at`"), "{rendered}");
-        assert!(issue_ops::find_by_repo_and_number(&db, 1, 1)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(issue::Entity::find().all(&db).await.unwrap().is_empty());
 
         issue.updated_at = "2024-01-02T00:00:00Z".to_string();
         let mut note = gitlab_note(901);
@@ -4679,10 +4931,7 @@ mod imported_issue_label_tests {
         assert!(rendered.contains("GitLab issue note 901"), "{rendered}");
         assert!(rendered.contains("`created_at`"), "{rendered}");
         assert!(
-            issue_ops::find_by_repo_and_number(&db, 1, 1)
-                .await
-                .unwrap()
-                .is_none(),
+            issue::Entity::find().all(&db).await.unwrap().is_empty(),
             "child timestamps are validated before the parent issue is written"
         );
     }
@@ -4842,7 +5091,7 @@ mod imported_issue_label_tests {
         .await
         .unwrap();
 
-        let imported = issue_ops::find_by_repo_and_number(&db, 1, 1)
+        let imported = issue_ops::find_by_repo_and_number(&db, 1, 41)
             .await
             .unwrap()
             .unwrap();
@@ -5451,7 +5700,7 @@ mod tests {
         .await
         .unwrap();
 
-        let imported = issue_ops::find_by_repo_and_number(&db, 1, 1)
+        let imported = issue_ops::find_by_repo_and_number(&db, 1, 41)
             .await
             .unwrap()
             .unwrap();

@@ -244,9 +244,14 @@ impl GitHubClient {
     pub async fn list_issues(&self, owner: &str, repo: &str) -> Result<Vec<GitHubIssue>> {
         // GitHub's /issues endpoint returns both issues and PRs.
         // We filter out PRs on our side since PRs are fetched separately.
+        //
+        // Oldest first, said out loud: GitHub's default is newest first. The
+        // import writes each issue under its own number either way, but the
+        // order it writes them in is the order the progress line counts and
+        // the local ids follow.
         let raw: Vec<GitHubIssue> = self
             .paginate_all(&format!(
-                "{}/repos/{}/{}/issues?state=all&per_page=100",
+                "{}/repos/{}/{}/issues?state=all&sort=created&direction=asc&per_page=100",
                 self.base_url, owner, repo
             ))
             .await?;
@@ -260,7 +265,7 @@ impl GitHubClient {
     /// List pull requests for a repository.
     pub async fn list_pull_requests(&self, owner: &str, repo: &str) -> Result<Vec<GitHubPR>> {
         self.paginate_all(&format!(
-            "{}/repos/{}/{}/pulls?state=all&per_page=100",
+            "{}/repos/{}/{}/pulls?state=all&sort=created&direction=asc&per_page=100",
             self.base_url, owner, repo
         ))
         .await
