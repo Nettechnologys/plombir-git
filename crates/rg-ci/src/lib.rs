@@ -1331,10 +1331,12 @@ async fn create_variant_jobs(
         } else {
             Some(serde_json::to_string(&variant.variables)?)
         };
+        // A path that was a template is this variant's (`out-linux`); both
+        // runners check it stays inside the workspace before they touch it.
         let cache_paths_json = job_config
             .cache
             .as_ref()
-            .map(|cache| serde_json::to_string(&cache.paths))
+            .map(|cache| serde_json::to_string(fields.cache_paths.as_ref().unwrap_or(&cache.paths)))
             .transpose()?;
         // Resolved per variant, so a matrix job's artifacts are named
         // after the variant that produced them rather than all landing
@@ -1342,15 +1344,21 @@ async fn create_variant_jobs(
         let artifacts_json = match job_config.artifacts.as_ref() {
             Some(artifacts) => {
                 let rendered;
-                let artifacts = match &fields.artifact_name {
-                    Some(name) => {
-                        rendered = config::ArtifactsConfig {
-                            name: Some(name.clone()),
-                            paths: artifacts.paths.clone(),
-                        };
-                        &rendered
-                    }
-                    None => artifacts,
+                let artifacts = if fields.artifact_name.is_some() || fields.artifact_paths.is_some()
+                {
+                    rendered = config::ArtifactsConfig {
+                        name: fields
+                            .artifact_name
+                            .clone()
+                            .or_else(|| artifacts.name.clone()),
+                        paths: fields
+                            .artifact_paths
+                            .clone()
+                            .unwrap_or_else(|| artifacts.paths.clone()),
+                    };
+                    &rendered
+                } else {
+                    artifacts
                 };
                 let (name, paths) = artifact_spec(&variant.name, artifacts).map_err(|error| {
                     rg_core::error::invalid_request(format!(
@@ -1382,6 +1390,9 @@ async fn create_variant_jobs(
             job_config.condition.as_deref(),
         )
         .await?;
+        if let Some(display_name) = &fields.display_name {
+            rg_db::ops::pipeline_ops::set_job_display_name(tx, job.id, display_name).await?;
+        }
         // Every variant names its matrix job and carries the job's
         // strategy: `fail-fast` and `max-parallel` are read off the rows.
         if let Some(strategy) = &job_config.matrix_strategy {
@@ -1407,6 +1418,22 @@ async fn create_variant_jobs(
             .await?;
         }
         if let Some(steps) = &job_config.steps {
+            // `- name: Test on ${{ matrix.os }}` is this variant's label.
+            let context = ActionTemplateContext {
+                variant: &variant,
+                ref_name,
+                event: trigger_type,
+                sha: commit_sha,
+                repository,
+            };
+            let steps = steps
+                .iter()
+                .cloned()
+                .map(|mut step| {
+                    step.name = step_label(&step.name, &context);
+                    step
+                })
+                .collect::<Vec<_>>();
             let names = steps
                 .iter()
                 .map(|step| step.name.clone())
@@ -1414,7 +1441,7 @@ async fn create_variant_jobs(
             rg_db::ops::pipeline_step_ops::create_job_steps(
                 tx,
                 job.id,
-                &serde_json::to_string(steps).context("serialize job steps")?,
+                &serde_json::to_string(&steps).context("serialize job steps")?,
                 &names,
             )
             .await?;
@@ -2339,20 +2366,26 @@ fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
             // the file would otherwise be discovered by a green job whose
             // artifact silently never appeared, which is the one failure a
             // pipeline cannot report.
-            // A name that is a template is checked once it is rendered for
-            // each variant, in `create_variant_jobs`; the paths are checked
-            // here either way.
-            let templated = job
-                .action_templates
-                .as_ref()
-                .is_some_and(|templates| templates.artifact_name.is_some());
-            let literal_name;
-            let artifacts = if templated {
-                literal_name = config::ArtifactsConfig {
-                    name: Some("artifact".to_owned()),
-                    paths: artifacts.paths.clone(),
+            // A name or a path that is a template is checked once it is
+            // rendered for each variant, in `create_variant_jobs`. A path's
+            // own text is judged here either way: `/${{ matrix.os }}` is
+            // absolute whatever the variant.
+            let templates = job.action_templates.as_ref();
+            let name_template = templates.and_then(|templates| templates.artifact_name.as_ref());
+            let path_templates = templates.and_then(|templates| templates.artifact_paths.as_ref());
+            let shaped;
+            let artifacts = if name_template.is_some() || path_templates.is_some() {
+                shaped = config::ArtifactsConfig {
+                    name: match name_template {
+                        Some(_) => Some("artifact".to_owned()),
+                        None => artifacts.name.clone(),
+                    },
+                    paths: match path_templates {
+                        Some(paths) => paths.iter().map(config::ActionTemplate::shape).collect(),
+                        None => artifacts.paths.clone(),
+                    },
                 };
-                &literal_name
+                &shaped
             } else {
                 artifacts
             };
@@ -2496,6 +2529,13 @@ struct ResolvedActionJobFields {
     environment: Option<String>,
     /// The rendered `actions/upload-artifact` name, when it was a template.
     artifact_name: Option<String>,
+    /// The rendered `actions/upload-artifact` / `actions/cache` paths, when
+    /// one of them was a template.
+    artifact_paths: Option<Vec<String>>,
+    cache_paths: Option<Vec<String>>,
+    /// `jobs.<id>.name` as this variant shows it; `None` without one, or when
+    /// it rendered empty — the job is then shown by its id, as on GitHub.
+    display_name: Option<String>,
 }
 
 struct ActionTemplateContext<'value, 'repo> {
@@ -2557,6 +2597,19 @@ fn render_action_template(
         })
 }
 
+/// A step's `name:` as one variant shows it. A label is never executed, so an
+/// expression with no value before a runner starts — `runner.os`,
+/// `steps.<id>.outputs.*` — stays as written rather than refusing a workflow
+/// over its label.
+fn step_label(name: &str, context: &ActionTemplateContext<'_, '_>) -> String {
+    match gitea_actions::compile_action_template(name) {
+        Some(template) => {
+            template.render_or_spell(|expression| action_expression_value(expression, context))
+        }
+        None => name.to_owned(),
+    }
+}
+
 fn resolve_action_job_fields(
     job_name: &str,
     config: &config::JobConfig,
@@ -2572,6 +2625,9 @@ fn resolve_action_job_fields(
             tags: config.tags.clone(),
             environment: config.environment.clone(),
             artifact_name: None,
+            artifact_paths: None,
+            cache_paths: None,
+            display_name: None,
         });
     };
     let context = ActionTemplateContext {
@@ -2619,14 +2675,51 @@ fn resolve_action_job_fields(
         .as_ref()
         .map(|template| render_action_template(job_name, "artifact name", template, &context))
         .transpose()?;
+    // A path line that renders empty — an input left blank — is no path, as
+    // a blank line of `path:` is not.
+    let render_paths = |field: &str, templates: &Option<Vec<config::ActionTemplate>>| {
+        templates
+            .as_ref()
+            .map(|templates| {
+                templates
+                    .iter()
+                    .map(|template| render_action_template(job_name, field, template, &context))
+                    .filter(|path| !path.as_ref().is_ok_and(String::is_empty))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()
+    };
+    let artifact_paths = render_paths("artifact path", &templates.artifact_paths)?;
+    let cache_paths = render_paths("cache path", &templates.cache_paths)?;
+
+    let display_name = templates
+        .display_name
+        .as_ref()
+        .map(|template| render_action_template(job_name, "name", template, &context))
+        .transpose()?
+        .filter(|name| !name.is_empty());
+    if let Some(name) = &display_name {
+        if name.chars().count() > JOB_DISPLAY_NAME_MAX || name.chars().any(char::is_control) {
+            return Err(rg_core::error::invalid_request(format!(
+                "job '{job_name}' has an unusable name: it must be at most \
+                 {JOB_DISPLAY_NAME_MAX} characters, without control characters"
+            )));
+        }
+    }
 
     Ok(ResolvedActionJobFields {
         image,
         tags,
         environment,
         artifact_name,
+        artifact_paths,
+        cache_paths,
+        display_name,
     })
 }
+
+/// Longest `jobs.<id>.name` a job is shown under, after rendering.
+const JOB_DISPLAY_NAME_MAX: usize = 255;
 
 fn matrix_variable_name(key: &str) -> String {
     format!("MATRIX_{}", key.to_ascii_uppercase().replace('-', "_"))
@@ -12502,6 +12595,260 @@ jobs:
                 "the workflow's mistake, not the server's: {message}"
             );
         }
+    }
+
+    /// The rows a push of `workflows` publishes, by job name — or the refusal.
+    async fn job_rows_of(
+        workflows: &[(&str, &str)],
+    ) -> Result<std::collections::BTreeMap<String, rg_db::entities::pipeline_job::Model>> {
+        let (db, pipeline_id, _, _temp) =
+            publish_workflows_for(workflows, &[], TestEvent::on("push", None)).await?;
+        Ok(
+            rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| (job.name.clone(), job))
+                .collect(),
+        )
+    }
+
+    const PATHS: &str = "on: push\njobs:\n  build:\n    strategy:\n      matrix:\nMATRIX    env:\n      OUT: out-${{ matrix.os }}\n    steps:\n      - uses: actions/cache@v4\n        with:\n          key: k-${{ matrix.os }}\n          path: |\n            CACHE\n            .cargo\n      - run: echo\n      - uses: actions/upload-artifact@v4\n        with:\n          name: dist-${{ matrix.os }}\n          path: PATH\n";
+
+    /// card_ffb33f8af357: an artifact's and a cache's `path:` are rendered per
+    /// matrix variant, as the artifact's name is — written directly or through
+    /// an `env.*` that reads the matrix — instead of being stored as the text
+    /// `${{ matrix.os }}`, which no path is called.
+    #[tokio::test]
+    async fn artifact_and_cache_paths_read_the_matrix_variant() {
+        let matrix = "        os: [linux, mac]\n";
+        for path in ["out-${{ matrix.os }}", "${{ env.OUT }}"] {
+            let workflow = PATHS
+                .replace("MATRIX", matrix)
+                .replace("CACHE", "target-${{ matrix.os }}")
+                .replace("PATH", path);
+            let rows = job_rows_of(&[("build.yml", &workflow)])
+                .await
+                .unwrap_or_else(|error| panic!("{path}: {error:#}"));
+            assert_eq!(rows.len(), 2, "{path}: {rows:?}");
+            for os in ["linux", "mac"] {
+                let job = &rows[&format!("build/build [os={os}]")];
+                let artifacts: serde_json::Value =
+                    serde_json::from_str(job.artifacts.as_deref().unwrap()).unwrap();
+                assert_eq!(
+                    artifacts,
+                    serde_json::json!({ "name": format!("dist-{os}"), "paths": [format!("out-{os}")] }),
+                    "{path}"
+                );
+                let cache_paths: Vec<String> =
+                    serde_json::from_str(job.cache_paths.as_deref().unwrap()).unwrap();
+                assert_eq!(cache_paths, [format!("target-{os}"), ".cargo".to_owned()]);
+            }
+        }
+    }
+
+    /// A path expression this engine has no value for is refused by field
+    /// and expression when the workflow is read; a path whose own text leaves
+    /// the workspace is refused as the author wrote it, and one a matrix value
+    /// takes out of it is refused for that variant.
+    #[tokio::test]
+    async fn a_path_refuses_an_unknown_expression_or_a_way_out_of_the_workspace() {
+        let os = "        os: [linux]\n";
+        for (matrix, cache, path, expected) in [
+            (
+                os,
+                "target",
+                "${{ secrets.TOKEN }}",
+                "build: step 3 with.path expression `secrets.TOKEN`",
+            ),
+            (
+                os,
+                "${{ steps.prep.outputs.dir }}",
+                "dist",
+                "build: step 1 with.path expression `steps.prep.outputs.dir`",
+            ),
+            (
+                os,
+                "target",
+                "/${{ matrix.os }}",
+                "artifact path must stay within the workspace: /${{ matrix.os }}",
+            ),
+            (
+                "        os: [linux]\n        dir: [../up]\n",
+                "target",
+                "${{ matrix.dir }}",
+                "job 'build/build [dir=../up, os=linux]' has an unusable artifacts block: \
+                 artifact path must stay within the workspace: ../up",
+            ),
+        ] {
+            let workflow = PATHS
+                .replace("MATRIX", matrix)
+                .replace("CACHE", cache)
+                .replace("PATH", path);
+            let error = job_rows_of(&[("build.yml", &workflow)])
+                .await
+                .expect_err("the path must be refused");
+            let message = format!("{error:#}");
+            assert!(message.contains(expected), "{path}: {message}");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "the workflow's mistake, not the server's: {message}"
+            );
+        }
+    }
+
+    const NAMED: &str = "on: push\njobs:\n  b:\nSTRATEGYNAME    steps:\n      - run: echo hi\n";
+
+    /// The name each job of `workflows` is shown under, by job.
+    async fn display_names_of(
+        workflows: &[(&str, &str)],
+    ) -> Result<std::collections::BTreeMap<String, Option<String>>> {
+        Ok(job_rows_of(workflows)
+            .await?
+            .into_iter()
+            .map(|(name, job)| (name, job.display_name))
+            .collect())
+    }
+
+    /// card_1535b3af81ac: `jobs.<id>.name` is accepted, rendered per matrix
+    /// variant as `runs-on` is, and stored beside the job's id, which stays
+    /// what it was.
+    #[tokio::test]
+    async fn a_job_name_is_shown_per_matrix_variant_beside_the_job_id() {
+        let matrix = "    strategy:\n      matrix:\n        os: [linux, mac]\n";
+        for (strategy, name, expected) in [
+            (
+                matrix,
+                "Build on ${{ matrix.os }}",
+                &[
+                    ("build/b [os=linux]", Some("Build on linux")),
+                    ("build/b [os=mac]", Some("Build on mac")),
+                ][..],
+            ),
+            (
+                "",
+                "Build ${{ github.ref_name }}",
+                &[("build/b", Some("Build main"))][..],
+            ),
+            ("", "Plain", &[("build/b", Some("Plain"))][..]),
+            ("", "", &[("build/b", None)][..]),
+        ] {
+            let name_line = if name.is_empty() {
+                String::new()
+            } else {
+                format!("    name: {name}\n")
+            };
+            let workflow = NAMED
+                .replace("STRATEGY", strategy)
+                .replace("NAME", &name_line);
+            let names = display_names_of(&[("build.yml", &workflow)])
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            let expected = expected
+                .iter()
+                .map(|(job, shown)| ((*job).to_owned(), shown.map(str::to_owned)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(names, expected, "{name}");
+        }
+    }
+
+    /// A name expression this engine has no value for before a runner starts
+    /// is refused by field and expression.
+    #[tokio::test]
+    async fn a_job_name_refuses_an_expression_it_has_no_value_for() {
+        for expression in ["secrets.TOKEN", "needs.a.outputs.x", "env.X"] {
+            let workflow = NAMED.replace("STRATEGY", "").replace(
+                "NAME",
+                &format!("    name: Build ${{{{ {expression} }}}}\n"),
+            );
+            let error = display_names_of(&[("build.yml", &workflow)])
+                .await
+                .expect_err("the name must be refused");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("b: name expression `{expression}`")),
+                "{expression}: {message}"
+            );
+        }
+    }
+
+    /// card_ffb33f8af357 (the low half): a step's label reads the matrix
+    /// variant, `github.*` and `env.*` — written or, for an unnamed step, the
+    /// first line it runs — in the step rows and in the steps a runner gets;
+    /// an expression with no value before a runner starts stays as written
+    /// instead of refusing the workflow over a label.
+    #[tokio::test]
+    async fn a_step_label_reads_the_matrix_variant() {
+        let workflow = "on: push\nenv:\n  TOOL: cargo\njobs:\n  b:\n    strategy:\n      matrix:\n        os: [linux, mac]\n    steps:\n      - name: Test on ${{ matrix.os }} with ${{ env.TOOL }} at ${{ github.ref_name }}\n        run: echo test\n      - run: echo ${{ matrix.os }}\n      - name: Cache on ${{ runner.os }}\n        run: echo cache\n";
+        let (db, pipeline_id, _, _temp) = publish_pipeline_on(workflow, &[], "push", None)
+            .await
+            .expect("the workflow publishes a pipeline");
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 2, "{jobs:?}");
+        for job in jobs {
+            let os = if job.name.contains("linux") {
+                "linux"
+            } else {
+                "mac"
+            };
+            let expected = [
+                format!("Test on {os} with cargo at main"),
+                format!("Run echo {os}"),
+                "Cache on ${{ runner.os }}".to_owned(),
+            ];
+            let rows = step_rows(&db, job.id)
+                .await
+                .into_iter()
+                .map(|row| row.0)
+                .collect::<Vec<_>>();
+            assert_eq!(rows, expected, "{}", job.name);
+            let specs: Vec<rg_process::ci_steps::StepSpec> =
+                serde_json::from_str(job.steps.as_deref().unwrap()).unwrap();
+            let names = specs.into_iter().map(|step| step.name).collect::<Vec<_>>();
+            assert_eq!(names, expected, "{}", job.name);
+        }
+    }
+
+    const CALLED: &str = "on:\n  workflow_call:\n    inputs:\n      target:\n        type: string\njobs:\n  deploy:\n    name: Deploy ${{ inputs.target }}\n    steps:\n      - run: echo\n  check:\n    steps:\n      - run: echo\n";
+
+    /// The name of a job that calls a reusable workflow heads each job it
+    /// brings, as GitHub shows `<caller> / <job>`; the called job's own name
+    /// reads the called workflow's inputs. Only a literal heads them.
+    #[tokio::test]
+    async fn a_calling_jobs_name_heads_the_jobs_it_brings() {
+        let caller = "on: push\njobs:\n  shared:\n    name: NAME\n    uses: ./.gitea/workflows/called.yml\n    with:\n      target: prod\n";
+        let names = display_names_of(&[
+            ("build.yml", &caller.replace("NAME", "Shared")),
+            ("called.yml", CALLED),
+        ])
+        .await
+        .unwrap();
+        let shown = names.values().flatten().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            ["Shared / check", "Shared / Deploy prod"],
+            "{names:?}"
+        );
+
+        let error = display_names_of(&[
+            (
+                "build.yml",
+                &caller.replace("NAME", "Shared ${{ github.ref_name }}"),
+            ),
+            ("called.yml", CALLED),
+        ])
+        .await
+        .expect_err("an expression in a calling job's name is refused");
+        assert!(
+            format!("{error:#}").contains(
+                "jobs.shared.name: a job that calls a reusable workflow takes a literal name"
+            ),
+            "{error:#}"
+        );
     }
 
     /// card_71a3e7424faa: the pre-2022 spelling of a dispatch input, in a

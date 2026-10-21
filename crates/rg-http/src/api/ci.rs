@@ -48,6 +48,10 @@ struct JobSummaryResponse {
     id: i64,
     stage_id: i64,
     name: String,
+    /// An Actions job's `jobs.<id>.name`, rendered for its matrix variant —
+    /// what to show the job under beside `name`, which stays its id in the
+    /// pipeline. Absent for a job the workflow gave no name.
+    display_name: Option<String>,
     image: Option<String>,
     script: String,
     when_condition: String,
@@ -147,6 +151,7 @@ impl From<rg_db::ops::pipeline_ops::PipelineJobSummary> for JobSummaryResponse {
             id: job.id,
             stage_id: job.stage_id,
             name: job.name,
+            display_name: job.display_name,
             image: job.image,
             script: job.script,
             when_condition: job.when_condition,

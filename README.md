@@ -139,7 +139,8 @@ cited in the row added it. Plombir Git's side is specified in full in
 | `inputs.*` / `github.event.inputs.*` in `if:`, `run:`, `env:`, `with:` | ✅ typed as on GitHub (a boolean is `true` / `false`); an undeclared name refused | ✅ |
 | `github.head_ref` / `github.base_ref` | ✅ the pull request's branches, `''` for other events — `${{ github.head_ref \|\| github.ref }}` groups work | ✅ |
 | `github.ref_name` in `run:`, `env:`, `with:` and job fields | ✅ `CI_REF_NAME`: `main`, `v1.2` | ✅ |
-| `actions/upload-artifact` `name:` with expressions | ✅ rendered per matrix variant (`dist-${{ matrix.os }}`); `artifact` without one | ✅ |
+| `actions/upload-artifact` `name:` / `path:` and `actions/cache` `path:` with expressions | ✅ rendered per matrix variant (`dist-${{ matrix.os }}`, `out-${{ matrix.os }}`); `artifact` without a name | ✅ |
+| `jobs.<id>.name`, step `name:` with expressions | ✅ rendered per matrix variant (`Build on ${{ matrix.os }}`), shown beside the job id | ✅ |
 | `always()` / `failure()` in a job's `if:` | ✅ answer for every job it needs, transitively; the pipeline stays failed; `cancelled()` refused — a canceled pipeline runs nothing more | ✅ |
 | `strategy.matrix` | ✅ static and dynamic (`fromJSON(needs.<job>.outputs.<name>)`), `include` / `exclude` | ✅ static and dynamic |
 | `strategy.fail-fast`, `strategy.max-parallel` | ✅ | ✅ |

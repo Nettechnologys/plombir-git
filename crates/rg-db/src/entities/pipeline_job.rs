@@ -69,6 +69,10 @@ pub struct Model {
     pub matrix_group: Option<String>,
     pub matrix_fail_fast: Option<bool>,
     pub matrix_max_parallel: Option<i32>,
+    /// An Actions job's `jobs.<id>.name`, rendered for its matrix variant —
+    /// what the job is shown under beside [`Self::name`], which stays the id
+    /// `needs:` and artifacts address it by. `None` without one.
+    pub display_name: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

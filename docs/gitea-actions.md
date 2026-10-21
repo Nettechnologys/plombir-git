@@ -485,6 +485,7 @@ quietly win.
 
 | Key | Type | Meaning |
 |-----|------|---------|
+| `name` | string | What the job page shows the job under, beside its id — the id still addresses it in `needs:` and everywhere else. May read `matrix.NAME`, `github.*`, `inputs.NAME` and `github.event.inputs.NAME`, resolved for each matrix variant (`Build on ${{ matrix.os }}` → `Build on linux`); any other expression is refused by name, and so is a resolved name past 255 characters. One that resolves empty shows the id. On a job that calls a reusable workflow it must be a literal, and heads each job it brings: `Shared / Deploy`. |
 | `runs-on` | string or non-empty list of strings | Runner labels required to pick the job up. |
 | `steps` | list | The job's work. See [Steps](#steps). |
 | `needs` | string or list of strings | Jobs that must finish first. |
@@ -643,7 +644,7 @@ which is read before the job's first step runs.
 
 | Key | Type | Meaning |
 |-----|------|---------|
-| `name` | string | Label for the step. Without one, the step is called `Run` and the first line of its `run:`, as on GitHub. |
+| `name` | string | Label for the step. Without one, the step is called `Run` and the first line of its `run:`, as on GitHub. `matrix.NAME`, `github.*`, `inputs.NAME` and `env.NAME` in it are resolved for each matrix variant; any other expression (`runner.os`) stays as written, since nothing runs a label. |
 | `id` | string | The step's id: a letter or `_`, then letters, digits, `-` and `_`. Unique in the job. Later steps read what it left as `steps.<id>.*` — see [Outputs](#outputs). |
 | `run` | string | The script. |
 | `shell` | string | `bash`, `sh`, `python`, `pwsh`, or a command line of your own with `{0}` where the script goes. Requires `run:`. |
@@ -1085,6 +1086,11 @@ path
 key
 ```
 
+`path` takes one path per line and, like `actions/upload-artifact`'s, is
+resolved for each matrix variant: `path: target-${{ matrix.os }}` caches
+`target-linux` and `target-mac`. It reads the same expressions and is refused
+the same way as the artifact's `path` below.
+
 `restore-keys` (a miss becomes a fallback hit), `fail-on-cache-miss` (a miss
 becomes a failure) and `lookup-only` (skip the restore) all change the outcome
 of a miss, which this cache does not implement, so accepting them would report
@@ -1099,11 +1105,15 @@ path
 ```
 
 `path` takes one path per line, exactly as the real action does; `name`
-defaults to `artifact`, as on GitHub. `name` may read `matrix.NAME`, `github.*`,
-`inputs.NAME`, `github.event.inputs.NAME` and `env.NAME`, and is resolved for
-each matrix variant, so `name: dist-${{ matrix.os }}` publishes `dist-linux` and
-`dist-mac`; any other expression is refused by name, and so is a resolved name
-outside ASCII letters, digits, `.`, `-` and `_`. The rest change behaviour this artifact store
+defaults to `artifact`, as on GitHub. Both may read `matrix.NAME`, `github.*`,
+`inputs.NAME`, `github.event.inputs.NAME` and `env.NAME` — an `env.NAME` that
+itself reads the matrix included — and are resolved for each matrix variant, so
+`name: dist-${{ matrix.os }}` with `path: out-${{ matrix.os }}` publishes
+`dist-linux` from `out-linux` and `dist-mac` from `out-mac`; any other
+expression is refused by name, and so is a resolved name outside ASCII letters,
+digits, `.`, `-` and `_`, and a path that leaves the workspace — as written
+(`/${{ matrix.os }}`) or once resolved (a matrix value `../up`). A path line that
+resolves empty is no path. The rest change behaviour this artifact store
 does not implement: `retention-days` would override a policy the repository
 owns, `if-no-files-found`, `overwrite` and `include-hidden-files` each decide
 what an empty or partial match means, and `compression-level` picks an archive
@@ -1142,12 +1152,13 @@ contexts.
 **Between steps**, the runner resolves `steps.*` and `needs.*` — see
 [Outputs](#outputs).
 
-**In job fields resolved before a runner starts** — `runs-on`,
-`container.image`, `environment` and `actions/upload-artifact`'s `name` — only
-the first six `github.*` above, plus `matrix.NAME`, `inputs.NAME` and
-`github.event.inputs.NAME`. `env.` and `secrets.` have no value at that
-boundary; they are refused there by field and expression rather than left in the
-configuration as literal `${{ … }}`.
+**In job fields resolved before a runner starts** — `name`, `runs-on`,
+`container.image`, `environment`, `actions/upload-artifact`'s `name` and `path`
+and `actions/cache`'s `path` — only the first six `github.*` above, plus
+`matrix.NAME`, `inputs.NAME` and `github.event.inputs.NAME`; the two actions'
+inputs also read `env.NAME`, as text. `secrets.`, and `env.` in the other
+fields, have no value at that boundary; they are refused there by field and
+expression rather than left in the configuration as literal `${{ … }}`.
 
 `vars.NAME` is read everywhere a workflow can write an expression — see
 [Variables](#variables-vars). It is never `env.NAME`: a variable and an

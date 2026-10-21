@@ -51,7 +51,8 @@ describe('pipeline job steps', () => {
 			started_at: timestamp, finished_at: timestamp,
 		});
 		const job = {
-			id: 5, name: 'build', status: 'success', started_at: timestamp, finished_at: timestamp,
+			id: 5, name: 'build/build [os=linux]', display_name: 'Build on linux', status: 'success',
+			started_at: timestamp, finished_at: timestamp,
 			steps: [
 				step(1, 'Compile', 'success', 'success'),
 				step(2, 'Flaky', 'failure', 'success'),
@@ -68,8 +69,12 @@ describe('pipeline job steps', () => {
 		setTestPage('/alice/demo/pipelines', { owner: 'alice', repo: 'demo' });
 		rendered = await renderComponent(PipelinesPage);
 		await click(element(rendered.container, '.pipeline-item'));
+		// card_1535b3af81ac: `jobs.<id>.name` is shown, the job's id beside it.
+		expect(element(rendered.container, '.job-card .job-name').textContent).toBe('Build on linux');
+		expect(element(rendered.container, '.job-card .job-id').textContent).toBe('build/build [os=linux]');
 
 		const dialog = await openModalFrom(rendered.container, element<HTMLElement>(rendered.container, '.job-card'));
+		expect(element(dialog, '#pipeline-log-title').textContent).toBe('Build on linux');
 		const names = [...dialog.querySelectorAll('.log-step-name')].map((name) => name.textContent);
 		expect(names).toEqual(['1. Compile', '2. Flaky', '3. Deploy']);
 		expect(dialog.textContent).toContain('failed, continued on error');
@@ -101,6 +106,8 @@ describe('pipeline job steps', () => {
 		setTestPage('/alice/demo/pipelines', { owner: 'alice', repo: 'demo' });
 		rendered = await renderComponent(PipelinesPage);
 		await click(element(rendered.container, '.pipeline-item'));
+		expect(element(rendered.container, '.job-card .job-name').textContent).toBe('native');
+		expect(rendered.container.querySelector('.job-card .job-id')).toBeNull();
 
 		const dialog = await openModalFrom(rendered.container, element<HTMLElement>(rendered.container, '.job-card'));
 		expect(dialog.querySelector('.log-steps')).toBeNull();

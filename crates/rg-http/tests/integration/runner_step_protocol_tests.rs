@@ -1265,3 +1265,53 @@ async fn a_composite_action_with_its_files_goes_only_to_a_runner_that_fetches_th
     assert_eq!(fetched.status(), StatusCode::OK);
     assert_eq!(fetched.bytes().await.unwrap().as_ref(), b"composite-bytes");
 }
+
+/// card_1535b3af81ac: the job page reads an Actions job's `jobs.<id>.name`
+/// beside the job's own name, which stays its id in the pipeline; a job the
+/// workflow gave no name carries none.
+#[tokio::test]
+async fn the_job_page_shows_a_jobs_name_beside_its_id() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed(&base, &db, "named").await;
+    let named = job(&db, seeded.stage_id, "build/b [os=linux]", &[]).await;
+    job(&db, seeded.stage_id, "build/plain", &[]).await;
+    rg_db::ops::pipeline_ops::set_job_display_name(&db, named, "Build on linux")
+        .await
+        .unwrap();
+
+    let detail = reqwest::Client::new()
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{owner}/pipelines/{}",
+            seeded.pipeline_id,
+            owner = seeded.owner
+        ))
+        .bearer_auth(&seeded.owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let jobs = detail["stages"][0]["jobs"]
+        .as_array()
+        .expect("the stage lists its jobs")
+        .iter()
+        .map(|job| {
+            (
+                job["name"].as_str().unwrap().to_string(),
+                job["display_name"].as_str().map(str::to_string),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        jobs,
+        [
+            (
+                "build/b [os=linux]".to_string(),
+                Some("Build on linux".to_string())
+            ),
+            ("build/plain".to_string(), None),
+        ],
+        "{detail}"
+    );
+}

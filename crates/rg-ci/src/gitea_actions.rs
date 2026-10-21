@@ -623,6 +623,11 @@ fn resolve_reusable_input_expression(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GiteaJob {
+    /// The name the job is shown under, beside its id — which still addresses
+    /// it in `needs:` and everywhere else. May read `matrix.*`, `github.*` and
+    /// `inputs.*`, rendered for each matrix variant.
+    pub name: Option<String>,
+
     /// Reusable workflow invocation. Repository-local workflow files are
     /// expanded before conversion; remote targets remain unsupported.
     pub uses: Option<String>,
@@ -1301,7 +1306,7 @@ fn job_field_expression(key: &str) -> Option<ActionExpression> {
     }
 }
 
-fn compile_action_template(input: &str) -> Option<ActionTemplate> {
+pub(crate) fn compile_action_template(input: &str) -> Option<ActionTemplate> {
     let mut parts = Vec::new();
     let mut rest = input;
     let mut found = false;
@@ -1770,8 +1775,11 @@ fn unsupported_job_field_expression_sites(workflow: &GiteaWorkflow) -> Vec<Strin
         }
     };
 
-    let mut artifact_names = Vec::new();
+    let mut step_fields = Vec::new();
     for (job_name, job) in &workflow.jobs {
+        if let Some(name) = &job.name {
+            inspect(format!("{job_name}: name"), name);
+        }
         match &job.runs_on {
             Some(GiteaRunsOn::Label(value)) => {
                 inspect(format!("{job_name}: runs-on"), value);
@@ -1790,28 +1798,40 @@ fn unsupported_job_field_expression_sites(workflow: &GiteaWorkflow) -> Vec<Strin
             inspect(format!("{job_name}: environment.name"), environment);
         }
         for (index, step) in job.steps.iter().enumerate() {
-            let uploads = step
-                .uses
-                .as_deref()
-                .is_some_and(|uses| uses.starts_with("actions/upload-artifact@"));
-            if let Some(name) = step.with.get("name").filter(|_| uploads) {
+            let uses = step.uses.as_deref().unwrap_or_default();
+            // The `with:` inputs that are job fields rather than shell text:
+            // an artifact's name and paths, and a cache's paths (its key is
+            // expanded by the runners and checked with the `run:` text).
+            let inputs: &[&str] = if uses.starts_with("actions/upload-artifact@") {
+                &["name", "path"]
+            } else if uses.starts_with("actions/cache@") {
+                &["path"]
+            } else {
+                &[]
+            };
+            for input in inputs {
+                let Some(value) = step.with.get(*input) else {
+                    continue;
+                };
                 // `env.*` is read as text when the job is translated
                 // (`substitute_env`); every other name is the template's.
-                let site = format!("{job_name}: step {} with.name", index + 1);
-                if let Some(template) = compile_action_template(name) {
-                    artifact_names.extend(
-                        template
-                            .unsupported_expressions()
-                            .into_iter()
-                            .filter(|expression| context_member(expression, "env").is_none())
-                            .map(|expression| format!("{site} expression `{expression}`")),
-                    );
+                let site = format!("{job_name}: step {} with.{input}", index + 1);
+                for line in value.lines() {
+                    if let Some(template) = compile_action_template(line) {
+                        step_fields.extend(
+                            template
+                                .unsupported_expressions()
+                                .into_iter()
+                                .filter(|expression| context_member(expression, "env").is_none())
+                                .map(|expression| format!("{site} expression `{expression}`")),
+                        );
+                    }
                 }
             }
         }
     }
 
-    unsupported.extend(artifact_names);
+    unsupported.extend(step_fields);
     unsupported
 }
 
@@ -3005,11 +3025,23 @@ impl GiteaWorkflow {
                     .map(str::to_owned),
             );
             let (tags, tag_templates) = split_action_template_list(runs_on_tags(&job.runs_on));
-            let (artifacts, artifact_name_template) = match artifacts {
+            let (artifacts, artifact_name_template, artifact_path_templates) = match artifacts {
                 Some(mut artifacts) => {
                     let (name, template) = split_action_template(artifacts.name.take());
                     artifacts.name = name;
-                    (Some(artifacts), template)
+                    let (paths, path_templates) =
+                        split_action_template_list(Some(std::mem::take(&mut artifacts.paths)));
+                    artifacts.paths = paths.unwrap_or_default();
+                    (Some(artifacts), template, path_templates)
+                }
+                None => (None, None, None),
+            };
+            let (cache, cache_path_templates) = match cache {
+                Some(mut cache) => {
+                    let (paths, path_templates) =
+                        split_action_template_list(Some(std::mem::take(&mut cache.paths)));
+                    cache.paths = paths.unwrap_or_default();
+                    (Some(cache), path_templates)
                 }
                 None => (None, None),
             };
@@ -3018,6 +3050,12 @@ impl GiteaWorkflow {
                 tags: tag_templates,
                 environment: environment_template,
                 artifact_name: artifact_name_template,
+                artifact_paths: artifact_path_templates,
+                cache_paths: cache_path_templates,
+                display_name: job.name.as_ref().map(|name| {
+                    compile_action_template(name)
+                        .unwrap_or_else(|| ActionTemplate::literal(name.clone()))
+                }),
             };
             let action_templates = (!action_templates.is_empty()).then_some(action_templates);
 
@@ -3241,6 +3279,11 @@ impl GiteaWorkflow {
                     .and_then(|run| run.working_directory.as_deref())
             });
         for step in &job.steps {
+            // A step's label reads `env.*` as text here; its other expressions
+            // are rendered per matrix variant when the graph is written
+            // (`create_variant_jobs`).
+            let step_label =
+                |label: String| substitute_env(&label, &self.env, &job.env, Some(&step.env));
             // Resolve a step's env against the enclosing scopes first, then
             // expose the resolved values to every expression surface in this
             // step. Entries in one `env:` map do not depend on HashMap order or
@@ -3282,12 +3325,11 @@ impl GiteaWorkflow {
                 }
                 if uses.starts_with("actions/cache@") {
                     if let (Some(path), Some(key)) = (step.with.get("path"), step.with.get("key")) {
-                        let paths = path
-                            .lines()
-                            .map(str::trim)
-                            .filter(|path| !path.is_empty())
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>();
+                        // The key reaches both runners' `cache_spec`, which
+                        // expands it against the job's variables; the paths
+                        // reach no shell, so they are rendered per matrix
+                        // variant (`ActionJobTemplates::cache_paths`).
+                        let paths = action_field_lines(path, &self.env, &job.env, &step.env);
                         cache = Some(CacheConfig {
                             key: substitute_expr(
                                 key,
@@ -3313,27 +3355,21 @@ impl GiteaWorkflow {
                     // only the last one exists. The last-wins reading is
                     // refused by name in `validate_supported_actions`.
                     if let Some(path) = step.with.get("path") {
-                        let paths = path
-                            .lines()
-                            .map(str::trim)
-                            .filter(|path| !path.is_empty())
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>();
-                        // Only `env.*` is read here, as text: the name is a
-                        // job field, rendered per matrix variant when the
-                        // graph is written (`ActionJobTemplates::artifact_name`),
-                        // and never reaches a shell that would expand the
-                        // `${MATRIX_OS}` `substitute_expr` defers it to.
+                        // Only `env.*` is read here, as text: the name and the
+                        // paths are job fields, rendered per matrix variant
+                        // when the graph is written (`ActionJobTemplates::
+                        // artifact_name` / `artifact_paths`), and never reach
+                        // a shell that would expand the `${MATRIX_OS}`
+                        // `substitute_expr` defers an expression to.
                         //
-                        // Without one it is GitHub's `artifact`. The native
+                        // Without a name it is GitHub's `artifact`. The native
                         // default — the job's name — is `<file>/<job>` here,
                         // which no artifact name may spell, so every unnamed
                         // upload used to be refused.
+                        let paths = action_field_lines(path, &self.env, &job.env, &step.env);
                         let name = step.with.get("name").map_or_else(
                             || DEFAULT_ARTIFACT_NAME.to_owned(),
-                            |name| {
-                                substitute_env(name, &self.env, &job_vars, Some(&resolved_step_env))
-                            },
+                            |name| substitute_env(name, &self.env, &job.env, Some(&step.env)),
                         );
                         artifacts = Some(ArtifactsConfig {
                             name: Some(name),
@@ -3358,7 +3394,7 @@ impl GiteaWorkflow {
             // A step of a JavaScript action: its file, run with Node by the
             // runner. The flat script cannot run one, and says so.
             if let Some(action) = step.action.as_ref().filter(|action| action.runs_node()) {
-                let name = step.name.clone().unwrap_or_default();
+                let name = step_label(step.name.clone().unwrap_or_default());
                 if statically_runs {
                     script.push(format!(
                         "echo \"Step '{}' runs a JavaScript action, which only a runner that \
@@ -3419,11 +3455,11 @@ impl GiteaWorkflow {
                     ));
                 }
                 steps.push(rg_process::ci_steps::StepSpec {
-                    name: step.name.clone().unwrap_or_else(|| {
+                    name: step_label(step.name.clone().unwrap_or_else(|| {
                         // GitHub's own label for an unnamed step: the first
                         // line of what it runs.
                         format!("Run {}", run_cmd.lines().next().unwrap_or_default().trim())
-                    }),
+                    })),
                     id: step.id.clone(),
                     run: expanded_cmd,
                     shell: step.shell.clone().or_else(|| default_shell.clone()),
@@ -3755,6 +3791,18 @@ fn expand_reusable_jobs(
             .map(|(job_name, _)| job_name.clone())
             .collect::<std::collections::HashSet<_>>();
 
+        // The calling job's `name:` heads each job it brings, as GitHub shows
+        // `<caller> / <job>`. Only as a literal: an expression in it would be
+        // rendered in the called jobs, where `inputs.*` are the called
+        // workflow's own and no longer the ones the caller read.
+        if let Some(caller_name) = original.name.as_deref() {
+            if caller_name.contains("${{") {
+                anyhow::bail!(
+                    "jobs.{name}.name: a job that calls a reusable workflow takes a literal name; \
+                     put the expression in the name of the called workflow's jobs"
+                );
+            }
+        }
         // A called workflow's jobs never get more than the job that calls it
         // declares, as on GitHub; its own `permissions:` can only narrow.
         let caller = match original
@@ -3785,6 +3833,10 @@ fn expand_reusable_jobs(
             });
             if roots.contains(&child_name) {
                 child.needs = original.needs.clone();
+            }
+            if let Some(caller_name) = &original.name {
+                let shown = child.name.take().unwrap_or_else(|| child_name.clone());
+                child.name = Some(format!("{caller_name} / {shown}"));
             }
             jobs.insert(format!("{name}/{child_name}"), child);
         }
@@ -4833,6 +4885,9 @@ impl GiteaWorkflow {
             if let Some(job_condition) = &mut job.condition {
                 condition(job_condition).map_err(at)?;
             }
+            if let Some(name) = &mut job.name {
+                text(name).map_err(at)?;
+            }
             match &mut job.runs_on {
                 Some(GiteaRunsOn::Label(label)) => text(label).map_err(at)?,
                 Some(GiteaRunsOn::Labels(labels)) => {
@@ -5205,6 +5260,7 @@ impl GiteaWorkflow {
             }
             // The job fields `job_field_expression` reads it in, besides.
             let fields = [
+                job.name.as_deref(),
                 job.container
                     .as_ref()
                     .map(|container| container.image.as_str()),
@@ -5256,9 +5312,32 @@ fn env_value(
         .unwrap_or_default()
 }
 
+/// The `path:` lines of `actions/cache` / `actions/upload-artifact`, one path
+/// per line, with `env.*` read as text ([`substitute_env`]); any other
+/// expression is left for the per-variant rendering.
+fn action_field_lines(
+    input: &str,
+    workflow_env: &HashMap<String, String>,
+    job_env: &HashMap<String, String>,
+    step_env: &HashMap<String, String>,
+) -> Vec<String> {
+    input
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| substitute_env(path, workflow_env, job_env, Some(step_env)))
+        .collect()
+}
+
 /// [`substitute_expr`]'s `env.*` alone, every other expression left in place —
 /// for a field compiled into an [`ActionTemplate`] afterwards, whose other
 /// expressions have a value only per matrix variant.
+///
+/// Called with the `env:` maps as the workflow wrote them, not as
+/// [`substitute_expr`] left them: an `env.DIR` written `out-${{ matrix.os }}`
+/// has to arrive at the template as that expression, where the per-variant
+/// rendering reads it. The `${MATRIX_OS}` it is deferred to in a job's
+/// variables is only ever expanded by a shell, which these fields never reach.
 fn substitute_env(
     input: &str,
     workflow_env: &HashMap<String, String>,

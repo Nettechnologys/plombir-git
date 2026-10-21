@@ -368,6 +368,22 @@ pub async fn create_job(
     Ok(result)
 }
 
+/// Record the name an Actions job is shown under (`jobs.<id>.name`, rendered
+/// for its variant), beside the job's own name.
+pub async fn set_job_display_name(
+    db: &impl ConnectionTrait,
+    job_id: i64,
+    display_name: &str,
+) -> Result<()> {
+    pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(job_id))
+        .col_expr(pipeline_job::Column::DisplayName, Expr::value(display_name))
+        .exec(db)
+        .await
+        .context("db: write job display name")?;
+    Ok(())
+}
+
 /// Atomically release a manual job for execution. Returns false if another
 /// request already released it or the job is not manual.
 pub async fn play_manual_job(db: &impl ConnectionTrait, id: i64) -> Result<bool> {
@@ -871,6 +887,7 @@ pub struct PipelineJobSummary {
     pub id: i64,
     pub stage_id: i64,
     pub name: String,
+    pub display_name: Option<String>,
     pub image: Option<String>,
     pub script: String,
     pub when_condition: String,
@@ -922,6 +939,7 @@ fn job_summaries_query() -> Select<pipeline_job::Entity> {
             pipeline_job::Column::Id,
             pipeline_job::Column::StageId,
             pipeline_job::Column::Name,
+            pipeline_job::Column::DisplayName,
             pipeline_job::Column::Image,
             pipeline_job::Column::Script,
             pipeline_job::Column::WhenCondition,

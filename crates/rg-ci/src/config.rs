@@ -210,6 +210,19 @@ pub(crate) struct ActionJobTemplates {
     /// back as `None`: that job's name was a literal.
     #[serde(default)]
     pub(crate) artifact_name: Option<ActionTemplate>,
+    /// `actions/upload-artifact`'s `path:` lines, when one of them reads an
+    /// expression (`out-${{ matrix.os }}`). The job's `artifacts.paths` is
+    /// empty then: no path exists before a variant does. `#[serde(default)]`
+    /// for the reason [`Self::artifact_name`] has it.
+    #[serde(default)]
+    pub(crate) artifact_paths: Option<Vec<ActionTemplate>>,
+    /// `actions/cache`'s `path:` lines, likewise; `cache.paths` is empty then.
+    #[serde(default)]
+    pub(crate) cache_paths: Option<Vec<ActionTemplate>>,
+    /// `jobs.<id>.name`, what the job is shown under beside its id — a literal
+    /// or a template such as `Build on ${{ matrix.os }}`.
+    #[serde(default)]
+    pub(crate) display_name: Option<ActionTemplate>,
 }
 
 impl ActionJobTemplates {
@@ -218,6 +231,9 @@ impl ActionJobTemplates {
             && self.tags.is_none()
             && self.environment.is_none()
             && self.artifact_name.is_none()
+            && self.artifact_paths.is_none()
+            && self.cache_paths.is_none()
+            && self.display_name.is_none()
     }
 }
 
@@ -262,6 +278,31 @@ impl ActionTemplate {
             }
         }
         Ok(rendered)
+    }
+
+    /// The template with every expression spelled back as `${{ … }}`: what a
+    /// check that runs before any matrix variant exists can still judge of a
+    /// path — whether its own text makes it absolute or climbs out with `..` —
+    /// and how a refusal quotes it to the author.
+    pub(crate) fn shape(&self) -> String {
+        self.render_or_spell(|_| None)
+    }
+
+    /// [`Self::render`] for a label, which nothing executes: an expression
+    /// `resolve` has no value for is spelled back as `${{ … }}` instead of
+    /// failing the whole text.
+    pub(crate) fn render_or_spell(
+        &self,
+        mut resolve: impl FnMut(&ActionExpression) -> Option<String>,
+    ) -> String {
+        self.parts
+            .iter()
+            .map(|part| match part {
+                ActionTemplatePart::Literal(value) => value.clone(),
+                ActionTemplatePart::Expression(expression) => resolve(expression)
+                    .unwrap_or_else(|| format!("${{{{ {} }}}}", expression.source_name())),
+            })
+            .collect()
     }
 }
 

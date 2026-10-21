@@ -1001,7 +1001,8 @@
                           {/if}
                         </div>
                         <div class="job-body">
-                          <span class="job-name">{job.name}</span>
+                          <span class="job-name">{job.display_name ?? job.name}</span>
+                          {#if job.display_name}<span class="job-id">{job.name}</span>{/if}
                           {#if job.environment_name}<span class="environment-name">🚀 {job.environment_name}</span>{/if}
                           {#if job.if_condition}
                             <span
@@ -1086,7 +1087,8 @@
     <div class="log-modal">
       <div class="log-header">
         <div>
-          <strong id="pipeline-log-title">{selectedJob?.name || t('pipeline.log.title')}</strong>
+          <strong id="pipeline-log-title">{selectedJob?.display_name || selectedJob?.name || t('pipeline.log.title')}</strong>
+          {#if selectedJob?.display_name}<span class="job-id">{selectedJob.name}</span>{/if}
           {#if selectedJob}
             <PipelineBadge status={selectedJob.status} />
           {/if}
@@ -1319,6 +1321,7 @@
   .job-body { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
   .job-name { flex: 1; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .environment-name { color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
+  .job-id { color: var(--text-secondary); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; }
   .job-condition {
     border: 1px solid var(--border);
     border-radius: 999px;

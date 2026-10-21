@@ -13430,7 +13430,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.play_manual",
-          "line": 1019,
+          "line": 1020,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handlePlay(job.id); }",
@@ -13482,7 +13482,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.approval_recorded",
-          "line": 1022,
+          "line": 1023,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handleApprove(job.id); }",
@@ -13534,7 +13534,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_downloading",
-          "line": 1058,
+          "line": 1059,
           "via": null,
           "href": null,
           "handler": "() => downloadArtifact(artifact)",
@@ -13559,7 +13559,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_deleting",
-          "line": 1064,
+          "line": 1065,
           "via": null,
           "href": null,
           "handler": "() => deleteArtifact(artifact)",
@@ -13584,7 +13584,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 1101,
+          "line": 1103,
           "via": null,
           "href": null,
           "handler": "closeLog",
@@ -13594,7 +13594,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.log.all_steps",
-          "line": 1111,
+          "line": 1113,
           "via": null,
           "href": null,
           "handler": "() => showStep(null)",
@@ -13619,7 +13619,7 @@
         {
           "tag": "button",
           "label": ".",
-          "line": 1119,
+          "line": 1121,
           "via": null,
           "href": null,
           "handler": "() => showStep(step.number)",
